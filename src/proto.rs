@@ -817,6 +817,74 @@ pub enum Request {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
+    /// One turn for a push of fresh small regular files on a fresh control
+    /// session: select and retain the destination directory, refuse if any
+    /// target already exists, register the directory as the session's
+    /// destination root, then stage and publish every file through the
+    /// ordinary small-file path. See `SmallCopyRequest`.
+    CopySmallFiles(SmallCopyRequest),
+}
+
+/// Bounds for one-turn small pushes. The receiver enforces them independently
+/// of the coordinator's eligibility check.
+pub const SMALL_COPY_MAX_FILES: usize = 64;
+pub const SMALL_COPY_MAX_FILE_BYTES: u64 = 1 << 20;
+pub const SMALL_COPY_MAX_TOTAL_BYTES: u64 = 4 << 20;
+
+/// The parts of a job identity only the coordinator knows. The receiver adds
+/// the canonical destination it resolves, so the sidecar names it stages
+/// through are the ones the ordinary engine would use for the same copy.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyIdentity {
+    pub src_endpoint: String,
+    pub src_roots: Vec<(String, bool)>,
+    pub dst_endpoint: String,
+    /// Exact placement names a directory entry beneath the selected
+    /// directory; its identity is the canonical parent plus this leaf.
+    pub dst_leaf: Option<PathBytes>,
+    pub semantic_flags: String,
+}
+
+/// One file of a small push. `path` is spelled as the ordinary engine would
+/// send it: beneath the request prefix, one component below the selected
+/// directory.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyFile {
+    pub path: PathBytes,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: ContentDigest,
+    pub meta: Meta,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyRequest {
+    /// The operator directory: the `--into` directory, or the parent of an
+    /// `--as` leaf. It must already exist.
+    pub directory: PathBytes,
+    pub symlink_policy: OperatorSymlinkPolicy,
+    /// What `AnchorDestination` would register as the request prefix.
+    pub request_prefix: PathBytes,
+    pub identity: SmallCopyIdentity,
+    /// Publication metadata flags, as for `SmallPut`.
+    pub flags: u8,
+    pub files: Vec<SmallCopyFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum SmallCopyOutcome {
+    /// Every file was attempted; one result per file in request order.
+    Published(Vec<Option<WireError>>),
+    /// At least one target already exists. Nothing was written and the
+    /// session holds no selection or root, so the ordinary engine can
+    /// continue on this connection.
+    NotFresh,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyResponse {
+    pub anchor: DirectoryAnchor,
+    pub outcome: SmallCopyOutcome,
 }
 
 impl Request {
@@ -917,6 +985,7 @@ pub enum Response {
     /// deliberately distinct from `Err`: filenames and other diagnostics are
     /// untrusted text and must never select a recovery path.
     CopyLocalUnsupported,
+    SmallFilesCopied(SmallCopyResponse),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]

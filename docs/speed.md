@@ -52,7 +52,11 @@ table](reference.md#compatibility-options)).
    file. Workers connect while the source is still being scanned, address
    probes run while the control connection prepares the destination, and a
    transfer of nothing but fresh small files over ssh reuses the authenticated
-   control connection instead of paying a handshake per worker.
+   control connection instead of paying a handshake per worker. A native push
+   of a few small local files into an existing remote directory goes further:
+   the destination check, the placement, and the writes travel as one request
+   on the control connection, so the copy costs one network round trip once
+   the connection is up.
 6. **Compression that costs nothing when it cannot help.** Remote transfers
    try zstd level 1 on each piece of data they send, sending the compressed
    form only when it is smaller, so archives, media, and encrypted data are not expanded on the
