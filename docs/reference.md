@@ -19,7 +19,7 @@ syq cp project --to server --into /backup       # named object → /backup/proje
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
-syq cp --from server data --to backup --coordinate-at dest --into /archive
+syq cp --from server data --to backup --coordinate-at dest --no-forward-agent --into /archive  # pull with backup's own credentials
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
@@ -58,9 +58,12 @@ follow the placement. This rule makes every bare path's role clear and applies
 equally to local and remote copies.
 
 `--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
-the source endpoint. Copy selectors may be absolute and then ignore `--cwd`.
-Removal selectors are always relative; native `rm` rejects a leading slash and
-any `.` or `..` component.
+the source endpoint. A selector may also be absolute, and a relative selector
+may use `.` and `..`, including a `..` that leaves `--cwd`: `--cwd` is a
+resolution base, not a boundary. With `--root DIR` in its place, every selector
+must be relative and must stay beneath `DIR`; an absolute selector, a `~`
+selector, or a `..` that would leave the root is refused before anything
+changes.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the target; by default a named symlink is copied as a
@@ -86,7 +89,7 @@ selected object rather than something to traverse, so a symlink there remains
 symlink payload. A directory-required selector such as `--src-src` or
 `--src-dir` cannot use a symlink as its selected directory by default.
 `--follow-src` permits this traversal only in directly supplied source paths,
-including `--cwd`, `rm --root`, and source selectors. `cp --follow-dest`
+including `--cwd`, `--root`, and source selectors. `cp --follow-dest`
 permits it only in the destination placement path. `--follow` is the umbrella:
 it enables both directions and also permits traversal in coordinator-local
 control paths such as `--ignore-from`, `--mapping`, and `--results`. The
@@ -351,12 +354,14 @@ a receiver-attested stream while data flows directly between the remotes.
 Both forms are rejected with `--detach`. Choose a results path outside the
 copy or removal trees; one inside them can make the run's own accounting
 unpredictable. An ordinary SSH `rm` returns structured endpoint outcomes, but a
-command-restricted receiver rejects native removal because its signed grants
-currently authorize copy mutations only. `--mapping` cannot be combined with `--prune` because
+command-restricted receiver rejects native removal because a signed grant
+authorizes the mutations of one copy and there is no grant form for `syq rm`. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers
 `--prune` runs, including their removals. `--max-delete` requires
-`--prune`; `rm` additionally accepts `--root` plus its endpoint-side
-removal semantics.
+`--prune`. `cp`, `rm`, and `map` all accept `--root DIR` in place of `--cwd`:
+selectors are then resolved beneath `DIR`, and anything that would leave it is
+refused. For `rm`, the root is also the containment boundary for the removal
+itself, as described above.
 
 Native `cp` exposes the remote runtime and transport controls
 directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
@@ -375,8 +380,8 @@ command line, so direct placement works for every filename and data is never
 routed through this machine implicitly. `--coordinate-at src` explicitly selects a
 direct push, `--coordinate-at dest` selects a direct pull with the SSH edge
 reversed, and `--coordinate-at local` explicitly selects a relay through this
-machine. `--coordinate-at` is rejected for copies that do not have two remote
-endpoints.
+machine. `--coordinate-at src`, `dest`, or `local` is rejected for copies that do not
+have two remote endpoints; `auto`, the default, is accepted everywhere.
 
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed, because there is
@@ -533,7 +538,7 @@ syq map --src-src photos \
   | syq cp --mapping - -C photos --to nas --into /pub
 ```
 
-`syq map` is local and destination-independent. Its options are `-C`,
+`syq map` is local and destination-independent. Its options are `-C` or `--root`,
 `--follow-src`/`--follow`, the source-selector family, and `--as` for renaming
 one selected root. Copy destinations, filtering, transfer policy, execution
 controls, results, receiver ceilings, and receipts belong to the downstream `cp`
@@ -574,9 +579,9 @@ accept them.
 | Option | Meaning |
 |---|---|
 | `-a`, `--archive` | Same as `-rlptgoD` |
-| `-r` `-l` `-p` `-t` `-g` `-o` `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
-| `-v`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
-| `-q` | Errors only |
+| `-r`/`--recursive`, `-l`/`--links`, `-p`/`--perms`, `-t`/`--times`, `-g`/`--group`, `-o`/`--owner`, `-D` | Recursive; symlinks as symlinks; perms; mtimes; group; owner; devices and specials |
+| `-v`/`--verbose`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
+| `-q`, `--quiet` | Errors only |
 | `-z`, `--compress` / `--no-compress` | Enable (the default) or disable zstd compression in syq's protocol; this is not `ssh -C` |
 | `-n`, `--dry-run` | Resolve mappings and transport, estimate transfers/exclusions/deletions; change nothing |
 | `--syq-connections N` | SYQ extension: parallel data connections (default: auto-tuned, see [Speed](speed.md#how-many-connections)) |
@@ -611,7 +616,8 @@ accept them.
 | `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
 | `--from0` | `--files-from` entries are NUL-separated |
 | `--insecure-links` | Follow symlinks in this machine's operator paths regardless of ownership, and use legacy traversal through symlinked source parents; never applied to a remote endpoint, as in rsync |
-| `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+| `-h`, `--human-readable` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
+| `-V`, `--version` | Print the version |
 
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
 notices, and `-v` file listings are hidden. Copy failures are still written to
@@ -1119,4 +1125,5 @@ differs and why, what's missing, and the open issues. The short version:
 | 0 | Everything copied and verified |
 | 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
 | 25 | Finished, but `--max-delete` stopped the deletions |
-| 1 | Fatal: bad arguments, couldn't connect, remote `syq` missing, connection lost |
+| 2 | Rejected on the command line: an unknown or unsupported option, a bad `--bwlimit` rate, two remote operands, or another usage error; nothing was started |
+| 1 | Fatal: couldn't connect, remote `syq` missing, connection lost, or a problem found after option parsing (for example a bad `--block-size` or `--max-size` value) |

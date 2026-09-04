@@ -265,8 +265,9 @@ drops with `ip -s link` and the vendor's tools.
   destinations keep the adaptive parallel path. NFS mount choices such as
   `nconnect` are client and server policy; see the
   [NFS notes](speed.md#nfs) and test with disposable data.
-- Compression trades network bytes for CPU. Compare with and without `-z` when
-  either the link or CPU is near saturation.
+- Compression trades network bytes for CPU and is on by default. Compare a run
+  with `--no-compress` against the default when either the link or CPU is near
+  saturation.
 - `--bwlimit` is the appropriate control when the goal is coexistence with
   other traffic, not maximum benchmark throughput.
 

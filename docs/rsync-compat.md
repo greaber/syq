@@ -2,8 +2,8 @@
 
 `syq rsync` is syq's rsync-shaped command surface. This file is the
 tracked record of how far that goes: what behaves the same, what differs and
-why, what rsync has that syq doesn't, and the open issues. `README.md` and the documents under `docs/`
-are the user-facing contract; when they and this record disagree, fix one of them.
+why, what rsync has that syq doesn't, and the open issues. It is kept
+consistent with `README.md` and the [command reference](reference.md).
 
 Each entry says whether it was **measured** (run against upstream rsync —
 3.5.0 at `7c20b077`, cross-checked with 3.2.7 where version-sensitive) or is
@@ -24,9 +24,9 @@ Categories:
   safety, product architecture, or another documented reason.
 - **SYQ extension** — functionality outside rsync's model. Every retained
   long option uses a `--syq-` name so scripts can identify it as non-portable.
-- **Not implemented** — rsync has it, syq doesn't yet, or the behavior belongs
+- **Not implemented** — rsync has it and syq does not, or the behavior belongs
   only on syq's native interface.
-- **Open issues** — known gaps we intend to close, or decisions still to make.
+- **Open issues** — known gaps and undecided behaviors.
 
 ## Automated upstream test ledger
 
@@ -91,9 +91,9 @@ behavior; an entry without one is only believed, not held.
 | Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; syq: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
 | Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Compatible subsets or approximations" 1 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
-| Files the source has but a rule skips — `-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D` — are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 (an earlier README claim that rsync deletes a `--max-size` casualty was wrong) | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
+| Files the source has but a rule skips — `-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D` — are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
 | `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Compatible subsets or approximations" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
-| `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_lists_no_missing_directories`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
+| `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_reports_no_missing_directory_changes`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
 | `--max-size` / `--min-size` on regular files only; `K`/`M`/`G` suffixes | measured | `size_limits_filter_files_and_protect_them_from_delete`, `bad_size_limits_fail_before_anything_connects` |
 | `--files-from` baseline: paths relative to one source; implied parents created; a plain listed directory is copied without its contents unless `-r` is given explicitly (`-a` doesn't count); `--from0`; `-` reads stdin; blank entries and entries starting with `#` or `;` dropped in both separator modes (literal names remain reachable as `./#name` and `./;name`) | measured; entry *parsing* has gaps, open issue 1 | `files_from_copies_listed_paths_with_their_parents`, `files_from_treats_hash_and_semicolon_entries_as_comments`, `files_from_creates_listed_and_implied_dirs_without_r`, `files_from_repeats_and_late_listed_dirs_across_chunks`, `files_from_root_may_be_a_symlink_and_root_lines_are_rejected` |
 | `--delete-after` / `--delete-delay` accepted as synonyms of `--delete` (they describe what syq does) | by construction | `delete_after_and_delay_are_synonyms` |
@@ -110,7 +110,7 @@ behavior; an entry without one is only believed, not held.
 
 Each item records the current reason syq does otherwise. Safety is one reason;
 architecture and disproportionate implementation cost can also justify a
-narrow divergence. If the reasoning stops holding, move the item.
+narrow divergence.
 
 1. **`--delete` runs after the transfer, always; no `--delete-before` /
    `--delete-during`.** rsync defaults to delete-during. syq's rule means a run
@@ -128,15 +128,19 @@ narrow divergence. If the reasoning stops holding, move the item.
    outright, says so, and exits 25 like rsync. Zero already means delete
    nothing in both programs. *Test:
    `max_delete_refuses_everything_past_the_limit`.*
-3. **`--files-from` follows symlinked implied parents and creates them as real
-   directories on the destination**, and refuses a listed symlink together with
-   a path through it. rsync's behavior here is version-sensitive (measured:
-   3.2.7 followed the parent and copied through it; 3.5 created the implied
-   directory, then refused the open with `ELOOP`). Either way, sending the
-   parent as a symlink would make a later write go *through* a destination
-   symlink to wherever it points, which is how a file list could redirect
-   writes outside the destination. Listing `data/foo` means "I want `foo`
-   under `data`"; syq does that and nothing else. *Tests:
+3. **`--files-from` does not traverse a parent that is a symlink on the
+   source.** That listed entry fails with a partial-transfer error (exit 23)
+   and nothing is created for it, while the rest of the list is still copied;
+   a listed symlink together with a path through it is refused. rsync's
+   behavior here is version-sensitive (measured: 3.2.7 followed the parent and
+   copied through it; 3.5 created the implied directory, then refused the open
+   with `ELOOP`). Syq refuses earlier than 3.5 and never emits the implied
+   parent. Sending the parent as a symlink would make a later write go
+   *through* a destination symlink to wherever it points, which is how a file
+   list could redirect writes outside the destination. On a local source,
+   `--insecure-links` restores the older behavior: the parent is followed and
+   created as a real directory on the destination. A remote source is always
+   confined, because the flag is never sent to it. *Tests:
    `files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs`,
    `files_from_leaves_no_ancestors_behind_on_a_bad_chain`,
    `files_from_symlink_conflict_is_order_independent`.*
@@ -197,17 +201,16 @@ corresponding copy would select. *Test: `verify_only_checks_the_filtered_scope`.
    `unreadable_source_root_disables_delete`,
    `delete_is_skipped_when_the_source_scan_has_errors`.*
 2. **`-u` applies to regular files only.** rsync also compares mtimes for
-   symlinks and devices (believed, not measured). Low impact; could be
-   aligned. Deliberately, a *type change* replaces regardless of mtimes —
-   a source directory still replaces a newer destination file (as in
+   symlinks and devices (believed, not measured). Deliberately, a *type
+   change* replaces regardless of mtimes — a source directory still replaces a newer destination file (as in
    rsync): `-u` is about not regressing newer file content, not about
    protecting whatever exists; that stronger promise is
    `--ignore-existing`'s (see "Intentional divergences" 5).
 3. **`--files-from` cannot combine with `--syq-ignore`/
    `--syq-ignore-from` or `--delete`.** Rsync allows filters and deletion with
    a file list. These are explicit restrictions rather than silent semantic
-   choices. Filters over a file list are a plausible later addition; deletion
-   scope under a file list is genuinely ambiguous and rsync's semantics for it
+   choices. Filters are not applied to a file list; deletion scope under a
+   file list is genuinely ambiguous and rsync's semantics for it
    are murky. *Test:
    `files_from_rejections_and_stdin`.*
 4. **Deletions are executed over the control connection** in batches of 1000
@@ -256,12 +259,13 @@ command says what to change.
 
 ## Open issues
 
-1. **The remaining `--files-from` entry parsing doesn't match rsync's**
-   (measured on 3.2.7 and 3.5.0). Finish the related path rules as one change:
-   normalize `..` and clamp it at the source root instead of rejecting;
-   preserve a trailing slash (`dir/` selects the directory's immediate
-   children without `-r`, `dir` only the directory); accept `.`/`/` as the root
-   entry (children without `-r`); add `-0` as an alias of `--from0`.
-2. **`-h` alone should print help**, as rsync does, while staying
-   `--human-readable` inside a cluster (`-avh`). Essentially free.
-3. **`-u` for symlinks/devices** — measure rsync, then align or record.
+1. **`--files-from` entry parsing differs from rsync's** (measured on 3.2.7
+   and 3.5.0): a `..` component is rejected rather than clamped at the source
+   root; a trailing slash is stripped, so `dir/` and `dir` select the same
+   thing, whereas rsync's `dir/` selects the directory's immediate children
+   without `-r`; `.` and `/` are rejected rather than treated as the root
+   entry; and `-0` is not accepted, only `--from0`.
+2. **`-h` alone does not print help**, unlike rsync; use `--help`. Inside a
+   cluster such as `-avh` it is the `--human-readable` no-op.
+3. **`-u` applies to regular files only**; rsync also compares mtimes for
+   symlinks and devices (believed, not measured).

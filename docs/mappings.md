@@ -2,7 +2,8 @@
 
 A mapping is a file (or stream) of explicit source→destination claims that
 `syq cp` can execute: a generalized `--as` covering many entries at
-once, or a `--files-from` whose entries can also *re-place* each file.
+once, or an `rsync --files-from` list whose entries can also *re-place* each
+file.
 You author selection and placement — with a script, or by transforming
 a mapping syq itself emits — and syq does what it always does:
 parallel transfer, delta, resume, verification, and conflict checking
@@ -41,8 +42,10 @@ One JSON object per line (NDJSON):
   disambiguates the request — mapping a file and mapping a directory
   (non-recursively; entries are never recursive) are different
   operations. If the object at `src` is not the declared kind, that
-  entry fails, exactly as if `src` did not exist. Without `kind`, the
-  entry maps whatever is there.
+  entry fails and the run continues, as with a missing source; in a
+  results stream the mismatch is a `conflict` marked `retryable: "no"`,
+  while a missing source is `io`/`not_found` with `retryable: "unknown"`.
+  Without `kind`, the entry maps whatever is there.
 - `size`, `mtime` (optional, informational): emitted by `syq map` for
   transforms to filter on; execution ignores them. Unknown keys are
   rejected, so a typo cannot be silently dropped.
@@ -51,7 +54,7 @@ Duplicate destinations, and a destination claimed both as a file and as
 a directory ancestor of another entry, are conflicts — detected before
 any transfer begins, across the entire manifest. Destination ancestor
 directories no entry names are created implicitly, as with
-`--files-from`.
+`syq rsync --files-from`.
 
 ## Emitting a mapping
 
@@ -259,8 +262,11 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   concurrent rename or symlink replacement cannot redirect the emitted tree.
   A followed named selector's emitted `src` is derived from that same component
   walk rather than a second `realpath` lookup.
-- `-C` is only a resolution base: directly supplied selectors may contain
-  `.` and `..` and may resolve outside it. `--root` is mutually exclusive with
+- `-C` is only a resolution base: selectors may contain `.` and `..`. A
+  named selector must still resolve inside that base, because its emitted
+  `src` is written relative to it, and `syq map` refuses one that escapes. A
+  contents selector (`--src-src DIR`) may point anywhere, since its entries
+  are relative to `DIR` itself. `--root` is mutually exclusive with
   `-C` and confines those selectors beneath the pinned root. A mapping emitted
   from a contents selector is relative to the selected directory, so its
   consumer must use that directory as its source base. These operator-path
@@ -283,8 +289,8 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   copying anything: parse errors, duplicate destinations, and
   declared-kind ancestor conflicts refuse the run before any entry is
   applied (the `--into` container itself is created eagerly, as with
-  `--files-from`). The price is memory proportional to the manifest, as
-  in a multi-source copy. Sources are then statted and planned in chunks, and transfers begin once planning completes.
+  `syq rsync --files-from`). The price is memory proportional to the
+  manifest, as in a multi-source copy. Sources are then statted and planned in chunks, and transfers begin once planning completes.
   Conflicts only observable at execution — an undeclared ancestor that
   turns out not to be a directory, existing destination state — still
   fail entries individually. `syq map` streams its output. Exit codes
@@ -311,22 +317,20 @@ metadata-only updates are not reported per operation. A missing
 terminal record means the run did not finish; a terminal status other
 than `success` or `partial` means entries may be unsettled.
 
-The results writer lives with the transfer coordinator, so a stream
-requires a local coordinator (an explicit `--coordinate-at local` for a
-remote-to-remote copy). `--results` cannot be combined with `--detach`,
-because the caller would no longer be attached for the complete stream
-and its terminal record. Receiver-attested streams for attached direct
-copies through a command-restricted receiver — records verified and
-decrypted from hostB's receipt, marked `"provenance":"receiver_attested"`
-— exist in the engine and return once wired to the file/descriptor
-outputs. A named file is created fresh beneath its retained parent; an existing
-entry is refused rather than truncated. With `--follow`, that retained
+The results writer runs on the machine you invoke syq from. A `--mapping`
+copy always has one local end (it refuses two remote endpoints), so its
+stream is written locally and in full. `--results` cannot be combined with
+`--detach`, because the caller would no longer be attached for the complete
+stream and its terminal record. A named file is created fresh beneath its
+retained parent; an existing entry is refused rather than truncated. With `--follow`, that retained
 selection is the resolved referent, so replacing the link later cannot redirect
 the output. Use an inherited `--results-fd` when the caller needs another kind
 of sink.
 
-Failed operation records carry `src`, `dst`, and `kind`, so a retry
-manifest is one filter away:
+Failed operation records for entries you named carry `src`, `dst`, and
+`kind`, so a retry manifest is one filter away (a failed implicit ancestor
+directory has no `src` and is marked `retryable: "no"`, so the filter below
+skips it):
 
 ```bash
 set -o pipefail
@@ -344,9 +348,9 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an `aborted`
-incomplete receipt or a `refused` run) means queued entries were never
-settled or their receipt records may be missing. In both cases, entries
+and a terminal status of `aborted` means the run stopped early, for example
+on a manifest error found after the stream began, so queued entries were
+never settled. In both cases, entries
 may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot

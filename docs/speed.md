@@ -22,9 +22,11 @@ table](reference.md#compatibility-options)).
    huge file stays parallel to its last byte. Deletion and native `rm` run in
    parallel too. Without `-j`, an auto-tuner adjusts the connection count while
    the copy runs, settling on the smallest count within 5 % of the best
-   measured rate (one worker is a valid answer for a spinning disk), and
-   remembers that count per path and transport as the next run's starting
-   point. See [How many connections](#how-many-connections).
+   measured rate (one worker is a valid answer for a spinning disk), and, for
+   copies with a remote endpoint, remembers that count per host path and
+   transport as the next run's starting point. Same-machine copies, including
+   copies into a mounted NFS path, always start from the local default. See
+   [How many connections](#how-many-connections).
 2. **A TCP data path beside ssh.** OpenSSH caps each channel at a 2 MB window,
    which is roughly 2 MB per round trip (about 7 MB/s at 265 ms), and caps each
    process at a few hundred MB/s of cipher work. Syq keeps ssh for
@@ -171,8 +173,11 @@ The rest of this document describes each mechanism in detail.
 - **ssh CPU**: one ssh process tops out at a few hundred MB/s of cipher/MAC
   work. N processes scale roughly linearly. Multiplexed channels over one
   connection wouldn't help — same TCP stream, same single encrypting process —
-  so syq passes `-o ControlMaster=no -o ControlPath=none` for its connections
-  on purpose.
+  so syq gives its large-file data connections their own ssh process
+  (`-o ControlMaster=no -o ControlPath=none`) on purpose. The one exception is
+  a job made only of fresh files no larger than one block, where the workers
+  share the already-authenticated control connection instead; those are
+  latency-bound, not cipher-bound.
 - **WAN**: several TCP flows beat one against per-flow window and loss limits.
 - **High-latency filesystems** (NFS, FUSE, object-backed): many small files
   are latency-bound; parallel stat and I/O hide it. The scan is parallel too.
@@ -199,9 +204,10 @@ other volatile telemetry. A stale hint only costs the tuner a probe or two. The
 cache is
 `$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
 `~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
-empty value to disable it). An explicit connection count, dry runs, verification, short runs
-that compare no counts, failed/aborted copies, and runs whose TCP path falls
-back to ssh after workers start do not update it; the last case may contain
+empty value to disable it). Same-machine copies, an explicit connection count,
+dry runs, verification, short runs that compare no counts, failed/aborted
+copies, and runs whose TCP path falls back to ssh after workers start do not
+update it; the last case may contain
 mixed-transport measurements that are not representative of either pure path.
 
 Useful progress (the high-water mark of logically completed bytes, plus a small
@@ -392,7 +398,7 @@ use the pipelined whole-file request described in the
 ## NFS
 
 Local↔NFS copies are a local-to-local syq run
-(`syq cp --connections 16 /raid/x --into /mnt/nfs`)
+(`syq cp /raid/x --into /mnt/nfs`)
 and benefit from parallelism across files and on reads: measured on a 20 Gbit
 NFSv4.2 mount, reads of one 4 GB file reached 858 MiB/s with eight workers vs ~400 MB/s
 for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.

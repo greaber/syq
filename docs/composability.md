@@ -89,7 +89,7 @@ or a stream can express too:
 
   ```sh
   syq map --src-src photos \
-    | jq 'select(.kind == "file")
+    | jq -c 'select(.kind == "file")
           | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
     | syq cp --mapping - -C photos --to nas --into /archive
   ```
@@ -123,9 +123,12 @@ or a stream can express too:
   hostB's verified receipt (each record marked
   `"provenance": "receiver_attested"`) while the data flows directly between
   the hosts; without an enrollment, the run fails unless `--coordinate-at
-  local` explicitly routes the data through your machine. Failed
-  operation records carry `src`, `dst`, and `kind`, so once the terminal
-  record says the run settled, a retry manifest is one filter away. The
+  local` explicitly routes the data through your machine. A dry run of a
+  remote-to-remote copy with `--results` always needs `--coordinate-at local`,
+  enrolled or not, because only a local coordinator produces the trace
+  stream. Failed copy records carry `src`, `dst`, and `kind` (delete records
+  carry only `dst` and `kind`), so once the terminal record says the run
+  settled, a retry manifest is one filter away. The
   [mappings guide](mappings.md#machine-readable-results) has that filter,
   including the terminal-record check. This is what an exit code cannot
   express: which entries failed, and whether a retry could help.

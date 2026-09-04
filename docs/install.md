@@ -20,7 +20,7 @@ do not depend on either command.
 
 To inspect it first, download the same URL without piping it to `sh`. Every
 release also has an immutable versioned installer, for example
-`https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
+`https://github.com/greaber/syq/releases/download/v0.1.8/install.sh`. To choose
 another directory, download the script and run `sh install.sh --bin-dir DIR`
 (or pipe it to `sh -s -- --bin-dir DIR`). The script detects the target,
 verifies the archive's embedded SHA-256 and size, runs the temporary binary to
@@ -67,7 +67,7 @@ the line for your shell to its startup file:
 # Bash (~/.bashrc)
 eval "$(syq completion bash)"
 
-# Zsh (~/.zshrc)
+# Zsh (~/.zshrc), after `autoload -Uz compinit && compinit`
 source <(syq completion zsh)
 ```
 

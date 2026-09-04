@@ -43,8 +43,9 @@ operator-path policy refuses a symlinked `FILE` (pass `--follow` to allow it).
 The results writer always lives on the invoking machine. A local removal and
 an ordinary SSH removal both stream their endpoint's structured outcomes back
 to that writer. A command-restricted receiver deliberately rejects native
-removal: its signed grants currently authorize copy mutations only, and no
-deletion authorization or deletion ceiling is inferred from them.
+removal: a signed grant authorizes the mutations of one copy, including
+that copy's `--prune` deletions under an explicit `--max-delete` ceiling,
+and there is no grant form for `syq rm`.
 
 For a remote-to-remote copy there are two ways to fill the stream. Through a
 command-restricted receiver enrollment, the stream is
@@ -74,8 +75,10 @@ immediately. If writing the stream itself fails, syq warns once on
 stderr and stops writing; the consumer detects this as a missing
 terminal record. Argument and usage errors exit `2` with no stream at
 all — a consumer constructs its own argv, so a usage error is a
-consumer bug and gets no JSON. Every run that gets past argument
-parsing emits a terminal record, fatal setup failures included.
+consumer bug and gets no JSON. If the stream itself cannot be opened (the
+`--results` file already exists, or the `--results-fd` descriptor is not
+open or is read-only), syq exits `1`, also with no stream. Every run whose
+stream was opened emits a terminal record, fatal setup failures included.
 
 ## Record envelope
 
@@ -152,8 +155,7 @@ in the terminal record only. Metadata-only updates (permissions,
 ownership, or times reconciled on an otherwise unchanged object) are
 not reported per operation in v1 — a live run emits no record for
 them, while a dry run does emit a `metadata_differs` trace for the
-same situation. Closing that asymmetry with a metadata result action
-is a candidate additive extension.
+same situation.
 
 Copy streams use `trace` and `operation_result`; removal streams use the next
 three record types instead.
@@ -217,8 +219,8 @@ an `object` that is `{"state": "absent"}`, an observation failure
 (`state`, `code`, `message`), or `{"state": "present"}` with `kind`
 (the receiver's precise vocabulary: `dir`, `file`, `symlink`, `fifo`,
 `socket`, `character_device`, `block_device`, `other`), `size`,
-`metadata` (mode/uid/gid/mtime), and — under `--receipt hashed` — a
-`digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
+`metadata` (`mode`, `uid`, `gid`, `mtime`, `mtime_nsec`, `rdev`), and —
+under `--receipt hashed` — a `digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
 `symlink_target` where applicable. Final states are what a verifier
 audits: they attest the tree, not the transfer's own narration.
 
@@ -309,5 +311,5 @@ integration tests validate every line syq emits against it, so any
 shape change fails a test and is reviewed as an API change. The
 committed fixtures under `tests/fixtures/automation-v1/` are examples
 of real streams (regenerate with
-`scripts/regen-automation-fixtures.sh`); client libraries can develop against
-them without running syq.
+`scripts/regen-automation-fixtures.sh`); a consumer can be written and tested
+against them without running syq.

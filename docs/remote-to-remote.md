@@ -177,16 +177,16 @@ Diagnostic text is bounded context rather than a stable interface; structured
 codes and dispositions are authoritative. An authenticated expected manifest
 is required for source completeness and byte authenticity.
 
-Restricted `--detach` deliberately has a weaker boundary until durable local
-job state exists. The launcher prints a security warning even under `-q` and
-reports only that the job started. HostB's signed v2 stream is plaintext in
-hostA's detached log, so hostA can read or suppress it, and `--follow` displays
-but does not locally authenticate completion.
+`--detach` cannot use the command-restricted path: the constrained agent
+exists only while syq is attached, so a detached transfer needs
+`--no-forward-agent`, with hostA holding its own credential for hostB, or an
+explicit `--rsh` policy. No enrolled receiver runs and no receipt is produced;
+the launcher reports only that the job started and where its log is on hostA.
 
 ## Signed policies and options that fail closed
 
 The command-restricted path requires encrypted TCP data connections. Ordered
-filter rules and `--delete-excluded` are included in the signed grant: the
+filter rules are included in the signed grant: the
 receiver requires destination scans to use the exact policy and rejects
 mutations that could only descend through a pruned source directory unless
 their deletion was explicitly authorized. Each source's actual mapped
@@ -195,20 +195,13 @@ root even when it overlaps an ignored path from another contents source.
 The signed publication policy distinguishes atomic staged writes from
 `--inplace`; in-place requests use descriptor-relative opens and writes beneath
 the enrolled root and cannot silently switch back to staged publication.
-The existing-object policy is signed and enforced by the receiver. Under
-`--ignore-existing` every creation and publication is forced to no-replace
-creation, and metadata or content changes to any non-directory that existed
-before the transfer are refused; existing directories are reused, as in the
-ordinary engine. Under `--existing` the receiver refuses to create any object
-and pins each update to the object it observed, so an existing object cannot
-change type. `--inplace` is refused together with `--ignore-existing`,
-`--existing`, or `--as-new` on this path, because an in-place write opens the
-final pathname directly and can neither be made no-replace nor be pinned to
-an observed object.
+The existing-object policy is signed and enforced by the receiver; a native
+copy always sends replace semantics. `--inplace` is refused together with
+`--as-new` on this path, because an in-place write opens the final pathname
+directly and cannot be made no-replace.
 Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
 a signed root precondition, checked against the enrolled root when the grant is
-claimed. `--update` still fails closed because it compares against source
-modification times that only hostA reports.
+claimed.
 `--mapping` and `--min-size` also fail closed because the receiver cannot
 enforce those semantics independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
@@ -221,24 +214,18 @@ Deletion through the receiver (`cp --prune`) requires an explicit
 inside the scope is always stated on the command line rather than defaulting
 to a hundred million; `--max-delete 0` signs a grant that forbids deletion
 outright. The other signed ceilings default to 100 million entries, 8 TiB of
-file data, and a 23-hour grant; native `--max-entries`, `--max-total-bytes`,
-and `--max-runtime` lower them for one transfer, which bounds what a claimed
-grant is worth to hostA.
+file data, and a 23-hour grant. Native `--max-runtime` can only shorten the
+grant; `--max-entries` and `--max-total-bytes` replace their defaults for one
+transfer and may be set above or below them. Either way, what a claimed grant
+is worth to hostA is stated on the command line.
 
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA
 sends one. They use an existing enrollment but do not install one; run
 `syq enrollment add` first when previewing or verifying a new destination.
-Destination-root symlinks are also refused in this mode; enroll the explicit
-referent so the signed pathname and opened root identify the same object.
 
-One conservative rsync-shaped edge fails safely: for a named recursive source
-such as `hostA:dir` and a destination path whose existence changes rsync's
-placement meaning, the grant authorizes the existing-directory interpretation.
-If that destination does not exist, creation of children at the alternate
-exact-path interpretation is denied. Use a trailing slash (`hostA:dir/`), the
-native `--as`/`--into` placement spelling, or create the destination directory
-first when that distinction matters.
+Enrollment never follows a destination-root symlink; enroll the explicit
+referent so the signed pathname and the opened root identify the same object.
 
 ## Enrollment lifecycle
 

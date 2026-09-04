@@ -155,9 +155,10 @@ The evidence is split along the boundaries where authority changes form:
 | Descriptor-rooted operations | Scanning, stat and hashing, content reads, sidecar preparation, writes, publication, metadata, and pruning are tested separately against the shared rooted primitives |
 | Native `rm` and `map` | Pre-mutation selector pinning, replacement races, and descriptor-rooted traversal |
 
-Linux CI runs the complete suite. macOS CI also runs the tests whose names
-begin with `confinement_matrix_`, including both remote worker transports and
-the restricted-receiver race. The loopback remote-shell harness starts real
+Linux and macOS CI run the complete suite after every merge. Pull-request CI
+runs a narrower macOS job that includes every test whose name begins with
+`confinement_matrix_`, including both remote worker transports and the
+restricted-receiver race. The loopback remote-shell harness starts real
 syq client and server processes and exercises the wire protocol, descriptor
 broker, and TCP handoff; it does not test sshd authentication or claim to be a
 network-filesystem stress test. Each operation family is tested at the shared
@@ -192,8 +193,9 @@ failure, and cross a nested mount. macOS always uses the portable walk.
 
 ### The problem
 
-`syq rsync hostA:src hostB:dst` runs the transfer on hostA, which must
-authenticate to hostB. The traditional way to give hostA that ability is ssh
+`syq cp --from hostA ... --to hostB ...` runs the transfer on hostA, which
+must authenticate to hostB (`syq rsync`, like rsync, refuses two remote
+operands). The traditional way to give hostA that ability is ssh
 agent forwarding (`ssh -A`): hostA gets a socket through which it can ask your
 agent to sign anything. Anyone with root on hostA, or merely access to that
 socket, can then log into every host your keys open and do anything you can
@@ -211,9 +213,11 @@ protects.
 
 For the duration of a transfer, syq starts a temporary agent-protocol socket
 locally and forwards *that* to hostA instead of your real agent. The broker
-holds no private keys; it forwards signing requests to your real agent (or to
-the enrollment key below) only after validating the exact path the request is
-for:
+never holds your agent's keys. With `--agent-broker-only` it forwards each
+signing request to your real agent; on the default path it signs with the
+dedicated enrollment key described below, which it loads from local state and
+never sends to hostA. Either way it signs only after validating the exact path
+the request is for:
 
 ```text
 trusted hostA session -> configured-user@trusted-hostB session
@@ -284,11 +288,12 @@ Filters, `--inplace`, preservation, existing-object policy, and placement
 preconditions are signed into the grant and enforced by the receiver on its
 own. Deletion through the receiver requires an explicit `--max-delete`, and
 the native `--max-entries`, `--max-total-bytes`, and `--max-runtime` options
-lower the signed ceilings for one transfer, so what a claimed grant is worth to
-hostA is always bounded on the command line. Options whose semantics the
-receiver cannot enforce independently of hostA fail closed rather than
-trusting hostA: `--files-from`, `--mapping`, `--update`, unencrypted or ssh
-data transport, and several others (the
+set the signed ceilings for one transfer (`--max-runtime` can only shorten
+the 23-hour grant; the other two replace their defaults and may go above or
+below them), so what a claimed grant is worth to hostA is always stated on the
+command line. Options whose semantics the receiver cannot enforce
+independently of hostA fail closed rather than trusting hostA: `--mapping`,
+`--min-size`, unencrypted or ssh data transport, and several others (the
 [complete list](remote-to-remote.md#signed-policies-and-options-that-fail-closed)
 is in the remote-to-remote guide). `--dry-run` and verification-only runs are marked
 read-only in the grant, and the receiver rejects every mutation under them even
@@ -332,9 +337,9 @@ become a valid clean receipt, though suppression remains a denial of service.
 
 The receipt is hostB's closure-time account of hostB: it says what landed, not
 what hostA omitted or invented, and it is neither a transaction nor a rollback.
-A detached restricted transfer is weaker: the receipt lands in hostA's log in
-plaintext, the launcher warns about that even under `-q`, and `--follow`
-displays completion without verifying it locally.
+`--detach` cannot use this path at all: a detached transfer needs
+`--no-forward-agent`, with hostA holding its own credential for hostB, or an
+explicit `--rsh`, so no enrolled receiver runs and no receipt is produced.
 
 ### Putting the layers together
 

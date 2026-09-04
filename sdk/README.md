@@ -3,11 +3,10 @@
 This directory contains the Python client for syq. It invokes the syq
 executable rather than inventing a second transfer implementation, and it
 implements synchronous and asyncio clients for typed
-`cp` (including `prune=True`) and `map` against syq's versioned machine
-interfaces. Commands without an automation result stream, currently including
-`rm`, remain available through raw `run`. The executable remains authoritative
-for argument semantics,
-filesystem behavior, exit status, and safety checks.
+`cp` (including `prune=True`), `rm`, and `map` against syq's versioned machine
+interfaces. Every other command and mode, such as a detached remote-to-remote
+copy, remains available through raw `run`. The executable remains authoritative
+for argument semantics, filesystem behavior, exit status, and safety checks.
 
 The Python-native surface is documented in
 [`python/NATIVE_API.md`](python/NATIVE_API.md).
