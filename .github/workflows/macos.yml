@@ -5,7 +5,7 @@ name: macOS suite
 # run happens after every merge to master and on demand.
 on:
   push:
-    branches: [master, macos-portability]
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
