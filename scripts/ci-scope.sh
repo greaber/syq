@@ -132,7 +132,7 @@ while IFS= read -r path; do
       tooling=true
       python_sdk=true
       ;;
-    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
+    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
       tooling=true
       python_sdk=true
       ;;

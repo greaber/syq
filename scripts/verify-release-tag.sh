@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Require a GitHub-verified annotated tag that directly names the commit being
 # built by this release workflow, is reachable from the protected branch, and
-# has every named CI check concluded successfully. Pull requests are checked
-# against their own head, not against the branch they land on, so a merge can
-# leave the branch red; the tagged commit's own check runs are what prove it.
+# has every named CI check concluded successfully. Pull requests do not run CI;
+# the tagged commit's own post-merge or manual check runs are what prove it.
 set -euo pipefail
 
 if [ "$#" -ne 5 ]; then

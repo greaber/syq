@@ -131,30 +131,31 @@ After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
 exact signed manifest and prepares the same Python package version. It opens an
 `automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
-cache-path documentation, and lockfile updates. GitHub places
-pull-request workflow runs caused by its own token into an approval-required
-state. The preparation workflow waits until GitHub has registered both native
-runs for the exact generated commit, verifies that the pull request and native
-events belong to the trusted repository, then approves them through the
-Actions API so the required checks remain attached to the pull request. The
-fixture-tested helper has bounded deadlines and reports its last observed state
-on failure. Because `sdks` is not currently a required branch-protection check,
-the helper also waits for that check to succeed on the exact generated commit
-before the workflow requests auto-merge. GitHub then still waits for every
-required check and branch-protection rule. The repository
-keeps the default workflow token read only, permits trusted Actions workflows
-to create pull requests, and grants write scopes only inside this preparation
+cache-path documentation, and lockfile updates. The workflow has already run
+the pinned SDK release-tool and unit-test suites, so it merges that pull request
+immediately without starting pull-request CI.
+
+GitHub suppresses ordinary push-triggered workflows when a merge uses the
+repository's `GITHUB_TOKEN`. To preserve post-merge validation, the preparation
+workflow advances the automation branch to the exact merge commit and
+explicitly dispatches `ci.yml`, `rsync-compat.yml`, and `macos.yml` on that ref.
+It verifies that each returned run targets the merge commit, waits for all three
+runs, and requires the CI run's substantive `sdks` job to succeed before
+deleting the automation branch. A failure leaves the generated SDK changes
+merged and the branch available for diagnosis; it does not block unrelated
+merges. The repository keeps the default workflow token read only and grants
+Actions, contents, and pull-request write scopes only inside this preparation
 workflow.
 
-The generated pull request merges automatically after its required checks.
-Reviewers may still stop auto-merge while it is pending. The final publication
-remains a deliberate release-authority action: create the signed annotated
-`sdk-python-v<version>` tag and approve the protected `pypi` environment. The
-tag then publishes through OIDC without a local upload or long-lived PyPI
-credential. Keeping the tag signature manual avoids placing maintainer signing
-authority in CI. The additional PyPI environment approval is intentionally
-retained as defense in depth for a separate package registry; PyPI availability
-cannot block publication of syq itself.
+The generated pull request does not have a pending review or cancellation
+window. The final publication remains a deliberate release-authority action:
+create the signed annotated `sdk-python-v<version>` tag and approve the
+protected `pypi` environment. The tag then publishes through OIDC without a
+local upload or long-lived PyPI credential. Keeping the tag signature manual
+avoids placing maintainer signing authority in CI. The additional PyPI
+environment approval is intentionally retained as defense in depth for a
+separate package registry; PyPI availability cannot block publication of syq
+itself.
 
 Python distributions use a pinned interpreter and the tagged commit timestamp
 as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized
