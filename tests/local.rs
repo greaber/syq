@@ -6164,7 +6164,7 @@ fn dry_run_reports_typed_preflight_summary() {
         "{out}"
     );
     assert!(
-        out.contains("exclusions: 1 path/subtree pruned by ignore rules; 1 other entry"),
+        out.contains("exclusions: 1 path/subtree skipped by ignore rules; 1 other entry"),
         "{out}"
     );
     assert!(

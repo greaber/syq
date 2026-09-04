@@ -1,8 +1,9 @@
 # Installing syq
 
 Syq runs on Linux and macOS. The local machine needs one of the installation
-paths below; remote hosts need nothing installed in advance, because syq
-installs a matching helper there on first use (see [Remote helper
+paths below; remote hosts need nothing installed in advance, because the first
+time syq connects to a remote host it installs the remote helper there, a copy
+of syq of the matching version (see [Remote helper
 bootstrap](#remote-helper-bootstrap)).
 
 ## Standalone installer
@@ -15,18 +16,18 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/la
 ```
 
 That initial shell installer necessarily needs `curl` or `wget` to obtain syq
-before syq exists. The installed application and its managed remote bootstrap
-do not depend on either command.
+before syq exists. The installed syq, and the remote helper installation it
+performs, do not depend on either command.
 
 To inspect it first, download the same URL without piping it to `sh`. Every
 release also has an immutable versioned installer, for example
 `https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
 another directory, download the script and run `sh install.sh --bin-dir DIR`
-(or pipe it to `sh -s -- --bin-dir DIR`). The script detects the target,
+(or pipe it to `sh -s -- --bin-dir DIR`). The script detects your platform,
 verifies the archive's embedded SHA-256 and size, runs the temporary binary to
 check its version and release identity, and then replaces `syq` atomically.
 Even with `--bin-dir`, either `HOME` or `XDG_CONFIG_HOME` must be set so every
-successful standalone installation can record its managed-install receipt.
+successful standalone installation can record its install receipt.
 
 ## Homebrew
 
@@ -44,14 +45,15 @@ Rust users can instead compile and install the published source package:
 cargo install --locked syq
 ```
 
-Or build a checkout with the pinned Rust toolchain:
+Or build a checkout with the Rust toolchain version the checkout specifies:
 
 ```sh
 cargo build --release          # binary at target/release/syq
 cargo install --locked --path . # or: put it on your PATH
 ```
 
-Managed remote bootstrap is available only from official release builds.
+Automatic installation of the remote helper is available only from official
+release builds.
 For Cargo and checkout builds, install a compatible `syq` on the remote and
 select it explicitly. Native `syq cp` and remote `syq rm` use `--syq-path
 PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
@@ -76,8 +78,8 @@ source <(syq completion zsh)
 syq completion fish | source
 ```
 
-Remote completion logs in with ordinary noninteractive SSH. The first Tab on
-a remote endpoint can take a few seconds if syq must install its verified
+Remote completion logs in with a normal noninteractive SSH session. The first
+Tab on a remote endpoint can take a few seconds if syq must install the remote
 helper there. `syq persist on` makes later completions much faster by keeping
 the authenticated SSH connection available between commands.
 
@@ -105,9 +107,10 @@ notarization in addition to this terminal-first path.
 
 ## Remote helper bootstrap
 
-An ordinary remote side runs `syq --server`, but it does not need to be
-installed or configured first. An official syq uses its exact release helper under
-`~/.cache/syq/helpers/`. On first use of a version it detects the remote
+The remote side of a copy runs the remote helper, but nothing needs to be
+installed or configured there first. An official release build runs a helper
+of exactly its own version, kept on the remote under `~/.cache/syq/helpers/`.
+On first use of a version it detects the remote
 platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
 that complete toolchain is available, the remote downloads the matching
 compressed binary and signed manifest from that version's GitHub release. It
@@ -119,8 +122,8 @@ the release host. Later runs execute that exact path without an extra probe
 connection.
 
 If the remote toolchain is unavailable, a tool fails, or the download times
-out or otherwise fails, the local client downloads the target-specific archive
-with its built-in rustls HTTP client instead. It verifies both the archive and
+out or otherwise fails, the local client downloads the archive for that
+platform with its own built-in HTTPS client (rustls) instead. It verifies both the archive and
 decompressed binary, caches the verified binary under
 `$XDG_CACHE_HOME/syq/helpers/` (normally `~/.cache/syq/helpers/`), and uploads it
 through the configured SSH command.
@@ -130,27 +133,30 @@ the same helper cannot fix them. A completed download with the wrong digest is
 discarded and produces an integrity warning even if the verified upload then
 succeeds.
 
-The managed cache accepts only a verified release binary. To opt out of
-managed bootstrap, install a compatible binary yourself. Native `syq cp` and
+The helper cache accepts only a verified release binary. To opt out of
+automatic helper installation, install a compatible binary yourself. Native `syq cp` and
 remote `syq rm` use `--syq-path /path/to/syq`, or `--no-bootstrap` when the
 binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
 /path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
-RFC 8785 canonical JSON. A remote download uses `curl` or `wget`, `gzip`,
+normalized JSON form (RFC 8785). A remote download uses `curl` or `wget`, `gzip`,
 and one of `sha256sum`, `shasum`, or `openssl`; those programs are optional
 because missing or unusable tools select verified SSH upload instead. Version
 directories coexist and either helper cache can be removed at any time; syq
-recreates the helper it needs on the next connection. After launch, both peers
-require the same build identity: the release tag for official binaries, or the
+recreates the helper it needs on the next connection. After launch, both sides
+must have the same build identity: the release tag for official binaries, or the
 Git-derived identity when an explicit source-built helper is used.
 
 ## SSH requirements
 
 Syq runs your own `ssh`, so your configuration, keys, agent, and known hosts
-apply unchanged. Two ordinary copies need nothing special. A copy between two
-remote machines forwards a constrained agent to the coordinator host by
-default, and that relies on OpenSSH features from release 8.9 (February 2022):
+apply unchanged. Copies between your machine and a remote host need nothing
+special. A copy between two remote machines forwards the constrained agent
+broker (a temporary stand-in for your ssh agent that holds no keys and passes
+on only signing requests for that copy) to the coordinator, the host that runs
+the copy, by default, and that relies on OpenSSH features from release 8.9
+(February 2022):
 the client on your machine and on the coordinator host must be 8.9 or newer,
 and so must the `sshd` on the other remote. Syq checks the two clients it runs
 and stops with a message naming the older one. Ubuntu 22.04, Debian 12, RHEL 9
@@ -171,16 +177,17 @@ first on `PATH`; syq picks up whichever `ssh` that resolves to.
   `cargo build --release` (needs the Xcode command-line tools, `xcode-select
   --install`, for the bundled zstd C library). The tool is otherwise pure Rust
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
-  glibc `mallopt`) are compiled out automatically. The receiver-side
+  glibc `mallopt`) are compiled out automatically. The destination-side
   same-machine copy fast path is Linux-only; on macOS those copies use the
-  normal path. macOS also cannot pin a file or directory it may not read, so
-  a copy that Linux completes through a permission-free handle (for example
-  a mode `000` source file) fails on macOS with a permission error. On
+  normal path. macOS also cannot hold open a file or directory it may not
+  read, so a copy that Linux completes through an open handle that needs no
+  read permission (for example a mode `000` source file) fails on macOS with
+  a permission error. On
   macOS, `/tmp`, `/var`, and `/etc` are symlinks into `/private`. Native
   commands refuse a symlink in a path they are given unless you pass
-  `--follow-src`, `--follow-dest`, or `--follow`, so spell such paths as
+  `--follow-src`, `--follow-dst`, or `--follow`, so spell such paths as
   `/private/tmp/...` or pass the follow option.
 - For a manually installed binary that is portable across distributions (for
   example, a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`
-  (the musl target also works if `musl-gcc` is installed, which `zstd-sys` needs).
+  (building for musl also works if `musl-gcc` is installed, which `zstd-sys` needs).

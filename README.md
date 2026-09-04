@@ -5,10 +5,10 @@ directory trees on one machine or across a network, built for the jobs where
 `cp -r`, `rm -r`, and rsync are too slow or too trusting.
 
 - **Much faster in many common situations.** Parallel across files and inside
-  large files, data over encrypted TCP instead of one ssh stream, kernel-side
-  copies on a single machine, and a connection count that tunes itself while
-  the copy runs.
-- **Direct server-to-server transfers without dangerous ssh agent
+  large files, data over encrypted TCP connections instead of one SSH stream,
+  kernel-side copies on a single machine, and a connection count that tunes
+  itself while the copy runs.
+- **Direct server-to-server transfers without dangerous SSH agent
   forwarding.** HostA gets a signed, single-use grant for exactly this
   transfer, never your agent, and hostB signs a receipt of what it wrote.
 - **Filters in gitignore syntax** instead of rsync's include, exclude, and
@@ -35,8 +35,8 @@ fast with `syq persist on`; see the [installation guide](https://greaber.github.
 syq rsync -av project/ server:backup/project/      # rsync syntax: push
 syq rsync -av server:data/ ./data/                 # pull
 syq rsync -a --dry-run -v src/ host:dst/           # preview; change nothing
-syq cp project --to server --into /backup          # native syntax → /backup/project
-syq cp --from hostA --src-src big --to hostB --into big   # direct server-to-server
+syq cp project --to server --into /backup          # native mode → /backup/project
+syq cp --from hostA --srcs-in big --to hostB --into big   # direct server-to-server
 syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
 syq rm old-output --results removal.ndjson         # structured per-path outcomes
 ```

@@ -239,7 +239,7 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always keeps partial files)
     #[arg(long)]
     pub partial: bool,
-    /// SYQ extension: emit machine-readable progress lines (JSON) on stderr
+    /// Syq extension: emit machine-readable progress lines (JSON) on stderr
     #[arg(long = "syq-progress-json")]
     pub progress_json: bool,
     /// Print transfer statistics at the end
@@ -249,7 +249,7 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// SYQ extension: only compare source and destination contents; transfer nothing
+    /// Syq extension: only compare source and destination contents; transfer nothing
     #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
@@ -264,23 +264,23 @@ pub struct Args {
     /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
-    /// SYQ extension: require syq on the remote PATH instead of installing a versioned helper
+    /// Syq extension: require syq on the remote PATH instead of installing a versioned helper
     #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
-    /// SYQ extension: use TCP data connections without encryption (trusted networks only)
+    /// Syq extension: use TCP data connections without encryption (trusted networks only)
     #[arg(long = "syq-tcp-plain")]
     pub tcp_plain: bool,
-    /// SYQ extension: send all data over ssh instead of separate TCP data connections
+    /// Syq extension: send all data over ssh instead of separate TCP data connections
     #[arg(long = "syq-no-tcp")]
     pub no_tcp: bool,
-    /// SYQ extension: port range the remote listens on for TCP data connections
+    /// Syq extension: port range the remote listens on for TCP data connections
     #[arg(
         long = "syq-tcp-ports",
         default_value = "47600-47699",
         value_name = "LO-HI"
     )]
     pub tcp_ports: String,
-    /// SYQ extension: use this congestion-control algorithm for TCP data sockets (Linux only)
+    /// Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only)
     #[arg(
         long = "syq-tcp-congestion",
         value_name = "ALGO",
@@ -288,7 +288,7 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long = "syq-pscope", value_name = "PATH", conflicts_with = "rsh")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
@@ -303,7 +303,7 @@ pub struct Args {
     /// Original source endpoint for a native remote coordinator's dry-run summary
     #[arg(skip)]
     pub plan_source_host: Option<String>,
-    /// SYQ extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
+    /// Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
     /// with --syq-ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
@@ -315,7 +315,7 @@ pub struct Args {
         allow_hyphen_values = true
     )]
     pub ignore: Vec<String>,
-    /// SYQ extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
+    /// Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<OsString>,
     /// All ignore patterns, in command-line order (filled by parse_args)
@@ -828,7 +828,7 @@ const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteHelperArgs {
-    /// Use this exact syq executable for ordinary remote helpers, including an r2r coordinator
+    /// Use this exact syq executable for ordinary remote helpers, including a remote-to-remote coordinator
     #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
     syq_path: Option<String>,
     /// Require ordinary remote helpers on PATH instead of installing a versioned helper
@@ -2080,7 +2080,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";

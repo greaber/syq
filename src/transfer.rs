@@ -3661,7 +3661,7 @@ fn print_dry_run_summary(
     let mut exclusions = Vec::new();
     if ignored > 0 {
         exclusions.push(format!(
-            "{} pruned by ignore rules",
+            "{} skipped by ignore rules",
             count_label(ignored, "path/subtree", "paths/subtrees")
         ));
     }
