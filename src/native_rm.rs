@@ -1018,20 +1018,13 @@ fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<Rem
     Ok(outcome)
 }
 
-/// Serialize the inspect-then-unlink step per target identity. Linux orders
-/// concurrent unlinks of one name so exactly one succeeds, but macOS can
-/// report success to both callers, which would count a duplicate selector's
-/// entry twice. Striping by (dev, ino) keeps unrelated removals concurrent.
-fn unlink_serialization(identity: Identity) -> &'static Mutex<()> {
-    static LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let index = identity.dev.wrapping_mul(31).wrapping_add(identity.ino) % 64;
-    &LOCKS[index as usize]
-}
-
+/// Two selectors that resolve to one entry race here. Linux orders their
+/// unlinks so exactly one succeeds and the other is already absent; macOS can
+/// report success to both, so the removed and already-absent counts may split
+/// differently there. Either way the entry is removed once, and the same
+/// outcomes already arise from an unrelated process removing the entry, so
+/// the race is not serialized.
 fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutcome> {
-    let _serialized = unlink_serialization(name.identity)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = match metadata_at_cstring(name.parent.as_raw_fd(), &name.name) {
         Ok(identity) => identity,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
