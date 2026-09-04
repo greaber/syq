@@ -60,9 +60,7 @@ That state directory is not a cache. Removing `~/.cache/syq` on either host
 only costs a fresh helper bootstrap on the next transfer, but removing
 `~/.local/share/syq/restricted` on hostB breaks every enrollment there and
 discards the record of which signed requests were already redeemed; revoke and
-enroll again instead. If hostB's home directory is on a network filesystem
-shared by several machines, they share the receiver, the forced key, and that
-record, so a signed request can be redeemed on only one of them.
+enroll again instead.
 
 Enrollment first tries local→hostB directly. If SSH reports a transport
 failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
