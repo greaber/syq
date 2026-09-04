@@ -22,7 +22,11 @@ jobs:
     outputs:
       native: ${{ steps.changes.outputs.native }}
       sdks: ${{ steps.changes.outputs.sdks }}
+      python_sdk: ${{ steps.changes.outputs.python_sdk }}
+      javascript_sdk: ${{ steps.changes.outputs.javascript_sdk }}
+      go_sdk: ${{ steps.changes.outputs.go_sdk }}
       tooling: ${{ steps.changes.outputs.tooling }}
+      shellcheck: ${{ steps.changes.outputs.shellcheck }}
       mapping_docs: ${{ steps.changes.outputs.mapping_docs }}
       macos: ${{ steps.changes.outputs.macos }}
       linux_arm64: ${{ steps.changes.outputs.linux_arm64 }}
@@ -48,12 +52,14 @@ jobs:
         if: >-
           needs.scope.outputs.native != 'true' &&
           needs.scope.outputs.tooling != 'true' &&
+          needs.scope.outputs.shellcheck != 'true' &&
           needs.scope.outputs.mapping_docs != 'true'
         run: echo 'Rust, executable documentation, and repository tooling are unaffected.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: >-
           needs.scope.outputs.native == 'true' ||
           needs.scope.outputs.tooling == 'true' ||
+          needs.scope.outputs.shellcheck == 'true' ||
           needs.scope.outputs.mapping_docs == 'true'
         with:
           persist-credentials: false
@@ -61,7 +67,9 @@ jobs:
         if: needs.scope.outputs.native == 'true'
         run: rustup component add rustfmt clippy
       - name: Check dependency policy
-        if: needs.scope.outputs.native == 'true'
+        if: >-
+          needs.scope.outputs.native == 'true' &&
+          needs.scope.outputs.full_suite == 'true'
         env:
           CARGO_DENY_VERSION: 0.20.2
           CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
@@ -144,6 +152,7 @@ jobs:
       - name: Lint shell tooling
         if: >-
           needs.scope.outputs.tooling == 'true' ||
+          needs.scope.outputs.shellcheck == 'true' ||
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
         run: shellcheck scripts/package-release.sh scripts/generate-installer.sh scripts/generate-homebrew-formula.sh scripts/sign-release-manifest.sh scripts/verify-release-tag.sh scripts/verify-release-ci.sh scripts/verify-release-assets.sh scripts/verify-crates-io-package.sh scripts/init-release-secrets.sh scripts/sync-github-secrets.sh scripts/ci-scope.sh scripts/approve-generated-pr-runs.sh scripts/release-preflight.sh scripts/release-status.sh scripts/branch-status.sh scripts/test-branch-status.sh scripts/check-workflows.sh scripts/test-cargo-package.sh scripts/test-installer.sh scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-homebrew-formula.sh scripts/test-python-sdk-release-tools.sh scripts/test-secret-tools.sh scripts/test-real-ssh.sh tests/real-ssh/entrypoint.sh tests/real-ssh/scenarios.sh tests/real-ssh/ssh-wrapper.sh
@@ -164,14 +173,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         with:
           python-version: "3.10"
       - name: Install pinned Python tooling
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
       - name: Require the matching Python SDK for the latest syq release
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -189,10 +198,10 @@ jobs:
             exit 1
           }
       - name: Build the candidate syq executable
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         run: cargo build --locked --bin syq
       - name: Test and reproducibly package Python SDK
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         env:
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
@@ -221,24 +230,24 @@ jobs:
             --with "$1" \
             python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.javascript_sdk == 'true'
         with:
           node-version: "22.x"
           package-manager-cache: false
       - name: Test and package JavaScript SDK
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.javascript_sdk == 'true'
         working-directory: sdk/js
         run: |
           npm ci --ignore-scripts
           npm test
           npm pack --dry-run
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.go_sdk == 'true'
         with:
           go-version: "1.26.x"
           cache: false
       - name: Format, vet, and test Go SDK
-        if: needs.scope.outputs.sdks == 'true'
+        if: needs.scope.outputs.go_sdk == 'true'
         working-directory: sdk/go
         run: |
           test -z "$(gofmt -l .)"
@@ -308,7 +317,7 @@ jobs:
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
-  # master/manual runs; pull requests get the ARM macOS behavior gate above.
+  # master/manual runs; pull requests defer macOS validation until after merge.
   macos_intel:
     needs: scope
     if: >-

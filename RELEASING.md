@@ -265,14 +265,14 @@ as their sole release identity.
 The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
 names are stable, but the work behind them differs before and after merge.
 Pull requests run an affected-surface gate: Rust changes get formatting,
-clippy, native unit tests, focused Apple Silicon macOS tests, and the Linux and
-macOS rsync-conformance matrix. SDK-owned changes get their SDK suite;
-executable examples in `MAPPINGS.md` get focused integration tests; and
-repository-tooling changes get the packaging, release, workflow, and shell
-checks. Ordinary native pull requests still defer the complete filesystem and
-SDK suites, Linux ARM64 validation, and Intel macOS validation to `master`.
-The working agent chooses and reports any additional integration tests
-justified by the change.
+clippy, and native unit tests. SDK-owned changes get only the affected language
+suite; rsync-compatibility changes get Linux conformance; executable examples
+in `docs/mappings.md` get focused integration tests; and repository-tooling
+changes get the relevant workflow and shell checks. Pull requests defer the
+complete filesystem and cross-SDK suites, dependency-policy check, Linux ARM64
+validation, macOS validation, and macOS rsync conformance to `master`. The
+working agent chooses and reports any additional integration tests justified
+by the change.
 
 Every native push to `master` runs the complete native and SDK suites, Linux
 and macOS conformance, Linux ARM64 validation, focused Apple Silicon macOS
@@ -289,10 +289,11 @@ reject selective stubs as release evidence.
 The checked-in classifier uses a pull request's merge-base diff rather than
 including unrelated base-branch changes. Documentation-only changes finish
 with small successful required jobs, except for documentation consumed by a
-test or generator. Unknown paths fail safe by selecting every suite. Manual
-workflow runs also select everything. This keeps branch protection and
-release-tag verification attached to stable check names while avoiding the
-same expensive validation on both sides of a merge.
+test or generator. Unknown paths fail safe by selecting every affected-surface
+suite, while their platform jobs remain post-merge. Manual workflow runs select
+everything. This keeps branch protection and release-tag verification attached
+to stable check names while avoiding the same expensive validation on both
+sides of a merge.
 
 ## macOS signing
 
