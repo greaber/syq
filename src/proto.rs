@@ -879,6 +879,14 @@ pub enum SmallCopyOutcome {
     /// session holds no selection or root, so the ordinary engine can
     /// continue on this connection.
     NotFresh,
+    /// The fresh-destination capacity preflight would refuse this copy.
+    /// Nothing was written and the session is untouched; the engine repeats
+    /// the preflight and reports the shortage itself.
+    CapacityShort,
+    /// Staging failed before anything was published. Every staged sidecar
+    /// was removed, but the session now holds the destination root, so the
+    /// engine needs a fresh control session to continue.
+    StagingFailed(WireError),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

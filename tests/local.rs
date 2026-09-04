@@ -7264,6 +7264,211 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
     assert_eq!(read(&t.path("dest-fast/new/one.txt")), b"one");
 }
 
+/// The one-turn push refuses, fails, warns, and explains itself exactly as
+/// the engine does: the fresh-destination capacity preflight, a staging
+/// failure that publishes nothing, a source named like a sidecar, and the
+/// -vv route report.
+#[test]
+fn small_push_refusals_and_failures_match_the_engine() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src/one.txt"), b"one");
+    write(&t.path("src/two.txt"), b"two");
+    write(&t.path("src/three.txt"), b"three");
+    let sources = [t.s("src/one.txt"), t.s("src/two.txt"), t.s("src/three.txt")];
+    let push = |label: &str,
+                engine: bool,
+                env: &[(&str, &str)],
+                extra: &[&str],
+                sources: &[String],
+                placement: &[&str]| {
+        let results = t.s(&format!("{label}.ndjson"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-progress",
+                "--results",
+                &results,
+            ])
+            .args(extra)
+            .args(sources)
+            .args(["--to", "fake.example"])
+            .args(placement)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_DEBUG", "1");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        if engine {
+            command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+        }
+        let output = command.run().unwrap();
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(results.as_str())))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (output, records)
+    };
+    // Records compare with the destination directory's own name masked,
+    // since a failure message names the path it failed on.
+    let comparable = |records: &[serde_json::Value], dir: &str| {
+        let mut operations: Vec<String> = records
+            .iter()
+            .filter(|record| record["type"] == "operation_result")
+            .map(|record| {
+                let mut record = record.clone();
+                record.as_object_mut().unwrap().remove("seq");
+                record.to_string().replace(&t.s(dir), "<destination>")
+            })
+            .collect();
+        operations.sort();
+        let mut terminal = records.last().unwrap().clone();
+        for key in ["seq", "elapsed_ms"] {
+            terminal.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(terminal["type"], "result");
+        (operations, terminal)
+    };
+
+    // An empty destination directory is fresh, so the capacity preflight
+    // applies; with no space reported, both refuse before writing anything.
+    for dir in ["cap-fast", "cap-engine"] {
+        fs::create_dir_all(t.path(dir)).unwrap();
+    }
+    let no_space = [("SYQ_TEST_AVAILABLE_BYTES", "0")];
+    let (fast, fast_records) = push(
+        "cap-fast",
+        false,
+        &no_space,
+        &[],
+        &sources,
+        &["--into", &t.s("cap-fast")],
+    );
+    let (engine, engine_records) = push(
+        "cap-engine",
+        true,
+        &no_space,
+        &[],
+        &sources,
+        &["--into", &t.s("cap-engine")],
+    );
+    assert_eq!(fast.status.code(), Some(1));
+    assert_eq!(engine.status.code(), Some(1));
+    for output in [&fast, &engine] {
+        assert!(
+            stderr_of(output).contains("fresh destination capacity preflight failed"),
+            "{}",
+            stderr_of(output)
+        );
+    }
+    assert!(
+        stderr_of(&fast).contains("capacity preflight would refuse"),
+        "{}",
+        stderr_of(&fast)
+    );
+    assert_eq!(
+        comparable(&fast_records, "cap-fast"),
+        comparable(&engine_records, "cap-engine")
+    );
+    for dir in ["cap-fast", "cap-engine"] {
+        assert!(fs::read_dir(t.path(dir)).unwrap().next().is_none(), "{dir}");
+    }
+
+    // A staging failure publishes nothing and leaves no sidecar; the engine
+    // then reports the same failure for the same file and publishes the rest.
+    for dir in ["stage-fast", "stage-engine"] {
+        fs::create_dir_all(t.path(dir)).unwrap();
+    }
+    let injected = [("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/two.txt")];
+    let (fast, fast_records) = push(
+        "stage-fast",
+        false,
+        &injected,
+        &[],
+        &sources,
+        &["--into", &t.s("stage-fast")],
+    );
+    let (engine, engine_records) = push(
+        "stage-engine",
+        true,
+        &injected,
+        &[],
+        &sources,
+        &["--into", &t.s("stage-engine")],
+    );
+    assert!(
+        stderr_of(&fast).contains("staging failed"),
+        "{}",
+        stderr_of(&fast)
+    );
+    assert_eq!(fast.status.code(), Some(23));
+    assert_eq!(engine.status.code(), Some(23));
+    assert_eq!(
+        comparable(&fast_records, "stage-fast"),
+        comparable(&engine_records, "stage-engine")
+    );
+    for dir in ["stage-fast", "stage-engine"] {
+        assert_eq!(read(&t.path(dir).join("one.txt")), b"one", "{dir}");
+        assert_eq!(read(&t.path(dir).join("three.txt")), b"three", "{dir}");
+        assert!(!t.path(dir).join("two.txt").exists(), "{dir}");
+        assert_eq!(partial_files(&t.path(dir)).len(), 1, "{dir}");
+    }
+
+    // A source named like a sidecar reaches the engine, which warns.
+    let sidecar = partial_files(&t.path("stage-engine")).pop().unwrap();
+    fs::create_dir_all(t.path("side")).unwrap();
+    let (side, _) = push(
+        "side",
+        false,
+        &[],
+        &[],
+        &[sidecar.to_string_lossy().into_owned()],
+        &["--into", &t.s("side")],
+    );
+    assert_output_ok(&side);
+    assert!(
+        !stderr_of(&side).contains("small copy: sending"),
+        "{}",
+        stderr_of(&side)
+    );
+    assert!(
+        stderr_of(&side).contains("recognizable SYQ partial path"),
+        "{}",
+        stderr_of(&side)
+    );
+
+    // -vv explains the helper and the route.
+    fs::create_dir_all(t.path("verbose")).unwrap();
+    let (verbose, _) = push(
+        "verbose",
+        false,
+        &[],
+        &["-vv"],
+        &sources,
+        &["--into", &t.s("verbose")],
+    );
+    assert_output_ok(&verbose);
+    let report = stderr_of(&verbose);
+    assert!(report.contains("small copy: published"), "{report}");
+    for line in [
+        "  helper: ",
+        "  transport: control connection",
+        "syq: concurrency: no data connections",
+    ] {
+        assert!(report.contains(line), "{line} missing from:\n{report}");
+    }
+}
+
 #[test]
 fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
     let t = Tmp::new();

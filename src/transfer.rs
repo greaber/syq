@@ -301,7 +301,8 @@ fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
     }
 }
 
-fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
+/// The control-connection and helper lines of a remote endpoint's -vv report.
+fn print_remote_control_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
     crate::output::diagnostic!("syq: {}:", spec.label());
     if let Some(peer) = &diagnostics.peer {
@@ -316,7 +317,25 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
         let helper_mode = remote_helper_mode(spec, args.interface);
         crate::output::diagnostic!("  helper: {} ({helper_mode})", peer.identity);
     }
+}
 
+/// What -vv explains for a copy whose files travelled on the control
+/// connection: the same helper lines, and a route that involved no data
+/// connection at all.
+fn print_small_copy_diagnostics(args: &Args, dst_ep: &Endpoint) {
+    if args.quiet || args.verbose < 2 {
+        return;
+    }
+    if let Endpoint::Remote(spec) = dst_ep {
+        print_remote_control_diagnostics(spec, args);
+        eprintln!("  transport: control connection (small files sent in one request)");
+    }
+    eprintln!("syq: concurrency: no data connections (small files sent on the control connection)");
+}
+
+fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
+    print_remote_control_diagnostics(spec, args);
+    let diagnostics = spec.diagnostics();
     if let Some(probe) = &diagnostics.tcp_probe {
         let fastest = probe
             .candidates
@@ -794,6 +813,10 @@ enum SmallCopy {
     /// written and the control session is untouched, so the ordinary engine
     /// continues on the same connections and reports any error itself.
     Declined,
+    /// Staging failed with nothing published, but the receiver now holds the
+    /// destination root; the engine continues on a fresh control session and
+    /// reports the failure itself.
+    Reconnect,
 }
 
 /// Whether a native push of local files to a remote directory may try the
@@ -853,12 +876,20 @@ fn attempt_small_copy(
     srcs: &[Location],
     dst: &Location,
     src_ep: &Endpoint,
+    dst_ep: &Endpoint,
     src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
     roots: &[RegisteredSourceRoot],
     progress: &Progress,
     t0: std::time::Instant,
 ) -> Result<SmallCopy> {
+    // A source named like a syq sidecar gets the engine's warning.
+    if srcs
+        .iter()
+        .any(|source| is_partial_name(OsStr::from_bytes(&source.basename())))
+    {
+        return Ok(SmallCopy::Declined);
+    }
     let follow = args.follows_native_source_paths();
     let mut entries = Vec::with_capacity(srcs.len());
     let mut total = 0u64;
@@ -1005,6 +1036,29 @@ fn attempt_small_copy(
             }
             return Ok(SmallCopy::Declined);
         }
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::CapacityShort,
+            ..
+        }) => {
+            if debug() {
+                eprintln!(
+                    "syq: small copy: capacity preflight would refuse; using the ordinary engine"
+                );
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::StagingFailed(error),
+            ..
+        }) => {
+            if debug() {
+                eprintln!(
+                    "syq: small copy: staging failed ({}); using the ordinary engine on a new control connection",
+                    error.message
+                );
+            }
+            return Ok(SmallCopy::Reconnect);
+        }
         Response::SmallFilesCopied(_) => bail!("small copy returned a mismatched result count"),
         // The receiver could not select the directory; the engine's own
         // preflight reproduces and reports that condition.
@@ -1029,6 +1083,7 @@ fn attempt_small_copy(
         );
     }
     announce_detached_ready()?;
+    print_small_copy_diagnostics(args, dst_ep);
 
     // Did any source change while we were at it? Same check as the worker's
     // small-file batch, through the same registered references.
@@ -1945,6 +2000,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             srcs,
             dst,
             &src_ep,
+            &dst_ep,
             &mut *src_ctl,
             &mut *dst_ctl,
             source_roots.get().expect("source roots registered"),
@@ -1953,6 +2009,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         )? {
             SmallCopy::Done(code) => return Ok(code),
             SmallCopy::Declined => {}
+            SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
         }
     }
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
@@ -3870,12 +3927,14 @@ struct FreshCapacityPlan {
     overflowed: bool,
 }
 
+/// The fresh-destination capacity rule, shared with the receiver's one-turn
+/// small copy so both refuse the same copies.
 #[derive(Clone, Copy)]
-struct FreshCapacityAssessment {
-    logical_bytes: u64,
-    objects: u64,
-    available_bytes: u64,
-    available_inodes: Option<u64>,
+pub(crate) struct FreshCapacityAssessment {
+    pub(crate) logical_bytes: u64,
+    pub(crate) objects: u64,
+    pub(crate) available_bytes: u64,
+    pub(crate) available_inodes: Option<u64>,
 }
 
 impl FreshCapacityAssessment {
@@ -3888,7 +3947,7 @@ impl FreshCapacityAssessment {
             .is_some_and(|available| self.objects.saturating_add(64) > available)
     }
 
-    fn sufficient(self) -> bool {
+    pub(crate) fn sufficient(self) -> bool {
         !self.byte_shortage() && !self.inode_shortage()
     }
 }

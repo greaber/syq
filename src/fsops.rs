@@ -710,6 +710,14 @@ fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> io
     }
 }
 
+/// One file of a small copy, staged but not yet published.
+struct StagedSmallFile {
+    root: Arc<Root>,
+    partial: RelativePath,
+    target: RelativePath,
+    file: File,
+}
+
 /// The single directory entry a small-copy file names beneath the request
 /// prefix. Nested paths are the ordinary engine's business.
 fn small_copy_leaf<'a>(request_prefix: &[u8], path: &'a [u8]) -> Result<&'a [u8]> {
@@ -1723,14 +1731,14 @@ impl FsOps {
             canonical.push(OsStr::from_bytes(leaf));
         }
         let identity = &request.identity;
-        let job_identity = crate::resume::job_identity(
+        let copy_identity = crate::resume::copy_identity(
             &identity.src_endpoint,
             &identity.src_roots,
             &identity.dst_endpoint,
             &crate::transfer::path_identity(&canonical),
             &identity.semantic_flags,
         );
-        let partial_id = crate::resume::partial_id(&job_identity);
+        let copy_id = crate::resume::copy_id(&copy_identity);
 
         let (selection, anchor) =
             select_operator_directory(&request.directory, false, request.symlink_policy)?;
@@ -1756,35 +1764,119 @@ impl FsOps {
                 }
             }
         }
+        // The engine's fresh-destination capacity preflight, on the retained
+        // selection. An exact target whose leaf is absent is fresh; a
+        // directory is fresh only while it is empty. A filesystem that cannot
+        // report its capacity is no reason to refuse, as for the engine.
+        let exact = request.identity.dst_leaf.is_some();
+        self.operator_selection = Some(selection);
+        let info = self.destination_filesystem_info(!exact, None).ok();
+        let fresh = exact || info.as_ref().is_some_and(|info| info.empty == Some(true));
+        if let Some(info) = info.filter(|_| fresh) {
+            let assessment = crate::transfer::FreshCapacityAssessment {
+                logical_bytes: total,
+                objects: request.files.len() as u64,
+                available_bytes: info.available_bytes,
+                available_inodes: info.available_inodes,
+            };
+            if !assessment.sufficient() {
+                self.operator_selection = None;
+                return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                    anchor,
+                    outcome: SmallCopyOutcome::CapacityShort,
+                }));
+            }
+        }
+        let selection = self
+            .operator_selection
+            .take()
+            .expect("selection retained for the capacity preflight");
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
 
-        let results = request
-            .files
+        // Stage everything before publishing anything, so a failure leaves
+        // the destination exactly as it was found.
+        let mut staged = Vec::with_capacity(request.files.len());
+        for file in &request.files {
+            match self.stage_small_file(
+                &file.path,
+                &copy_id,
+                &file.data,
+                file.hash,
+                &file.meta,
+                request.flags,
+            ) {
+                Ok(item) => staged.push(item),
+                Err(error) => {
+                    for item in &staged {
+                        let _ = item.root.unlink(&item.partial);
+                    }
+                    return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                        anchor,
+                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
+                    }));
+                }
+            }
+        }
+        let results = staged
             .iter()
-            .map(|file| {
-                let put = SmallPut {
-                    path: match self.destination_relative(&file.path) {
-                        Ok(path) => path,
-                        Err(error) => return Some(wire_error(&error)),
-                    },
-                    partial_id,
-                    data: file.data.clone(),
-                    hash: file.hash,
-                    meta: file.meta,
-                    flags: request.flags,
-                    inplace: false,
-                    condition: TargetCondition::Absent,
-                    guard: None,
-                };
-                self.put_small(&put).err().map(|error| wire_error(&error))
+            .map(|item| {
+                publish_partial_rooted(
+                    &item.root,
+                    &item.partial,
+                    &item.target,
+                    &item.file,
+                    TargetCondition::Absent,
+                )
+                .err()
+                .map(|error| wire_error(&error))
             })
             .collect();
         Ok(Response::SmallFilesCopied(SmallCopyResponse {
             anchor,
             outcome: SmallCopyOutcome::Published(results),
         }))
+    }
+
+    /// Stage one small file as a private sidecar beneath the destination
+    /// root, ready to publish: the staging half of `put_small`'s default path.
+    fn stage_small_file(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        data: &[u8],
+        hash: ContentDigest,
+        meta: &Meta,
+        flags: u8,
+    ) -> Result<StagedSmallFile> {
+        if content_digest(data) != hash {
+            bail!("block hash mismatch on receive");
+        }
+        let path = self.destination_relative(path)?;
+        let rooted = self
+            .rooted_destination_target(&path, None)?
+            .context("small copy requires the destination root")?;
+        self.uncache_rooted(&rooted.root, &rooted.relative);
+        let (partial, label) = rooted_partial_target(&rooted, copy_id)?;
+        let (file, _) = self
+            .open_private_partial_rooted(&rooted.root, &partial, &label, true)?
+            .context("sidecar creation was requested")?;
+        file.set_len(0)?;
+        file.write_all_at(data, 0)
+            .with_context(|| format!("write {}", label.display()))?;
+        file.set_len(data.len() as u64)?;
+        set_meta_file(&file, meta, flags)
+            .with_context(|| format!("set metadata {}", label.display()))?;
+        require_safe_rooted_named_partial(&rooted.root, &partial, &label, &file)?;
+        #[cfg(debug_assertions)]
+        fail_put_small_before_rename_for_test(&rooted.label)?;
+        Ok(StagedSmallFile {
+            root: rooted.root,
+            partial,
+            target: rooted.relative,
+            file,
+        })
     }
 
     /// Install the exact control-session root delivered during worker
