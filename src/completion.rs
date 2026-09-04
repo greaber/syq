@@ -499,6 +499,15 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     while words.len() <= index {
         words.push(Vec::new());
     }
+    let Some(command_start) = words
+        .iter()
+        .take(index.saturating_add(1))
+        .position(|word| !is_shell_assignment(word))
+    else {
+        return Ok(Vec::new());
+    };
+    let index = index.saturating_sub(command_start);
+    let words = &words[command_start..];
     let current = &words[index];
     if index <= 1 {
         return Ok(root_candidates(current));
@@ -515,6 +524,18 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn is_shell_assignment(word: &[u8]) -> bool {
+    let Some(separator) = word.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    let name = &word[..separator];
+    name.first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
 /// Parse the portion of a Bash command line before the cursor without relying
@@ -609,7 +630,6 @@ fn bash_command_words(line: &[u8]) -> (usize, Vec<Vec<u8>>) {
     (words.len().saturating_sub(1), words)
 }
 
-/// Bash replaces only the part after its last active word-break character.
 /// The completion engine works with the complete dequoted token, so trim the
 /// prefix Readline leaves in place before returning matches to Bash.
 fn bash_replacement_candidates(
@@ -624,6 +644,11 @@ fn bash_replacement_candidates(
     else {
         return candidates;
     };
+    // Bash includes `@` in the span it replaces even though COMP_WORDS omits
+    // it from the current fragment. Keep that final byte in returned matches.
+    let prefix_length = prefix_length
+        .checked_sub(usize::from(current[..prefix_length].ends_with(b"@")))
+        .expect("a suffix byte can only be removed from a nonempty prefix");
     let prefix = &current[..prefix_length];
     for candidate in &mut candidates {
         if candidate.value.starts_with(prefix) {
@@ -1450,15 +1475,33 @@ fn has_explicit_rsh(command: &str, args: &[Vec<u8>]) -> bool {
     } else {
         &[b"--rsh"]
     };
-    args.iter().any(|argument| {
-        (command == "rsync" && argument.starts_with(b"-e") && argument.len() > 2)
-            || names.iter().any(|name| argument == *name)
+    option_arguments(args).any(|argument| {
+        (command == "rsync" && rsync_short_cluster_has_rsh(argument))
+            || names.contains(&argument)
             || names.iter().any(|name| {
                 name.starts_with(b"--")
                     && argument.starts_with(name)
                     && argument.get(name.len()) == Some(&b'=')
             })
     })
+}
+
+fn rsync_short_cluster_has_rsh(argument: &[u8]) -> bool {
+    let Some(cluster) = argument.strip_prefix(b"-") else {
+        return false;
+    };
+    if cluster.is_empty() || cluster.starts_with(b"-") {
+        return false;
+    }
+    for option in cluster {
+        match option {
+            b'e' => return true,
+            // `-B` consumes the rest of its token, so an `e` there is data.
+            b'B' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn pscope_from_args<'a>(command: &str, args: &'a [Vec<u8>]) -> Option<&'a str> {
@@ -1480,8 +1523,14 @@ fn find_option_bytes<'a>(args: &'a [Vec<u8>], option: &[u8]) -> Option<&'a [u8]>
     let mut found = None;
     let mut index = 0;
     while index < args.len() {
+        if args[index] == b"--" {
+            break;
+        }
         if args[index] == option {
             if let Some(value) = args.get(index + 1) {
+                if value == b"--" {
+                    break;
+                }
                 found = Some(value.as_slice());
             }
             index += 2;
@@ -1496,12 +1545,20 @@ fn find_option_bytes<'a>(args: &'a [Vec<u8>], option: &[u8]) -> Option<&'a [u8]>
 }
 
 fn contains_option(args: &[Vec<u8>], option: &[u8]) -> bool {
-    args.iter().any(|argument| argument == option)
+    option_arguments(args).any(|argument| argument == option)
 }
 
 fn previous_is(args: &[Vec<u8>], options: &[&[u8]]) -> bool {
-    args.last()
-        .is_some_and(|previous| options.iter().any(|option| previous == option))
+    !args.iter().any(|argument| argument == b"--")
+        && args
+            .last()
+            .is_some_and(|previous| options.iter().any(|option| previous == *option))
+}
+
+fn option_arguments(args: &[Vec<u8>]) -> impl Iterator<Item = &[u8]> {
+    args.iter()
+        .map(Vec::as_slice)
+        .take_while(|argument| *argument != b"--")
 }
 
 const BASH_ADAPTER: &str = r#"# syq dynamic completion
@@ -1632,6 +1689,25 @@ mod tests {
             )),
             vec![b"fake.example".to_vec()]
         );
+        assert_eq!(
+            values(bash_replacement_candidates(
+                vec![Candidate::text(b"alice@example".to_vec())],
+                b"alice@ex",
+                b"ex",
+            )),
+            vec![b"@example".to_vec()]
+        );
+    }
+
+    #[test]
+    fn leading_shell_assignments_do_not_hide_the_syq_command() {
+        let words = ["SYQ_COMPLETION_DEBUG=1", "FOO=x", "syq", "c"].map(OsString::from);
+        let candidates = values(candidates(3, &words).unwrap());
+        assert!(candidates.contains(&b"cp".to_vec()));
+        assert!(candidates.contains(&b"completion".to_vec()));
+        assert!(is_shell_assignment(b"_FOO_2=value"));
+        assert!(!is_shell_assignment(b"2FOO=value"));
+        assert!(!is_shell_assignment(b"--from=value"));
     }
 
     #[test]
@@ -1649,8 +1725,45 @@ mod tests {
     #[test]
     fn attached_rsync_rsh_options_disable_remote_completion() {
         assert!(has_explicit_rsh("rsync", &[b"-efalse".to_vec()]));
+        assert!(has_explicit_rsh("rsync", &[b"-avefalse".to_vec()]));
         assert!(has_explicit_rsh("rsync", &[b"--rsh=false".to_vec()]));
+        assert!(!has_explicit_rsh("rsync", &[b"-Bsize".to_vec()]));
         assert!(!has_explicit_rsh("cp", &[b"-efalse".to_vec()]));
+    }
+
+    #[test]
+    fn option_policy_stops_at_the_double_dash_terminator() {
+        let args = vec![
+            b"--from".to_vec(),
+            b"real.example".to_vec(),
+            b"--".to_vec(),
+            b"--from".to_vec(),
+            b"fake.example".to_vec(),
+            b"--rsh=false".to_vec(),
+            b"--no-bootstrap".to_vec(),
+        ];
+        assert_eq!(
+            find_option_bytes(&args, b"--from"),
+            Some(&b"real.example"[..])
+        );
+        assert!(!has_explicit_rsh("cp", &args));
+        assert!(!contains_option(&args, b"--no-bootstrap"));
+        assert!(!previous_is(
+            &[b"--pscope".to_vec(), b"--".to_vec()],
+            &[b"--pscope"]
+        ));
+
+        let terminated_value = vec![
+            b"--from".to_vec(),
+            b"--".to_vec(),
+            b"--from".to_vec(),
+            b"fake.example".to_vec(),
+        ];
+        assert_eq!(find_option_bytes(&terminated_value, b"--from"), None);
+        assert!(!has_explicit_rsh(
+            "rsync",
+            &[b"--".to_vec(), b"-avefalse".to_vec()]
+        ));
     }
 
     #[test]

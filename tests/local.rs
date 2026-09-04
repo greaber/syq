@@ -12212,10 +12212,10 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
         .arg("-c")
         .arg(
             r#"source <("$SYQ" completion bash)
-COMP_LINE='syq c'
+COMP_LINE='FOO=x syq c'
 COMP_POINT=${#COMP_LINE}
-COMP_WORDS=(syq c)
-COMP_CWORD=1
+COMP_WORDS=(FOO=x syq c)
+COMP_CWORD=2
 _syq_complete
 printf '%s\n' "${COMPREPLY[@]}"
 complete -p syq"#,
@@ -12392,6 +12392,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     fs::create_dir(t.path("runtime")).unwrap();
     fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
     write(&t.path("remote-home/data/name with spaces"), b"remote");
+    write(&t.path("from-local"), b"local");
     let ssh = fake_ssh(&t);
     let path = format!("{}/n", t.s("remote-home/data"));
     let executable = env!("CARGO_BIN_EXE_syq");
@@ -12645,7 +12646,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
             "rsync",
             "--rsync-path",
             executable,
-            "-efalse",
+            "-avefalse",
             &remote_operand,
         ],
     )
@@ -12660,6 +12661,45 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     .unwrap();
     assert_output_ok(&explicit_rsh);
     assert!(explicit_rsh.stdout.is_empty());
+    assert_eq!(
+        fs::metadata(t.path("rsh.log")).unwrap().len(),
+        ssh_log_length
+    );
+
+    let after_terminator = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "7",
+            "--",
+            "syq",
+            "cp",
+            "--into",
+            &t.s("destination"),
+            "--",
+            "--from",
+            "fake.example",
+            &t.s("from-l"),
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&after_terminator);
+    assert_eq!(
+        completion_values(&after_terminator.stdout),
+        vec![(
+            b'f',
+            t.path("from-local").as_os_str().as_encoded_bytes().to_vec(),
+        )]
+    );
     assert_eq!(
         fs::metadata(t.path("rsh.log")).unwrap().len(),
         ssh_log_length
@@ -12732,6 +12772,17 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     assert!(completion_values(&inline.stdout)
         .iter()
         .any(|candidate| candidate == &(b'f', b"fake.example".to_vec())));
+
+    let user_endpoint = completion_command(
+        &t,
+        &["__complete-bash", "fake", "--", "syq cp --from=alice@fake"],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&user_endpoint);
+    assert!(completion_values(&user_endpoint.stdout)
+        .iter()
+        .any(|candidate| candidate == &(b'f', b"@fake.example".to_vec())));
 
     let forgotten = completion_command(&t, &["cache", "forget", "fake.example"])
         .run()
