@@ -1230,6 +1230,27 @@ impl ReplayStore {
         Ok(())
     }
 
+    /// Open the shared lock file, creating it on first use. macOS can answer
+    /// a concurrent `O_CREAT` open of one name with a spurious `ENOENT` while
+    /// another thread is creating it, so retry that case a few times.
+    fn open_lock(&self) -> io::Result<File> {
+        let mut attempt = 0;
+        loop {
+            match openat_file(
+                self.directory.as_raw_fd(),
+                ".claim-lock",
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound && attempt < 16 => {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn claim_after_lock(
         &self,
         request: RequestId,
@@ -1237,13 +1258,9 @@ impl ReplayStore {
         claimed_at: impl FnOnce() -> Result<i64>,
     ) -> Result<()> {
         request.validate()?;
-        let lock = openat_file(
-            self.directory.as_raw_fd(),
-            ".claim-lock",
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-        .with_context(|| format!("open replay lock in {}", self.path.display()))?;
+        let lock = self
+            .open_lock()
+            .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
         flock_exclusive(lock.as_raw_fd()).context("lock replay claim store")?;
         // Timestamp and revalidate only after a potentially queued lock wait.
