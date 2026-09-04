@@ -385,7 +385,9 @@ credentials, `--agent-broker-only`, or
 `--unrestricted-agent-forwarding`. The authentication options and `--detach`
 apply only to a direct copy between distinct remote endpoints. A detached
 launch requires coordinator-owned credentials (`--no-forward-agent`) or an
-explicit remote-shell policy; the launcher reports its coordinator and log only after
+explicit remote-shell policy, and the coordinator host needs `/bin/kill` plus
+either `setsid` or `perl` to start the new session (macOS has no `setsid`);
+the launcher reports its coordinator and log only after
 the detached coordinator has established the transfer route and completed
 destination preflight. If that readiness deadline expires, the launcher
 terminates and verifies the complete detached process group before reporting

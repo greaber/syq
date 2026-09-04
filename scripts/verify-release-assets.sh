@@ -21,8 +21,8 @@ gh release download "$tag" --dir "$published"
 
 local_names="$work/local-names"
 published_names="$work/published-names"
-find "$local_dist" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$local_names"
-find "$published" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$published_names"
+find "$local_dist" -mindepth 1 -maxdepth 1 -type f | sed 's|.*/||' | sort > "$local_names"
+find "$published" -mindepth 1 -maxdepth 1 -type f | sed 's|.*/||' | sort > "$published_names"
 diff -u "$local_names" "$published_names" || {
   echo "published release $tag has a different asset inventory" >&2
   exit 1

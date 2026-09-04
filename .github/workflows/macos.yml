@@ -1,0 +1,54 @@
+name: macOS suite
+
+# The complete native test suite, clippy, and the release shell suites on
+# macOS. Pull-request CI runs a narrow macOS job in ci.yml; this cumulative
+# run happens after every merge to master and on demand.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Show toolchain and environment
+        run: |
+          rustc --version
+          cargo --version
+          bash --version | head -1
+          echo "TMPDIR=$TMPDIR"
+      - run: rustup component add clippy
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Native tests
+        run: cargo test --locked --all-targets --no-fail-fast
+      - name: Use Homebrew OpenSSL for Ed25519 signing
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+      - name: Release shell suites
+        run: |
+          status=0
+          for suite in \
+            scripts/test-release-tools.sh \
+            scripts/test-release-orchestration.sh \
+            scripts/test-secret-tools.sh \
+            scripts/test-python-sdk-release-tools.sh \
+            scripts/test-installer.sh \
+            scripts/test-homebrew-formula.sh
+          do
+            echo "=== $suite"
+            if ! "$suite"; then
+              echo "=== $suite failed"
+              status=1
+            fi
+          done
+          exit "$status"

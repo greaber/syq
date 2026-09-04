@@ -54,7 +54,11 @@ decryption key nor official publishing authority.
 
 Install the pinned maintainer tool, then initialize the inventory on an
 encrypted developer machine. The initializer generates independent Ed25519
-keys for manifest signing and Homebrew tap access; it needs no secret input:
+keys for manifest signing and Homebrew tap access; it needs no secret input.
+The release scripts need `bash`, `jq`, `ssh-keygen`, and OpenSSL 3 as
+`openssl` (1.1.1 cannot sign Ed25519 with `pkeyutl`); macOS ships LibreSSL
+under that name, so install `openssl@3` with Homebrew and put its `bin`
+directory first on `PATH` before signing:
 
 ```sh
 npm install --global @dotenvx/dotenvx@2.21.0

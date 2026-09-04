@@ -65,7 +65,7 @@ the line for your shell to its startup file:
 
 ```bash
 # Bash (~/.bashrc)
-source <(syq completion bash)
+eval "$(syq completion bash)"
 
 # Zsh (~/.zshrc)
 source <(syq completion zsh)
@@ -153,7 +153,13 @@ Git-derived identity when an explicit source-built helper is used.
   and uses only POSIX calls; Linux-only optimizations (`fallocate`,
   glibc `mallopt`) are compiled out automatically. The receiver-side
   same-machine copy fast path is Linux-only; on macOS those copies use the
-  normal path.
+  normal path. macOS also cannot pin a file or directory it may not read, so
+  a copy that Linux completes through a permission-free handle (for example
+  a mode `000` source file) fails on macOS with a permission error. On
+  macOS, `/tmp`, `/var`, and `/etc` are symlinks into `/private`. Native
+  commands refuse a symlink in a path they are given unless you pass
+  `--follow-src`, `--follow-dest`, or `--follow`, so spell such paths as
+  `/private/tmp/...` or pass the follow option.
 - For a manually installed binary that is portable across distributions (for
   example, a host with an older glibc), build a static binary:
   `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu`

@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn descriptor_scan_stays_with_replaced_root_and_does_not_follow_symlinks() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let selected = temp.path().join("selected");
         let moved = temp.path().join("moved");
         let outside = temp.path().join("outside");
@@ -808,7 +808,14 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(selected.join("directory/child"), b"child").unwrap();
         fs::write(outside.join("secret"), b"secret").unwrap();
-        let non_utf8 = std::ffi::OsString::from_vec(vec![b'n', 0xff]);
+        // Exercise a raw byte name where the filesystem allows one.
+        let non_utf8 = std::ffi::OsString::from_vec(
+            if crate::test_support::filesystem_accepts_non_utf8_names() {
+                vec![b'n', 0xff]
+            } else {
+                b"n-plain".to_vec()
+            },
+        );
         fs::write(selected.join(&non_utf8), b"raw").unwrap();
         let root = Arc::new(Root::from_directory(File::open(&selected).unwrap()).unwrap());
 
@@ -857,7 +864,7 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let mut deep = temp.path().to_path_buf();
         for index in 0..80 {
             deep.push(format!("d{index:02}"));

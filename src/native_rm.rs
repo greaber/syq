@@ -1045,15 +1045,28 @@ fn remove_pinned(
     Ok(outcome)
 }
 
+/// Serialize a removal attempt per selected identity. This keeps duplicate
+/// selectors from simultaneously quarantining the same name on platforms
+/// where concurrent namespace operations can both report success. Striping
+/// by (dev, ino) keeps unrelated removals concurrent.
+fn unlink_serialization(identity: Identity) -> &'static Mutex<()> {
+    static LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+    let index = identity.dev.wrapping_mul(31).wrapping_add(identity.ino) % 64;
+    &LOCKS[index as usize]
+}
+
 fn remove_pinned_with_hook(
     name: &PinnedName,
     directory: bool,
     quarantine_ceiling: Option<&File>,
     after_quarantine: impl FnOnce(&RemovalQuarantine, &CString) -> Result<()>,
 ) -> Result<RemovePinnedOutcome> {
+    let _serialized = unlink_serialization(name.identity)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // POSIX has no identity-conditioned unlink. Move the currently named
     // entry into an owner-only directory in a trusted ancestor on the same
-    // filesystem, then authenticate and remove it there. An untrusted writer
+    // mount, then authenticate and remove it there. An untrusted writer
     // cannot address the quarantined name, and a later object installed at the
     // operator-visible name is never addressed by the final unlink.
     //
@@ -1989,7 +2002,7 @@ mod tests {
 
     #[test]
     fn repeated_directory_scans_start_at_the_beginning() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
         let directory = OpenOptions::new()
@@ -2009,7 +2022,7 @@ mod tests {
 
     #[test]
     fn simultaneous_directory_streams_have_independent_offsets() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
         let directory = OpenOptions::new()
@@ -2047,7 +2060,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_never_unlinks_a_later_writer() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("selected"), b"selected").unwrap();
         let directory = File::open(temp.path()).unwrap();
         let selected = pinned_test_name(&directory, b"selected");
@@ -2067,7 +2080,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_preserves_a_candidate_when_restore_would_replace() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("selected"), b"selected").unwrap();
         let directory = File::open(temp.path()).unwrap();
         let selected = pinned_test_name(&directory, b"selected");
@@ -2106,7 +2119,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_reports_preserved_candidate_when_original_parent_is_unlinked() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let parent_path = temp.path().join("parent");
         fs::create_dir(&parent_path).unwrap();
         fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o777)).unwrap();
@@ -2146,7 +2159,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_quarantines_outside_an_untrusted_parent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let hostile = temp.path().join("hostile");
         fs::create_dir(&hostile).unwrap();
         fs::set_permissions(&hostile, fs::Permissions::from_mode(0o777)).unwrap();
@@ -2169,7 +2182,7 @@ mod tests {
 
     #[test]
     fn removal_root_is_a_hard_ceiling_for_quarantine_placement() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
@@ -2212,7 +2225,7 @@ mod tests {
 
     #[test]
     fn removal_root_need_not_be_writable_when_a_stable_lower_parent_is() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir_all(root.join("owned")).unwrap();
         fs::write(root.join("owned/selected"), b"selected").unwrap();
@@ -2259,7 +2272,7 @@ mod tests {
 
     #[test]
     fn parent_moved_outside_root_is_refused_before_quarantine_creation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().join("root");
         let outside = temp.path().join("outside");
         fs::create_dir_all(root.join("parent")).unwrap();
@@ -2318,7 +2331,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_restores_a_candidate_that_changed_before_quarantine() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("selected"), b"selected").unwrap();
         fs::write(temp.path().join("replacement"), b"replacement").unwrap();
         let directory = File::open(temp.path()).unwrap();
@@ -2350,7 +2363,7 @@ mod tests {
 
     #[test]
     fn pinned_removal_reports_a_quarantined_candidate_that_disappears() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("selected"), b"selected").unwrap();
         let directory = File::open(temp.path()).unwrap();
         let selected = pinned_test_name(&directory, b"selected");
@@ -2378,7 +2391,7 @@ mod tests {
 
     #[test]
     fn overlapping_removal_from_an_unlinked_parent_is_already_absent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let parent_path = temp.path().join("parent");
         fs::create_dir(&parent_path).unwrap();
         fs::write(parent_path.join("selected"), b"selected").unwrap();
@@ -2397,7 +2410,7 @@ mod tests {
 
     #[test]
     fn no_follow_aborts_before_any_mutation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         fs::write(temp.path().join("victim"), b"data").unwrap();
@@ -2426,7 +2439,7 @@ mod tests {
 
     #[test]
     fn no_follow_unlinks_selected_symlink_and_preserves_referent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         symlink("real", temp.path().join("link")).unwrap();
@@ -2456,7 +2469,7 @@ mod tests {
 
     #[test]
     fn failed_attached_emit_cancels_pending_mutation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("victim"), b"data").unwrap();
         let directory = OpenOptions::new()
             .read(true)
@@ -2500,7 +2513,7 @@ mod tests {
 
     #[test]
     fn follow_removes_referent_and_leaves_link() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         symlink("real", temp.path().join("link")).unwrap();
@@ -2526,7 +2539,7 @@ mod tests {
 
     #[test]
     fn root_rejects_symlink_that_leaves_and_reenters() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("root/inside")).unwrap();
         symlink("../root/inside", temp.path().join("root/escape")).unwrap();
         let result = remove(
@@ -2544,7 +2557,7 @@ mod tests {
 
     #[test]
     fn selected_directory_rename_cannot_redirect_removal_to_its_replacement() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("tree")).unwrap();
         fs::write(temp.path().join("tree/old"), b"old").unwrap();
         let mut outcomes = Vec::new();
@@ -2579,7 +2592,7 @@ mod tests {
 
     #[test]
     fn directory_swapped_before_quarantine_is_preserved() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         fs::write(base.join("tree/old"), b"old").unwrap();
@@ -2615,7 +2628,7 @@ mod tests {
 
     #[test]
     fn leaf_swapped_before_quarantine_preserves_replacement_entries() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::write(base.join("file"), b"old").unwrap();
         fs::write(base.join("dir-file"), b"old").unwrap();
@@ -2688,7 +2701,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_renamed_away_before_quarantine_is_reported_as_a_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         let swap = base.clone();
@@ -2707,7 +2720,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_renamed_away_after_pinning_is_reported_as_a_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         let mut outcomes = Vec::new();

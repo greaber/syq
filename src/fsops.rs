@@ -115,13 +115,17 @@ enum FileSystemKey {
     Device(u64),
 }
 
+// The same-machine copy fast path exists only on Linux; other platforms
+// report every request as unsupported without reading the policy.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy {
     inplace: bool,
     allow_sequential_nfs_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum CopyLocalOutcome {
     Copied,
     Unsupported,
@@ -6399,7 +6403,7 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
+        crate::test_support::temp_dir().join(format!(
             "syq-fsops-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -6583,7 +6587,7 @@ mod tests {
         }
 
         for swap_root in [false, true] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = crate::test_support::tempdir().unwrap();
             let root_path = temporary.path().join("root");
             let outside = temporary.path().join("outside");
             fs::create_dir_all(root_path.join("target/parent")).unwrap();
@@ -6899,7 +6903,8 @@ mod tests {
 
     #[test]
     fn unlink_never_recurses_into_a_directory() {
-        let dir = std::env::temp_dir().join(format!("syq-unlink-{}", std::process::id()));
+        let dir =
+            crate::test_support::temp_dir().join(format!("syq-unlink-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("d/inside")).unwrap();
         fs::write(dir.join("f"), b"f").unwrap();
@@ -8221,7 +8226,7 @@ mod tests {
 
     #[test]
     fn source_workers_adopt_registered_descriptor_after_path_replacement() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::create_dir(&selected).unwrap();
         fs::write(selected.join("original"), b"original").unwrap();
@@ -8287,7 +8292,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn destination_worker_claims_copy_sources_from_the_foreign_session() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let source = temporary.path().join("source");
         let destination = temporary.path().join("destination");
         fs::create_dir(&source).unwrap();
@@ -8340,7 +8345,7 @@ mod tests {
 
     #[test]
     fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let first = temporary.path().join("first");
         let second = temporary.path().join("second");
         fs::create_dir(&first).unwrap();
@@ -8396,7 +8401,7 @@ mod tests {
 
     #[test]
     fn source_initialization_rejects_missing_mistyped_and_cross_session_leaf_tickets() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let first = temporary.path().join("first");
         let second = temporary.path().join("second");
         fs::write(&first, b"first").unwrap();
@@ -8470,7 +8475,7 @@ mod tests {
 
     #[test]
     fn independent_source_worker_keeps_exact_object_after_control_and_broker_close() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::write(&selected, b"original").unwrap();
         let session = DescriptorSessionSlot::default();
@@ -8524,7 +8529,7 @@ mod tests {
 
     #[test]
     fn repeated_source_registration_keeps_the_original_root_and_leaf_pin() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let first = temporary.path().join("first");
         let second = temporary.path().join("second");
         fs::write(&first, b"first").unwrap();
@@ -8577,7 +8582,7 @@ mod tests {
 
     #[test]
     fn source_stat_enforces_exact_leaf_authority_and_ignores_parallel_path() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::write(&selected, b"selected").unwrap();
         fs::write(temporary.path().join("sibling"), b"sibling").unwrap();
@@ -8662,7 +8667,7 @@ mod tests {
 
     #[test]
     fn source_scan_rejects_a_replaced_exact_symlink() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         fs::write(temporary.path().join("target-a"), b"a").unwrap();
         fs::write(temporary.path().join("target-b"), b"b").unwrap();
         let selected = temporary.path().join("selected");
@@ -8718,7 +8723,7 @@ mod tests {
 
     #[test]
     fn exact_symlink_scan_uses_the_descriptor_bound_raw_target_snapshot() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let target = OsString::from_vec(b"raw-target-\xff".to_vec());
         symlink(Path::new(&target), &selected).unwrap();
@@ -8787,7 +8792,7 @@ mod tests {
 
     #[test]
     fn source_stat_does_not_follow_intermediate_symlinks() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let outside = temporary.path().join("outside");
         fs::create_dir(&selected).unwrap();
@@ -8826,14 +8831,21 @@ mod tests {
 
     #[test]
     fn source_content_uses_registered_directory_after_name_replacement() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let replacement = temporary.path().join("replacement");
         fs::create_dir(&selected).unwrap();
         fs::create_dir(&replacement).unwrap();
         fs::write(selected.join("marker"), b"original").unwrap();
         fs::write(replacement.join("marker"), b"replacement").unwrap();
-        let raw_name = OsString::from_vec(b"raw-\xff".to_vec());
+        // Exercise a raw byte name where the filesystem allows one.
+        let raw_name = OsString::from_vec(
+            if crate::test_support::filesystem_accepts_non_utf8_names() {
+                b"raw-\xff".to_vec()
+            } else {
+                b"raw-plain".to_vec()
+            },
+        );
         fs::write(selected.join(&raw_name), b"raw-original").unwrap();
 
         let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
@@ -8900,7 +8912,7 @@ mod tests {
 
     #[test]
     fn source_content_rejects_a_replaced_exact_leaf() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::write(&selected, b"original").unwrap();
         let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
@@ -8948,7 +8960,7 @@ mod tests {
 
     #[test]
     fn source_content_refuses_symlink_intermediates() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let outside = temporary.path().join("outside");
         fs::create_dir(&selected).unwrap();
@@ -8999,7 +9011,7 @@ mod tests {
 
     #[test]
     fn source_read_cache_keys_root_and_attempt() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let first = temporary.path().join("first");
         let second = temporary.path().join("second");
         fs::create_dir(&first).unwrap();
@@ -9047,7 +9059,7 @@ mod tests {
 
     #[test]
     fn confined_source_content_requires_exact_registered_references() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         fs::write(&selected, b"selected").unwrap();
         fs::write(temporary.path().join("sibling"), b"sibling!").unwrap();
@@ -9113,7 +9125,7 @@ mod tests {
 
     #[test]
     fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let sibling = temporary.path().join("sibling");
         fs::write(&selected, b"selected").unwrap();
@@ -9153,7 +9165,7 @@ mod tests {
 
     #[test]
     fn destination_worker_rejects_source_only_content_requests() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         fs::write(temporary.path().join("marker"), b"marker").unwrap();
         let mut worker = FsOps::new();
         worker.destination_root = Some(Arc::new(Root::open(temporary.path()).unwrap()));
@@ -9182,7 +9194,7 @@ mod tests {
 
     #[test]
     fn source_legacy_stat_requires_explicit_unconfined_registration() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         let sibling = temporary.path().join("sibling");
         fs::write(&selected, b"selected").unwrap();
@@ -9249,7 +9261,7 @@ mod tests {
 
     #[test]
     fn process_umask_matches_file_creation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)

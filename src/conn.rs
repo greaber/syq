@@ -196,24 +196,29 @@ fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
 /// Apply an explicit Linux TCP_CONGESTION override and read it back. With no
 /// override this is observational only: an unavailable getter returns None
 /// and never changes normal socket behavior.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
+    _socket: &S,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    match requested {
+        None => Ok(None),
+        Some(requested) => Err(TcpCongestionError(format!(
+            "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     socket: &S,
     requested: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(requested) = requested else {
-        #[cfg(target_os = "linux")]
         return Ok(tcp_congestion_control(socket).ok());
-        #[cfg(not(target_os = "linux"))]
-        return Ok(None);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    return Err(TcpCongestionError(format!(
-        "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
-    ))
-    .into());
-
-    #[cfg(target_os = "linux")]
     {
         let result = unsafe {
             libc::setsockopt(
@@ -246,6 +251,22 @@ pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn connect_tcp_stream(
+    address: &SocketAddr,
+    timeout: std::time::Duration,
+    congestion_control: Option<&str>,
+) -> Result<TcpStream> {
+    match congestion_control {
+        None => TcpStream::connect_timeout(address, timeout).map_err(Into::into),
+        Some(congestion_control) => Err(TcpCongestionError(format!(
+            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn connect_tcp_stream(
     address: &SocketAddr,
     timeout: std::time::Duration,
@@ -255,16 +276,6 @@ fn connect_tcp_stream(
         return TcpStream::connect_timeout(address, timeout).map_err(Into::into);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (address, timeout);
-        return Err(TcpCongestionError(format!(
-            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
-        ))
-        .into());
-    }
-
-    #[cfg(target_os = "linux")]
     {
         use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -325,10 +336,44 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     })
 }
 
+/// `struct tcp_connection_info` as the XNU kernel lays it out. The `libc`
+/// crate expands the kernel's single 32-bit TFO bit-field word into
+/// eighteen separate fields, which shifts every 64-bit counter and makes the
+/// kernel's returned length fall short of them.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DarwinTcpConnectionInfo {
+    tcpi_state: u8,
+    tcpi_snd_wscale: u8,
+    tcpi_rcv_wscale: u8,
+    __pad1: u8,
+    tcpi_options: u32,
+    tcpi_flags: u32,
+    tcpi_rto: u32,
+    tcpi_maxseg: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_snd_sbbytes: u32,
+    tcpi_rcv_wnd: u32,
+    tcpi_rttcur: u32,
+    tcpi_srtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_tfo: u32,
+    tcpi_txpackets: u64,
+    tcpi_txbytes: u64,
+    tcpi_txretransmitbytes: u64,
+    tcpi_rxpackets: u64,
+    tcpi_rxbytes: u64,
+    tcpi_rxoutoforderbytes: u64,
+    tcpi_txretransmitpackets: u64,
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
-    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let mut info: DarwinTcpConnectionInfo = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<DarwinTcpConnectionInfo>() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
@@ -344,7 +389,7 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     macro_rules! field {
         ($name:ident, $value:expr) => {
             ((len as usize)
-                >= std::mem::offset_of!(libc::tcp_connection_info, $name)
+                >= std::mem::offset_of!(DarwinTcpConnectionInfo, $name)
                     + std::mem::size_of_val(&info.$name))
             .then(|| $value)
         };
@@ -853,6 +898,26 @@ impl Drop for ConnectSlot {
 }
 
 pub const CIPHERS: &str = "Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
+
+/// Whether an advertised address belongs to an overlay network (CGNAT /
+/// Tailscale). Such routes are last in priority on both ends: the server
+/// buckets them last, and the client inserts the direct ssh target before
+/// them, so an overlay never wins over the public address ssh reached.
+/// Tailscale uses `100.64.0.0/10` and `fd7a:115c:a1e0::/48`; any other IPv6
+/// unique-local address is an ordinary private network.
+pub(crate) fn is_overlay_address(address: &str) -> bool {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let [a, b, _, _] = v4.octets();
+            a == 100 && (b & 0xc0) == 64
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+        Err(_) => false,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataAddressSource {
@@ -1441,7 +1506,7 @@ impl RemoteSpec {
             if !candidates.iter().any(|candidate| candidate.address == h) {
                 let at = candidates
                     .iter()
-                    .position(|candidate| candidate.address.starts_with("100."))
+                    .position(|candidate| is_overlay_address(&candidate.address))
                     .unwrap_or(candidates.len());
                 candidates.insert(
                     at,
@@ -1607,7 +1672,9 @@ impl RemoteSpec {
                             )
                         })
                     }
-                    Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
+                    Err(e) => {
+                        last = anyhow!("{}: {e}", crate::transfer::data_address(addr, info.port))
+                    }
                 }
             }
             let stream = match got {
@@ -1685,7 +1752,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         });
     }
     drop(resolved_tx);
-    let mut resolved = vec![Vec::new(); candidates.len()];
+    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     for _ in 0..candidates.len() {
         let Ok((i, addrs)) = resolved_rx.recv() else {
             break;
@@ -1693,18 +1760,37 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         resolved[i] = addrs;
     }
 
+    // Probe each distinct socket address once. An advertised literal and the
+    // ssh target name commonly resolve to the same address; one probe answers
+    // for every candidate that led there.
+    let mut targets: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
+    let mut remaining: Vec<usize> = vec![0; candidates.len()];
+    for (i, addrs) in resolved.iter().enumerate() {
+        for &addr in addrs {
+            let owners = match targets.iter_mut().find(|(target, _)| *target == addr) {
+                Some((_, owners)) => owners,
+                None => {
+                    targets.push((addr, Vec::new()));
+                    &mut targets.last_mut().unwrap().1
+                }
+            };
+            if !owners.contains(&i) {
+                owners.push(i);
+                remaining[i] += 1;
+            }
+        }
+    }
+
     let timeout = std::time::Duration::from_millis(1000);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut remaining: Vec<usize> = resolved.iter().map(Vec::len).collect();
     let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
     let mut determined = vec![false; candidates.len()];
-    for (i, addrs) in resolved.into_iter().enumerate() {
-        for addr in addrs {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send((i, TcpStream::connect_timeout(&addr, timeout).is_ok()));
-            });
-        }
+    for (t, (addr, _)) in targets.iter().enumerate() {
+        let tx = tx.clone();
+        let addr = *addr;
+        std::thread::spawn(move || {
+            let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+        });
     }
     drop(tx);
 
@@ -1716,17 +1802,19 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
-        let Ok((i, reachable)) = rx.recv_timeout(wait) else {
+        let Ok((t, reachable)) = rx.recv_timeout(wait) else {
             break;
         };
-        if determined[i] {
-            continue;
-        }
-        remaining[i] -= 1;
-        if reachable || remaining[i] == 0 {
-            candidates[i].reachable = reachable;
-            determined[i] = true;
-            undetermined -= 1;
+        for &i in &targets[t].1 {
+            if determined[i] {
+                continue;
+            }
+            remaining[i] -= 1;
+            if reachable || remaining[i] == 0 {
+                candidates[i].reachable = reachable;
+                determined[i] = true;
+                undetermined -= 1;
+            }
         }
     }
 }
@@ -2392,7 +2480,7 @@ mod tests {
 
     #[test]
     fn local_workers_clone_the_control_descriptor_session_in_process() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let endpoint = Endpoint::local();
@@ -2428,7 +2516,7 @@ mod tests {
 
     #[test]
     fn local_source_worker_rejects_destination_mutation_requests() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let marker = selected.join("marker");
@@ -2568,11 +2656,13 @@ mod tests {
         assert_eq!(byte, [7]);
         assert!(
             client_stats.segments_sent.is_some_and(|value| value > 0)
-                || client_stats.bytes_sent.is_some_and(|value| value > 0)
+                || client_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{client_stats:?}"
         );
         assert!(
             server_stats.segments_sent.is_some_and(|value| value > 0)
-                || server_stats.bytes_sent.is_some_and(|value| value > 0)
+                || server_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{server_stats:?}"
         );
         #[cfg(target_os = "linux")]
         {
@@ -2671,7 +2761,7 @@ mod tests {
 
     #[test]
     fn hello_carries_destination_initialization_before_readiness() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let descriptor_session = crate::descriptor_broker::DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(temp.path()).unwrap())
@@ -3064,7 +3154,7 @@ mod tests {
     #[test]
     fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let base = directory.path().join("scope");
         crate::persistence::initialize_scope(&base).unwrap();
         // The socket name is stable per endpoint, and a dead leftover at the
@@ -3158,5 +3248,50 @@ mod tests {
             args[control_index + 1].as_bytes(),
             b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
         );
+    }
+
+    #[test]
+    fn probe_reachable_probes_each_socket_address_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let via_localhost = ("localhost", port)
+            .to_socket_addrs()
+            .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
+            .unwrap_or(false);
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            while let Ok((_stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let candidate = |address: &str| TcpCandidate {
+            address: address.to_string(),
+            speed_mbps: 0,
+            source: DataAddressSource::RemoteInterface,
+            reachable: false,
+            selected: false,
+        };
+        let mut candidates = vec![
+            candidate("127.0.0.1"),
+            candidate("localhost"),
+            candidate("127.0.0.1"),
+        ];
+        probe_reachable(&mut candidates, port);
+        assert!(candidates[0].reachable);
+        assert!(candidates[2].reachable);
+        assert_eq!(candidates[1].reachable, via_localhost);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn overlay_addresses_are_recognized_in_both_families() {
+        assert!(is_overlay_address("100.101.102.103"));
+        assert!(is_overlay_address("fd7a:115c:a1e0::1234"));
+        assert!(!is_overlay_address("100.1.2.3"));
+        assert!(!is_overlay_address("fdaa:0:1:a7b::2"));
+        assert!(!is_overlay_address("192.168.1.2"));
+        assert!(!is_overlay_address("gpu01.example.net"));
     }
 }

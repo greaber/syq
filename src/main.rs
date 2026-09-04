@@ -29,6 +29,8 @@ mod rooted;
 mod scan;
 mod sched;
 mod server;
+#[cfg(test)]
+mod test_support;
 mod transfer;
 mod tune;
 mod update;
@@ -106,7 +108,7 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
         )
     };
     (result == 0 && length == std::mem::size_of::<libc::c_int>() && value > 0)
-        .then(|| value as libc::rlim_t)
+        .then_some(value as libc::rlim_t)
 }
 
 fn main() {
