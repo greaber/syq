@@ -51,10 +51,11 @@ degree with speed and composability. It is mainly a replacement for `cp`, not
 `rm` or `mv`, but `cp` is the command that most needed replacing, and rsync's
 `--delete` adds a mirroring capability the classical commands never had.
 
-Syq aims to do most of what rsync does while doing better on all four counts.
-Today its biggest strengths are speed and secure remote-to-remote transfers.
-Its composability story is still developing but is arguably already ahead of
-rsync's. On filesystem hardening, rsync, and especially [its security
+Syq does most of what rsync does and improves on all four counts. Its
+biggest strengths are speed and secure remote-to-remote transfers. Its
+composability comes from planning before acting: a dry run reports what would
+change, mappings make placement data, and a results stream gives a program the
+outcome of every operation. On filesystem hardening, rsync, and especially [its security
 design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md), has
 been a great teacher; native `cp` and `rm` now follow the same design, and the
 remaining differences are documented rather than hidden.
@@ -209,8 +210,7 @@ does not. Report vulnerabilities as described in
 2. **Native mode.** `syq cp`, `syq rm`, and `syq map` put the verb first, make
    endpoints, selection, and placement explicit, and add what rsync lacks:
    remote-to-remote copies, a parallel `rm`, exact placement, filters and
-   preservation as ordinary options, mappings. Native mode is experimental,
-   and its grammar may change between releases.
+   preservation as ordinary options, mappings. Native mode is experimental.
 3. **Programmatic.** `--progress-json` streams progress, native `cp` and `rm`
    accept `--results` for a machine-readable NDJSON outcome stream with a versioned contract
    ([Automation results](automation-v1.md)), and mappings let a program

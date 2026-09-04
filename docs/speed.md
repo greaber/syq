@@ -102,34 +102,7 @@ your own workloads against rsync and cp.
 | Remove 20,000 files on NFS, `-j32` | 2.5 s | `rm -rf` 9.7 s |
 | 1 Gbit, Germany → Japan (265 ms), ssh data connections | ~110 MB/s auto-tuned | a fixed 8 connections: 44 MB/s |
 | Same path, TCP data connections | line rate, settling at 8–13 connections | |
-| 262 ms path, fresh 2,000-file / 8 MiB tree over `--no-tcp` | 11.29 s | 16.85 s with independent worker handshakes |
 | 20 Gbit LAN, two 160-core hosts, `-j8` into tmpfs | 1.2–1.3 GiB/s | one ssh stream 450–550 MB/s |
-
-### Path-confinement cost
-
-The descriptor-rooted implementation was measured separately on 2026-09-04,
-comparing the pre-confinement revision `0382c06` with a build of the Linux
-`openat2` implementation later committed as `e4de953` on top of master
-`37ab73a` (benchmarked binary SHA-256 prefix `4e2687350003`). Each campaign
-used 32 connections, checksum verification, a 100,000-file mixed-depth tree
-holding 100 MiB, and both tool orderings. File pages were evicted where
-possible, but dentry and inode caches remained warm.
-
-On local ext4, the rooted build took 3.27–3.32 s median by ordering versus
-2.17–2.22 s before confinement, a 47–53% increase on a deliberately short,
-metadata-heavy workload. A shallow 100,000-file tree increased by 12–18%, and
-the sub-second no-change case showed no stable difference. The absolute
-mixed-tree cost was about 1.1 seconds per 100,000 files.
-
-On a same-datacenter NFSv4 mount, five local-to-NFS fresh-copy samples had
-combined medians of 46.45 s rooted and 44.05 s before confinement; the sample
-ranges overlapped widely (41.19–50.96 s and 38.43–52.58 s). The NFS-to-local
-campaign had the same 8.93 s combined median for both builds. A destination
-no-change campaign did not expose a rooted penalty. NFS metadata probes varied
-from 552 to 1,264 files/s during these runs, so the measurements rule out a
-large consistent regression in this setup rather than a small one. They are
-not a performance guarantee for other servers, mount options, cache states, or
-tree shapes.
 
 ## When rsync or cp is faster
 
@@ -256,12 +229,6 @@ connections (where each stream is capped by OpenSSH's 2 MB window) it
 reaches line rate (~110 MB/s, where a fixed eight workers managed 44) about 30 s
 after the connections are up.
 
-On the same kind of long path (262 ms), a fresh 2,000-file / 8 MiB tree over
-`--syq-no-tcp` took 11.29 s in two verified runs after fresh-small-file workers
-began reusing the authenticated control connection, versus 16.85 s with eight
-independently authenticated worker connections. Larger and mixed workloads
-still use independent SSH connections so they retain multi-flow throughput.
-
 Native `-j N`/`--connections N`, or compatibility
 `--syq-connections N`, fixes the count and disables tuning. Use it when you
 know better—for example, one worker for a spinning disk that must not be read
@@ -331,10 +298,7 @@ data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
 link. Every candidate still gets its complete bounded probe window, but those
 independent probes run while the control connection prepares the destination.
-An unrestricted destination worker claims its registered directory as part of
-its authenticated Hello, and the receiver acknowledges readiness only after
-that claim succeeds. Single-homed hosts and laptops use the one best path,
-unchanged. With ufw:
+Single-homed hosts and laptops use the one best path, unchanged. With ufw:
 
 ```sh
 sudo ufw allow from 192.0.2.0/24  to any port 47600:47699 proto tcp   # example LAN
@@ -405,9 +369,8 @@ for `cp`, and 20,000 small files were written in 28 s vs 72 s for `cp -r`.
 Writes from a recognized local disk filesystem into one asynchronous NFS inode
 are instead serialized automatically by the receiver when the kernel cannot
 offload them.
-On a fresh 4 GiB `/raid`→NFS copy, that changed syq from 21.44 s with 32 range
-writers to a 9.93 s median with one sequential receiver-side writer, versus a
-10.94 s median for `cp` (two interleaved runs). Synchronous destinations and
+On a fresh 4 GiB `/raid`→NFS copy, that sequential writer reached a 9.93 s
+median versus 10.94 s for `cp` (two interleaved runs). Synchronous destinations and
 NFS sources retain the adaptive parallel path; the reciprocal NFS→`/raid` copy
 reached 1.13 GiB/s with parallel range reads.
 Separate files still run concurrently and have reached ~650 MB/s in aggregate.
