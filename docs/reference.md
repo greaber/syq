@@ -1159,6 +1159,7 @@ differs and why, what's missing, and the open issues. The short version:
 | Code | Meaning |
 |---|---|
 | 0 | Everything copied and verified |
+| 1 | Fatal: couldn't connect, remote `syq` missing, connection lost |
+| 2 | Bad arguments or usage |
 | 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
 | 25 | Finished, but `--max-delete` stopped the deletions |
-| 1 | Fatal: bad arguments, couldn't connect, remote `syq` missing, connection lost |

@@ -170,8 +170,8 @@ These options buy speed by giving something up; the default is the safe side.
   ssh). Only on a network whose trust boundary you understand.
 - `--inplace` writes directly into destination files instead of writing a
   partial file and renaming it into place, saving the space and time of a
-  second copy, at the cost of each file appearing either complete or not at
-  all, and of safe interruption.
+  second copy. Readers can see a partially updated file, and an interruption
+  leaves the final file unfinished.
 - `--no-compress` saves the compression attempt on a very fast LAN.
 - `--connections N` fixes the connection count and disables the auto-tuner;
   `--bwlimit` caps throughput to be polite on a shared link.

@@ -52,10 +52,11 @@ inferred from them.
 For a remote-to-remote copy there are two ways to fill the stream. Through the
 restricted receiver, the stream is **receiver-attested**: built from hostB's
 signed receipt rather than from what hostA reported. hostB records every
-operation, and the final state of every path once the copy has closed, inside
-its encrypted, signed receipt; the invoking machine verifies and decrypts it,
-and only then writes the records, marked `"provenance": "receiver_attested"`,
-into the local file or descriptor. Data still flows directly between the
+operation and, once the copy has closed, the final state of every path the
+transfer could have changed. It puts those facts inside its encrypted, signed
+receipt; the invoking machine verifies and decrypts it, and only then writes
+the records, marked `"provenance": "receiver_attested"`, into the local file or
+descriptor. Data still flows directly between the
 remotes; only the verified account comes home. Without an enrollment there is
 no trusted channel, so the run fails (with a `failed` terminal record) unless
 `--coordinate-at local` explicitly routes the transfer through this machine;
