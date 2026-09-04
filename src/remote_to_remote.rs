@@ -149,9 +149,34 @@ impl Iterator for CapturedFrames<'_> {
 /// other transfers inherit stdout untouched. Frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
 fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
+    let mut output_error = None;
+    let result = relay_output(stdout, &mut std::io::stdout().lock(), &mut output_error);
+    // Report only after releasing stdout, including when receipt parsing fails.
+    if let Some(error) = output_error {
+        crate::output::warn_stdout(&error);
+    }
+    result
+}
+
+fn relay_output(
+    stdout: impl std::io::Read,
+    out: &mut impl Write,
+    output_error: &mut Option<std::io::Error>,
+) -> Result<Option<CapturedReceipt>> {
     let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
-    let mut out = std::io::stdout().lock();
+    // A failed human-output sink must not discard the receiver's evidence.
+    // Keep draining and validating receipt frames after the first write error.
+    let mut forward = |bytes: &[u8], flush: bool| {
+        if output_error.is_none() {
+            let result = out
+                .write_all(bytes)
+                .and_then(|()| if flush { out.flush() } else { Ok(()) });
+            if let Err(error) = result {
+                *output_error = Some(error);
+            }
+        }
+    };
     let mut receipt = None;
     // The first bytes of the current line, held only until the prefix
     // decision; then either the receipt payload being collected or nothing.
@@ -189,16 +214,14 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                     if head.starts_with(prefix) {
                         capturing = Some(head[prefix.len()..].to_vec());
                     } else {
-                        out.write_all(&head)
-                            .context("relay remote coordinator output")?;
+                        forward(&head, false);
                     }
                     head.clear();
                 }
             } else if let Some(payload) = capturing.as_mut() {
                 payload.extend_from_slice(segment);
             } else {
-                out.write_all(segment)
-                    .context("relay remote coordinator output")?;
+                forward(segment, false);
             }
             if let Some(payload) = capturing.as_mut() {
                 if payload.len() > MAX_RECEIPT_LINE_BYTES {
@@ -209,7 +232,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 if let Some(mut payload) = capturing.take() {
                     store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
                 } else {
-                    out.flush().context("relay remote coordinator output")?;
+                    forward(&[], true);
                 }
                 decided = false;
             }
@@ -221,14 +244,13 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
         if head.starts_with(prefix) {
             capturing = Some(head[prefix.len()..].to_vec());
         } else {
-            out.write_all(&head)
-                .context("relay remote coordinator output")?;
+            forward(&head, false);
         }
     }
     if let Some(mut payload) = capturing.take() {
         store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
     }
-    out.flush().context("relay remote coordinator output")?;
+    forward(&[], true);
     Ok(receipt)
 }
 
@@ -410,7 +432,7 @@ fn settle_captured_receipt(
         // machine just received (the coordinator's own summary was
         // suppressed), so the two can never disagree.
         if !quiet {
-            println!(
+            crate::output::human_stdout!(
                 "syq: receiver-attested: {} files published ({}), {} deleted, {} error(s); receipt {}; {}",
                 terminal.summary.published_files,
                 crate::progress::human(terminal.summary.transferred_bytes),
@@ -424,7 +446,7 @@ fn settle_captured_receipt(
         // stream advertises. Verification complaints reach stderr; they do
         // not fork the exit code away from the terminal record.
         if let Some(message) = settlement_error {
-            eprintln!("syq: {message}");
+            crate::output::diagnostic!("syq: {message}");
         }
         return Ok(outcome.exit_code);
     }
@@ -440,10 +462,10 @@ fn settle_captured_receipt(
                 .map(|problem| format!("; first: {problem}"))
                 .unwrap_or_default()
         );
-        eprintln!("syq: warning: {message}");
+        crate::output::diagnostic!("syq: warning: {message}");
     }
     if verbose {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: encrypted receipt from {dst_host} verified: {} operations, {} final states, {} files published ({}), {} deletions",
             terminal.summary.operations,
             terminal.summary.final_states,
@@ -818,7 +840,7 @@ fn run_remote(
                 grant_digest: Some(prepared.grant_digest),
             });
             if !args.quiet {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: using command-restricted destination enrollment {}",
                     prepared.enrollment_id
                 );
@@ -1129,7 +1151,7 @@ fn run_remote(
         )
     };
     if args.peer_auth == PeerAuth::FullAgent {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: warning: --peer-auth full-agent exposes every capability in your SSH agent to {coordinator_host} for this transfer"
         );
     }
@@ -1152,15 +1174,18 @@ fn run_remote(
         }
         // The handoff is the command's result, not chatter: -q trims it to
         // the bare coordinator and log path rather than suppressing it.
-        if args.quiet {
-            println!("{coordinator_target}:{log}");
+        let handoff = if args.quiet {
+            format!("{coordinator_target}:{log}")
         } else {
-            println!("syq: started on {coordinator_target}, log {log}");
-        }
+            format!("syq: started on {coordinator_target}, log {log}")
+        };
+        crate::output::write_stdout(format_args!("{handoff}")).with_context(|| {
+            format!("job started on {coordinator_target}, log {log}, but writing its location to stdout failed")
+        })?;
         return Ok(0);
     }
     if !args.quiet {
-        eprintln!("syq: remote-to-remote: running on {coordinator_host}");
+        crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
     }
     let run = || {
         let mut cmd = make_command();
@@ -1505,6 +1530,151 @@ mod tests {
         assert!(!automatic_enrollment_allowed(true, false));
         assert!(!automatic_enrollment_allowed(false, true));
         assert!(!automatic_enrollment_allowed(true, true));
+    }
+
+    #[test]
+    fn relay_output_failure_preserves_verified_receipt_and_rejects_corruption() {
+        use crate::receipt::*;
+        struct FailingOutput {
+            flush_only: bool,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush_only {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let signing_key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[19; 32]).into(),
+            "output-test",
+        )
+        .unwrap();
+        let (secret, public) = generate_recipient().unwrap();
+        let policy = ReceiptPolicy {
+            required: true,
+            hashed: false,
+            max_records: 32,
+            max_plaintext_bytes: 64 * 1024,
+            delivery: ReceiptDelivery::AttachedEncrypted {
+                suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+                recipient_public_key: public,
+            },
+        };
+        let enrollment_id = EnrollmentId::random();
+        let request_id = RequestId::fresh(1_900_000_000).unwrap();
+        let grant_digest = [17; 32];
+        let issued = ReceiptStreamWriter::new(&policy)
+            .unwrap()
+            .finish(ReceiptClosure {
+                enrollment_id,
+                request_id,
+                grant_digest,
+                issued_at: 1_900_000_001,
+                policy: policy.clone(),
+                entries_touched: 0,
+                transferred_bytes: 0,
+                signing_key: &signing_key,
+            })
+            .unwrap();
+        let mut encoded = Vec::new();
+        emit_receipt_frames(issued, |frame| {
+            encoded.extend_from_slice(RECEIPT_LINE_PREFIX.as_bytes());
+            encoded.extend_from_slice(
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .encode(frame)
+                    .as_bytes(),
+            );
+            encoded.push(b'\n');
+            Ok(())
+        })
+        .unwrap();
+        let expected = ReceiptExpectation {
+            public_key: signing_key.public_key().to_openssh().unwrap(),
+            enrollment_id,
+            request_id,
+            recipient_secret: Some(secret),
+            policy,
+            grant_digest: Some(grant_digest),
+        };
+        for flush_only in [false, true] {
+            // Fail either before the receipt arrives or after it was captured.
+            for human_first in [false, true] {
+                let input = if human_first {
+                    [b"human line\n".as_slice(), &encoded].concat()
+                } else {
+                    [&encoded, b"human line\n".as_slice()].concat()
+                };
+                let mut output_error = None;
+                let mut captured = relay_output(
+                    input.as_slice(),
+                    &mut FailingOutput { flush_only },
+                    &mut output_error,
+                )
+                .unwrap();
+                assert_eq!(output_error.unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+                let file = tempfile::tempfile().unwrap();
+                let writer =
+                    crate::results::ResultsWriter::new(Box::new(file.try_clone().unwrap()));
+                assert_eq!(
+                    settle_receipt(
+                        &expected,
+                        captured.as_mut(),
+                        ReceiptSettlement {
+                            src_host: "source",
+                            dst_host: "destination",
+                            coordinator_exit_code: 0,
+                            results: Some(&writer),
+                            elapsed_ms: 1,
+                            verbose: false,
+                            quiet: false,
+                        }
+                    )
+                    .unwrap(),
+                    0
+                );
+                let mut text = String::new();
+                let mut file = file;
+                file.rewind().unwrap();
+                file.read_to_string(&mut text).unwrap();
+                let result: serde_json::Value =
+                    serde_json::from_str(text.lines().last().unwrap()).unwrap();
+                assert_eq!(result["exit_code"], 0);
+                assert_eq!(result["provenance"], "receiver_attested");
+            }
+        }
+        // Losing human output never disables receipt framing or verification.
+        let invalid = format!("human line\n{RECEIPT_LINE_PREFIX}invalid!\n");
+        assert!(relay_output(
+            invalid.as_bytes(),
+            &mut FailingOutput { flush_only: false },
+            &mut None
+        )
+        .is_err());
+        let mut captured = relay_output(encoded.as_slice(), &mut Vec::new(), &mut None).unwrap();
+        let wrong_expected = ReceiptExpectation {
+            grant_digest: Some([99; 32]),
+            ..expected
+        };
+        assert!(settle_receipt(
+            &wrong_expected,
+            captured.as_mut(),
+            ReceiptSettlement {
+                src_host: "source",
+                dst_host: "destination",
+                coordinator_exit_code: 0,
+                results: None,
+                elapsed_ms: 1,
+                verbose: false,
+                quiet: true,
+            }
+        )
+        .is_err());
     }
 
     #[test]

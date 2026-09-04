@@ -1413,7 +1413,7 @@ impl RemoteSpec {
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
                     if crate::transfer::debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
                             self.label()
                         );
@@ -1431,7 +1431,7 @@ impl RemoteSpec {
                         None
                     };
                     if crate::transfer::debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
                             attempt + 1,
@@ -1689,7 +1689,7 @@ impl RemoteSpec {
             bail!("no advertised data address is reachable");
         }
         if crate::transfer::debug() {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: data paths {:?} (advertised {:?})",
                 self.label(),
                 addrs,
@@ -1790,7 +1790,10 @@ impl RemoteSpec {
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             if crate::transfer::debug() {
-                eprintln!("syq: {}: data connection via tcp {addr_s}", self.label());
+                crate::output::diagnostic!(
+                    "syq: {}: data connection via tcp {addr_s}",
+                    self.label()
+                );
             }
             stream.set_nodelay(true)?;
             let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2021,7 +2024,7 @@ impl RemoteSpec {
         let bootstrap = self.remote_bootstrap()?;
         let target = bootstrap.target;
         if !self.quiet {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: installing {} helper for {}",
                 self.label(),
                 remote_helper::helper_identity(),
@@ -2095,7 +2098,7 @@ impl RemoteSpec {
                 RemoteDownloadOutcome::Fallback { detail, helper } => {
                     trusted = helper;
                     if !self.quiet {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: {}: remote download unavailable{}; uploading the verified helper over SSH",
                             self.label(),
                             parenthesized_detail(&detail)
@@ -2104,7 +2107,7 @@ impl RemoteSpec {
                 }
                 RemoteDownloadOutcome::Integrity { warning, helper } => {
                     trusted = helper;
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: warning: {}: {}; the remote download was discarded; uploading the verified helper over SSH",
                         self.label(),
                         warning
@@ -2112,7 +2115,7 @@ impl RemoteSpec {
                 }
             }
         } else if !self.quiet {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: remote download prerequisites unavailable; uploading the verified helper over SSH",
                 self.label()
             );
@@ -2556,6 +2559,7 @@ impl Endpoint {
                                 return Err(e).context("TCP data transport required by test");
                             }
                             let mut g = spec.tcp.lock().unwrap();
+                            let mut warning = None;
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
                                     i.failed = true;
@@ -2564,9 +2568,13 @@ impl Endpoint {
                                         let congestion_note = tcp_congestion_fallback_note(
                                             info.congestion_control.as_deref(),
                                         );
-                                        eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port);
+                                        warning = Some(format!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port));
                                     }
                                 }
+                            }
+                            drop(g);
+                            if let Some(warning) = warning {
+                                crate::output::diagnostic!("{warning}");
                             }
                         }
                     }
@@ -3271,6 +3279,56 @@ mod tests {
             .ssh_command(SshConnection::Independent)
             .get_args()
             .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
+    }
+
+    #[test]
+    fn worker_tcp_fallback_survives_broken_stderr() {
+        if !crate::test_support::with_broken_stderr(
+            "conn::tests::worker_tcp_fallback_survives_broken_stderr",
+        ) {
+            return;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let marker = temporary.path().join("ssh-attempted");
+        let spec = RemoteSpec {
+            local_process: false,
+            user: None,
+            host: "unused".into(),
+            port: None,
+            // The shell records that fallback was reached, then reports a
+            // missing helper so no retry or real SSH connection is needed.
+            rsh: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "touch {}; exit 127",
+                    shell_words::quote(marker.to_str().unwrap())
+                ),
+            ],
+            syq_path: None,
+            bootstrap_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: None,
+            quiet: false,
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(Some(TcpInfo {
+                addrs: vec!["invalid address".into()], // Fail resolution without DNS or a socket.
+                port: 0,
+                key: None,
+                token: Vec::new(),
+                congestion_control: None,
+                failed: false,
+                failure: None,
+                next: Default::default(),
+            }))),
+            diagnostics: Default::default(),
+        };
+        let endpoint = Endpoint::Remote(spec.clone());
+        assert!(endpoint
+            .connect_with_role(false, ConnectionRole::SourceWorker { roots: Vec::new() })
+            .is_err());
+        assert!(marker.exists(), "worker never attempted SSH fallback");
+        assert!(spec.tcp.lock().unwrap().as_ref().unwrap().failed);
     }
 
     #[test]

@@ -4244,6 +4244,35 @@ exit 22
 }
 
 #[test]
+fn helper_install_and_upload_fallback_survive_broken_stderr() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+    write(
+        &t.path("src"),
+        b"helper installed despite missing diagnostics",
+    );
+    let remote = format!("fake:{}", t.s("dst"));
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let output = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+}
+
+#[test]
 fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -11430,6 +11459,60 @@ fn native_detach_does_not_report_an_immediate_setup_failure_as_started() {
         "immediate setup failure waited for the full readiness timeout"
     );
     assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_detach_broken_stdout_reports_running_job_without_panicking() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"detached");
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args([
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "-j",
+            "1",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("job started on hostA, log "), "{stderr}");
+    assert!(
+        stderr.contains("writing its location to stdout failed"),
+        "{stderr}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read(t.path("dst")).ok().as_deref() != Some(b"detached".as_slice())
+        && std::time::Instant::now() < deadline
+    {
+        eprintln!("waiting for detached job after handoff output failure");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(read(&t.path("dst")), b"detached");
 }
 
 // ----------------------------------------------------------- review round 13

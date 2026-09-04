@@ -4241,7 +4241,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
         return None;
     }
     let Some(command) = argv.get(2).and_then(|argument| argument.to_str()) else {
-        eprintln!("{RECEIVER_USAGE}");
+        crate::output::diagnostic!("{RECEIVER_USAGE}");
         return Some(Ok(2));
     };
     match command {

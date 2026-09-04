@@ -589,7 +589,9 @@ impl ResultsWriter {
 
     fn mark_dead(&self, error: &std::io::Error) {
         if !self.dead.swap(true, Relaxed) {
-            eprintln!("syq: warning: --results stream failed ({error}); further records are lost");
+            crate::output::diagnostic!(
+                "syq: warning: --results stream failed ({error}); further records are lost"
+            );
         }
     }
 }
@@ -609,6 +611,22 @@ fn tagged(path: &[u8]) -> serde_json::Value {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn failed_results_and_stderr_do_not_panic() {
+        if !crate::test_support::with_broken_stderr(
+            "results::tests::failed_results_and_stderr_do_not_panic",
+        ) {
+            return;
+        }
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(reader);
+        let writer = ResultsWriter::new(Box::new(writer));
+        writer.emit_error_classified("first failure", None, None);
+        assert!(writer.is_dead());
+        writer.emit_error_classified("later failure", None, None);
+        assert!(!writer.out.is_poisoned());
+    }
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);

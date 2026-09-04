@@ -375,6 +375,14 @@ outside the copy or removal trees; one inside them can make the run's own
 accounting unpredictable. A remote `rm` over a normal SSH login returns
 structured outcomes from the endpoint, but the restricted receiver rejects
 native removal because its signed grants authorize copy changes only.
+
+Copy and removal continue if writing human summaries, file listings, or
+diagnostics fails; the exit status still describes the filesystem operation.
+If stdout fails, syq attempts one warning on stderr. A failed stderr cannot
+carry that warning. A slow output consumer can still block the worker writing
+to it. Progress can continue on a separate, writable stderr or results stream
+while stdout is blocked.
+
 `--mapping` cannot be combined with `--prune` because mapping manifests define
 no region to prune; `--results` covers `--prune` runs, including their
 removals. `--max-delete` requires
@@ -426,6 +434,10 @@ the transfer route and finished checking the destination, before anything is
 written. If that readiness deadline expires, the launcher
 terminates and verifies the complete detached process group before reporting
 failure.
+
+If the job starts but the launcher cannot write its coordinator and log to
+stdout, the launcher exits with an error and attempts to report that location
+on stderr. The background job continues running.
 
 The restricted receiver, which serves one copy and then exits, requires
 encrypted TCP data connections. Consequently `--no-tcp`, falling back from TCP

@@ -577,7 +577,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         }
     }
     if debug {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq server{}: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
             if over_ssh { "" } else { " (tcp)" },
             bytes >> 20,
@@ -913,7 +913,9 @@ fn accept_data_connections(
         if live.fetch_add(1, Relaxed) >= max_live {
             live.fetch_sub(1, Relaxed);
             if debug {
-                eprintln!("syq server (tcp): refusing connection, {max_live} already live");
+                crate::output::diagnostic!(
+                    "syq server (tcp): refusing connection, {max_live} already live"
+                );
             }
             continue; // drop; stream closes
         }
@@ -938,7 +940,7 @@ fn accept_data_connections(
                 descriptor_session,
             ) {
                 if debug {
-                    eprintln!("syq server (tcp {id}): {e:#}");
+                    crate::output::diagnostic!("syq server (tcp {id}): {e:#}");
                 }
             }
             live.fetch_sub(1, Relaxed);

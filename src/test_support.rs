@@ -2,6 +2,30 @@
 
 use std::path::PathBuf;
 
+/// Run a unit test in a separate process whose stderr reader has gone away.
+/// Keep stdout available for the test harness and assertion diagnostics.
+pub(crate) fn with_broken_stderr(name: &str) -> bool {
+    if std::env::var("SYQ_TEST_BROKEN_STDERR").as_deref() == Ok(name) {
+        return true;
+    }
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("SYQ_TEST_BROKEN_STDERR", name)
+        .stderr(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+            writer,
+        )))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    false
+}
+
 /// The process temporary directory with symlinks resolved.
 ///
 /// macOS places `TMPDIR` under `/var`, a symlink to `/private/var`. Native
