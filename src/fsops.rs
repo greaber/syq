@@ -2048,6 +2048,34 @@ impl FsOps {
         Ok(())
     }
 
+    /// A destination mutation needs an authority before it may touch the
+    /// filesystem: the directory a control connection registered with
+    /// `AnchorDestination`, the registered root a destination worker was
+    /// initialized with, or the guard a command-restricted receiver attaches
+    /// from its signed grant. Until one of those exists, a request naming an
+    /// arbitrary pathname is refused instead of being served through the
+    /// unrooted pathname branch.
+    pub(crate) fn validate_destination_session_request(&self, request: &Request) -> Result<()> {
+        if self.destination_root.is_some() {
+            return Ok(());
+        }
+        let unrooted = match request {
+            Request::Apply { guard, .. }
+            | Request::Prepare { guard, .. }
+            | Request::SeedBasis { guard, .. }
+            | Request::FinishBasis { guard, .. }
+            | Request::WriteRange { guard, .. }
+            | Request::Finalize { guard, .. } => guard.is_none(),
+            Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_none()),
+            Request::CopyLocal { .. } => true,
+            _ => false,
+        };
+        if unrooted {
+            bail!("destination mutation before a destination root was registered");
+        }
+        Ok(())
+    }
+
     /// Resolve one source-content request. A destination worker must never
     /// service source-only read families, and a confined source session never
     /// treats an omitted registered reference as pathname authority.
@@ -5548,7 +5576,10 @@ impl FsOps {
 
     /// Dispatch a request that has a single response (everything except Scan).
     pub fn handle(&mut self, req: &Request) -> Response {
-        if let Err(error) = self.validate_source_session_request(req) {
+        if let Err(error) = self
+            .validate_source_session_request(req)
+            .and_then(|()| self.validate_destination_session_request(req))
+        {
             return Response::Err(errstr(&error));
         }
         let req = match self.map_request(req) {
@@ -7055,6 +7086,82 @@ mod tests {
                 "canonicalize is not valid after destination capability activation"
             ))
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A destination mutation is refused until the session holds an
+    /// authority for it: a registered root or a signed receiver's guard. The
+    /// same request is served once either exists.
+    #[test]
+    fn destination_mutations_need_a_registered_root_or_a_guard() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("made");
+        let target_bytes = target.as_os_str().as_bytes().to_vec();
+        let mkdir = |path: PathBytes, guard: Option<ContainerGuard>| Request::Apply {
+            ops: vec![Op::Mkdir {
+                path,
+                mode: 0o755,
+                condition: TargetCondition::Any,
+            }],
+            guard,
+        };
+        let put = Request::PutSmallBatch(vec![SmallPut {
+            path: target_bytes.clone(),
+            copy_id: [3; 16],
+            data: b"new".to_vec(),
+            hash: content_digest(b"new"),
+            meta: Meta {
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags: 0,
+            inplace: false,
+            condition: TargetCondition::Absent,
+            guard: None,
+        }]);
+
+        let mut unrooted = FsOps::new();
+        for request in [mkdir(target_bytes.clone(), None), put] {
+            let response = unrooted.handle(&request);
+            assert!(
+                matches!(
+                    &response,
+                    Response::Err(message) if message.contains("before a destination root")
+                ),
+                "{response:?}"
+            );
+        }
+        assert!(!target.exists());
+
+        let root = Root::open(&dir).unwrap();
+        let identity = root.identity();
+        let guard = ContainerGuard {
+            root: dir.as_os_str().as_bytes().to_vec(),
+            dev: identity.dev,
+            ino: identity.ino,
+        };
+        let response = unrooted.handle(&mkdir(target_bytes.clone(), Some(guard)));
+        assert!(
+            matches!(&response, Response::Applied(errors) if errors == &vec![None]),
+            "{response:?}"
+        );
+        assert!(target.is_dir());
+        fs::remove_dir(&target).unwrap();
+
+        let mut rooted = FsOps::new();
+        rooted
+            .install_destination(File::open(&dir).unwrap(), b"logical")
+            .unwrap();
+        let response = rooted.handle(&mkdir(b"logical/made".to_vec(), None));
+        assert!(
+            matches!(&response, Response::Applied(errors) if errors == &vec![None]),
+            "{response:?}"
+        );
+        assert!(target.is_dir());
         fs::remove_dir_all(&dir).unwrap();
     }
 

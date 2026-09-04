@@ -176,6 +176,8 @@ file is the temporary file, named `.name.syq-part.<copy-id>`, that syq writes
 beside a destination file and renames into place once it is complete; see
 [How it works](#how-it-works).) Using the handle does not change the worker
 process's current directory; destination operations do not depend on it.
+If a write request reaches an endpoint before that handle exists and carries
+no signed grant, syq refuses it instead of resolving the path by name.
 
 Control files on the machine running syq get the same treatment:
 `--ignore-from`, `--syq-ignore-from`, `--files-from`, and a named `--mapping`
