@@ -103,6 +103,32 @@ your own workloads against rsync and cp.
 | 262 ms path, fresh 2,000-file / 8 MiB tree over `--no-tcp` | 11.29 s | 16.85 s with independent worker handshakes |
 | 20 Gbit LAN, two 160-core hosts, `-j8` into tmpfs | 1.2–1.3 GiB/s | one ssh stream 450–550 MB/s |
 
+### Path-confinement cost
+
+The descriptor-rooted implementation was measured separately on 2026-09-04,
+comparing the pre-confinement revision `0382c06` with a build of the Linux
+`openat2` implementation later committed as `e4de953` on top of master
+`37ab73a` (benchmarked binary SHA-256 prefix `4e2687350003`). Each campaign
+used 32 connections, checksum verification, a 100,000-file mixed-depth tree
+holding 100 MiB, and both tool orderings. File pages were evicted where
+possible, but dentry and inode caches remained warm.
+
+On local ext4, the rooted build took 3.27–3.32 s median by ordering versus
+2.17–2.22 s before confinement, a 47–53% increase on a deliberately short,
+metadata-heavy workload. A shallow 100,000-file tree increased by 12–18%, and
+the sub-second no-change case showed no stable difference. The absolute
+mixed-tree cost was about 1.1 seconds per 100,000 files.
+
+On a same-datacenter NFSv4 mount, five local-to-NFS fresh-copy samples had
+combined medians of 46.45 s rooted and 44.05 s before confinement; the sample
+ranges overlapped widely (41.19–50.96 s and 38.43–52.58 s). The NFS-to-local
+campaign had the same 8.93 s combined median for both builds. A destination
+no-change campaign did not expose a rooted penalty. NFS metadata probes varied
+from 552 to 1,264 files/s during these runs, so the measurements rule out a
+large consistent regression in this setup rather than a small one. They are
+not a performance guarantee for other servers, mount options, cache states, or
+tree shapes.
+
 ## When rsync or cp is faster
 
 - **A single spinning disk.** Parallel reads of one file there mean seeks. Use
