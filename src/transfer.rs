@@ -1427,10 +1427,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                     };
                     if debug() {
-                        eprintln!(
-                            "syq: worker {id} connected in {:.2}s",
+                        crate::progress::write_stderr_best_effort(format_args!(
+                            "syq: worker {id} connected in {:.2}s\n",
                             t0.elapsed().as_secs_f64()
-                        );
+                        ));
                     }
                     let result = worker.run();
                     if collect_tcp_stats {
@@ -2710,15 +2710,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
+    let show_human_output = !args.quiet && (!aborted || capacity_only_dry_run_abort);
+    let mut human_output = Vec::new();
+    if show_human_output && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
-                progress.println(&format!(
+                human_output.push(format!(
                     "create directory {} (destination missing)",
                     display_directory(&dst_root)
                 ));
             }
-            progress.println(&dry_run_summary(
+            human_output.push(dry_run_summary(
                 srcs,
                 dst,
                 &dry_run_mappings,
@@ -2732,7 +2734,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 fresh_capacity_assessment,
             ));
         } else if opts.verify_only {
-            progress.println(&format!(
+            human_output.push(format!(
                 "syq: {}verified {} files, {} differ/missing, {} in {}",
                 target_summary_prefix(&args),
                 commas(progress.files_done.load(Relaxed) + errors),
@@ -2741,7 +2743,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 crate::progress::hms(elapsed)
             ));
         } else {
-            progress.println(&format!(
+            human_output.push(format!(
                 "syq: {}transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
                 target_summary_prefix(&args),
                 commas(terminal.files_transferred),
@@ -2764,8 +2766,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+    // attested settlement re-renders; a delegated coordinator keeps it. Keep
+    // it in the same write as the summary so another target cannot interleave.
+    if show_human_output && args.stats {
         let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
             if opts.dry_run {
                 (
@@ -2791,7 +2794,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let heading = args.fanout_run.as_ref().map_or_else(String::new, |run| {
             format!("syq: target {}: stats\n", run.label)
         });
-        progress.println(&format!(
+        human_output.push(format!(
                 "{heading}  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
@@ -2815,6 +2818,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 },
                 tcp_stats,
             ));
+    }
+    if !human_output.is_empty() {
+        progress.println(&human_output.join("\n"));
     }
     if let Some(run) = &args.fanout_run {
         run.group

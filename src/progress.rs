@@ -55,6 +55,7 @@ pub struct Progress {
     workers: Mutex<Vec<Option<WorkerStatus>>>,
     term: Mutex<TermState>,
     stop: AtomicBool,
+    stdout_warning_emitted: AtomicBool,
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
@@ -67,6 +68,14 @@ struct TermState {
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
     last_results: Option<Instant>,
+}
+
+pub(crate) fn write_stderr_best_effort(args: std::fmt::Arguments<'_>) {
+    let rendered = args.to_string();
+    let mut err = std::io::stderr().lock();
+    let _ = err
+        .write_all(rendered.as_bytes())
+        .and_then(|()| err.flush());
 }
 
 pub(crate) struct ProgressSnapshot {
@@ -148,6 +157,7 @@ impl Progress {
                 last_results: None,
             }),
             stop: AtomicBool::new(false),
+            stdout_warning_emitted: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
             result_destination: std::sync::OnceLock::new(),
             fanout_group: std::sync::OnceLock::new(),
@@ -220,8 +230,24 @@ impl Progress {
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
         let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+        let result = writeln!(out, "{line}").and_then(|()| out.flush());
+        drop(out);
+        if let Err(error) = result {
+            if !self.stdout_warning_emitted.swap(true, Relaxed) {
+                let message = format!("could not write to stdout: {error}");
+                if self.json {
+                    let warning = serde_json::json!({
+                        "type": "warning",
+                        "code": "stdout-write",
+                        "count": 1,
+                        "message": message,
+                    });
+                    write_stderr_best_effort(format_args!("{warning}\n"));
+                } else {
+                    write_stderr_best_effort(format_args!("syq: warning: {message}\n"));
+                }
+            }
+        }
     }
 
     /// Print a line to stderr (errors and warnings), keeping the progress area intact.
@@ -230,9 +256,7 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{line}");
-        let _ = err.flush();
+        write_stderr_best_effort(format_args!("{line}\n"));
     }
 
     pub fn error(&self, line: &str) {
@@ -257,27 +281,22 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut term = self.term.lock().unwrap();
         self.erase(&mut term);
-        let mut err = std::io::stderr().lock();
         if self.json {
-            let _ = writeln!(
-                err,
-                "{}",
-                serde_json::json!({
-                    "type": "warning",
-                    "code": code,
-                    "count": count,
-                    "message": message,
-                })
-            );
+            let warning = serde_json::json!({
+                "type": "warning",
+                "code": code,
+                "count": count,
+                "message": message,
+            });
+            write_stderr_best_effort(format_args!("{warning}\n"));
         } else {
-            let _ = writeln!(err, "syq: warning: {message}");
+            write_stderr_best_effort(format_args!("syq: warning: {message}\n"));
         }
-        let _ = err.flush();
     }
 
     fn erase(&self, t: &mut TermState) {
         if t.lines_drawn > 0 {
-            eprint!("\r\x1b[{}A\x1b[J", t.lines_drawn);
+            write_stderr_best_effort(format_args!("\r\x1b[{}A\x1b[J", t.lines_drawn));
             t.lines_drawn = 0;
         }
     }
@@ -367,9 +386,10 @@ impl Progress {
                 if self.enabled {
                     self.erase(&mut t);
                 }
-                let mut err = std::io::stderr().lock();
-                let _ = writeln!(err, "{}", progress_json(&snapshot, None, None));
-                let _ = err.flush();
+                write_stderr_best_effort(format_args!(
+                    "{}\n",
+                    progress_json(&snapshot, None, None)
+                ));
             }
         }
         if !self.enabled {
@@ -399,11 +419,12 @@ impl Progress {
             let room = width.saturating_sub(prefix.len() + suffix.len() + 1);
             lines.push(format!("{prefix}{}{suffix}", truncate(&path, room)));
         }
-        let mut err = std::io::stderr().lock();
-        for l in &lines {
-            let _ = writeln!(err, "{}", truncate(l, width.saturating_sub(1)));
-        }
-        let _ = err.flush();
+        let rendered = lines
+            .iter()
+            .map(|line| truncate(line, width.saturating_sub(1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_stderr_best_effort(format_args!("{rendered}\n"));
         t.lines_drawn = lines.len();
     }
 

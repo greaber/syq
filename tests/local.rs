@@ -1304,14 +1304,16 @@ fn fanout_summaries_label_targets_and_default_to_per_target_tuning() {
 
     assert_output_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
     for host in ["alpha", "beta"] {
-        assert!(
-            stdout.contains(&format!("syq: target {host}: transferred 1 files")),
-            "{stdout}"
-        );
-        assert!(
-            stdout.contains(&format!("syq: target {host}: stats")),
-            "{stdout}"
+        let summary = lines
+            .iter()
+            .position(|line| line.starts_with(&format!("syq: target {host}: transferred 1 files")))
+            .unwrap_or_else(|| panic!("missing {host} summary in {stdout}"));
+        assert_eq!(
+            lines.get(summary + 1),
+            Some(&format!("syq: target {host}: stats").as_str()),
+            "another target's output split the {host} summary and stats:\n{stdout}"
         );
     }
     assert_eq!(stdout.matches("connections: auto:").count(), 2, "{stdout}");
@@ -1343,6 +1345,9 @@ fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
         .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
         .env("FAKE_REMOTE_ROOT", t.path("remotes"))
         .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        // A malformed debug-only synchronization hook must not turn completed
+        // copies into worker failures.
+        .env("SYQ_TEST_FANOUT_SETTLED_INDEX", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
@@ -1351,12 +1356,50 @@ fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
     let output = child.wait_with_output().unwrap();
 
     assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("warning: could not write to stdout"),
+        "{}",
+        stderr_of(&output)
+    );
     for host in ["alpha", "beta"] {
         assert_eq!(
             read(&t.path(&format!("remotes/{host}/dst/source"))),
             b"copy despite a closed summary pipe"
         );
     }
+}
+
+#[test]
+fn closed_summary_stdout_warns_without_changing_single_target_outcome() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"copy despite a closed summary pipe");
+    fs::create_dir(t.path("dst")).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--into-existing",
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("warning: could not write to stdout"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        read(&t.path("dst/source")),
+        b"copy despite a closed summary pipe"
+    );
 }
 
 #[cfg(debug_assertions)]

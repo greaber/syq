@@ -99,10 +99,11 @@ new-only precondition cannot be reused.
 
 A target that finishes with some file errors (exit 23), or refuses its deletion
 phase because of `--max-delete` (exit 25), does not stop the other targets. A
-fatal setup, connection, or filesystem failure (exit 1) cancels work that has
-not yet settled on the other targets. The command returns the most severe
-target outcome: 1 takes precedence over 23, which takes precedence over 25,
-which takes precedence over success (0).
+fatal setup, connection, or filesystem failure (exit 1) cancels unfinished
+targets. Copies they have already completed remain in place; syq does not roll
+them back. The command returns the most severe target outcome: 1 takes
+precedence over 23, which takes precedence over 25, which takes precedence over
+success (0).
 
 Multi-target copies support the ordinary local-source `cp` options, including
 `--root`, directional link following, `--mapping` (stdin is acquired once),
@@ -121,7 +122,7 @@ the final aggregate `result` seals the stream.
 
 Multi-target copies require a local source. A command with both a remote source
 and multiple targets is rejected. Options that apply only to a direct copy
-between two remote hosts, including receiver limits, receipts, detached mode,
+between two remote hosts, including receiver ceilings, receipts, detached mode,
 and agent-forwarding controls, therefore remain single-target options.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
@@ -678,6 +679,9 @@ accept them.
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
 notices, and `-v` file listings are hidden. Copy failures are still written to
 stderr and reflected in the exit status.
+
+If stdout stops accepting this human-readable copy output, syq warns once on
+stderr but does not change the copy's filesystem outcome or exit status.
 
 `--bwlimit` is one approximate limit shared by every `--syq-connections` worker, not a
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,

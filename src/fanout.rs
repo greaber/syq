@@ -10,7 +10,7 @@ use crate::progress::Progress;
 use crate::proto::Entry;
 use crate::sched::Sched;
 use anyhow::{bail, Result};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -162,9 +162,7 @@ impl Group {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *lines > 0 {
-            let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r\x1b[{}A\x1b[J", *lines);
-            let _ = err.flush();
+            crate::progress::write_stderr_best_effort(format_args!("\r\x1b[{}A\x1b[J", *lines));
             *lines = 0;
         }
         output
@@ -179,9 +177,7 @@ impl Group {
 
     fn write_stderr_block(&self, block: &str) {
         let _output = self.lock_human_output();
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{block}");
-        let _ = err.flush();
+        crate::progress::write_stderr_best_effort(format_args!("{block}\n"));
     }
 
     fn ensure_failed_member(&self, index: usize, args: &Args) -> bool {
@@ -561,10 +557,10 @@ fn run_group(
         let _ = ticker.join();
     }
     for notice in notices {
-        eprintln!("syq: fan-out: {notice}");
+        crate::progress::write_stderr_best_effort(format_args!("syq: fan-out: {notice}\n"));
     }
     for failure in failures {
-        eprintln!("syq: fan-out: {failure}");
+        crate::progress::write_stderr_best_effort(format_args!("syq: fan-out: {failure}\n"));
     }
     let terminals = group.terminal_records();
     if let Some(results) = group.results() {
@@ -614,7 +610,7 @@ fn spawn_progress_ticker(
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
-    let width = args.width.unwrap_or_else(crate::progress::term_width);
+    let configured_width = args.width;
     let ticker = std::thread::spawn(move || {
         let mut last_sample = None;
         while !thread_stop.load(Relaxed) {
@@ -624,7 +620,8 @@ fn spawn_progress_ticker(
                 .into_iter()
                 .map(|(index, progress)| (index, progress.snapshot()))
                 .collect();
-            if !snapshots.is_empty()
+            let all_members_registered = snapshots.len() == labels.len();
+            if all_members_registered
                 && last_sample.is_none_or(|last| now - last >= std::time::Duration::from_secs(1))
             {
                 last_sample = Some(now);
@@ -645,22 +642,22 @@ fn spawn_progress_ticker(
                     group.write_stderr_block(&json_lines.join("\n"));
                 }
             }
-            if human && !snapshots.is_empty() {
+            if human && all_members_registered {
                 let _output = group.lock_human_output();
-                let mut err = std::io::stderr().lock();
-                for (index, snapshot) in &snapshots {
-                    let line = format!(
-                        "target {}: {}",
-                        labels[*index],
-                        crate::progress::progress_line(snapshot)
-                    );
-                    let _ = writeln!(
-                        err,
-                        "{}",
+                let width = configured_width.unwrap_or_else(crate::progress::term_width);
+                let rendered = snapshots
+                    .iter()
+                    .map(|(index, snapshot)| {
+                        let line = format!(
+                            "target {}: {}",
+                            labels[*index],
+                            crate::progress::progress_line(snapshot)
+                        );
                         crate::progress::truncate(&line, width.saturating_sub(1))
-                    );
-                }
-                let _ = err.flush();
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::progress::write_stderr_best_effort(format_args!("{rendered}\n"));
                 group.set_progress_lines(snapshots.len());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -704,9 +701,10 @@ fn announce_member_settled_for_test(index: usize) {
     if selected != Some(index) {
         return;
     }
-    let marker = std::env::var_os("SYQ_TEST_FANOUT_SETTLED_FILE")
-        .expect("SYQ_TEST_FANOUT_SETTLED_INDEX requires SYQ_TEST_FANOUT_SETTLED_FILE");
-    std::fs::write(marker, b"settled").expect("write fan-out member-settled marker");
+    let Some(marker) = std::env::var_os("SYQ_TEST_FANOUT_SETTLED_FILE") else {
+        return;
+    };
+    let _ = std::fs::write(marker, b"settled");
 }
 
 #[cfg(not(debug_assertions))]
