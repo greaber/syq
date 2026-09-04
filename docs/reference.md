@@ -302,10 +302,13 @@ Native copy fidelity defaults to `-rlt`: recurse through directories, copy
 symlinks as symlinks, and retain mtimes. `--preserve=permissions` additionally
 copies modes, `--preserve=ownership` requests numeric owner and group, and
 `--preserve=specials` copies device, FIFO, and socket nodes. The option is
-repeatable and accepts comma-separated values. Ownership follows the same
-receiver-side rules as archive mode: owner is set only when the receiver runs
-as root, while group changes that fail with `EPERM` are skipped. Hard links,
-ACLs, and xattrs are not preserved.
+repeatable and accepts comma-separated values. On macOS, socket nodes are
+reported and skipped, even under `--quiet`, because macOS cannot create them
+through the confined destination directory descriptor; regular files and
+other special files in the same copy continue normally. Ownership follows the
+same receiver-side rules as archive mode: owner is set only when the receiver
+runs as root, while group changes that fail with `EPERM` are skipped. Hard
+links, ACLs, and xattrs are not preserved.
 
 Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
 `-n`/`--dry-run`, `-v`/`--verbose`,

@@ -1485,6 +1485,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    let destination_supports_confined_socket_nodes = match &dst_ep {
+        Endpoint::Remote(spec) => {
+            spec.diagnostics()
+                .peer
+                .context("destination handshake did not report receiver capabilities")?
+                .supports_confined_socket_nodes
+        }
+        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
+    };
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
     let mut pending_tcp_setups = Vec::new();
     if let Some(ports) = tcp_ports {
@@ -2135,6 +2144,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        destination_supports_confined_socket_nodes,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
@@ -3315,6 +3325,10 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
+fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) -> bool {
+    kind != Kind::Socket || destination_supports_sockets
+}
+
 fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
     (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
@@ -3684,6 +3698,9 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
+    /// Capability reported by the destination receiver's authenticated
+    /// handshake. The coordinator may be running on a different platform.
+    destination_supports_confined_socket_nodes: bool,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -3854,7 +3871,13 @@ impl Planner<'_> {
                         .is_none_or(|minimum| entry.size >= minimum)
             }
             Kind::Symlink => self.opts.links,
-            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                self.opts.devices
+                    && special_creation_supported(
+                        self.destination_supports_confined_socket_nodes,
+                        entry.kind,
+                    )
+            }
             Kind::Other => false,
         };
         if !included {
@@ -4607,7 +4630,13 @@ impl Planner<'_> {
                     ino: e.ino,
                 },
                 Kind::Symlink if opts.links => Claim::Leaf,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev if opts.devices => {
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+                    if opts.devices
+                        && special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
+                {
                     Claim::Leaf
                 }
                 _ => Claim::Weak,
@@ -4643,6 +4672,19 @@ impl Planner<'_> {
                 Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                }
+                Claim::Weak
+                    if e.kind == Kind::Socket
+                        && opts.devices
+                        && !special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
+                {
+                    self.progress.eprintln(&format!(
+                        "syq: skipping socket \"{rel}\": macOS cannot create socket nodes through a confined destination"
+                    ));
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {
