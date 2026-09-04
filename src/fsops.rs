@@ -1229,12 +1229,26 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The process file-creation mask. Linux publishes it in `/proc/self/status`
-/// (kernel 4.7 and later), which avoids the umask(2) set-and-restore window
-/// during which another thread would create files with the probe mask. The
-/// portable probe is used elsewhere; callers read the mask before starting
-/// any thread that creates files.
+static PROCESS_UMASK: OnceLock<u32> = OnceLock::new();
+
+/// Record the file-creation mask while the process is still single-threaded.
+/// `main` calls this before anything can spawn a thread, so the portable
+/// probe in `read_process_umask` never races another file creation.
+pub(crate) fn capture_process_umask() {
+    PROCESS_UMASK.get_or_init(read_process_umask);
+}
+
+/// The process file-creation mask captured at startup. A caller that runs
+/// without `main`, such as a unit test, reads it lazily instead.
 pub(crate) fn process_umask() -> u32 {
+    *PROCESS_UMASK.get_or_init(read_process_umask)
+}
+
+/// Linux publishes the mask in `/proc/self/status` (kernel 4.7 and later),
+/// which avoids the umask(2) set-and-restore window during which another
+/// thread would create files with the probe mask. Elsewhere the probe is the
+/// only option, so it must run while the process is single-threaded.
+fn read_process_umask() -> u32 {
     #[cfg(target_os = "linux")]
     if let Some(mask) = fs::read_to_string("/proc/self/status")
         .ok()
@@ -1256,13 +1270,35 @@ fn parse_proc_status_umask(status: &str) -> Option<u32> {
 
 fn probe_umask() -> u32 {
     // SAFETY: umask(2) only exchanges the process mask and the original is
-    // restored at once; the callers guarantee no other thread creates files
-    // in between.
+    // restored at once; `capture_process_umask` runs this before any thread
+    // exists, so no other file creation can observe the probe value.
     unsafe {
         let mask = libc::umask(0o022);
         libc::umask(mask);
         mask as u32
     }
+}
+
+/// Read this process's open-file limits.
+pub(crate) fn nofile_limits() -> io::Result<libc::rlimit> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only into the local struct passed by pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limits)
+}
+
+/// Replace this process's open-file limits.
+pub(crate) fn set_nofile_limits(limits: &libc::rlimit) -> io::Result<()> {
+    // SAFETY: setrlimit only reads the struct behind the pointer.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, limits) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn source_descriptor_requirement(
@@ -1341,13 +1377,7 @@ fn require_source_descriptor_capacity(
     shared_workers: usize,
     independent_workers: usize,
 ) -> Result<()> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(io::Error::last_os_error()).context("read source endpoint file limit");
-    }
+    let limit = nofile_limits().context("read source endpoint file limit")?;
     if limit.rlim_cur == libc::RLIM_INFINITY {
         return Ok(());
     }
@@ -9137,14 +9167,7 @@ mod tests {
 
     #[test]
     fn live_descriptor_snapshot_includes_this_process() {
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
-            0
-        );
+        let limits = nofile_limits().unwrap();
         if limits.rlim_cur != libc::RLIM_INFINITY {
             assert!(current_open_descriptor_count(limits.rlim_cur).unwrap() >= 3);
         }

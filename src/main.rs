@@ -53,50 +53,40 @@ fn tune_allocator() {}
 /// allows. Best effort: the source descriptor budget later reports what the
 /// endpoint actually permits.
 fn raise_nofile() {
-    let mut limits = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit writes only into the local struct passed by pointer.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0
-        || limits.rlim_cur >= limits.rlim_max
-    {
+    let Some((limits, wanted)) = nofile_raise_target() else {
         return;
-    }
-    for candidate in nofile_candidates(limits.rlim_max) {
-        let wanted = candidate.min(limits.rlim_max);
-        if wanted <= limits.rlim_cur {
-            continue;
-        }
-        let raised = libc::rlimit {
-            rlim_cur: wanted,
-            rlim_max: limits.rlim_max,
-        };
-        // SAFETY: setrlimit reads only the local struct. A rejected value
-        // leaves the limit unchanged, so the next candidate can be tried.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-            return;
-        }
-    }
+    };
+    let _ = fsops::set_nofile_limits(&libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limits.rlim_max,
+    });
 }
 
-/// Soft limits to try, highest first. Linux accepts anything up to the hard
-/// limit, so one candidate suffices. macOS usually reports an unlimited hard
-/// limit but rejects a soft limit above `kern.maxfilesperproc` with EINVAL
-/// instead of clamping it, so that ceiling and then `OPEN_MAX` follow.
-fn nofile_candidates(hard_limit: libc::rlim_t) -> Vec<libc::rlim_t> {
-    let ceiling = hard_limit.min(1 << 20);
-    #[cfg(target_os = "macos")]
-    {
-        let mut candidates = vec![ceiling];
-        candidates.extend(max_files_per_process());
-        candidates.push(10240);
-        candidates
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        vec![ceiling]
-    }
+/// The current limits and the soft limit worth requesting, or `None` when the
+/// soft limit is already as high as it can usefully go. The request stays at
+/// or below one million descriptors and the platform ceiling.
+fn nofile_raise_target() -> Option<(libc::rlimit, libc::rlim_t)> {
+    let limits = fsops::nofile_limits().ok()?;
+    let wanted = platform_nofile_ceiling(limits.rlim_max.min(1 << 20));
+    (wanted > limits.rlim_cur).then_some((limits, wanted))
+}
+
+/// macOS usually reports an unlimited hard limit but enforces
+/// `kern.maxfilesperproc` as the real per-process ceiling. macOS 11 and later
+/// store a higher soft limit and apply the ceiling internally; macOS 10.15 and
+/// earlier rejected such a request with EINVAL instead of clamping it, which
+/// left the default soft limit of 256 in place. Requesting at most the ceiling
+/// behaves the same on both. `OPEN_MAX` is the kernel's initial value for the
+/// ceiling and stands in when the sysctl is unavailable.
+#[cfg(target_os = "macos")]
+fn platform_nofile_ceiling(wanted: libc::rlim_t) -> libc::rlim_t {
+    const OPEN_MAX: libc::rlim_t = 10240;
+    wanted.min(max_files_per_process().unwrap_or(OPEN_MAX))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_nofile_ceiling(wanted: libc::rlim_t) -> libc::rlim_t {
+    wanted
 }
 
 #[cfg(target_os = "macos")]
@@ -121,6 +111,7 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 fn main() {
     tune_allocator();
     raise_nofile();
+    fsops::capture_process_umask();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
@@ -261,23 +252,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn raise_nofile_lifts_the_soft_limit_to_a_usable_value() {
+    fn raise_nofile_reaches_its_target() {
+        let target = super::nofile_raise_target();
         super::raise_nofile();
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes only into the local struct.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
-            0
-        );
-        // A rejected raise would leave macOS at its default soft limit of 256.
+        let after = crate::fsops::nofile_limits().unwrap();
+        if let Some((before, wanted)) = target {
+            assert!(wanted > before.rlim_cur);
+            assert_eq!(
+                after.rlim_cur, wanted,
+                "soft descriptor limit {} did not reach {wanted} under hard limit {}",
+                after.rlim_cur, before.rlim_max
+            );
+        }
         assert!(
-            limits.rlim_cur >= limits.rlim_max.min(1024),
-            "soft descriptor limit {} was not raised toward hard limit {}",
-            limits.rlim_cur,
-            limits.rlim_max
+            super::nofile_raise_target().is_none(),
+            "soft descriptor limit {} can still be raised under hard limit {}",
+            after.rlim_cur,
+            after.rlim_max
         );
     }
 }

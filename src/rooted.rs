@@ -2871,17 +2871,13 @@ mod tests {
         fs::create_dir_all(tree.path().join(&path)).unwrap();
         let base = File::open(tree.path()).unwrap();
 
-        let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
-            0
-        );
+        let mut limits = crate::fsops::nofile_limits().unwrap();
         assert!(
             limits.rlim_max >= 64,
             "hard file-descriptor limit is below 64"
         );
         limits.rlim_cur = 64;
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        crate::fsops::set_nofile_limits(&limits).unwrap();
 
         let resolver =
             OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();

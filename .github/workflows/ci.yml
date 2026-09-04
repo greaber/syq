@@ -292,7 +292,7 @@ jobs:
         if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked --bin syq --
-          --exact tests::raise_nofile_lifts_the_soft_limit_to_a_usable_value
+          --exact tests::raise_nofile_reaches_its_target
           fsops::tests::process_umask_matches_file_creation
       - name: Exercise macOS descriptor-pressure bounds
         if: needs.scope.outputs.macos == 'true'

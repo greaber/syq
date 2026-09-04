@@ -330,9 +330,7 @@ fn reject_control_plane_scopes(
 
 #[cfg(not(test))]
 fn read_process_umask() -> u32 {
-    // RestrictedAuthority is constructed by the forced receiver before it
-    // starts any protocol worker threads, which the portable fallback in
-    // `process_umask` relies on.
+    // main captured the mask before any thread existed.
     crate::fsops::process_umask()
 }
 
