@@ -3,6 +3,15 @@
 # metadata, checksums, the standalone installer, and the Homebrew formula.
 set -euo pipefail
 
+# Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 vVERSION DIST_DIR" >&2
   exit 2
@@ -43,10 +52,10 @@ for index in "${!targets[@]}"; do
     exit 1
   fi
 
-  binary_hash=$(sha256sum "$binary" | awk '{print $1}')
-  archive_hash=$(sha256sum "$archive" | awk '{print $1}')
-  binary_size=$(stat -c '%s' "$binary")
-  archive_size=$(stat -c '%s' "$archive")
+  binary_hash=$(sha256_file "$binary")
+  archive_hash=$(sha256_file "$archive")
+  binary_size=$(wc -c < "$binary" | tr -d ' ')
+  archive_size=$(wc -c < "$archive" | tr -d ' ')
   printf '%s  %s\n' "$binary_hash" "$asset" > "$binary.sha256"
   printf '%s  %s\n' "$archive_hash" "$asset.gz" > "$archive.sha256"
 
@@ -68,10 +77,10 @@ jq -n --sort-keys \
 
 "$script_dir/generate-installer.sh" "$manifest_core" "$dist/install.sh"
 "$script_dir/generate-homebrew-formula.sh" "$manifest_core" "$dist/syq.rb"
-installer_hash=$(sha256sum "$dist/install.sh" | awk '{print $1}')
-installer_size=$(stat -c '%s' "$dist/install.sh")
-formula_hash=$(sha256sum "$dist/syq.rb" | awk '{print $1}')
-formula_size=$(stat -c '%s' "$dist/syq.rb")
+installer_hash=$(sha256_file "$dist/install.sh")
+installer_size=$(wc -c < "$dist/install.sh" | tr -d ' ')
+formula_hash=$(sha256_file "$dist/syq.rb")
+formula_size=$(wc -c < "$dist/syq.rb" | tr -d ' ')
 jq --sort-keys \
   --arg installer_sha "$installer_hash" --argjson installer_size "$installer_size" \
   --arg formula_sha "$formula_hash" --argjson formula_size "$formula_size" \
@@ -91,7 +100,7 @@ for asset in "${assets[@]}"; do
 done | sort > "$expected"
 printf '%s\n' install.sh syq-release-manifest.json syq.rb >> "$expected"
 sort -o "$expected" "$expected"
-find "$dist" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$actual"
+find "$dist" -mindepth 1 -maxdepth 1 | sed 's|.*/||' | sort > "$actual"
 diff -u "$expected" "$actual" || {
   echo "release directory contains missing or unexpected files" >&2
   exit 1

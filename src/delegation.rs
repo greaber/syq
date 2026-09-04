@@ -875,16 +875,43 @@ impl SshsigPolicy {
             .args(["-I", signer, "-n", SSHSIG_NAMESPACE, "-s"])
             .arg(signature_child.path());
         if let Some(revocation) = &revocation_child {
-            command.arg("-r").arg(revocation.path());
+            // ssh-keygen opens a plain-text revocation list twice: once to
+            // probe for KRL magic and again to scan keys. On Darwin an open of
+            // /dev/fd/N duplicates the descriptor and shares its offset, so the
+            // second pass would start at EOF and a revoked key would verify.
+            // macOS therefore names the snapshot relative to the store's
+            // retained directory descriptor, which the child enters with
+            // fchdir below, so a replaced path cannot substitute the list.
+            let argument = if cfg!(target_os = "macos") {
+                PathBuf::from(
+                    &revocation_file
+                        .as_ref()
+                        .expect("revocation snapshot exists when its descriptor does")
+                        .name,
+                )
+            } else {
+                revocation.path()
+            };
+            command.arg("-r").arg(argument);
         }
         let mut mappings = vec![signature_child.mapping(), allowed_child.mapping()];
         if let Some(revocation) = &revocation_child {
             mappings.push(revocation.mapping());
         }
+        let store_directory = if cfg!(target_os = "macos") && revocation_child.is_some() {
+            Some(store.directory.as_raw_fd())
+        } else {
+            None
+        };
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) == -1 {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(directory) = store_directory {
+                    if libc::fchdir(directory) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 for (source, target) in &mappings {
                     dup2_retry(*source, *target)?;
@@ -1203,6 +1230,27 @@ impl ReplayStore {
         Ok(())
     }
 
+    /// Open the shared lock file, creating it on first use. macOS can answer
+    /// a concurrent `O_CREAT` open of one name with a spurious `ENOENT` while
+    /// another thread is creating it, so retry that case a few times.
+    fn open_lock(&self) -> io::Result<File> {
+        let mut attempt = 0;
+        loop {
+            match openat_file(
+                self.directory.as_raw_fd(),
+                ".claim-lock",
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound && attempt < 16 => {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn claim_after_lock(
         &self,
         request: RequestId,
@@ -1210,13 +1258,9 @@ impl ReplayStore {
         claimed_at: impl FnOnce() -> Result<i64>,
     ) -> Result<()> {
         request.validate()?;
-        let lock = openat_file(
-            self.directory.as_raw_fd(),
-            ".claim-lock",
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-        .with_context(|| format!("open replay lock in {}", self.path.display()))?;
+        let lock = self
+            .open_lock()
+            .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
         flock_exclusive(lock.as_raw_fd()).context("lock replay claim store")?;
         // Timestamp and revalidate only after a potentially queued lock wait.
@@ -1665,11 +1709,20 @@ mod tests {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .expect("tests require an absolute private runtime or home directory");
+            // Resolve symlinks (macOS `/var`) and keep the name short: an
+            // ssh-agent socket beneath this directory must fit `sun_path`,
+            // which is 104 bytes on macOS beneath an already long `TMPDIR`.
+            let parent = fs::canonicalize(&parent).unwrap_or(parent);
+            let label: String = label
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(6)
+                .collect();
             for _ in 0..100 {
                 let path = parent.join(format!(
-                    "syq-delegation-{label}-{}-{}",
+                    "syq-{label}-{}-{}",
                     std::process::id(),
-                    hex(&random_array::<12>().expect("test randomness"))
+                    hex(&random_array::<4>().expect("test randomness"))
                 ));
                 let result = fs::DirBuilder::new().mode(0o700).create(&path);
                 match result {
@@ -2486,9 +2539,12 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let failures: Vec<_> = results.into_iter().filter_map(Result::err).collect();
         assert_eq!(failures.len(), 7);
-        assert!(failures.iter().all(|error| error
-            .to_string()
-            .contains("signed request has already been redeemed")));
+        assert!(
+            failures.iter().all(|error| error
+                .to_string()
+                .contains("signed request has already been redeemed")),
+            "{failures:?}"
+        );
         let mut no_verifier = fixture.policy();
         no_verifier.ssh_keygen = PathBuf::from("/missing/verifier-must-not-run");
         let error = verify_and_claim(
@@ -2722,6 +2778,35 @@ mod tests {
         let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect_err("a key listed only for another principal must fail");
         assert!(error.to_string().starts_with("SSHSIG verification failed"));
+    }
+
+    #[test]
+    fn revocation_survives_replay_path_replacement() {
+        let fixture = Fixture::ordinary();
+        let revocations = fixture.directory.join("revocations");
+        let public_key =
+            fs::read(fixture.key.with_extension("pub")).expect("read revoked test public key");
+        write_private(&revocations, &public_key);
+        let mut policy = fixture.policy();
+        policy.revocation_file = Some(revocations);
+        let replay = fixture.replay("replaced-replay");
+        // Move the opened store aside and put a fresh, empty store at its
+        // old path. The verifier must keep using the retained directory.
+        let moved = fixture.directory.join("replaced-replay-moved");
+        fs::rename(&replay.path, &moved).expect("move replay directory");
+        provision_test_replay_directory(&replay.path);
+        let error = verify_and_claim(
+            &fixture.signed(fixture_grant(26)),
+            &context(SIGNER, TARGET, NOW, 0),
+            &policy,
+            &replay,
+        )
+        .expect_err("a revoked signer must fail after its store path is replaced");
+        assert!(
+            error.to_string().starts_with("SSHSIG verification failed"),
+            "{error:#}"
+        );
+        assert!(fs::read_dir(&replay.path).unwrap().next().is_none());
     }
 
     #[test]

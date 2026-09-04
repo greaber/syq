@@ -3,6 +3,15 @@
 # the release tag. Exit 3 means that the version has not been published yet.
 set -euo pipefail
 
+# Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 VERSION CRATE_FILE" >&2
   exit 2
@@ -19,7 +28,8 @@ if [ ! -f "$package" ] || [ -L "$package" ]; then
   exit 1
 fi
 command -v jq >/dev/null || { echo 'crate verification needs jq' >&2; exit 1; }
-command -v sha256sum >/dev/null || { echo 'crate verification needs sha256sum' >&2; exit 1; }
+command -v sha256sum >/dev/null || command -v shasum >/dev/null \
+  || { echo 'crate verification needs sha256sum or shasum' >&2; exit 1; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-crates-io.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
@@ -67,7 +77,7 @@ published_checksum=$(jq -er '.version.checksum' "$response") || {
   exit 1
 }
 
-local_checksum=$(sha256sum "$package" | awk '{print $1}')
+local_checksum=$(sha256_file "$package")
 [ "$published_checksum" = "$local_checksum" ] || {
   echo "crates.io syq $version differs from the package assembled from this tag" >&2
   echo "published: $published_checksum" >&2

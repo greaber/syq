@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn release_fetches_reject_plain_http() {
-        let parent = std::env::temp_dir();
+        let parent = crate::test_support::temp_dir();
         let destination = TempFile::new(&parent, ".http-test").unwrap();
         let error = fetch(
             "http://127.0.0.1:1/release",

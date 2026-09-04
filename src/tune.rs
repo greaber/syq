@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     fn temporary_cache(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_support::temp_dir().join(format!(
             "syq-tune-test-{}-{name}-{}",
             std::process::id(),
             std::time::SystemTime::now()

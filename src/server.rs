@@ -896,7 +896,11 @@ fn accept_data_connections(
             break;
         }
         let stream = match listener.accept() {
-            Ok((stream, _)) => stream,
+            // BSD-derived kernels (macOS) hand accepted sockets the
+            // listener's non-blocking flag; Linux does not. Every
+            // connection handler expects a blocking socket.
+            Ok((stream, _)) if stream.set_nonblocking(false).is_ok() => stream,
+            Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
@@ -1181,7 +1185,7 @@ mod tests {
     fn tcp_server_joins_request_reader_on_shutdown() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let selected = tempfile::tempdir().unwrap();
+        let selected = crate::test_support::tempdir().unwrap();
         let marker = selected.path().join("marker");
         std::fs::write(&marker, b"marker").unwrap();
         let descriptor_session = DescriptorSessionSlot::default();
@@ -1340,7 +1344,7 @@ mod tests {
 
     #[test]
     fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
-        let selected = tempfile::tempdir().unwrap();
+        let selected = crate::test_support::tempdir().unwrap();
         let owner = DescriptorSessionSlot::default();
         let ticket = owner
             .register(std::fs::File::open(selected.path()).unwrap())
@@ -1393,7 +1397,7 @@ mod tests {
 
     #[test]
     fn rejected_source_ticket_is_not_acknowledged_as_ready() {
-        let selected = tempfile::tempdir().unwrap();
+        let selected = crate::test_support::tempdir().unwrap();
         let owner = DescriptorSessionSlot::default();
         let ticket = owner
             .register(std::fs::File::open(selected.path()).unwrap())
@@ -1480,7 +1484,7 @@ mod tests {
 
     #[test]
     fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let authority = Arc::new(crate::restricted::tests::tcp_test_authority(&root));

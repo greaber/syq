@@ -2502,8 +2502,8 @@ mod tests {
     impl TestDir {
         fn new(name: &str) -> Self {
             let n = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("syq-rooted-{name}-{}-{n}", std::process::id()));
+            let path = crate::test_support::temp_dir()
+                .join(format!("syq-rooted-{name}-{}-{n}", std::process::id()));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -3218,6 +3218,10 @@ mod tests {
 
     #[test]
     fn confined_primitives_round_trip_non_utf8_names() {
+        if !crate::test_support::filesystem_accepts_non_utf8_names() {
+            eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+            return;
+        }
         let tree = TestDir::new("primitives");
         let root = Root::open(tree.path()).unwrap();
         root.create_directory(&relative(b"dir"), 0o700).unwrap();

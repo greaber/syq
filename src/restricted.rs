@@ -4439,7 +4439,7 @@ pub(crate) mod tests {
 
     #[test]
     fn receiver_publication_is_atomic_private_and_executable() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let directory = open_directory(temporary.path()).unwrap();
         atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v1").unwrap();
@@ -4514,7 +4514,7 @@ pub(crate) mod tests {
 
     #[test]
     fn final_enrollment_cleanup_preserves_general_account_directories() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let home = temporary.path();
         let local = home.join(".local");
         let share = local.join("share");
@@ -4538,7 +4538,7 @@ pub(crate) mod tests {
 
     #[test]
     fn local_management_executable_check_is_scoped_to_the_open_file() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let executable = temporary.path().join("syq");
         fs::write(&executable, b"test executable").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4575,7 +4575,7 @@ pub(crate) mod tests {
             child.wait_with_output().unwrap()
         }
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let request = br#"{"value":"' ; exit 91; #"}"#;
         let output = invoke(
             temporary.path(),
@@ -5004,7 +5004,7 @@ pub(crate) mod tests {
 
     #[test]
     fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
@@ -5118,7 +5118,7 @@ pub(crate) mod tests {
 
     #[test]
     fn exact_destination_observation_scope_excludes_its_parent() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
@@ -5145,7 +5145,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_filters_bind_scans_mutations_and_prune_protection() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let policy = FilterPolicy {
@@ -5227,7 +5227,7 @@ pub(crate) mod tests {
 
     #[test]
     fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let destination = root.join("target").as_os_str().as_bytes().to_vec();
@@ -5279,7 +5279,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_inplace_policy_requires_inplace_file_mutations() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority_with_policy(
@@ -5442,7 +5442,7 @@ pub(crate) mod tests {
     #[test]
     fn signed_skip_policy_retains_preexisting_objects() {
         use proto::TargetCondition::{Absent, Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let dir = target.join("dir");
@@ -5548,7 +5548,7 @@ pub(crate) mod tests {
     #[test]
     fn signed_must_exist_policy_creates_nothing() {
         use proto::TargetCondition::{Absent, Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let dir = target.join("dir");
@@ -5624,7 +5624,7 @@ pub(crate) mod tests {
     #[test]
     fn provisional_creations_are_forgotten_when_execution_fails() {
         use proto::TargetCondition::{Absent, Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
@@ -5683,7 +5683,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_request_leaves_no_provisional_creations_behind() {
         use proto::TargetCondition::{Absent, Any};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let kept = target.join("kept");
@@ -5731,7 +5731,7 @@ pub(crate) mod tests {
     #[test]
     fn must_exist_accepts_only_the_observed_identity() {
         use proto::TargetCondition::{Matches, MatchesFingerprint};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let present = target.join("present");
@@ -5773,7 +5773,7 @@ pub(crate) mod tests {
     #[test]
     fn must_exist_pins_update_only_operations() {
         use proto::TargetCondition::{Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let present = target.join("present");
@@ -5832,7 +5832,7 @@ pub(crate) mod tests {
     #[test]
     fn must_exist_replacement_and_metadata_execute_as_one_batch() {
         use proto::TargetCondition::{Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let link = target.join("link");
@@ -5933,7 +5933,7 @@ pub(crate) mod tests {
 
     #[test]
     fn receipt_attests_confirmed_outcomes_and_closes_the_grant() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let kept = target.join("kept");
@@ -6136,7 +6136,7 @@ pub(crate) mod tests {
 
     #[test]
     fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
@@ -6195,7 +6195,7 @@ pub(crate) mod tests {
 
     #[test]
     fn older_observation_does_not_release_newer_real_reservation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
@@ -6247,10 +6247,15 @@ pub(crate) mod tests {
 
     #[test]
     fn receipt_v2_records_each_outcome_and_closure_state_then_encrypts_it() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
-        let copied_name = vec![b'c', b'o', b'p', 0xff];
+        // Exercise a raw byte name where the filesystem allows one.
+        let copied_name = if crate::test_support::filesystem_accepts_non_utf8_names() {
+            vec![b'c', b'o', b'p', 0xff]
+        } else {
+            b"copied".to_vec()
+        };
         let copied = target.join(OsString::from_vec(copied_name.clone()));
         let failed = target.join("failed");
         let removed = target.join("removed");
@@ -6383,7 +6388,7 @@ pub(crate) mod tests {
 
     #[test]
     fn in_place_files_appear_in_the_receipt_before_their_final_step() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let image = target.join("image");
@@ -6539,7 +6544,7 @@ pub(crate) mod tests {
     #[test]
     fn guarded_executor_honors_creation_conditions() {
         use proto::TargetCondition::{Absent, Any, Matches};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let file = target.join("file");
@@ -6601,7 +6606,7 @@ pub(crate) mod tests {
     #[test]
     fn new_directory_placement_root_must_be_created_as_a_directory() {
         use proto::TargetCondition::{Absent, Any};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let target = root.join("target");
@@ -6625,7 +6630,7 @@ pub(crate) mod tests {
 
     #[test]
     fn inplace_publication_cannot_honor_no_replace_policies() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let inplace = |existing, placement, root_existence| {
@@ -6692,7 +6697,7 @@ pub(crate) mod tests {
     #[test]
     fn signed_root_existence_is_checked_at_claim_and_forced_on_creation() {
         use proto::TargetCondition::{Absent, Any};
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let target = root.join("target");
@@ -6779,7 +6784,7 @@ pub(crate) mod tests {
 
     #[test]
     fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let target = root.join("target").as_os_str().as_bytes().to_vec();
@@ -6831,7 +6836,7 @@ pub(crate) mod tests {
 
     #[test]
     fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let existing_directory = target.join("existing-dir");
@@ -7069,7 +7074,7 @@ pub(crate) mod tests {
 
     #[test]
     fn receiver_managed_missing_root_preserves_receiver_umask_and_inherited_setgid() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         fs::create_dir(&root).unwrap();
@@ -7098,7 +7103,13 @@ pub(crate) mod tests {
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2700);
+        // Linux propagates a parent's setgid bit to new directories; BSD-derived
+        // kernels (macOS) inherit the group without the bit.
+        let inherited_setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
+        assert_eq!(
+            fs::metadata(&target).unwrap().mode() & 0o7777,
+            0o700 | inherited_setgid
+        );
 
         let mut metadata = Request::Apply {
             ops: vec![Op::SetMeta {
@@ -7127,22 +7138,25 @@ pub(crate) mod tests {
         assert!(matches!(
             ops[0],
             Op::SetMeta {
-                meta: proto::Meta { mode: 0o2755, .. },
+                meta: proto::Meta { mode, .. },
                 flags: proto::flags::MODE,
                 condition: proto::TargetCondition::MatchesFingerprint { .. },
                 ..
-            }
+            } if mode == 0o755 | inherited_setgid
         ));
         assert!(crate::fsops::FsOps::new()
             .apply(ops, Some(guard))
             .into_iter()
             .all(|error| error.is_none()));
-        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o2755);
+        assert_eq!(
+            fs::metadata(&target).unwrap().mode() & 0o7777,
+            0o755 | inherited_setgid
+        );
     }
 
     #[test]
     fn signed_hash_block_and_response_bounds_are_enforced() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, DEFAULT_MAX_BYTES);
@@ -7182,7 +7196,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_file_data_rate_is_enforced_across_requests() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 1024, 1024);
@@ -7254,7 +7268,7 @@ pub(crate) mod tests {
 
     #[test]
     fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
@@ -7312,7 +7326,7 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_read_only_modes_reject_every_destination_mutation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
@@ -7358,7 +7372,7 @@ pub(crate) mod tests {
 
     #[test]
     fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
@@ -7399,7 +7413,7 @@ pub(crate) mod tests {
 
     #[test]
     fn entry_ceiling_survives_resubmission_of_a_rejected_path() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         // The helper grant allows eight entries.
@@ -7435,7 +7449,7 @@ pub(crate) mod tests {
 
     #[test]
     fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority_with_policy(
@@ -7474,7 +7488,7 @@ pub(crate) mod tests {
 
     #[test]
     fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir_all(root.join("target")).unwrap();
         // The helper grant allows 16 bytes in total and per file.
@@ -7553,7 +7567,7 @@ pub(crate) mod tests {
 
     #[test]
     fn scanned_entries_count_against_the_entry_ceiling() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         // The helper grant allows eight entries.
@@ -7786,7 +7800,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rooted_scan_and_hash_never_follow_a_payload_symlink() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         let outside = temporary.path().join("outside");
@@ -7849,7 +7863,7 @@ pub(crate) mod tests {
 
     #[test]
     fn restricted_authority_rejects_caller_source_registration() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);

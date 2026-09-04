@@ -196,24 +196,29 @@ fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
 /// Apply an explicit Linux TCP_CONGESTION override and read it back. With no
 /// override this is observational only: an unavailable getter returns None
 /// and never changes normal socket behavior.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
+    _socket: &S,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    match requested {
+        None => Ok(None),
+        Some(requested) => Err(TcpCongestionError(format!(
+            "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     socket: &S,
     requested: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(requested) = requested else {
-        #[cfg(target_os = "linux")]
         return Ok(tcp_congestion_control(socket).ok());
-        #[cfg(not(target_os = "linux"))]
-        return Ok(None);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    return Err(TcpCongestionError(format!(
-        "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
-    ))
-    .into());
-
-    #[cfg(target_os = "linux")]
     {
         let result = unsafe {
             libc::setsockopt(
@@ -246,6 +251,22 @@ pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn connect_tcp_stream(
+    address: &SocketAddr,
+    timeout: std::time::Duration,
+    congestion_control: Option<&str>,
+) -> Result<TcpStream> {
+    match congestion_control {
+        None => TcpStream::connect_timeout(address, timeout).map_err(Into::into),
+        Some(congestion_control) => Err(TcpCongestionError(format!(
+            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn connect_tcp_stream(
     address: &SocketAddr,
     timeout: std::time::Duration,
@@ -255,16 +276,6 @@ fn connect_tcp_stream(
         return TcpStream::connect_timeout(address, timeout).map_err(Into::into);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (address, timeout);
-        return Err(TcpCongestionError(format!(
-            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
-        ))
-        .into());
-    }
-
-    #[cfg(target_os = "linux")]
     {
         use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -325,10 +336,44 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     })
 }
 
+/// `struct tcp_connection_info` as the XNU kernel lays it out. The `libc`
+/// crate expands the kernel's single 32-bit TFO bit-field word into
+/// eighteen separate fields, which shifts every 64-bit counter and makes the
+/// kernel's returned length fall short of them.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DarwinTcpConnectionInfo {
+    tcpi_state: u8,
+    tcpi_snd_wscale: u8,
+    tcpi_rcv_wscale: u8,
+    __pad1: u8,
+    tcpi_options: u32,
+    tcpi_flags: u32,
+    tcpi_rto: u32,
+    tcpi_maxseg: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_snd_sbbytes: u32,
+    tcpi_rcv_wnd: u32,
+    tcpi_rttcur: u32,
+    tcpi_srtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_tfo: u32,
+    tcpi_txpackets: u64,
+    tcpi_txbytes: u64,
+    tcpi_txretransmitbytes: u64,
+    tcpi_rxpackets: u64,
+    tcpi_rxbytes: u64,
+    tcpi_rxoutoforderbytes: u64,
+    tcpi_txretransmitpackets: u64,
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
-    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let mut info: DarwinTcpConnectionInfo = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<DarwinTcpConnectionInfo>() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
@@ -344,7 +389,7 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     macro_rules! field {
         ($name:ident, $value:expr) => {
             ((len as usize)
-                >= std::mem::offset_of!(libc::tcp_connection_info, $name)
+                >= std::mem::offset_of!(DarwinTcpConnectionInfo, $name)
                     + std::mem::size_of_val(&info.$name))
             .then(|| $value)
         };
@@ -2435,7 +2480,7 @@ mod tests {
 
     #[test]
     fn local_workers_clone_the_control_descriptor_session_in_process() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let endpoint = Endpoint::local();
@@ -2471,7 +2516,7 @@ mod tests {
 
     #[test]
     fn local_source_worker_rejects_destination_mutation_requests() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let marker = selected.join("marker");
@@ -2611,11 +2656,13 @@ mod tests {
         assert_eq!(byte, [7]);
         assert!(
             client_stats.segments_sent.is_some_and(|value| value > 0)
-                || client_stats.bytes_sent.is_some_and(|value| value > 0)
+                || client_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{client_stats:?}"
         );
         assert!(
             server_stats.segments_sent.is_some_and(|value| value > 0)
-                || server_stats.bytes_sent.is_some_and(|value| value > 0)
+                || server_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{server_stats:?}"
         );
         #[cfg(target_os = "linux")]
         {
@@ -2714,7 +2761,7 @@ mod tests {
 
     #[test]
     fn hello_carries_destination_initialization_before_readiness() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let descriptor_session = crate::descriptor_broker::DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(temp.path()).unwrap())
@@ -3107,7 +3154,7 @@ mod tests {
     #[test]
     fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let base = directory.path().join("scope");
         crate::persistence::initialize_scope(&base).unwrap();
         // The socket name is stable per endpoint, and a dead leftover at the

@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn endpoint_records_are_stable_and_inactive_scopes_close_cleanly() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let first = prepare_endpoint(&scope, Some("alice"), "example", None).unwrap();
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn concurrent_endpoint_registration_publishes_one_complete_record() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn explicit_scope_validation_never_follows_or_chmods_a_symlink() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let victim = temporary.path().join("victim");
         std::fs::create_dir(&victim).unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
