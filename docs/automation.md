@@ -45,9 +45,9 @@ The results stream is always written on the machine you invoke syq from. A
 local removal and a removal over plain SSH both send each entry's outcome back
 to that machine. The restricted receiver (the command-restricted receiver, a
 forced command on hostB that syq installs when you enroll a destination)
-deliberately rejects native removal: the signed grants it accepts currently
-authorize copy writes only, and no permission or limit for deletion is
-inferred from them.
+rejects native removal: a signed grant authorizes the changes of one copy,
+including that copy's `--prune` deletions under an explicit `--max-delete`
+ceiling. There is no grant form for `syq rm`.
 
 For a remote-to-remote copy there are two ways to fill the stream. Through the
 restricted receiver, the stream is **receiver-attested**: built from hostB's
@@ -78,8 +78,11 @@ immediately. If writing the stream itself fails, syq warns once on
 stderr and stops writing; the consumer detects this as a missing
 terminal record. Argument and usage errors exit `2` with no stream at
 all: a consumer constructs its own argv, so a usage error is a
-consumer bug and gets no JSON. Every run that gets past argument
-parsing emits a terminal record, fatal setup failures included.
+consumer bug and gets no JSON. If the stream cannot be opened (the results
+file already exists, or the descriptor is closed or read-only), syq exits `1`
+with no stream. Once the stream is open, a completed run emits a terminal
+record, fatal setup failures included, provided the stream stays writable.
+A crash or interruption can also leave it incomplete.
 
 ## Record envelope
 
@@ -160,8 +163,7 @@ counted in the terminal record only. Metadata-only updates (permissions,
 ownership, or times reconciled on an otherwise unchanged object, that is,
 an unchanged file, directory, symlink, or special file) are not reported
 per operation in v1: a live run emits no record for them, while a dry run
-does emit a `metadata_differs` trace for the same situation. Closing that
-asymmetry with a metadata result action is a candidate additive extension.
+does emit a `metadata_differs` trace for the same situation.
 
 Copy streams use `trace` and `operation_result`; removal streams use the next
 three record types instead.
@@ -228,8 +230,8 @@ an `object` that is `{"state": "absent"}`, an observation failure
 (`state`, `code`, `message`), or `{"state": "present"}` with `kind`
 (the receiver's precise vocabulary: `dir`, `file`, `symlink`, `fifo`,
 `socket`, `character_device`, `block_device`, `other`), `size`,
-`metadata` (mode/uid/gid/mtime), and, under `--receiver-receipt digests`, a
-`digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
+`metadata` (`mode`, `uid`, `gid`, `mtime`, `mtime_nsec`, `rdev`), and, under
+`--receiver-receipt digests`, a `digest` (`{"algorithm": "blake3", "value": <hex>}`), plus
 `symlink_target` where applicable. Final states are what a verifier
 audits: they describe the tree hostB ended with, not what the transfer
 said it did.

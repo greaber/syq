@@ -144,7 +144,7 @@ What is different from rsync, or weaker:
   specific limits, but the protocol between the two sides has not been fuzzed
   the way rsync's has.
 
-### How confinement is verified
+### How path safety is tested
 
 Syq's tests for this behavior do not rely on scheduler timing. After syq has
 selected or opened a path, the test pauses it at that point, renames the
@@ -226,9 +226,11 @@ protects.
 
 For the duration of a transfer, syq starts a temporary agent-protocol socket
 locally (the constrained agent broker, or the broker for short) and forwards
-*that* to hostA instead of your real agent. The broker holds no private keys;
-it forwards signing requests to your real agent (or to the enrollment key
-below) only after validating the exact path the request is
+*that* to hostA instead of your real agent. With `--peer-auth broker`, it
+passes signing requests to your real agent without holding that agent's keys.
+On the default restricted path, it loads the dedicated enrollment private key
+from local state and signs with it; that key never goes to hostA. In both
+cases, the broker signs only after validating the exact path the request is
 for:
 
 ```text
@@ -304,8 +306,9 @@ Ignore rules, `--inplace`, preservation, the policy for objects that already
 exist at the destination, and placement preconditions are signed into the
 grant and enforced by the receiver on its own. Deletion through the receiver
 requires an explicit `--max-delete`, and the `--receiver-max-entries` and
-`--receiver-max-bytes` options lower the signed ceilings for one transfer, so
-what a redeemed grant is worth to hostA is always bounded on the command line.
+`--receiver-max-bytes` options replace the default limits for one transfer.
+They can increase or decrease them within the allowed ranges. HostA's
+authority is bounded by the defaults or the values you choose.
 Behavior the receiver cannot check independently of hostA is refused rather
 than trusted: `--mapping`, `--min-size`, sending data unencrypted or through
 ssh instead of over TCP data connections, and several others (the
@@ -314,7 +317,7 @@ is in the remote-to-remote guide). `--dry-run` is marked read-only in the
 grant, and the receiver rejects every mutation under it even if hostA sends
 one.
 
-### Layer 4: the rooted receiver
+### Layer 4: staying inside the destination directory
 
 Every destination scan, stat, hash, partial-file operation, metadata change,
 write, and deletion the receiver performs happens relative to the open handle

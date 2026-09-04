@@ -57,8 +57,9 @@ Several guarantees make the plan more than a printout:
 - **`--dry-run` and `--syq-verify-only` are read-only by construction.** For a
   remote-to-remote copy through the restricted receiver (the command-restricted
   receiver, a forced command on hostB that syq installs when you enroll a
-  destination), the signed grant that authorizes the copy marks them read-only,
-  and the receiver rejects every write even if the sending host attempts one.
+  destination), the signed grant marks a dry run read-only, and the receiver
+  rejects every write even if the sending host attempts one. Verification-only
+  is an rsync-mode option; it cannot run between two remote endpoints.
 
 What a plan does not give you is a transaction. A filesystem cannot make a
 change to several files all-or-nothing: permissions can change or a disk can
@@ -94,9 +95,10 @@ or a stream can express too:
   them, any tool that edits JSON can reshape a transfer, and syq checks the
   whole manifest for conflicting destinations before a byte moves:
 
-  ```sh
+  ```bash
+  set -o pipefail
   syq map --srcs-in photos \
-    | jq 'select(.kind == "file")
+    | jq -c 'select(.kind == "file")
           | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
     | syq cp --mapping - -C photos --to nas --into /archive
   ```
@@ -137,10 +139,14 @@ or a stream can express too:
   hostA reported, each record marked `"provenance": "receiver_attested"`,
   while the data flows directly between the hosts; without an enrollment, the
   run fails unless `--coordinate-at local` explicitly routes the data through
-  your machine. Failed operation records carry `src`, `dst`, and `kind`, so
-  once the terminal record says the run finished, a retry manifest is one
-  filter away. The [mappings guide](mappings.md#machine-readable-results) has
-  that filter, including the terminal-record check. This is what an exit code
+  your machine. A remote-to-remote dry run with `--results` always needs
+  `--coordinate-at local`, because only that coordinator produces the trace
+  stream. Failed mapping entries carry `src`, `dst`, and `kind`; failed
+  implicit ancestor directories can lack `src` and are non-retryable. Ordinary
+  copy and deletion records have no `src`. Once the terminal record says the
+  mapping run finished, a retry manifest is one filter away. The
+  [mappings guide](mappings.md#machine-readable-results) has that filter,
+  including the terminal-record check. This is what an exit code
   cannot express: which entries failed, and whether a retry could help.
 
 ## Reruns converge

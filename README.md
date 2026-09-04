@@ -24,7 +24,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/la
 
 No `sudo` is needed; the binary lands in `~/.local/bin`. Homebrew
 (`brew install greaber/tap/syq`) and Cargo (`cargo install --locked syq`) also
-work. Remote hosts need nothing installed in advance.
+work. With the installer or Homebrew, syq installs its matching remote helper
+on first use. Cargo builds need a compatible remote `syq`; see the
+[installation guide](https://greaber.github.io/syq/install.html#cargo).
 
 Bash, Zsh, and fish completion includes remote paths and becomes especially
 fast with `syq persist on`; see the [installation guide](https://greaber.github.io/syq/install.html#shell-completion).
