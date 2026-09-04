@@ -7,7 +7,7 @@ use crate::fsops::{self, FsOps};
 use crate::proto::*;
 use anyhow::{bail, Context, Result};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
@@ -377,11 +377,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     authority.clone(),
                     descriptor_session.clone(),
                 ) {
-                    Ok((port, congestion_control)) => w.write_msg(&Response::TcpListening {
-                        port,
-                        addrs: local_addrs(),
-                        congestion_control,
-                    })?,
+                    Ok((port, families, congestion_control)) => {
+                        w.write_msg(&Response::TcpListening {
+                            port,
+                            addrs: local_addrs(families),
+                            congestion_control,
+                        })?
+                    }
                     Err(e) if crate::conn::is_tcp_congestion_error(&e) => {
                         w.write_msg(&Response::TcpCongestionRejected(format!("{e:#}")))?
                     }
@@ -605,49 +607,206 @@ fn iface_speed(name: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// (ip, speed_mbps) for each real NIC the client might reach us on. The ssh
-/// session's own server-IP is first; virtual interfaces (docker/bridges/etc.)
-/// are skipped so multipath never fans out onto a dead bridge.
-fn local_addrs() -> Vec<(String, u32)> {
-    let ssh_ip = std::env::var("SSH_CONNECTION")
-        .ok()
-        .and_then(|c| c.split_whitespace().nth(2).map(str::to_string));
+/// Which address families the data listener bound, and so which advertised
+/// addresses a client could possibly connect to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundFamilies {
+    v4: bool,
+    v6: bool,
+}
+
+impl BoundFamilies {
+    fn accepts(self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(_) => self.v4,
+            IpAddr::V6(_) => self.v6,
+        }
+    }
+}
+
+/// (ip, speed_mbps) for each real NIC the client might reach us on, over
+/// both IPv4 and IPv6. The ssh session's own server address is first (and is
+/// included even when the interface listing is unavailable); virtual
+/// interfaces (docker/bridges/etc.) are skipped so multipath never fans out
+/// onto a dead bridge.
+fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
+    let ssh_ip = std::env::var("SSH_CONNECTION").ok().and_then(|c| {
+        c.split_whitespace()
+            .nth(2)
+            .and_then(|ip| ip.parse::<IpAddr>().ok())
+    });
     let out = std::process::Command::new("ip")
-        .args(["-o", "-4", "addr", "show"])
+        .args(["-o", "addr", "show"])
         .output();
     let text = out
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let mut addrs: Vec<(String, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
+    advertised_addrs(&text, ssh_ip, families, iface_speed)
+}
+
+/// Priority bucket for an advertised address: lower sorts first. The address
+/// ssh arrived on is bucket 0 (handled by the caller); this classifies the
+/// rest so that LAN addresses are tried before public ones and overlay
+/// (CGNAT / Tailscale) addresses last.
+fn addr_bucket(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            if v4.is_private() {
+                1
+            } else if a == 100 && (b & 0xc0) == 64 {
+                3 // CGNAT / Tailscale (100.64.0.0/10)
+            } else {
+                2 // public
+            }
+        }
+        IpAddr::V6(v6) => {
+            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+                1 // unique local (fc00::/7), e.g. a private cloud network
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// Parse `ip -o addr show` output into the addresses worth advertising, in
+/// priority order: the ssh arrival address, then by bucket, then by NIC speed
+/// (fastest first). Only `scope global` addresses of a bound family count,
+/// which drops loopback and link-local addresses (a client cannot use an
+/// `fe80::` address without the interface scope, which syq does not carry).
+fn advertised_addrs(
+    text: &str,
+    ssh_ip: Option<IpAddr>,
+    families: BoundFamilies,
+    iface_speed: impl Fn(&str) -> u32,
+) -> Vec<(String, u32)> {
+    let mut addrs: Vec<(IpAddr, u32, u8)> = Vec::new(); // (ip, speed, priority-bucket)
     for line in text.lines() {
-        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0"
+        // "3: bond0    inet 10.2.201.45/24 brd ... scope global bond0\ ..."
+        // "3: bond0    inet6 fdaa:0:1::2/112 scope global \ ..."
         let f: Vec<&str> = line.split_whitespace().collect();
-        let (Some(iface), Some(ipcidr)) = (f.get(1), f.iter().skip_while(|w| **w != "inet").nth(1))
-        else {
+        let Some(iface) = f.get(1) else {
             continue;
         };
+        let Some(family_at) = f.iter().position(|w| *w == "inet" || *w == "inet6") else {
+            continue;
+        };
+        let Some(ipcidr) = f.get(family_at + 1) else {
+            continue;
+        };
+        let scope = f
+            .iter()
+            .position(|w| *w == "scope")
+            .and_then(|at| f.get(at + 1))
+            .copied();
+        if scope != Some("global") {
+            continue;
+        }
+        // An address the kernel is still checking, or is retiring, is not a
+        // reliable route to advertise.
+        if f.iter().any(|w| *w == "tentative" || *w == "deprecated") {
+            continue;
+        }
         if is_virtual_iface(iface) {
             continue;
         }
-        let ip = ipcidr.split('/').next().unwrap_or("").to_string();
-        if ip.is_empty() || ip.starts_with("127.") {
+        let Some(ip) = ipcidr
+            .split('/')
+            .next()
+            .and_then(|ip| ip.parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        if !families.accepts(ip) || ip.is_loopback() {
             continue;
         }
-        let bucket = if ssh_ip.as_deref() == Some(&ip) {
+        let bucket = if ssh_ip == Some(ip) {
             0
-        } else if ip.starts_with("10.") || ip.starts_with("192.168.") || ip.starts_with("172.") {
-            1
-        } else if ip.starts_with("100.") {
-            3 // CGNAT / Tailscale
         } else {
-            2 // public
+            addr_bucket(ip)
         };
         addrs.push((ip, iface_speed(iface), bucket));
+    }
+    // The address ssh arrived on is reachable by construction (loopback
+    // included: the client is then on this host). Advertise it even when the
+    // listing did not name it (no `ip` tool, or an address on an interface
+    // the listing filtered out).
+    if let Some(ip) = ssh_ip {
+        if families.accepts(ip) && !addrs.iter().any(|a| a.0 == ip) {
+            addrs.push((ip, 0, 0));
+        }
     }
     // ssh-arrival ip first, then by bucket, then by speed (fastest first).
     addrs.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)));
     addrs.dedup_by(|a, b| a.0 == b.0);
-    addrs.into_iter().map(|(ip, sp, _)| (ip, sp)).collect()
+    addrs
+        .into_iter()
+        .map(|(ip, sp, _)| (ip.to_string(), sp))
+        .collect()
+}
+
+/// Bind the data listener on the first free port in `lo..=hi`, on both
+/// address families when the host supports both. IPv6 is bound `V6ONLY` so the
+/// two sockets never contend for the same wildcard address, whatever the
+/// platform default. A port where either family is already taken is skipped
+/// so the two listeners always share one port number; a family the host cannot
+/// bind at all (no IPv6, say) is simply left out.
+fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListener>)> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let mut last_error = None;
+    // Port 0 asks the kernel for an ephemeral port: the first family's bind
+    // chooses it and the second must follow. Retry a few times if the second
+    // family finds that port taken.
+    let attempts: Vec<u16> = if lo == 0 && hi == 0 {
+        vec![0; 8]
+    } else {
+        (lo..=hi.max(lo)).collect()
+    };
+    for requested in attempts {
+        let mut port = requested;
+        let mut listeners: Vec<TcpListener> = Vec::new();
+        let mut in_use = false;
+        for domain in [Domain::IPV4, Domain::IPV6] {
+            let bound = (|| -> std::io::Result<TcpListener> {
+                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+                // As std's TcpListener::bind does: a port with lingering
+                // TIME_WAIT sockets from an earlier transfer stays usable.
+                #[cfg(unix)]
+                socket.set_reuse_address(true)?;
+                let address: SocketAddr = if domain == Domain::IPV4 {
+                    (Ipv4Addr::UNSPECIFIED, port).into()
+                } else {
+                    socket.set_only_v6(true)?;
+                    (Ipv6Addr::UNSPECIFIED, port).into()
+                };
+                socket.bind(&SockAddr::from(address))?;
+                socket.listen(128)?;
+                Ok(socket.into())
+            })();
+            match bound {
+                Ok(listener) => {
+                    if port == 0 {
+                        port = listener.local_addr()?.port();
+                    }
+                    listeners.push(listener);
+                }
+                Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                    in_use = true;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if in_use || listeners.is_empty() {
+            continue;
+        }
+        return Ok((port, listeners));
+    }
+    match last_error {
+        Some(error) => bail!("no free port in {lo}-{hi} ({error})"),
+        None => bail!("no free port in {lo}-{hi}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -661,22 +820,24 @@ fn tcp_listen(
     congestion_control: Option<&str>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
-) -> Result<(u16, Option<String>)> {
-    let mut listener = None;
-    for port in lo..=hi.max(lo) {
-        if let Ok(l) = TcpListener::bind(("0.0.0.0", port)) {
-            listener = Some(l);
-            break;
-        }
-    }
-    let Some(listener) = listener else {
-        bail!("no free port in {lo}-{hi}");
-    };
+) -> Result<(u16, BoundFamilies, Option<String>)> {
+    let (port, listeners) = bind_data_listeners(lo, hi)?;
     // Passive connections inherit the listener's congestion controller. Set
-    // and verify it before advertising the port so even handshake-time
-    // behavior uses the requested algorithm.
-    let congestion_control = crate::conn::configure_tcp_congestion(&listener, congestion_control)?;
-    let port = listener.local_addr()?.port();
+    // and verify it on every listener before advertising the port so even
+    // handshake-time behavior uses the requested algorithm.
+    let mut effective_congestion_control = None;
+    for listener in &listeners {
+        let effective = crate::conn::configure_tcp_congestion(listener, congestion_control)?;
+        effective_congestion_control = effective_congestion_control.or(effective);
+    }
+    let families = BoundFamilies {
+        v4: listeners
+            .iter()
+            .any(|l| l.local_addr().is_ok_and(|a| a.is_ipv4())),
+        v6: listeners
+            .iter()
+            .any(|l| l.local_addr().is_ok_and(|a| a.is_ipv6())),
+    };
     let next_id = Arc::new(AtomicU32::new(1));
     // Bound in-flight data connections (a peer shouldn't be able to spawn
     // unbounded threads), and remember which client connection ids we've seen
@@ -690,61 +851,104 @@ fn tcp_listen(
     let seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let max_live = MAX_LIVE_TCP_CONNECTIONS;
-    listener.set_nonblocking(true)?;
-    std::thread::spawn(move || {
-        loop {
-            if descriptor_session.is_closed()
-                || authority
-                    .as_ref()
-                    .is_some_and(|authority| !authority.control_is_open())
-            {
-                break;
-            }
-            let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                Err(_) => continue,
-            };
-            let id = next_id.fetch_add(1, Relaxed);
-            if live.load(Relaxed) >= max_live {
-                if debug {
-                    eprintln!("syq server (tcp): refusing connection, {max_live} already live");
-                }
-                continue; // drop; stream closes
-            }
-            live.fetch_add(1, Relaxed);
-            let (key, token, live, seen, authority, descriptor_session) = (
-                key.clone(),
-                token.clone(),
-                live.clone(),
-                seen.clone(),
-                authority.clone(),
-                descriptor_session.clone(),
-            );
-            std::thread::spawn(move || {
-                if let Err(e) = serve_tcp(
-                    stream,
-                    id,
-                    key,
-                    token,
-                    debug,
-                    compress,
-                    &seen,
-                    authority.clone(),
-                    descriptor_session,
-                ) {
-                    if debug {
-                        eprintln!("syq server (tcp {id}): {e:#}");
-                    }
-                }
-                live.fetch_sub(1, Relaxed);
-            });
+    // One accept thread per bound family; every listener feeds the same
+    // token, connection limit, replay set, and id sequence.
+    for listener in listeners {
+        listener.set_nonblocking(true)?;
+        let (key, token, next_id, live, seen, authority, descriptor_session) = (
+            key.clone(),
+            token.clone(),
+            next_id.clone(),
+            live.clone(),
+            seen.clone(),
+            authority.clone(),
+            descriptor_session.clone(),
+        );
+        std::thread::spawn(move || {
+            accept_data_connections(
+                listener,
+                key,
+                token,
+                debug,
+                compress,
+                next_id,
+                live,
+                max_live,
+                seen,
+                authority,
+                descriptor_session,
+            )
+        });
+    }
+    Ok((port, families, effective_congestion_control))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_data_connections(
+    listener: TcpListener,
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    debug: bool,
+    compress: bool,
+    next_id: Arc<AtomicU32>,
+    live: Arc<AtomicU32>,
+    max_live: u32,
+    seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    descriptor_session: DescriptorSessionSlot,
+) {
+    loop {
+        if descriptor_session.is_closed()
+            || authority
+                .as_ref()
+                .is_some_and(|authority| !authority.control_is_open())
+        {
+            break;
         }
-    });
-    Ok((port, congestion_control))
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let id = next_id.fetch_add(1, Relaxed);
+        // Reserve a slot atomically: both family listeners charge one bound.
+        if live.fetch_add(1, Relaxed) >= max_live {
+            live.fetch_sub(1, Relaxed);
+            if debug {
+                eprintln!("syq server (tcp): refusing connection, {max_live} already live");
+            }
+            continue; // drop; stream closes
+        }
+        let (key, token, live, seen, authority, descriptor_session) = (
+            key.clone(),
+            token.clone(),
+            live.clone(),
+            seen.clone(),
+            authority.clone(),
+            descriptor_session.clone(),
+        );
+        std::thread::spawn(move || {
+            if let Err(e) = serve_tcp(
+                stream,
+                id,
+                key,
+                token,
+                debug,
+                compress,
+                &seen,
+                authority.clone(),
+                descriptor_session,
+            ) {
+                if debug {
+                    eprintln!("syq server (tcp {id}): {e:#}");
+                }
+            }
+            live.fetch_sub(1, Relaxed);
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -875,6 +1079,93 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+
+    const IP_ADDR_SHOW: &str = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+1: lo    inet6 ::1/128 scope host noprefixroute \\       valid_lft forever preferred_lft forever
+2: eth0    inet 172.19.3.10/29 brd 172.19.3.15 scope global eth0\\       valid_lft forever preferred_lft forever
+2: eth0    inet6 fdaa:0:1:a7b::2/112 scope global \\       valid_lft forever preferred_lft forever
+2: eth0    inet6 2001:db8::2/64 scope global \\       valid_lft forever preferred_lft forever
+2: eth0    inet6 2001:db8::3/64 scope global tentative \\       valid_lft forever preferred_lft forever
+2: eth0    inet6 fe80::9e6b:ff:fe4e:89ad/64 scope link \\       valid_lft forever preferred_lft forever
+3: bond0    inet 10.2.201.45/24 brd 10.2.201.255 scope global bond0\\       valid_lft forever preferred_lft forever
+4: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       valid_lft forever preferred_lft forever
+5: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever
+";
+
+    fn speeds(name: &str) -> u32 {
+        match name {
+            "bond0" => 25000,
+            "eth0" => 1000,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn advertised_addrs_lists_both_families_with_ssh_arrival_first() {
+        let ssh = "fdaa:0:1:a7b::2".parse().ok();
+        let both = BoundFamilies { v4: true, v6: true };
+        let got = advertised_addrs(IP_ADDR_SHOW, ssh, both, speeds);
+        assert_eq!(
+            got,
+            vec![
+                ("fdaa:0:1:a7b::2".to_string(), 1000),
+                ("10.2.201.45".to_string(), 25000),
+                ("172.19.3.10".to_string(), 1000),
+                ("2001:db8::2".to_string(), 1000),
+                ("100.101.102.103".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn advertised_addrs_only_names_families_the_listener_bound() {
+        let v4 = BoundFamilies {
+            v4: true,
+            v6: false,
+        };
+        let got = advertised_addrs(IP_ADDR_SHOW, None, v4, speeds);
+        assert!(got
+            .iter()
+            .all(|(ip, _)| ip.parse::<IpAddr>().unwrap().is_ipv4()));
+        assert_eq!(got[0].0, "10.2.201.45");
+        // The ssh arrival address is still advertised first, but only when a
+        // listener of its family exists.
+        let ssh = "fdaa:0:1:a7b::2".parse().ok();
+        let got = advertised_addrs(IP_ADDR_SHOW, ssh, v4, speeds);
+        assert!(!got.iter().any(|(ip, _)| ip.starts_with("fdaa")));
+    }
+
+    #[test]
+    fn advertised_addrs_includes_ssh_arrival_address_without_a_listing() {
+        let ssh = "203.0.113.7".parse().ok();
+        let both = BoundFamilies { v4: true, v6: true };
+        assert_eq!(
+            advertised_addrs("", ssh, both, speeds),
+            vec![("203.0.113.7".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn data_listeners_share_one_port_across_families() {
+        let (port, listeners) = bind_data_listeners(0, 0).unwrap();
+        assert_ne!(port, 0);
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+        assert!(ports.iter().all(|p| *p == port), "{ports:?} != {port}");
+        for listener in &listeners {
+            let local = listener.local_addr().unwrap();
+            let target: SocketAddr = if local.is_ipv4() {
+                (Ipv4Addr::LOCALHOST, port).into()
+            } else {
+                (Ipv6Addr::LOCALHOST, port).into()
+            };
+            TcpStream::connect_timeout(&target, Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("connect {target}: {e}"));
+        }
+    }
 
     struct ExitObserved<R> {
         inner: R,
@@ -1204,7 +1495,7 @@ mod tests {
         let max_workers = usize::from(crate::restricted::tests::TEST_AUTHORITY_MAX_CONNECTIONS);
         let token = b"data-token".to_vec();
         let descriptor_session = DescriptorSessionSlot::default();
-        let (port, _) = tcp_listen(
+        let (port, _, _) = tcp_listen(
             None,
             token.clone(),
             0,

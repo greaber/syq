@@ -215,7 +215,7 @@ pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
     Ok((lo, hi))
 }
 
-fn data_address(address: &str, port: u16) -> String {
+pub(crate) fn data_address(address: &str, port: u16) -> String {
     if address.contains(':') {
         format!("[{address}]:{port}")
     } else {

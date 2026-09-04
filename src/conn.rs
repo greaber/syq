@@ -1607,7 +1607,9 @@ impl RemoteSpec {
                             )
                         })
                     }
-                    Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
+                    Err(e) => {
+                        last = anyhow!("{}: {e}", crate::transfer::data_address(addr, info.port))
+                    }
                 }
             }
             let stream = match got {
@@ -1685,7 +1687,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         });
     }
     drop(resolved_tx);
-    let mut resolved = vec![Vec::new(); candidates.len()];
+    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     for _ in 0..candidates.len() {
         let Ok((i, addrs)) = resolved_rx.recv() else {
             break;
@@ -1693,18 +1695,37 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         resolved[i] = addrs;
     }
 
+    // Probe each distinct socket address once. An advertised literal and the
+    // ssh target name commonly resolve to the same address; one probe answers
+    // for every candidate that led there.
+    let mut targets: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
+    let mut remaining: Vec<usize> = vec![0; candidates.len()];
+    for (i, addrs) in resolved.iter().enumerate() {
+        for &addr in addrs {
+            let owners = match targets.iter_mut().find(|(target, _)| *target == addr) {
+                Some((_, owners)) => owners,
+                None => {
+                    targets.push((addr, Vec::new()));
+                    &mut targets.last_mut().unwrap().1
+                }
+            };
+            if !owners.contains(&i) {
+                owners.push(i);
+                remaining[i] += 1;
+            }
+        }
+    }
+
     let timeout = std::time::Duration::from_millis(1000);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut remaining: Vec<usize> = resolved.iter().map(Vec::len).collect();
     let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
     let mut determined = vec![false; candidates.len()];
-    for (i, addrs) in resolved.into_iter().enumerate() {
-        for addr in addrs {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send((i, TcpStream::connect_timeout(&addr, timeout).is_ok()));
-            });
-        }
+    for (t, (addr, _)) in targets.iter().enumerate() {
+        let tx = tx.clone();
+        let addr = *addr;
+        std::thread::spawn(move || {
+            let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+        });
     }
     drop(tx);
 
@@ -1716,17 +1737,19 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
-        let Ok((i, reachable)) = rx.recv_timeout(wait) else {
+        let Ok((t, reachable)) = rx.recv_timeout(wait) else {
             break;
         };
-        if determined[i] {
-            continue;
-        }
-        remaining[i] -= 1;
-        if reachable || remaining[i] == 0 {
-            candidates[i].reachable = reachable;
-            determined[i] = true;
-            undetermined -= 1;
+        for &i in &targets[t].1 {
+            if determined[i] {
+                continue;
+            }
+            remaining[i] -= 1;
+            if reachable || remaining[i] == 0 {
+                candidates[i].reachable = reachable;
+                determined[i] = true;
+                undetermined -= 1;
+            }
         }
     }
 }
@@ -3158,5 +3181,40 @@ mod tests {
             args[control_index + 1].as_bytes(),
             b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
         );
+    }
+
+    #[test]
+    fn probe_reachable_probes_each_socket_address_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let via_localhost = ("localhost", port)
+            .to_socket_addrs()
+            .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
+            .unwrap_or(false);
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            while let Ok((_stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let candidate = |address: &str| TcpCandidate {
+            address: address.to_string(),
+            speed_mbps: 0,
+            source: DataAddressSource::RemoteInterface,
+            reachable: false,
+            selected: false,
+        };
+        let mut candidates = vec![
+            candidate("127.0.0.1"),
+            candidate("localhost"),
+            candidate("127.0.0.1"),
+        ];
+        probe_reachable(&mut candidates, port);
+        assert!(candidates[0].reachable);
+        assert!(candidates[2].reachable);
+        assert_eq!(candidates[1].reachable, via_localhost);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

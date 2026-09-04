@@ -30,8 +30,8 @@ table](reference.md#compatibility-options)).
    process at a few hundred MB/s of cipher work. Syq keeps ssh for
    authentication and control and moves data over separate TCP connections
    carrying AES-256-GCM records keyed through the ssh session. It advertises
-   every address the remote has, prefers the fastest that answers, and spreads
-   connections across NICs of comparable speed. If no port is reachable it says
+   every IPv4 and IPv6 address the remote has, prefers the fastest that
+   answers, and spreads connections across NICs of comparable speed. If no port is reachable it says
    so once and falls back to ssh data connections. See [TCP data
    connections](#tcp-data-connections).
 3. **Kernel and server-side copies on one machine.** Same-machine copies use
@@ -247,6 +247,17 @@ AES-256-GCM records keyed by a secret exchanged over the ssh session
 (`--syq-tcp-plain` skips the encryption on trusted networks; `--syq-no-tcp` sends data over the ssh connection instead). If the port can't be
 reached — a firewall, typically — syq says so once and falls back to ssh data
 connections, so the default is always safe.
+
+The listener accepts IPv4 and IPv6 on the same port, and the remote advertises
+its global addresses of both families: the address your ssh session arrived
+on first, then private-network addresses, then public ones, then overlay
+addresses such as Tailscale, with faster NICs first within each group.
+Link-local IPv6 addresses (`fe80::`) and addresses on virtual interfaces such
+as docker bridges are not advertised. syq also tries the name you gave ssh,
+which is what works when the remote sits behind NAT or port forwarding. Every
+distinct address is probed once, in parallel, for one second; on an IPv6-only
+private network such as a cloud provider's internal mesh the IPv6 address is
+the one that answers.
 
 On Linux, `--syq-tcp-congestion ALGO` requests a congestion-control algorithm for
 both ends of every direct TCP data connection. The connecting socket is
