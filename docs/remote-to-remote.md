@@ -62,9 +62,7 @@ only costs a fresh helper bootstrap on the next transfer, but removing
 discards the record of which signed requests were already redeemed; revoke and
 enroll again instead. If hostB's home directory is on a network filesystem
 shared by several machines, they share the receiver, the forced key, and that
-record, so a signed request can be redeemed on only one of them. Each redemption
-is recorded by creating a link that fails if the name already exists, which
-stays atomic on NFS even where advisory locking does not.
+record, so a signed request can be redeemed on only one of them.
 
 Enrollment first tries local→hostB directly. If SSH reports a transport
 failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
