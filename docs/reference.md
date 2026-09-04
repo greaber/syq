@@ -36,6 +36,12 @@ syq rm --root /srv --src-dir cache
 syq rm --cwd /srv --follow-src --src-dir current-release
 ```
 
+Native path and pattern option values that begin with `-` use the attached
+`--option=value` spelling, for example `--src=--archive`, `--src-dir=-`, or
+`--into=-target`. This keeps a following option recognizable. `--mapping -`
+is the intentional exception: there, `-` means to read the mapping from
+standard input.
+
 `--from [USER@]HOST[:PORT]` selects one source endpoint and `--to
 [USER@]HOST[:PORT]` selects one target endpoint; omission means local. Enclose
 an IPv6 address in brackets, for example `alice@[2001:db8::1]:2222`. The port
@@ -62,8 +68,8 @@ the target container. `--srcs PATH...`, `--src-srcs DIR...`, `--src-files
 PATH...`, and `--src-dirs DIR...` are bulk conveniences for the corresponding
 singular selectors. Symlinks found while traversing a selected directory are
 copied as symlinks and are never followed. Singular selector options consume
-their next argument even when it begins with `-`, so every Unix filename is
-expressible without losing raw path bytes.
+an ordinary next argument; the attached spelling above works for singular and
+bulk selectors and preserves every Unix filename and its raw path bytes.
 
 All native commands use one link-resolution rule for filesystem paths supplied
 directly by the operator. By default, SYQ refuses a symlink in any component

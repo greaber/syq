@@ -331,6 +331,17 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--quiet", argv)
         self.assertEqual(argv.count("--src"), 2)
 
+    def test_hyphen_prefixed_paths_use_attached_option_values(self) -> None:
+        self.client.cp(src_dir="-", cwd="-base", into="-destination")
+
+        argv = self.argv()
+        self.assertIn("--src-dir=-", argv)
+        self.assertIn("--cwd=-base", argv)
+        self.assertIn("--into=-destination", argv)
+        self.assertNotIn("-", argv)
+        self.assertNotIn("-base", argv)
+        self.assertNotIn("-destination", argv)
+
     def test_rm_uses_native_names_and_returns_structured_outcomes(self) -> None:
         events: list[syq.AutomationEvent] = []
         output = io.BytesIO()
