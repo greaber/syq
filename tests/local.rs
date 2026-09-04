@@ -3091,6 +3091,7 @@ fn native_rm_results_preserve_non_utf8_paths() {
 fn native_rm_cwd_may_escape_while_root_confines_dotdot() {
     let t = Tmp::new();
     fs::create_dir_all(t.path("base/nested")).unwrap();
+    fs::set_permissions(t.path("base"), fs::Permissions::from_mode(0o755)).unwrap();
     write(&t.path("base/inside"), b"inside");
     write(&t.path("outside/remove"), b"outside");
 
@@ -3151,6 +3152,7 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
     let t = Tmp::new();
     write(&t.path("root/victim"), b"keep");
     fs::create_dir_all(t.path("root/inside")).unwrap();
+    fs::set_permissions(t.path("root"), fs::Permissions::from_mode(0o755)).unwrap();
     symlink("root", t.path("root-link")).unwrap();
     symlink("../../root/inside", t.path("root/escape")).unwrap();
 
@@ -3189,6 +3191,7 @@ fn native_rm_root_allows_following_a_symlink_that_stays_inside() {
 
     let t = Tmp::new();
     write(&t.path("root/inside/file"), b"remove");
+    fs::set_permissions(t.path("root"), fs::Permissions::from_mode(0o755)).unwrap();
     symlink("inside", t.path("root/link")).unwrap();
 
     run_native_ok(&[

@@ -446,6 +446,7 @@ struct Pool {
     sender: Mutex<Option<mpsc::SyncSender<Task>>>,
     pending: Mutex<usize>,
     events: mpsc::Sender<NativeRemoveOutcome>,
+    quarantine_ceiling: Option<File>,
     dry_run: bool,
     cancelled: AtomicBool,
 }
@@ -576,6 +577,13 @@ pub(crate) fn remove(
     let (base, confined) =
         open_base(cwd, root, selections, follow_symlinks, &mut traces).map_err(endpoint_failure)?;
     let resolver = Resolver::new(&base, confined, follow_symlinks).map_err(endpoint_failure)?;
+    let quarantine_ceiling = confined
+        .then(|| {
+            base.try_clone()
+                .context("retain removal root for quarantine confinement")
+        })
+        .transpose()
+        .map_err(endpoint_failure)?;
 
     // This phase is deliberately complete before the worker pool starts: a
     // later selector can never acquire a new meaning because an earlier one
@@ -638,6 +646,7 @@ pub(crate) fn remove(
         sender: Mutex::new(Some(task_tx)),
         pending: Mutex::new(0),
         events: event_tx,
+        quarantine_ceiling,
         dry_run,
         cancelled: AtomicBool::new(false),
     });
@@ -776,7 +785,7 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
                     None,
                 )
             } else {
-                match remove_pinned(&name, None) {
+                match remove_pinned(&name, None, pool.quarantine_ceiling.as_ref()) {
                     Ok(RemovePinnedOutcome::Removed) => removal_outcome(
                         selector,
                         label,
@@ -931,7 +940,11 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let result = if pool.dry_run {
         Ok(RemovePinnedOutcome::Removed)
     } else {
-        remove_pinned(removal, Some(&job.directory))
+        remove_pinned(
+            removal,
+            Some(&job.directory),
+            pool.quarantine_ceiling.as_ref(),
+        )
     };
     match result {
         Ok(outcome) => {
@@ -1014,8 +1027,17 @@ enum RemovePinnedOutcome {
     AlreadyAbsent,
 }
 
-fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<RemovePinnedOutcome> {
-    let outcome = remove_pinned_with_hook(name, held_directory.is_some(), |_, _| Ok(()))?;
+fn remove_pinned(
+    name: &PinnedName,
+    held_directory: Option<&File>,
+    quarantine_ceiling: Option<&File>,
+) -> Result<RemovePinnedOutcome> {
+    let outcome = remove_pinned_with_hook(
+        name,
+        held_directory.is_some(),
+        quarantine_ceiling,
+        |_, _| Ok(()),
+    )?;
     if let Some(directory) = held_directory {
         require_unlinked_directory(directory)?;
     }
@@ -1025,6 +1047,7 @@ fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<Rem
 fn remove_pinned_with_hook(
     name: &PinnedName,
     directory: bool,
+    quarantine_ceiling: Option<&File>,
     after_quarantine: impl FnOnce(&RemovalQuarantine, &CString) -> Result<()>,
 ) -> Result<RemovePinnedOutcome> {
     // POSIX has no identity-conditioned unlink. Move the currently named
@@ -1032,7 +1055,19 @@ fn remove_pinned_with_hook(
     // filesystem, then authenticate and remove it there. An untrusted writer
     // cannot address the quarantined name, and a later object installed at the
     // operator-visible name is never addressed by the final unlink.
-    let mut quarantine = RemovalQuarantine::create(&name.parent)?;
+    //
+    // Check absence before allocating the quarantine. Overlapping selectors
+    // can leave this task holding the selected name's now-unlinked parent; in
+    // that state `mkdirat` fails even though the selected name is already gone.
+    match metadata_at_cstring(name.parent.as_raw_fd(), &name.name) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RemovePinnedOutcome::AlreadyAbsent)
+        }
+        Err(error) => return Err(error).context("inspect pinned removal name"),
+    }
+
+    let mut quarantine = RemovalQuarantine::create(&name.parent, quarantine_ceiling)?;
     let candidate = component_cstring(REMOVE_QUARANTINE_ENTRY)?;
     #[cfg(test)]
     tests::before_quarantine(name.parent.as_raw_fd(), &name.name);
@@ -1153,11 +1188,12 @@ struct RemovalQuarantine {
 }
 
 impl RemovalQuarantine {
-    fn create(source_parent: &PinnedParent) -> Result<Self> {
+    fn create(source_parent: &PinnedParent, ceiling: Option<&File>) -> Result<Self> {
         let mut directory = source_parent
             .try_clone()
             .context("duplicate removal parent descriptor")?;
         let source_device = directory.metadata()?.dev();
+        let ceiling_identity = ceiling.map(identity_from_file).transpose()?;
         let effective_uid = effective_user_id();
         let mut last_create_error = None;
 
@@ -1166,6 +1202,14 @@ impl RemovalQuarantine {
             if metadata.dev() != source_device {
                 break;
             }
+            let directory_identity = Identity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                file_type: metadata.mode() & MODE_TYPE_MASK,
+            };
+            // The retained ceiling identifies the exact opened `--root`, even
+            // if its operator-visible name is replaced while removal runs.
+            let at_ceiling = ceiling_identity == Some(directory_identity);
             if is_trusted_quarantine_parent(&metadata, effective_uid) {
                 match Self::create_in(&directory, parent_hops, effective_uid) {
                     Ok(quarantine) => return Ok(quarantine),
@@ -1183,6 +1227,9 @@ impl RemovalQuarantine {
                     Err(error) => return Err(error).context("create removal quarantine"),
                 }
             }
+            if at_ceiling {
+                break;
+            }
 
             let parent = open_directory_at(&directory, b"..")
                 .context("walk to a trusted removal quarantine parent")?;
@@ -1197,8 +1244,16 @@ impl RemovalQuarantine {
         }
 
         if let Some(error) = last_create_error {
-            return Err(error).context(
-                "no writable trusted ancestor can hold the removal quarantine on this filesystem",
+            let context = if ceiling_identity.is_some() {
+                "no writable trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
+            } else {
+                "no writable trusted ancestor can hold the removal quarantine on this filesystem"
+            };
+            return Err(error).context(context);
+        }
+        if ceiling_identity.is_some() {
+            bail!(
+                "no trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
             );
         }
         bail!("no trusted ancestor can hold the removal quarantine on this filesystem")
@@ -1820,7 +1875,7 @@ mod tests {
         let directory = File::open(temp.path()).unwrap();
         let selected = pinned_test_name(&directory, b"selected");
 
-        let error = remove_pinned_with_hook(&selected, false, |_, _| {
+        let error = remove_pinned_with_hook(&selected, false, None, |_, _| {
             fs::write(temp.path().join("selected"), b"later")?;
             Ok(())
         })
@@ -1841,7 +1896,7 @@ mod tests {
         let selected = pinned_test_name(&directory, b"selected");
         let mut retained = None;
 
-        let error = remove_pinned_with_hook(&selected, false, |quarantine, _| {
+        let error = remove_pinned_with_hook(&selected, false, None, |quarantine, _| {
             retained = Some((
                 quarantine.parent.try_clone()?,
                 quarantine.name.clone(),
@@ -1882,7 +1937,7 @@ mod tests {
         let directory = File::open(&hostile).unwrap();
         let selected = pinned_test_name(&directory, b"selected");
 
-        let outcome = remove_pinned_with_hook(&selected, false, |quarantine, _| {
+        let outcome = remove_pinned_with_hook(&selected, false, None, |quarantine, _| {
             assert!(removal_quarantines(&hostile).is_empty());
             let metadata = quarantine.directory.metadata()?;
             assert_eq!(metadata.mode() & 0o777, 0o700);
@@ -1893,6 +1948,44 @@ mod tests {
         assert_eq!(outcome, RemovePinnedOutcome::Removed);
         assert!(!hostile.join("selected").exists());
         assert!(removal_quarantines(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn removal_root_is_a_hard_ceiling_for_quarantine_placement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(root.join("selected"), b"selected").unwrap();
+        let mut outcomes = Vec::new();
+
+        remove(
+            None,
+            Some(root.as_os_str().as_bytes()),
+            &[selector(b"selected", NativeRemoveKind::File)],
+            false,
+            false,
+            1,
+            &mut |_| Ok(()),
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(root.join("selected")).unwrap(), b"selected");
+        assert!(removal_quarantines(&root).is_empty());
+        assert!(removal_quarantines(temp.path()).is_empty());
+        let failure = outcomes
+            .iter()
+            .find(|outcome| outcome.disposition == NativeRemoveDisposition::Failed)
+            .and_then(|outcome| outcome.failure.as_ref())
+            .expect("an untrusted removal root fails without escaping to its parent");
+        assert!(
+            failure.error.message.contains("within the removal root"),
+            "{failure:?}"
+        );
     }
 
     #[test]
@@ -1913,7 +2006,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_pinned(&selected, None).unwrap_err();
+        let error = remove_pinned(&selected, None, None).unwrap_err();
 
         assert!(format!("{error:#}").contains("removal target changed identity"));
         assert_eq!(
@@ -1935,7 +2028,7 @@ mod tests {
         let selected = pinned_test_name(&directory, b"selected");
         let moved = component_cstring(b"moved-elsewhere").unwrap();
 
-        let error = remove_pinned_with_hook(&selected, false, |quarantine, candidate| {
+        let error = remove_pinned_with_hook(&selected, false, None, |quarantine, candidate| {
             rename_noreplace_at(
                 quarantine.directory.as_raw_fd(),
                 candidate,
@@ -1953,6 +2046,25 @@ mod tests {
             fs::read(temp.path().join("moved-elsewhere")).unwrap(),
             b"selected"
         );
+    }
+
+    #[test]
+    fn overlapping_removal_from_an_unlinked_parent_is_already_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        fs::create_dir(&parent_path).unwrap();
+        fs::write(parent_path.join("selected"), b"selected").unwrap();
+        let parent = File::open(&parent_path).unwrap();
+        let selected = pinned_test_name(&parent, b"selected");
+
+        fs::remove_file(parent_path.join("selected")).unwrap();
+        fs::remove_dir(&parent_path).unwrap();
+
+        assert_eq!(
+            remove_pinned(&selected, None, None).unwrap(),
+            RemovePinnedOutcome::AlreadyAbsent
+        );
+        assert!(removal_quarantines(temp.path()).is_empty());
     }
 
     #[test]
@@ -2030,6 +2142,7 @@ mod tests {
             sender: Mutex::new(Some(task_tx)),
             pending: Mutex::new(0),
             events: event_tx,
+            quarantine_ceiling: None,
             dry_run: false,
             cancelled: AtomicBool::new(false),
         });

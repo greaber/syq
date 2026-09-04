@@ -72,14 +72,15 @@ go further:
 - Native `rm` resolves and pins every selector before its first change and
   enumerates opened directories. Before deletion, it atomically moves the
   current entry into an owner-only quarantine directory in a trusted ancestor
-  on the same filesystem, then re-checks device, inode, and type there. A name
-  swapped to a different inode is restored or preserved in the reported
-  quarantine, not deleted, and a later entry at the selected name is left
-  alone. If the filesystem has no atomic no-replace rename, or no writable
-  trusted ancestor can hold the quarantine, removal fails closed. On Linux, an
-  open descriptor also lets syq report a selected directory renamed away
-  before quarantine as a failure; macOS cannot expose that directory state and
-  reports it as already absent.
+  on the same filesystem, then re-checks device, inode, and type there. Under
+  `--root`, the ancestor search stops at the opened root. A name swapped to a
+  different inode is restored or preserved in the reported quarantine, not
+  deleted, and a later entry at the selected name is left alone. If the
+  filesystem has no atomic no-replace rename, or no writable trusted ancestor
+  inside the allowed boundary can hold the quarantine, removal fails closed.
+  On Linux, an open descriptor also lets syq report a selected directory
+  renamed away before quarantine as a failure; macOS cannot expose that
+  directory state and reports it as already absent.
 - The restricted remote-to-remote receiver performs every operation relative
   to an opened root; descendant symlinks are payload, never traversal.
 - Native `cp` defaults to `-rlt`: no owner, group, mode, or device is applied
