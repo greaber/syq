@@ -481,8 +481,19 @@ def _append_paths(
 ) -> int:
     values = _values(value, label=option)
     for item in values:
-        argv.extend((option, item))
+        _append_path_option(argv, option, item)
     return len(values)
+
+
+def _append_path_option(
+    argv: list[Argument], option: str, value: Argument
+) -> None:
+    if isinstance(value, bytes) and value.startswith(b"-"):
+        argv.append(os.fsencode(option) + b"=" + value)
+    elif isinstance(value, str) and value.startswith("-"):
+        argv.append(f"{option}={value}")
+    else:
+        argv.extend((option, value))
 
 
 def _append_text(argv: list[Argument], option: str, value: object | None) -> None:
@@ -516,7 +527,9 @@ def _append_remote_arguments(
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
     if syq_path is not None:
-        argv.extend(("--syq-path", _text_arg(syq_path, label="syq_path")))
+        _append_path_option(
+            argv, "--syq-path", _text_arg(syq_path, label="syq_path")
+        )
     for enabled, option in (
         (no_bootstrap, "--no-bootstrap"),
         (tcp_plain, "--tcp-plain"),
@@ -616,9 +629,9 @@ def _copy_arguments(
     if cwd is not None and root is not None:
         raise SyqInvocationError("cwd and root are mutually exclusive")
     if cwd is not None:
-        argv.extend(("--cwd", _argument(cwd, label="cwd")))
+        _append_path_option(argv, "--cwd", _argument(cwd, label="cwd"))
     if root is not None:
-        argv.extend(("--root", _argument(root, label="root")))
+        _append_path_option(argv, "--root", _argument(root, label="root"))
     if follow:
         argv.append("--follow")
     if follow_src:
@@ -647,7 +660,7 @@ def _copy_arguments(
         raise SyqInvocationError("mapping placement options conflict")
     for option, value in selected_placements:
         assert value is not None
-        argv.extend((option, _argument(value, label=option)))
+        _append_path_option(argv, option, _argument(value, label=option))
         if option.startswith("--as") and source_count and (
             source_count != 1 or contents_count
         ):
@@ -676,11 +689,13 @@ def _copy_arguments(
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
         for rule in rules:
             if isinstance(rule, IgnoreFrom):
-                argv.extend(
-                    ("--ignore-from", _argument(rule.path, label="--ignore-from"))
+                _append_path_option(
+                    argv,
+                    "--ignore-from",
+                    _argument(rule.path, label="--ignore-from"),
                 )
             elif isinstance(rule, str):
-                argv.extend(("--ignore", rule))
+                _append_path_option(argv, "--ignore", rule)
             else:
                 raise SyqInvocationError(
                     "--ignore entries must be text or syq.IgnoreFrom"
@@ -742,9 +757,9 @@ def _rm_arguments(
     if cwd is not None and root is not None:
         raise SyqInvocationError("cwd and root are mutually exclusive")
     if cwd is not None:
-        argv.extend(("--cwd", _argument(cwd, label="cwd")))
+        _append_path_option(argv, "--cwd", _argument(cwd, label="cwd"))
     if root is not None:
-        argv.extend(("--root", _argument(root, label="root")))
+        _append_path_option(argv, "--root", _argument(root, label="root"))
     if follow:
         argv.append("--follow")
     if follow_src:
@@ -761,7 +776,9 @@ def _rm_arguments(
     if syq_path is not None and no_bootstrap:
         raise SyqInvocationError("syq_path and no_bootstrap conflict")
     if syq_path is not None:
-        argv.extend(("--syq-path", _text_arg(syq_path, label="syq_path")))
+        _append_path_option(
+            argv, "--syq-path", _text_arg(syq_path, label="syq_path")
+        )
     if no_bootstrap:
         argv.append("--no-bootstrap")
     return argv, source_count
@@ -1090,7 +1107,9 @@ class Client:
         if any(value is not None for value in (as_, as_new, as_existing)):
             raise SyqInvocationError("--mapping conflicts with --as")
         if isinstance(mapping, (str, bytes, os.PathLike)):
-            argv.extend(("--mapping", _argument(mapping, label="mapping")))
+            _append_path_option(
+                argv, "--mapping", _argument(mapping, label="mapping")
+            )
             return self._typed(
                 argv,
                 mode="cp",

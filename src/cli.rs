@@ -640,16 +640,10 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
 #[derive(clap::Args, Debug)]
 struct NativeSourceArgs {
     /// Resolve relative source selectors from DIR
-    #[arg(
-        short = 'C',
-        long,
-        value_name = "DIR",
-        allow_hyphen_values = true,
-        conflicts_with = "root"
-    )]
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
     cwd: Option<OsString>,
     /// Resolve source selectors beneath DIR and refuse any escape
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    #[arg(long, value_name = "DIR")]
     root: Option<OsString>,
     /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
@@ -657,17 +651,17 @@ struct NativeSourceArgs {
     /// Follow symlinks in directly supplied source paths
     #[arg(long)]
     follow_src: bool,
-    /// Select a named source object (repeatable)
-    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    /// Select a named source object; attach =PATH when it begins with `-` (repeatable)
+    #[arg(long, value_name = "PATH")]
     src: Vec<OsString>,
-    /// Select a directory's contents (repeatable)
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
+    #[arg(long, value_name = "DIR")]
     src_src: Vec<OsString>,
-    /// Select a named non-directory source object (repeatable)
-    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    /// Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable)
+    #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
-    /// Select a named source directory (repeatable)
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    /// Select a named source directory; attach =DIR when it begins with `-` (repeatable)
+    #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several named non-directory source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
@@ -701,16 +695,10 @@ struct NativeRmSelectionArgs {
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     /// Resolve relative selectors from DIR at the source endpoint
-    #[arg(
-        short = 'C',
-        long,
-        value_name = "DIR",
-        allow_hyphen_values = true,
-        conflicts_with = "root"
-    )]
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
     cwd: Option<OsString>,
     /// Confine resolution and removal beneath DIR
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    #[arg(long, value_name = "DIR")]
     root: Option<OsString>,
     /// Follow symlinks in all directly supplied filesystem paths
     #[arg(long)]
@@ -718,17 +706,17 @@ struct NativeRmSelectionArgs {
     /// Follow symlinks in directly supplied source paths
     #[arg(long)]
     follow_src: bool,
-    /// Select an object without constraining the selected object's type (repeatable)
-    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    /// Select an object without constraining its type; attach =PATH when it begins with `-` (repeatable)
+    #[arg(long, value_name = "PATH")]
     src: Vec<OsString>,
-    /// Select a directory's contents, retaining the directory (repeatable)
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
+    #[arg(long, value_name = "DIR")]
     src_src: Vec<OsString>,
-    /// Select a non-directory object (repeatable)
-    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
+    #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
-    /// Select a directory tree (repeatable)
-    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    /// Select a directory tree; attach =DIR when it begins with `-` (repeatable)
+    #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several non-directory objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
@@ -776,7 +764,7 @@ struct NativeOperationalArgs {
 struct NativeResultsArgs {
     /// Write the machine-readable NDJSON result stream to FILE (created
     /// fresh; an existing file is refused). Automation schema version 1
-    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    #[arg(long, value_name = "FILE")]
     results: Option<OsString>,
     /// Write the result stream to an inherited file descriptor the caller
     /// opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2
@@ -801,7 +789,7 @@ struct NativeCopyOperationalArgs {
     #[arg(long)]
     stats: bool,
     /// Skip paths matching a gitignore-style pattern (repeatable)
-    #[arg(long = "ignore", value_name = "PATTERN", allow_hyphen_values = true)]
+    #[arg(long = "ignore", value_name = "PATTERN")]
     ignore: Vec<String>,
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
     #[arg(long, value_name = "FILE")]
@@ -916,57 +904,27 @@ struct NativeCopyFields {
     #[arg(long)]
     follow_dest: bool,
     /// Put selected names inside DIR, creating it if necessary
-    #[arg(
-        long,
-        value_name = "DIR",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "DIR", group = "placement")]
     into: Option<OsString>,
     /// Put selected names inside DIR, which must not exist
-    #[arg(
-        long,
-        value_name = "DIR",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "DIR", group = "placement")]
     into_new: Option<OsString>,
     /// Put selected names inside an existing directory
-    #[arg(
-        long,
-        value_name = "DIR",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "DIR", group = "placement")]
     into_existing: Option<OsString>,
     /// Map one named source exactly to PATH; never follow its final entry
-    #[arg(
-        long,
-        value_name = "PATH",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "PATH", group = "placement")]
     r#as: Option<OsString>,
     /// Map one named source exactly to PATH; its final entry must not exist and is never followed
-    #[arg(
-        long,
-        value_name = "PATH",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "PATH", group = "placement")]
     as_new: Option<OsString>,
     /// Map one named source exactly to PATH; its final entry must exist and is never followed
-    #[arg(
-        long,
-        value_name = "PATH",
-        group = "placement",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "PATH", group = "placement")]
     as_existing: Option<OsString>,
     /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin), acquired before
     /// destination changes, instead of selecting sources; entry src paths are relative to
     /// -C and dst paths are relative to the --into container
-    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    #[arg(long, value_name = "FILE")]
     mapping: Option<OsString>,
     #[command(flatten)]
     results_output: NativeResultsArgs,
@@ -989,7 +947,7 @@ struct NativeSizeSelectionArgs {
     name = "syq cp",
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths.",
+    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
 )]
 struct NativeCopyCommand {
@@ -1016,14 +974,14 @@ struct NativeCopyCommand {
     name = "syq map",
     version,
     about = "Print a local source selection as an NDJSON mapping",
-    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8.",
+    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
     #[command(flatten)]
     source: NativeSourceArgs,
     /// Rename the single selected root in the emitted mapping
-    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    #[arg(long, value_name = "PATH")]
     r#as: Option<OsString>,
 }
 
@@ -1032,6 +990,7 @@ struct NativeMapCommand {
     name = "syq rm",
     version,
     about = "Remove endpoint-resolved object trees without following symlinks by default",
+    long_about = "Remove endpoint-resolved object trees without following symlinks by default.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq rm [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeRmCommand {
@@ -1049,12 +1008,87 @@ struct NativeRmCommand {
 }
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
+    reject_detached_dash_native_values(argv)?;
     match interface {
         Interface::NativeCp => parse_native_copy(argv),
         Interface::NativeMap => parse_native_map(argv),
         Interface::NativeRm => parse_native_rm(argv),
         Interface::Rsync => unreachable!(),
     }
+}
+
+/// Clap normally treats option-looking tokens as new options, but deliberately
+/// treats a lone `-` as an ordinary detached value. Keep native path and
+/// pattern arguments consistent: a hyphen-prefixed value uses the attached
+/// `--option=value` spelling. `--mapping -` remains the conventional stdin
+/// spelling and is intentionally not in this list.
+fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
+    const ATTACHED_VALUE_OPTIONS: &[&[u8]] = &[
+        b"-C",
+        b"--cwd",
+        b"--root",
+        b"--src",
+        b"--src-src",
+        b"--src-file",
+        b"--src-dir",
+        b"--srcs",
+        b"--src-srcs",
+        b"--src-files",
+        b"--src-dirs",
+        b"--into",
+        b"--into-new",
+        b"--into-existing",
+        b"--as",
+        b"--as-new",
+        b"--as-existing",
+        b"--results",
+        b"--ignore",
+        b"--ignore-from",
+        b"--pscope",
+        b"--syq-path",
+    ];
+    const VARIADIC_VALUE_OPTIONS: &[&[u8]] =
+        &[b"--srcs", b"--src-srcs", b"--src-files", b"--src-dirs"];
+
+    let arguments = argv
+        .split(|argument| argument.as_bytes() == b"--")
+        .next()
+        .unwrap_or_default();
+
+    for pair in arguments.windows(2) {
+        let option = pair[0].as_bytes();
+        if ATTACHED_VALUE_OPTIONS.contains(&option) && pair[1].as_bytes() == b"-" {
+            reject_detached_dash(option)?;
+        }
+    }
+
+    let mut variadic_option = None;
+    for argument in arguments {
+        let argument = argument.as_bytes();
+        if argument == b"-" {
+            if let Some(option) = variadic_option {
+                reject_detached_dash(option)?;
+            }
+        } else if argument.starts_with(b"-") {
+            variadic_option = VARIADIC_VALUE_OPTIONS.iter().copied().find(|option| {
+                argument == *option
+                    || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_detached_dash(option: &[u8]) -> Result<()> {
+    let option = String::from_utf8_lossy(option);
+    let attached = if option == "-C" {
+        "--cwd=-".to_string()
+    } else {
+        format!("{option}=-")
+    };
+    bail!(
+        "a native path or pattern value beginning with `-` must be attached with `=`; use {attached}"
+    )
 }
 
 /// Decode the base64 path operands of a delegated remote-to-remote argv

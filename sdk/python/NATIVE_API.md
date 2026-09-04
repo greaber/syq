@@ -86,9 +86,10 @@ syq.cp(src=["a", "b"], src_dir=["assets", "fonts"], into="archive")
 ```
 
 The implementation serializes this as repeated `--src` and `--src-dir`
-options. A keyword accepts either one path or an iterable of paths; `str`,
-`bytes`, and path-like objects are always treated as scalar paths rather than
-iterables.
+options. When a path begins with `-`, it uses the native attached spelling such
+as `--src-dir=-`; callers still pass the path itself. A keyword accepts either
+one path or an iterable of paths; `str`, `bytes`, and path-like objects are
+always treated as scalar paths rather than iterables.
 
 ## Scope
 

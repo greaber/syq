@@ -1370,7 +1370,7 @@ fn native_as_existing_updates_a_same_type_symlink() {
 }
 
 #[test]
-fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
+fn native_copy_uses_explicit_endpoints_cwd_and_attached_option_like_selectors() {
     let t = Tmp::new();
     write(&t.path("base/foo"), b"cwd");
     write(&t.path("base/--into"), b"option-looking");
@@ -1382,8 +1382,7 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
         &t.s("base"),
         "--src",
         "foo",
-        "--src",
-        "--into",
+        "--src=--into",
         "host:path",
         "--into",
         &t.s("dst"),
@@ -1408,6 +1407,95 @@ fn native_copy_uses_explicit_endpoints_cwd_and_option_safe_selectors() {
     assert!(!no_basename.status.success());
     assert!(String::from_utf8_lossy(&no_basename.stderr).contains("no target basename"));
     assert!(!t.path("no-basename").exists());
+}
+
+#[test]
+fn native_hyphen_prefixed_selector_values_require_equals() {
+    let t = Tmp::new();
+    write(&t.path("base/-/file"), b"literal hyphen directory");
+    write(&t.path("base/foo"), b"ordinary source");
+
+    let option_looking = native_syq(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--src-dir",
+        "--dry-run",
+        "--into",
+        &t.s("option-looking"),
+    ]);
+    assert!(!option_looking.status.success());
+    assert!(
+        stderr_of(&option_looking).contains("a value is required for '--src-dir <DIR>'"),
+        "{}",
+        stderr_of(&option_looking)
+    );
+    assert!(!t.path("option-looking").exists());
+
+    let detached = native_syq(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--src-dir",
+        "-",
+        "--into",
+        &t.s("detached"),
+    ]);
+    assert!(!detached.status.success());
+    assert!(
+        stderr_of(&detached).contains("use --src-dir=-"),
+        "{}",
+        stderr_of(&detached)
+    );
+    assert!(!t.path("detached").exists());
+
+    for (selector_args, destination) in [
+        (&["--srcs", "foo", "-"][..], "detached-bulk"),
+        (&["--srcs=foo", "-"][..], "detached-inline-bulk"),
+    ] {
+        let base = t.s("base");
+        let destination_path = t.s(destination);
+        let mut args = vec!["cp", "--cwd", base.as_str()];
+        args.extend_from_slice(selector_args);
+        args.extend_from_slice(&["--into", destination_path.as_str()]);
+        let detached_bulk = native_syq(&args);
+        assert!(!detached_bulk.status.success());
+        assert!(
+            stderr_of(&detached_bulk).contains("use --srcs=-"),
+            "{}",
+            stderr_of(&detached_bulk)
+        );
+        assert!(!t.path(destination).exists());
+    }
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--src-dir=-",
+        "--into",
+        &t.s("attached"),
+    ]);
+    assert_eq!(
+        read(&t.path("attached/-/file")),
+        b"literal hyphen directory"
+    );
+
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--srcs",
+        "foo",
+        "--srcs=-",
+        "--into",
+        &t.s("attached-bulk"),
+    ]);
+    assert_eq!(read(&t.path("attached-bulk/foo")), b"ordinary source");
+    assert_eq!(
+        read(&t.path("attached-bulk/-/file")),
+        b"literal hyphen directory"
+    );
 }
 
 #[test]

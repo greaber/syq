@@ -765,7 +765,9 @@ fn filesystem_command_candidates(
         }
         if let Some(previous) = args.last() {
             if let Some(kind) = value_completion(command, previous, &command_meta) {
-                return complete_value(command, args, current, kind);
+                if command == "rsync" || !current.starts_with(b"-") {
+                    return complete_value(command, args, current, kind);
+                }
             }
         }
         if current.starts_with(b"-") {
@@ -1806,6 +1808,14 @@ mod tests {
         let command = crate::cli::command_for_completion("cp").unwrap();
         let options = values(option_candidates(&command, b"--coor"));
         assert_eq!(options, vec![b"--coordinate-at".to_vec()]);
+    }
+
+    #[test]
+    fn native_option_looking_values_are_completed_as_options_unless_attached() {
+        let options =
+            values(filesystem_command_candidates("cp", &[b"--src-dir".to_vec()], b"--i").unwrap());
+        assert!(options.contains(&b"--ignore".to_vec()));
+        assert!(options.contains(&b"--into".to_vec()));
     }
 
     #[test]
