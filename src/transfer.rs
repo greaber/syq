@@ -1397,10 +1397,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }
                             gate.mark_warming(id);
                             if !opts.quiet {
-                                eprintln!(
+                                progress.eprintln(&format!(
                                     "syq: worker {id}: connection setup failed; retrying in {}s ({error:#})",
                                     1 << (failures - 1)
-                                );
+                                ));
                             }
                             std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                             continue;
@@ -1452,10 +1452,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }
                             gate.mark_warming(id);
                             if !opts.quiet {
-                                eprintln!(
+                                progress.eprintln(&format!(
                                     "syq: worker {id}: connection dropped; reopening in {}s ({error:#})",
                                     1 << (failures - 1)
-                                );
+                                ));
                             }
                             std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
                         }

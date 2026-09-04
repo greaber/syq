@@ -680,8 +680,11 @@ Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
 notices, and `-v` file listings are hidden. Copy failures are still written to
 stderr and reflected in the exit status.
 
-If stdout stops accepting this human-readable copy output, syq warns once on
-stderr but does not change the copy's filesystem outcome or exit status.
+For copies whose sources are local, if stdout stops accepting the ordinary
+human-readable output, syq warns once on stderr but does not change the copy's
+filesystem outcome or exit status. Remote-to-remote output can carry the
+relayed result or a receiver-attested receipt, so failure to write it remains
+an error.
 
 `--bwlimit` is one approximate limit shared by every `--syq-connections` worker, not a
 per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,

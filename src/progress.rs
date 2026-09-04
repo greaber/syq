@@ -226,26 +226,34 @@ impl Progress {
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
         let group = self.fanout_group.get().and_then(std::sync::Weak::upgrade);
-        let _group_output = group.as_ref().map(|group| group.lock_human_output());
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
+        let stdout_is_terminal = std::io::stdout().is_terminal();
+        let group_stdout_output = group.as_ref().map(|group| group.lock_stdout_output());
+        // A redirected stdout cannot tear progress rows on stderr. Keeping it
+        // out of the group display lock also prevents a slow pipe from
+        // freezing progress for every destination.
+        let group_human_output = group
+            .as_ref()
+            .filter(|_| stdout_is_terminal)
+            .map(|group| group.lock_human_output());
+        let mut term = Some(self.term.lock().unwrap());
+        self.erase(term.as_mut().unwrap());
+        if group.is_some() && !stdout_is_terminal {
+            drop(term.take());
+        }
         let mut out = std::io::stdout().lock();
         let result = writeln!(out, "{line}").and_then(|()| out.flush());
         drop(out);
+        drop(term);
+        drop(group_human_output);
+        drop(group_stdout_output);
         if let Err(error) = result {
-            if !self.stdout_warning_emitted.swap(true, Relaxed) {
+            let should_warn = group.as_ref().map_or_else(
+                || !self.stdout_warning_emitted.swap(true, Relaxed),
+                |group| group.claim_stdout_warning(),
+            );
+            if should_warn {
                 let message = format!("could not write to stdout: {error}");
-                if self.json {
-                    let warning = serde_json::json!({
-                        "type": "warning",
-                        "code": "stdout-write",
-                        "count": 1,
-                        "message": message,
-                    });
-                    write_stderr_best_effort(format_args!("{warning}\n"));
-                } else {
-                    write_stderr_best_effort(format_args!("syq: warning: {message}\n"));
-                }
+                self.warning("stdout-write", 1, &message);
             }
         }
     }

@@ -71,6 +71,8 @@ pub struct Group {
     progresses: Mutex<Vec<Option<Arc<Progress>>>>,
     terminals: Mutex<Vec<Option<crate::results::ResultRecord>>>,
     human_output: Mutex<()>,
+    stdout_output: Mutex<()>,
+    stdout_warning_emitted: AtomicBool,
     progress_lines: Mutex<usize>,
     results: Option<Arc<crate::results::ResultsWriter>>,
     bandwidth: Option<Arc<BandwidthLimit>>,
@@ -114,6 +116,8 @@ impl Group {
             progresses: Mutex::new(vec![None; total]),
             terminals: Mutex::new(vec![None; total]),
             human_output: Mutex::new(()),
+            stdout_output: Mutex::new(()),
+            stdout_warning_emitted: AtomicBool::new(false),
             progress_lines: Mutex::new(0),
             results,
             bandwidth: (bytes_per_second > 0)
@@ -166,6 +170,16 @@ impl Group {
             *lines = 0;
         }
         output
+    }
+
+    pub fn lock_stdout_output(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stdout_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn claim_stdout_warning(&self) -> bool {
+        !self.stdout_warning_emitted.swap(true, Relaxed)
     }
 
     fn set_progress_lines(&self, lines: usize) {
@@ -615,50 +629,52 @@ fn spawn_progress_ticker(
         let mut last_sample = None;
         while !thread_stop.load(Relaxed) {
             let now = std::time::Instant::now();
-            let snapshots: Vec<_> = group
-                .member_progresses()
-                .into_iter()
-                .map(|(index, progress)| (index, progress.snapshot()))
-                .collect();
-            let all_members_registered = snapshots.len() == labels.len();
-            if all_members_registered
-                && last_sample.is_none_or(|last| now - last >= std::time::Duration::from_secs(1))
-            {
-                last_sample = Some(now);
-                let mut json_lines = Vec::new();
-                for (index, snapshot) in &snapshots {
-                    if let Some(results) = group.results() {
-                        results.emit_progress(&snapshot.result_record(Some(*index)));
+            let progresses = group.member_progresses();
+            let all_members_registered = progresses.len() == labels.len();
+            let sample_due =
+                last_sample.is_none_or(|last| now - last >= std::time::Duration::from_secs(1));
+            if all_members_registered && (human || sample_due) {
+                let snapshots: Vec<_> = progresses
+                    .into_iter()
+                    .map(|(index, progress)| (index, progress.snapshot()))
+                    .collect();
+                if sample_due {
+                    last_sample = Some(now);
+                    let mut json_lines = Vec::new();
+                    for (index, snapshot) in &snapshots {
+                        if let Some(results) = group.results() {
+                            results.emit_progress(&snapshot.result_record(Some(*index)));
+                        }
+                        if json {
+                            json_lines.push(crate::progress::progress_json(
+                                snapshot,
+                                Some(*index),
+                                Some(&labels[*index]),
+                            ));
+                        }
                     }
-                    if json {
-                        json_lines.push(crate::progress::progress_json(
-                            snapshot,
-                            Some(*index),
-                            Some(&labels[*index]),
-                        ));
+                    if !json_lines.is_empty() {
+                        group.write_stderr_block(&json_lines.join("\n"));
                     }
                 }
-                if !json_lines.is_empty() {
-                    group.write_stderr_block(&json_lines.join("\n"));
+                if human {
+                    let _output = group.lock_human_output();
+                    let width = configured_width.unwrap_or_else(crate::progress::term_width);
+                    let rendered = snapshots
+                        .iter()
+                        .map(|(index, snapshot)| {
+                            let line = format!(
+                                "target {}: {}",
+                                labels[*index],
+                                crate::progress::progress_line(snapshot)
+                            );
+                            crate::progress::truncate(&line, width.saturating_sub(1))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    crate::progress::write_stderr_best_effort(format_args!("{rendered}\n"));
+                    group.set_progress_lines(snapshots.len());
                 }
-            }
-            if human && all_members_registered {
-                let _output = group.lock_human_output();
-                let width = configured_width.unwrap_or_else(crate::progress::term_width);
-                let rendered = snapshots
-                    .iter()
-                    .map(|(index, snapshot)| {
-                        let line = format!(
-                            "target {}: {}",
-                            labels[*index],
-                            crate::progress::progress_line(snapshot)
-                        );
-                        crate::progress::truncate(&line, width.saturating_sub(1))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                crate::progress::write_stderr_best_effort(format_args!("{rendered}\n"));
-                group.set_progress_lines(snapshots.len());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

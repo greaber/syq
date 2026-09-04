@@ -124,7 +124,7 @@ fn print_summary(args: &Args, progress: &Progress, summary: &RemovalSummary) {
     if summary.entries_failed > 0 {
         details.push(format!("{} errors", commas(summary.entries_failed)));
     }
-    println!(
+    progress.println(&format!(
         "syq: {} {} entries in {}{}",
         if args.dry_run {
             "would remove"
@@ -138,7 +138,7 @@ fn print_summary(args: &Args, progress: &Progress, summary: &RemovalSummary) {
         } else {
             format!(", {}", details.join(", "))
         }
-    );
+    ));
 }
 
 fn run_remove(
