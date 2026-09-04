@@ -1229,6 +1229,42 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The process file-creation mask. Linux publishes it in `/proc/self/status`
+/// (kernel 4.7 and later), which avoids the umask(2) set-and-restore window
+/// during which another thread would create files with the probe mask. The
+/// portable probe is used elsewhere; callers read the mask before starting
+/// any thread that creates files.
+pub(crate) fn process_umask() -> u32 {
+    #[cfg(target_os = "linux")]
+    if let Some(mask) = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| parse_proc_status_umask(&status))
+    {
+        return mask;
+    }
+    probe_umask()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_status_umask(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+        .filter(|mask| *mask <= 0o777)
+}
+
+fn probe_umask() -> u32 {
+    // SAFETY: umask(2) only exchanges the process mask and the original is
+    // restored at once; the callers guarantee no other thread creates files
+    // in between.
+    unsafe {
+        let mask = libc::umask(0o022);
+        libc::umask(mask);
+        mask as u32
+    }
+}
+
 fn source_descriptor_requirement(
     current_open: usize,
     root_count: usize,
@@ -4782,15 +4818,18 @@ impl FsOps {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
         }
-        let mut off: i64 = 0;
+        let mut source_offset: libc::off64_t = 0;
+        let mut destination_offset: libc::off64_t = 0;
         let mut remaining = size;
         while remaining > 0 && !userspace_fallback {
+            // SAFETY: each offset is its own local that outlives the call, so
+            // the kernel reads and advances the two through distinct pointers.
             let n = unsafe {
                 libc::copy_file_range(
                     s.as_raw_fd(),
-                    &mut off as *mut i64 as *mut _,
+                    &mut source_offset,
                     d.as_raw_fd(),
-                    &mut off as *mut i64 as *mut _,
+                    &mut destination_offset,
                     remaining as usize,
                     0,
                 )
@@ -9109,5 +9148,31 @@ mod tests {
         if limits.rlim_cur != libc::RLIM_INFINITY {
             assert!(current_open_descriptor_count(limits.rlim_cur).unwrap() >= 3);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_status_umask_parses_only_the_kernel_line() {
+        assert_eq!(
+            parse_proc_status_umask("Name:\tsyq\nUmask:\t0022\nState:\tR (running)\n"),
+            Some(0o022)
+        );
+        assert_eq!(parse_proc_status_umask("Umask:\t0077\n"), Some(0o077));
+        assert_eq!(parse_proc_status_umask("Name:\tsyq\n"), None);
+        assert_eq!(parse_proc_status_umask("Umask:\t8\n"), None);
+        assert_eq!(parse_proc_status_umask("Umask:\t01777\n"), None);
+    }
+
+    #[test]
+    fn process_umask_matches_file_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o777)
+            .open(temp.path().join("probe"))
+            .unwrap();
+        let created = file.metadata().unwrap().mode() & 0o777;
+        assert_eq!(created, 0o777 & !process_umask());
     }
 }

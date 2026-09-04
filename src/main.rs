@@ -48,19 +48,74 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
-/// Many workers each keep a few files open; the default soft limit (1024) is
-/// too small for -j32, so use whatever the hard limit allows.
+/// Many workers each keep a few files open; the default soft limit (1024 on
+/// Linux, 256 on macOS) is too small for -j32, so use whatever the hard limit
+/// allows. Best effort: the source descriptor budget later reports what the
+/// endpoint actually permits.
 fn raise_nofile() {
-    unsafe {
-        let mut rl = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only into the local struct passed by pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0
+        || limits.rlim_cur >= limits.rlim_max
+    {
+        return;
+    }
+    for candidate in nofile_candidates(limits.rlim_max) {
+        let wanted = candidate.min(limits.rlim_max);
+        if wanted <= limits.rlim_cur {
+            continue;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: wanted,
+            rlim_max: limits.rlim_max,
         };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < rl.rlim_max {
-            rl.rlim_cur = rl.rlim_max.min(1 << 20);
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        // SAFETY: setrlimit reads only the local struct. A rejected value
+        // leaves the limit unchanged, so the next candidate can be tried.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return;
         }
     }
+}
+
+/// Soft limits to try, highest first. Linux accepts anything up to the hard
+/// limit, so one candidate suffices. macOS usually reports an unlimited hard
+/// limit but rejects a soft limit above `kern.maxfilesperproc` with EINVAL
+/// instead of clamping it, so that ceiling and then `OPEN_MAX` follow.
+fn nofile_candidates(hard_limit: libc::rlim_t) -> Vec<libc::rlim_t> {
+    let ceiling = hard_limit.min(1 << 20);
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![ceiling];
+        candidates.extend(max_files_per_process());
+        candidates.push(10240);
+        candidates
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![ceiling]
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn max_files_per_process() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>();
+    // SAFETY: sysctlbyname writes at most `length` bytes into `value` and
+    // stores the bytes written back through `length`; no new value is set.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of::<libc::c_int>() && value > 0)
+        .then(|| value as libc::rlim_t)
 }
 
 fn main() {
@@ -200,5 +255,29 @@ fn main() {
             eprintln!("syq: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn raise_nofile_lifts_the_soft_limit_to_a_usable_value() {
+        super::raise_nofile();
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes only into the local struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        // A rejected raise would leave macOS at its default soft limit of 256.
+        assert!(
+            limits.rlim_cur >= limits.rlim_max.min(1024),
+            "soft descriptor limit {} was not raised toward hard limit {}",
+            limits.rlim_cur,
+            limits.rlim_max
+        );
     }
 }

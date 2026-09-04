@@ -787,14 +787,6 @@ pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
 }
 
-fn read_umask() -> u32 {
-    unsafe {
-        let m = libc::umask(0o022);
-        libc::umask(m);
-        m as u32
-    }
-}
-
 fn handle_tcp_setup_error(
     args: &Args,
     spec: &RemoteSpec,
@@ -1195,7 +1187,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
-        umask: read_umask(),
+        umask: crate::fsops::process_umask(),
         partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
