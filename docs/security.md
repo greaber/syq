@@ -110,13 +110,14 @@ What is different from rsync, or weaker:
 
 ### How confinement is verified
 
-The confinement tests use bounded two-way barriers after a path has been
-selected or registered. Syq acknowledges that it has reached the barrier and
-does not continue until the test confirms that it has renamed the selected
-directory or object and replaced its old pathname with a symlink or a different
-inode. The operation must then either continue through the retained descriptor
-or fail without touching the replacement. This exercises the race boundary
-directly instead of relying on scheduler timing.
+The adversarial `confinement_matrix_` tests use bounded two-way barriers after
+a path has been selected or registered. Syq acknowledges that it has reached
+the barrier and does not continue until the test confirms that it has renamed
+the selected directory or object and replaced its old pathname with a symlink
+or a different inode. The operation must then either continue through the
+retained descriptor or fail without touching the replacement. These matrix
+cases exercise the race boundary directly instead of relying on scheduler
+timing.
 
 The evidence is split along the boundaries where authority changes form:
 
