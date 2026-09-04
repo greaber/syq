@@ -1410,6 +1410,51 @@ fn native_copy_uses_explicit_endpoints_cwd_and_attached_option_like_selectors() 
 }
 
 #[test]
+fn native_copy_requires_sources_before_the_destination() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"data");
+
+    for args in [
+        vec!["cp", "--into", &t.s("bare-target"), &t.s("source")],
+        vec![
+            "cp",
+            "--into",
+            &t.s("selector-target"),
+            "--src",
+            &t.s("source"),
+        ],
+        vec![
+            "cp",
+            "--into",
+            &t.s("mapping-target"),
+            "--mapping",
+            "missing.ndjson",
+        ],
+    ] {
+        let output = native_syq(&args);
+        assert!(!output.status.success(), "unexpected success for {args:?}");
+        assert!(
+            stderr_of(&output).contains("must appear before destination arguments"),
+            "{}",
+            stderr_of(&output)
+        );
+    }
+
+    assert!(!t.path("bare-target").exists());
+    assert!(!t.path("selector-target").exists());
+    assert!(!t.path("mapping-target").exists());
+
+    run_native_ok(&[
+        "cp",
+        &t.s("source"),
+        "--into",
+        &t.s("valid-target"),
+        "--dry-run",
+    ]);
+    assert!(!t.path("valid-target").exists());
+}
+
+#[test]
 fn native_hyphen_prefixed_selector_values_require_equals() {
     let t = Tmp::new();
     write(&t.path("base/-/file"), b"literal hyphen directory");

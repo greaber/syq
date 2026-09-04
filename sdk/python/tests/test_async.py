@@ -312,6 +312,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             )
         argv = self.argv()
         manifest = Path(argv[argv.index("--mapping") + 1])
+        self.assertLess(argv.index("--mapping"), argv.index("--into"))
         self.assertEqual(manifest.parent, physical.resolve())
 
     async def test_ignore_stream_preserves_native_cross_option_order(self) -> None:

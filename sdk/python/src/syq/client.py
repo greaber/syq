@@ -496,6 +496,17 @@ def _append_path_option(
         argv.extend((option, value))
 
 
+def _insert_mapping_option(
+    argv: list[Argument], index: int, value: Argument
+) -> None:
+    arguments: list[Argument] = []
+    if value == "-" or value == b"-":
+        arguments.extend(("--mapping", value))
+    else:
+        _append_path_option(arguments, "--mapping", value)
+    argv[index:index] = arguments
+
+
 def _append_text(argv: list[Argument], option: str, value: object | None) -> None:
     if value is not None:
         if not isinstance(value, (str, int)) or isinstance(value, bool):
@@ -607,7 +618,7 @@ def _copy_arguments(
     max_size: str | int | None,
     min_size: str | int | None,
     max_delete: int | None,
-) -> tuple[list[Argument], int]:
+) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
     source_count = 0
     contents_count = 0
@@ -636,6 +647,7 @@ def _copy_arguments(
         argv.append("--follow")
     if follow_src:
         argv.append("--follow-src")
+    source_end = len(argv)
     if follow_dest:
         argv.append("--follow-dest")
     if to is not None:
@@ -718,7 +730,7 @@ def _copy_arguments(
         if not prune:
             raise SyqInvocationError("--max-delete requires --prune")
         argv.extend(("--max-delete", str(max_delete)))
-    return argv, source_count
+    return argv, source_count, source_end
 
 
 def _rm_arguments(
@@ -1034,7 +1046,7 @@ class Client:
                 "stream this surface relies on; pass coordinate_at='local'"
             )
         results = _prepare_results_file(results)
-        argv, source_count = _copy_arguments(
+        argv, source_count, source_end = _copy_arguments(
             "cp",
             sources,
             src=src,
@@ -1107,8 +1119,8 @@ class Client:
         if any(value is not None for value in (as_, as_new, as_existing)):
             raise SyqInvocationError("--mapping conflicts with --as")
         if isinstance(mapping, (str, bytes, os.PathLike)):
-            _append_path_option(
-                argv, "--mapping", _argument(mapping, label="mapping")
+            _insert_mapping_option(
+                argv, source_end, _argument(mapping, label="mapping")
             )
             return self._typed(
                 argv,
@@ -1126,7 +1138,9 @@ class Client:
             mode="wb", prefix="syq-python-mapping-", suffix=".ndjson"
         ) as manifest:
             _write_mapping_manifest(manifest, mapping)
-            argv.extend(("--mapping", os.path.realpath(manifest.name)))
+            _insert_mapping_option(
+                argv, source_end, os.path.realpath(manifest.name)
+            )
             return self._typed(
                 argv,
                 mode="cp",
@@ -1213,7 +1227,7 @@ class Client:
         src_src_values = _values(src_src, label="--src-src")
         src_file_values = _values(src_file, label="--src-file")
         src_dir_values = _values(src_dir, label="--src-dir")
-        argv, source_count = _copy_arguments(
+        argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,
