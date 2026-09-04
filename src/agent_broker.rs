@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn configured_known_hosts_provenance_uses_files_openssh_read() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let config = temp.path().join("ssh_config");
         std::fs::write(
             &config,
@@ -1854,7 +1854,7 @@ mod tests {
         let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
         assert!(!defaults.user.rendered.contains(['"', '\\', '\n', '\r']));
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let config = temp.path().join("ssh_config");
         std::fs::write(
             &config,
@@ -2005,7 +2005,7 @@ mod tests {
         assert!(defaults.user.files.iter().all(|path| path.is_absolute()));
         assert!(defaults.global.files.iter().all(|path| path.is_absolute()));
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let known_hosts = temp.path().join("known_hosts");
         let lookup = "[vault.internal]:2222";
         let (_, host_key) = key(53);
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let known_hosts = temp.path().join("known_hosts");
         let config = temp.path().join("ssh_config");
         let ssh = temp.path().join("ssh");
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let (identity_private, identity) = key(23);
         let (ambient, requests) = fake_ambient(&ambient_socket, identity_private.clone());
@@ -2313,7 +2313,7 @@ mod tests {
 
     #[test]
     fn unbound_sign_mutation_unknown_extension_and_oversize_fail_closed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (_, source) = key(31);
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn broker_bounds_idle_clients_and_drop_closes_them() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (_, source) = key(41);
@@ -2460,7 +2460,7 @@ mod tests {
 
     #[test]
     fn broker_advertises_and_signs_only_the_transport_key() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();
         let (source_private, source) = key(51);

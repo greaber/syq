@@ -1768,7 +1768,7 @@ mod tests {
 
     #[test]
     fn completion_cache_lock_fails_immediately_when_already_held() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let directory = open_cache_directory(temporary.path(), true)
             .unwrap()
             .unwrap();

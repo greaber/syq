@@ -2,7 +2,9 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+#[cfg(target_os = "linux")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -24,12 +26,36 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 // The isolated real-SSH Compose suite still exercises the production default.
 const EPHEMERAL_TCP_PORTS: &str = "0-0";
 
+/// The process temporary directory with symlinks resolved. macOS places
+/// `TMPDIR` under `/var`, a symlink to `/private/var`, and native operator
+/// paths refuse symlink components by default.
+fn temp_dir() -> PathBuf {
+    let path = std::env::temp_dir();
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Whether the temporary filesystem accepts file names that are not valid
+/// UTF-8. APFS on macOS rejects them with `EILSEQ`, so tests about raw byte
+/// names have nothing to exercise there and report that they were skipped.
+fn filesystem_accepts_non_utf8_names() -> bool {
+    let mut name = std::ffi::OsString::from(format!("syq-probe-{}-", std::process::id()));
+    name.push(std::ffi::OsString::from_vec(vec![0xff]));
+    let path = temp_dir().join(name);
+    match File::create(&path) {
+        Ok(_) => {
+            let _ = fs::remove_file(&path);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 struct Tmp(PathBuf);
 
 impl Tmp {
     fn new() -> Tmp {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!("syq-test-{}-{}", std::process::id(), n));
+        let p = temp_dir().join(format!("syq-test-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         Tmp(p)
@@ -278,7 +304,14 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
         .unwrap();
     // Conservatively budget every selector as parent + exact object for the
     // registry, control, and all 64 shared workers, plus worker/cache reserve.
-    assert_eq!(required, current_open + 1764, "{stderr}");
+    // Same-machine destination workers claim exact source capabilities only
+    // on Linux, where the descriptor-copy fast path exists.
+    let copy_local_claims = if cfg!(target_os = "linux") { 64 * 3 } else { 0 };
+    assert_eq!(
+        required,
+        current_open + 1572 + copy_local_claims,
+        "{stderr}"
+    );
     assert!(
         !t.path("destination").exists(),
         "source FD admission failed after destination creation"
@@ -2682,6 +2715,10 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
 
 #[test]
 fn native_copy_preserves_non_utf8_selector_bytes() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     let t = Tmp::new();
     let mut name = b"non-utf8-".to_vec();
     name.push(0xff);
@@ -3053,6 +3090,10 @@ fn native_rm_missing_selectors_succeed() {
 
 #[test]
 fn native_rm_results_preserve_non_utf8_paths() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -3571,6 +3612,7 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn cached_local_helper(t: &Tmp) -> PathBuf {
     let target = match std::env::consts::ARCH {
         "x86_64" => "linux-x86_64",
@@ -4214,7 +4256,10 @@ fn double_verbose_dry_run_reports_tcp_without_extra_connection() {
     assert!(!t.path("dst").exists());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("control: connected via fake-rsh; remote linux-"),
+        stderr.contains(&format!(
+            "control: connected via fake-rsh; remote {}-",
+            std::env::consts::OS
+        )),
         "{stderr}"
     );
     assert!(
@@ -7155,6 +7200,10 @@ fn rsync_control_inputs_follow_links_owned_by_the_effective_user() {
 
 #[test]
 fn control_file_names_preserve_non_utf8_bytes() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     let t = Tmp::new();
     write(&t.path("src/keep"), b"keep");
     write(&t.path("src/drop"), b"drop");
@@ -11332,6 +11381,10 @@ fn native_map_exposes_only_manifest_shaping_options() {
 
 #[test]
 fn native_map_refuses_non_utf8_names() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     let t = Tmp::new();
     write(&t.path("src/ok.txt"), b"ok");
     let bad = t
@@ -11423,6 +11476,10 @@ fn native_cp_mapping_renames_creates_ancestors_and_reads_stdin() {
 
 #[test]
 fn native_cp_mapping_file_manifest_and_base64_src() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     let t = Tmp::new();
     let bad = t
         .path("src")
@@ -12578,7 +12635,10 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     write(&t.path("éalpha"), b"unicode");
     write(&t.path("ébeta"), b"unicode");
     let raw_name = std::ffi::OsString::from_vec(b"raw-\xff".to_vec());
-    write(&t.path("").join(&raw_name), b"raw");
+    let raw_names_supported = filesystem_accepts_non_utf8_names();
+    if raw_names_supported {
+        write(&t.path("").join(&raw_name), b"raw");
+    }
 
     let bash = completion_command(&t, &["bash"]).run().unwrap();
     assert_output_ok(&bash);
@@ -12709,14 +12769,18 @@ printf '%s\n' "${COMPREPLY[@]}""#,
     assert_output_ok(&raw);
     assert_eq!(
         completion_values(&raw.stdout),
-        vec![(
-            b'f',
-            t.path("")
-                .join(raw_name)
-                .as_os_str()
-                .as_encoded_bytes()
-                .to_vec(),
-        )]
+        if raw_names_supported {
+            vec![(
+                b'f',
+                t.path("")
+                    .join(raw_name)
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )]
+        } else {
+            Vec::new()
+        }
     );
 
     let based = completion_command(
@@ -14224,6 +14288,10 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
 }
 #[test]
 fn native_remote_to_remote_carries_any_path_bytes_directly() {
+    if !filesystem_accepts_non_utf8_names() {
+        eprintln!("skipping: this filesystem rejects file names that are not valid UTF-8");
+        return;
+    }
     use std::os::unix::ffi::OsStrExt;
     let t = Tmp::new();
     let rsh = fake_rsh(&t);

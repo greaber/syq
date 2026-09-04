@@ -3,6 +3,15 @@
 # metadata, checksums, the standalone installer, and the Homebrew formula.
 set -euo pipefail
 
+# Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 vVERSION DIST_DIR" >&2
   exit 2
@@ -43,9 +52,9 @@ for index in "${!targets[@]}"; do
     exit 1
   fi
 
-  binary_hash=$(sha256sum "$binary" | awk '{print $1}')
-  archive_hash=$(sha256sum "$archive" | awk '{print $1}')
-  binary_size=$(stat -c '%s' "$binary")
+  binary_hash=$(sha256_file "$binary")
+  archive_hash=$(sha256_file "$archive")
+  binary_size=$(wc -c < "$binary" | tr -d ' ')
   archive_size=$(stat -c '%s' "$archive")
   printf '%s  %s\n' "$binary_hash" "$asset" > "$binary.sha256"
   printf '%s  %s\n' "$archive_hash" "$asset.gz" > "$archive.sha256"

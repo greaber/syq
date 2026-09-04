@@ -16,11 +16,29 @@ target_dir=$(cargo metadata --no-deps --format-version 1 \
   --manifest-path "$repo_dir/Cargo.toml" | jq -r .target_directory)
 canonicalizer="$target_dir/debug/syq"
 
+# Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$@"
+  else
+    shasum -a 256 -c "$@"
+  fi
+}
+
 prepare_dist() {
   local dist=$1 asset
   mkdir -p "$dist"
   for asset in syq-linux-x86_64 syq-linux-aarch64 syq-macos-arm64 syq-macos-x86_64; do
-    cp /bin/true "$dist/$asset"
+    printf '#!/bin/sh\nexit 0\n' > "$dist/$asset"
+    chmod 755 "$dist/$asset"
     gzip -9 -n -c "$dist/$asset" > "$dist/$asset.gz"
   done
 }
@@ -47,9 +65,9 @@ prepare_dist "$second"
 "$script_dir/package-release.sh" "$tag" "$second"
 
 test "$(find "$first" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 19
-(cd "$first" && sha256sum -c syq-linux-x86_64.sha256 syq-linux-x86_64.gz.sha256)
-installer_sha=$(sha256sum "$first/install.sh" | awk '{print $1}')
-formula_sha=$(sha256sum "$first/syq.rb" | awk '{print $1}')
+(cd "$first" && sha256_check syq-linux-x86_64.sha256 syq-linux-x86_64.gz.sha256)
+installer_sha=$(sha256_file "$first/install.sh")
+formula_sha=$(sha256_file "$first/syq.rb")
 jq -e \
   --arg installer_sha "$installer_sha" --arg formula_sha "$formula_sha" '
     .schema == 1
@@ -89,7 +107,7 @@ expect_failure 'does not match Cargo.toml version' \
 # missing version with exit 3, and fail closed on registry errors.
 source_crate="$work/syq-0.1.0.crate"
 printf 'source crate\n' > "$source_crate"
-source_checksum=$(sha256sum "$source_crate" | awk '{print $1}')
+source_checksum=$(sha256_file "$source_crate")
 crate_response="$work/crate-response.json"
 jq -n --arg checksum "$source_checksum" \
   '{version:{num:"0.1.0",checksum:$checksum}}' > "$crate_response"
@@ -137,12 +155,12 @@ other_key="$work/other.pem"
 openssl genpkey -algorithm ED25519 -out "$other_key" >/dev/null 2>&1
 other_public_b64=$(openssl pkey -in "$other_key" -pubout -outform DER | \
   tail -c 32 | openssl base64 -A)
-second_sha=$(sha256sum "$second/syq-release-manifest.json" | awk '{print $1}')
+second_sha=$(sha256_file "$second/syq-release-manifest.json")
 expect_failure 'does not match SYQ_RELEASE_PUBLIC_KEY' env \
   SYQ_RELEASE_SIGNING_KEY_PEM_B64="$key_b64" SYQ_RELEASE_PUBLIC_KEY="$other_public_b64" \
   "$script_dir/sign-release-manifest.sh" \
   "$second/syq-release-manifest.json" "$canonicalizer"
-test "$(sha256sum "$second/syq-release-manifest.json" | awk '{print $1}')" = "$second_sha"
+test "$(sha256_file "$second/syq-release-manifest.json")" = "$second_sha"
 jq -e 'has("signature") | not' "$second/syq-release-manifest.json" >/dev/null
 
 # Verify the workflow's GitHub tag checks against controlled API responses.

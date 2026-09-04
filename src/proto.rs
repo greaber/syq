@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn registered_paths_reject_unsafe_wire_components() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let session = crate::descriptor_broker::DescriptorSessionSlot::default();
         let ticket = session
             .register(std::fs::File::open(temporary.path()).unwrap())

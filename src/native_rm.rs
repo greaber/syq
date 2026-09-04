@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn repeated_directory_scans_start_at_the_beginning() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
         let directory = OpenOptions::new()
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[test]
     fn simultaneous_directory_streams_have_independent_offsets() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("one"), b"1").unwrap();
         fs::write(temp.path().join("two"), b"2").unwrap();
         let directory = OpenOptions::new()
@@ -1426,7 +1426,7 @@ mod tests {
 
     #[test]
     fn no_follow_aborts_before_any_mutation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         fs::write(temp.path().join("victim"), b"data").unwrap();
@@ -1455,7 +1455,7 @@ mod tests {
 
     #[test]
     fn no_follow_unlinks_selected_symlink_and_preserves_referent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         symlink("real", temp.path().join("link")).unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn failed_attached_emit_cancels_pending_mutation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::write(temp.path().join("victim"), b"data").unwrap();
         let directory = OpenOptions::new()
             .read(true)
@@ -1528,7 +1528,7 @@ mod tests {
 
     #[test]
     fn follow_removes_referent_and_leaves_link() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         symlink("real", temp.path().join("link")).unwrap();
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn root_rejects_symlink_that_leaves_and_reenters() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("root/inside")).unwrap();
         symlink("../root/inside", temp.path().join("root/escape")).unwrap();
         let result = remove(
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn selected_directory_rename_cannot_redirect_removal_to_its_replacement() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("tree")).unwrap();
         fs::write(temp.path().join("tree/old"), b"old").unwrap();
         let mut outcomes = Vec::new();
@@ -1608,7 +1608,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_swapped_after_its_identity_check_is_reported_as_a_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         fs::write(base.join("tree/old"), b"old").unwrap();
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[test]
     fn leaf_swapped_after_its_identity_check_removes_only_the_replacement_entry() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::write(base.join("file"), b"old").unwrap();
         fs::write(base.join("dir-file"), b"old").unwrap();
@@ -1711,7 +1711,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_renamed_away_after_its_identity_check_is_reported_as_a_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         let swap = base.clone();
@@ -1730,7 +1730,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_renamed_away_after_pinning_is_reported_as_a_failure() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let base = temp.path().to_path_buf();
         fs::create_dir(base.join("tree")).unwrap();
         let mut outcomes = Vec::new();

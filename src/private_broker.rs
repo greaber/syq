@@ -190,6 +190,12 @@ fn accept_connections<F>(
         reap_workers(&mut workers);
         match listener.accept() {
             Ok((stream, _)) => {
+                // BSD-derived kernels (macOS) hand accepted sockets the
+                // listener's non-blocking flag; Linux does not. Workers read
+                // with timeouts and need a blocking socket either way.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 if workers.len() >= max_connections {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;

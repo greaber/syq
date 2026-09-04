@@ -1,5 +1,9 @@
 //! End-to-end standalone updater tests using a copied executable and signed,
 //! local fixtures. No test ever replaces the Cargo-built binary.
+//!
+//! Every test here exercises the Linux release layout, so the whole file is
+//! compiled only on Linux.
+#![cfg(target_os = "linux")]
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
@@ -20,8 +24,9 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("syq-update-test-{}-{sequence}", std::process::id()));
+        let parent = std::env::temp_dir();
+        let parent = fs::canonicalize(&parent).unwrap_or(parent);
+        let path = parent.join(format!("syq-update-test-{}-{sequence}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self(path)

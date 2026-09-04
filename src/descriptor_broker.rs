@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn shared_process_workers_clone_the_registered_root() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let selected = temp.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         std::fs::write(selected.join("marker"), b"original").unwrap();
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn source_parent_and_object_are_distinct_repeatable_capabilities() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let selected = temp.path().join("selected");
         std::fs::write(&selected, b"selected").unwrap();
         let object = File::open(&selected).unwrap();
@@ -877,7 +877,7 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let selected = temp.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         std::fs::write(selected.join("marker"), b"original").unwrap();
@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn broker_rejects_bad_secrets_and_unknown_roots() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSession::start(2, 2).unwrap();
         let root = session.register(File::open(temp.path()).unwrap()).unwrap();
 
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn registration_requires_explicit_root_reuse_and_enforces_the_limit() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let first = temp.path().join("first");
         std::fs::create_dir(&first).unwrap();
         let session = DescriptorSession::start(1, 1).unwrap();
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn batch_registration_checks_capacity_before_consuming_any_root_id() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSession::start(1, 1).unwrap();
         let error = session
             .registry()
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn repeated_inode_registrations_keep_distinct_authority_ids() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSession::start(2, 1).unwrap();
         let ids = session
             .registry()
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn populated_slot_rejects_another_sessions_ticket() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let first = DescriptorSessionSlot::default();
         first.register(File::open(temp.path()).unwrap()).unwrap();
         let second = DescriptorSessionSlot::default();
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn explicit_close_removes_broker_while_slot_clones_remain() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSessionSlot::default();
         let listener_clone = session.clone();
         let ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn ticket_debug_output_does_not_expose_the_secret() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSession::start(1, 1).unwrap();
         let root = session.register(File::open(temp.path()).unwrap()).unwrap();
         let ticket = session.ticket(root).unwrap();

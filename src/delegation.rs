@@ -1665,11 +1665,20 @@ mod tests {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .expect("tests require an absolute private runtime or home directory");
+            // Resolve symlinks (macOS `/var`) and keep the name short: an
+            // ssh-agent socket beneath this directory must fit `sun_path`,
+            // which is 104 bytes on macOS beneath an already long `TMPDIR`.
+            let parent = fs::canonicalize(&parent).unwrap_or(parent);
+            let label: String = label
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(6)
+                .collect();
             for _ in 0..100 {
                 let path = parent.join(format!(
-                    "syq-delegation-{label}-{}-{}",
+                    "syq-{label}-{}-{}",
                     std::process::id(),
-                    hex(&random_array::<12>().expect("test randomness"))
+                    hex(&random_array::<4>().expect("test randomness"))
                 ));
                 let result = fs::DirBuilder::new().mode(0o700).create(&path);
                 match result {

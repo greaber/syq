@@ -196,24 +196,29 @@ fn tcp_congestion_control<S: AsRawFd>(socket: &S) -> std::io::Result<String> {
 /// Apply an explicit Linux TCP_CONGESTION override and read it back. With no
 /// override this is observational only: an unavailable getter returns None
 /// and never changes normal socket behavior.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
+    _socket: &S,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    match requested {
+        None => Ok(None),
+        Some(requested) => Err(TcpCongestionError(format!(
+            "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     socket: &S,
     requested: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(requested) = requested else {
-        #[cfg(target_os = "linux")]
         return Ok(tcp_congestion_control(socket).ok());
-        #[cfg(not(target_os = "linux"))]
-        return Ok(None);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    return Err(TcpCongestionError(format!(
-        "TCP congestion control {requested:?} was requested, but per-socket selection is supported only on Linux"
-    ))
-    .into());
-
-    #[cfg(target_os = "linux")]
     {
         let result = unsafe {
             libc::setsockopt(
@@ -2392,7 +2397,7 @@ mod tests {
 
     #[test]
     fn local_workers_clone_the_control_descriptor_session_in_process() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let endpoint = Endpoint::local();
@@ -2428,7 +2433,7 @@ mod tests {
 
     #[test]
     fn local_source_worker_rejects_destination_mutation_requests() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_support::tempdir().unwrap();
         let selected = temporary.path().join("selected");
         std::fs::create_dir(&selected).unwrap();
         let marker = selected.join("marker");
@@ -2568,11 +2573,13 @@ mod tests {
         assert_eq!(byte, [7]);
         assert!(
             client_stats.segments_sent.is_some_and(|value| value > 0)
-                || client_stats.bytes_sent.is_some_and(|value| value > 0)
+                || client_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{client_stats:?}"
         );
         assert!(
             server_stats.segments_sent.is_some_and(|value| value > 0)
-                || server_stats.bytes_sent.is_some_and(|value| value > 0)
+                || server_stats.bytes_sent.is_some_and(|value| value > 0),
+            "{server_stats:?}"
         );
         #[cfg(target_os = "linux")]
         {
@@ -2671,7 +2678,7 @@ mod tests {
 
     #[test]
     fn hello_carries_destination_initialization_before_readiness() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::tempdir().unwrap();
         let descriptor_session = crate::descriptor_broker::DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(temp.path()).unwrap())
@@ -3064,7 +3071,7 @@ mod tests {
     #[test]
     fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let base = directory.path().join("scope");
         crate::persistence::initialize_scope(&base).unwrap();
         // The socket name is stable per endpoint, and a dead leftover at the

@@ -140,7 +140,10 @@ env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
   > "$work/init-output" 2>&1
 [ -f "$repo/.env.release" ] || fail "initializer did not create .env.release"
 [ -f "$repo/.env.keys" ] || fail "initializer did not create .env.keys"
-[ "$(stat -c '%a' "$repo/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+[ "$(file_mode "$repo/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
 grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$repo/.env.release" \
   && fail "encrypted inventory contains the plaintext Homebrew key"
 grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$work/init-output" \

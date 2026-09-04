@@ -50,10 +50,18 @@ test "$(grep -Fc "syq/sdk/python/v$next_syq_version/" \
   "$work/sdk/python/README.md")" -eq 2
 cmp "$candidate" "$work/sdk/python/src/syq/syq-release-manifest.json"
 
-before=$(find "$work/sdk" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
+# Portable tree fingerprint: GNU coreutils on Linux, Perl shasum on macOS.
+tree_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    find "$1" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum
+  else
+    find "$1" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256
+  fi
+}
+before=$(tree_digest "$work/sdk")
 python3 "$script_dir/prepare-python-sdk-release.py" \
   --root "$work" --manifest "$candidate"
-after=$(find "$work/sdk" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)
+after=$(tree_digest "$work/sdk")
 test "$before" = "$after"
 
 misaligned="$work/misaligned"

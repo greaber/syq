@@ -110,8 +110,8 @@ selected_actions=$(gh api "repos/$CANONICAL_REPOSITORY/actions/permissions/selec
 jq -e '.github_owned_allowed == true and .verified_allowed == false' \
   <<<"$selected_actions" >/dev/null \
   || die 'unexpected GitHub selected-actions policy'
-mapfile -t workflow_actions < <(sed -n 's/^[[:space:]]*uses:[[:space:]]*\([^ #]*\).*/\1/p' .github/workflows/*.yml | sort -u)
-for action in "${workflow_actions[@]}"; do
+workflow_actions=$(sed -n 's/^[[:space:]]*uses:[[:space:]]*\([^ #]*\).*/\1/p' .github/workflows/*.yml | sort -u)
+for action in $workflow_actions; do
   case "$action" in
     ./*) continue ;;
   esac
