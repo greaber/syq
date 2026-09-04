@@ -27,15 +27,14 @@ case "$1:$2" in
     done
     cat "$SYQ_TEST_RUNS_DIR/$workflow.json"
     ;;
-  pr:view)
+  pr:list)
     if [ "${SYQ_TEST_PR_JSON:-}" = FAIL ]; then
       echo 'GraphQL: simulated GraphQL failure' >&2
       exit 1
     elif [ -n "${SYQ_TEST_PR_JSON:-}" ]; then
-      printf '%s\n' "$SYQ_TEST_PR_JSON"
+      printf '[%s]\n' "$SYQ_TEST_PR_JSON"
     else
-      echo 'no pull requests found for branch' >&2
-      exit 1
+      echo '[]'
     fi
     ;;
   *) echo "unexpected fake gh invocation: $*" >&2; exit 2 ;;
@@ -156,7 +155,7 @@ with_pr "$empty_pr" expect_exit 0 run_status
 expect_output 'checks: none registered yet'
 expect_no_output 'all completed successfully'
 
-# A pull-request lookup failure other than "no pull request" is an error.
+# A pull-request lookup failure is an error, not "no pull request".
 with_pr FAIL expect_exit 2 run_status
 expect_output 'could not look up the pull request for task'
 expect_output 'simulated GraphQL failure'

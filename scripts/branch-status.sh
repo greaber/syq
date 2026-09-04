@@ -88,19 +88,15 @@ for workflow in "${workflows[@]}"; do
 done
 
 # The pull request for this branch, if any.
+# An empty list means no open pull request; a failed command is an error.
 pr=null
 if [ "$branch" != HEAD ]; then
-  pr_error=$(mktemp)
-  if pr_json=$(gh pr view "$branch" --repo "$repository" \
-      --json number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,mergeStateStatus,statusCheckRollup 2>"$pr_error"); then
-    pr=$pr_json
-  elif ! grep -q 'no pull requests found' "$pr_error"; then
-    echo "could not look up the pull request for $branch:" >&2
-    cat "$pr_error" >&2
-    rm -f "$pr_error"
+  if ! pr_list=$(gh pr list --repo "$repository" --head "$branch" --state open --limit 1 \
+      --json number,url,state,isDraft,baseRefName,headRefOid,reviewDecision,mergeStateStatus,statusCheckRollup); then
+    echo "could not look up the pull request for $branch" >&2
     exit 2
   fi
-  rm -f "$pr_error"
+  pr=$(jq -c 'first // null' <<<"$pr_list")
 fi
 pr_head_relation=none
 if [ "$pr" != null ]; then
