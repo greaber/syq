@@ -59,7 +59,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             from_="source",
             root="source-root",
             follow_src=True,
-            follow_dest=True,
+            follow_dst=True,
             to="target",
             coordinate_at="local",
             into_existing="out",
@@ -84,7 +84,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--quiet", self.argv())
         self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
-        self.assertIn("--follow-dest", self.argv())
+        self.assertIn("--follow-dst", self.argv())
         self.assertIn("--receiver-max-entries", self.argv())
         self.assertIn("--receiver-max-bytes", self.argv())
         self.assertIn("--receiver-receipt", self.argv())
@@ -95,7 +95,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.argv().count("--src"), 2)
 
         prune = await self.client.cp(
-            src_src="source", into="target", prune=True, max_delete=10
+            srcs_in="source", into="target", prune=True, max_delete=10
         )
         self.assertIsInstance(prune, syq.CpResult)
         self.assertEqual(prune.deletions_completed, 1)
@@ -185,7 +185,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_map_is_a_lazy_async_context_managed_stream(self) -> None:
         stream = self.client.map(
-            src_src="source", root="source-root", follow_src=True
+            srcs_in="source", root="source-root", follow_src=True
         )
         self.assertFalse(self.argv_log.exists(), "map started before it was consumed")
         async with stream:
@@ -215,7 +215,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             process_cwd=self.root,
         )
         stream = client.map(
-            src_src="link/../selected", cwd="base", follow_src=True
+            srcs_in="link/../selected", cwd="base", follow_src=True
         )
         async with stream:
             entries = [entry async for entry in stream]
@@ -232,7 +232,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             env={**self.env, "HOME": os.fspath(home)},
             process_cwd=self.root,
         )
-        stream = client.map(src_src="~/selected", cwd="ignored")
+        stream = client.map(srcs_in="~/selected", cwd="ignored")
         async with stream:
             entries = [entry async for entry in stream]
         self.assertEqual(len(entries), 1)
@@ -424,7 +424,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                 "SYQ_FAKE_PAUSE": "10",
             },
         )
-        async with client.map(src_src="source"):
+        async with client.map(srcs_in="source"):
             deadline = time.monotonic() + 2
             while not marker.with_suffix(".ready").exists():
                 if time.monotonic() >= deadline:

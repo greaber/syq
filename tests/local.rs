@@ -1253,7 +1253,7 @@ fn native_copy_distinguishes_named_contents_and_exact_placement() {
     run_native_ok(&["cp", &many_slashes, "--into", &t.s("named")]);
     assert_eq!(read(&t.path("named/src/sub/file")), b"data");
 
-    run_native_ok(&["cp", "--src-src", &t.s("src"), "--into", &t.s("contents")]);
+    run_native_ok(&["cp", "--srcs-in", &t.s("src"), "--into", &t.s("contents")]);
     assert_eq!(read(&t.path("contents/sub/file")), b"data");
     assert!(!t.path("contents/src").exists());
 
@@ -1334,7 +1334,7 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     let contents_target = t.s("bad-contents-target");
     let not_a_directory = native_syq(&[
         "cp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-new",
         &contents_target,
@@ -1886,7 +1886,7 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
         if prune {
             args.push("--prune");
         }
-        args.extend(["--src-src", &source, "--into-existing", &target]);
+        args.extend(["--srcs-in", &source, "--into-existing", &target]);
         run_native_ok(&args);
         assert_eq!(read(&t.path(&format!("{destination}/file"))), corrupted);
         if prune {
@@ -1913,7 +1913,7 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
         "cp",
         "--ignore",
         "*.tmp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("copied"),
@@ -1930,7 +1930,7 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
         &t.s("patterns"),
         "--ignore",
         "!important.tmp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("pruned"),
@@ -1954,7 +1954,7 @@ fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
         "2",
         "--max-size",
         "4",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("copied"),
@@ -1970,7 +1970,7 @@ fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
         "--prune",
         "--min-size=2",
         "--max-size=4",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("pruned"),
@@ -1994,7 +1994,7 @@ fn native_size_limits_fail_before_destination_mutation() {
             "cp",
             option,
             value,
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--into",
             &t.s(destination),
@@ -2023,7 +2023,7 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
     run_native_ok(&[
         "cp",
         "--preserve=permissions,specials",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -2051,7 +2051,7 @@ fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
         .args([
             "cp",
             "--preserve=specials",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--into",
             &t.s("dst"),
@@ -2093,7 +2093,7 @@ fn native_remote_destination_socket_policy_uses_handshake_capability() {
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
             .args(["--no-tcp", "-j", "1", "--preserve=specials"])
-            .args(["--src-src", &t.s("src"), "--to", "fake", "--into"])
+            .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
             .arg(t.path(destination))
             .arg("--no-progress")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -2144,7 +2144,7 @@ fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     run_native_ok(&[
         "cp",
         "--inplace",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -2191,7 +2191,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     write(&t.path("real/file"), b"data");
     symlink("real", t.path("link")).unwrap();
 
-    let refused = native_syq(&["cp", "--src-src", &t.s("link"), "--into", &t.s("refused")]);
+    let refused = native_syq(&["cp", "--srcs-in", &t.s("link"), "--into", &t.s("refused")]);
     assert!(!refused.status.success());
     assert!(stderr_of(&refused).contains("pass --follow"));
     assert!(!t.path("refused").exists());
@@ -2199,7 +2199,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     run_native_ok(&[
         "cp",
         "--follow",
-        "--src-src",
+        "--srcs-in",
         &t.s("link"),
         "--into",
         &t.s("followed"),
@@ -2230,7 +2230,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     let stderr = stderr_of(&refused);
     assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
     assert!(
-        stderr.contains("--follow-dest for destination paths"),
+        stderr.contains("--follow-dst for destination paths"),
         "{stderr}"
     );
     assert!(
@@ -2253,7 +2253,7 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     run_native_ok(&[
         "cp",
         "--follow-src",
-        "--src-src",
+        "--srcs-in",
         &t.s("source-link"),
         "--into",
         &t.s("source-followed"),
@@ -2263,19 +2263,19 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     let destination_refused = native_syq(&[
         "cp",
         "--follow-src",
-        "--src-src",
+        "--srcs-in",
         &t.s("real-source"),
         "--into-existing",
         &t.s("destination-link"),
     ]);
     assert!(!destination_refused.status.success());
-    assert!(stderr_of(&destination_refused).contains("--follow-dest"));
+    assert!(stderr_of(&destination_refused).contains("--follow-dst"));
     assert!(!t.path("real-destination/file").exists());
 
     let source_refused = native_syq(&[
         "cp",
-        "--follow-dest",
-        "--src-src",
+        "--follow-dst",
+        "--srcs-in",
         &t.s("source-link"),
         "--into",
         &t.s("source-refused"),
@@ -2286,8 +2286,8 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
 
     run_native_ok(&[
         "cp",
-        "--follow-dest",
-        "--src-src",
+        "--follow-dst",
+        "--srcs-in",
         &t.s("real-source"),
         "--into-existing",
         &t.s("destination-link"),
@@ -2299,10 +2299,10 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     let control_refused = native_syq(&[
         "cp",
         "--follow-src",
-        "--follow-dest",
+        "--follow-dst",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("real-source"),
         "--into",
         &t.s("control-refused"),
@@ -2425,13 +2425,13 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     assert!(!refused.status.success());
     let stderr = stderr_of(&refused);
     assert!(
-        stderr.contains("--follow-dest for destination paths"),
+        stderr.contains("--follow-dst for destination paths"),
         "{stderr}"
     );
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
-        "--follow-dest",
+        "--follow-dst",
         &t.s("source"),
         "--as",
         &t.s("parent-link/exact-name"),
@@ -2485,7 +2485,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "cp",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("ignored-output"),
@@ -2499,7 +2499,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "--follow",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("followed-output"),
@@ -2562,7 +2562,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "cp",
         "--ignore-from",
         "/dev/null",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("device-input-output"),
@@ -2597,7 +2597,7 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
                 command
                     .args(["cp", "--ignore-from"])
                     .arg(&selected)
-                    .arg("--src-src")
+                    .arg("--srcs-in")
                     .arg(t.path("src"))
                     .arg("--into")
                     .arg(&destination)
@@ -2667,7 +2667,7 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
     command
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(&destination)
@@ -2703,7 +2703,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
     command
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(&destination)
@@ -2762,7 +2762,7 @@ fn named_fifo_control_input_fails_before_destination_mutation() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(t.path("dst"))
@@ -2998,7 +2998,7 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
     run_native_ok(&[
         "cp",
         "--prune",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -3061,7 +3061,7 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
             .args([
                 "cp",
                 option,
-                "--src-src",
+                "--srcs-in",
                 &t.s("src"),
                 "--into",
                 &t.s("dst"),
@@ -3196,7 +3196,7 @@ fn native_rm_follow_contents_empties_the_referent_directory_and_keeps_the_link()
     write(&t.path("real/file"), b"remove");
     symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-src", "link"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--srcs-in", "link"]);
 
     assert!(t.path("link").is_symlink());
     assert!(t.path("real").is_dir());
@@ -3407,7 +3407,7 @@ fn native_rm_cwd_may_escape_while_root_confines_dotdot() {
 
     write(&t.path("base/a"), b"a");
     write(&t.path("base/sub/b"), b"b");
-    run_native_ok(&["rm", "--root", &t.s("base"), "--src-src", "."]);
+    run_native_ok(&["rm", "--root", &t.s("base"), "--srcs-in", "."]);
     assert!(t.path("base").is_dir());
     assert!(listing(&t.path("base")).is_empty());
 }
@@ -3444,7 +3444,7 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
         "--follow",
         "--src",
         "victim",
-        "--src-src",
+        "--srcs-in",
         "escape",
     ]);
     assert!(!excursion.status.success());
@@ -3464,7 +3464,7 @@ fn native_rm_root_allows_following_a_symlink_that_stays_inside() {
         "--root",
         &t.s("root"),
         "--follow",
-        "--src-src",
+        "--srcs-in",
         "link",
     ]);
     assert!(t.path("root/link").is_symlink());
@@ -6002,7 +6002,7 @@ fn fallocate_quota_error_is_preserved_in_results() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into-existing",
             "dst",
@@ -6051,7 +6051,7 @@ fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into-existing",
             "dst",
@@ -6937,7 +6937,7 @@ fn native_cp_matches_rsync_rlt() {
     std::os::unix::fs::symlink("sub/file", t.path("src/link")).unwrap();
 
     run_ok(&["-rlt", &t.s("src/"), &t.s("rsync/")]);
-    run_native_ok(&["cp", "--src-src", &t.s("src"), "--into", &t.s("native")]);
+    run_native_ok(&["cp", "--srcs-in", &t.s("src"), "--into", &t.s("native")]);
 
     assert_eq!(listing(&t.path("native")), listing(&t.path("rsync")));
     assert_eq!(read(&t.path("native/sub/file")), b"contents");
@@ -6964,7 +6964,7 @@ fn native_cp_with_prune_matches_rsync_delete() {
     run_native_ok(&[
         "cp",
         "--prune",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("native"),
@@ -6982,7 +6982,7 @@ fn native_rm_removes_named_tree_and_contents_keeps_root() {
     }
 
     run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "native"]);
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--src-src", "contents"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--srcs-in", "contents"]);
 
     assert!(!t.path("native").exists());
     assert!(t.path("contents").is_dir());
@@ -7066,7 +7066,7 @@ fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
 fn native_rm_contents_requires_a_directory() {
     let t = Tmp::new();
     write(&t.path("file"), b"keep");
-    let out = native_syq(&["rm", "--cwd", &t.s(""), "--src-src", "file"]);
+    let out = native_syq(&["rm", "--cwd", &t.s(""), "--srcs-in", "file"]);
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("must resolve to a directory"),
@@ -7228,7 +7228,7 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "a",
         "--srcs",
         "tree",
-        "--src-srcs",
+        "--srcs-in",
         "contents",
         "--src-files",
         "file-a",
@@ -7328,7 +7328,7 @@ fn native_cp_with_prune_keeps_placement_siblings_and_honors_max_delete() {
         "--prune",
         "--max-delete",
         "0",
-        "--src-src",
+        "--srcs-in",
         &t.s("source/tree"),
         "--into-existing",
         &t.s("contents"),
@@ -7524,7 +7524,7 @@ fn control_file_names_preserve_non_utf8_bytes() {
     let native = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--ignore-from"])
         .arg(&rules)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(t.path("native"))
@@ -10957,7 +10957,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
-                "--src-src",
+                "--srcs-in",
                 "/src",
                 "--from",
                 "hosta",
@@ -11020,10 +11020,10 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--from",
             "fake",
             "--follow-src",
-            "--follow-dest",
+            "--follow-dst",
             "--root",
             &t.s("src"),
-            "--src-src",
+            "--srcs-in",
             ".",
             "--to",
             "fake",
@@ -11056,7 +11056,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     for option in [
         "--follow-src",
-        "--follow-dest",
+        "--follow-dst",
         "--root",
         "--ignore=*.tmp",
         "--preserve=permissions",
@@ -11072,7 +11072,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
 }
 
 #[test]
-fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
+fn native_coordinate_at_dst_reverses_the_remote_ssh_edge() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src/file"), b"pulled");
@@ -11088,12 +11088,12 @@ fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
             "1",
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
             "-q",
@@ -11136,12 +11136,12 @@ fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
             "--dry-run",
             "--from",
             "hostA:2200",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB:2222",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
         ])
@@ -11221,7 +11221,7 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
             "1",
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB",
@@ -11249,7 +11249,7 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
 }
 
 #[test]
-fn native_coordinate_at_dest_fails_closed_without_read_enrollment_support() {
+fn native_coordinate_at_dst_fails_closed_without_read_enrollment_support() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -11261,7 +11261,7 @@ fn native_coordinate_at_dest_fails_closed_without_read_enrollment_support() {
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
         ])
@@ -11537,7 +11537,7 @@ fn native_map_contents_emits_identity_parent_first() {
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
     std::os::unix::fs::symlink("Notes.TXT", t.path("src/Link.TXT")).unwrap();
-    let lines = map_lines(&syq_map_in(&t.path(""), &["--src-src", "src"]));
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--srcs-in", "src"]));
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["Berlin", "Berlin/IMG.JPG", "Link.TXT", "Notes.TXT"]);
     for v in &lines {
@@ -11561,7 +11561,7 @@ fn native_map_uses_the_common_source_follow_policy() {
     write(&t.path("real/file"), b"data");
     symlink("real", t.path("link")).unwrap();
 
-    let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
+    let refused = syq_map_in(&t.path(""), &["--srcs-in", "link"]);
     assert!(!refused.status.success());
     assert!(stderr_of(&refused).contains("--follow-src"));
 
@@ -11572,7 +11572,7 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let lines = map_lines(&syq_map_in(
         &t.path(""),
-        &["--follow-src", "--src-src", "link"],
+        &["--follow-src", "--srcs-in", "link"],
     ));
     assert_eq!(lines.len(), 1);
     assert_eq!(map_path(&lines[0], "src"), "file");
@@ -11625,7 +11625,7 @@ fn native_map_follow_keeps_cwd_unconfined_but_named_sources_base_relative() {
 
     let escaped = map_lines(&syq_map_in(
         &t.path(""),
-        &["-C", &t.s("base"), "--follow-src", "--src-src", "escape"],
+        &["-C", &t.s("base"), "--follow-src", "--srcs-in", "escape"],
     ));
     assert_eq!(map_path(&escaped[0], "src"), "file");
     assert_eq!(map_path(&escaped[0], "dst"), "file");
@@ -11657,7 +11657,7 @@ fn native_map_scans_the_pinned_selection_after_path_replacement() {
     write(&t.path("outside/outside.txt"), b"outside");
     let ready = t.path("map-ready");
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["map", "--src-src", "selected"])
+        .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""))
         .env("SYQ_TEST_MAP_SELECTION_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_MAP_SELECTION_MS", "750")
@@ -11697,7 +11697,7 @@ fn native_map_descriptor_walk_has_bounded_fd_use() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
-        .args(["map", "--src-src", "selected"])
+        .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""));
     unsafe {
         command.pre_exec(|| {
@@ -11798,8 +11798,8 @@ fn native_map_refusals() {
         assert!(stderr.contains(needle), "stderr for {args:?}: {stderr}");
     };
     refuse(&["/etc"], "mapping source base");
-    refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
-    refuse(&["--src-src", "d1", "d2"], "only selector");
+    refuse(&["--srcs-in", "d1", "--srcs-in", "d2"], "only selector");
+    refuse(&["--srcs-in", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
     refuse(&["d1", "--as", "/abs"], "is absolute");
     refuse(&["d1", "--as", "../up"], "`..` component");
@@ -11828,7 +11828,7 @@ fn native_map_exposes_only_manifest_shaping_options() {
         .expect("run syq map --help");
     assert_output_ok(&help);
     let help = String::from_utf8(help.stdout).expect("map help is UTF-8");
-    for option in ["--cwd", "--follow", "--src", "--src-src", "--as"] {
+    for option in ["--cwd", "--follow", "--src", "--srcs-in", "--as"] {
         assert!(help.contains(option), "map help omitted {option}:\n{help}");
     }
     for option in [
@@ -11879,7 +11879,7 @@ fn native_map_refuses_non_utf8_names() {
         .path("src")
         .join(std::ffi::OsString::from_vec(b"bad\xff.dat".to_vec()));
     write(&bad, b"x");
-    let out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    let out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(stderr.contains("UTF-8"), "stderr: {stderr}");
@@ -12107,7 +12107,7 @@ fn native_cp_mapping_end_to_end_map_pipeline() {
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
     // syq map | (lowercase transform) | syq cp --mapping -
-    let map_out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    let map_out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
     assert!(map_out.status.success());
     let transformed: String = String::from_utf8(map_out.stdout)
         .unwrap()
@@ -12269,7 +12269,7 @@ fn native_cp_results_without_mapping_and_refusals() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "out",
@@ -12299,14 +12299,14 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(lines.last().unwrap()["status"], "success");
     // map does not expose --results; pruning copies accept it (schema v1
     // covers deletions) and mark the run record.
-    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
+    let out = syq_map_in(&t.path(""), &["--srcs-in", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--results'"));
     let out = syq_cp_in(
         &t.path(""),
         &[
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "pruned",
@@ -12344,26 +12344,26 @@ fn native_map_cwd_may_escape_while_root_confines_component_resolution() {
     assert_eq!(dsts, ["photos", "photos/a.jpg"]);
     assert_eq!(map_path(&lines[0], "src"), "photos");
 
-    let lines = map_lines(&syq_map_in(&t.path("base"), &["--src-src", "../outside"]));
+    let lines = map_lines(&syq_map_in(&t.path("base"), &["--srcs-in", "../outside"]));
     assert_eq!(map_path(&lines[0], "src"), "b.jpg");
     assert_eq!(map_path(&lines[0], "dst"), "b.jpg");
 
     let lines = map_lines(&syq_map_in(
         &t.path("base"),
-        &["--cwd", "missing-base", "--src-src", &t.s("outside")],
+        &["--cwd", "missing-base", "--srcs-in", &t.s("outside")],
     ));
     assert_eq!(map_path(&lines[0], "src"), "b.jpg");
 
     let escape = syq_map_in(
         &t.path(""),
-        &["--root", &t.s("base"), "--src-src", "../outside"],
+        &["--root", &t.s("base"), "--srcs-in", "../outside"],
     );
     assert!(!escape.status.success());
     assert!(stderr_of(&escape).contains("outside its confined root"));
 
     let absolute_escape = syq_map_in(
         &t.path(""),
-        &["--root", &t.s("base"), "--src-src", &t.s("outside")],
+        &["--root", &t.s("base"), "--srcs-in", &t.s("outside")],
     );
     assert!(!absolute_escape.status.success());
 
@@ -12388,7 +12388,7 @@ fn native_cp_results_dry_run_emits_traces() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -12527,7 +12527,7 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -12563,7 +12563,7 @@ fn native_cp_results_fatal_failure_emits_terminal_record() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "absent",
             "--into",
             "dst",
@@ -12597,7 +12597,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -12650,7 +12650,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -12686,7 +12686,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -12950,7 +12950,7 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
 
 fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
     assert_documented(jq_args, program);
-    let map_out = syq_map_in(&t.path(""), &["--src-src", src]);
+    let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
     assert!(
@@ -13892,7 +13892,7 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     let copy = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--pscope"])
         .arg(&scope)
-        .args(["--src-src", &t.s("src"), "--into", &t.s("out"), "-q"])
+        .args(["--srcs-in", &t.s("src"), "--into", &t.s("out"), "-q"])
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
@@ -13961,7 +13961,7 @@ exit 23
                 "own-credentials",
                 "--from",
                 "hostA",
-                "--src-src",
+                "--srcs-in",
                 "src",
                 "--to",
                 "hostB",
@@ -14247,12 +14247,12 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
             scope,
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             "dst",
             "-q",
@@ -14336,7 +14336,7 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
         let dst = format!("dst-{mode}");
         let results = format!("r-{mode}.ndjson");
         let mut args = vec![
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             &dst,
@@ -14373,7 +14373,7 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -14449,7 +14449,7 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
         &t.path(""),
         &[
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "missing",
             "--into",
             "dst",
@@ -14618,7 +14618,7 @@ fn automation_live_streams_validate_against_schema() {
                 "--prune",
                 "--max-delete",
                 "1",
-                "--src-src",
+                "--srcs-in",
                 "src",
                 "--into",
                 "dst",
@@ -14639,7 +14639,7 @@ fn automation_live_streams_validate_against_schema() {
         let out = syq_cp_in(
             &t.path(""),
             &[
-                "--src-src",
+                "--srcs-in",
                 "missing",
                 "--into",
                 "dst",
@@ -14720,7 +14720,7 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
     // outside per-entry accounting, so one directory, matching the record.
     let human = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "-n"],
+        &["--srcs-in", "src", "--into", "dst", "-n"],
         None,
     );
     assert!(human.status.success(), "{}", stderr_of(&human));
@@ -14732,7 +14732,7 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
     let machine = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst2",
@@ -14759,7 +14759,7 @@ fn native_cp_results_refuses_an_existing_file() {
     write(&t.path("r.ndjson"), b"yesterday's run");
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results", "r.ndjson"],
+        &["--srcs-in", "src", "--into", "dst", "--results", "r.ndjson"],
         None,
     );
     assert!(!out.status.success());
@@ -14778,7 +14778,7 @@ fn native_cp_results_fd_streams_to_a_caller_opened_descriptor() {
     // The caller opens fd 3 (`3>fd.ndjson`); syq only ever writes to it.
     let out = Command::new("/bin/sh")
         .arg("-c")
-        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 -q 3>fd.ndjson")
+        .arg("exec \"$1\" cp --srcs-in src --into dst --results-fd 3 -q 3>fd.ndjson")
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .current_dir(t.path(""))
@@ -14803,7 +14803,7 @@ fn native_cp_results_fd_refusals() {
     // A descriptor nobody connected fails loudly at startup.
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results-fd", "37"],
+        &["--srcs-in", "src", "--into", "dst", "--results-fd", "37"],
         None,
     );
     assert!(!out.status.success());
@@ -14812,7 +14812,7 @@ fn native_cp_results_fd_refusals() {
     // A read-only descriptor would swallow every record silently.
     let out = Command::new("/bin/sh")
         .arg("-c")
-        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 3</dev/null")
+        .arg("exec \"$1\" cp --srcs-in src --into dst --results-fd 3 3</dev/null")
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .current_dir(t.path(""))
@@ -14824,7 +14824,7 @@ fn native_cp_results_fd_refusals() {
     // Slots 0-2 belong to stdin/stdout/stderr.
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results-fd", "1"],
+        &["--srcs-in", "src", "--into", "dst", "--results-fd", "1"],
         None,
     );
     assert!(!out.status.success());
@@ -14856,7 +14856,7 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--as",
             &t.s("dst-remote"),
         ])

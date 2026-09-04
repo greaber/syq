@@ -216,7 +216,7 @@ fn pin_selection(
         PinnedPath::Leaf(leaf) => {
             if location.selection == SourceSelection::Contents && leaf.metadata().is_symlink() {
                 bail!(
-                    "--src-src {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                    "--srcs-in {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
                     display(&location.path)
                 );
             }
@@ -297,7 +297,7 @@ fn emit_selection(
     }
     if contents {
         if root_entry.kind != Kind::Dir {
-            bail!("--src-src {} is not a directory", display(&location.path));
+            bail!("--srcs-in {} is not a directory", display(&location.path));
         }
     } else {
         crate::transfer::validate_native_source_type(

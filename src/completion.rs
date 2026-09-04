@@ -802,11 +802,10 @@ fn native_copy_source_option(option: &[u8]) -> bool {
             | b"--cwd"
             | b"--root"
             | b"--src"
-            | b"--src-src"
+            | b"--srcs-in"
             | b"--src-file"
             | b"--src-dir"
             | b"--srcs"
-            | b"--src-srcs"
             | b"--src-files"
             | b"--src-dirs"
             | b"--mapping"
@@ -831,10 +830,8 @@ fn value_completion(
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
             | b"--as-existing" => Some(ValueCompletion::DestinationPath),
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
@@ -843,7 +840,7 @@ fn value_completion(
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
-            b"--coordinate-at" => Some(ValueCompletion::Enum(&["auto", "src", "dest", "local"])),
+            b"--coordinate-at" => Some(ValueCompletion::Enum(&["auto", "src", "dst", "local"])),
             b"--preserve" => Some(ValueCompletion::Enum(&[
                 "permissions",
                 "ownership",
@@ -861,10 +858,8 @@ fn value_completion(
         "rm" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
@@ -872,10 +867,8 @@ fn value_completion(
         },
         "map" => match option {
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--as" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),

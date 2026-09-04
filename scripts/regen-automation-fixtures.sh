@@ -83,7 +83,7 @@ printf 'k' >"$dir/dst/keep.txt"
 printf 'x' >"$dir/dst/extra-1.txt"
 printf 'x' >"$dir/dst/extra-2.txt"
 (cd "$dir" &&
-    "$syq" cp -j1 --prune --max-delete 1 --src-src src --into dst \
+    "$syq" cp -j1 --prune --max-delete 1 --srcs-in src --into dst \
         --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 
@@ -92,7 +92,7 @@ normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 dir="$work/failed"
 mkdir -p "$dir"
 (cd "$dir" &&
-    "$syq" cp -j1 --src-src missing --into dst --results raw.ndjson -q) || true
+    "$syq" cp -j1 --srcs-in missing --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/failed.ndjson"
 
 # rm-success: one directory tree is removed and one explicit selector is
@@ -120,7 +120,7 @@ dir="$work/rm-dry-partial"
 mkdir -p "$dir/tree/blocked"
 chmod 000 "$dir/tree/blocked"
 (cd "$dir" &&
-    "$syq" rm -j1 -n --src-src tree --results raw.ndjson -q) || true
+    "$syq" rm -j1 -n --srcs-in tree --results raw.ndjson -q) || true
 chmod 700 "$dir/tree/blocked"
 normalize <"$dir/raw.ndjson" >"$out/rm-dry-partial.ndjson"
 
