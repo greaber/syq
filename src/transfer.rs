@@ -158,9 +158,18 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     })
 }
 
-fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+/// Rsync's `--insecure-links` is local only: it is never sent to the remote
+/// side of a transfer, so a remote endpoint keeps the default trusted-owner
+/// policy and the confined source paths even when the operator passed the
+/// flag here. Rsync mode never places the coordinator remotely, so "this
+/// machine" is the one the operator invoked syq on.
+fn rsync_insecure_links(args: &Args, endpoint_is_local: bool) -> bool {
+    args.interface == Interface::Rsync && args.insecure_links && endpoint_is_local
+}
+
+fn source_operator_symlink_policy(args: &Args, source_is_local: bool) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        rsync_operator_symlink_policy(args.insecure_links)
+        rsync_operator_symlink_policy(rsync_insecure_links(args, source_is_local))
     } else if args.follows_native_source_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -168,9 +177,12 @@ fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     }
 }
 
-fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+fn destination_operator_symlink_policy(
+    args: &Args,
+    destination_is_local: bool,
+) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        rsync_operator_symlink_policy(args.insecure_links)
+        rsync_operator_symlink_policy(rsync_insecure_links(args, destination_is_local))
     } else if args.follows_native_destination_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -1196,8 +1208,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         update: args.update,
         ignore_existing: args.ignore_existing,
         existing: args.existing,
-        insecure_links: args.interface == Interface::Rsync && args.insecure_links,
-        operator_symlink_policy: destination_operator_symlink_policy(&args),
+        insecure_links: rsync_insecure_links(&args, !src_ep.is_remote()),
+        operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
         max_size,
         min_size,
     });
@@ -2985,6 +2997,7 @@ fn register_source_roots(
     shared_workers: usize,
     independent_claim_workers: usize,
 ) -> Result<Vec<RegisteredSourceRoot>> {
+    let source_is_local = !sources.iter().any(Location::is_remote);
     let base = if let Some(path) = &args.native_source_root {
         SourceRootBase {
             path: Some(path.clone()),
@@ -3011,8 +3024,8 @@ fn register_source_roots(
         conn.call(Request::RegisterSourceRoots {
             base,
             selections,
-            symlink_policy: source_operator_symlink_policy(args),
-            allow_unconfined_paths: args.interface == Interface::Rsync && args.insecure_links,
+            symlink_policy: source_operator_symlink_policy(args, source_is_local),
+            allow_unconfined_paths: rsync_insecure_links(args, source_is_local),
             shared_workers,
             independent_claim_workers,
         })?,

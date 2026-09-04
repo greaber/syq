@@ -116,7 +116,9 @@ What is different from rsync, or weaker:
   the unconfined, name-based source traversal, including through symlinked
   `--files-from` parents. It exists for compatibility and is never selected
   automatically; do not reach for it to satisfy a source-side need without
-  accepting that destination and control paths lose the same check. It does
+  accepting that destination and control paths lose the same check. Like
+  rsync's flag, it is local only: it never reaches a remote endpoint, which
+  keeps the default ownership check and confined source paths. It does
   not enable rsync's separate descendant-link modes:
   `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`, and
   `-K`/`--keep-dirlinks` remain unsupported and are rejected before either
@@ -390,3 +392,11 @@ verified:
 - **Source builds are honest about identity.** A checkout build carries its Git
   revision, is not an immutable release, and cannot populate the managed
   helper cache; peers must present matching build identities to connect.
+- **Both sides always run the same build.** Every connection starts by
+  exchanging build identities in plain bytes, and any mismatch is refused
+  before either side decodes a protocol message. There is no protocol version
+  number and no negotiation between versions: the wire format is free to
+  change between releases because two different builds never talk to each
+  other. The managed helper install is what makes this practical; the local
+  client puts its own verified release on the remote side rather than
+  adapting to whatever is installed there.

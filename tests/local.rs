@@ -7904,6 +7904,72 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     assert!(!t.path("outside/secret2").exists());
 }
 
+/// Rsync's `--insecure-links` is local only and is never sent to the remote
+/// side. A remote source therefore keeps the confined default even when the
+/// operator passed the flag, and the flag still opts out locally in the same
+/// invocation.
+#[test]
+fn insecure_links_never_reaches_a_remote_endpoint() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("outside/secret"), b"secret");
+    fs::create_dir_all(t.path("src/a")).unwrap();
+    std::os::unix::fs::symlink("../outside", t.path("src/link")).unwrap();
+    write(&t.path("src/a/listed"), b"l");
+    write(&t.path("list"), b"link/secret\na/listed\n");
+
+    // Remote source: the symlinked ancestor stays refused.
+    let remote_src = format!("fake:{}", t.s("src"));
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "-r",
+            "--syq-no-bootstrap",
+            "--insecure-links",
+            "--files-from",
+            &t.s("list"),
+            &remote_src,
+            &t.s("dst"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("link is not a directory"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
+    assert!(!t.path("dst/link").exists());
+
+    // Local source, remote destination: the local opt-out still applies and
+    // the remote receiver is unaffected by it.
+    let remote_dst = format!("fake:{}", t.s("dst-remote"));
+    let out = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "-r",
+            "--syq-no-bootstrap",
+            "--insecure-links",
+            "--files-from",
+            &t.s("list"),
+            &t.s("src"),
+            &remote_dst,
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(
+        listing(&t.path("dst-remote")),
+        ["a", "a/listed", "link", "link/secret"]
+    );
+    assert_eq!(read(&t.path("dst-remote/link/secret")), b"secret");
+}
+
 #[test]
 fn existing_never_creates_the_destination_root() {
     let t = Tmp::new();
@@ -9476,6 +9542,34 @@ fn foreign_owned_destination_root_symlink_is_refused() {
     let opted_out = syq(&["-a", "--insecure-links", &t.s("src/"), &t.s("dst/")]);
     assert_output_ok(&opted_out);
     assert_eq!(read(&t.path("outside/f")), b"payload");
+
+    // The opt-out is local only: a remote destination keeps refusing the link.
+    fs::remove_file(t.path("outside/f")).unwrap();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let remote = format!("fake:{}/", t.s("dst"));
+    let refused = remote_syq(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--syq-no-bootstrap",
+            "--insecure-links",
+            &t.s("src/"),
+            &remote,
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "remote foreign-owned link was followed"
+    );
+    assert!(
+        stderr_of(&refused).contains("refusing symlink component"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!t.path("outside/f").exists());
 }
 
 #[cfg(debug_assertions)]
