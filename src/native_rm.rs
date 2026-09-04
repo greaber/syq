@@ -761,7 +761,7 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
                     None,
                 )
             } else {
-                match remove_pinned(&name, false) {
+                match remove_pinned(&name, None) {
                     Ok(RemovePinnedOutcome::Removed) => removal_outcome(
                         selector,
                         label,
@@ -916,7 +916,7 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let result = if pool.dry_run {
         Ok(RemovePinnedOutcome::Removed)
     } else {
-        remove_pinned(removal, true)
+        remove_pinned(removal, Some(&job.directory))
     };
     match result {
         Ok(outcome) => {
@@ -999,7 +999,16 @@ enum RemovePinnedOutcome {
     AlreadyAbsent,
 }
 
-fn remove_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutcome> {
+/// Remove one pinned name from its retained parent.
+///
+/// The identity re-check and `unlinkat` are separate system calls; POSIX has
+/// no identity-conditioned unlink, so an entry renamed over the name between
+/// them is removed as a single entry (never followed or descended) while the
+/// pinned object survives under its new name. For a directory the caller
+/// passes the descriptor it holds on the pinned directory, and a removal that
+/// leaves that directory linked is reported as a failure instead of success.
+/// Leaves hold no descriptor, so a swapped leaf cannot be detected afterwards.
+fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<RemovePinnedOutcome> {
     let current = match metadata_at_cstring(name.parent.as_raw_fd(), &name.name) {
         Ok(identity) => identity,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1008,17 +1017,45 @@ fn remove_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutco
         Err(error) => return Err(error).context("inspect pinned removal name"),
     };
     require_same_identity(name.identity, current, "removal target")?;
-    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
-    retry_zero(|| unsafe { libc::unlinkat(name.parent.as_raw_fd(), name.name.as_ptr(), flags) })
-        .map(|()| RemovePinnedOutcome::Removed)
-        .or_else(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                Ok(RemovePinnedOutcome::AlreadyAbsent)
-            } else {
-                Err(error)
-            }
-        })
-        .context("remove pinned object")
+    #[cfg(test)]
+    tests::before_unlink(name.parent.as_raw_fd(), &name.name);
+    let flags = if held_directory.is_some() {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    let outcome = retry_zero(|| unsafe {
+        libc::unlinkat(name.parent.as_raw_fd(), name.name.as_ptr(), flags)
+    })
+    .map(|()| RemovePinnedOutcome::Removed)
+    .or_else(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(RemovePinnedOutcome::AlreadyAbsent)
+        } else {
+            Err(error)
+        }
+    })
+    .context("remove pinned object")?;
+    if let (RemovePinnedOutcome::Removed, Some(directory)) = (outcome, held_directory) {
+        require_unlinked_directory(directory)?;
+    }
+    Ok(outcome)
+}
+
+/// After a successful `rmdir`, the pinned directory descriptor must refer to
+/// an unlinked directory. A directory still linked means the name was swapped
+/// between the identity check and `unlinkat`, and the replacement was removed
+/// instead of the selected directory.
+fn require_unlinked_directory(directory: &File) -> Result<()> {
+    let metadata = directory.metadata().context("inspect removed directory")?;
+    if metadata.nlink() != 0 {
+        bail!(
+            "removal target {}:{} was replaced before unlinkat; the replacement was removed and the selected directory remains",
+            metadata.dev(),
+            metadata.ino()
+        );
+    }
+    Ok(())
 }
 
 fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {
@@ -1232,9 +1269,63 @@ fn get_errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
     use std::fs::{self, OpenOptions};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, OpenOptionsExt};
+    use std::sync::OnceLock;
+
+    type UnlinkHook = Box<dyn Fn(&CStr) + Send + Sync>;
+
+    /// Hooks that run between the identity re-check and `unlinkat`, keyed by
+    /// the identity of the parent directory whose entry is about to be
+    /// removed. Tests register a hook for their own temporary directory so
+    /// concurrent tests never observe it.
+    fn unlink_hooks() -> &'static Mutex<Vec<(Identity, UnlinkHook)>> {
+        static HOOKS: OnceLock<Mutex<Vec<(Identity, UnlinkHook)>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn before_unlink(parent: RawFd, name: &CStr) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(parent, &mut stat) } != 0 {
+            return;
+        }
+        let identity = identity_from_stat(&stat);
+        let hooks = unlink_hooks().lock().unwrap();
+        for (target, hook) in hooks.iter() {
+            if *target == identity {
+                hook(name);
+            }
+        }
+    }
+
+    fn hook_unlinks_in(directory: &std::path::Path, hook: UnlinkHook) {
+        let identity = identity_from_file(&File::open(directory).unwrap()).unwrap();
+        unlink_hooks().lock().unwrap().push((identity, hook));
+    }
+
+    fn remove_selectors(
+        base: &std::path::Path,
+        selections: &[NativeRemoveSelection],
+    ) -> Vec<NativeRemoveOutcome> {
+        let mut outcomes = Vec::new();
+        remove(
+            Some(base.as_os_str().as_bytes()),
+            None,
+            selections,
+            false,
+            false,
+            2,
+            &mut |_| Ok(()),
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        outcomes
+    }
 
     fn selector(path: &[u8], kind: NativeRemoveKind) -> NativeRemoveSelection {
         NativeRemoveSelection {
@@ -1478,5 +1569,90 @@ mod tests {
         assert!(temp.path().join("moved").is_dir());
         assert_eq!(fs::read_dir(temp.path().join("moved")).unwrap().count(), 0);
         assert!(outcomes.iter().any(|outcome| outcome.failure.is_some()));
+    }
+
+    #[test]
+    fn directory_swapped_after_its_identity_check_is_reported_as_a_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().to_path_buf();
+        fs::create_dir(base.join("tree")).unwrap();
+        fs::write(base.join("tree/old"), b"old").unwrap();
+        let swap = base.clone();
+        hook_unlinks_in(
+            &base,
+            Box::new(move |name| {
+                if name.to_bytes() == b"tree" {
+                    fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
+                    fs::create_dir(swap.join("tree")).unwrap();
+                }
+            }),
+        );
+
+        let outcomes = remove_selectors(&base, &[selector(b"tree", NativeRemoveKind::Directory)]);
+
+        // The replacement was an empty directory, so rmdir removed it; POSIX
+        // offers no way to refuse that. The selected directory survives, and
+        // the outcome must say so instead of reporting a removal.
+        assert!(base.join("moved").is_dir());
+        assert!(!base.join("tree").exists());
+        let failure = outcomes
+            .iter()
+            .find(|outcome| outcome.disposition == NativeRemoveDisposition::Failed)
+            .and_then(|outcome| outcome.failure.as_ref())
+            .expect("swapped directory removal is reported as a failure");
+        assert!(
+            failure.error.message.contains("replaced before unlinkat")
+                && failure.class == NativeRemoveErrorClass::Conflict,
+            "{failure:?}"
+        );
+        assert!(!outcomes.iter().any(|outcome| {
+            outcome.path == b"tree" && outcome.disposition == NativeRemoveDisposition::Removed
+        }));
+    }
+
+    #[test]
+    fn leaf_swapped_after_its_identity_check_removes_only_the_replacement_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().to_path_buf();
+        fs::write(base.join("file"), b"old").unwrap();
+        fs::write(base.join("dir-file"), b"old").unwrap();
+        fs::create_dir(base.join("referent")).unwrap();
+        fs::write(base.join("referent/keep"), b"keep").unwrap();
+        fs::create_dir(base.join("full")).unwrap();
+        fs::write(base.join("full/keep"), b"keep").unwrap();
+        let swap = base.clone();
+        hook_unlinks_in(
+            &base,
+            Box::new(move |name| match name.to_bytes() {
+                b"file" => {
+                    fs::rename(swap.join("file"), swap.join("file-moved")).unwrap();
+                    symlink("referent", swap.join("file")).unwrap();
+                }
+                b"dir-file" => {
+                    fs::rename(swap.join("dir-file"), swap.join("dir-file-moved")).unwrap();
+                    fs::rename(swap.join("full"), swap.join("dir-file")).unwrap();
+                }
+                _ => {}
+            }),
+        );
+
+        let outcomes = remove_selectors(
+            &base,
+            &[
+                selector(b"file", NativeRemoveKind::File),
+                selector(b"dir-file", NativeRemoveKind::File),
+            ],
+        );
+
+        // A symlink swapped in is unlinked as an entry and never followed.
+        assert!(!base.join("file").exists());
+        assert_eq!(fs::read(base.join("file-moved")).unwrap(), b"old");
+        assert_eq!(fs::read(base.join("referent/keep")).unwrap(), b"keep");
+        // A directory swapped in is refused by the kernel and left intact.
+        assert_eq!(fs::read(base.join("dir-file/keep")).unwrap(), b"keep");
+        assert_eq!(fs::read(base.join("dir-file-moved")).unwrap(), b"old");
+        assert!(outcomes.iter().any(|outcome| {
+            outcome.path == b"dir-file" && outcome.disposition == NativeRemoveDisposition::Failed
+        }));
     }
 }
