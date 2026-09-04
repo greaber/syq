@@ -150,18 +150,38 @@ impl Group {
     }
 
     pub fn lock_human_output(&self) -> std::sync::MutexGuard<'_, ()> {
-        let output = self.human_output.lock().unwrap();
-        let mut lines = self.progress_lines.lock().unwrap();
+        // This mutex protects only output serialization, not program state, so
+        // its invariant remains valid if an earlier writer unwound while it
+        // held the guard.
+        let output = self
+            .human_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut lines = self
+            .progress_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *lines > 0 {
-            eprint!("\r\x1b[{}A\x1b[J", *lines);
-            let _ = std::io::stderr().flush();
+            let mut err = std::io::stderr().lock();
+            let _ = write!(err, "\r\x1b[{}A\x1b[J", *lines);
+            let _ = err.flush();
             *lines = 0;
         }
         output
     }
 
     fn set_progress_lines(&self, lines: usize) {
-        *self.progress_lines.lock().unwrap() = lines;
+        *self
+            .progress_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = lines;
+    }
+
+    fn write_stderr_block(&self, block: &str) {
+        let _output = self.lock_human_output();
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{block}");
+        let _ = err.flush();
     }
 
     fn ensure_failed_member(&self, index: usize, args: &Args) -> bool {
@@ -208,12 +228,7 @@ impl Group {
         elapsed_ms: u64,
     ) -> crate::results::ResultRecord {
         let mut aggregate = crate::results::ResultRecord {
-            status: match exit_code {
-                0 => "success",
-                23 => "partial",
-                25 => "refused",
-                _ => "failed",
-            },
+            status: exit_code_info(exit_code).0,
             exit_code,
             dry_run: args.dry_run,
             files_transferred: 0,
@@ -313,18 +328,18 @@ impl Group {
         }
         state.arrived += 1;
         if !self.quiet {
-            eprintln!(
+            self.write_stderr_block(&format!(
                 "syq: fan-out: target {label} ready ({}/{})",
                 state.arrived, self.total
-            );
+            ));
         }
         if state.arrived == self.total {
             state.released = true;
             if !self.quiet {
-                eprintln!(
+                self.write_stderr_block(&format!(
                     "syq: fan-out: all {} targets ready; starting copies",
                     self.total
-                );
+                ));
             }
             self.ready.notify_all();
             return Ok(());
@@ -398,7 +413,6 @@ pub fn run(mut args: Args) -> Result<i32> {
         target_existence: args.target_existence,
     });
     destinations.append(&mut args.fanout_targets);
-    debug_assert_eq!(destinations.len(), target_count);
     let sources = args.locations.clone();
     let source_count = crate::transfer::deduplicate_native_sources(&sources).len();
     if args.native_mapping.is_some() {
@@ -444,7 +458,7 @@ fn run_group(
     let group = Group::new(
         target_count,
         source_count,
-        args.quiet || human_progress_enabled(args),
+        args.quiet,
         args.bwlimit_bytes,
         results,
     );
@@ -485,11 +499,10 @@ fn run_group(
                     crate::transfer::run(member)
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("target engine panicked")));
-                match &result {
-                    Ok(0 | 23 | 25) => {}
-                    Ok(_) => member_group.cancel(),
-                    Err(error) => member_group.failed(&member_label, error),
+                if let Err(error) = &result {
+                    member_group.failed(&member_label, error);
                 }
+                announce_member_settled_for_test(index);
                 result
             }),
         ));
@@ -615,20 +628,21 @@ fn spawn_progress_ticker(
                 && last_sample.is_none_or(|last| now - last >= std::time::Duration::from_secs(1))
             {
                 last_sample = Some(now);
+                let mut json_lines = Vec::new();
                 for (index, snapshot) in &snapshots {
                     if let Some(results) = group.results() {
                         results.emit_progress(&snapshot.result_record(Some(*index)));
                     }
                     if json {
-                        eprintln!(
-                            "{}",
-                            crate::progress::progress_json(
-                                snapshot,
-                                Some(*index),
-                                Some(&labels[*index]),
-                            )
-                        );
+                        json_lines.push(crate::progress::progress_json(
+                            snapshot,
+                            Some(*index),
+                            Some(&labels[*index]),
+                        ));
                     }
+                }
+                if !json_lines.is_empty() {
+                    group.write_stderr_block(&json_lines.join("\n"));
                 }
             }
             if human && !snapshots.is_empty() {
@@ -666,14 +680,37 @@ fn human_progress_enabled(args: &Args) -> bool {
 }
 
 fn combine_exit_codes(current: i32, next: i32) -> i32 {
-    match (current, next) {
-        (1, _) | (_, 1) => 1,
-        (23, _) | (_, 23) => 23,
-        (25, _) | (_, 25) => 25,
-        (code, 0) if code != 0 => code,
-        (_, code) => code,
+    if exit_code_info(next).1 > exit_code_info(current).1 {
+        next
+    } else {
+        current
     }
 }
+
+fn exit_code_info(code: i32) -> (&'static str, u8) {
+    match code {
+        0 => ("success", 0),
+        25 => ("refused", 1),
+        23 => ("partial", 2),
+        _ => ("failed", 3),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn announce_member_settled_for_test(index: usize) {
+    let selected = std::env::var("SYQ_TEST_FANOUT_SETTLED_INDEX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    if selected != Some(index) {
+        return;
+    }
+    let marker = std::env::var_os("SYQ_TEST_FANOUT_SETTLED_FILE")
+        .expect("SYQ_TEST_FANOUT_SETTLED_INDEX requires SYQ_TEST_FANOUT_SETTLED_FILE");
+    std::fs::write(marker, b"settled").expect("write fan-out member-settled marker");
+}
+
+#[cfg(not(debug_assertions))]
+fn announce_member_settled_for_test(_index: usize) {}
 
 fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {

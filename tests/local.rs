@@ -979,12 +979,15 @@ fn fanout_max_delete_refusal_does_not_abort_peers() {
     write(&alpha.join("dst/file"), &data);
     write(&alpha.join("dst/remove"), b"keep after refusal");
     fs::create_dir_all(beta.join("dst")).unwrap();
+    let partial_ready = t.path("beta-partial-ready");
+    let partial_continue = t.path("beta-partial-continue");
+    let refusal_settled = t.path("alpha-refusal-settled");
     set_mtime(&t.path("src/file"), 1_600_000_000);
     set_mtime(&alpha.join("dst/file"), 1_600_000_000);
     install_cached_remote_helper(&alpha);
     install_cached_remote_helper(&beta);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
             "--src-src",
@@ -1002,9 +1005,18 @@ fn fanout_max_delete_refusal_does_not_abort_peers() {
         .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
         .env("FAKE_REMOTE_ROOT", t.path("remotes"))
         .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "750")
-        .run()
+        .env("SYQ_TEST_PARTIAL_READY_FILE", &partial_ready)
+        .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &partial_continue)
+        .env("SYQ_TEST_FANOUT_SETTLED_INDEX", "0")
+        .env("SYQ_TEST_FANOUT_SETTLED_FILE", &refusal_settled)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
         .unwrap();
+    wait_for_confinement_marker(&mut child, &partial_ready, "beta partial preparation");
+    wait_for_confinement_marker(&mut child, &refusal_settled, "alpha deletion refusal");
+    release_confinement_barrier(&partial_continue);
+    let output = child.wait_with_output().unwrap();
 
     assert_eq!(output.status.code(), Some(25), "{}", stderr_of(&output));
     assert!(alpha.join("dst/remove").exists());
@@ -1303,6 +1315,48 @@ fn fanout_summaries_label_targets_and_default_to_per_target_tuning() {
         );
     }
     assert_eq!(stdout.matches("connections: auto:").count(), 2, "{stdout}");
+}
+
+#[test]
+fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), b"copy despite a closed summary pipe");
+    for host in ["alpha", "beta"] {
+        let home = t.path(&format!("remotes/{host}"));
+        fs::create_dir_all(home.join("dst")).unwrap();
+        install_cached_remote_helper(&home);
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--no-tcp",
+            "--no-progress",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert_output_ok(&output);
+    for host in ["alpha", "beta"] {
+        assert_eq!(
+            read(&t.path(&format!("remotes/{host}/dst/source"))),
+            b"copy despite a closed summary pipe"
+        );
+    }
 }
 
 #[cfg(debug_assertions)]

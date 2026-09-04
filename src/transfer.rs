@@ -2710,19 +2710,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
-    let _human_output = args
-        .fanout_run
-        .as_ref()
-        .map(|run| run.group.lock_human_output());
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
-                println!(
+                progress.println(&format!(
                     "create directory {} (destination missing)",
                     display_directory(&dst_root)
-                );
+                ));
             }
-            print_dry_run_summary(
+            progress.println(&dry_run_summary(
                 srcs,
                 dst,
                 &dry_run_mappings,
@@ -2734,18 +2730,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 delete_plan,
                 &dry_run_changes,
                 fresh_capacity_assessment,
-            );
+            ));
         } else if opts.verify_only {
-            println!(
+            progress.println(&format!(
                 "syq: {}verified {} files, {} differ/missing, {} in {}",
                 target_summary_prefix(&args),
                 commas(progress.files_done.load(Relaxed) + errors),
                 errors,
                 human(done),
                 crate::progress::hms(elapsed)
-            );
+            ));
         } else {
-            println!(
+            progress.println(&format!(
                 "syq: {}transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
                 target_summary_prefix(&args),
                 commas(terminal.files_transferred),
@@ -2764,15 +2760,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 } else {
                     String::new()
                 }
-            );
+            ));
         }
     }
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
-        if let Some(run) = &args.fanout_run {
-            println!("syq: target {}: stats", run.label);
-        }
         let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
             if opts.dry_run {
                 (
@@ -2795,8 +2788,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        println!(
-                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
+        let heading = args.fanout_run.as_ref().map_or_else(String::new, |run| {
+            format!("syq: target {}: stats\n", run.label)
+        });
+        progress.println(&format!(
+                "{heading}  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_skipped.load(Relaxed)),
@@ -2818,7 +2814,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     None => args.connections.to_string(),
                 },
                 tcp_stats,
-            );
+            ));
     }
     if let Some(run) = &args.fanout_run {
         run.group
@@ -3663,7 +3659,7 @@ fn deletion_summary(plan: DeletePlan, deleted: u64, max: Option<u64>) -> String 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_dry_run_summary(
+fn dry_run_summary(
     srcs: &[Location],
     dst: &Location,
     mappings: &[DryRunMapping],
@@ -3675,42 +3671,47 @@ fn print_dry_run_summary(
     deletes: DeletePlan,
     changes: &DryRunChanges,
     capacity: Option<FreshCapacityAssessment>,
-) {
-    println!("syq: {}dry-run summary", target_summary_prefix(args));
+) -> String {
+    let mut lines = vec![format!(
+        "syq: {}dry-run summary",
+        target_summary_prefix(args)
+    )];
     for (source, mapping) in srcs.iter().zip(mappings) {
-        println!(
+        lines.push(format!(
             "  mapping: {} -> {} ({})",
             display_plan_source(source, args),
             display_plan_target(dst, &mapping.target, args),
             mapping.semantics
-        );
+        ));
     }
-    println!("  changes: {}", changes.summary());
+    lines.push(format!("  changes: {}", changes.summary()));
 
     match deletes {
-        DeletePlan::Disabled => println!("  deletions: disabled"),
+        DeletePlan::Disabled => lines.push("  deletions: disabled".into()),
         DeletePlan::Planned(n) => {
             if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
-                println!(
+                lines.push(format!(
                     "  deletions: {} planned; blocked by --max-delete {limit}",
                     count_label(n, "entry", "entries")
-                );
+                ));
             } else {
-                println!(
+                lines.push(format!(
                     "  deletions: {} planned after a successful copy",
                     count_label(n, "entry", "entries")
-                );
+                ));
             }
         }
-        DeletePlan::Skipped(reason) => println!("  deletions: skipped ({reason})"),
+        DeletePlan::Skipped(reason) => {
+            lines.push(format!("  deletions: skipped ({reason})"));
+        }
     }
-    println!(
+    lines.push(format!(
         "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
         count_label(progress.files_total.load(Relaxed), "file", "files"),
         human(progress.bytes_skipped.load(Relaxed)),
         count_label(progress.files_skipped.load(Relaxed), "file", "files")
-    );
+    ));
     if let Some(capacity) = capacity {
         let inode_detail = capacity.available_inodes.map_or_else(
             || {
@@ -3727,7 +3728,7 @@ fn print_dry_run_summary(
                 )
             },
         );
-        println!(
+        lines.push(format!(
             "  capacity: {} logical data required; {} available; {inode_detail} ({})",
             human(capacity.logical_bytes),
             human(capacity.available_bytes),
@@ -3736,7 +3737,7 @@ fn print_dry_run_summary(
             } else {
                 "insufficient"
             }
-        );
+        ));
     }
 
     let ignored = progress.paths_ignored.load(Relaxed);
@@ -3751,7 +3752,7 @@ fn print_dry_run_summary(
     if other > 0 {
         exclusions.push(count_label(other, "other entry", "other entries"));
     }
-    println!(
+    lines.push(format!(
         "  exclusions: {}",
         if exclusions.is_empty() {
             if opts.ignore.is_empty() {
@@ -3762,9 +3763,10 @@ fn print_dry_run_summary(
         } else {
             exclusions.join("; ")
         }
-    );
+    ));
 
-    println!("  route: {}", selected_route(src_ep, dst_ep, args));
+    lines.push(format!("  route: {}", selected_route(src_ep, dst_ep, args)));
+    lines.join("\n")
 }
 
 fn target_summary_prefix(args: &Args) -> String {

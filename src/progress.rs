@@ -230,7 +230,9 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
-        eprintln!("{line}");
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{line}");
+        let _ = err.flush();
     }
 
     pub fn error(&self, line: &str) {
@@ -255,8 +257,10 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut term = self.term.lock().unwrap();
         self.erase(&mut term);
+        let mut err = std::io::stderr().lock();
         if self.json {
-            eprintln!(
+            let _ = writeln!(
+                err,
                 "{}",
                 serde_json::json!({
                     "type": "warning",
@@ -266,8 +270,9 @@ impl Progress {
                 })
             );
         } else {
-            eprintln!("syq: warning: {message}");
+            let _ = writeln!(err, "syq: warning: {message}");
         }
+        let _ = err.flush();
     }
 
     fn erase(&self, t: &mut TermState) {
@@ -356,7 +361,15 @@ impl Progress {
                 .is_none_or(|l| now - l >= Duration::from_secs(1))
             {
                 t.last_json = Some(now);
-                eprintln!("{}", progress_json(&snapshot, None, None));
+                // Keep telemetry above the live progress area. Otherwise the
+                // next erase counts only the progress rows and leaves stale
+                // rows behind whenever both displays are enabled.
+                if self.enabled {
+                    self.erase(&mut t);
+                }
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(err, "{}", progress_json(&snapshot, None, None));
+                let _ = err.flush();
             }
         }
         if !self.enabled {
@@ -424,29 +437,45 @@ pub(crate) fn progress_json(
     snapshot: &ProgressSnapshot,
     destination_index: Option<usize>,
     destination: Option<&str>,
-) -> serde_json::Value {
-    let mut record = serde_json::json!({
-        "bytes_done": snapshot.bytes_done,
-        "bytes_total": snapshot.bytes_total,
-        "bytes_skipped": snapshot.bytes_skipped,
-        "files_done": snapshot.files_done,
-        "files_total": snapshot.files_total,
-        "files_skipped": snapshot.files_skipped,
-        "files_excluded": snapshot.files_excluded,
-        "scanned": snapshot.scanned,
-        "scan_done": snapshot.scan_done,
-        "rate": snapshot.rate.round() as u64,
-        "eta": snapshot.eta.map(|eta| eta.round() as u64),
-        "elapsed": (snapshot.elapsed.as_secs_f64() * 10.0).round() / 10.0,
-    });
-    let object = record.as_object_mut().expect("progress JSON is an object");
-    if let Some(index) = destination_index {
-        object.insert("destination_index".into(), index.into());
+) -> String {
+    #[derive(serde::Serialize)]
+    struct Record<'a> {
+        bytes_done: u64,
+        bytes_total: u64,
+        bytes_skipped: u64,
+        files_done: u64,
+        files_total: u64,
+        files_skipped: u64,
+        files_excluded: u64,
+        scanned: u64,
+        scan_done: bool,
+        rate: u64,
+        eta: Option<u64>,
+        elapsed: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<&'a str>,
     }
-    if let Some(label) = destination {
-        object.insert("destination".into(), label.into());
-    }
-    record
+
+    serde_json::to_string(&Record {
+        bytes_done: snapshot.bytes_done,
+        bytes_total: snapshot.bytes_total,
+        bytes_skipped: snapshot.bytes_skipped,
+        files_done: snapshot.files_done,
+        files_total: snapshot.files_total,
+        files_skipped: snapshot.files_skipped,
+        files_excluded: snapshot.files_excluded,
+        scanned: snapshot.scanned,
+        scan_done: snapshot.scan_done,
+        // Match the rounding used by the previous fixed-precision formatter.
+        rate: snapshot.rate.round_ties_even() as u64,
+        eta: snapshot.eta.map(|eta| eta.round_ties_even() as u64),
+        elapsed: (snapshot.elapsed.as_secs_f64() * 10.0).round_ties_even() / 10.0,
+        destination_index,
+        destination,
+    })
+    .expect("serialize progress JSON")
 }
 
 pub(crate) fn progress_line(snapshot: &ProgressSnapshot) -> String {
@@ -590,5 +619,30 @@ mod tests {
         assert_eq!(Meter::bytes(&*progress), 1_000);
         progress.add_bytes(100);
         assert_eq!(Meter::bytes(&*progress), 1_100);
+    }
+
+    #[test]
+    fn progress_json_keeps_the_existing_single_target_field_order() {
+        let snapshot = ProgressSnapshot {
+            bytes_done: 1,
+            bytes_total: 2,
+            bytes_skipped: 3,
+            files_done: 4,
+            files_total: 5,
+            files_skipped: 6,
+            files_excluded: 7,
+            scanned: 8,
+            scan_done: true,
+            rate: 10.5,
+            eta: Some(11.5),
+            elapsed: Duration::from_millis(1_250),
+            active_workers: 0,
+            rm: false,
+        };
+
+        assert_eq!(
+            progress_json(&snapshot, None, None),
+            r#"{"bytes_done":1,"bytes_total":2,"bytes_skipped":3,"files_done":4,"files_total":5,"files_skipped":6,"files_excluded":7,"scanned":8,"scan_done":true,"rate":10,"eta":12,"elapsed":1.2}"#
+        );
     }
 }

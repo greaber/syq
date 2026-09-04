@@ -97,6 +97,13 @@ safely converges the targets unless its placement is new-only. After a partial
 `--as`, respectively: the successful targets now exist, so the original
 new-only precondition cannot be reused.
 
+A target that finishes with some file errors (exit 23), or refuses its deletion
+phase because of `--max-delete` (exit 25), does not stop the other targets. A
+fatal setup, connection, or filesystem failure (exit 1) cancels work that has
+not yet settled on the other targets. The command returns the most severe
+target outcome: 1 takes precedence over 23, which takes precedence over 25,
+which takes precedence over success (0).
+
 Multi-target copies support the ordinary local-source `cp` options, including
 `--root`, directional link following, `--mapping` (stdin is acquired once),
 `--inplace`, `--prune`, dry runs, filtering and preservation, progress, stats,
@@ -112,13 +119,10 @@ operation, or error carries a zero-based `destination_index` into that ordered
 destination list. A `destination_result` records each target's outcome before
 the final aggregate `result` seals the stream.
 
-A remote source is the remaining unsupported multi-target topology. Direct
-remote-to-remote coordination and its command-restricted receiver grants bind
-one destination, so treating several independent remote coordinators as one
-barrier would make a safety promise they cannot enforce. The receiver-only
-ceilings, receipts, detached mode, and agent-forwarding controls consequently
-retain their existing direct remote-to-remote scope rather than acquiring a
-different meaning in multi-target mode.
+Multi-target copies require a local source. A command with both a remote source
+and multiple targets is rejected. Options that apply only to a direct copy
+between two remote hosts, including receiver limits, receipts, detached mode,
+and agent-forwarding controls, therefore remain single-target options.
 
 Bare paths and repeatable `--src PATH` select named objects. A named directory
 keeps its basename at the target; by default a named symlink is copied as a
