@@ -138,7 +138,7 @@ key.
 ## Signed receipts
 
 HostA also cannot forge a clean account of what hostB's restricted receiver
-did. Every attached command-restricted transfer ends with a v2 receipt. Its
+did. Every attached command-restricted transfer ends with a receipt. Its
 canonical stream records one outcome for every receiver-visible logical
 pathname mutation: one file lifecycle, each directory/symlink/special or
 metadata operation, and each individual `--prune` unlink or rmdir. Failed and

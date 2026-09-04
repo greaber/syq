@@ -424,7 +424,7 @@ per-command setup to milliseconds and avoiding another hardware-token
 interaction. `status` shows the global scope and its recorded endpoints;
 `off` disables the policy, asks every live syq-owned master to exit, and
 removes the global runtime scope. The durable preference lives in
-`$XDG_CONFIG_HOME/syq/persistence-v1.json` (normally under `~/.config`), while
+`$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
 control sockets live in a private per-user runtime directory.
 
 Scripts can avoid changing that shared preference by creating an isolated
@@ -505,8 +505,8 @@ scope. Port-specific entries are offered in native endpoint syntax only;
 `host:2222` is a remote path, not a port, in rsync syntax.
 
 The learned suggestions are a disposable local cache at
-`$XDG_CACHE_HOME/syq/completion-endpoints-v1.json`, normally
-`~/.cache/syq/completion-endpoints-v1.json`. It contains at most 100 recently
+`$XDG_CACHE_HOME/syq/completion-endpoints.json`, normally
+`~/.cache/syq/completion-endpoints.json`. It contains at most 100 recently
 successful endpoint names, users, ports, and timestamps. It contains no paths,
 credentials, keys, or transfer history. Manage it with:
 

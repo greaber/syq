@@ -549,8 +549,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Receipt => match &authority {
                 Some(authority) => match authority.issue_receipt() {
                     Ok(receipt) => {
-                        crate::receipt_v2::emit_receipt_frames(receipt, |frame| {
-                            w.write_msg(&Response::ReceiptV2(frame))?;
+                        crate::receipt::emit_receipt_frames(receipt, |frame| {
+                            w.write_msg(&Response::Receipt(frame))?;
                             Ok(())
                         })?;
                     }

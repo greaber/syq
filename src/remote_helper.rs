@@ -15,7 +15,7 @@ pub const REMOTE_DOWNLOAD_FALLBACK_EXIT: i32 = 75;
 pub const REMOTE_DOWNLOAD_INTEGRITY_EXIT: i32 = 76;
 /// The remote cache itself could not be written or finalized; upload cannot fix it.
 pub const INSTALL_FAILED_EXIT: i32 = 77;
-const DOWNLOAD_CACHE_GENERATION: &str = "release-v1";
+const DOWNLOAD_CACHE_GENERATION: &str = "release";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {

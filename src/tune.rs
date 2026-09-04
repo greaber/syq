@@ -167,7 +167,7 @@ pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
         .collect::<Vec<_>>()
         .join("+");
     Some(format!(
-        "v1|{}>{}|{transport}",
+        "{}>{}|{transport}",
         endpoint_key(src),
         endpoint_key(dst)
     ))
@@ -185,7 +185,7 @@ fn cache_path() -> Option<PathBuf> {
                 .filter(|path| !path.is_empty())
                 .map(|home| PathBuf::from(home).join(".cache"))
         })
-        .map(|root| root.join("syq/tuning-v1.json"))
+        .map(|root| root.join("syq/tuning.json"))
 }
 
 fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {

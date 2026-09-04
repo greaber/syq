@@ -2524,8 +2524,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             loop {
                 match dst_ctl.recv() {
-                    Ok(Response::ReceiptV2(frame)) => {
-                        let terminal = match crate::receipt_v2::receipt_frame_is_end(&frame) {
+                    Ok(Response::Receipt(frame)) => {
+                        let terminal = match crate::receipt::receipt_frame_is_end(&frame) {
                             Ok(terminal) => terminal,
                             Err(error) => {
                                 progress.error(&format!("syq: receipt: {error:#}"));
@@ -2534,7 +2534,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         };
                         println!(
                             "{}{}",
-                            crate::receipt_v2::RECEIPT_LINE_PREFIX,
+                            crate::receipt::RECEIPT_LINE_PREFIX,
                             base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
                         );
                         if terminal {

@@ -53,8 +53,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const SSHSIG_NAMESPACE: &str = "syq-grant@greaber.github";
 const WIRE_MAGIC: &[u8; 8] = b"SYQGRNT\0";
-const WIRE_VERSION: u16 = 3;
-const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 2 + 4 + 4;
+const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4;
 const MAX_GRANT_BYTES: usize = 32 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = WIRE_HEADER_LEN + MAX_GRANT_BYTES + MAX_SIGNATURE_BYTES;
@@ -78,8 +77,7 @@ const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;
 const REDEMPTION_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
-const CLAIM_VERSION: u16 = 1;
-const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 2 + 8 + 32 + 32;
+const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
 use crate::enrollment::EnrollmentId;
 
@@ -405,17 +403,17 @@ struct GrantBody {
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     root_existence: RootExistence,
-    receipt_v2: crate::receipt_v2::ReceiptPolicyV2,
+    receipt_policy: crate::receipt::ReceiptPolicy,
 }
 
 #[cfg(test)]
-fn test_receipt_policy() -> crate::receipt_v2::ReceiptPolicyV2 {
-    crate::receipt_v2::ReceiptPolicyV2 {
+fn test_receipt_policy() -> crate::receipt::ReceiptPolicy {
+    crate::receipt::ReceiptPolicy {
         required: true,
         hashed: false,
-        max_records: crate::receipt_v2::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt_v2::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::receipt_v2::ReceiptDeliveryV2::DetachedSignedPlaintext,
+        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
+        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
+        delivery: crate::receipt::ReceiptDelivery::DetachedSignedPlaintext,
     }
 }
 
@@ -425,7 +423,7 @@ pub(crate) struct SignedGrantEnvelope {
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
-    pub receipt_v2: crate::receipt_v2::ReceiptPolicyV2,
+    pub receipt_policy: crate::receipt::ReceiptPolicy,
     /// Canonical OpenSSH armored SSHSIG bytes.
     pub signature: Vec<u8>,
 }
@@ -438,7 +436,7 @@ impl SignedGrantEnvelope {
             max_file_data_bytes_per_second,
             filters: FilterPolicy::default(),
             root_existence: RootExistence::Any,
-            receipt_v2: test_receipt_policy(),
+            receipt_policy: test_receipt_policy(),
             signature,
         }
     }
@@ -451,7 +449,7 @@ impl SignedGrantEnvelope {
             self.max_file_data_bytes_per_second,
             &self.filters,
             self.root_existence,
-            &self.receipt_v2,
+            &self.receipt_policy,
         )?;
         if body.len() > MAX_GRANT_BYTES {
             bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -461,7 +459,6 @@ impl SignedGrantEnvelope {
         }
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body.len() + self.signature.len());
         out.extend_from_slice(WIRE_MAGIC);
-        out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
         out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
         out.extend_from_slice(&body);
@@ -476,14 +473,9 @@ impl SignedGrantEnvelope {
         if bytes.len() < WIRE_HEADER_LEN || &bytes[..WIRE_MAGIC.len()] != WIRE_MAGIC {
             bail!("not a SYQ signed grant envelope");
         }
-        let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed header"));
-        if version != WIRE_VERSION {
-            bail!("unsupported signed grant envelope version {version}");
-        }
-        let grant_len =
-            u32::from_be_bytes(bytes[10..14].try_into().expect("fixed header")) as usize;
+        let grant_len = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed header")) as usize;
         let signature_len =
-            u32::from_be_bytes(bytes[14..18].try_into().expect("fixed header")) as usize;
+            u32::from_be_bytes(bytes[12..16].try_into().expect("fixed header")) as usize;
         if grant_len == 0 || grant_len > MAX_GRANT_BYTES {
             bail!("signed grant length is outside the supported range");
         }
@@ -504,21 +496,21 @@ impl SignedGrantEnvelope {
             max_file_data_bytes_per_second,
             filters,
             root_existence,
-            receipt_v2,
+            receipt_policy,
         } = body;
         if canonical_body_bytes(
             &grant,
             max_file_data_bytes_per_second,
             &filters,
             root_existence,
-            &receipt_v2,
+            &receipt_policy,
         )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
         }
         grant.validate_static()?;
         filters.validate(&grant)?;
-        receipt_v2.validate()?;
+        receipt_policy.validate()?;
         let signature = bytes[WIRE_HEADER_LEN + grant_len..].to_vec();
         validate_canonical_sshsig(&signature)?;
         Ok(Self {
@@ -526,7 +518,7 @@ impl SignedGrantEnvelope {
             max_file_data_bytes_per_second,
             filters,
             root_existence,
-            receipt_v2,
+            receipt_policy,
             signature,
         })
     }
@@ -537,7 +529,7 @@ impl SignedGrantEnvelope {
             self.max_file_data_bytes_per_second,
             &self.filters,
             self.root_existence,
-            &self.receipt_v2,
+            &self.receipt_policy,
         )
     }
 }
@@ -551,7 +543,7 @@ pub(crate) fn sign_grant(
         max_file_data_bytes_per_second,
         mut filters,
         root_existence,
-        receipt_v2,
+        receipt_policy,
     } = constraints;
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted enrollment key");
@@ -570,7 +562,7 @@ pub(crate) fn sign_grant(
         max_file_data_bytes_per_second,
         &filters,
         root_existence,
-        &receipt_v2,
+        &receipt_policy,
     )?;
     let signature = private_key
         .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
@@ -583,7 +575,7 @@ pub(crate) fn sign_grant(
         max_file_data_bytes_per_second,
         filters,
         root_existence,
-        receipt_v2,
+        receipt_policy,
         signature,
     }
     .encode()
@@ -605,7 +597,7 @@ fn signing_payload(
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicy,
     root_existence: RootExistence,
-    receipt_v2: &crate::receipt_v2::ReceiptPolicyV2,
+    receipt_policy: &crate::receipt::ReceiptPolicy,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
@@ -614,14 +606,13 @@ fn signing_payload(
         max_file_data_bytes_per_second,
         filters,
         root_existence,
-        receipt_v2,
+        receipt_policy,
     )?;
     if body.len() > MAX_GRANT_BYTES {
         bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
     }
-    let mut out = Vec::with_capacity(WIRE_MAGIC.len() + 2 + 4 + body.len());
+    let mut out = Vec::with_capacity(WIRE_MAGIC.len() + 4 + body.len());
     out.extend_from_slice(WIRE_MAGIC);
-    out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
     Ok(out)
@@ -632,15 +623,15 @@ fn canonical_body_bytes(
     max_file_data_bytes_per_second: u64,
     filters: &FilterPolicy,
     root_existence: RootExistence,
-    receipt_v2: &crate::receipt_v2::ReceiptPolicyV2,
+    receipt_policy: &crate::receipt::ReceiptPolicy,
 ) -> Result<Vec<u8>> {
-    receipt_v2.validate()?;
+    receipt_policy.validate()?;
     postcard::to_stdvec(&GrantBody {
         grant: grant.clone(),
         max_file_data_bytes_per_second,
         filters: filters.clone(),
         root_existence,
-        receipt_v2: receipt_v2.clone(),
+        receipt_policy: receipt_policy.clone(),
     })
     .context("encode canonical signed grant")
 }
@@ -1083,7 +1074,7 @@ pub(crate) struct VerifiedGrant {
     max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     root_existence: RootExistence,
-    receipt_v2: crate::receipt_v2::ReceiptPolicyV2,
+    receipt_policy: crate::receipt::ReceiptPolicy,
     grant_digest: [u8; 32],
     execution_deadline: Instant,
 }
@@ -1094,7 +1085,7 @@ pub(crate) struct GrantConstraints {
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
-    pub receipt_v2: crate::receipt_v2::ReceiptPolicyV2,
+    pub receipt_policy: crate::receipt::ReceiptPolicy,
 }
 
 #[cfg(test)]
@@ -1104,7 +1095,7 @@ impl Default for GrantConstraints {
             max_file_data_bytes_per_second: 0,
             filters: FilterPolicy::default(),
             root_existence: RootExistence::Any,
-            receipt_v2: test_receipt_policy(),
+            receipt_policy: test_receipt_policy(),
         }
     }
 }
@@ -1122,7 +1113,7 @@ impl VerifiedGrant {
                 max_file_data_bytes_per_second: self.max_file_data_bytes_per_second,
                 filters: self.filters,
                 root_existence: self.root_existence,
-                receipt_v2: self.receipt_v2,
+                receipt_policy: self.receipt_policy,
             },
             self.grant_digest,
             self.execution_deadline,
@@ -1164,7 +1155,7 @@ pub(crate) fn verify_and_redeem(
         max_file_data_bytes_per_second: envelope.max_file_data_bytes_per_second,
         filters: envelope.filters,
         root_existence: envelope.root_existence,
-        receipt_v2: envelope.receipt_v2,
+        receipt_policy: envelope.receipt_policy,
         grant_digest,
         execution_deadline,
     })
@@ -1177,7 +1168,7 @@ pub(crate) fn signed_grant_digest(encoded: &[u8]) -> Result<[u8; 32]> {
 
 fn grant_transcript_digest(payload: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"syq-grant-transcript-v1@greaber.github\0");
+    hasher.update(b"syq-grant-transcript@greaber.github\0");
     hasher.update(&(payload.len() as u64).to_be_bytes());
     hasher.update(payload);
     *hasher.finalize().as_bytes()
@@ -1535,7 +1526,6 @@ fn redeem_record(request: RequestId, digest: [u8; 32], redeemed_at: i64) -> Resu
     }
     let mut record = Vec::with_capacity(REDEMPTION_RECORD_LEN);
     record.extend_from_slice(REDEMPTION_MAGIC);
-    record.extend_from_slice(&CLAIM_VERSION.to_be_bytes());
     record.extend_from_slice(&redeemed_at.to_be_bytes());
     record.extend_from_slice(&request.0);
     record.extend_from_slice(&digest);
@@ -1543,20 +1533,17 @@ fn redeem_record(request: RequestId, digest: [u8; 32], redeemed_at: i64) -> Resu
 }
 
 fn validate_redeem_record(record: &[u8], request: RequestId, digest: [u8; 32]) -> Result<()> {
-    if record.len() != REDEMPTION_RECORD_LEN
-        || &record[..8] != REDEMPTION_MAGIC
-        || u16::from_be_bytes(record[8..10].try_into().expect("redeem header")) != CLAIM_VERSION
-    {
+    if record.len() != REDEMPTION_RECORD_LEN || &record[..8] != REDEMPTION_MAGIC {
         bail!("replay state is malformed; refusing signed request");
     }
-    let redeemed_at = i64::from_be_bytes(record[10..18].try_into().expect("redeem timestamp"));
+    let redeemed_at = i64::from_be_bytes(record[8..16].try_into().expect("redeem timestamp"));
     if !(0..=MAX_UNIX_TIMESTAMP).contains(&redeemed_at) {
         bail!("replay state has an invalid timestamp; refusing signed request");
     }
-    if record[18..50] != request.0 {
+    if record[16..48] != request.0 {
         bail!("replay state request ID does not match its filename");
     }
-    if record[50..82] != digest {
+    if record[48..80] != digest {
         bail!("request ID was already redeemed by a different signed grant");
     }
     Ok(())
@@ -2056,7 +2043,6 @@ mod tests {
         .expect("encode test grant");
         let mut out = Vec::new();
         out.extend_from_slice(WIRE_MAGIC);
-        out.extend_from_slice(&WIRE_VERSION.to_be_bytes());
         out.extend_from_slice(&(grant.len() as u32).to_be_bytes());
         out.extend_from_slice(&(signature.len() as u32).to_be_bytes());
         out.extend_from_slice(&grant);
@@ -2071,14 +2057,9 @@ mod tests {
         let decoded = SignedGrantEnvelope::decode(&encoded).expect("decode canonical grant");
         assert_eq!(decoded.grant, fixture_grant(1));
         assert_eq!(decoded.max_file_data_bytes_per_second, 0);
-        let mut unsupported = encoded.clone();
-        unsupported[8..10].copy_from_slice(&(WIRE_VERSION + 1).to_be_bytes());
-        assert!(SignedGrantEnvelope::decode(&unsupported).is_err());
-        let mut legacy = encoded.clone();
-        legacy[8..10].copy_from_slice(&1u16.to_be_bytes());
-        assert!(SignedGrantEnvelope::decode(&legacy).is_err());
-        legacy[8..10].copy_from_slice(&2u16.to_be_bytes());
-        assert!(SignedGrantEnvelope::decode(&legacy).is_err());
+        let mut bad_magic = encoded.clone();
+        bad_magic[3] ^= 1;
+        assert!(SignedGrantEnvelope::decode(&bad_magic).is_err());
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -2214,41 +2195,37 @@ mod tests {
 
         // The grant binds the complete receipt delivery policy, including the
         // per-transfer HPKE recipient key, into the signed grant transcript.
-        let policy_v2 = crate::receipt_v2::ReceiptPolicyV2 {
+        let expected_receipt_policy = crate::receipt::ReceiptPolicy {
             required: true,
             hashed: true,
             max_records: 32,
             max_plaintext_bytes: 64 * 1024,
-            delivery: crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted {
-                suite: crate::receipt_v2::HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+            delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
+                suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
                 recipient_public_key: [4; 32],
             },
         };
-        let receipted_v2 = sign_grant(
+        let receipted = sign_grant(
             fixture_grant(53),
             GrantConstraints {
-                receipt_v2: policy_v2.clone(),
+                receipt_policy: expected_receipt_policy.clone(),
                 ..GrantConstraints::default()
             },
             &private,
         )
         .unwrap();
-        let decoded = SignedGrantEnvelope::decode(&receipted_v2).unwrap();
-        assert_eq!(
-            u16::from_be_bytes(receipted_v2[8..10].try_into().unwrap()),
-            WIRE_VERSION
-        );
-        assert_eq!(decoded.receipt_v2, policy_v2.clone());
-        let expected_digest = signed_grant_digest(&receipted_v2).unwrap();
+        let decoded = SignedGrantEnvelope::decode(&receipted).unwrap();
+        assert_eq!(decoded.receipt_policy, expected_receipt_policy.clone());
+        let expected_digest = signed_grant_digest(&receipted).unwrap();
         let verified = verify_and_redeem(
-            &receipted_v2,
+            &receipted,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
-            &fixture.replay("in-process-receipt-v2-signature-replay"),
+            &fixture.replay("in-process-receipt-signature-replay"),
         )
-        .expect("OpenSSH must accept the signed receipt v2 policy");
+        .expect("OpenSSH must accept the signed receipt policy");
         let (_, extensions, digest, _) = verified.into_parts();
-        assert_eq!(extensions.receipt_v2, policy_v2);
+        assert_eq!(extensions.receipt_policy, expected_receipt_policy);
         assert_eq!(digest, expected_digest);
     }
 
@@ -2507,7 +2484,7 @@ mod tests {
                 .join(format!("redeemed-{}", RequestId([22; 32]).file_component())),
         )
         .expect("read adjusted replay redeem");
-        let redeemed_at = i64::from_be_bytes(redeem[10..18].try_into().expect("redeem timestamp"));
+        let redeemed_at = i64::from_be_bytes(redeem[8..16].try_into().expect("redeem timestamp"));
         assert!(redeemed_at >= NOW + 3);
 
         let mut expired = fixture_grant(23);

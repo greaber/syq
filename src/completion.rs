@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 1;
-const CACHE_FILE: &str = "completion-endpoints-v1.json";
+const CACHE_FILE: &str = "completion-endpoints.json";
 const CACHE_LOCK: &str = ".completion-endpoints.lock";
 const MAX_CACHED_ENDPOINTS: usize = 100;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024;
@@ -129,20 +128,10 @@ impl CachedEndpoint {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionCache {
-    version: u8,
     endpoints: Vec<CachedEndpoint>,
-}
-
-impl Default for CompletionCache {
-    fn default() -> Self {
-        Self {
-            version: CACHE_VERSION,
-            endpoints: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,13 +433,6 @@ fn read_cache() -> Result<CompletionCache> {
     file.read_to_end(&mut bytes)?;
     let mut cache: CompletionCache = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse completion cache {}", path.display()))?;
-    if cache.version != CACHE_VERSION {
-        bail!(
-            "unsupported completion cache version {} in {}",
-            cache.version,
-            path.display()
-        );
-    }
     cache.endpoints.truncate(MAX_CACHED_ENDPOINTS);
     Ok(cache)
 }
