@@ -107,7 +107,9 @@ index 0000000..b6a44bc
 +# SIGUSR1, reports readiness on stdout only after that handler is installed so
 +# the push starts under a running flipper, terminates with this test process,
 +# and has a hard backstop so an interrupted suite cannot leave a
-+# namespace-mutating process behind.
++# namespace-mutating process behind.  Both writes go straight to the
++# descriptor: a signal that lands while buffered stdout is mid-write would
++# make a print() in the handler fail with a reentrancy error.
 +flip_code = (
 +    "import os, signal, sys, time\n"
 +    "sub, link = sys.argv[1], sys.argv[2]\n"
@@ -115,8 +117,10 @@ index 0000000..b6a44bc
 +    "parent = os.getppid()\n"
 +    "deadline = time.monotonic() + 120\n"
 +    "cycles = 0\n"
-+    "signal.signal(signal.SIGUSR1, lambda *_: print(cycles, flush=True))\n"
-+    "print('ready', flush=True)\n"
++    "def report(*_):\n"
++    "    os.write(1, f'{cycles}\\n'.encode())\n"
++    "signal.signal(signal.SIGUSR1, report)\n"
++    "os.write(1, b'ready\\n')\n"
 +    "while time.monotonic() < deadline and os.getppid() == parent:\n"
 +    "    try:\n"
 +    "        os.makedirs(sub, exist_ok=True)\n"
