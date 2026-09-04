@@ -667,14 +667,14 @@ impl OperatorResolver {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct OperatorDirectoryIdentity {
+pub(crate) struct OperatorDirectoryIdentity {
     dev: u64,
     ino: u64,
     #[cfg(target_os = "linux")]
     mount_id: Option<u64>,
 }
 
-fn operator_directory_identity(directory: &File) -> Result<OperatorDirectoryIdentity> {
+pub(crate) fn operator_directory_identity(directory: &File) -> Result<OperatorDirectoryIdentity> {
     let metadata = root_metadata_from_std(&directory.metadata()?)?;
     Ok(OperatorDirectoryIdentity {
         dev: metadata.dev,
@@ -684,7 +684,7 @@ fn operator_directory_identity(directory: &File) -> Result<OperatorDirectoryIden
     })
 }
 
-fn operator_directory_identities_match(
+pub(crate) fn operator_directory_identities_match(
     left: OperatorDirectoryIdentity,
     right: OperatorDirectoryIdentity,
 ) -> bool {

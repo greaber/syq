@@ -73,9 +73,11 @@ go further:
   enumerates opened directories. Before deletion, it atomically moves the
   current entry into an owner-only quarantine directory in a trusted ancestor
   on the same filesystem, then re-checks device, inode, and type there. Under
-  `--root`, the ancestor search stops at the opened root. A name swapped to a
-  different inode is restored or preserved in the reported quarantine, not
-  deleted, and a later entry at the selected name is left alone. If the
+  `--root`, it verifies that the selected entry's opened parent still has the
+  opened root in its ancestor chain before it creates the quarantine; a parent
+  moved outside the root is refused. A name swapped to a different inode is
+  restored or preserved in the reported quarantine, not deleted, and a later
+  entry at the selected name is left alone. If the
   filesystem has no atomic no-replace rename, or no writable trusted ancestor
   inside the allowed boundary can hold the quarantine, removal fails closed.
   On Linux, an open descriptor also lets syq report a selected directory

@@ -249,9 +249,12 @@ inside a selected directory are removed as entries and are never followed.
 
 Each pinned entry is atomically moved into an owner-only quarantine directory
 in a trusted ancestor on the same filesystem before it is unlinked. With
-`--root`, that ancestor search stops at the opened root and never creates or
-moves an entry above it. Syq checks the quarantined device, inode, and type, so
-a replacement that won the race is restored instead of deleted. If its
+`--root`, syq first checks without making changes that the selected entry's
+opened parent still leads to the opened root. If the parent was moved
+elsewhere, removal fails; otherwise the ancestor search stops at the root and
+never creates or moves an entry above it. Syq checks the quarantined device,
+inode, and type, so a replacement that won the race is restored instead of
+deleted. If its
 original name has already been reused, syq reports the owner-only quarantine
 path and leaves both entries in place. A later writer at the selected name is
 likewise left alone and reported as a conflict. Removal fails without deleting

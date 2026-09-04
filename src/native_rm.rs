@@ -13,8 +13,8 @@ use crate::proto::{
     NativeRemoveOutcome, NativeRemoveSelection, OperatorSymlinkPolicy, PathBytes,
 };
 use crate::rooted::{
-    OperatorFinalComponent, OperatorResolver, OperatorSymlinkHop, PinnedLeaf as RootedPinnedLeaf,
-    PinnedPath, RootMetadata,
+    operator_directory_identities_match, operator_directory_identity, OperatorFinalComponent,
+    OperatorResolver, OperatorSymlinkHop, PinnedLeaf as RootedPinnedLeaf, PinnedPath, RootMetadata,
 };
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;
@@ -1189,11 +1189,83 @@ struct RemovalQuarantine {
 
 impl RemovalQuarantine {
     fn create(source_parent: &PinnedParent, ceiling: Option<&File>) -> Result<Self> {
+        if let Some(ceiling) = ceiling {
+            return Self::create_within_root(source_parent, ceiling);
+        }
+        Self::create_unconfined(source_parent)
+    }
+
+    fn create_within_root(source_parent: &PinnedParent, ceiling: &File) -> Result<Self> {
         let mut directory = source_parent
             .try_clone()
             .context("duplicate removal parent descriptor")?;
         let source_device = directory.metadata()?.dev();
-        let ceiling_identity = ceiling.map(identity_from_file).transpose()?;
+        let ceiling_identity = operator_directory_identity(ceiling)?;
+        let effective_uid = effective_user_id();
+        let mut candidate = None;
+        let mut candidate_chain_is_trusted = false;
+        let mut reached_ceiling = false;
+
+        for parent_hops in 0..REMOVE_QUARANTINE_ANCESTORS {
+            let metadata = directory.metadata()?;
+            let trusted = is_trusted_quarantine_parent(&metadata, effective_uid);
+            if metadata.dev() == source_device {
+                // Keep the highest same-filesystem directory. When the root is
+                // on this filesystem this is the root itself, so an untrusted
+                // descendant cannot reparent the quarantine after validation.
+                candidate = Some((
+                    directory
+                        .try_clone()
+                        .context("retain removal quarantine ancestor")?,
+                    parent_hops,
+                ));
+                candidate_chain_is_trusted = trusted;
+            } else if candidate.is_some() {
+                // For a nested filesystem, every directory anchoring its mount
+                // back to `--root` must also exclude untrusted namespace writers.
+                candidate_chain_is_trusted &= trusted;
+            }
+
+            let directory_identity = operator_directory_identity(&directory)?;
+            if operator_directory_identities_match(directory_identity, ceiling_identity) {
+                reached_ceiling = true;
+                break;
+            }
+
+            let parent = open_directory_at(&directory, b"..")
+                .context("verify removal parent ancestry beneath removal root")?;
+            if operator_directory_identities_match(
+                operator_directory_identity(&parent)?,
+                directory_identity,
+            ) {
+                break;
+            }
+            directory = parent;
+        }
+
+        if !reached_ceiling {
+            bail!("removal parent is no longer beneath the retained removal root");
+        }
+        let Some((candidate, parent_hops)) = candidate else {
+            bail!(
+                "no trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
+            )
+        };
+        if !candidate_chain_is_trusted {
+            bail!(
+                "no trusted ancestor chain within the removal root can hold the removal quarantine on this filesystem"
+            );
+        }
+        Self::create_in(&candidate, parent_hops, effective_uid).context(
+            "no writable trusted ancestor within the removal root can hold the removal quarantine on this filesystem",
+        )
+    }
+
+    fn create_unconfined(source_parent: &PinnedParent) -> Result<Self> {
+        let mut directory = source_parent
+            .try_clone()
+            .context("duplicate removal parent descriptor")?;
+        let source_device = directory.metadata()?.dev();
         let effective_uid = effective_user_id();
         let mut last_create_error = None;
 
@@ -1202,14 +1274,6 @@ impl RemovalQuarantine {
             if metadata.dev() != source_device {
                 break;
             }
-            let directory_identity = Identity {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-                file_type: metadata.mode() & MODE_TYPE_MASK,
-            };
-            // The retained ceiling identifies the exact opened `--root`, even
-            // if its operator-visible name is replaced while removal runs.
-            let at_ceiling = ceiling_identity == Some(directory_identity);
             if is_trusted_quarantine_parent(&metadata, effective_uid) {
                 match Self::create_in(&directory, parent_hops, effective_uid) {
                     Ok(quarantine) => return Ok(quarantine),
@@ -1227,9 +1291,6 @@ impl RemovalQuarantine {
                     Err(error) => return Err(error).context("create removal quarantine"),
                 }
             }
-            if at_ceiling {
-                break;
-            }
 
             let parent = open_directory_at(&directory, b"..")
                 .context("walk to a trusted removal quarantine parent")?;
@@ -1244,16 +1305,8 @@ impl RemovalQuarantine {
         }
 
         if let Some(error) = last_create_error {
-            let context = if ceiling_identity.is_some() {
-                "no writable trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
-            } else {
-                "no writable trusted ancestor can hold the removal quarantine on this filesystem"
-            };
-            return Err(error).context(context);
-        }
-        if ceiling_identity.is_some() {
-            bail!(
-                "no trusted ancestor within the removal root can hold the removal quarantine on this filesystem"
+            return Err(error).context(
+                "no writable trusted ancestor can hold the removal quarantine on this filesystem",
             );
         }
         bail!("no trusted ancestor can hold the removal quarantine on this filesystem")
@@ -1984,6 +2037,65 @@ mod tests {
             .expect("an untrusted removal root fails without escaping to its parent");
         assert!(
             failure.error.message.contains("within the removal root"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn parent_moved_outside_root_is_refused_before_quarantine_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(root.join("parent")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("parent"), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(root.join("parent/selected"), b"selected").unwrap();
+        let mut moved = false;
+        let mut outcomes = Vec::new();
+
+        remove(
+            None,
+            Some(root.as_os_str().as_bytes()),
+            &[selector(b"parent/selected", NativeRemoveKind::File)],
+            false,
+            false,
+            1,
+            &mut |_| Ok(()),
+            &mut |batch| {
+                if !moved
+                    && batch
+                        .iter()
+                        .any(|outcome| outcome.disposition == NativeRemoveDisposition::Resolved)
+                {
+                    fs::rename(root.join("parent"), outside.join("parent"))?;
+                    moved = true;
+                }
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(moved);
+        assert_eq!(
+            fs::read(outside.join("parent/selected")).unwrap(),
+            b"selected"
+        );
+        assert!(removal_quarantines(&root).is_empty());
+        assert!(removal_quarantines(&outside).is_empty());
+        assert!(removal_quarantines(temp.path()).is_empty());
+        let failure = outcomes
+            .iter()
+            .find(|outcome| outcome.disposition == NativeRemoveDisposition::Failed)
+            .and_then(|outcome| outcome.failure.as_ref())
+            .expect("a parent reparented outside --root is refused");
+        assert!(
+            failure
+                .error
+                .message
+                .contains("no longer beneath the retained removal root"),
             "{failure:?}"
         );
     }
