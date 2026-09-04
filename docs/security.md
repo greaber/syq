@@ -332,9 +332,11 @@ become a valid clean receipt, though suppression remains a denial of service.
 
 The receipt is hostB's closure-time account of hostB: it says what landed, not
 what hostA omitted or invented, and it is neither a transaction nor a rollback.
-A detached restricted transfer is weaker: the receipt lands in hostA's log in
-plaintext, the launcher warns about that even under `-q`, and `--follow`
-displays completion without verifying it locally.
+`--detach` is not available with this command-restricted receiver because its
+constrained agent exists only while syq remains attached. A detached launch
+instead requires coordinator-owned peer credentials through
+`--no-forward-agent`, or an explicit `--rsh` policy. Neither path prepares a
+restricted grant or signed receipt.
 
 ### Putting the layers together
 
