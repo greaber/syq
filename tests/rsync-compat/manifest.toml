@@ -507,7 +507,7 @@ baseline = "pass"
 platforms = ["linux"]
 tags = ["local", "security", "destination-race", "publication"]
 requirements = ["symlinks"]
-note = "Race a destination parent between a directory and an out-of-tree symlink during normal staged publication; the adaptation removes upstream's unsupported absolute --temp-dir trigger but preserves its flipper, positive control, and outside-write oracle."
+note = "Race a destination parent between a directory and an out-of-tree symlink during normal staged publication; the adaptation removes upstream's unsupported absolute --temp-dir trigger, keeps its flipper, positive control, and outside-write oracle, and re-arms the symlink before every push so a pass proves publication ran under a live flip."
 
 [[tests]]
 name = "unsafe-links"

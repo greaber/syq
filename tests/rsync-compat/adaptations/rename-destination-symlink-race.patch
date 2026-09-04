@@ -1,9 +1,9 @@
 diff --git a/testsuite/receiver-rename-symlink-race_test.py b/testsuite/receiver-rename-symlink-race_test.py
 new file mode 100755
-index 0000000..f78034a
+index 0000000..a8b4e14
 --- /dev/null
 +++ b/testsuite/receiver-rename-symlink-race_test.py
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,173 @@
 +#!/usr/bin/env python3
 +"""Normal staged-publication rename stays beneath the destination root.
 +
@@ -12,10 +12,24 @@ index 0000000..f78034a
 +bug in rsync's rename wrapper.  SYQ has no --temp-dir, so this scenario keeps
 +the same real parent-directory flipper and outside-write oracle while staging
 +through the target's ordinary temporary-file path.
++
++Unlike upstream, every round re-arms the attack from a known state.  Upstream
++resets dest/sub by name while its flipper runs, so the reset unlinks the
++malicious symlink as soon as it lands on it, and a target that replaces a
++destination symlink with a directory when the source has a directory there
++(rsync and SYQ both do) consumes the symlink as well.  Either way the flipper
++is left swapping two ordinary directories for the rest of the budget and the
++oracle stops seeing the attack.  Here the flipper is stopped, the
++directory/symlink pair is rebuilt, and the flipper is restarted before every
++push.  The test also fails as vacuous unless at least one push published files
++into the real directory while the symlink was still present, so a pass is
++evidence that staged publication ran under a live flip.
 +"""
 +
 +import os
++import shutil
 +import subprocess
++import sys
 +import time
 +
 +from rsyncfns import SCRATCHDIR, race_budget, rmtree, rsync_argv, test_fail
@@ -32,9 +46,10 @@ index 0000000..f78034a
 +dest.mkdir()
 +outside.mkdir()
 +
-+sub = dest / 'sub'
-+link = dest / '.sublink'
-+link.symlink_to(outside)
++sub = dest / 'sub'              # the parent the attacker flips
++link = dest / '.sublink'        # a symlink -> outside, swapped in for `sub`
++scratch = dest / 'sub.flip'     # the flipper's transient third name
++names = (sub, link, scratch)
 +
 +
 +def push():
@@ -44,9 +59,34 @@ index 0000000..f78034a
 +    )
 +
 +
++def remove(path):
++    """Remove one name without following a symlink."""
++    if path.is_symlink() or path.is_file():
++        path.unlink()
++    elif path.is_dir():
++        shutil.rmtree(path)
++
++
++def arm():
++    """Rebuild dest/sub as an empty directory and dest/.sublink as the
++    attacker's symlink.  Only valid while no flipper is running."""
++    for name in names:
++        remove(name)
++    sub.mkdir()
++    link.symlink_to(outside)
++
++
++def real_dir():
++    """The ordinary directory among the flipped names, if any."""
++    for name in names:
++        if name.is_dir() and not name.is_symlink():
++            return name
++    return None
++
++
 +# A clean run must traverse the same staged write and final-rename path.  This
 +# prevents a target that simply rejects the invocation from passing the race.
-+sub.mkdir()
++arm()
 +control = push()
 +if control.returncode != 0 or not (sub / 'f0').is_file():
 +    test_fail(
@@ -54,19 +94,21 @@ index 0000000..f78034a
 +        f"(rc={control.returncode}); the rename-race test would be vacuous"
 +    )
 +for entry in outside.iterdir():
-+    if entry.is_file() or entry.is_symlink():
-+        entry.unlink()
++    remove(entry)
 +
 +# Keep dest/sub alternating between the real directory and a symlink to the
-+# outside sentinel directory while repeated transfers stage and publish files.
-+# The child terminates with this test process and has a hard backstop so an
-+# interrupted suite cannot leave a namespace-mutating process behind.
++# outside sentinel directory while a transfer stages and publishes files.  The
++# swap is upstream's 3-rename dance through a scratch name.  The child reports
++# readiness on stdout so the push starts under a running flipper, terminates
++# with this test process, and has a hard backstop so an interrupted suite
++# cannot leave a namespace-mutating process behind.
 +flip_code = (
 +    "import os, sys, time\n"
 +    "sub, link = sys.argv[1], sys.argv[2]\n"
 +    "scratch = sub + '.flip'\n"
 +    "parent = os.getppid()\n"
 +    "deadline = time.monotonic() + 120\n"
++    "print('ready', flush=True)\n"
 +    "while time.monotonic() < deadline and os.getppid() == parent:\n"
 +    "    try:\n"
 +    "        os.makedirs(sub, exist_ok=True)\n"
@@ -75,31 +117,63 @@ index 0000000..f78034a
 +    "    except OSError:\n"
 +    "        pass\n"
 +)
-+flip = subprocess.Popen(['python3', '-c', flip_code, str(sub), str(link)])
-+try:
-+    deadline = time.monotonic() + race_budget(10.0)
-+    while time.monotonic() < deadline:
-+        rmtree(sub)
-+        try:
-+            sub.unlink()
-+        except OSError:
-+            pass
-+        push()
-+        escaped = sorted(
-+            entry.name for entry in outside.iterdir()
-+            if entry.is_file() and not entry.is_symlink()
-+        )
-+        if escaped:
-+            test_fail(
-+                "receiver publication followed a raced destination parent "
-+                f"symlink and wrote outside the selected tree: {escaped}"
-+            )
-+finally:
++
++
++def stop_flipper(flip):
 +    flip.terminate()
 +    try:
 +        flip.wait(timeout=5)
 +    except subprocess.TimeoutExpired:
 +        flip.kill()
 +        flip.wait()
++    flip.stdout.close()
 +
-+print("receiver-rename-symlink-race: publication stayed beneath destination root")
++
++def start_flipper():
++    flip = subprocess.Popen(
++        [sys.executable, '-c', flip_code, str(sub), str(link)],
++        stdout=subprocess.PIPE, text=True,
++    )
++    if flip.stdout.readline().strip() != 'ready':
++        stop_flipper(flip)
++        test_fail("the destination parent flipper did not start")
++    return flip
++
++
++rounds = armed = productive = 0
++deadline = time.monotonic() + race_budget(10.0)
++while time.monotonic() < deadline:
++    rounds += 1
++    arm()
++    flip = start_flipper()
++    try:
++        push()
++    finally:
++        stop_flipper(flip)
++    escaped = sorted(entry.name for entry in outside.iterdir())
++    if escaped:
++        test_fail(
++            "receiver publication followed a raced destination parent "
++            f"symlink and wrote outside the selected tree: {escaped}"
++        )
++    # With the flipper stopped this is a consistent view of the three names.
++    # A round counts as armed when the target never consumed the symlink, and
++    # as productive when it also published payload into the real directory
++    # under that live flip.
++    if any(name.is_symlink() for name in names):
++        armed += 1
++        real = real_dir()
++        if real is not None and any((real / f'f{i}').is_file() for i in range(40)):
++            productive += 1
++
++if productive == 0:
++    test_fail(
++        f"vacuous race: {rounds} rounds, {armed} of them with the attacker's "
++        "symlink still present after the push, but no push published a file "
++        "into the real directory while the symlink was live"
++    )
++
++print(
++    "receiver-rename-symlink-race: publication stayed beneath destination root "
++    f"({rounds} rounds, {armed} armed, {productive} productive)"
++)

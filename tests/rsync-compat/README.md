@@ -14,14 +14,20 @@ To run only the security-classified scenarios, use:
 
 ```sh
 python3 scripts/rsync-compat.py --area security --report-label security-user
-sudo python3 scripts/rsync-compat.py --area security --report-label security-root
+sudo python3 scripts/rsync-compat.py --area security --report-label security-root \
+  --no-build-syq --syq-bin "$PWD/target/debug/syq"
+sudo chown -R "$(id -u):$(id -g)" target/rsync-compat
 ```
 
 `--area` is repeatable. The non-root and root runs exercise different cells;
-in particular, foreign-owner symlink plants require root to set up. This is a
-focused slice of the applicable compatibility matrix, not a claim that rsync
-has a standalone security suite or that SYQ implements rsync's daemon and wire
-protocol surfaces.
+in particular, foreign-owner symlink plants require root to set up. The first
+command builds SYQ and prepares the suite as your own user, and the root run
+reuses both rather than invoking Cargo as root, which usually cannot find a
+rustup toolchain and would leave root-owned build output behind. The root run
+still writes its reports under `target/rsync-compat/`, so the last command
+hands that directory back to you. This is a focused slice of the applicable
+compatibility matrix, not a claim that rsync has a standalone security suite or
+that SYQ implements rsync's daemon and wire protocol surfaces.
 
 The manifest routes upstream invocations to `syq rsync`, keeping compatibility
 coverage separate from the native command grammar without patching upstream
