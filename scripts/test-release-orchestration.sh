@@ -26,21 +26,25 @@ expect_failure() {
   }
 }
 
-# Scope pull requests to affected checks. Native changes exercise macOS and
-# rsync conformance before merge; broader cross-subsystem and architecture
-# checks remain cumulative.
+# Scope pull requests to affected Linux checks; broader cross-subsystem,
+# architecture, and platform checks remain cumulative after merge.
 assert_scope() {
   local output=$1 key=$2 expected=$3
   grep -Fx "$key=$expected" <<<"$output" >/dev/null
 }
 
+scope_keys=(
+  native sdks python_sdk javascript_sdk go_sdk tooling shellcheck mapping_docs
+  conformance macos linux_arm64 full_suite
+)
+
 paths="$work/paths"
 printf 'README.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" false
 done
-printf 'MAPPINGS.md\n' >"$paths"
+printf 'docs/mappings.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" mapping_docs true
 assert_scope "$scope" native false
@@ -48,10 +52,26 @@ printf 'sdk/python/src/syq/syq-release-manifest.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" javascript_sdk false
+assert_scope "$scope" go_sdk false
+printf 'sdk/js/src/index.js\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk false
+assert_scope "$scope" javascript_sdk true
+assert_scope "$scope" go_sdk false
+printf 'sdk/go/client.go\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk false
+assert_scope "$scope" javascript_sdk false
+assert_scope "$scope" go_sdk true
 printf 'sdk/python/native-api.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 for sdk_script in \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
@@ -63,6 +83,7 @@ do
   scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
   assert_scope "$scope" tooling true
   assert_scope "$scope" sdks true
+  assert_scope "$scope" python_sdk true
   assert_scope "$scope" native false
 done
 printf 'tests/rsync-compat/LEDGER.md\n' >"$paths"
@@ -73,9 +94,14 @@ printf 'src/main.rs\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks false
-assert_scope "$scope" conformance true
-assert_scope "$scope" macos true
+assert_scope "$scope" conformance false
+assert_scope "$scope" macos false
 assert_scope "$scope" linux_arm64 false
+printf 'tests/real-ssh/scenarios.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" shellcheck true
+assert_scope "$scope" tooling false
+assert_scope "$scope" native false
 printf 'scripts/test-installer.sh\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
@@ -83,12 +109,9 @@ assert_scope "$scope" native false
 printf '.github/workflows/ci.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
-assert_scope "$scope" native true
-assert_scope "$scope" sdks true
-assert_scope "$scope" mapping_docs true
-assert_scope "$scope" conformance true
-assert_scope "$scope" macos true
-assert_scope "$scope" linux_arm64 true
+for key in native sdks python_sdk javascript_sdk go_sdk shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 printf '.github/workflows/rsync-compat.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
@@ -98,7 +121,26 @@ printf '.github/workflows/python-api-sync.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 assert_scope "$scope" native false
+
+# The surface touched by PR #190 should run the Rust baseline, Python SDK, and
+# shell lint without promoting the pull request to unrelated suites.
+printf '%s\n' \
+  docs/reference.md \
+  sdk/python/native-api.json \
+  sdk/python/src/syq/client.py \
+  src/cli.rs \
+  tests/local.rs \
+  tests/real-ssh/scenarios.sh >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" shellcheck true
+for key in javascript_sdk go_sdk tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 
 scope_repo="$work/scope-repo"
 mkdir "$scope_repo"
@@ -121,6 +163,7 @@ jq -n --arg base "$scope_base" --arg head "$scope_head" \
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 assert_scope "$scope" full_suite false
 
 # A pull request branch may lag master. Scope its own three-dot diff rather
@@ -138,7 +181,7 @@ advanced_base=$(git -C "$scope_repo" rev-parse HEAD)
 jq -n --arg base "$advanced_base" --arg head "$docs_head" \
   '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" false
 done
 
@@ -161,6 +204,9 @@ jq -n --arg before "$scope_head" --arg after "$advanced_base" \
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" javascript_sdk true
+assert_scope "$scope" go_sdk true
 assert_scope "$scope" conformance true
 assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 true
@@ -169,7 +215,7 @@ assert_scope "$scope" full_suite true
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
 
