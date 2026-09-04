@@ -10,7 +10,7 @@ use crate::progress::Progress;
 use crate::proto::Entry;
 use crate::sched::Sched;
 use anyhow::{bail, Result};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -71,8 +71,6 @@ pub struct Group {
     progresses: Mutex<Vec<Option<Arc<Progress>>>>,
     terminals: Mutex<Vec<Option<crate::results::ResultRecord>>>,
     human_output: Mutex<()>,
-    stdout_output: Mutex<()>,
-    stdout_warning_emitted: AtomicBool,
     progress_lines: Mutex<usize>,
     results: Option<Arc<crate::results::ResultsWriter>>,
     bandwidth: Option<Arc<BandwidthLimit>>,
@@ -116,8 +114,6 @@ impl Group {
             progresses: Mutex::new(vec![None; total]),
             terminals: Mutex::new(vec![None; total]),
             human_output: Mutex::new(()),
-            stdout_output: Mutex::new(()),
-            stdout_warning_emitted: AtomicBool::new(false),
             progress_lines: Mutex::new(0),
             results,
             bandwidth: (bytes_per_second > 0)
@@ -166,20 +162,12 @@ impl Group {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *lines > 0 {
-            crate::progress::write_stderr_best_effort(format_args!("\r\x1b[{}A\x1b[J", *lines));
+            let mut err = std::io::stderr().lock();
+            let _ = write!(err, "\r\x1b[{}A\x1b[J", *lines);
+            let _ = err.flush();
             *lines = 0;
         }
         output
-    }
-
-    pub fn lock_stdout_output(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.stdout_output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub fn claim_stdout_warning(&self) -> bool {
-        !self.stdout_warning_emitted.swap(true, Relaxed)
     }
 
     fn set_progress_lines(&self, lines: usize) {
@@ -191,7 +179,9 @@ impl Group {
 
     fn write_stderr_block(&self, block: &str) {
         let _output = self.lock_human_output();
-        crate::progress::write_stderr_best_effort(format_args!("{block}\n"));
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{block}");
+        let _ = err.flush();
     }
 
     fn ensure_failed_member(&self, index: usize, args: &Args) -> bool {
@@ -571,10 +561,10 @@ fn run_group(
         let _ = ticker.join();
     }
     for notice in notices {
-        crate::progress::write_stderr_best_effort(format_args!("syq: fan-out: {notice}\n"));
+        eprintln!("syq: fan-out: {notice}");
     }
     for failure in failures {
-        crate::progress::write_stderr_best_effort(format_args!("syq: fan-out: {failure}\n"));
+        eprintln!("syq: fan-out: {failure}");
     }
     let terminals = group.terminal_records();
     if let Some(results) = group.results() {
@@ -660,19 +650,20 @@ fn spawn_progress_ticker(
                 if human {
                     let _output = group.lock_human_output();
                     let width = configured_width.unwrap_or_else(crate::progress::term_width);
-                    let rendered = snapshots
-                        .iter()
-                        .map(|(index, snapshot)| {
-                            let line = format!(
-                                "target {}: {}",
-                                labels[*index],
-                                crate::progress::progress_line(snapshot)
-                            );
+                    let mut err = std::io::stderr().lock();
+                    for (index, snapshot) in &snapshots {
+                        let line = format!(
+                            "target {}: {}",
+                            labels[*index],
+                            crate::progress::progress_line(snapshot)
+                        );
+                        let _ = writeln!(
+                            err,
+                            "{}",
                             crate::progress::truncate(&line, width.saturating_sub(1))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    crate::progress::write_stderr_best_effort(format_args!("{rendered}\n"));
+                        );
+                    }
+                    let _ = err.flush();
                     group.set_progress_lines(snapshots.len());
                 }
             }
@@ -717,10 +708,9 @@ fn announce_member_settled_for_test(index: usize) {
     if selected != Some(index) {
         return;
     }
-    let Some(marker) = std::env::var_os("SYQ_TEST_FANOUT_SETTLED_FILE") else {
-        return;
-    };
-    let _ = std::fs::write(marker, b"settled");
+    let marker = std::env::var_os("SYQ_TEST_FANOUT_SETTLED_FILE")
+        .expect("SYQ_TEST_FANOUT_SETTLED_INDEX requires SYQ_TEST_FANOUT_SETTLED_FILE");
+    std::fs::write(marker, b"settled").expect("write fan-out member-settled marker");
 }
 
 #[cfg(not(debug_assertions))]

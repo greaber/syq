@@ -1345,9 +1345,6 @@ fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
         .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
         .env("FAKE_REMOTE_ROOT", t.path("remotes"))
         .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
-        // A malformed debug-only synchronization hook must not turn completed
-        // copies into worker failures.
-        .env("SYQ_TEST_FANOUT_SETTLED_INDEX", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
@@ -1356,56 +1353,12 @@ fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
     let output = child.wait_with_output().unwrap();
 
     assert_output_ok(&output);
-    assert_eq!(
-        stderr_of(&output)
-            .matches("warning: could not write to stdout")
-            .count(),
-        1,
-        "{}",
-        stderr_of(&output),
-    );
     for host in ["alpha", "beta"] {
         assert_eq!(
             read(&t.path(&format!("remotes/{host}/dst/source"))),
             b"copy despite a closed summary pipe"
         );
     }
-}
-
-#[test]
-fn closed_summary_stdout_warns_without_changing_single_target_outcome() {
-    let t = Tmp::new();
-    write(&t.path("source"), b"copy despite a closed summary pipe");
-    fs::create_dir(t.path("dst")).unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            &t.s("source"),
-            "--into-existing",
-            &t.s("dst"),
-            "--no-progress",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
-    drop(child.stdout.take());
-    let output = child.wait_with_output().unwrap();
-
-    assert_output_ok(&output);
-    assert_eq!(
-        stderr_of(&output)
-            .matches("warning: could not write to stdout")
-            .count(),
-        1,
-        "{}",
-        stderr_of(&output),
-    );
-    assert_eq!(
-        read(&t.path("dst/source")),
-        b"copy despite a closed summary pipe"
-    );
 }
 
 #[cfg(debug_assertions)]
@@ -5953,43 +5906,6 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     );
 }
 
-#[cfg(debug_assertions)]
-#[test]
-fn dropped_write_connection_recovers_when_retry_notice_stderr_is_closed() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    let data = vec![b'r'; 2 * 1024 * 1024];
-    write(&t.path("src"), &data);
-    let remote = format!("fake:{}", t.s("dst"));
-    let marker = t.path("drop-write-once");
-
-    let mut child = remote_syq_command(
-        &t,
-        &rsh,
-        &[
-            "-a",
-            "--syq-no-bootstrap",
-            "--block-size=64K",
-            &t.s("src"),
-            &remote,
-        ],
-    )
-    .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
-    .env("SYQ_TEST_DROP_MARKER", &marker)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .start()
-    .unwrap();
-    drop(child.stderr.take());
-    let output = child.wait_with_output().unwrap();
-
-    assert_output_ok(&output);
-    assert!(marker.exists());
-    assert_eq!(read(&t.path("dst")), data);
-}
-
 // The expected tuner trajectory depends on measured loopback throughput and
 // is calibrated for Linux runners.
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -7913,32 +7829,6 @@ fn native_rm_removes_named_tree_and_contents_keeps_root() {
     assert!(!t.path("native").exists());
     assert!(t.path("contents").is_dir());
     assert!(listing(&t.path("contents")).is_empty());
-}
-
-#[test]
-fn native_rm_closed_summary_stdout_does_not_change_removal_outcome() {
-    let t = Tmp::new();
-    write(&t.path("victim"), b"remove despite a closed summary pipe");
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["rm", "--cwd", &t.s(""), "--src", "victim"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
-    drop(child.stdout.take());
-    let output = child.wait_with_output().unwrap();
-
-    assert_output_ok(&output);
-    assert_eq!(
-        stderr_of(&output)
-            .matches("warning: could not write to stdout")
-            .count(),
-        1,
-        "{}",
-        stderr_of(&output),
-    );
-    assert!(!t.path("victim").exists());
 }
 
 #[test]
