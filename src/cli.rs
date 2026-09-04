@@ -356,8 +356,6 @@ pub struct Args {
     pub max_entries: Option<u64>,
     #[arg(skip)]
     pub max_total_bytes: Option<u64>,
-    #[arg(skip)]
-    pub max_runtime_secs: Option<u32>,
     /// Native-only: `--receipt` was given at all, and whether it asked the
     /// command-restricted receiver for a hashed receipt.
     #[arg(skip)]
@@ -806,9 +804,6 @@ struct NativeCopyOperationalArgs {
     /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total (direct remote-to-remote only)
     #[arg(long, value_name = "SIZE")]
     max_total_bytes: Option<String>,
-    /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
-    #[arg(long, value_name = "DURATION")]
-    max_runtime: Option<String>,
     /// Receiver receipt detail: final sizes (default) or also final BLAKE3 file digests (direct remote-to-remote only)
     #[arg(long, value_name = "MODE", value_enum)]
     receipt: Option<ReceiptMode>,
@@ -1328,11 +1323,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
-    if args.max_entries.is_some()
-        || args.max_total_bytes.is_some()
-        || args.max_runtime_secs.is_some()
-        || args.receipt_requested
-    {
+    if args.max_entries.is_some() || args.max_total_bytes.is_some() || args.receipt_requested {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
         // refuse rather than let them read as local limits.
@@ -1340,7 +1331,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--max-entries, --max-total-bytes, and --receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
             );
         }
     }
@@ -1706,17 +1697,12 @@ fn apply_native_copy_operational(
         inplace,
         max_entries,
         max_total_bytes,
-        max_runtime,
         receipt,
     } = operational;
     args.receipt_requested = receipt.is_some();
     args.receipt_hashed = receipt == Some(ReceiptMode::Hashed);
     args.max_entries = max_entries;
     args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
-    args.max_runtime_secs = max_runtime
-        .as_deref()
-        .map(parse_duration_secs)
-        .transpose()?;
     args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
@@ -2133,33 +2119,6 @@ fn message_for_short(c: char) -> Option<&'static str> {
 }
 
 /// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
-/// (seconds when unsuffixed) into seconds. Zero is rejected.
-pub fn parse_duration_secs(s: &str) -> Result<u32> {
-    let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some(c) if c.is_ascii_alphabetic() => {
-            let m: u32 = match c.to_ascii_lowercase() {
-                's' => 1,
-                'm' => 60,
-                'h' => 60 * 60,
-                _ => bail!("bad duration suffix in {s:?}; use s, m, or h"),
-            };
-            (&s[..s.len() - 1], m)
-        }
-        _ => (s, 1),
-    };
-    let n: u32 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad duration {s:?}"))?;
-    let seconds = n
-        .checked_mul(mult)
-        .ok_or_else(|| anyhow::anyhow!("bad duration {s:?}: value is too large"))?;
-    if seconds == 0 {
-        bail!("duration {s:?} must be at least one second");
-    }
-    Ok(seconds)
-}
-
 fn parse_max_delete(value: &str) -> std::result::Result<u64, String> {
     if value == "-1" {
         // Rsync documents -1 as the backward-compatible spelling of its
@@ -2211,9 +2170,9 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_native_rm, parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args,
-        Placement, SourceSelection,
+        native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Placement,
+        SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
@@ -2302,17 +2261,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn durations_take_seconds_minutes_or_hours_and_reject_zero() {
-        assert_eq!(parse_duration_secs("45").unwrap(), 45);
-        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
-        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
-        assert_eq!(parse_duration_secs("2H").unwrap(), 7200);
-        for bad in ["0", "0m", "", "5d", "1.5h", "-3", "4294967295h"] {
-            assert!(parse_duration_secs(bad).is_err(), "{bad:?}");
         }
     }
 

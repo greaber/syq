@@ -67,7 +67,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             hash=True,
             max_entries=100,
             max_total_bytes="2G",
-            max_runtime="30m",
             receipt="sizes",
             pscope="scope",
             on_event=observe,
@@ -88,7 +87,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--follow-dest", self.argv())
         self.assertIn("--max-entries", self.argv())
         self.assertIn("--max-total-bytes", self.argv())
-        self.assertIn("--max-runtime", self.argv())
         self.assertIn("--receipt", self.argv())
         self.assertIn("--pscope", self.argv())
         self.assertEqual(

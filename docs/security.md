@@ -273,7 +273,8 @@ machine records with the enrollment (see Layer 6).
 
 For each transfer, the local machine signs a typed request naming the exact
 destination, login, copy semantics, hash block size, TCP port range, entry,
-byte, deletion, and connection limits, a validity interval, and a fresh nonce.
+byte, deletion, and connection limits, a start-by time, a finish-by time, and
+a fresh nonce.
 HostA carries this request but cannot alter it. The forced receiver on hostB
 verifies the signature (via OpenSSH's SSHSIG verifier and a policy file hostB
 owns), durably claims the nonce before doing anything, enforces the deadline,
@@ -283,7 +284,7 @@ at most once; a replayed request is rejected.
 Filters, `--inplace`, preservation, existing-object policy, and placement
 preconditions are signed into the grant and enforced by the receiver on its
 own. Deletion through the receiver requires an explicit `--max-delete`, and
-the native `--max-entries`, `--max-total-bytes`, and `--max-runtime` options
+the native `--max-entries` and `--max-total-bytes` options
 lower the signed ceilings for one transfer, so what a claimed grant is worth to
 hostA is always bounded on the command line. Options whose semantics the
 receiver cannot enforce independently of hostA fail closed rather than

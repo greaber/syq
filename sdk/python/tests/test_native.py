@@ -287,7 +287,6 @@ class NativeClientTests(unittest.TestCase):
             connections=4,
             max_entries=100,
             max_total_bytes="2G",
-            max_runtime="30m",
             receipt="hashed",
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
@@ -321,7 +320,7 @@ class NativeClientTests(unittest.TestCase):
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
             "--max-entries", "--max-total-bytes",
-            "--max-runtime", "--receipt", "--ignore", "--ignore-from",
+            "--receipt", "--ignore", "--ignore-from",
             "--preserve",
             "--inplace", "--max-size", "--min-size",
         ):
