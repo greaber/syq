@@ -710,6 +710,33 @@ fn mkdir_operator_directory_at(parent: &File, component: &[u8], mode: u32) -> io
     }
 }
 
+/// One file of a small copy, staged but not yet published.
+struct StagedSmallFile {
+    root: Arc<Root>,
+    partial: RelativePath,
+    target: RelativePath,
+    file: File,
+}
+
+/// The single directory entry a small-copy file names beneath the request
+/// prefix. Nested paths are the ordinary engine's business.
+fn small_copy_leaf<'a>(request_prefix: &[u8], path: &'a [u8]) -> Result<&'a [u8]> {
+    let mut prefix_len = request_prefix.len();
+    while prefix_len > 1 && request_prefix[prefix_len - 1] == b'/' {
+        prefix_len -= 1;
+    }
+    let leaf = match path.strip_prefix(&request_prefix[..prefix_len]) {
+        Some(rest) if prefix_len == 0 || &request_prefix[..prefix_len] == b"/" => rest,
+        Some(rest) if rest.first() == Some(&b'/') => &rest[1..],
+        _ => bail!("small copy path is not beneath the request prefix"),
+    };
+    if leaf.is_empty() || leaf == b"." || leaf == b".." || leaf.contains(&b'/') || leaf.contains(&0)
+    {
+        bail!("small copy path must name one entry beneath the destination directory");
+    }
+    Ok(leaf)
+}
+
 fn operator_lstat_at(parent: &File, component: &[u8]) -> io::Result<libc::stat> {
     let component = CString::new(component).expect("path component was checked for NUL");
     loop {
@@ -1658,6 +1685,202 @@ impl FsOps {
         Ok(ticket)
     }
 
+    /// One-turn push of fresh small files. This composes the steps the
+    /// ordinary engine issues separately, in the same order, on one fresh
+    /// control session: select and retain the operator directory, refuse if
+    /// any target exists, register and install the directory as the
+    /// destination root exactly as `AnchorDestination` does, then publish
+    /// every file through `put_small` with an absent-target condition. A
+    /// refusal leaves the session as it found it, so the engine can continue
+    /// on this connection.
+    fn copy_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
+        if self.operator_selection.is_some()
+            || self.destination_root.is_some()
+            || self.destination_prefix.is_some()
+            || !self.source_roots.is_empty()
+        {
+            bail!("small copy is valid only on a fresh control session");
+        }
+        if request.files.is_empty() || request.files.len() > SMALL_COPY_MAX_FILES {
+            bail!(
+                "small copy carries {} files; the limit is {SMALL_COPY_MAX_FILES}",
+                request.files.len()
+            );
+        }
+        let mut total = 0u64;
+        let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
+        for file in &request.files {
+            let bytes = file.data.len() as u64;
+            if bytes > SMALL_COPY_MAX_FILE_BYTES {
+                bail!("small copy file exceeds {SMALL_COPY_MAX_FILE_BYTES} bytes");
+            }
+            total = total
+                .checked_add(bytes)
+                .filter(|total| *total <= SMALL_COPY_MAX_TOTAL_BYTES)
+                .context("small copy exceeds its total byte limit")?;
+            let name = small_copy_leaf(&request.request_prefix, &file.path)?;
+            if names.contains(&name) {
+                bail!("small copy names one destination twice");
+            }
+            names.push(name);
+        }
+        // The engine canonicalizes before it walks the directory; the job
+        // identity, and therefore every sidecar name, comes from that spelling.
+        let mut canonical = normalize(&resolve(&request.directory));
+        if let Some(leaf) = &request.identity.dst_leaf {
+            canonical.push(OsStr::from_bytes(leaf));
+        }
+        let identity = &request.identity;
+        let copy_identity = crate::resume::copy_identity(
+            &identity.src_endpoint,
+            &identity.src_roots,
+            &identity.dst_endpoint,
+            &crate::transfer::path_identity(&canonical),
+            &identity.semantic_flags,
+        );
+        let copy_id = crate::resume::copy_id(&copy_identity);
+
+        let (selection, anchor) =
+            select_operator_directory(&request.directory, false, request.symlink_policy)?;
+        let anchor = anchor.context("destination directory is missing")?;
+        // Freshness is decided through the retained descriptor, before
+        // anything is registered, so a refusal has no session side effect.
+        for name in &names {
+            match operator_lstat_at(&selection.directory, name) {
+                Ok(_) => {
+                    return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                        anchor,
+                        outcome: SmallCopyOutcome::NotFresh,
+                    }))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspect destination entry {}",
+                            String::from_utf8_lossy(name)
+                        )
+                    })
+                }
+            }
+        }
+        // The engine's fresh-destination capacity preflight, on the retained
+        // selection. An exact target whose leaf is absent is fresh; a
+        // directory is fresh only while it is empty. A filesystem that cannot
+        // report its capacity is no reason to refuse, as for the engine.
+        let exact = request.identity.dst_leaf.is_some();
+        self.operator_selection = Some(selection);
+        let info = self.destination_filesystem_info(!exact, None).ok();
+        let fresh = exact || info.as_ref().is_some_and(|info| info.empty == Some(true));
+        if let Some(info) = info.filter(|_| fresh) {
+            let assessment = crate::transfer::FreshCapacityAssessment {
+                logical_bytes: total,
+                objects: request.files.len() as u64,
+                available_bytes: info.available_bytes,
+                available_inodes: info.available_inodes,
+            };
+            if !assessment.sufficient() {
+                self.operator_selection = None;
+                return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                    anchor,
+                    outcome: SmallCopyOutcome::CapacityShort,
+                }));
+            }
+        }
+        let selection = self
+            .operator_selection
+            .take()
+            .expect("selection retained for the capacity preflight");
+        let ticket = self.descriptor_session.register(selection.directory)?;
+        let directory = self.descriptor_session.acquire(&ticket)?;
+        self.install_destination(directory, &request.request_prefix)?;
+
+        // Stage everything before publishing any final files. A staging
+        // failure can leave sidecars for the fallback engine to resume.
+        let mut staged = Vec::with_capacity(request.files.len());
+        for file in &request.files {
+            match self.stage_small_file(
+                &file.path,
+                &copy_id,
+                &file.data,
+                file.hash,
+                &file.meta,
+                request.flags,
+            ) {
+                Ok(item) => staged.push(item),
+                Err(error) => {
+                    for item in &staged {
+                        let _ = item.root.unlink(&item.partial);
+                    }
+                    return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                        anchor,
+                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
+                    }));
+                }
+            }
+        }
+        // Each publication has its own outcome; earlier successes remain
+        // published if a later file fails.
+        let results = staged
+            .iter()
+            .map(|item| {
+                publish_partial_rooted(
+                    &item.root,
+                    &item.partial,
+                    &item.target,
+                    &item.file,
+                    TargetCondition::Absent,
+                )
+                .err()
+                .map(|error| wire_error(&error))
+            })
+            .collect();
+        Ok(Response::SmallFilesCopied(SmallCopyResponse {
+            anchor,
+            outcome: SmallCopyOutcome::Published(results),
+        }))
+    }
+
+    /// Stage one small file as a private sidecar beneath the destination
+    /// root, ready to publish: the staging half of `put_small`'s default path.
+    fn stage_small_file(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        data: &[u8],
+        hash: ContentDigest,
+        meta: &Meta,
+        flags: u8,
+    ) -> Result<StagedSmallFile> {
+        if content_digest(data) != hash {
+            bail!("block hash mismatch on receive");
+        }
+        let path = self.destination_relative(path)?;
+        let rooted = self
+            .rooted_destination_target(&path, None)?
+            .context("small copy requires the destination root")?;
+        self.uncache_rooted(&rooted.root, &rooted.relative);
+        let (partial, label) = rooted_partial_target(&rooted, copy_id)?;
+        let (file, _) = self
+            .open_private_partial_rooted(&rooted.root, &partial, &label, true)?
+            .context("sidecar creation was requested")?;
+        file.set_len(0)?;
+        file.write_all_at(data, 0)
+            .with_context(|| format!("write {}", label.display()))?;
+        file.set_len(data.len() as u64)?;
+        set_meta_file(&file, meta, flags)
+            .with_context(|| format!("set metadata {}", label.display()))?;
+        require_safe_rooted_named_partial(&rooted.root, &partial, &label, &file)?;
+        #[cfg(debug_assertions)]
+        fail_put_small_before_rename_for_test(&rooted.label)?;
+        Ok(StagedSmallFile {
+            root: rooted.root,
+            partial,
+            target: rooted.relative,
+            file,
+        })
+    }
+
     /// Install the exact control-session root delivered during worker
     /// initialization. A same-process TCP worker clones it from the shared
     /// registry; an independent worker claims it with SCM_RIGHTS.
@@ -2396,7 +2619,8 @@ impl FsOps {
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
             | Request::Receipt
-            | Request::Shutdown => {}
+            | Request::Shutdown
+            | Request::CopySmallFiles(_) => {}
         }
         Ok(req)
     }
@@ -5645,6 +5869,7 @@ impl FsOps {
             } => self
                 .anchor_destination(*expected_dev, *expected_ino, request_prefix)
                 .map(Response::DestinationRegistered),
+            Request::CopySmallFiles(request) => self.copy_small_files(request),
             Request::DestinationFilesystemInfo {
                 check_empty,
                 target,
@@ -7162,6 +7387,157 @@ mod tests {
             "{response:?}"
         );
         assert!(target.is_dir());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn small_copy_leaf_accepts_root_and_relative_prefixes_without_nested_paths() {
+        for (prefix, path) in [
+            (&b"/"[..], &b"/file"[..]),
+            (b"/directory/", b"/directory/file"),
+            (b".", b"./file"),
+            (b"directory", b"directory/file"),
+            (b"", b"file"),
+        ] {
+            assert_eq!(small_copy_leaf(prefix, path).unwrap(), b"file");
+        }
+        for (prefix, path) in [
+            (&b"/"[..], &b"/nested/file"[..]),
+            (b"/", b"//file"),
+            (b"/", b"/.."),
+            (b"/", b"/"),
+            (b".", b"../file"),
+            (b"directory", b"directory-other/file"),
+            (b"directory", b"directory/nested/file"),
+        ] {
+            assert!(
+                small_copy_leaf(prefix, path).is_err(),
+                "{prefix:?}: {path:?}"
+            );
+        }
+    }
+
+    /// The one-turn small copy publishes fresh files through the ordinary
+    /// staged path and leaves the session anchored; an existing target makes
+    /// it write nothing and leave the session untouched; its bounds and the
+    /// one-entry shape are enforced here, not only by the coordinator.
+    #[test]
+    fn small_copy_publishes_fresh_files_and_declines_existing_ones() {
+        let dir = test_dir();
+        fs::create_dir(&dir).unwrap();
+        let prefix = dir.as_os_str().as_bytes().to_vec();
+        let file = |name: &str, data: &[u8]| SmallCopyFile {
+            path: join(&prefix, name.as_bytes()),
+            data: data.to_vec(),
+            hash: content_digest(data),
+            meta: Meta {
+                mode: 0o640,
+                uid: 0,
+                gid: 0,
+                mtime: 1_700_000_000,
+                mtime_nsec: 0,
+            },
+        };
+        let request = |directory: PathBytes, files: Vec<SmallCopyFile>| {
+            Request::CopySmallFiles(SmallCopyRequest {
+                directory,
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                request_prefix: prefix.clone(),
+                identity: SmallCopyIdentity {
+                    src_endpoint: "local".into(),
+                    src_roots: vec![("source".into(), false)],
+                    dst_endpoint: "example".into(),
+                    dst_leaf: None,
+                    semantic_flags: "{}".into(),
+                },
+                flags: flags::MODE | flags::TIMES,
+                files,
+            })
+        };
+        let message = |response: &Response| match response {
+            Response::Err(message) => message.clone(),
+            Response::EndpointError(error) => error.message.clone(),
+            other => panic!("{other:?}"),
+        };
+
+        let mut operations = FsOps::new();
+        let response = operations.handle(&request(
+            prefix.clone(),
+            vec![file("one", b"first"), file("two", b"")],
+        ));
+        match response {
+            Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::Published(results),
+            }) => {
+                assert_eq!(results, vec![None, None]);
+                assert_eq!(anchor.ino, fs::metadata(&dir).unwrap().ino());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(dir.join("one")).unwrap(), b"first");
+        assert_eq!(fs::read(dir.join("two")).unwrap(), b"");
+        let metadata = fs::metadata(dir.join("one")).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(metadata.mtime(), 1_700_000_000);
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "one" && name != "two")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(operations.destination_root.is_some());
+        let again = operations.handle(&request(prefix.clone(), vec![file("three", b"x")]));
+        assert!(
+            message(&again).contains("fresh control session"),
+            "{again:?}"
+        );
+        assert!(!dir.join("three").exists());
+
+        let mut declined = FsOps::new();
+        let response = declined.handle(&request(
+            prefix.clone(),
+            vec![file("three", b"x"), file("one", b"replaced")],
+        ));
+        assert!(
+            matches!(
+                &response,
+                Response::SmallFilesCopied(SmallCopyResponse {
+                    outcome: SmallCopyOutcome::NotFresh,
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+        assert!(!dir.join("three").exists());
+        assert_eq!(fs::read(dir.join("one")).unwrap(), b"first");
+        assert!(declined.destination_root.is_none() && declined.operator_selection.is_none());
+        let canonical = declined.handle(&Request::Canonicalize {
+            path: prefix.clone(),
+            guard: None,
+        });
+        assert!(matches!(canonical, Response::Path(_)), "{canonical:?}");
+
+        let nested = SmallCopyFile {
+            path: join(&prefix, b"sub/deep"),
+            ..file("x", b"x")
+        };
+        let response = FsOps::new().handle(&request(prefix.clone(), vec![nested]));
+        assert!(
+            message(&response).contains("one entry beneath"),
+            "{response:?}"
+        );
+        let response = FsOps::new().handle(&request(
+            prefix.clone(),
+            vec![file("dup", b"a"), file("dup", b"b")],
+        ));
+        assert!(message(&response).contains("twice"), "{response:?}");
+        let response = FsOps::new().handle(&request(prefix.clone(), Vec::new()));
+        assert!(message(&response).contains("limit"), "{response:?}");
+        let response =
+            FsOps::new().handle(&request(join(&prefix, b"absent"), vec![file("x", b"x")]));
+        assert!(!message(&response).is_empty());
+        assert!(!dir.join("absent").exists() && !dir.join("x").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

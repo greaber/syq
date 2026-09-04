@@ -301,7 +301,8 @@ fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
     }
 }
 
-fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
+/// The control-connection and helper lines of a remote endpoint's -vv report.
+fn print_remote_control_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
     crate::output::diagnostic!("syq: {}:", spec.label());
     if let Some(peer) = &diagnostics.peer {
@@ -316,7 +317,29 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
         let helper_mode = remote_helper_mode(spec, args.interface);
         crate::output::diagnostic!("  helper: {} ({helper_mode})", peer.identity);
     }
+}
 
+/// What -vv explains for a copy whose files travelled on the control
+/// connection: the same helper lines, and a route that involved no data
+/// connection at all.
+fn print_small_copy_diagnostics(args: &Args, dst_ep: &Endpoint) {
+    if args.quiet || args.verbose < 2 {
+        return;
+    }
+    if let Endpoint::Remote(spec) = dst_ep {
+        print_remote_control_diagnostics(spec, args);
+        crate::output::diagnostic!(
+            "  transport: control connection (small files sent in one request)"
+        );
+    }
+    crate::output::diagnostic!(
+        "syq: concurrency: no data connections (small files sent on the control connection)"
+    );
+}
+
+fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
+    print_remote_control_diagnostics(spec, args);
+    let diagnostics = spec.diagnostics();
     if let Some(probe) = &diagnostics.tcp_probe {
         let fastest = probe
             .candidates
@@ -658,7 +681,7 @@ fn endpoint_identity(l: &Location) -> String {
 
 /// Keep existing partial identities unchanged for UTF-8 paths, while giving
 /// native raw-byte paths a lossless and unambiguous spelling.
-fn path_identity(path: &std::path::Path) -> String {
+pub(crate) fn path_identity(path: &std::path::Path) -> String {
     if let Some(path) = path.to_str() {
         return path.to_string();
     }
@@ -730,27 +753,16 @@ fn resolve_copy_identity(
     // Relative native bases and selectors get their meaning from the source
     // endpoint's process cwd. Identify that already-held cwd separately;
     // never canonicalize the registered selection after it has been pinned.
-    let native_endpoint_cwd = (args.interface == Interface::NativeCp)
-        .then(|| {
-            canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))
-        })
-        .transpose()?;
-    let mut src_roots: Vec<(String, bool)> = Vec::with_capacity(srcs.len());
-    for source in srcs {
-        let identity = if args.interface == Interface::NativeCp {
-            native_source_identity(
-                args,
-                source,
-                native_endpoint_cwd
-                    .as_deref()
-                    .expect("native endpoint cwd was identified"),
-            )
-        } else {
-            let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-            path_identity(&path)
-        };
-        src_roots.push((identity, source.copies_contents()));
-    }
+    let src_roots: Vec<(String, bool)> = if args.interface == Interface::NativeCp {
+        source_identity_parts(args, srcs, src_ctl)?
+    } else {
+        srcs.iter()
+            .map(|source| {
+                let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
+                Ok((path_identity(&path), source.copies_contents()))
+            })
+            .collect::<Result<_>>()?
+    };
     let dst_root = match dst_canonical {
         Some(path) => path,
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
@@ -763,6 +775,463 @@ fn resolve_copy_identity(
         &dst_root,
         &semantic_flags(opts, args, srcs),
     ))
+}
+
+/// The job-identity inputs that do not depend on the destination endpoint:
+/// what a small push sends so the receiver can finish the identity with the
+/// canonical destination it resolves.
+fn source_identity_parts(
+    args: &Args,
+    srcs: &[Location],
+    src_ctl: &mut dyn Conn,
+) -> Result<Vec<(String, bool)>> {
+    let native_endpoint_cwd =
+        canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))?;
+    Ok(srcs
+        .iter()
+        .map(|source| {
+            (
+                native_source_identity(args, source, &native_endpoint_cwd),
+                source.copies_contents(),
+            )
+        })
+        .collect())
+}
+
+/// Mode a fresh destination file is created with: the source mode under -p,
+/// otherwise the source mode minus the umask (rsync semantics).
+fn fresh_file_mode(opts: &Opts, entry: &Entry) -> u32 {
+    if opts.perms {
+        entry.mode & 0o7777
+    } else {
+        entry.mode & 0o777 & !opts.umask
+    }
+}
+
+/// Outcome of the one-turn small push attempted before the ordinary engine
+/// starts its destination preflight.
+enum SmallCopy {
+    /// The copy completed on the control connection and the run is settled.
+    Done(i32),
+    /// Not applicable, not fresh, or refused by the receiver. Nothing was
+    /// written and the control session is untouched, so the ordinary engine
+    /// continues on the same connections and reports any error itself.
+    Declined,
+    /// Staging failed with nothing published, but the receiver now holds the
+    /// destination root; the engine continues on a fresh control session and
+    /// reports the failure itself.
+    Reconnect,
+}
+
+/// Whether a native push of local files to a remote directory may try the
+/// one-turn small copy. Everything the ordinary engine decides from flags
+/// that the fused request does not carry stays with the engine.
+fn small_copy_eligible(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    src_ep: &Endpoint,
+    dst_ep: &Endpoint,
+) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_DISABLE_SMALL_COPY").is_some() {
+        return false;
+    }
+    args.interface == Interface::NativeCp
+        && matches!(args.placement, Placement::Into | Placement::As)
+        && args.target_existence == Existence::Any
+        && dst.is_remote()
+        && dst_ep.is_remote()
+        && !src_ep.is_remote()
+        && !srcs.iter().any(Location::is_remote)
+        && args.restricted_grant.is_none()
+        && !args.dry_run
+        && !args.verify_only
+        && !args.inplace
+        && !args.delete
+        && !args.update
+        && !args.checksum
+        && !args.ignore_existing
+        && !args.existing
+        && !args.stats
+        && args.files_from.is_none()
+        && args.native_mapping.is_none()
+        && args.ignore_lines.is_empty()
+        && args.bwlimit_bytes == 0
+        && args.max_size.is_none()
+        && args.min_size.is_none()
+        && !args.follows_native_destination_paths()
+        && !srcs.is_empty()
+        && srcs.len() <= SMALL_COPY_MAX_FILES
+        && srcs.iter().all(|source| !source.copies_contents())
+        && (args.placement == Placement::Into || srcs.len() == 1)
+        && clean_root(&dst.path) != b"~"
+}
+
+/// Push fresh small regular files in one control-connection turn. Sources
+/// are read through the same registered references the engine's workers
+/// use; the receiver selects, anchors, checks, stages, and publishes in one
+/// request. Every result record and the summary come from the same counters
+/// the engine settles from.
+#[allow(clippy::too_many_arguments)]
+fn attempt_small_copy(
+    args: &Args,
+    opts: &Opts,
+    srcs: &[Location],
+    dst: &Location,
+    src_ep: &Endpoint,
+    dst_ep: &Endpoint,
+    src_ctl: &mut dyn Conn,
+    dst_ctl: &mut dyn Conn,
+    roots: &[RegisteredSourceRoot],
+    progress: &Progress,
+    t0: std::time::Instant,
+) -> Result<SmallCopy> {
+    // A source named like a syq sidecar gets the engine's warning.
+    if srcs
+        .iter()
+        .any(|source| is_partial_name(OsStr::from_bytes(&source.basename())))
+    {
+        return Ok(SmallCopy::Declined);
+    }
+    let follow = args.follows_native_source_paths();
+    let mut entries = Vec::with_capacity(srcs.len());
+    let mut total = 0u64;
+    for (source, root) in srcs.iter().zip(roots) {
+        // A missing or unusable source is the engine's to report.
+        let Ok(Some(entry)) = stat_one_registered(
+            src_ctl,
+            &source.path,
+            &root.selection,
+            source.follows_root(follow),
+        ) else {
+            return Ok(SmallCopy::Declined);
+        };
+        if entry.kind != Kind::File
+            || validate_native_source_type(&source.path, source.selection, entry.kind).is_err()
+            || entry.size > SMALL_COPY_MAX_FILE_BYTES
+        {
+            return Ok(SmallCopy::Declined);
+        }
+        total += entry.size;
+        if total > SMALL_COPY_MAX_TOTAL_BYTES {
+            return Ok(SmallCopy::Declined);
+        }
+        entries.push(entry);
+    }
+
+    // Destination spellings exactly as the planner produces them.
+    let operator_dst_root = clean_root(&dst.path);
+    let (directory, dst_leaf) = match args.placement {
+        Placement::Into => (operator_dst_root.clone(), None),
+        Placement::As => {
+            let Some(leaf) = operator_dst_root
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .filter(|component| !component.is_empty())
+            else {
+                return Ok(SmallCopy::Declined);
+            };
+            (parent_path(&operator_dst_root), Some(leaf.to_vec()))
+        }
+        Placement::Rsync => return Ok(SmallCopy::Declined),
+    };
+    let request_prefix = directory.clone();
+    let mut targets: Vec<(PathBytes, PathBytes, String)> = Vec::with_capacity(srcs.len());
+    for source in srcs {
+        let (dst_path, rel_bytes) = if args.placement == Placement::Into {
+            let name = source.basename();
+            (join(&operator_dst_root, &name), name)
+        } else {
+            (
+                join(
+                    &directory,
+                    dst_leaf.as_ref().expect("exact destination leaf"),
+                ),
+                Vec::new(),
+            )
+        };
+        if targets.iter().any(|(existing, _, _)| *existing == dst_path) {
+            return Ok(SmallCopy::Declined);
+        }
+        let rel = display(&source.basename());
+        targets.push((dst_path, rel_bytes, rel));
+    }
+
+    // Read through the engine's source-worker path.
+    let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec()) else {
+        return Ok(SmallCopy::Declined);
+    };
+    let reads: Vec<SmallRead> = srcs
+        .iter()
+        .zip(roots)
+        .zip(&entries)
+        .filter(|(_, entry)| entry.size > 0)
+        .map(|((source, root), entry)| SmallRead {
+            path: source.path.clone(),
+            source: Some(root.selection.clone()),
+            attempt: 0,
+            len: entry.size as u32,
+        })
+        .collect();
+    let mut blocks = if reads.is_empty() {
+        Vec::new()
+    } else {
+        let count = reads.len();
+        reader.send(Request::ReadSmallBatch(reads))?;
+        match ok(reader.recv()?, "read small batch")? {
+            Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
+            other => bail!("unexpected response {other:?}"),
+        }
+    }
+    .into_iter();
+    let flags = publication_metadata_flags(opts.flags);
+    let mut files = Vec::with_capacity(srcs.len());
+    for (entry, (dst_path, _, _)) in entries.iter().zip(&targets) {
+        let (data, hash) = if entry.size == 0 {
+            (Vec::new(), content_digest(&[]))
+        } else {
+            match blocks.next() {
+                Some(Ok(block)) if block.data.len() as u64 == entry.size => {
+                    (block.data, block.hash)
+                }
+                // A read failure or a changed size is the engine's to
+                // report or retry.
+                _ => return Ok(SmallCopy::Declined),
+            }
+        };
+        let mut meta = entry.meta();
+        meta.mode = fresh_file_mode(opts, entry);
+        files.push(SmallCopyFile {
+            path: dst_path.clone(),
+            data,
+            hash,
+            meta,
+        });
+    }
+
+    let request = SmallCopyRequest {
+        directory,
+        symlink_policy: opts.operator_symlink_policy,
+        request_prefix,
+        identity: SmallCopyIdentity {
+            src_endpoint: endpoint_identity(&srcs[0]),
+            src_roots: source_identity_parts(args, srcs, src_ctl)?,
+            dst_endpoint: endpoint_identity(dst),
+            dst_leaf,
+            semantic_flags: semantic_flags(opts, args, srcs),
+        },
+        flags,
+        files,
+    };
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: small copy: sending {} files ({} bytes) in one turn at {:.2}s",
+            srcs.len(),
+            total,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    let results = match dst_ctl.call(Request::CopySmallFiles(request))? {
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::Published(results),
+            ..
+        }) if results.len() == srcs.len() => results,
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::NotFresh,
+            ..
+        }) => {
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: small copy: a destination exists; using the ordinary engine"
+                );
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::CapacityShort,
+            ..
+        }) => {
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: small copy: capacity preflight would refuse; using the ordinary engine"
+                );
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::StagingFailed(error),
+            ..
+        }) => {
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: small copy: staging failed ({}); using the ordinary engine on a new control connection",
+                    error.message
+                );
+            }
+            return Ok(SmallCopy::Reconnect);
+        }
+        Response::SmallFilesCopied(_) => bail!("small copy returned a mismatched result count"),
+        // The receiver could not select the directory; the engine's own
+        // preflight reproduces and reports that condition.
+        Response::Err(error) => {
+            if debug() {
+                crate::output::diagnostic!("syq: small copy declined: {error}");
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        Response::EndpointError(error) => {
+            if debug() {
+                crate::output::diagnostic!("syq: small copy declined: {}", error.message);
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        other => bail!("unexpected response {other:?}"),
+    };
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: small copy: published at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    announce_detached_ready()?;
+    print_small_copy_diagnostics(args, dst_ep);
+
+    // Did any source change while we were at it? Same check as the worker's
+    // small-file batch, through the same registered references.
+    let now = stat_many_registered(
+        src_ctl,
+        srcs.iter().map(|source| source.path.clone()).collect(),
+        Some(roots.iter().map(|root| root.selection.clone()).collect()),
+        false,
+    )?;
+    for (((entry, (_, rel_bytes, rel)), result), now) in
+        entries.iter().zip(&targets).zip(results).zip(now)
+    {
+        progress.files_total.fetch_add(1, Relaxed);
+        progress.bytes_total.fetch_add(entry.size, Relaxed);
+        let failure = match result {
+            Some(error) => {
+                let error = endpoint_error(error).context("put");
+                Some(("unknown", os_kind_of(&error), format!("{error:#}")))
+            }
+            None => {
+                let changed = match &now {
+                    Some(e) => {
+                        e.kind != Kind::File
+                            || e.size != entry.size
+                            || e.mtime != entry.mtime
+                            || e.mtime_nsec != entry.mtime_nsec
+                    }
+                    None => true,
+                };
+                changed.then(|| {
+                    (
+                        "yes",
+                        None,
+                        "source changed during transfer (or vanished)".to_string(),
+                    )
+                })
+            }
+        };
+        if let Some((retryable, os_kind, message)) = failure {
+            progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
+            if let Some(results) = progress.results_writer() {
+                results.emit_operation(&crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: rel_bytes,
+                    src: None,
+                    kind: "file",
+                    disposition: "failed",
+                    bytes: None,
+                    attempts: Some(1),
+                    retryable: Some(retryable),
+                    class: Some("io"),
+                    os_kind,
+                    message: Some(&message),
+                });
+            }
+            continue;
+        }
+        progress.add_bytes(entry.size);
+        progress.files_done.fetch_add(1, Relaxed);
+        if let Some(results) = progress.results_writer() {
+            results.emit_operation(&crate::results::OperationRecord {
+                action: "transfer_file",
+                dst: rel_bytes,
+                src: None,
+                kind: "file",
+                disposition: "succeeded",
+                bytes: Some(entry.size),
+                attempts: Some(1),
+                retryable: None,
+                class: None,
+                os_kind: None,
+                message: None,
+            });
+        }
+        if opts.verbose > 0 {
+            progress.println(rel);
+        }
+    }
+
+    progress.stop();
+    progress.clear();
+    let errors = progress.errors.load(Relaxed);
+    let (status, exit_code) = if errors > 0 {
+        ("partial", 23)
+    } else {
+        ("success", 0)
+    };
+    let terminal = crate::results::ResultRecord {
+        status,
+        exit_code,
+        dry_run: false,
+        files_transferred: progress.files_done.load(Relaxed),
+        files_unchanged: 0,
+        files_excluded: 0,
+        directories_created: 0,
+        symlinks_created: 0,
+        specials_created: 0,
+        errors,
+        bytes_transferred: progress.bytes_done.load(Relaxed),
+        bytes_unchanged: 0,
+        elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        deletions_planned: None,
+        deletions_completed: None,
+        deletions_blocked: None,
+    };
+    if !args.quiet && !args.suppress_summary {
+        print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
+    }
+    if let Some(results) = progress.results_writer() {
+        results.emit_result(&terminal);
+    }
+    Ok(SmallCopy::Done(exit_code))
+}
+
+/// The one summary line a completed copy prints, rendered from the same
+/// record the results stream settles with.
+fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64, deletions: &str) {
+    crate::output::human_stdout!(
+        "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
+        commas(terminal.files_transferred),
+        human(terminal.bytes_transferred),
+        human(terminal.bytes_unchanged),
+        commas(terminal.files_unchanged),
+        commas(terminal.directories_created),
+        deletions,
+        format_args!(
+            ", {} at {}/s",
+            crate::progress::hms(elapsed),
+            human((terminal.bytes_transferred as f64 / elapsed.max(0.001)) as u64)
+        ),
+        if terminal.errors > 0 {
+            format!(", {} errors", terminal.errors)
+        } else {
+            String::new()
+        }
+    );
 }
 
 /// Native source authority is the pinned endpoint-side base plus the raw
@@ -1494,31 +1963,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
     };
-    let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
-    let mut pending_tcp_setups = Vec::new();
-    if let Some(ports) = tcp_ports {
-        for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
-            if let Endpoint::Remote(spec) = ep {
-                match spec.begin_tcp_setup(
-                    &mut **ctl,
-                    args.tcp_plain,
-                    ports,
-                    args.tcp_congestion.as_deref(),
-                ) {
-                    Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
-                    Err(error) => {
-                        handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?;
-                    }
-                }
-            }
-        }
-    }
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: TCP route probes started at {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-    }
     let maximum_workers = if autotune {
         tune::MAX
     } else {
@@ -1556,6 +2000,55 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
+    // A native push of a few small local files needs no data worker and no
+    // separate preflight: one control-connection turn selects, anchors,
+    // checks, and publishes. Source registration above was local, so nothing
+    // but the control handshake has crossed the network yet. Anything the
+    // fused request declines continues below on the same connections.
+    if small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep) {
+        match attempt_small_copy(
+            &args,
+            &opts,
+            srcs,
+            dst,
+            &src_ep,
+            &dst_ep,
+            &mut *src_ctl,
+            &mut *dst_ctl,
+            source_roots.get().expect("source roots registered"),
+            &progress,
+            t0,
+        )? {
+            SmallCopy::Done(code) => return Ok(code),
+            SmallCopy::Declined => {}
+            SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
+        }
+    }
+    let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
+    let mut pending_tcp_setups = Vec::new();
+    if let Some(ports) = tcp_ports {
+        for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
+            if let Endpoint::Remote(spec) = ep {
+                match spec.begin_tcp_setup(
+                    &mut **ctl,
+                    args.tcp_plain,
+                    ports,
+                    args.tcp_congestion.as_deref(),
+                ) {
+                    Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
+                    Err(error) => {
+                        handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?;
+                    }
+                }
+            }
+        }
+    }
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: TCP route probes started at {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     // One spelling for the destination root: every derived key — claims,
     // delete roots, destination-walk paths, receiver-computed sidecar names —
     // flows from this, and the receiver rebuilds paths through `Path`, which
@@ -2690,24 +3183,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 crate::progress::hms(elapsed)
             );
         } else {
-            crate::output::human_stdout!(
-                "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
-                commas(terminal.files_transferred),
-                human(terminal.bytes_transferred),
-                human(terminal.bytes_unchanged),
-                commas(terminal.files_unchanged),
-                commas(terminal.directories_created),
-                deletion_summary(delete_plan, deleted, opts.max_delete),
-                format_args!(
-                    ", {} at {}/s",
-                    crate::progress::hms(elapsed),
-                    human((terminal.bytes_transferred as f64 / elapsed.max(0.001)) as u64)
-                ),
-                if terminal.errors > 0 {
-                    format!(", {} errors", terminal.errors)
-                } else {
-                    String::new()
-                }
+            print_transfer_summary(
+                &terminal,
+                elapsed,
+                &deletion_summary(delete_plan, deleted, opts.max_delete),
             );
         }
     }
@@ -3460,12 +3939,14 @@ struct FreshCapacityPlan {
     overflowed: bool,
 }
 
+/// The fresh-destination capacity rule, shared with the receiver's one-turn
+/// small copy so both refuse the same copies.
 #[derive(Clone, Copy)]
-struct FreshCapacityAssessment {
-    logical_bytes: u64,
-    objects: u64,
-    available_bytes: u64,
-    available_inodes: Option<u64>,
+pub(crate) struct FreshCapacityAssessment {
+    pub(crate) logical_bytes: u64,
+    pub(crate) objects: u64,
+    pub(crate) available_bytes: u64,
+    pub(crate) available_inodes: Option<u64>,
 }
 
 impl FreshCapacityAssessment {
@@ -3478,7 +3959,7 @@ impl FreshCapacityAssessment {
             .is_some_and(|available| self.objects.saturating_add(64) > available)
     }
 
-    fn sufficient(self) -> bool {
+    pub(crate) fn sufficient(self) -> bool {
         !self.byte_shortage() && !self.inode_shortage()
     }
 }
@@ -7209,12 +7690,9 @@ impl Worker {
     /// with -p the source mode; without -p an existing file keeps its own mode
     /// and a new file gets the source mode minus the umask.
     fn create_mode(&self, job: &FileJob) -> u32 {
-        if self.opts.perms {
-            job.entry.mode & 0o7777
-        } else if let Some(d) = job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
-            d.mode & 0o7777
-        } else {
-            job.entry.mode & 0o777 & !self.opts.umask
+        match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
+            Some(d) if !self.opts.perms => d.mode & 0o7777,
+            _ => fresh_file_mode(&self.opts, &job.entry),
         }
     }
 

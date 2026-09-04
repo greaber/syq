@@ -483,6 +483,7 @@ impl Conn for LocalConn {
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
+                    | Request::CopySmallFiles(_)
                     | Request::Receipt
             )
         {

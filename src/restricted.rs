@@ -2392,7 +2392,10 @@ impl RestrictedAuthority {
                     put.guard = Some(self.guard.clone());
                 }
             }
-            Request::CopyLocal { .. } | Request::ReadRange { .. } | Request::ReadSmallBatch(_) => {
+            Request::CopyLocal { .. }
+            | Request::ReadRange { .. }
+            | Request::ReadSmallBatch(_)
+            | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::ListDir { .. } => {

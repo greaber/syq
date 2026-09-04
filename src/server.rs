@@ -305,6 +305,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
+                    | Request::CopySmallFiles(_)
                     | Request::Receipt
             )
         {

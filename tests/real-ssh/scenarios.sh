@@ -140,6 +140,33 @@ fi
 syq completion cache clear >/dev/null
 syq persist off >/dev/null
 
+printf 'case: small native push to an ordinary SSH destination takes one turn\n'
+small_source=/tmp/syq-real-ssh-small.bin
+small_debug=/tmp/syq-real-ssh-small.debug
+small_results=/tmp/syq-real-ssh-small.ndjson
+head -c 1024 /dev/urandom >"$small_source"
+ssh source 'rm -rf /tmp/syq-real-ssh/small-destination && install -d /tmp/syq-real-ssh/small-destination'
+SYQ_DEBUG=1 syq cp --no-progress --results "$small_results" \
+    "$small_source" --to source --into /tmp/syq-real-ssh/small-destination \
+    2>"$small_debug"
+small_status=$(tail -n 1 "$small_results")
+case "$small_status" in
+    *'"status":"success"'*'"type":"result"'*) ;;
+    *)
+        echo 'small push did not settle successfully:' >&2
+        cat "$small_results" "$small_debug" >&2
+        exit 1
+        ;;
+esac
+if ! grep -q 'small copy: published' "$small_debug"; then
+    echo 'small push did not use the one-turn path:' >&2
+    cat "$small_debug" >&2
+    exit 1
+fi
+small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
+small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
+test "$small_expected" = "$small_actual"
+
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
