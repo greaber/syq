@@ -78,12 +78,14 @@ go further:
   a swapped-in symlink is unlinked without being followed, a swapped-in
   directory is refused by the kernel where a file was expected, and a
   non-empty directory is never descended into. The selected object survives
-  under its new name. For a selected or walked directory, syq holds a
-  descriptor on the pinned directory and reports the removal as a failure when
-  that directory is still linked afterwards; a swapped file has no descriptor
-  to check and is reported as removed. Exploiting the window needs write
-  permission on the pinned parent, which already permits removing the entry
-  that gets swapped in.
+  under its new name. On Linux, syq holds a descriptor on every selected or
+  walked directory and reports the removal as a failure when that directory is
+  still linked once its name is gone, whether the name was swapped or renamed
+  away. macOS does not update the link count of a removed directory, so there
+  such a directory is reported as removed or already absent. A swapped file
+  has no descriptor to check and is reported as removed on every platform.
+  Exploiting the window needs write permission on the pinned parent, which
+  already permits removing the entry that gets swapped in.
 - The restricted remote-to-remote receiver performs every operation relative
   to an opened root; descendant symlinks are payload, never traversal.
 - Native `cp` defaults to `-rlt`: no owner, group, mode, or device is applied
