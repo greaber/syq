@@ -3,11 +3,9 @@ mod bwlimit;
 mod cli;
 mod completion;
 mod conn;
-mod crypto;
 mod delegation;
 #[allow(dead_code)]
 mod descriptor_broker;
-mod direct;
 pub mod enrollment;
 mod fsops;
 mod identity;
@@ -20,6 +18,7 @@ mod progress;
 mod proto;
 mod receipt_v2;
 mod remote_helper;
+mod remote_to_remote;
 mod restricted;
 mod results;
 mod resume;
@@ -29,6 +28,7 @@ mod rooted;
 mod scan;
 mod sched;
 mod server;
+mod tcp_records;
 #[cfg(test)]
 mod test_support;
 mod transfer;

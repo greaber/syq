@@ -133,7 +133,7 @@ the safer way to turn a link chain into an explicit operand.
 These rules form the hostile-namespace containment model for native copy and
 removal. Native `rm` retains the resolved directories and selected identities
 through mutation. Copy resolves and registers every
-selected source before destination mutation, and every source worker claims
+selected source before destination mutation, and every source worker acquires
 those exact directory or parent descriptors during authenticated startup,
 before it reports readiness. Source discovery and metadata stats, including
 retry checks, source content hashes, and range/small reads, use the resulting
@@ -187,7 +187,7 @@ opens the source and destination relative to those descriptors. Rsync-mode
 `--insecure-links` skips that optimization because its explicitly unconfined
 source names cannot be represented by the capability-only request. Directory
 self-copy preflight also uses capabilities: on a confined same-machine copy,
-the destination endpoint claims the exact opened source directory and walks
+the destination endpoint acquires the exact opened source directory and walks
 parents from its retained destination selection. Renaming either command-line
 spelling cannot redirect that decision.
 
@@ -214,8 +214,8 @@ Registration budgets the process's
 currently open descriptors, one retained parent descriptor per source root and
 one object descriptor per exact leaf for the registry, control connection, and
 every worker that may share its process, plus conservative per-worker
-file-cache, transport, and concurrent independent-worker broker-claim overhead.
-Same-machine Linux copies include the destination workers' cross-session claims
+file-cache, transport, and concurrent independent-worker descriptor-handoff overhead.
+Same-machine Linux copies include the destination workers' cross-session handoffs
 in that admission check. If the endpoint's open-file limit cannot hold that
 set, the copy fails before destination mutation with guidance to reduce
 selectors or `--connections`.
@@ -249,7 +249,7 @@ continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
 during the source's first scan batch, in both dry-run and execution. On the
 command-restricted remote-to-remote path the precondition is also signed: the
-receiver checks it against the enrolled root when it claims the grant, and a
+receiver checks it against the enrolled root when it redeems the grant, and a
 `new` root can only be created without replacing anything.
 
 `cp` copies or updates mapped source objects and keeps unrelated target objects
@@ -599,7 +599,7 @@ accept them.
 | `--syq-no-tcp` | SYQ extension: send data over the ssh connection instead of separate TCP sockets |
 | `--syq-tcp-plain` | SYQ extension: TCP data connections without encryption (trusted networks only) |
 | `--syq-tcp-ports LO-HI` | SYQ extension: port range the remote listens on for TCP data (default 47600-47699) |
-| `--syq-tcp-congestion ALGO` | SYQ extension, Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
+| `--syq-tcp-congestion ALGO` | SYQ extension, Linux: use `ALGO` on both ends of TCP data sockets; the host default is unchanged |
 | `--syq-pscope PATH` | SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
 | `--syq-ignore PATTERN` | SYQ extension: skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--syq-ignore-from FILE` | SYQ extension: read ignore patterns from a file (repeatable, stacks with `--syq-ignore`) |

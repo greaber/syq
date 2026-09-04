@@ -47,7 +47,7 @@ go further:
 - Every path a remote peer sends is validated before it reaches the
   filesystem: absolute names, NUL, empty components, `.` and `..` are rejected.
 - Every selected source is resolved and registered as an open descriptor
-  before anything on the destination changes, and every worker claims those
+  before anything on the destination changes, and every worker acquires those
   exact descriptors when it starts. Directory walks, stats, content hashes, and
   reads use that descriptor plus strict relative names; they never reopen the
   operator's spelling and never follow a symlink found inside the tree. A
@@ -149,7 +149,7 @@ The evidence is split along the boundaries where authority changes form:
 | Boundary | What is exercised |
 | --- | --- |
 | Operator selection | Root replacement, intermediate-link substitution, exact-leaf replacement, and missing-path placement |
-| Source capability handoff | Local workers, remote TCP workers that clone the registered descriptor, and fresh remote worker processes that claim it from the descriptor broker |
+| Source capability handoff | Local workers, remote TCP workers that clone the registered descriptor, and fresh remote worker processes that acquire it from the descriptor broker |
 | Destination capability handoff | Local receivers, remote TCP receivers, and fresh remote receiver processes, for both root replacement and descendant-parent substitution |
 | Restricted receiver | A changed signed root identity is refused, and descendant parents are opened without following links |
 | Descriptor-rooted operations | Scanning, stat and hashing, content reads, sidecar preparation, writes, publication, metadata, and pruning are tested separately against the shared rooted primitives |
@@ -277,7 +277,7 @@ byte, deletion, and connection limits, a start-by time, a finish-by time, and
 a fresh nonce.
 HostA carries this request but cannot alter it. The forced receiver on hostB
 verifies the signature (via OpenSSH's SSHSIG verifier and a policy file hostB
-owns), durably claims the nonce before doing anything, enforces the deadline,
+owns), durably redeems the nonce before doing anything, enforces the deadline,
 and then accepts protocol requests only within the signed scope. Redemption is
 at most once; a replayed request is rejected.
 
@@ -285,7 +285,7 @@ Filters, `--inplace`, preservation, existing-object policy, and placement
 preconditions are signed into the grant and enforced by the receiver on its
 own. Deletion through the receiver requires an explicit `--max-delete`, and
 the native `--receiver-max-entries` and `--receiver-max-bytes` options
-lower the signed ceilings for one transfer, so what a claimed grant is worth to
+lower the signed ceilings for one transfer, so what a redeemed grant is worth to
 hostA is always bounded on the command line. Options whose semantics the
 receiver cannot enforce independently of hostA fail closed rather than
 trusting hostA: `--files-from`, `--mapping`, `--update`, unencrypted or ssh

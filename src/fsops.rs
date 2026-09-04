@@ -2,7 +2,8 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    claim_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, DEFAULT_MAX_ROOTS,
+    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId,
+    DEFAULT_MAX_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -1229,7 +1230,7 @@ fn cstr(p: &Path) -> Result<CString> {
     CString::new(p.as_os_str().as_bytes()).map_err(|_| anyhow!("path contains NUL"))
 }
 
-fn is_root() -> bool {
+fn is_superuser() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -1600,7 +1601,7 @@ impl FsOps {
                 if !check.source_root.is_directory() {
                     bail!("destination ancestry requires a source directory ticket");
                 }
-                let source = claim_descriptor(&check.source_root)
+                let source = acquire_descriptor(&check.source_root)
                     .context("claim exact source directory for destination ancestry")?;
                 check
                     .suffixes
@@ -1909,7 +1910,7 @@ impl FsOps {
             }
             let acquire = |ticket: &DescriptorTicket| {
                 if claim_foreign_session {
-                    claim_descriptor(ticket)
+                    acquire_descriptor(ticket)
                 } else {
                     self.descriptor_session.acquire(ticket)
                 }
@@ -3408,7 +3409,7 @@ fn set_meta_rooted(
     let metadata = target.root.metadata(&target.relative)?;
     require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
-    let owner_differs = (flags & flags::OWNER != 0 && is_root() && metadata.uid != meta.uid)
+    let owner_differs = (flags & flags::OWNER != 0 && is_superuser() && metadata.uid != meta.uid)
         || (flags & flags::GROUP != 0 && metadata.gid != meta.gid);
     let mode_differs =
         flags & flags::MODE_MASK != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
@@ -5589,7 +5590,7 @@ impl FsOps {
                 symlink_policy,
                 allow_unconfined_paths,
                 shared_workers,
-                independent_claim_workers,
+                independent_handoff_workers,
             } => self
                 .register_source_roots(
                     base,
@@ -5597,7 +5598,7 @@ impl FsOps {
                     *symlink_policy,
                     *allow_unconfined_paths,
                     *shared_workers,
-                    *independent_claim_workers,
+                    *independent_handoff_workers,
                 )
                 .map(Response::SourceRootsRegistered),
             Request::CreateOperatorDirectory {
@@ -6374,7 +6375,7 @@ fn apply_owner_if_changed(
     current_gid: u32,
     chown: impl Fn(Option<u32>, Option<u32>) -> io::Result<()>,
 ) -> Result<bool> {
-    let uid = if flags & flags::OWNER != 0 && is_root() && current_uid != meta.uid {
+    let uid = if flags & flags::OWNER != 0 && is_superuser() && current_uid != meta.uid {
         Some(meta.uid)
     } else {
         None
@@ -6428,7 +6429,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8242,7 +8243,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8311,7 +8312,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 1,
+            independent_handoff_workers: 1,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8367,7 +8368,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8416,7 +8417,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 0,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             });
             let Response::SourceRootsRegistered(roots) = response else {
                 panic!("unexpected source registration response: {response:?}")
@@ -8489,7 +8490,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 1,
+            independent_handoff_workers: 1,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8544,7 +8545,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         };
         let response = control.handle(&register(&first));
         let Response::SourceRootsRegistered(roots) = response else {
@@ -8597,7 +8598,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8683,7 +8684,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8738,7 +8739,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 1,
+            independent_handoff_workers: 1,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -8810,7 +8811,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
@@ -9210,7 +9211,7 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: true,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         });
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")

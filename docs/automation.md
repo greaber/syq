@@ -237,7 +237,7 @@ terminal additionally carries `provenance`, the verified
 `receipt_status` (`clean`|`failed`|`incomplete`), and receipt
 bookkeeping (`operations`, `final_states`, `receipt_records`); its
 aggregates cover receiver-visible work only — unchanged and excluded
-entries are orchestrator concepts a receipt cannot attest, and read
+entries are coordinator concepts a receipt cannot attest, and read
 as zero. Of the deletion totals it carries only `deletions_completed`,
 the settled deletions the receipt attests (each also appears as an
 individual `delete` record); `deletions_planned` and

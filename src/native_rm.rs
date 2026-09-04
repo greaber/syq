@@ -108,7 +108,7 @@ struct PinnedDirectory {
     directory: File,
     name: Option<PinnedName>,
     label: PathBytes,
-    remove_root: bool,
+    remove_selected_directory: bool,
 }
 
 enum ResolvedSelection {
@@ -209,10 +209,10 @@ impl Resolver {
             PinnedPath::Directory(directory) => {
                 let identity = identity_from_root(directory.metadata());
                 require_kind(selection.kind, identity, &label)?;
-                let remove_root = selection.kind != NativeRemoveKind::Contents;
+                let remove_selected_directory = selection.kind != NativeRemoveKind::Contents;
                 let (directory, name) = directory.into_parts();
                 let name = name.map(|name| pinned_name_from_root(name).0);
-                if remove_root && name.is_none() {
+                if remove_selected_directory && name.is_none() {
                     bail!(
                         "selector {:?} resolves to a directory without a removable name; select its contents explicitly instead",
                         String::from_utf8_lossy(&label)
@@ -229,7 +229,7 @@ impl Resolver {
                     directory,
                     name,
                     label,
-                    remove_root,
+                    remove_selected_directory,
                 }))
             }
             PinnedPath::OpenFile(_) => {
@@ -640,7 +640,10 @@ pub(crate) fn remove(
                 pool.submit(Task::Scan(Arc::new(DirectoryJob {
                     selector: directory.selector,
                     directory: directory.directory,
-                    removal: directory.remove_root.then_some(directory.name).flatten(),
+                    removal: directory
+                        .remove_selected_directory
+                        .then_some(directory.name)
+                        .flatten(),
                     label: directory.label,
                     parent: None,
                     remaining: AtomicUsize::new(1),

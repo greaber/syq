@@ -1,10 +1,10 @@
 //! `syq --server`: serve requests over stdin/stdout, and optionally over
 //! TCP data connections (see `crypto.rs`) when the client asks for them.
 
-use crate::crypto::{Cipher, RecordReader, RecordWriter};
 use crate::descriptor_broker::DescriptorSessionSlot;
 use crate::fsops::{self, FsOps};
 use crate::proto::*;
+use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{bail, Context, Result};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -549,7 +549,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::Receipt => match &authority {
                 Some(authority) => match authority.issue_receipt() {
                     Ok(receipt) => {
-                        crate::receipt_v2::emit_transport_frames(receipt, |frame| {
+                        crate::receipt_v2::emit_receipt_frames(receipt, |frame| {
                             w.write_msg(&Response::ReceiptV2(frame))?;
                             Ok(())
                         })?;
@@ -1330,7 +1330,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 0,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             })
             .unwrap();
         assert!(matches!(
