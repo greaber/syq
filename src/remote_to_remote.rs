@@ -1,4 +1,4 @@
-//! Direct remote-to-remote: run the orchestrator on the source host so data
+//! Remote-to-remote copies: run the coordinator on one of the remote hosts so data
 //! flows source→destination without passing through this machine.
 
 use crate::cli::PeerAuth;
@@ -31,14 +31,14 @@ struct ReceiptSettlementOutcome {
 fn receipt_settlement_outcome(
     receipt_status: crate::receipt_v2::ReceiptStatusV2,
     refusals: u64,
-    orchestrator_exit_code: i32,
+    coordinator_exit_code: i32,
 ) -> ReceiptSettlementOutcome {
     // The receipt decides whether verification fails the run: a non-clean
     // receipt against a coordinator that claimed success is a contradiction
     // the exit code must surface.
     let rejects_receipt = refusals > 0
         || (receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
-            && orchestrator_exit_code == 0);
+            && coordinator_exit_code == 0);
     // Status first, then the exit code the automation contract pairs with
     // it — the two can never disagree.
     let results_status = if receipt_status == crate::receipt_v2::ReceiptStatusV2::Incomplete {
@@ -46,14 +46,14 @@ fn receipt_settlement_outcome(
         // as safe input for a per-entry retry, even when the coordinator also
         // reported a conventional partial-transfer exit.
         "aborted"
-    } else if orchestrator_exit_code == 1 {
+    } else if coordinator_exit_code == 1 {
         // A coordinator-fatal run may hold unsettled entries; the attested
         // records still describe what did land.
         "failed"
-    } else if refusals > 0 || orchestrator_exit_code == 25 {
+    } else if refusals > 0 || coordinator_exit_code == 25 {
         "refused"
     } else if receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
-        || orchestrator_exit_code == 23
+        || coordinator_exit_code == 23
     {
         "partial"
     } else {
@@ -96,7 +96,7 @@ impl CapturedReceipt {
         if self.ended {
             bail!("the relayed receipt contains a frame after its terminal frame");
         }
-        let terminal = crate::receipt_v2::transport_frame_is_end(encoded)?;
+        let terminal = crate::receipt_v2::receipt_frame_is_end(encoded)?;
         let length = u32::try_from(encoded.len()).context("receipt frame length exceeds u32")?;
         let added = 4u64 + u64::from(length);
         self.bytes = self
@@ -172,7 +172,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
     loop {
         let buffer = reader
             .fill_buf()
-            .context("read remote orchestrator output")?;
+            .context("read remote coordinator output")?;
         if buffer.is_empty() {
             break;
         }
@@ -192,7 +192,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                         capturing = Some(head[prefix.len()..].to_vec());
                     } else {
                         out.write_all(&head)
-                            .context("relay remote orchestrator output")?;
+                            .context("relay remote coordinator output")?;
                     }
                     head.clear();
                 }
@@ -200,7 +200,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
-                    .context("relay remote orchestrator output")?;
+                    .context("relay remote coordinator output")?;
             }
             if let Some(payload) = capturing.as_mut() {
                 if payload.len() > MAX_RECEIPT_V2_LINE_BYTES {
@@ -211,7 +211,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 if let Some(mut payload) = capturing.take() {
                     store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
                 } else {
-                    out.flush().context("relay remote orchestrator output")?;
+                    out.flush().context("relay remote coordinator output")?;
                 }
                 decided = false;
             }
@@ -224,13 +224,13 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
             capturing = Some(head[prefix.len()..].to_vec());
         } else {
             out.write_all(&head)
-                .context("relay remote orchestrator output")?;
+                .context("relay remote coordinator output")?;
         }
     }
     if let Some(mut payload) = capturing.take() {
         store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
     }
-    out.flush().context("relay remote orchestrator output")?;
+    out.flush().context("relay remote coordinator output")?;
     Ok(receipt)
 }
 
@@ -247,12 +247,12 @@ fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) 
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
 /// unverifiable, or mismatching receipt fails the transfer regardless of
-/// what the source-side orchestrator reported.
+/// what the source-side coordinator reported.
 /// The context a captured receipt settles against.
 struct ReceiptSettlement<'a> {
     src_host: &'a str,
     dst_host: &'a str,
-    orchestrator_exit_code: i32,
+    coordinator_exit_code: i32,
     results: Option<&'a crate::results::ResultsWriter>,
     elapsed_ms: u64,
     verbose: bool,
@@ -284,7 +284,7 @@ fn settle_receipt_v2(
     let ReceiptSettlement {
         src_host,
         dst_host,
-        orchestrator_exit_code,
+        coordinator_exit_code,
         results,
         elapsed_ms,
         verbose,
@@ -377,7 +377,7 @@ fn settle_receipt_v2(
     let outcome = receipt_settlement_outcome(
         terminal.status,
         terminal.summary.refusals,
-        orchestrator_exit_code,
+        coordinator_exit_code,
     );
     let settlement_error = if terminal.summary.refusals > 0 {
         Some(format!(
@@ -386,7 +386,7 @@ fn settle_receipt_v2(
             first_problem.as_deref().unwrap_or("(no detail recorded)")
         ))
     } else if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean
-        && orchestrator_exit_code == 0
+        && coordinator_exit_code == 0
     {
         Some(format!(
             "the receiver on {dst_host} issued a {:?} receipt{}, yet {src_host} reported success",
@@ -455,7 +455,7 @@ fn settle_receipt_v2(
             terminal.summary.deletions
         );
     }
-    Ok(orchestrator_exit_code)
+    Ok(coordinator_exit_code)
 }
 
 #[derive(Clone, Debug)]
@@ -868,7 +868,7 @@ fn run_remote(
         diagnostics: Default::default(),
     };
 
-    // Rebuild the native command for the remote orchestrator. Placement stays
+    // Rebuild the native command for the remote coordinator. Placement stays
     // explicit rather than being translated into trailing-slash heuristics.
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => unreachable!("checked above"),
@@ -1227,7 +1227,7 @@ fn run_remote(
             ReceiptSettlement {
                 src_host: &coordinator_host,
                 dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
-                orchestrator_exit_code: code,
+                coordinator_exit_code: code,
                 results: results.as_deref(),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 verbose: args.verbose > 0,
@@ -1465,20 +1465,20 @@ mod tests {
         // Marker lines are decoded and spooled as separate bounded frames,
         // not accumulated into one receipt allocation.
         let frames = [
-            crate::receipt_v2::TransportFrameV2::Start {
-                mode: crate::receipt_v2::TransportModeV2::DetachedSignedPlaintext,
+            crate::receipt_v2::ReceiptFrameV2::Start {
+                mode: crate::receipt_v2::ReceiptDeliveryKindV2::DetachedSignedPlaintext,
                 encapsulated_key: Vec::new(),
             },
-            crate::receipt_v2::TransportFrameV2::Chunk {
+            crate::receipt_v2::ReceiptFrameV2::Chunk {
                 sequence: 0,
                 payload: b"stream".to_vec(),
             },
-            crate::receipt_v2::TransportFrameV2::End {
+            crate::receipt_v2::ReceiptFrameV2::End {
                 sequence: 1,
                 payload: b"terminal".to_vec(),
             },
         ]
-        .map(|frame| crate::receipt_v2::encode_transport_frame(&frame).unwrap());
+        .map(|frame| crate::receipt_v2::encode_receipt_frame(&frame).unwrap());
         let mut output = b"ordinary line\n".to_vec();
         for frame in &frames {
             output.extend_from_slice(crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes());

@@ -20,7 +20,7 @@ syq cp --from hostA --src-src big --to hostB --into big
 syq cp --prune --from hostA --src-src tree --to hostB --into-existing tree
 ```
 
-syq starts the orchestrator on hostA and pushes directly to hostB, so file
+syq starts the coordinator on hostA and pushes directly to hostB, so file
 data does not traverse the invoking machine; path operands travel encoded in
 the delegated command, so any filename works. Matching helpers are installed
 automatically on both hosts and output is streamed back. When both endpoints
@@ -94,7 +94,7 @@ the final host-bound authentication request's session ID, destination login
 user, host key, selected credential, and signature algorithm. Key addition,
 removal, raw or non-host-bound signing, unknown extensions, and extra forwarding hops
 are refused. The A → B client is forced to use host-bound public-key
-authentication. The forced receiver verifies and durably claims the signed
+authentication. The forced receiver verifies and durably redeems the signed
 request before starting syq's protocol. Every destination scan, stat, hash,
 sidecar operation, metadata change, write, and deletion is rewritten onto the
 enrolled root descriptor. Descendant symlinks are payload, never traversal.
@@ -207,7 +207,7 @@ final pathname directly and can neither be made no-replace nor be pinned to
 an observed object.
 Native `--into-new`/`--as-new` and `--into-existing`/`--as-existing` travel as
 a signed root precondition, checked against the enrolled root when the grant is
-claimed. `--update` still fails closed because it compares against source
+redeemed. `--update` still fails closed because it compares against source
 modification times that only hostA reports.
 `--mapping` and `--min-size` also fail closed because the receiver cannot
 enforce those semantics independently of hostA.
@@ -222,7 +222,7 @@ inside the scope is always stated on the command line rather than defaulting
 to a hundred million; `--max-delete 0` signs a grant that forbids deletion
 outright. The other signed ceilings default to 100 million entries and 8 TiB of
 file data; native `--receiver-max-entries` and `--receiver-max-bytes` lower them for one
-transfer, which bounds what a claimed grant is worth to hostA. Every grant also
+transfer, which bounds what a redeemed grant is worth to hostA. Every grant also
 carries two deadlines: hostA must start the transfer within 24 hours of the
 grant being issued, and the transfer must finish within 7 days of it.
 
@@ -265,7 +265,7 @@ its temporary management helper within one SSH session whose cleanup trap owns
 the stage. Install and revoke serialize the shared receiver lifecycle, so a
 concurrent enrollment recreates the receiver before publishing its forced key.
 Revocation prevents new receiver sessions. A
-session that already claimed its signed request can finish an operation already
+session that already redeemed its signed request can finish an operation already
 in progress; later protocol requests are rejected once the signed execution
 deadline expires rather than forcibly interrupting a filesystem syscall.
 

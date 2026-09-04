@@ -137,7 +137,7 @@ binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
 /path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
-RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
+RFC 8785 canonical JSON. A remote download uses `curl` or `wget`, `gzip`,
 and one of `sha256sum`, `shasum`, or `openssl`; those programs are optional
 because missing or unusable tools select verified SSH upload instead. Version
 directories coexist and either helper cache can be removed at any time; syq

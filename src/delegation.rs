@@ -1,6 +1,6 @@
 //! Signed receiver authorization core.
 //!
-//! The forced receiver verifies and claims a grant here, then converts the
+//! The forced receiver verifies and redeems a grant here, then converts the
 //! resulting `VerifiedGrant` into `restricted::RestrictedAuthority`. That
 //! separate type binds every protocol request to the enrolled filesystem root;
 //! verification by itself remains deliberately incapable of filesystem access.
@@ -8,15 +8,15 @@
 //! The wire representation deliberately signs a typed, canonical binary grant
 //! rather than a command line. The signature is an OpenSSH SSHSIG in the fixed
 //! [`SSHSIG_NAMESPACE`], verified by OpenSSH against an explicit allowed-signers
-//! policy. A fresh random [`RequestId`] is a replay nonce; durable claiming gives
+//! policy. A fresh random [`RequestId`] is a replay nonce; durable redeeming gives
 //! at-most-once redemption, not exactly-once execution across a receiver crash.
 //! The ID is a separate type and size from the stable copy IDs in
 //! `proto`.
-//! Redeemed IDs are rejected from the pinned claim store before invoking the
+//! Redeemed IDs are rejected from the pinned redeem store before invoking the
 //! verifier. Each verifier runs in an isolated process group with a 30-second
 //! deadline; a timeout kills the group before request handling returns.
 //!
-//! "Durable" here means that claim contents and directory-entry changes are
+//! "Durable" here means that redeem contents and directory-entry changes are
 //! flushed with ordinary `fsync` through [`File::sync_all`] on a local filesystem
 //! that honors those operations. It is not a promise against filesystems or
 //! storage hardware that discard acknowledged writes. In particular, this core
@@ -77,9 +77,9 @@ const MAX_CONNECTIONS: u16 = 64;
 const MAX_FILTER_RULES: usize = 4096;
 const MAX_FILTER_RULE_BYTES: usize = 4096;
 const MAX_FILTER_ROOTS: usize = 1024;
-const CLAIM_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
+const REDEMPTION_MAGIC: &[u8; 8] = b"SYQCLM\0\0";
 const CLAIM_VERSION: u16 = 1;
-const CLAIM_RECORD_LEN: usize = CLAIM_MAGIC.len() + 2 + 8 + 32 + 32;
+const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 2 + 8 + 32 + 32;
 
 use crate::enrollment::EnrollmentId;
 
@@ -90,12 +90,12 @@ pub(crate) struct RequestId([u8; 32]);
 
 impl RequestId {
     /// A fresh nonce whose first 8 bytes are the big-endian issue time, so
-    /// hex claim filenames sort chronologically for inspection. The
+    /// hex redeem filenames sort chronologically for inspection. The
     /// remaining 24 random bytes carry uniqueness; the timestamp is
     /// organizational only — verifiers rely on the envelope signature and
-    /// the claim store, never on this prefix. IMPORTANT: Any future expiry
-    /// or pruning decision MUST read `claimed_at` from the
-    /// claim record (see `validate_claim_record`), never infer it from the
+    /// the redeem store, never on this prefix. IMPORTANT: Any future expiry
+    /// or pruning decision MUST read `redeemed_at` from the
+    /// redeem record (see `validate_redeem_record`), never infer it from the
     /// filename.
     pub(crate) fn fresh(issued_at: i64) -> Result<Self> {
         let mut bytes = [0u8; 32];
@@ -385,16 +385,16 @@ impl FilterPolicy {
 }
 
 /// Signed precondition on the placement root itself. The receiver checks it
-/// once against the enrolled root when the grant is claimed, and `New`
+/// once against the enrolled root when the grant is redeemed, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RootExistence {
     #[default]
     Any,
-    /// The signed destination must not exist when the grant is claimed.
+    /// The signed destination must not exist when the grant is redeemed.
     New,
-    /// The signed destination must already exist when the grant is claimed;
+    /// The signed destination must already exist when the grant is redeemed;
     /// a directory placement additionally requires a directory.
     Existing,
 }
@@ -554,7 +554,7 @@ pub(crate) fn sign_grant(
         receipt_v2,
     } = constraints;
     if private_key.is_encrypted() {
-        bail!("cannot sign a grant with an encrypted transport key");
+        bail!("cannot sign a grant with an encrypted enrollment key");
     }
     // With no filters, --delete-excluded has no observable effect.
     if filters.ignore.is_empty() {
@@ -750,7 +750,7 @@ impl ReceiverContext<'_> {
             .map_err(|_| anyhow!("receiver observation duration is out of range"))?;
         // The paired wall observation has whole-second precision. Use the
         // lower bound for not-before/future checks and the upper bound for
-        // expiry, claims, and deadlines. That accepts neither end of the
+        // expiry, redeems, and deadlines. That accepts neither end of the
         // interval based on a favorable fractional-second assumption.
         let elapsed_ceil = elapsed
             .as_secs()
@@ -1074,7 +1074,7 @@ fn read_verifier_output(mut output: impl Read) -> io::Result<Vec<u8>> {
 }
 
 /// Evidence that the signature, target binding, time bounds, and one-time
-/// replay claim all succeeded. The restricted receiver consumes this into its
+/// replay redeem all succeeded. The restricted receiver consumes this into its
 /// independently enforced request authority and monotonic execution deadline.
 #[derive(Debug)]
 pub(crate) struct VerifiedGrant {
@@ -1130,7 +1130,7 @@ impl VerifiedGrant {
     }
 }
 
-pub(crate) fn verify_and_claim(
+pub(crate) fn verify_and_redeem(
     encoded: &[u8],
     context: &ReceiverContext<'_>,
     policy: &SshsigPolicy,
@@ -1141,14 +1141,14 @@ pub(crate) fn verify_and_claim(
     let payload = envelope.signing_payload()?;
     let replay_digest: [u8; 32] = Sha256::digest(&payload).into();
     let grant_digest = grant_transcript_digest(&payload);
-    replay.reject_if_claimed(envelope.grant.request_id, replay_digest)?;
+    replay.reject_if_redeemed(envelope.grant.request_id, replay_digest)?;
     policy.verify(
         replay,
         context.expected_signer,
         &envelope.signature,
         &payload,
     )?;
-    replay.claim_after_lock(envelope.grant.request_id, replay_digest, || {
+    replay.redeem_after_lock(envelope.grant.request_id, replay_digest, || {
         context.validate_at(&envelope.grant, Instant::now())
     })?;
     let verified_at = Instant::now();
@@ -1197,7 +1197,7 @@ fn execution_deadline(
         .checked_sub(current_wall_time)
         .ok_or_else(|| anyhow!("grant remaining finish window overflow"))?;
     if remaining <= 0 {
-        bail!("grant finish-by time passed while it was being verified and claimed");
+        bail!("grant finish-by time passed while it was being verified and redeemed");
     }
     verified_at
         .checked_add(Duration::from_secs(remaining as u64))
@@ -1220,19 +1220,19 @@ impl ReplayStore {
     }
 
     #[cfg(test)]
-    fn claim(&self, request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<()> {
-        self.claim_after_lock(request, digest, || Ok(claimed_at))
+    fn redeem(&self, request: RequestId, digest: [u8; 32], redeemed_at: i64) -> Result<()> {
+        self.redeem_after_lock(request, digest, || Ok(redeemed_at))
     }
 
-    fn reject_if_claimed(&self, request: RequestId, digest: [u8; 32]) -> Result<()> {
+    fn reject_if_redeemed(&self, request: RequestId, digest: [u8; 32]) -> Result<()> {
         request.validate()?;
-        let final_name = format!("claim-{}", request.file_component());
+        let final_name = format!("redeemed-{}", request.file_component());
         if let Some(existing) = readat_optional(
             self.directory.as_raw_fd(),
             &final_name,
-            CLAIM_RECORD_LEN + 1,
+            REDEMPTION_RECORD_LEN + 1,
         )? {
-            validate_claim_record(&existing, request, digest)?;
+            validate_redeem_record(&existing, request, digest)?;
             bail!("signed request has already been redeemed");
         }
         Ok(())
@@ -1246,7 +1246,7 @@ impl ReplayStore {
         loop {
             match openat_file(
                 self.directory.as_raw_fd(),
-                ".claim-lock",
+                ".redeem-lock",
                 libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             ) {
@@ -1259,34 +1259,34 @@ impl ReplayStore {
         }
     }
 
-    fn claim_after_lock(
+    fn redeem_after_lock(
         &self,
         request: RequestId,
         digest: [u8; 32],
-        claimed_at: impl FnOnce() -> Result<i64>,
+        redeemed_at: impl FnOnce() -> Result<i64>,
     ) -> Result<()> {
         request.validate()?;
         let lock = self
             .open_lock()
             .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
-        flock_exclusive(lock.as_raw_fd()).context("lock replay claim store")?;
+        flock_exclusive(lock.as_raw_fd()).context("lock replay redeem store")?;
         // Timestamp and revalidate only after a potentially queued lock wait.
-        // No stale ReceiverContext observation may authorize a later claim.
-        let claimed_at = claimed_at()?;
+        // No stale ReceiverContext observation may authorize a later redeem.
+        let redeemed_at = redeemed_at()?;
 
-        let final_name = format!("claim-{}", request.file_component());
+        let final_name = format!("redeemed-{}", request.file_component());
         if let Some(existing) = readat_optional(
             self.directory.as_raw_fd(),
             &final_name,
-            CLAIM_RECORD_LEN + 1,
+            REDEMPTION_RECORD_LEN + 1,
         )? {
-            validate_claim_record(&existing, request, digest)?;
+            validate_redeem_record(&existing, request, digest)?;
             bail!("signed request has already been redeemed");
         }
 
         let temporary_name = format!(
-            ".claim-{}-{}.tmp",
+            ".redeemed-{}-{}.tmp",
             request.file_component(),
             hex(&random_array::<16>()?)
         );
@@ -1296,12 +1296,12 @@ impl ReplayStore {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
-        .with_context(|| format!("create replay claim in {}", self.path.display()))?;
-        if let Err(error) = validate_private_file(&temporary, "temporary replay claim") {
+        .with_context(|| format!("create replay redeem in {}", self.path.display()))?;
+        if let Err(error) = validate_private_file(&temporary, "temporary replay redeem") {
             let _ = unlinkat(self.directory.as_raw_fd(), &temporary_name);
             return Err(error);
         }
-        let record = claim_record(request, digest, claimed_at)?;
+        let record = redeem_record(request, digest, redeemed_at)?;
         if let Err(error) = (|| -> io::Result<()> {
             temporary.write_all(&record)?;
             temporary.sync_all()?;
@@ -1312,8 +1312,8 @@ impl ReplayStore {
                 &final_name,
             )?;
             // Persist the no-replace publication before removing the temporary
-            // name. A crash after this point can only leave an already-claimed
-            // request, never a successful-but-forgotten claim.
+            // name. A crash after this point can only leave an already-redeemed
+            // request, never a successful-but-forgotten redeem.
             self.directory.sync_all()?;
             unlinkat(self.directory.as_raw_fd(), &temporary_name)?;
             self.directory.sync_all()?;
@@ -1324,13 +1324,13 @@ impl ReplayStore {
                 if let Some(existing) = readat_optional(
                     self.directory.as_raw_fd(),
                     &final_name,
-                    CLAIM_RECORD_LEN + 1,
+                    REDEMPTION_RECORD_LEN + 1,
                 )? {
-                    validate_claim_record(&existing, request, digest)?;
+                    validate_redeem_record(&existing, request, digest)?;
                     bail!("signed request has already been redeemed");
                 }
             }
-            return Err(error).context("durably publish replay claim");
+            return Err(error).context("durably publish replay redeem");
         }
         Ok(())
     }
@@ -1529,35 +1529,35 @@ pub(crate) fn read_private_regular(path: &Path, label: &str, maximum: usize) -> 
     Ok(contents)
 }
 
-fn claim_record(request: RequestId, digest: [u8; 32], claimed_at: i64) -> Result<Vec<u8>> {
-    if !(0..=MAX_UNIX_TIMESTAMP).contains(&claimed_at) {
-        bail!("replay claim timestamp is outside the supported range");
+fn redeem_record(request: RequestId, digest: [u8; 32], redeemed_at: i64) -> Result<Vec<u8>> {
+    if !(0..=MAX_UNIX_TIMESTAMP).contains(&redeemed_at) {
+        bail!("replay redeem timestamp is outside the supported range");
     }
-    let mut record = Vec::with_capacity(CLAIM_RECORD_LEN);
-    record.extend_from_slice(CLAIM_MAGIC);
+    let mut record = Vec::with_capacity(REDEMPTION_RECORD_LEN);
+    record.extend_from_slice(REDEMPTION_MAGIC);
     record.extend_from_slice(&CLAIM_VERSION.to_be_bytes());
-    record.extend_from_slice(&claimed_at.to_be_bytes());
+    record.extend_from_slice(&redeemed_at.to_be_bytes());
     record.extend_from_slice(&request.0);
     record.extend_from_slice(&digest);
     Ok(record)
 }
 
-fn validate_claim_record(record: &[u8], request: RequestId, digest: [u8; 32]) -> Result<()> {
-    if record.len() != CLAIM_RECORD_LEN
-        || &record[..8] != CLAIM_MAGIC
-        || u16::from_be_bytes(record[8..10].try_into().expect("claim header")) != CLAIM_VERSION
+fn validate_redeem_record(record: &[u8], request: RequestId, digest: [u8; 32]) -> Result<()> {
+    if record.len() != REDEMPTION_RECORD_LEN
+        || &record[..8] != REDEMPTION_MAGIC
+        || u16::from_be_bytes(record[8..10].try_into().expect("redeem header")) != CLAIM_VERSION
     {
         bail!("replay state is malformed; refusing signed request");
     }
-    let claimed_at = i64::from_be_bytes(record[10..18].try_into().expect("claim timestamp"));
-    if !(0..=MAX_UNIX_TIMESTAMP).contains(&claimed_at) {
+    let redeemed_at = i64::from_be_bytes(record[10..18].try_into().expect("redeem timestamp"));
+    if !(0..=MAX_UNIX_TIMESTAMP).contains(&redeemed_at) {
         bail!("replay state has an invalid timestamp; refusing signed request");
     }
     if record[18..50] != request.0 {
         bail!("replay state request ID does not match its filename");
     }
     if record[50..82] != digest {
-        bail!("request ID was already claimed by a different signed grant");
+        bail!("request ID was already redeemed by a different signed grant");
     }
     Ok(())
 }
@@ -1627,13 +1627,13 @@ fn readat_optional(directory: RawFd, name: &str, maximum: usize) -> Result<Optio
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("open replay record {name}")),
     };
-    validate_private_file(&file, "replay claim")?;
+    validate_private_file(&file, "replay redeem")?;
     let mut contents = Vec::new();
     Read::by_ref(&mut file)
         .take(maximum as u64)
         .read_to_end(&mut contents)?;
     if contents.len() >= maximum {
-        bail!("replay claim exceeds its fixed format; refusing request");
+        bail!("replay redeem exceeds its fixed format; refusing request");
     }
     Ok(Some(contents))
 }
@@ -2114,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn in_process_transport_key_signature_is_accepted_by_openssh() {
+    fn in_process_enrollment_key_signature_is_accepted_by_openssh() {
         let fixture = Fixture::ordinary();
         let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]);
         let private = PrivateKey::new(keypair.into(), "syq-test").unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
         let replay = fixture.replay("in-process-signature-replay");
         let encoded = sign_grant(fixture_grant(44), GrantConstraints::default(), &private).unwrap();
         SignedGrantEnvelope::decode(&encoded).unwrap();
-        verify_and_claim(
+        verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2142,7 +2142,7 @@ mod tests {
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&rate_limited).unwrap();
         assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
-        verify_and_claim(
+        verify_and_redeem(
             &rate_limited,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2167,7 +2167,7 @@ mod tests {
         let decoded = SignedGrantEnvelope::decode(&filtered).unwrap();
         assert_eq!(decoded.filters, filters);
         assert_eq!(decoded.root_existence, RootExistence::Any);
-        let verified = verify_and_claim(
+        let verified = verify_and_redeem(
             &filtered,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2203,7 +2203,7 @@ mod tests {
         .unwrap();
         let decoded = SignedGrantEnvelope::decode(&rooted).unwrap();
         assert_eq!(decoded.root_existence, RootExistence::New);
-        let verified = verify_and_claim(
+        let verified = verify_and_redeem(
             &rooted,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2240,7 +2240,7 @@ mod tests {
         );
         assert_eq!(decoded.receipt_v2, policy_v2.clone());
         let expected_digest = signed_grant_digest(&receipted_v2).unwrap();
-        let verified = verify_and_claim(
+        let verified = verify_and_redeem(
             &receipted_v2,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2307,7 +2307,7 @@ mod tests {
         let fixture = Fixture::ordinary();
         let replay = fixture.replay("replay");
         let encoded = fixture.signed(fixture_grant(6));
-        verify_and_claim(
+        verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2321,7 +2321,7 @@ mod tests {
         let GrantOperation::Copy(copy) = &mut altered.operation;
         copy.options.verify_only = false;
         let tampered = raw_envelope(&altered, &original.signature);
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &tampered,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2341,7 +2341,7 @@ mod tests {
             SignedGrantEnvelope::decode(&rate_limited).expect("decode rate-limited grant");
         assert_eq!(decoded.max_file_data_bytes_per_second, 4096);
         let tampered_rate = raw_envelope_with_rate(&rate_grant, 8192, &decoded.signature);
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &tampered_rate,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2351,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_namespace_signer_target_and_enrollment_without_claiming() {
+    fn rejects_wrong_namespace_signer_target_and_enrollment_without_redeeming() {
         let fixture = Fixture::ordinary();
         let grant = fixture_grant(8);
         let wrong_namespace = signed_envelope(
@@ -2361,7 +2361,7 @@ mod tests {
             None,
         );
         let replay = fixture.replay("binding-replay");
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &wrong_namespace,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2370,7 +2370,7 @@ mod tests {
         .is_err());
 
         let encoded = fixture.signed(grant.clone());
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &encoded,
             &context("mallory@example.test", TARGET, NOW, 0),
             &fixture.policy(),
@@ -2380,14 +2380,14 @@ mod tests {
         let mut unlisted_signer = grant.clone();
         unlisted_signer.signer = "mallory@example.test".to_owned();
         let unlisted_signer = fixture.signed(unlisted_signer);
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &unlisted_signer,
             &context("mallory@example.test", TARGET, NOW, 0),
             &fixture.policy(),
             &replay,
         )
         .is_err());
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &encoded,
             &context(SIGNER, "root", NOW, 0),
             &fixture.policy(),
@@ -2396,8 +2396,10 @@ mod tests {
         .is_err());
         let mut wrong_enrollment = context(SIGNER, TARGET, NOW, 0);
         wrong_enrollment.enrollment_id = EnrollmentId::test_v4(9);
-        assert!(verify_and_claim(&encoded, &wrong_enrollment, &fixture.policy(), &replay).is_err());
-        verify_and_claim(
+        assert!(
+            verify_and_redeem(&encoded, &wrong_enrollment, &fixture.policy(), &replay).is_err()
+        );
+        verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
@@ -2411,14 +2413,14 @@ mod tests {
         let fixture = Fixture::ordinary();
         let encoded = fixture.signed(fixture_grant(9));
         let replay = fixture.replay("expired-replay");
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW + 620, 10),
             &fixture.policy(),
             &replay,
         )
         .is_err());
-        verify_and_claim(
+        verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW + 590, 10),
             &fixture.policy(),
@@ -2432,14 +2434,14 @@ mod tests {
         future.start_by = NOW + 400;
         let encoded = fixture.signed(future);
         let replay = fixture.replay("future-replay");
-        assert!(verify_and_claim(
+        assert!(verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW, 90),
             &fixture.policy(),
             &replay,
         )
         .is_err());
-        verify_and_claim(
+        verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW + 50, 60),
             &fixture.policy(),
@@ -2481,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_clock_observation_advances_validation_claim_and_deadline() {
+    fn queued_clock_observation_advances_validation_redeem_and_deadline() {
         let fixture = Fixture::ordinary();
         let replay = fixture.replay("paired-clock-replay");
         let observed_at = Instant::now()
@@ -2496,32 +2498,32 @@ mod tests {
         );
 
         let encoded = fixture.signed(fixture_grant(22));
-        let verified = verify_and_claim(&encoded, &context, &fixture.policy(), &replay)
+        let verified = verify_and_redeem(&encoded, &context, &fixture.policy(), &replay)
             .expect("verify with a queued but still-valid clock observation");
         assert!(verified.execution_deadline() <= Instant::now() + Duration::from_secs(900));
-        let claim = fs::read(
+        let redeem = fs::read(
             replay
                 .path
-                .join(format!("claim-{}", RequestId([22; 32]).file_component())),
+                .join(format!("redeemed-{}", RequestId([22; 32]).file_component())),
         )
-        .expect("read adjusted replay claim");
-        let claimed_at = i64::from_be_bytes(claim[10..18].try_into().expect("claim timestamp"));
-        assert!(claimed_at >= NOW + 3);
+        .expect("read adjusted replay redeem");
+        let redeemed_at = i64::from_be_bytes(redeem[10..18].try_into().expect("redeem timestamp"));
+        assert!(redeemed_at >= NOW + 3);
 
         let mut expired = fixture_grant(23);
         expired.start_by = NOW + 2;
         expired.finish_by = NOW + 2;
         let encoded = fixture.signed(expired);
         let expired_replay = fixture.replay("queued-expired-replay");
-        assert!(verify_and_claim(&encoded, &context, &fixture.policy(), &expired_replay).is_err());
+        assert!(verify_and_redeem(&encoded, &context, &fixture.policy(), &expired_replay).is_err());
         assert!(!expired_replay
             .path
-            .join(format!("claim-{}", RequestId([23; 32]).file_component()))
+            .join(format!("redeemed-{}", RequestId([23; 32]).file_component()))
             .exists());
     }
 
     #[test]
-    fn duplicate_and_concurrent_redemption_allow_exactly_one_claim() {
+    fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
         let fixture = Fixture::ordinary();
         let encoded = Arc::new(fixture.signed(fixture_grant(12)));
         let replay = fixture.replay("concurrent-replay");
@@ -2535,7 +2537,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             threads.push(thread::spawn(move || {
                 barrier.wait();
-                verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+                verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             }));
         }
         let results: Vec<_> = threads
@@ -2553,7 +2555,7 @@ mod tests {
         );
         let mut no_verifier = fixture.policy();
         no_verifier.ssh_keygen = PathBuf::from("/missing/verifier-must-not-run");
-        let error = verify_and_claim(
+        let error = verify_and_redeem(
             &encoded,
             &context(SIGNER, TARGET, NOW, 0),
             &no_verifier,
@@ -2566,35 +2568,37 @@ mod tests {
     }
 
     #[test]
-    fn replay_claim_survives_reopen_ignores_stale_temp_and_fails_closed_on_corruption() {
+    fn replay_redeem_survives_reopen_ignores_stale_temp_and_fails_closed_on_corruption() {
         let directory = TestDir::new("replay-disk");
         let state = directory.join("state");
         let first = RequestId([13; 32]);
         let first_digest = [0x31; 32];
         provision_test_replay_directory(&state);
         let store = ReplayStore::open(&state).expect("open replay store");
-        store.claim(first, first_digest, NOW).expect("first claim");
+        store
+            .redeem(first, first_digest, NOW)
+            .expect("first redeem");
         drop(store);
 
-        let record_path = state.join(format!("claim-{}", first.file_component()));
-        let metadata = fs::metadata(&record_path).expect("claim record metadata");
-        assert_eq!(metadata.len() as usize, CLAIM_RECORD_LEN);
+        let record_path = state.join(format!("redeemed-{}", first.file_component()));
+        let metadata = fs::metadata(&record_path).expect("redeem record metadata");
+        assert_eq!(metadata.len() as usize, REDEMPTION_RECORD_LEN);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
-        write_private(&state.join(".claim-crash-residue.tmp"), b"partial");
+        write_private(&state.join(".redeem-crash-residue.tmp"), b"partial");
         let reopened = ReplayStore::open(&state).expect("reopen replay store");
-        assert!(reopened.claim(first, first_digest, NOW + 1).is_err());
-        assert!(reopened.claim(first, [0xff; 32], NOW + 1).is_err());
+        assert!(reopened.redeem(first, first_digest, NOW + 1).is_err());
+        assert!(reopened.redeem(first, [0xff; 32], NOW + 1).is_err());
         reopened
-            .claim(RequestId([14; 32]), [0x32; 32], NOW + 1)
-            .expect("stale unpublished temp cannot block another claim");
+            .redeem(RequestId([14; 32]), [0x32; 32], NOW + 1)
+            .expect("stale unpublished temp cannot block another redeem");
 
         let corrupt = RequestId([15; 32]);
         write_private(
-            &state.join(format!("claim-{}", corrupt.file_component())),
+            &state.join(format!("redeemed-{}", corrupt.file_component())),
             b"partial",
         );
-        assert!(reopened.claim(corrupt, [0x33; 32], NOW + 2).is_err());
+        assert!(reopened.redeem(corrupt, [0x33; 32], NOW + 2).is_err());
     }
 
     #[test]
@@ -2729,7 +2733,7 @@ mod tests {
         let later = RequestId::fresh(NOW + 1).expect("fresh request ID");
         assert_eq!(earlier.0[..8], u64::try_from(NOW).unwrap().to_be_bytes());
         // Hex filenames of big-endian timestamps sort lexicographically in
-        // time order, so claim listings are naturally chronological.
+        // time order, so redeem listings are naturally chronological.
         assert!(earlier.file_component() < later.file_component());
         // Same second, distinct nonces: the 24 random bytes carry uniqueness.
         let sibling = RequestId::fresh(NOW).expect("fresh request ID");
@@ -2781,7 +2785,7 @@ mod tests {
             revocation_file: None,
         };
 
-        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+        let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect_err("a key listed only for another principal must fail");
         assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
@@ -2801,7 +2805,7 @@ mod tests {
         let moved = fixture.directory.join("replaced-replay-moved");
         fs::rename(&replay.path, &moved).expect("move replay directory");
         provision_test_replay_directory(&replay.path);
-        let error = verify_and_claim(
+        let error = verify_and_redeem(
             &fixture.signed(fixture_grant(26)),
             &context(SIGNER, TARGET, NOW, 0),
             &policy,
@@ -2826,7 +2830,7 @@ mod tests {
         policy.revocation_file = Some(revocations);
         let replay = fixture.replay("revoked-replay");
 
-        let error = verify_and_claim(
+        let error = verify_and_redeem(
             &fixture.signed(fixture_grant(25)),
             &context(SIGNER, TARGET, NOW, 0),
             &policy,
@@ -2864,7 +2868,7 @@ mod tests {
             allowed_signers,
             revocation_file: None,
         };
-        verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+        verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect("verify SSH certificate signature through allowed CA");
     }
 
@@ -2896,7 +2900,7 @@ mod tests {
             revocation_file: None,
         };
 
-        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+        let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect_err("a certificate without the expected principal must fail");
         assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }
@@ -2929,7 +2933,7 @@ mod tests {
             revocation_file: None,
         };
 
-        let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
+        let error = verify_and_redeem(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect_err("a certificate signed by a non-authority entry must fail");
         assert!(error.to_string().starts_with("SSHSIG verification failed"));
     }

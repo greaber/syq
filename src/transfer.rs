@@ -1,4 +1,4 @@
-//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
+//! The coordinator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
@@ -1045,7 +1045,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
         );
     }
     for source in original_srcs {
@@ -1122,14 +1122,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
-            return crate::direct::coordinate_at_dest(
+            return crate::remote_to_remote::coordinate_at_dest(
                 &args,
                 srcs,
                 dst,
                 progress.results_writer().cloned(),
             );
         }
-        return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
+        return crate::remote_to_remote::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
@@ -1161,7 +1161,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
-    // orchestrator process's cwd.
+    // coordinator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -1176,7 +1176,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
+            "{} {algorithm} requires a Linux transfer coordinator and Linux remote endpoints",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
@@ -1525,7 +1525,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Remote(_) if use_tcp => maximum_workers,
         Endpoint::Remote(_) => 0,
     };
-    let source_independent_claim_workers = match &src_ep {
+    let source_independent_handoff_workers = match &src_ep {
         Endpoint::Local { .. } => 0,
         Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
@@ -1539,7 +1539,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             0
         };
-    let source_independent_claim_workers = source_independent_claim_workers
+    let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;
     let registered_sources = register_source_roots(
@@ -1547,7 +1547,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         srcs,
         &args,
         source_shared_workers,
-        source_independent_claim_workers,
+        source_independent_handoff_workers,
     )?;
     source_roots
         .set(registered_sources)
@@ -2156,7 +2156,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
-        root_path: dst_root.clone(),
+        dst_root: dst_root.clone(),
         exact_condition,
         mutation_root_condition,
         container_guard,
@@ -2515,7 +2515,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this orchestrator's
+    // machine as marked lines. That machine verifies it; this coordinator's
     // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
@@ -2525,7 +2525,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             loop {
                 match dst_ctl.recv() {
                     Ok(Response::ReceiptV2(frame)) => {
-                        let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
+                        let terminal = match crate::receipt_v2::receipt_frame_is_end(&frame) {
                             Ok(terminal) => terminal,
                             Err(error) => {
                                 progress.error(&format!("syq: receipt: {error:#}"));
@@ -3004,7 +3004,7 @@ fn register_source_roots(
     sources: &[Location],
     args: &Args,
     shared_workers: usize,
-    independent_claim_workers: usize,
+    independent_handoff_workers: usize,
 ) -> Result<Vec<RegisteredSourceRoot>> {
     let source_is_local = !sources.iter().any(Location::is_remote);
     let base = if let Some(path) = &args.native_source_root {
@@ -3036,7 +3036,7 @@ fn register_source_roots(
             symlink_policy: source_operator_symlink_policy(args, source_is_local),
             allow_unconfined_paths: rsync_insecure_links(args, source_is_local),
             shared_workers,
-            independent_claim_workers,
+            independent_handoff_workers,
         })?,
         "register source roots",
     )? {
@@ -3757,7 +3757,7 @@ struct Planner<'a> {
     /// This run consumes a --mapping manifest (identity entries included).
     mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
-    root_path: PathBytes,
+    dst_root: PathBytes,
     exact_condition: TargetCondition,
     mutation_root_condition: TargetCondition,
     container_guard: Option<ContainerGuard>,
@@ -3879,7 +3879,7 @@ impl Planner<'_> {
         if !included {
             return;
         }
-        let reuses_existing_root = dst == self.root_path && entry.kind == Kind::Dir;
+        let reuses_existing_root = dst == self.dst_root && entry.kind == Kind::Dir;
         let Some(plan) = &mut self.fresh_capacity else {
             return;
         };
@@ -3930,7 +3930,7 @@ impl Planner<'_> {
     }
 
     fn exact_condition_for(&self, path: &[u8]) -> TargetCondition {
-        if path == self.root_path {
+        if path == self.dst_root {
             self.exact_condition
         } else {
             TargetCondition::Any
@@ -3953,14 +3953,14 @@ impl Planner<'_> {
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
             TargetCondition::Any | TargetCondition::Absent => return Ok(()),
         };
-        let current = stat_many(self.dst, vec![self.root_path.clone()], false)?
+        let current = stat_many(self.dst, vec![self.dst_root.clone()], false)?
             .pop()
             .flatten();
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
-                display(&self.root_path)
+                display(&self.dst_root)
             ),
         }
     }
@@ -4969,7 +4969,7 @@ impl Planner<'_> {
                     .iter()
                     .filter(|(path, _, _, st)| {
                         let root_must_be_new = self.exact_condition == TargetCondition::Absent
-                            && path == &self.root_path;
+                            && path == &self.dst_root;
                         root_must_be_new
                             || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
@@ -4986,7 +4986,7 @@ impl Planner<'_> {
                             path,
                             condition: TargetCondition::Absent,
                             ..
-                        } if path == &self.root_path
+                        } if path == &self.dst_root
                     )
                 }) {
                     // Establish the new authority directory by itself. Every
@@ -5010,9 +5010,9 @@ impl Planner<'_> {
                     self.progress.dirs_created.fetch_add(1, Relaxed);
                     if opts.verbose > 0 {
                         self.progress
-                            .println(&format!("{}/", display(&self.root_path)));
+                            .println(&format!("{}/", display(&self.dst_root)));
                     }
-                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
+                    let created = stat_many(self.dst, vec![self.dst_root.clone()], false)?
                         .pop()
                         .flatten()
                         .filter(|entry| entry.kind == Kind::Dir)
@@ -5020,7 +5020,7 @@ impl Planner<'_> {
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
                     if self.guard_containers {
-                        self.container_guard = Some(target_container(&self.root_path, &created));
+                        self.container_guard = Some(target_container(&self.dst_root, &created));
                     }
                 }
                 for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
@@ -5050,7 +5050,7 @@ impl Planner<'_> {
                                 Some("io"),
                                 os_kind,
                             );
-                            if name == &self.root_path && *condition != TargetCondition::Any {
+                            if name == &self.dst_root && *condition != TargetCondition::Any {
                                 self.collision = true;
                             }
                         } else if opts.verbose > 0 && !preexisting {
@@ -6151,7 +6151,7 @@ impl Planner<'_> {
     fn flush_dry_directory_traces(&mut self) {
         let creates = std::mem::take(&mut self.dry_run_changes.directory_creates);
         for (path, reason) in creates {
-            if let Some(dst_rel) = strip_dst_root(&path, &self.root_path) {
+            if let Some(dst_rel) = strip_dst_root(&path, &self.dst_root) {
                 self.emit_trace_with_src(
                     "create_directory",
                     dst_rel,
@@ -6181,7 +6181,7 @@ impl Planner<'_> {
                         .map(|(p, _, kind)| (p, *kind))
                         .chain(dirs.values().flatten().map(|(p, _, _)| (p, "dir")));
                     for (p, kind) in blocked {
-                        let Some(dst_rel) = strip_dst_root(p, &self.root_path) else {
+                        let Some(dst_rel) = strip_dst_root(p, &self.dst_root) else {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {
@@ -6214,7 +6214,7 @@ impl Planner<'_> {
                     for (p, rel, kind) in chunk {
                         n += 1;
                         me.progress.deletions_completed.fetch_add(1, Relaxed);
-                        if let Some(dst_rel) = strip_dst_root(p, &me.root_path) {
+                        if let Some(dst_rel) = strip_dst_root(p, &me.dst_root) {
                             me.emit_trace("delete", dst_rel, kind, None, "destination_only");
                         }
                         if opts.verbose > 0 {
@@ -6254,7 +6254,7 @@ impl Planner<'_> {
                         ),
                     }
                     if let Some(results) = me.progress.results_writer() {
-                        let Some(dst_rel) = strip_dst_root(p, &me.root_path) else {
+                        let Some(dst_rel) = strip_dst_root(p, &me.dst_root) else {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {

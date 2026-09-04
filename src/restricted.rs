@@ -7,8 +7,8 @@ use crate::delegation::{
     MutationScope, PublicationPolicy, RequestId, RootExistence,
 };
 use crate::enrollment::{
-    self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentRoute, SshEndpoint,
-    TransportPublicKey,
+    self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,
+    EnrollmentRoute, SshEndpoint,
 };
 use crate::proto::{self, ContainerGuard, Op, Request};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
@@ -149,11 +149,11 @@ struct AuthorityState {
     /// preallocation and basis seeding are charged against the aggregate
     /// ceiling here, once per file at its largest declared size, and every
     /// write or publication must name a declared partial. Observation-only
-    /// preparations own separate provisional claims so an older absent
+    /// preparations own separate provisional holds so an older absent
     /// observation cannot roll back a newer preparation for the same key.
     reserved: HashMap<(Vec<u8>, proto::PartialId), ByteReservation>,
     reserved_bytes: u64,
-    next_reservation_claim: u64,
+    next_reservation_hold: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
@@ -194,16 +194,16 @@ enum ReceiverModeState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ReservationClaimId(u64);
+struct ReservationHoldId(u64);
 
 #[derive(Debug, Default)]
 struct ByteReservation {
     /// Capacity retained by a preparation that may have created, resized, or
     /// reused the write target.
     retained: Option<u64>,
-    /// Capacity provisionally claimed by observation-only preparations until
+    /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
-    observations: HashMap<ReservationClaimId, u64>,
+    observations: HashMap<ReservationHoldId, u64>,
 }
 
 impl ByteReservation {
@@ -458,7 +458,7 @@ impl RestrictedAuthority {
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
-                next_reservation_claim: 0,
+                next_reservation_hold: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
@@ -795,7 +795,7 @@ impl RestrictedAuthority {
         partial_id: proto::PartialId,
         size: u64,
         observation_only: bool,
-    ) -> Result<Option<ReservationClaimId>> {
+    ) -> Result<Option<ReservationHoldId>> {
         let mut state = self.state.lock().unwrap();
         let key = (path.to_vec(), partial_id);
         let previous = state
@@ -812,19 +812,19 @@ impl RestrictedAuthority {
         if total > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
-        let claim = if observation_only {
-            let claim = ReservationClaimId(state.next_reservation_claim);
-            state.next_reservation_claim = state
-                .next_reservation_claim
+        let hold = if observation_only {
+            let hold = ReservationHoldId(state.next_reservation_hold);
+            state.next_reservation_hold = state
+                .next_reservation_hold
                 .checked_add(1)
-                .context("reservation claim counter overflow")?;
-            Some(claim)
+                .context("reservation hold counter overflow")?;
+            Some(hold)
         } else {
             None
         };
         let reservation = state.reserved.entry(key).or_default();
-        if let Some(claim) = claim {
-            reservation.observations.insert(claim, size);
+        if let Some(hold) = hold {
+            reservation.observations.insert(hold, size);
         } else {
             reservation.retained = Some(
                 reservation
@@ -833,15 +833,15 @@ impl RestrictedAuthority {
             );
         }
         state.reserved_bytes = total;
-        Ok(claim)
+        Ok(hold)
     }
 
     /// Settle one observation's provisional reservation without disturbing
-    /// claims installed by requests that ran before or after it.
+    /// holds installed by requests that ran before or after it.
     fn settle_observation_reservation(
         state: &mut AuthorityState,
         key: &(Vec<u8>, proto::PartialId),
-        claim: ReservationClaimId,
+        hold: ReservationHoldId,
         retain: bool,
     ) {
         let Some(reservation) = state.reserved.get_mut(key) else {
@@ -849,8 +849,8 @@ impl RestrictedAuthority {
         };
         let before = reservation
             .effective_size()
-            .expect("a stored reservation has at least one claim");
-        let Some(size) = reservation.observations.remove(&claim) else {
+            .expect("a stored reservation has at least one hold");
+        let Some(size) = reservation.observations.remove(&hold) else {
             return;
         };
         if retain {
@@ -1153,17 +1153,17 @@ impl RestrictedAuthority {
                     inplace,
                     stage,
                     skip_if_absent,
-                    observation_claim,
+                    observation_hold,
                 } => {
                     // Observation-only Prepare replaces the old partial probe.
-                    // Settle only this request's provisional claim: concurrent
+                    // Settle only this request's provisional hold: concurrent
                     // preparations for the same partial retain their own
                     // capacity regardless of response ordering.
                     let absent =
                         skip_if_absent && matches!(response, proto::Response::PartialSize(None));
-                    if let Some(claim) = observation_claim {
+                    if let Some(hold) = observation_hold {
                         let key = (path.clone(), partial_id);
-                        Self::settle_observation_reservation(&mut state, &key, claim, !absent);
+                        Self::settle_observation_reservation(&mut state, &key, hold, !absent);
                     }
                     // If no sidecar existed, the observation performed no
                     // file-lifecycle mutation and must not create an
@@ -2067,7 +2067,7 @@ impl RestrictedAuthority {
                 }
                 if key
                     .as_ref()
-                    .is_none_or(|key| key.len() != crate::crypto::KEY_LEN)
+                    .is_none_or(|key| key.len() != crate::tcp_records::KEY_LEN)
                     || token.len() != 16
                 {
                     bail!("signed transfers require encrypted TCP data connections");
@@ -2228,7 +2228,7 @@ impl RestrictedAuthority {
                     inplace: false,
                     stage: FileStageV2::Prepare,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
                 *guard = Some(self.guard.clone());
             }
@@ -2274,7 +2274,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
-                let observation_claim =
+                let observation_hold =
                     self.reserve_bytes(path, *partial_id, *size, !*create_if_missing)?;
                 outcomes.push(PendingOutcome::FileStageV2 {
                     index: 0,
@@ -2284,7 +2284,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Prepare,
                     skip_if_absent: !*create_if_missing,
-                    observation_claim,
+                    observation_hold,
                 });
                 if *inplace {
                     // In-place preparation resizes the final file itself:
@@ -2323,7 +2323,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Write,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -2352,7 +2352,7 @@ impl RestrictedAuthority {
                     inplace: *inplace,
                     stage: FileStageV2::Finalize,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
                 touched_v2.push(path.clone());
                 self.constrain_receiver_mode(
@@ -2501,9 +2501,9 @@ enum PendingOutcome {
         /// resumable sidecar and therefore performed no lifecycle mutation.
         skip_if_absent: bool,
         /// This observation-only Prepare's provisional reservation. Settlement
-        /// releases or retains precisely this claim without affecting a
+        /// releases or retains precisely this hold without affecting a
         /// concurrent preparation for the same partial.
-        observation_claim: Option<ReservationClaimId>,
+        observation_hold: Option<ReservationHoldId>,
     },
 }
 
@@ -2823,13 +2823,13 @@ fn remove_leaf_locked(directory: &File, name: &str) -> Result<()> {
     }
 }
 
-fn generate_transport_key(id: EnrollmentId) -> Result<PrivateKey> {
+fn generate_enrollment_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).context("generate restricted transport key")?;
+    getrandom::fill(&mut seed).context("generate enrollment key")?;
     let keypair = Ed25519Keypair::from_seed(&seed);
     seed.fill(0);
     PrivateKey::new(keypair.into(), format!("syq-enrollment:{id}"))
-        .context("construct restricted transport key")
+        .context("construct enrollment key")
 }
 
 /// The receiver's own signing key for receipts. It lives only on hostB, in
@@ -3086,11 +3086,11 @@ pub(crate) fn remote_install() -> Result<()> {
     reject_control_plane_path(canonical_destination.as_os_str().as_bytes(), &protected)?;
     let root = crate::rooted::Root::open(&canonical_root)?;
     let root_identity = root.identity();
-    let transport = TransportPublicKey::parse(&request.public_key)?;
+    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
     let signer = signer_name(request.id);
     let public_words: Vec<&str> = request.public_key.split_ascii_whitespace().collect();
     if public_words.len() < 2 {
-        bail!("transport public key is malformed");
+        bail!("enrollment public key is malformed");
     }
     let running_receiver = std::env::current_exe().context("resolve restricted receiver path")?;
     delegation::validate_regular_executable(&running_receiver, "restricted receiver")?;
@@ -3104,7 +3104,7 @@ pub(crate) fn remote_install() -> Result<()> {
     // installer that already started has its bytes and recreates it before
     // publishing the new forced authorization.
     let receiver_path = materialize_receiver(&home, &receiver_contents)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
@@ -3224,8 +3224,8 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
         }
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
-    let transport = TransportPublicKey::parse(&request.public_key)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
+    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;
@@ -3327,8 +3327,8 @@ fn store_pending_files(
 ) -> Result<()> {
     let private = private_key
         .to_openssh(LineEnding::LF)
-        .context("encode restricted transport private key")?;
-    atomic_write(directory, "transport", private.as_bytes(), 0o600)?;
+        .context("encode enrollment private key")?;
+    atomic_write(directory, "enrollment-key", private.as_bytes(), 0o600)?;
     atomic_write(
         directory,
         "pending.json",
@@ -3416,11 +3416,11 @@ fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
 
 fn load_private_key(directory: &Path) -> Result<PrivateKey> {
     let encoded = delegation::read_private_regular(
-        &directory.join("transport"),
-        "restricted transport private key",
+        &directory.join("enrollment-key"),
+        "enrollment private key",
         128 * 1024,
     )?;
-    PrivateKey::from_openssh(&encoded).context("parse restricted transport private key")
+    PrivateKey::from_openssh(&encoded).context("parse enrollment private key")
 }
 
 #[derive(Debug)]
@@ -3670,7 +3670,7 @@ fn enroll(
         }
         (None, None) => {
             let id = EnrollmentId::random();
-            let private_key = generate_transport_key(id)?;
+            let private_key = generate_enrollment_key(id)?;
             let pending = PendingEnrollment {
                 version: CONFIG_VERSION,
                 id,
@@ -4196,7 +4196,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         allowed_signers,
         revocation_file: None,
     };
-    let verified = delegation::verify_and_claim(&envelope, &context, &policy, &replay)?;
+    let verified = delegation::verify_and_redeem(&envelope, &context, &policy, &replay)?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
     let receipt_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
@@ -4217,7 +4217,7 @@ fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     }
     let words = shell_words::split(original).context("parse restricted receiver command")?;
     if words.len() != 3 || words[0] != "syq" || words[1] != "--server" {
-        bail!("restricted credential accepts only a syq server request with one signed grant");
+        bail!("the enrollment key accepts only a syq server request with one signed grant");
     }
     let encoded = words[2]
         .strip_prefix("--restricted-grant=")
@@ -4476,9 +4476,9 @@ pub(crate) mod tests {
             fs::create_dir(&ssh).unwrap();
             fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 
-            let key = generate_transport_key(id).unwrap();
+            let key = generate_enrollment_key(id).unwrap();
             let public_key = key.public_key().to_openssh().unwrap();
-            let transport = TransportPublicKey::parse(&public_key).unwrap();
+            let transport = EnrollmentPublicKey::parse(&public_key).unwrap();
             let entry =
                 AuthorizedKeyEntry::new(id, &receiver_install_path(home), &transport).unwrap();
             let original = format!("{}\n", entry.line()).into_bytes();
@@ -4950,11 +4950,14 @@ pub(crate) mod tests {
             target_login: "backup".into(),
             requested_destination: "/archive/item".into(),
         };
-        let private_key = generate_transport_key(id).unwrap();
+        let private_key = generate_enrollment_key(id).unwrap();
         store_pending_files(&directory, &pending, &private_key).unwrap();
         assert!(directory.join("pending.json").is_file());
         assert_eq!(
-            fs::metadata(directory.join("transport")).unwrap().mode() & 0o777,
+            fs::metadata(directory.join("enrollment-key"))
+                .unwrap()
+                .mode()
+                & 0o777,
             0o600
         );
         assert_eq!(
@@ -4985,7 +4988,7 @@ pub(crate) mod tests {
         complete_local_enrollment(&directory, &metadata).unwrap();
         assert!(!directory.join("pending.json").exists());
         assert!(directory.join("metadata.json").is_file());
-        assert!(directory.join("transport").is_file());
+        assert!(directory.join("enrollment-key").is_file());
     }
 
     #[test]
@@ -5944,7 +5947,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // An observation the orchestrator asked for is hostB's own view.
+        // An observation the coordinator asked for is hostB's own view.
         let mut hash = Request::FileHash {
             path: path_bytes(&kept),
             source: None,
@@ -6308,7 +6311,7 @@ pub(crate) mod tests {
         assert!(authority.authorize(&mut late, false).is_err());
         assert!(authority.issue_receipt().is_err());
         let mut frames = Vec::new();
-        crate::receipt_v2::emit_transport_frames(issued, |frame| {
+        crate::receipt_v2::emit_receipt_frames(issued, |frame| {
             frames.push(Ok(frame));
             Ok(())
         })
@@ -6510,7 +6513,7 @@ pub(crate) mod tests {
     ) -> crate::receipt_v2::VerifiedReceiptV2 {
         let issued = authority.issue_receipt().unwrap();
         let mut frames = Vec::new();
-        crate::receipt_v2::emit_transport_frames(issued, |frame| {
+        crate::receipt_v2::emit_receipt_frames(issued, |frame| {
             frames.push(Ok(frame));
             Ok(())
         })
@@ -6660,7 +6663,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // The orchestrator refuses the same combination before signing. The
+        // The coordinator refuses the same combination before signing. The
         // rsync-shaped parser already makes --inplace and --ignore-existing
         // conflict, so the reachable case is the native --as-new placement.
         let mut args = Args::try_parse_from([
@@ -6681,7 +6684,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn signed_root_existence_is_checked_at_claim_and_forced_on_creation() {
+    fn signed_root_existence_is_checked_at_redemption_and_forced_on_creation() {
         use proto::TargetCondition::{Absent, Any};
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -6758,7 +6761,7 @@ pub(crate) mod tests {
         .unwrap();
 
         // The one existing-object policy the receiver cannot enforce is
-        // refused when the grant is claimed rather than trusted.
+        // refused when the grant is redeemed rather than trusted.
         assert!(existence_authority(
             &root,
             ExistingDestinationPolicy::UpdateIfOlder,
@@ -7259,7 +7262,7 @@ pub(crate) mod tests {
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 47_600,
             port_hi: 47_699,
@@ -7273,7 +7276,7 @@ pub(crate) mod tests {
 
         let wrong_range = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 1,
             port_hi: 2,
@@ -7283,7 +7286,7 @@ pub(crate) mod tests {
 
         let congestion_override = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 47_600,
             port_hi: 47_699,
@@ -7845,7 +7848,7 @@ pub(crate) mod tests {
             symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         };
         let error = authority.authorize(&mut request, true).unwrap_err();
         assert!(error

@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const CLAIM_MAGIC: &[u8; 8] = b"SYQFD001";
+const HANDOFF_MAGIC: &[u8; 8] = b"SYQFD001";
 const SECRET_LEN: usize = 32;
-const CLAIM_LEN: usize = CLAIM_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
+const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
@@ -294,7 +294,7 @@ pub(crate) struct DescriptorSession {
 impl DescriptorSession {
     pub(crate) fn start(max_roots: usize, max_connections: usize) -> Result<Self> {
         let registry = RegisteredRootRegistry::new(max_roots)?;
-        let secret: [u8; SECRET_LEN] = crate::crypto::random_bytes(SECRET_LEN)
+        let secret: [u8; SECRET_LEN] = crate::tcp_records::random_bytes(SECRET_LEN)
             .try_into()
             .map_err(|_| anyhow!("generated descriptor broker secret has the wrong length"))?;
         let server_registry = registry.clone();
@@ -309,7 +309,7 @@ impl DescriptorSession {
                 io_timeout: BROKER_IO_TIMEOUT,
             },
             move |mut stream, _connections| {
-                let _ = serve_claim(&mut stream, &server_registry, &server_secret);
+                let _ = serve_acquire(&mut stream, &server_registry, &server_secret);
             },
         )?;
         Ok(Self {
@@ -366,7 +366,7 @@ impl DescriptorSession {
 /// A process-local view of one endpoint session. The control connection
 /// creates the descriptor broker lazily when it registers a root. TCP workers
 /// share this slot and clone the root directly; a fresh independent-worker
-/// process has an empty slot and claims the same root over the broker socket.
+/// process has an empty slot and acquires the same root over the broker socket.
 #[derive(Clone)]
 pub(crate) struct DescriptorSessionSlot {
     session: Arc<Mutex<Option<DescriptorSession>>>,
@@ -477,7 +477,7 @@ impl DescriptorSessionSlot {
         if self.closed.load(Ordering::Acquire) {
             bail!("descriptor session is closed");
         }
-        claim_descriptor(ticket)
+        acquire_descriptor(ticket)
     }
 
     /// End the control session even if its detached TCP listener still holds
@@ -501,27 +501,27 @@ impl DescriptorSessionSlot {
 /// Claim a registered root from an independent process. The returned
 /// descriptor refers to the exact registered object even if its original
 /// pathname has been renamed or replaced.
-pub(crate) fn claim_descriptor(ticket: &DescriptorTicket) -> Result<File> {
+pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     let socket_path = ticket.socket_path();
     let mut stream = UnixStream::connect(&socket_path)
         .with_context(|| format!("connect to descriptor broker {}", socket_path.display()))?;
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
-    let mut claim = [0u8; CLAIM_LEN];
-    claim[..CLAIM_MAGIC.len()].copy_from_slice(CLAIM_MAGIC);
-    let secret_start = CLAIM_MAGIC.len();
-    claim[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
+    let mut request = [0u8; HANDOFF_REQUEST_LEN];
+    request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
+    let secret_start = HANDOFF_MAGIC.len();
+    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
     let root_start = secret_start + SECRET_LEN;
     let root_end = root_start + size_of::<u64>();
-    claim[root_start..root_end].copy_from_slice(&ticket.root_id.0.to_be_bytes());
-    claim[root_end] = ticket.kind.wire_byte();
-    stream.write_all(&claim)?;
+    request[root_start..root_end].copy_from_slice(&ticket.root_id.0.to_be_bytes());
+    request[root_end] = ticket.kind.wire_byte();
+    stream.write_all(&request)?;
 
     let (status, descriptor) = receive_descriptor(stream.as_raw_fd())?;
     match (status, descriptor) {
         (RESPONSE_OK, Some(descriptor)) => Ok(descriptor),
         (RESPONSE_OK, None) => bail!("descriptor broker returned success without a descriptor"),
-        (RESPONSE_REJECTED, None) => bail!("descriptor broker rejected the session root claim"),
+        (RESPONSE_REJECTED, None) => bail!("descriptor broker rejected the session root request"),
         (RESPONSE_INTERNAL, None) => {
             bail!("descriptor broker could not duplicate the session root")
         }
@@ -530,16 +530,16 @@ pub(crate) fn claim_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     }
 }
 
-fn serve_claim(
+fn serve_acquire(
     stream: &mut TrackedStream,
     registry: &RegisteredRootRegistry,
     secret: &[u8; SECRET_LEN],
 ) -> Result<()> {
-    let mut claim = [0u8; CLAIM_LEN];
-    stream.read_exact(&mut claim)?;
-    let secret_start = CLAIM_MAGIC.len();
-    let authenticated = claim[..secret_start] == *CLAIM_MAGIC
-        && claim[secret_start..secret_start + SECRET_LEN] == *secret;
+    let mut request = [0u8; HANDOFF_REQUEST_LEN];
+    stream.read_exact(&mut request)?;
+    let secret_start = HANDOFF_MAGIC.len();
+    let authenticated = request[..secret_start] == *HANDOFF_MAGIC
+        && request[secret_start..secret_start + SECRET_LEN] == *secret;
     if !authenticated {
         stream.write_all(&[RESPONSE_REJECTED])?;
         return Ok(());
@@ -547,11 +547,11 @@ fn serve_claim(
     let root_start = secret_start + SECRET_LEN;
     let root_end = root_start + size_of::<u64>();
     let root_id = RegisteredRootId(u64::from_be_bytes(
-        claim[root_start..root_end]
+        request[root_start..root_end]
             .try_into()
-            .expect("claim root identifier has a fixed length"),
+            .expect("request root identifier has a fixed length"),
     ));
-    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(claim[root_end]) else {
+    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(request[root_end]) else {
         stream.write_all(&[RESPONSE_REJECTED])?;
         return Ok(());
     };
@@ -622,7 +622,7 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
     // Darwin does not expose an atomic close-on-exec receive flag. The future
-    // worker protocol must therefore claim its roots during single-threaded
+    // worker protocol must therefore request its roots during single-threaded
     // initialization, before it can spawn children, and acknowledge startup
     // only after this function has applied FD_CLOEXEC.
     #[cfg(not(target_os = "linux"))]
@@ -824,7 +824,7 @@ mod tests {
         assert!(directory_ticket.same_session(&leaf_ticket));
 
         // An empty slot takes the independent-worker SCM_RIGHTS path. Both
-        // kinds can be claimed repeatedly and each receipt is close-on-exec.
+        // kinds can be acquired repeatedly and each receipt is close-on-exec.
         let fresh = DescriptorSessionSlot::default();
         let directory = fresh.acquire(&directory_ticket).unwrap();
         assert!(directory.metadata().unwrap().is_dir());
@@ -845,7 +845,7 @@ mod tests {
 
         let mut missing_object = session.register(File::open(temp.path()).unwrap()).unwrap();
         missing_object.kind = RegisteredDescriptorKind::SourceLeaf;
-        assert!(claim_descriptor(&missing_object)
+        assert!(acquire_descriptor(&missing_object)
             .unwrap_err()
             .to_string()
             .contains("rejected"));
@@ -855,7 +855,7 @@ mod tests {
     fn independent_process_receives_exact_registered_descriptor() {
         if std::env::var_os(CHILD_ENV).is_some() {
             let ticket = ticket_from_environment();
-            let directory = claim_descriptor(&ticket).unwrap();
+            let directory = acquire_descriptor(&ticket).unwrap();
             let metadata = directory.metadata().unwrap();
             let expected_dev: u64 = std::env::var("SYQ_TEST_DESCRIPTOR_BROKER_DEV")
                 .unwrap()
@@ -914,14 +914,14 @@ mod tests {
 
         let mut bad_secret = session.ticket(root).unwrap();
         bad_secret.secret[0] ^= 1;
-        assert!(claim_descriptor(&bad_secret)
+        assert!(acquire_descriptor(&bad_secret)
             .unwrap_err()
             .to_string()
             .contains("rejected"));
 
         let mut unknown = session.ticket(root).unwrap();
         unknown.root_id = RegisteredRootId(root.0 + 1);
-        assert!(claim_descriptor(&unknown)
+        assert!(acquire_descriptor(&unknown)
             .unwrap_err()
             .to_string()
             .contains("rejected"));

@@ -531,15 +531,15 @@ pub(crate) struct IssuedReceiptV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TransportModeV2 {
+pub(crate) enum ReceiptDeliveryKindV2 {
     AttachedEncrypted,
     DetachedSignedPlaintext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TransportFrameV2 {
+pub(crate) enum ReceiptFrameV2 {
     Start {
-        mode: TransportModeV2,
+        mode: ReceiptDeliveryKindV2,
         encapsulated_key: Vec<u8>,
     },
     Chunk {
@@ -553,9 +553,9 @@ pub(crate) enum TransportFrameV2 {
 }
 
 #[derive(Serialize)]
-enum BorrowedTransportFrameV2<'a> {
+enum BorrowedReceiptFrameV2<'a> {
     Start {
-        mode: TransportModeV2,
+        mode: ReceiptDeliveryKindV2,
         encapsulated_key: &'a [u8],
     },
     Chunk {
@@ -569,21 +569,21 @@ enum BorrowedTransportFrameV2<'a> {
 }
 
 #[cfg(test)]
-impl TransportFrameV2 {
-    fn as_borrowed(&self) -> BorrowedTransportFrameV2<'_> {
+impl ReceiptFrameV2 {
+    fn as_borrowed(&self) -> BorrowedReceiptFrameV2<'_> {
         match self {
             Self::Start {
                 mode,
                 encapsulated_key,
-            } => BorrowedTransportFrameV2::Start {
+            } => BorrowedReceiptFrameV2::Start {
                 mode: *mode,
                 encapsulated_key,
             },
-            Self::Chunk { sequence, payload } => BorrowedTransportFrameV2::Chunk {
+            Self::Chunk { sequence, payload } => BorrowedReceiptFrameV2::Chunk {
                 sequence: *sequence,
                 payload,
             },
-            Self::End { sequence, payload } => BorrowedTransportFrameV2::End {
+            Self::End { sequence, payload } => BorrowedReceiptFrameV2::End {
                 sequence: *sequence,
                 payload,
             },
@@ -591,7 +591,7 @@ impl TransportFrameV2 {
     }
 }
 
-pub(crate) fn emit_transport_frames(
+pub(crate) fn emit_receipt_frames(
     mut issued: IssuedReceiptV2,
     mut emit: impl FnMut(Vec<u8>) -> Result<()>,
 ) -> Result<()> {
@@ -607,9 +607,9 @@ pub(crate) fn emit_transport_frames(
                 setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &public, &info)
                     .map_err(|_| anyhow!("set up HPKE receipt sender"))?;
             let encapsulated = encapsulated.to_bytes();
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::Start {
-                    mode: TransportModeV2::AttachedEncrypted,
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrameV2::Start {
+                    mode: ReceiptDeliveryKindV2::AttachedEncrypted,
                     encapsulated_key: encapsulated.as_slice(),
                 },
             )?)?;
@@ -626,8 +626,8 @@ pub(crate) fn emit_transport_frames(
                 let payload = sender
                     .seal(&buffer[..wanted], &frame_aad(sequence, false))
                     .map_err(|_| anyhow!("encrypt receipt stream frame"))?;
-                emit(encode_borrowed_transport_frame(
-                    &BorrowedTransportFrameV2::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrameV2::Chunk {
                         sequence,
                         payload: &payload,
                     },
@@ -638,17 +638,17 @@ pub(crate) fn emit_transport_frames(
             let payload = sender
                 .seal(&issued.signed_terminal, &frame_aad(sequence, true))
                 .map_err(|_| anyhow!("encrypt receipt terminal frame"))?;
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::End {
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrameV2::End {
                     sequence,
                     payload: &payload,
                 },
             )?)?;
         }
         ReceiptDeliveryV2::DetachedSignedPlaintext => {
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::Start {
-                    mode: TransportModeV2::DetachedSignedPlaintext,
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrameV2::Start {
+                    mode: ReceiptDeliveryKindV2::DetachedSignedPlaintext,
                     encapsulated_key: &[],
                 },
             )?)?;
@@ -662,8 +662,8 @@ pub(crate) fn emit_transport_frames(
                     .stream
                     .read_exact(&mut buffer[..wanted])
                     .context("read receiver receipt spool")?;
-                emit(encode_borrowed_transport_frame(
-                    &BorrowedTransportFrameV2::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrameV2::Chunk {
                         sequence,
                         payload: &buffer[..wanted],
                     },
@@ -671,8 +671,8 @@ pub(crate) fn emit_transport_frames(
                 sequence += 1;
                 remaining -= wanted as u64;
             }
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::End {
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrameV2::End {
                     sequence,
                     payload: &issued.signed_terminal,
                 },
@@ -683,17 +683,17 @@ pub(crate) fn emit_transport_frames(
 }
 
 #[cfg(test)]
-pub(crate) fn encode_transport_frame(frame: &TransportFrameV2) -> Result<Vec<u8>> {
-    encode_borrowed_transport_frame(&frame.as_borrowed())
+pub(crate) fn encode_receipt_frame(frame: &ReceiptFrameV2) -> Result<Vec<u8>> {
+    encode_borrowed_receipt_frame(&frame.as_borrowed())
 }
 
-fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Result<Vec<u8>> {
+fn encode_borrowed_receipt_frame(frame: &BorrowedReceiptFrameV2<'_>) -> Result<Vec<u8>> {
     let payload_len = match frame {
-        BorrowedTransportFrameV2::Start {
+        BorrowedReceiptFrameV2::Start {
             encapsulated_key, ..
         } => encapsulated_key.len(),
-        BorrowedTransportFrameV2::Chunk { payload, .. }
-        | BorrowedTransportFrameV2::End { payload, .. } => payload.len(),
+        BorrowedReceiptFrameV2::Chunk { payload, .. }
+        | BorrowedReceiptFrameV2::End { payload, .. } => payload.len(),
     };
     // Postcard adds only enum tags and variable-length integer fields around
     // the byte payload. Leave modest headroom so normal frames need one
@@ -701,13 +701,13 @@ fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Resu
     let capacity = HEADER_LEN
         .checked_add(payload_len)
         .and_then(|length| length.checked_add(32))
-        .context("receipt transport frame length overflow")?;
+        .context("receipt frame length overflow")?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.resize(HEADER_LEN, 0);
-    encoded = postcard::to_extend(frame, encoded).context("encode receipt transport frame")?;
+    encoded = postcard::to_extend(frame, encoded).context("encode receipt frame")?;
     let body_len = encoded.len() - HEADER_LEN;
     if body_len == 0 || body_len > MAX_FRAME_BODY_BYTES {
-        bail!("receipt transport frame exceeds size limit");
+        bail!("receipt frame exceeds size limit");
     }
     encoded[..8].copy_from_slice(FRAME_MAGIC);
     encoded[8..10].copy_from_slice(&FRAME_VERSION.to_be_bytes());
@@ -715,9 +715,9 @@ fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Resu
     Ok(encoded)
 }
 
-pub(crate) fn decode_transport_frame(encoded: &[u8]) -> Result<TransportFrameV2> {
+pub(crate) fn decode_receipt_frame(encoded: &[u8]) -> Result<ReceiptFrameV2> {
     if encoded.len() < HEADER_LEN || &encoded[..8] != FRAME_MAGIC {
-        bail!("not a receipt v2 transport frame");
+        bail!("not a receipt v2 frame");
     }
     let version = u16::from_be_bytes(encoded[8..10].try_into().expect("fixed header"));
     if version != FRAME_VERSION {
@@ -725,31 +725,30 @@ pub(crate) fn decode_transport_frame(encoded: &[u8]) -> Result<TransportFrameV2>
     }
     let body_len = u32::from_be_bytes(encoded[10..14].try_into().expect("fixed header")) as usize;
     if body_len == 0 || body_len > MAX_FRAME_BODY_BYTES || encoded.len() != HEADER_LEN + body_len {
-        bail!("receipt transport frame length is noncanonical");
+        bail!("receipt frame length is noncanonical");
     }
     let body = &encoded[HEADER_LEN..];
-    let frame: TransportFrameV2 =
-        postcard::from_bytes(body).context("decode receipt transport frame")?;
+    let frame: ReceiptFrameV2 = postcard::from_bytes(body).context("decode receipt frame")?;
     if postcard::to_stdvec(&frame)? != body {
-        bail!("receipt transport frame uses a noncanonical encoding");
+        bail!("receipt frame uses a noncanonical encoding");
     }
     match &frame {
-        TransportFrameV2::Start {
-            mode: TransportModeV2::AttachedEncrypted,
+        ReceiptFrameV2::Start {
+            mode: ReceiptDeliveryKindV2::AttachedEncrypted,
             encapsulated_key,
         } if encapsulated_key.len() != 32 => bail!("invalid HPKE encapsulated-key length"),
-        TransportFrameV2::Start {
-            mode: TransportModeV2::DetachedSignedPlaintext,
+        ReceiptFrameV2::Start {
+            mode: ReceiptDeliveryKindV2::DetachedSignedPlaintext,
             encapsulated_key,
         } if !encapsulated_key.is_empty() => {
             bail!("plaintext receipt start frame carries an encapsulated key")
         }
-        TransportFrameV2::Chunk { payload, .. }
+        ReceiptFrameV2::Chunk { payload, .. }
             if payload.len() > PLAINTEXT_CHUNK_BYTES + HPKE_TAG_BYTES =>
         {
             bail!("receipt chunk payload exceeds size limit")
         }
-        TransportFrameV2::End { payload, .. }
+        ReceiptFrameV2::End { payload, .. }
             if payload.len()
                 > MAX_TERMINAL_BYTES
                     + MAX_SIGNATURE_BYTES
@@ -763,10 +762,10 @@ pub(crate) fn decode_transport_frame(encoded: &[u8]) -> Result<TransportFrameV2>
     Ok(frame)
 }
 
-pub(crate) fn transport_frame_is_end(encoded: &[u8]) -> Result<bool> {
+pub(crate) fn receipt_frame_is_end(encoded: &[u8]) -> Result<bool> {
     Ok(matches!(
-        decode_transport_frame(encoded)?,
-        TransportFrameV2::End { .. }
+        decode_receipt_frame(encoded)?,
+        ReceiptFrameV2::End { .. }
     ))
 }
 
@@ -1004,7 +1003,7 @@ pub(crate) fn emit_automation_records(
     // counted error, by construction.
     let errors = errors_emitted;
     // Aggregates describe receiver-visible work only: unchanged and
-    // excluded entries are orchestrator concepts a receipt cannot attest.
+    // excluded entries are coordinator concepts a receipt cannot attest.
     writer.emit_terminal_value(serde_json::json!({
         "type": "result",
         "provenance": "receiver_attested",
@@ -1109,7 +1108,7 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-/// Decrypt and verify an attached receipt whose encoded transport frames have
+/// Decrypt and verify an attached receipt whose encoded frames have
 /// been captured in order. Decrypted bytes remain in an anonymous temporary
 /// file until the terminal signature and stream commitment have verified.
 pub(crate) fn open_attached_frames<I>(
@@ -1128,13 +1127,13 @@ where
     let first = frames
         .next()
         .context("receipt stream has no start frame")??;
-    let encapsulated_key = match decode_transport_frame(&first)? {
-        TransportFrameV2::Start {
-            mode: TransportModeV2::AttachedEncrypted,
+    let encapsulated_key = match decode_receipt_frame(&first)? {
+        ReceiptFrameV2::Start {
+            mode: ReceiptDeliveryKindV2::AttachedEncrypted,
             encapsulated_key,
         } => encapsulated_key,
-        TransportFrameV2::Start {
-            mode: TransportModeV2::DetachedSignedPlaintext,
+        ReceiptFrameV2::Start {
+            mode: ReceiptDeliveryKindV2::DetachedSignedPlaintext,
             ..
         } => bail!("attached transfer received a detached plaintext receipt"),
         _ => bail!("receipt stream does not begin with a start frame"),
@@ -1157,8 +1156,8 @@ where
         let encoded = frames
             .next()
             .context("receipt stream has no terminal frame")??;
-        match decode_transport_frame(&encoded)? {
-            TransportFrameV2::Chunk {
+        match decode_receipt_frame(&encoded)? {
+            ReceiptFrameV2::Chunk {
                 sequence: observed,
                 payload,
             } => {
@@ -1173,7 +1172,7 @@ where
                     .context("write local decrypted receipt spool")?;
                 sequence += 1;
             }
-            TransportFrameV2::End {
+            ReceiptFrameV2::End {
                 sequence: observed,
                 payload,
             } => {
@@ -1185,7 +1184,7 @@ where
                     .map_err(|_| anyhow!("receipt terminal frame failed authentication"))?;
                 break terminal;
             }
-            TransportFrameV2::Start { .. } => bail!("receipt stream contains a second start frame"),
+            ReceiptFrameV2::Start { .. } => bail!("receipt stream contains a second start frame"),
         }
     };
     if frames.next().is_some() {
@@ -1653,7 +1652,7 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             frames.push(frame);
             Ok(())
         })
@@ -1747,17 +1746,17 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_transport_frames_preserve_wire_encoding() {
+    fn borrowed_receipt_frames_preserve_wire_encoding() {
         let frames = [
-            TransportFrameV2::Start {
-                mode: TransportModeV2::AttachedEncrypted,
+            ReceiptFrameV2::Start {
+                mode: ReceiptDeliveryKindV2::AttachedEncrypted,
                 encapsulated_key: vec![3; 32],
             },
-            TransportFrameV2::Chunk {
+            ReceiptFrameV2::Chunk {
                 sequence: u64::MAX,
                 payload: vec![5; PLAINTEXT_CHUNK_BYTES],
             },
-            TransportFrameV2::End {
+            ReceiptFrameV2::End {
                 sequence: 17,
                 payload: vec![7; 257],
             },
@@ -1767,9 +1766,9 @@ mod tests {
             let borrowed = postcard::to_stdvec(&frame.as_borrowed()).unwrap();
             assert_eq!(borrowed, owned);
 
-            let encoded = encode_transport_frame(&frame).unwrap();
+            let encoded = encode_receipt_frame(&frame).unwrap();
             assert_eq!(&encoded[HEADER_LEN..], owned);
-            assert_eq!(decode_transport_frame(&encoded).unwrap(), frame);
+            assert_eq!(decode_receipt_frame(&encoded).unwrap(), frame);
         }
     }
 
@@ -1827,7 +1826,7 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             frames.push(frame);
             Ok(())
         })
@@ -1943,17 +1942,17 @@ mod tests {
                 .unwrap()
         };
         let mut tampered = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             tampered.push(frame);
             Ok(())
         })
         .unwrap();
-        let mut chunk = decode_transport_frame(&tampered[1]).unwrap();
-        let TransportFrameV2::Chunk { payload, .. } = &mut chunk else {
+        let mut chunk = decode_receipt_frame(&tampered[1]).unwrap();
+        let ReceiptFrameV2::Chunk { payload, .. } = &mut chunk else {
             panic!("expected encrypted stream chunk");
         };
         payload[0] ^= 1;
-        tampered[1] = encode_transport_frame(&chunk).unwrap();
+        tampered[1] = encode_receipt_frame(&chunk).unwrap();
         assert!(open_attached_frames(
             tampered.into_iter().map(Ok),
             &secret,
@@ -2007,24 +2006,24 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
-            frames.push(decode_transport_frame(&frame)?);
+        emit_receipt_frames(issued, |frame| {
+            frames.push(decode_receipt_frame(&frame)?);
             Ok(())
         })
         .unwrap();
         assert!(matches!(
             frames[0],
-            TransportFrameV2::Start {
-                mode: TransportModeV2::DetachedSignedPlaintext,
+            ReceiptFrameV2::Start {
+                mode: ReceiptDeliveryKindV2::DetachedSignedPlaintext,
                 ref encapsulated_key,
             } if encapsulated_key.is_empty()
         ));
-        let TransportFrameV2::Chunk { payload, .. } = &frames[1] else {
+        let ReceiptFrameV2::Chunk { payload, .. } = &frames[1] else {
             panic!("expected plaintext receipt chunk");
         };
         let mut spool = tempfile::tempfile().unwrap();
         spool.write_all(payload).unwrap();
-        let TransportFrameV2::End { payload, .. } = &frames[2] else {
+        let ReceiptFrameV2::End { payload, .. } = &frames[2] else {
             panic!("expected signed terminal frame");
         };
         let terminal =

@@ -640,7 +640,7 @@ pub enum Request {
         shared_workers: usize,
         /// Maximum concurrent independent-worker claims against the control
         /// process's private descriptor broker.
-        independent_claim_workers: usize,
+        independent_handoff_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
@@ -913,7 +913,7 @@ pub enum Response {
     /// and authorization protocol failures continue to use Err(String).
     EndpointError(WireError),
     Err(String),
-    /// `CopyLocal` could not use the receiver-side direct-copy path. This is
+    /// `CopyLocal` could not use the receiver-side kernel-copy path. This is
     /// deliberately distinct from `Err`: filenames and other diagnostics are
     /// untrusted text and must never select a recovery path.
     CopyLocalUnsupported,

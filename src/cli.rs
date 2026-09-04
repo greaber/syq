@@ -79,7 +79,7 @@ pub struct Args {
     #[arg(skip)]
     pub locations: Vec<Location>,
     /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
-    /// not joined into selector strings by the orchestrator.
+    /// not joined into selector strings by the coordinator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
     /// Endpoint-side containment boundary for native removal.
@@ -280,7 +280,7 @@ pub struct Args {
         value_name = "LO-HI"
     )]
     pub tcp_ports: String,
-    /// SYQ extension: use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    /// SYQ extension: use this congestion-control algorithm for TCP data sockets (Linux only)
     #[arg(
         long = "syq-tcp-congestion",
         value_name = "ALGO",
@@ -294,7 +294,7 @@ pub struct Args {
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Signed receiver grant forwarded to a native source-host orchestrator
+    /// Signed receiver grant forwarded to a native source-host coordinator
     #[arg(skip)]
     pub restricted_grant: Option<String>,
     /// Terminal width for a native remote coordinator's progress display
@@ -855,7 +855,7 @@ struct NativeRemoteArgs {
     /// Port range remote listeners use for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     tcp_ports: String,
-    /// Use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    /// Use this congestion-control algorithm for TCP data sockets (Linux only)
     #[arg(
         long,
         value_name = "ALGO",
@@ -2050,7 +2050,7 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
 fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
-    // way on every orchestrator. The kernel otherwise looks up the registered
+    // way on every coordinator. The kernel otherwise looks up the registered
     // name exactly, without imposing a character whitelist.
     if value.is_empty() {
         return Err("congestion-control algorithm cannot be empty".into());
