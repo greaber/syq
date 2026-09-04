@@ -2,10 +2,10 @@
 //!
 //! `Root` follows the explicitly selected root path once, opens that directory,
 //! and uses only the resulting descriptor afterward. Descendant paths are raw
-//! Unix bytes split into validated relative components. Every intermediate
-//! component is opened relative to the preceding descriptor with
-//! `O_DIRECTORY | O_NOFOLLOW`; leaf operations are performed relative to a
-//! held parent descriptor. There is no pathname fallback.
+//! Unix bytes split into validated relative components. The kernel resolves
+//! each intermediate component without following symlinks, and leaf operations
+//! are performed relative to a held parent descriptor. There is no pathname
+//! fallback.
 //!
 //! Native guarded placements and signed receivers use these operations for
 //! descendant mutation and inspection; the unrestricted implementation remains
@@ -15,9 +15,11 @@
 //! Traversal uses search-only descriptors where the platform provides them;
 //! directory enumeration separately opens an independent readable descriptor.
 //!
-//! Linux currently uses the same component walk as other Unix platforms. An
-//! `openat2` fast path should be added only with tests proving that it has
-//! exactly the same root-symlink, descendant-symlink, and mount semantics.
+//! Linux uses `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` to
+//! open a validated multi-component directory path in one syscall. Kernels or
+//! sandboxes without that syscall retain the same component-by-component
+//! descriptor walk used on other Unix platforms; neither path falls back to
+//! an unconfined pathname.
 //!
 //! The guarantee is pathname confinement. A hard link beneath the root may
 //! still refer to an inode with another name outside the root. As with all
@@ -899,12 +901,8 @@ impl Root {
     /// Open the root or a descendant directory without following any
     /// descendant symlink.
     pub(crate) fn open_directory(&self, path: &RelativePath) -> Result<File> {
-        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
-        for component in &path.components {
-            directory = open_directory_at(&directory, component)
-                .with_context(|| format!("open confined directory {}", path.label()))?;
-        }
-        Ok(directory)
+        open_directory_components(&self.directory, &path.components)
+            .with_context(|| format!("open confined directory {}", path.label()))
     }
 
     /// Open the longest directory prefix without following a descendant
@@ -1065,6 +1063,9 @@ impl Root {
     /// accepted only when the resulting component opens as a directory.
     pub(crate) fn create_missing_parents(&self, path: &RelativePath, mode: u32) -> Result<()> {
         let (parents, _) = path.leaf()?;
+        if open_directory_components_fast(&self.directory, parents).is_ok() {
+            return Ok(());
+        }
         let mut directory = self.directory.try_clone().context("duplicate root fd")?;
         for component in parents {
             match open_directory_at(&directory, component) {
@@ -1699,11 +1700,8 @@ impl Root {
 
     fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent> {
         let (parents, leaf) = path.leaf()?;
-        let mut directory = self.directory.try_clone().context("duplicate root fd")?;
-        for component in parents {
-            directory = open_directory_at(&directory, component)
-                .with_context(|| format!("resolve confined parent for {}", path.label()))?;
-        }
+        let directory = open_directory_components(&self.directory, parents)
+            .with_context(|| format!("resolve confined parent for {}", path.label()))?;
         Ok(ResolvedParent {
             directory,
             leaf: component_cstring(leaf),
@@ -2018,6 +2016,93 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
         access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC,
         0,
     )
+}
+
+fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        match open_directory_components_fast(parent, components) {
+            Ok(directory) => Ok(directory),
+            Err(_) => open_directory_components_one_at_a_time(parent, components),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        open_directory_components_one_at_a_time(parent, components)
+    }
+}
+
+fn open_directory_components_one_at_a_time(
+    parent: &File,
+    components: &[Vec<u8>],
+) -> io::Result<File> {
+    let mut directory = parent.try_clone()?;
+    for component in components {
+        directory = open_directory_at(&directory, component)?;
+    }
+    Ok(directory)
+}
+
+fn open_directory_components_fast(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+    if components.is_empty() {
+        return parent.try_clone();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        open_directory_components_openat2(parent, components)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        open_directory_components_one_at_a_time(parent, components)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_components_openat2(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    // linux/openat2.h. libc exposes SYS_openat2 but not open_how or these
+    // resolve flags on every supported target.
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    let path_len = components.iter().map(Vec::len).sum::<usize>() + components.len() - 1;
+    let mut path = Vec::with_capacity(path_len);
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            path.push(b'/');
+        }
+        path.extend_from_slice(component);
+    }
+    let path = CString::new(path).expect("RelativePath already rejected NUL");
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    loop {
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                parent.as_raw_fd(),
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd as RawFd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn open_readable_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
@@ -2446,6 +2531,24 @@ mod tests {
         RelativePath::new(path).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    fn require_test_openat2(result: io::Result<File>) -> Option<File> {
+        match result {
+            Ok(file) => Some(file),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                // Production retains the secure component walker when the
+                // running kernel or its syscall policy does not allow openat2.
+                None
+            }
+            Err(error) => panic!("openat2 fast path failed unexpectedly: {error}"),
+        }
+    }
+
     #[test]
     fn rooted_name_max_queries_each_filesystem_once() {
         let tree = TestDir::new("name-max-cache");
@@ -2470,6 +2573,72 @@ mod tests {
             143
         );
         assert_eq!(queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openat2_directory_walk_matches_component_walk() {
+        let tree = TestDir::new("openat2-directory-walk");
+        fs::create_dir_all(tree.path().join("first/second/third")).unwrap();
+        let base = File::open(tree.path()).unwrap();
+        let components = relative(b"first/second/third").components;
+
+        let Some(fast) =
+            require_test_openat2(open_directory_components_openat2(&base, &components))
+        else {
+            return;
+        };
+        let component_walk = open_directory_components_one_at_a_time(&base, &components).unwrap();
+        let fast_metadata = fast.metadata().unwrap();
+        let component_metadata = component_walk.metadata().unwrap();
+
+        assert_eq!(fast_metadata.dev(), component_metadata.dev());
+        assert_eq!(fast_metadata.ino(), component_metadata.ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openat2_directory_walk_refuses_intermediate_symlink() {
+        let tree = TestDir::new("openat2-directory-symlink");
+        fs::create_dir_all(tree.path().join("real/child")).unwrap();
+        symlink("real", tree.path().join("link")).unwrap();
+        let base = File::open(tree.path()).unwrap();
+        let supported = relative(b"real/child").components;
+        if require_test_openat2(open_directory_components_openat2(&base, &supported)).is_none() {
+            return;
+        }
+        let components = relative(b"link/child").components;
+
+        assert!(open_directory_components_openat2(&base, &components).is_err());
+        let component_error =
+            open_directory_components_one_at_a_time(&base, &components).unwrap_err();
+        let selected_error = open_directory_components(&base, &components).unwrap_err();
+        assert_eq!(
+            selected_error.raw_os_error(),
+            component_error.raw_os_error()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openat2_directory_walk_allows_nested_mounts() {
+        if !Path::new("/proc/sys").is_dir() {
+            return;
+        }
+        let base = File::open("/").unwrap();
+        let components = relative(b"proc/sys").components;
+
+        let Some(fast) =
+            require_test_openat2(open_directory_components_openat2(&base, &components))
+        else {
+            return;
+        };
+        let component_walk = open_directory_components_one_at_a_time(&base, &components).unwrap();
+        let fast_metadata = fast.metadata().unwrap();
+        let component_metadata = component_walk.metadata().unwrap();
+
+        assert_eq!(fast_metadata.dev(), component_metadata.dev());
+        assert_eq!(fast_metadata.ino(), component_metadata.ino());
     }
 
     #[test]
