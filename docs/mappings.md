@@ -298,7 +298,7 @@ output; `--results-fd N` writes to a caller-opened descriptor instead
 (`--results-fd 3 3>r.ndjson`, or a pipe). The
 full contract — every record type and field, the exit-code table,
 the JSON Schema, and example streams — is
-[Automation results](automation-v1.md). In brief: the
+[Automation results](automation.md). In brief: the
 stream carries `schema_version: 1`: a `run` record (run id, mode,
 endpoints), sampled `progress` records, one `operation_result` per
 settled mutation and per failed mapping entry (with `retryable`, and

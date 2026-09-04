@@ -14264,16 +14264,16 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
     assert_eq!(terminal["deletions_blocked"], 0);
 }
 
-fn automation_v1_validator() -> jsonschema::Validator {
+fn automation_validator() -> jsonschema::Validator {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schemas/automation-v1.schema.json"))
+        serde_json::from_str(include_str!("../schemas/automation.schema.json"))
             .expect("schema file is JSON");
     jsonschema::validator_for(&schema).expect("schema compiles")
 }
 
 /// Every line validates against the committed schema, seq is contiguous
 /// from 0, the first record is `run`, and the last is `result`.
-fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
+fn assert_automation_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
     let records: Vec<serde_json::Value> = content
         .lines()
         .enumerate()
@@ -14294,9 +14294,9 @@ fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str,
 }
 
 #[test]
-fn automation_v1_fixtures_validate_against_schema() {
-    let validator = automation_v1_validator();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation-v1");
+fn automation_fixtures_validate_against_schema() {
+    let validator = automation_validator();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("fixture dir")
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -14319,7 +14319,7 @@ fn automation_v1_fixtures_validate_against_schema() {
     );
     for name in names {
         let content = String::from_utf8(read(&dir.join(&name))).unwrap();
-        assert_automation_v1_stream(&validator, &content, &name);
+        assert_automation_stream(&validator, &content, &name);
     }
     // The strictness is the point: a shape change must fail, not slide by.
     let mut record: serde_json::Value = serde_json::from_str(
@@ -14347,8 +14347,8 @@ fn automation_v1_fixtures_validate_against_schema() {
 }
 
 #[test]
-fn automation_v1_live_streams_validate_against_schema() {
-    let validator = automation_v1_validator();
+fn automation_live_streams_validate_against_schema() {
+    let validator = automation_validator();
     let manifest = format!(
         "{}{}",
         entry_line("Berlin/IMG.JPG", "berlin/2024/img.jpg", Some("file")),
@@ -14367,7 +14367,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
         assert!(out.status.success(), "{name}: {}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path(&results))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
     }
 
     // partial: one mapping entry fails. Exit 23.
@@ -14391,7 +14391,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "partial");
+        assert_automation_stream(&validator, &content, "partial");
     }
 
     // refused: --max-delete blocks the deletion pass. Exit 25.
@@ -14419,7 +14419,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "refused");
+        assert_automation_stream(&validator, &content, "refused");
     }
 
     // failed: fatal setup failure still yields a valid stream. Exit 1.
@@ -14440,7 +14440,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "failed");
+        assert_automation_stream(&validator, &content, "failed");
     }
 
     // Native removal has command-specific selector, trace, outcome, and
@@ -14458,7 +14458,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = command.run().unwrap();
         assert_output_ok(&out);
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
         assert_eq!(t.path("tree").exists(), dry_run);
     }
 }

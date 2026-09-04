@@ -28,7 +28,7 @@ plan = syq.cp("project", to="server", into="/backup", dry_run=True)
 print(plan.files_transferred, plan.bytes_transferred)
 ```
 
-The typed API validates syq's complete automation-v1 stream and its agreement
+The typed API validates syq's complete automation results stream and its agreement
 with the process status. Dry and live calls return the same `CpResult` type;
 dry runs report planned mutation totals and emit `TraceEvent` records:
 

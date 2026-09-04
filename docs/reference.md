@@ -342,7 +342,7 @@ would act on them.
 file, one run), and
 `--results-fd N` writes to a descriptor the caller opened, e.g.
 `--results-fd 3 3>run.ndjson` (see
-[Automation results](automation-v1.md)). The stream is always written on the
+[Automation results](automation.md)). The stream is always written on the
 invoking machine. For a remote-to-remote copy the coordinator is normally
 elsewhere, so the copy is refused unless `--coordinate-at local` is passed
 explicitly — routing through this machine is never chosen implicitly on the

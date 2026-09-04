@@ -1,13 +1,13 @@
-# Automation results, schema version 1
+# Automation results
 
 Native `syq cp --results FILE` and `syq rm --results FILE` write a
 machine-readable NDJSON stream of operation outcomes. This document is the
 contract for those streams:
 what each record means, which fields a consumer may rely on, and how
 exit codes correspond to terminal statuses. The machine-checkable
-counterpart is [`schemas/automation-v1.schema.json`](https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json);
+counterpart is [`schemas/automation.schema.json`](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json);
 example streams live in
-[`tests/fixtures/automation-v1/`](https://github.com/greaber/syq/tree/master/tests/fixtures/automation-v1).
+[`tests/fixtures/automation/`](https://github.com/greaber/syq/tree/master/tests/fixtures/automation).
 For the mapping manifest *input* format, see
 [Mappings](mappings.md) — `syq map` output is a manifest, not
 this stream, and the two formats never mix.
@@ -294,20 +294,20 @@ tree, and emits `selection_result` plus `removal_trace` records; its terminal
   unsettled — rerun instead. (The retry recipe in [the mappings guide](mappings.md)
   enforces both checks.)
 - Ignore record types and optional fields you do not recognize;
-  additions within schema version 1 are not breaking.
+  additions that leave `schema_version` unchanged are not breaking.
 - Fail closed on an unknown `schema` value or `schema_version`, an
   unknown terminal `status`, or an unknown path `encoding`.
 
 ## Compatibility
 
-Within schema version 1: required fields never change type or
-meaning; existing types, actions, dispositions, statuses, classes,
+While `schema_version` keeps its current value, required fields never
+change type or meaning; existing types, actions, dispositions, statuses, classes,
 and reasons are never renamed or reused; new record types and new
 optional fields may be added; human `message` text may change at any
 time. The JSON Schema in this repository is deliberately strict —
 integration tests validate every line syq emits against it, so any
 shape change fails a test and is reviewed as an API change. The
-committed fixtures under `tests/fixtures/automation-v1/` are examples
+committed fixtures under `tests/fixtures/automation/` are examples
 of real streams (regenerate with
 `scripts/regen-automation-fixtures.sh`); client libraries can develop against
 them without running syq.

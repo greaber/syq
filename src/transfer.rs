@@ -870,7 +870,7 @@ fn announce_detached_ready() -> Result<()> {
 pub fn run(args: Args) -> Result<i32> {
     // The results stream and progress exist before anything else can fail,
     // so every run that got past argument parsing settles with a terminal
-    // record — fatal setup failures included (spec: automation v1).
+    // record — fatal setup failures included (spec: automation results).
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         args.connections,
