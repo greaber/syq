@@ -159,9 +159,11 @@ Debian 11 do not. On such hosts pass `--no-forward-agent` and keep credentials
 on the coordinator host, or choose `--unrestricted-agent-forwarding` or an
 explicit `--rsh` policy. `syq cp -vv` prints the client version it found.
 
-On macOS, Apple's `ssh` is built without FIDO support, so hardware-backed
-`sk-` keys do not work with it. Install `openssh` with Homebrew and put its
-`bin` directory first on `PATH`; syq picks up whichever `ssh` that resolves to.
+On macOS, Apple's `ssh` ships without a built-in FIDO provider, so a
+hardware-backed `sk-` key works only with an external `SecurityKeyProvider`
+library configured in `ssh_config`. The simplest route is to install `openssh`
+with Homebrew, which has the provider built in, and put its `bin` directory
+first on `PATH`; syq picks up whichever `ssh` that resolves to.
 
 ## Platform notes
 

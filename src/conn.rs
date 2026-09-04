@@ -131,6 +131,7 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
+        || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || message.contains("build identity mismatch")
         || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
         || message.contains("unexpected handshake response")
@@ -1054,15 +1055,32 @@ pub(crate) fn openssh_version(program: &str) -> Option<OpenSshVersion> {
     version
 }
 
+/// An installed OpenSSH client is too old for constrained agent forwarding.
+/// Nothing about a retry changes that, so the connection loop gives up on it
+/// immediately.
+#[derive(Debug)]
+pub(crate) struct OpenSshVersionError(String);
+
+impl std::fmt::Display for OpenSshVersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OpenSshVersionError {}
+
 /// Refuse constrained agent forwarding through an OpenSSH client that
 /// predates session binding. A client whose version cannot be read is left to
 /// fail on its own, so this only turns a confusing authentication failure
 /// into a direct explanation.
 pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Result<()> {
     match openssh_version(program) {
-        Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => bail!(
-            "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
-        ),
+        Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => {
+            Err(OpenSshVersionError(format!(
+                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+            ))
+            .into())
+        }
         _ => Ok(()),
     }
 }
@@ -2747,6 +2765,18 @@ mod tests {
         );
         assert!(OpenSshVersion { major: 9, minor: 0 } > CONSTRAINED_OPENSSH_MINIMUM);
         assert_eq!(CONSTRAINED_OPENSSH_MINIMUM.to_string(), "OpenSSH 8.9");
+    }
+
+    #[test]
+    fn an_old_client_is_not_retried() {
+        let error: anyhow::Error = OpenSshVersionError("too old".to_owned()).into();
+        assert!(is_non_retryable_connect_error(&error));
+        assert!(is_non_retryable_connect_error(
+            &error.context("connect to the coordinator")
+        ));
+        assert!(!is_non_retryable_connect_error(&anyhow!(
+            "connection reset"
+        )));
     }
 
     #[test]
