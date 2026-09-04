@@ -7,8 +7,9 @@
 # baseline (fmt, clippy, unit tests) in this worktree.
 #
 # Exit status: 0 when nothing needs attention; 1 when master's latest
-# post-merge run failed, the pull request's checks failed, the GitHub head is
-# stale or unrelated, or a --check step failed; 2 on usage or tooling errors.
+# post-merge run failed, the GitHub head is stale or unrelated, or a --check
+# step failed; 2 on usage or tooling errors. Pull-request checks are reported
+# for context but do not gate handoff or merging.
 set -euo pipefail
 
 repository=greaber/syq
@@ -125,7 +126,6 @@ if [ "$pr" != null ]; then
   failed_checks=$(jq -r '[.[] | select(.pending | not) |
     select(.outcome != "SUCCESS" and .outcome != "SKIPPED" and .outcome != "NEUTRAL") |
     .name + " " + (.outcome | ascii_downcase)] | join(", ")' <<<"$checks_json")
-  [ -z "$failed_checks" ] || warn "PR #$pr_number checks: $failed_checks"
   pending_checks=$(jq -r '[.[] | select(.pending) | .name] | join(", ")' <<<"$checks_json")
 fi
 

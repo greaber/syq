@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fixture-driven checks for path selection, generated-PR approval, preflight,
-# and release status reporting.
+# Fixture-driven checks for path selection, preflight, and release status
+# reporting.
 set -euo pipefail
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -76,6 +76,7 @@ for sdk_script in \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
   scripts/prepare-python-sdk-release.py \
+  scripts/run-generated-sdk-post-merge-ci.sh \
   scripts/select-trusted-pr.jq \
   scripts/test-python-sdk-release-tools.sh
 do
@@ -224,75 +225,73 @@ for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
 
-# The approval helper binds the PR and both workflow runs to the same trusted
-# repository, native pull_request event, branch, and exact head SHA.
-approval_bin="$work/approval-bin"
-mkdir "$approval_bin"
-approval_log="$work/approvals"
-head_sha=0123456789abcdef0123456789abcdef01234567
-cat >"$approval_bin/gh" <<'EOF'
+# The generated SDK follow-up dispatches CI on a branch pinned to the exact
+# merge commit, binds the returned run to that commit, and requires its SDK job.
+post_merge_bin="$work/post-merge-bin"
+mkdir "$post_merge_bin"
+post_merge_sha=0123456789abcdef0123456789abcdef01234567
+cat >"$post_merge_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "$1" = api ] && [[ " $* " == *" repos/greaber/syq/pulls "* ]]; then
-  jq -cn --arg repo "${SYQ_TEST_PR_REPOSITORY:-greaber/syq}" \
-    --arg branch automation/python-sdk-v0.1.9 --arg sha "$SYQ_TEST_HEAD_SHA" '
-    [{head:{repo:{full_name:$repo},ref:$branch,sha:$sha},base:{ref:"master"}}]'
-elif [ "$1:$2" = 'run:list' ]; then
-  jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_HEAD_SHA}" \
-    --arg event "${SYQ_TEST_RUN_EVENT:-pull_request}" '[
-    {conclusion:"action_required",databaseId:101,event:$event,headSha:$sha,status:"completed",url:"https://example.test/101",workflowName:"ci"},
-    {conclusion:"action_required",databaseId:102,event:$event,headSha:$sha,status:"completed",url:"https://example.test/102",workflowName:"rsync compatibility"}]'
-elif [ "$1" = api ] && [[ " $* " == *'/approve '* ]]; then
-  printf '%s\n' "$*" >>"$SYQ_TEST_APPROVAL_LOG"
-elif [ "$1" = api ] && [[ "$2" == *'/check-runs?'* ]]; then
-  status=${SYQ_TEST_SDK_STATUS:-completed}
-  conclusion=${SYQ_TEST_SDK_CONCLUSION:-success}
-  if [ "$conclusion" = null ]; then
-    jq -cn --arg status "$status" \
-      '{check_runs:[{name:"sdks",status:$status,conclusion:null}]}'
-  else
-    jq -cn --arg status "$status" --arg conclusion "$conclusion" \
-      '{check_runs:[{name:"sdks",status:$status,conclusion:$conclusion}]}'
-  fi
-else
-  echo "unexpected fake gh invocation: $*" >&2
-  exit 2
-fi
+case "$1:$2" in
+  api:*)
+    case " $* " in
+      *'/git/ref/heads/automation/python-sdk-v0.1.9 '*)
+        jq -cn --arg sha "${SYQ_TEST_REF_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{object:{sha:$sha}}'
+        ;;
+      *'/actions/workflows/ci.yml/dispatches '*)
+        printf '{"workflow_run_id":501}\n'
+        ;;
+      *'/actions/workflows/rsync-compat.yml/dispatches '*)
+        printf '{"workflow_run_id":502}\n'
+        ;;
+      *'/actions/workflows/macos.yml/dispatches '*)
+        printf '{"workflow_run_id":503}\n'
+        ;;
+      *'/actions/runs/501/jobs?per_page=100 '*)
+        jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
+          '{jobs:[{name:"sdks",status:"completed",conclusion:$conclusion}]}'
+        ;;
+      *'/actions/runs/'*)
+        run_id=${2##*/}
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          --argjson id "$run_id" \
+          '{id:$id,event:"workflow_dispatch",head_sha:$sha,status:"queued",conclusion:null}'
+        ;;
+      *) echo "unexpected fake gh api invocation: $*" >&2; exit 2 ;;
+    esac
+    ;;
+  run:watch)
+    [ "${SYQ_TEST_WATCH_RESULT:-success}" = success ]
+    ;;
+  *) echo "unexpected fake gh invocation: $*" >&2; exit 2 ;;
+esac
 EOF
-chmod 755 "$approval_bin/gh"
-SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_APPROVAL_LOG="$approval_log" \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha" >/dev/null
-[ "$(wc -l <"$approval_log")" -eq 2 ]
-expect_failure 'expected one trusted open pull request' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_PR_REPOSITORY=attacker/syq \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for native pull-request workflow runs' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" SYQ_APPROVAL_TIMEOUT_SECONDS=0 \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'required generated-PR check sdks is completed/failure' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_CONCLUSION=failure \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for required generated-PR check sdks' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_SDK_STATUS=in_progress \
-  SYQ_TEST_SDK_CONCLUSION=null SYQ_REQUIRED_CHECK_TIMEOUT_SECONDS=0 \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
-expect_failure 'timed out waiting for native pull-request workflow runs' env \
-  SYQ_TEST_HEAD_SHA="$head_sha" SYQ_TEST_RUN_EVENT=workflow_dispatch \
-  SYQ_TEST_APPROVAL_LOG="$approval_log" SYQ_APPROVAL_TIMEOUT_SECONDS=0 \
-  PATH="$approval_bin:$PATH" \
-  "$script_dir/approve-generated-pr-runs.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$head_sha"
+chmod 755 "$post_merge_bin/gh"
+SYQ_TEST_MERGE_SHA="$post_merge_sha" PATH="$post_merge_bin:$PATH" \
+  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha" \
+  >"$work/post-merge.out"
+grep -F "Post-merge workflows passed for $post_merge_sha" \
+  "$work/post-merge.out" >/dev/null
+expect_failure 'does not point to expected merge commit' env \
+  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
+  SYQ_TEST_REF_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  PATH="$post_merge_bin:$PATH" \
+  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
+expect_failure 'ci.yml run 501 targets' env \
+  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
+  SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  PATH="$post_merge_bin:$PATH" \
+  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
+expect_failure 'ci.yml run 501 sdks job is completed/failure' env \
+  SYQ_TEST_MERGE_SHA="$post_merge_sha" SYQ_TEST_SDK_CONCLUSION=failure \
+  PATH="$post_merge_bin:$PATH" \
+  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
+  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.

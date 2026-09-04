@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Classify a GitHub Actions change set without removing any required check.
+# Classify a GitHub Actions change set for post-merge and manual validation.
 set -euo pipefail
 
 event_path=${1:-${GITHUB_EVENT_PATH:-}}
@@ -132,7 +132,7 @@ while IFS= read -r path; do
       tooling=true
       python_sdk=true
       ;;
-    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
+    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
       tooling=true
       python_sdk=true
       ;;
@@ -171,8 +171,8 @@ if [ "$saw_path" = false ]; then
   conformance=true
 fi
 
-# Pull requests run only affected Linux checks. The cumulative master state
-# gets broad cross-subsystem and platform coverage once after merge.
+# The cumulative master state gets broad cross-subsystem and platform coverage
+# once after merge.
 if [ "$full_suite" = true ] && [ "$native" = true ]; then
   python_sdk=true
   javascript_sdk=true

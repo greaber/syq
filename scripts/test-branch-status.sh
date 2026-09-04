@@ -131,17 +131,17 @@ with_pr "$stale_pr" expect_exit 1 run_status
 expect_output "GitHub head ${previous_sha:0:7}: github-behind local $short_sha"
 expect_output "WARNING: PR #7 head ${previous_sha:0:7} is behind local $short_sha; push before reporting"
 
-# A failed pull-request check.
+# Failed pull-request checks are informational and do not gate the branch.
 failed_pr=$(jq -c '.statusCheckRollup[0].conclusion = "FAILURE"' <<<"$pr_json")
-with_pr "$failed_pr" expect_exit 1 run_status
+with_pr "$failed_pr" expect_exit 0 run_status
 expect_output 'failed checks: rust failure'
-expect_output 'WARNING: PR #7 checks: rust failure'
+expect_no_output WARNING
 
-# A failed commit status context, which carries state rather than conclusion.
+# A failed commit status context is informational too.
 context_pr=$(jq -c '.statusCheckRollup += [{context:"external", state:"FAILURE"}]' <<<"$pr_json")
-with_pr "$context_pr" expect_exit 1 run_status
+with_pr "$context_pr" expect_exit 0 run_status
 expect_output 'failed checks: external failure'
-expect_output 'WARNING: PR #7 checks: external failure'
+expect_no_output WARNING
 
 # A pending commit status context is neither green nor a failure.
 context_pr=$(jq -c '.statusCheckRollup += [{context:"external", state:"PENDING"}]' <<<"$pr_json")

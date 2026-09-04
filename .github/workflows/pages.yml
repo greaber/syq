@@ -8,13 +8,6 @@ on:
       - 'book.toml'
       - 'scripts/check-doc-links.py'
       - '.github/workflows/pages.yml'
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'book.toml'
-      - 'README.md'
-      - 'scripts/check-doc-links.py'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -46,14 +39,11 @@ jobs:
       - name: Build the site
         run: mdbook build
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-        if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        if: github.event_name != 'pull_request'
         with:
           path: target/book
 
   deploy:
-    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     permissions:
