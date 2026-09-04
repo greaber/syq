@@ -54,11 +54,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             name: syq-linux-aarch64
             flags: "-C target-feature=+crt-static"
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             name: syq-macos-arm64
             flags: ""
-          - os: macos-15-intel
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             name: syq-macos-x86_64
             flags: ""

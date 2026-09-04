@@ -265,48 +265,93 @@ jobs:
       - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
 
-  macos:
+  macos_arm:
     needs: scope
-    if: always()
-    runs-on: macos-14
+    if: >-
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.macos == 'true'
+    runs-on: macos-26
     steps:
-      - name: Require successful path classification
-        if: needs.scope.result != 'success'
-        run: echo 'Path classification failed.' >&2; exit 1
-      - name: Complete the required check when macOS validation is deferred
-        if: needs.scope.outputs.macos != 'true'
-        run: echo 'macOS validation is deferred to the cumulative post-merge suite.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.macos == 'true'
         with:
           persist-credentials: false
-      - if: needs.scope.outputs.macos == 'true'
-        run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-targets
       - name: Exercise macOS symlink descriptor pinning
-        if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked
           rooted::tests::operator_resolver_selects_a_last_component_symlink_without_following_it
           -- --exact
       - name: Exercise macOS cross-process descriptor handoff
-        if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked
           descriptor_broker::tests::independent_process_receives_exact_registered_descriptor
           -- --exact
       - name: Exercise macOS descriptor soft-limit raise and umask read
-        if: needs.scope.outputs.macos == 'true'
         run: >-
           cargo test --locked --bin syq --
           --exact tests::raise_nofile_reaches_its_target
           fsops::tests::process_umask_matches_file_creation
       - name: Exercise macOS descriptor-pressure bounds
-        if: needs.scope.outputs.macos == 'true'
         run: cargo test --locked --test local source_fd_budget_
       - name: Exercise macOS adversarial confinement matrix
-        if: needs.scope.outputs.macos == 'true'
         run: cargo test --locked confinement_matrix_
-      - if: needs.scope.outputs.macos == 'true'
-        run: scripts/test-installer.sh
-      - if: needs.scope.outputs.macos == 'true'
-        run: scripts/test-homebrew-formula.sh
+      - name: Exercise macOS standalone updates
+        run: cargo test --locked --test update
+      - name: Exercise macOS managed remote-helper bootstrap
+        run: cargo test --locked --test local remote_
+      - name: Exercise macOS socket-special behavior
+        run: >-
+          cargo test --locked --test local
+          native_preserve_specials_copies_or_visibly_skips_socket_nodes -- --exact
+      - run: scripts/test-installer.sh
+      - run: scripts/test-homebrew-formula.sh
+
+  # An actual Intel runner catches host-architecture cfg and libc differences
+  # before the release workflow builds its x86-64 artifact. Keep this on full
+  # master/manual runs; pull requests get the ARM macOS behavior gate above.
+  macos_intel:
+    needs: scope
+    if: >-
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.macos == 'true' &&
+      needs.scope.outputs.full_suite == 'true'
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo check --locked --all-targets
+      - name: Exercise the Intel standalone-update artifact selection
+        run: cargo test --locked --test update
+
+  # Preserve the required `macos` check name while making full certifications
+  # depend on both architectures.
+  macos:
+    needs: [scope, macos_arm, macos_intel]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful path classification
+        if: needs.scope.result != 'success'
+        run: echo 'Path classification failed.' >&2; exit 1
+      - name: Complete the required check when macOS validation is unaffected
+        if: needs.scope.outputs.macos != 'true'
+        run: echo 'macOS validation is not needed for this change set.'
+      - name: Require Apple Silicon validation
+        if: >-
+          needs.scope.outputs.macos == 'true' &&
+          needs.macos_arm.result != 'success'
+        run: echo 'Apple Silicon macOS validation failed or did not complete.' >&2; exit 1
+      - name: Require Intel validation in a full suite
+        if: >-
+          needs.scope.outputs.macos == 'true' &&
+          needs.scope.outputs.full_suite == 'true' &&
+          needs.macos_intel.result != 'success'
+        run: echo 'Intel macOS validation failed or did not complete.' >&2; exit 1
+      - name: Record successful macOS validation
+        if: >-
+          needs.scope.outputs.macos == 'true' &&
+          needs.macos_arm.result == 'success' &&
+          (needs.scope.outputs.full_suite != 'true' ||
+           needs.macos_intel.result == 'success')
+        run: echo 'Required macOS validation succeeded.'

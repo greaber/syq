@@ -264,16 +264,21 @@ as their sole release identity.
 
 The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
 names are stable, but the work behind them differs before and after merge.
-Pull requests run a fast affected-surface gate: Rust changes get formatting,
-clippy, and native unit tests; SDK and rsync-owned changes get their respective
-suites; executable examples in `MAPPINGS.md` get their focused integration
-tests; and repository-tooling changes get the packaging, release, workflow, and
-shell checks. Ordinary native pull requests defer the complete filesystem,
-SDK, conformance, ARM, and macOS suites to `master`. The working agent chooses
-and reports any additional integration tests justified by the change.
+Pull requests run an affected-surface gate: Rust changes get formatting,
+clippy, native unit tests, focused Apple Silicon macOS tests, and the Linux and
+macOS rsync-conformance matrix. SDK-owned changes get their SDK suite;
+executable examples in `MAPPINGS.md` get focused integration tests; and
+repository-tooling changes get the packaging, release, workflow, and shell
+checks. Ordinary native pull requests still defer the complete filesystem and
+SDK suites, Linux ARM64 validation, and Intel macOS validation to `master`.
+The working agent chooses and reports any additional integration tests
+justified by the change.
 
-Every native push to `master` runs the complete native, SDK, conformance, ARM,
-and macOS suites. Workflow concurrency cancels an older run when a newer commit
+Every native push to `master` runs the complete native and SDK suites, Linux
+and macOS conformance, Linux ARM64 validation, focused Apple Silicon macOS
+tests, and an Intel macOS compile-and-updater check. The separate macOS workflow
+also runs the complete native and SDK suites on Apple Silicon. Workflow
+concurrency cancels an older run when a newer commit
 arrives on the same pull request. Each non-PR run has a unique concurrency
 group, including while it is pending, because a later push may affect a
 different subsystem and therefore cannot safely replace the earlier push's

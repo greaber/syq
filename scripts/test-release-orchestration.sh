@@ -26,8 +26,9 @@ expect_failure() {
   }
 }
 
-# Scope pull requests to affected fast checks and reserve the cumulative suites
-# for master pushes and explicit manual runs.
+# Scope pull requests to affected checks. Native changes exercise macOS and
+# rsync conformance before merge; broader cross-subsystem and architecture
+# checks remain cumulative.
 assert_scope() {
   local output=$1 key=$2 expected=$3
   grep -Fx "$key=$expected" <<<"$output" >/dev/null
@@ -72,8 +73,8 @@ printf 'src/main.rs\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks false
-assert_scope "$scope" conformance false
-assert_scope "$scope" macos false
+assert_scope "$scope" conformance true
+assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 false
 printf 'scripts/test-installer.sh\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")

@@ -1,11 +1,8 @@
 //! Integration tests: local -> local copies through the built binary.
 
 use base64::Engine as _;
-#[cfg(target_os = "linux")]
 use ed25519_dalek::{Signer, SigningKey};
-#[cfg(target_os = "linux")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,7 +12,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -2045,6 +2041,43 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
 }
 
 #[test]
+fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--preserve=specials",
+            "--src-src",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/nested/ordinary")), b"ordinary");
+
+    #[cfg(target_os = "linux")]
+    assert!(fs::symlink_metadata(t.path("dst/nested/socket"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(!t.path("dst/nested/socket").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("skipping socket"), "{stderr}");
+        assert!(stderr.contains("confined destination"), "{stderr}");
+    }
+}
+
+#[test]
 fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     let t = Tmp::new();
     let expected = vec![b'n'; 5 * 1024 * 1024];
@@ -3782,7 +3815,6 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn cached_local_helper(t: &Tmp) -> PathBuf {
     let target = helper_target();
     t.path(&format!(
@@ -3800,7 +3832,6 @@ fn binary_identity(argument: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -3808,7 +3839,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 struct ReleaseBootstrapFixture {
     archive: Vec<u8>,
     manifest: Vec<u8>,
@@ -3816,10 +3846,8 @@ struct ReleaseBootstrapFixture {
     asset: &'static str,
 }
 
-#[cfg(target_os = "linux")]
 static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
 
-#[cfg(target_os = "linux")]
 fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     RELEASE_BOOTSTRAP_FIXTURE.get_or_init(|| {
         let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
@@ -3829,10 +3857,13 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&binary_bytes).unwrap();
         let archive = encoder.finish().unwrap();
-        let (target, asset) = match std::env::consts::ARCH {
-            "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
-            "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
-            arch => panic!("unsupported test architecture {arch}"),
+        let target = helper_target();
+        let asset = match target {
+            "linux-x86_64" => "syq-linux-x86_64",
+            "linux-aarch64" => "syq-linux-aarch64",
+            "macos-x86_64" => "syq-macos-x86_64",
+            "macos-arm64" => "syq-macos-arm64",
+            other => panic!("unsupported release target {other}"),
         };
         let manifest = serde_json::json!({
             "schema": 1,
@@ -3873,7 +3904,6 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     })
 }
 
-#[cfg(target_os = "linux")]
 fn setup_release_bootstrap(t: &Tmp) {
     let fixture = release_bootstrap_fixture();
     write(&t.path("release.gz"), &fixture.archive);
@@ -3903,7 +3933,6 @@ esac
     );
 }
 
-#[cfg(target_os = "linux")]
 fn add_remote_tool(t: &Tmp, name: &str) {
     let destination = t.path(&format!("remote-bin/{name}"));
     if destination.exists() {
@@ -3919,7 +3948,6 @@ fn add_remote_tool(t: &Tmp, name: &str) {
     std::os::unix::fs::symlink(source, destination).unwrap();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
@@ -3967,7 +3995,6 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -4017,7 +4044,6 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     assert_eq!(cache_entries, ["syq"]);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_cannot_inject_digest_protocol_framing() {
     let t = Tmp::new();
@@ -4078,7 +4104,6 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     let t = Tmp::new();
@@ -4118,7 +4143,6 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn failed_remote_download_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -4148,7 +4172,6 @@ exit 22
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -4180,7 +4203,6 @@ fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     assert!(!t.path("curl.log").exists());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn broken_remote_hasher_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -4211,9 +4233,8 @@ exit 1
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn corrupted_local_helper_cache_is_discarded_and_refetched() {
+fn remote_corrupted_local_helper_cache_is_discarded_and_refetched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
@@ -4247,7 +4268,6 @@ exit 22
     assert!(stderr.contains("discarding it"), "{stderr}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_download_write_failure_does_not_retry_with_upload() {
     let t = Tmp::new();
