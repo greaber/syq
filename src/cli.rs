@@ -166,7 +166,7 @@ pub struct Args {
     /// Copy symlinks as symlinks
     #[arg(short = 'l', long)]
     pub links: bool,
-    /// Permit legacy traversal through symlinks in rsync operator paths and source descendants
+    /// Follow symlinks in this machine's rsync operator paths regardless of ownership (local only, as in rsync)
     #[arg(long)]
     pub insecure_links: bool,
     /// Preserve permissions

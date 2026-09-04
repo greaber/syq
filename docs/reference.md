@@ -186,7 +186,12 @@ spelling cannot redirect that decision.
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
 session follows symlinks regardless of ownership in its operator-supplied
 source, destination, and control paths, and uses the legacy unconfined source
-discovery and content-read paths. Native
+discovery and content-read paths. As in rsync, the flag is local only. It
+applies to the source or destination on the machine where you run syq and to
+the control files syq reads there; it is never passed to a remote endpoint,
+which keeps the default trusted-owner policy and confined source paths. Rsync
+lets the remote side opt out through `--rsync-path`; syq's `--rsync-path` is
+an executable path only, so a remote endpoint cannot opt out. Native
 mapping/generated names never inherit native `--follow`; they remain strict
 descendants of the registered source root. Rsync-compatible operator control
 paths retain rsync's implicit policy of following a symlink owned by root or
@@ -594,7 +599,7 @@ accept them.
 | `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
 | `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
 | `--from0` | `--files-from` entries are NUL-separated |
-| `--insecure-links` | Permit legacy traversal through symlinks in rsync operator paths and source descendants, regardless of ownership |
+| `--insecure-links` | Follow symlinks in this machine's operator paths regardless of ownership, and use legacy traversal through symlinked source parents; never applied to a remote endpoint, as in rsync |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
@@ -1057,9 +1062,10 @@ source is not traversed and that listed path fails. This is deliberately
 stricter than hardened rsync 3.5.0: rsync may first emit the implied destination
 directory and then fail the content open, while SYQ refuses the path before
 emitting that implied parent. Both report a partial-transfer error (exit 23).
-`--insecure-links` opts the whole source session into the legacy unconfined
+`--insecure-links` opts a local source session into the legacy unconfined
 pathname behavior: such a parent is followed and becomes a real directory on
-the destination. A parent that resolves to a file or dangles is an error. A
+the destination. A remote source keeps the confined behavior, because the flag
+is never sent to the remote side. A parent that resolves to a file or dangles is an error. A
 listed directory is copied *without*
 its contents unless `-r` is given on the command line itself — `-a` alone
 does not count, as in rsync — so `-a -r --files-from` walks the directories
