@@ -11,7 +11,7 @@ rsync, the headline differences for a casual user are:
   stream, lets the kernel copy on a single machine, and tunes its own
   connection count while a copy runs. See [Speed](speed.md).
 - **Direct server-to-server transfers without dangerous ssh agent
-  forwarding.** `syq cp --from hostA --src-src big --to hostB --into big`
+  forwarding.** `syq cp --from hostA --srcs-in big --to hostB --into big`
   sends data straight from A to B. HostA never receives your agent or a
   reusable credential for hostB; it gets a signed, single-use grant for
   exactly this transfer, and hostB signs a receipt saying what it actually

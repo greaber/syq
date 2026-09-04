@@ -77,7 +77,7 @@ or a stream can express too:
   without walking the source, which is the point on a slow filesystem when the
   list is already known ([Copying a list](reference.md#copying-a-list---files-from)).
 - Native selectors separate the endpoint (`--from host`), the working
-  directory (`-C DIR`), the selection (`--src`, `--src-src`, `--src-file`,
+  directory (`-C DIR`), the selection (`--src`, `--srcs-in`, `--src-file`,
   `--src-dir`, and their plural forms), and the placement (`--into`, `--as`),
   so a program can compose a command from parts without re-implementing rsync's
   colon and trailing-slash rules ([Native
@@ -88,7 +88,7 @@ or a stream can express too:
   whole manifest for conflicting destinations before a byte moves:
 
   ```sh
-  syq map --src-src photos \
+  syq map --srcs-in photos \
     | jq 'select(.kind == "file")
           | .dst.value = (.mtime | gmtime | strftime("%Y/%m")) + "/" + .dst.value' \
     | syq cp --mapping - -C photos --to nas --into /archive

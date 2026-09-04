@@ -143,7 +143,7 @@ syq persist off >/dev/null
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
-    --from source --src-src /tmp/syq-real-ssh/protected-source \
+    --from source --srcs-in /tmp/syq-real-ssh/protected-source \
     --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
     echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
     exit 1
@@ -165,7 +165,7 @@ ssh destination '
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress -j 2 --preserve=permissions \
-    --from source --src-src /tmp/syq-real-ssh/direct-source \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/direct-source \
@@ -176,7 +176,7 @@ printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress -j 2 --preserve=permissions \
     --agent-broker-only --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
-    --from source --src-src /tmp/syq-real-ssh/firewall-source \
+    --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/firewall-source \
@@ -187,7 +187,7 @@ printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
     --agent-broker-only \
-    --from source --src-src /tmp/syq-real-ssh/ssh-source \
+    --from source --srcs-in /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/ssh-source \
@@ -197,8 +197,8 @@ assert_same_tree \
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --agent-broker-only --coordinate-at dest \
-    --from source --src-src /tmp/syq-real-ssh/pull-source \
+    --agent-broker-only --coordinate-at dst \
+    --from source --srcs-in /tmp/syq-real-ssh/pull-source \
     --to destination --into /tmp/syq-real-ssh/pull-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/pull-source \
@@ -211,7 +211,7 @@ trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
     --coordinate-at local \
-    --from source --src-src /tmp/syq-real-ssh/relay-source \
+    --from source --srcs-in /tmp/syq-real-ssh/relay-source \
     --to destination --into /tmp/syq-real-ssh/relay-destination
 
 if [ "${SYQ_REAL_SSH_PROFILE:-default}" = max-sessions-1 ]; then

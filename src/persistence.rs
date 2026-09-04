@@ -1,7 +1,7 @@
 //! User-managed OpenSSH control-connection persistence.
 //!
 //! A durable preference selects a well-known per-user runtime scope. Scripts
-//! can instead create an isolated scope and pass its path back with
+//! can instead create an ephemeral scope and pass its path back with
 //! `--pscope`, avoiding shared configuration state.
 
 use crate::cli::Args;
@@ -37,19 +37,19 @@ struct PersistCommand {
 enum PersistAction {
     /// Enable reusable SSH control connections
     On {
-        /// Create an isolated scope and print its path instead of changing the user setting
+        /// Create an ephemeral scope and print its path instead of changing the user setting
         #[arg(long)]
         ephemeral: bool,
     },
     /// Disable persistence and close its live SSH control connections
     Off {
-        /// Operate on this isolated persistence scope instead of the user setting
+        /// Operate on this ephemeral persistence scope instead of the user setting
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
     },
     /// Show the configured policy and live SSH control connections
     Status {
-        /// Inspect this isolated persistence scope instead of the user setting
+        /// Inspect this ephemeral persistence scope instead of the user setting
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
     },

@@ -531,9 +531,9 @@ def _append_remote_arguments(
     agent_broker_only: bool,
 ) -> None:
     if coordinate_at is not None:
-        if coordinate_at not in {"auto", "local", "src", "dest"}:
+        if coordinate_at not in {"auto", "local", "src", "dst"}:
             raise SyqInvocationError(
-                "--coordinate-at must be auto, local, src, or dest"
+                "--coordinate-at must be auto, local, src, or dst"
             )
         argv.extend(("--coordinate-at", coordinate_at))
     if pscope is not None and rsh is not None:
@@ -593,7 +593,7 @@ def _copy_arguments(
     sources: tuple[PathArgument, ...],
     *,
     src: Selector | None,
-    src_src: Selector | None,
+    srcs_in: Selector | None,
     src_file: Selector | None,
     src_dir: Selector | None,
     from_: str | None,
@@ -601,7 +601,7 @@ def _copy_arguments(
     root: PathArgument | None,
     follow: bool,
     follow_src: bool,
-    follow_dest: bool,
+    follow_dst: bool,
     to: str | None,
     into: PathArgument | None,
     into_new: PathArgument | None,
@@ -635,13 +635,13 @@ def _copy_arguments(
         source_count += 1
     for option, value in (
         ("--src", src),
-        ("--src-src", src_src),
+        ("--srcs-in", srcs_in),
         ("--src-file", src_file),
         ("--src-dir", src_dir),
     ):
         appended = _append_paths(argv, option, value)
         source_count += appended
-        if option == "--src-src":
+        if option == "--srcs-in":
             contents_count += appended
     if from_ is not None:
         argv.extend(("--from", _text_arg(from_, label="from_")))
@@ -656,8 +656,8 @@ def _copy_arguments(
     if follow_src:
         argv.append("--follow-src")
     source_end = len(argv)
-    if follow_dest:
-        argv.append("--follow-dest")
+    if follow_dst:
+        argv.append("--follow-dst")
     if to is not None:
         argv.extend(("--to", _text_arg(to, label="to")))
     placements = [
@@ -750,7 +750,7 @@ def _rm_arguments(
     sources: tuple[PathArgument, ...],
     *,
     src: Selector | None,
-    src_src: Selector | None,
+    srcs_in: Selector | None,
     src_file: Selector | None,
     src_dir: Selector | None,
     from_: str | None,
@@ -771,7 +771,7 @@ def _rm_arguments(
         source_count += 1
     for option, value in (
         ("--src", src),
-        ("--src-src", src_src),
+        ("--srcs-in", srcs_in),
         ("--src-file", src_file),
         ("--src-dir", src_dir),
     ):
@@ -1002,7 +1002,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -1010,7 +1010,7 @@ class Client:
         root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
-        follow_dest: bool = False,
+        follow_dst: bool = False,
         to: str | None = None,
         into: PathArgument | None = None,
         into_new: PathArgument | None = None,
@@ -1070,7 +1070,7 @@ class Client:
             "cp",
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -1078,7 +1078,7 @@ class Client:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=follow_dest,
+            follow_dst=follow_dst,
             to=to,
             into=into,
             into_new=into_new,
@@ -1180,7 +1180,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -1202,7 +1202,7 @@ class Client:
         argv, selectors_total = _rm_arguments(
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -1235,7 +1235,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
@@ -1248,14 +1248,14 @@ class Client:
         # Materialize selectors once so generators are not consumed separately
         # while deriving the source base carried by MapStream.cwd.
         src_values = _values(src, label="--src")
-        src_src_values = _values(src_src, label="--src-src")
+        srcs_in_values = _values(srcs_in, label="--srcs-in")
         src_file_values = _values(src_file, label="--src-file")
         src_dir_values = _values(src_dir, label="--src-dir")
         argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,
-            src_src=src_src_values,
+            srcs_in=srcs_in_values,
             src_file=src_file_values,
             src_dir=src_dir_values,
             from_=None,
@@ -1263,7 +1263,7 @@ class Client:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=False,
+            follow_dst=False,
             to=None,
             into=None,
             into_new=None,
@@ -1294,12 +1294,12 @@ class Client:
         command = (self._executable_value(), *argv)
         selected_base = root if root is not None else cwd
         contents_selector = None
-        if src_src_values:
-            if len(src_src_values) != 1 or source_count != 1:
+        if srcs_in_values:
+            if len(srcs_in_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
-                    "syq map takes --src-src as its only selector"
+                    "syq map takes --srcs-in as its only selector"
                 )
-            contents_selector = src_src_values[0]
+            contents_selector = srcs_in_values[0]
         effective_cwd = _map_stream_cwd(
             self.process_cwd,
             self.env,

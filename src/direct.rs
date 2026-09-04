@@ -718,14 +718,14 @@ pub fn run(
     run_remote(args, srcs, dst, false, results)
 }
 
-pub fn coordinate_at_dest(
+pub fn coordinate_at_dst(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     if args.interface == Interface::Rsync {
-        bail!("--coordinate-at dest is available only through native copy syntax");
+        bail!("--coordinate-at dst is available only through native copy syntax");
     }
     if !srcs[0].same_host(dst)
         && args.rsh.is_none()
@@ -734,7 +734,7 @@ pub fn coordinate_at_dest(
         && !args.agent_broker_only
     {
         bail!(
-            "--coordinate-at dest requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with target-host credentials, or an explicit --rsh policy"
+            "--coordinate-at dst requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with its own credentials for the peer, or an explicit --rsh policy"
         );
     }
     run_remote(args, srcs, dst, true, results)
@@ -744,13 +744,13 @@ fn run_remote(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
-    coordinator_at_target: bool,
+    coordinator_at_dst: bool,
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
     let rsh = parse_rsh(&args.rsh)?;
-    let coordinator = if coordinator_at_target { dst } else { &srcs[0] };
-    let peer = if coordinator_at_target { &srcs[0] } else { dst };
+    let coordinator = if coordinator_at_dst { dst } else { &srcs[0] };
+    let peer = if coordinator_at_dst { &srcs[0] } else { dst };
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
     if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
@@ -795,7 +795,7 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_target && !args.agent_broker_only)
+        let prepared = (!coordinator_at_dst && !args.agent_broker_only)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -912,8 +912,8 @@ fn run_remote(
         if args.native_follow_src {
             remote.push("--follow-src".into());
         }
-        if args.native_follow_dest {
-            remote.push("--follow-dest".into());
+        if args.native_follow_dst {
+            remote.push("--follow-dst".into());
         }
     }
     if args.delete {
@@ -999,7 +999,7 @@ fn run_remote(
         remote.push("--progress".into());
     }
 
-    if coordinator_at_target && !same_host {
+    if coordinator_at_dst && !same_host {
         remote.push("--from".into());
         remote.push(endpoint_arg(
             &srcs[0],
@@ -1017,7 +1017,7 @@ fn run_remote(
     for source in srcs {
         remote.push(
             match source.selection {
-                SourceSelection::Contents => "--src-src",
+                SourceSelection::Contents => "--srcs-in",
                 SourceSelection::File => "--src-file",
                 SourceSelection::Directory => "--src-dir",
                 SourceSelection::Named
@@ -1028,7 +1028,7 @@ fn run_remote(
         );
         remote.push(delegated_operand(&source.path));
     }
-    if !coordinator_at_target && !same_host {
+    if !coordinator_at_dst && !same_host {
         remote.push("--to".into());
         remote.push(endpoint_arg(
             dst,

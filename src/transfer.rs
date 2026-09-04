@@ -1125,8 +1125,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if args.connections_default {
             args.connections = tune::START_SSH;
         }
-        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dest {
-            return crate::direct::coordinate_at_dest(
+        if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dst {
+            return crate::direct::coordinate_at_dst(
                 &args,
                 srcs,
                 dst,
@@ -1638,7 +1638,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .is_some_and(|entry| entry.kind == Kind::Symlink)
             {
                 bail!(
-                    "--into destination {} is a symlink; pass --follow-dest (or --follow) to resolve destination symlinks",
+                    "--into destination {} is a symlink; pass --follow-dst (or --follow) to resolve destination symlinks",
                     display(&dst_root)
                 );
             }

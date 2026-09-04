@@ -36,7 +36,7 @@ dry runs report planned mutation totals and emit `TraceEvent` records:
 client = syq.Client(process_cwd="/srv/jobs")
 
 preview = client.cp(
-    src_src="build",
+    srcs_in="build",
     to="server",
     into_existing="/srv/app",
     prune=True,
@@ -126,7 +126,7 @@ transform cannot launch a copy with only a valid prefix:
 ```python
 from dataclasses import replace
 
-with syq.map(src_src="photos") as mapping:
+with syq.map(srcs_in="photos") as mapping:
     entries = (
         replace(entry, dst=syq.RelativePath("archive") / entry.dst)
         for entry in mapping
@@ -137,7 +137,7 @@ with syq.map(src_src="photos") as mapping:
 The async mapping stream is lazy and uses an async context manager:
 
 ```python
-async with client.map(src_src="photos") as mapping:
+async with client.map(srcs_in="photos") as mapping:
     result = await client.cp(
         mapping=mapping,
         cwd=mapping.cwd,

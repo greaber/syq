@@ -9,9 +9,9 @@
         "root",
         "follow",
         "follow-src",
-        "follow-dest",
+        "follow-dst",
         "src",
-        "src-src",
+        "srcs-in",
         "src-file",
         "src-dir",
         "to",
@@ -60,7 +60,6 @@
       ],
       "aliases": {
         "srcs": "src",
-        "src-srcs": "src-src",
         "src-files": "src-file",
         "src-dirs": "src-dir"
       },
@@ -84,7 +83,7 @@
         "follow",
         "follow-src",
         "src",
-        "src-src",
+        "srcs-in",
         "src-file",
         "src-dir",
         "results",
@@ -99,7 +98,6 @@
       ],
       "aliases": {
         "srcs": "src",
-        "src-srcs": "src-src",
         "src-files": "src-file",
         "src-dirs": "src-dir"
       },
@@ -123,12 +121,11 @@
         "src",
         "src-dir",
         "src-file",
-        "src-src"
+        "srcs-in"
       ],
       "internal": [],
       "aliases": {
         "srcs": "src",
-        "src-srcs": "src-src",
         "src-files": "src-file",
         "src-dirs": "src-dir"
       },

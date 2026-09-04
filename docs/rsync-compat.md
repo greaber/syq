@@ -175,7 +175,7 @@ These options intentionally do not pretend to be rsync options:
 | `--syq-verify-only` | Compare the selected source and destination scope without mutation |
 | `--syq-no-bootstrap` | Require a compatible syq in the remote `PATH` |
 | `--syq-no-tcp`, `--syq-tcp-plain`, `--syq-tcp-ports`, `--syq-tcp-congestion` | Tune syq's separate TCP data path |
-| `--syq-pscope PATH` | Use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
+| `--syq-pscope PATH` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
 
 The gitignore rules have a broadly similar purpose to rsync filters but are not
 syntax-compatible: syq is last-match-wins with `!` re-inclusion, while rsync

@@ -43,7 +43,7 @@ static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
-pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dest for destination paths, or --follow for all directly supplied filesystem paths";
+pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all directly supplied filesystem paths";
 
 #[cfg(target_os = "linux")]
 const MODE_TYPE_MASK: u32 = libc::S_IFMT;

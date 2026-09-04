@@ -178,7 +178,7 @@ first on `PATH`; syq picks up whichever `ssh` that resolves to.
   a mode `000` source file) fails on macOS with a permission error. On
   macOS, `/tmp`, `/var`, and `/etc` are symlinks into `/private`. Native
   commands refuse a symlink in a path they are given unless you pass
-  `--follow-src`, `--follow-dest`, or `--follow`, so spell such paths as
+  `--follow-src`, `--follow-dst`, or `--follow`, so spell such paths as
   `/private/tmp/...` or pass the follow option.
 - For a manually installed binary that is portable across distributions (for
   example, a host with an older glibc), build a static binary:

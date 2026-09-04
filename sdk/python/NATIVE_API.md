@@ -47,9 +47,9 @@ learn a second set of names for concepts that syq already names.
 | `syq rm` | `syq.rm()` or `Client.rm()` |
 | `syq map` | `syq.map()` or `Client.map()` |
 | `--root` | `root=` |
-| `--src-src` | `src_src=` |
+| `--srcs-in` | `srcs_in=` |
 | `--follow-src` | `follow_src=` |
-| `--follow-dest` | `follow_dest=` |
+| `--follow-dst` | `follow_dst=` |
 | `--into-existing` | `into_existing=` |
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
@@ -76,7 +76,7 @@ accepts a Python binary file-like object instead of a path so applications can
 choose files, in-memory buffers, and their own stream adapters naturally.
 
 Not every command-line parsing convenience needs another Python parameter.
-The plural options `--srcs`, `--src-srcs`, `--src-files`, and `--src-dirs`
+The plural options `--srcs`, `--src-files`, and `--src-dirs`
 only batch values on a command line. Python passes a sequence to the matching
 singular keyword instead. This removes redundant syntax without renaming a
 product concept:
@@ -194,7 +194,7 @@ The conceptual `cp` signature is:
 syq.cp(
     *sources,
     src=None,
-    src_src=None,
+    srcs_in=None,
     src_file=None,
     src_dir=None,
     from_=None,
@@ -202,7 +202,7 @@ syq.cp(
     root=None,
     follow=False,
     follow_src=False,
-    follow_dest=False,
+    follow_dst=False,
     to=None,
     into=None,
     into_new=None,
@@ -254,7 +254,7 @@ removal accepts:
 syq.rm(
     *sources,
     src=None,
-    src_src=None,
+    srcs_in=None,
     src_file=None,
     src_dir=None,
     from_=None,
@@ -280,7 +280,7 @@ retain the native meanings:
 | Python keyword | Native option | Meaning |
 |---|---|---|
 | `src` | `--src` | Select a named object |
-| `src_src` | `--src-src` | Select a directory's contents |
+| `srcs_in` | `--srcs-in` | Select a directory's contents |
 | `src_file` | `--src-file` | Require a non-directory object |
 | `src_dir` | `--src-dir` | Require a directory |
 
@@ -307,7 +307,7 @@ paths retain their separate strict relative grammar. Input paths accept text
 and byte path-like objects on supported Unix systems; byte paths are not
 decoded merely to build argv.
 
-`follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
+`follow`, `follow_src`, `follow_dst`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
 `min_size`, and `dry_run` retain the exact native meanings. `max_entries`,
 `max_total_bytes`, and `max_runtime` expose the native command-restricted
@@ -422,7 +422,7 @@ import syq
 
 prefix = syq.RelativePath("by-year")
 
-with syq.map(src_src="photos") as mapping:
+with syq.map(srcs_in="photos") as mapping:
     entries = (
         replace(entry, dst=prefix / entry.dst)
         for entry in mapping
@@ -436,7 +436,7 @@ with syq.map(src_src="photos") as mapping:
     )
 ```
 
-This corresponds to `syq map --src-src photos` followed by a transformed
+This corresponds to `syq map --srcs-in photos` followed by a transformed
 manifest and `syq cp --mapping ... -C photos --to storage --into /archive`.
 `MapStream.cwd` is the absolute, unresolved spelling of the source base needed
 to execute its emitted `src` paths. Keeping that property named `cwd` makes it
@@ -495,7 +495,7 @@ The typed API does not initially expose a `stream=True` switch.
 
 ```python
 result = syq.cp(
-    src_src="build",
+    srcs_in="build",
     to="server",
     into_existing="/srv/app",
     prune=True,
@@ -542,9 +542,9 @@ delete scope and safety ceiling is separate product work.
 `--dry-run` remains `dry_run=True` on the same operation:
 
 ```python
-preview = syq.cp(src_src="build", into="staging", dry_run=True)
+preview = syq.cp(srcs_in="build", into="staging", dry_run=True)
 preview = syq.cp(
-    src_src="build",
+    srcs_in="build",
     into_existing="staging",
     prune=True,
     max_delete=100,
@@ -700,7 +700,7 @@ client = syq.AsyncClient(process_cwd="/srv/jobs")
 result = await client.cp("project", to="server", into="/backup")
 removed = await client.rm("old-project", from_="server")
 
-async with client.map(src_src="photos") as mapping:
+async with client.map(srcs_in="photos") as mapping:
     result = await client.cp(mapping=mapping, cwd=mapping.cwd, into="photos")
 ```
 
