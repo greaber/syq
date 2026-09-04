@@ -40,8 +40,10 @@ This is usually the most useful server-side change. syq authenticates over ssh,
 then asks the remote helper to listen on one available port in
 `47600-47699` (or the range given with `--syq-tcp-ports`) for the duration of that
 transfer. The default TCP records are encrypted with a key exchanged through
-ssh. If no advertised address and port is reachable, syq reports the fallback
-once and carries data over separate ssh sessions instead.
+ssh. The helper listens on that port over both IPv4 and IPv6, so a firewall
+rule must allow whichever family the client will use. If no advertised
+address and port is reachable, syq reports the fallback once and carries data
+over separate ssh sessions instead.
 
 Allow the chosen port range only from clients or trusted networks that need it.
 For example, an administrator using ufw could adapt one of these rules:

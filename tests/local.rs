@@ -3424,6 +3424,14 @@ else
     PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
 fi
 export HOME PATH
+# The remote helper advertises the address ssh arrived on; never leak the
+# developer's own session into the fixture.
+if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
+    SSH_CONNECTION="$FAKE_SSH_CONNECTION"
+    export SSH_CONNECTION
+else
+    unset SSH_CONNECTION
+fi
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
 exec /bin/sh -c "$1"
 "#,
@@ -3453,6 +3461,12 @@ shift
 HOME="$FAKE_REMOTE_HOME"
 PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
 export HOME PATH
+if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
+    SSH_CONNECTION="$FAKE_SSH_CONNECTION"
+    export SSH_CONNECTION
+else
+    unset SSH_CONNECTION
+fi
 exec /bin/sh -c "$1"
 "#,
     );
@@ -3503,6 +3517,12 @@ fi
 HOME="$FAKE_REMOTE_HOME"
 PATH=/usr/bin:/bin
 export HOME PATH
+if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
+    SSH_CONNECTION="$FAKE_SSH_CONNECTION"
+    export SSH_CONNECTION
+else
+    unset SSH_CONNECTION
+fi
 exec /bin/sh -c "$1"
 "#,
     );
@@ -4302,6 +4322,49 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
             .count(),
         1,
         "-vv must not verify fallback with an extra connection"
+    );
+}
+
+#[test]
+fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // No usable interface listing: only the address ssh arrived on, an IPv6
+    // loopback here, can be advertised. It must be listened on and selected.
+    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
+    write(&t.path("src"), b"v6");
+    let remote = format!("diagnostic.invalid:{}", t.s("dst"));
+
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
+        .args(["--dry-run", "-vv", "-a"])
+        .arg(t.s("src"))
+        .arg(&remote)
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CONNECTION", "::1 40000 ::1 22")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .expect("run double-verbose dry-run over IPv6");
+
+    assert_output_ok(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TCP [::1]:")
+            && stderr.contains(": reachable, link speed unknown, selected by preflight"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "transport: encrypted TCP planned for a real transfer (reachability preflight passed)"
+        ),
+        "{stderr}"
     );
 }
 
