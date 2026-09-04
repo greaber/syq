@@ -1427,6 +1427,11 @@ impl RemoteSpec {
     /// descriptors, and Darwin cannot receive those close-on-exec
     /// atomically, so this runs before any child is spawned alongside.
     pub(crate) fn prime_pooled_control(&self, compress: bool) {
+        // The same gate as the control connection's: a --no-compress command
+        // connects directly and must not hold a session it will not use.
+        if !compress {
+            return;
+        }
         if let Some(conn) = self.take_pooled_control(compress) {
             *self.primed_control.lock().unwrap() = Some(conn);
         }

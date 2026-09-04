@@ -412,9 +412,12 @@ window ends with `syq persist off`.
 
 The pool cannot widen that boundary. It never authenticates: a session is
 opened only after the master answers a liveness check, with every
-authentication method turned off, so a dead connection leaves the pool empty
-rather than logging in on its own, and a changed host key or a required
-prompt reaches you through the next command you run yourself. It never reads
+authentication method turned off and the proxy pinned to a command that
+fails, so a connection that has gone away leaves the pool empty rather than
+logging in on its own, even through a configured `ProxyCommand` or
+`ProxyJump`, and a changed host key or a required prompt reaches you through
+the next command you run yourself. Its idle session carries none of your
+agent, display, or port forwardings to the remote host. It never reads
 from the session it holds, so the command that takes it sees exactly what a
 fresh session would show. It matches the exact remote command and syq build
 of the command asking, and exits when a different build appears, when its

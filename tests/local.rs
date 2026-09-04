@@ -14096,6 +14096,14 @@ fn session_pool_serves_later_commands_without_new_ssh_sessions() {
     assert!(!checks.is_empty(), "{warmed}");
     for option in [
         "ControlMaster=no",
+        "ProxyJump=none",
+        "ProxyCommand=false",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "GSSAPIDelegateCredentials=no",
+        "RequestTTY=no",
         "BatchMode=yes",
         "PubkeyAuthentication=no",
         "PasswordAuthentication=no",

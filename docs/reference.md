@@ -471,9 +471,10 @@ endpoint. The next command takes the ready session instead of opening its
 own, so a remote completion or a small copy costs one round trip. The pool
 opens its session through the existing control connection only: it checks
 that the master is alive, attaches to it with every authentication method
-disabled, and never reads from the session it holds. If the master has gone
-away the pool simply stays empty, and the next command logs in normally and
-shows whatever OpenSSH has to say. The pool exits after five minutes without
+disabled, no agent, display, or port forwarding, and no proxy of its own, and
+never reads from the session it holds. If the master has gone away the pool
+simply stays empty, and the next command logs in normally and shows whatever
+OpenSSH has to say. The pool exits after five minutes without
 handing over a session, and the control connection's own five-minute window
 begins after that, so the reuse window after your last command can reach ten
 minutes in total. It also exits when its scope is removed or when a newer

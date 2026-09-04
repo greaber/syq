@@ -444,8 +444,12 @@ impl Pool {
         Verdict::Continue
     }
 
-    /// The ssh command every spare shares: attach to the live master only,
-    /// and never authenticate.
+    /// The ssh command every spare shares: attach to the live master and
+    /// nothing else. With a missing socket OpenSSH would otherwise fall back
+    /// to an ordinary connection, and a configured ProxyCommand or ProxyJump
+    /// could authenticate on its own even with target authentication off, so
+    /// the proxy is pinned to a command that fails; and an idle session must
+    /// not carry the user's agent, display, or forwardings to the remote.
     fn ssh(&self) -> Command {
         let mut command = Command::new("ssh");
         command
@@ -454,6 +458,22 @@ impl Pool {
             .arg("-S")
             .arg(crate::persistence::openssh_control_path(&self.control))
             .args([
+                "-o",
+                "ProxyJump=none",
+                "-o",
+                "ProxyCommand=false",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "GSSAPIDelegateCredentials=no",
+                "-o",
+                "RequestTTY=no",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -505,40 +525,20 @@ impl Pool {
             .stderr(Stdio::piped())
             .spawn()
             .context("start a spare session")?;
-        // SAFETY: each descriptor comes from a piped child stdio handle this
-        // process owns and is wrapped exactly once.
-        let stdin = child
-            .stdin
-            .take()
-            .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
-            .context("spare session stdin was not piped")?;
-        let stdout = child
-            .stdout
-            .take()
-            .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
-            .context("spare session stdout was not piped")?;
-        let stderr = child
-            .stderr
-            .take()
-            .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
-            .context("spare session stderr was not piped")?;
-        // The hello goes out now; the taker reads its reply. A default
-        // command's flags are used so the receiver's writer matches them.
-        {
-            let mut writer = FrameWriter::new(&stdin, true);
-            writer.write_msg(&crate::conn::hello_request(
-                true,
-                false,
-                Vec::new(),
-                ConnectionRole::Control,
-            ))?;
+        match greet_spare(&mut child) {
+            Ok((stdin, stdout, stderr)) => Ok(Spare {
+                child,
+                stdin,
+                stdout,
+                stderr,
+            }),
+            Err(error) => {
+                // A refused or lost session is not left as a zombie.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
         }
-        Ok(Spare {
-            child,
-            stdin,
-            stdout,
-            stderr,
-        })
     }
 
     fn handle_client(&mut self, mut stream: UnixStream) -> Verdict {
@@ -625,6 +625,37 @@ impl Pool {
         }
         let _ = fs::remove_file(lock_path(&self.control));
     }
+}
+
+/// Take a spare's pipes and send the hello on it. The taker reads the reply;
+/// a default command's flags are used so the receiver's writer matches them.
+fn greet_spare(child: &mut Child) -> Result<(File, File, File)> {
+    // SAFETY: each descriptor comes from a piped child stdio handle this
+    // process owns and is wrapped exactly once.
+    let stdin = child
+        .stdin
+        .take()
+        .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
+        .context("spare session stdin was not piped")?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
+        .context("spare session stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| unsafe { File::from_raw_fd(pipe.into_raw_fd()) })
+        .context("spare session stderr was not piped")?;
+    let mut writer = FrameWriter::new(&stdin, true);
+    writer.write_msg(&crate::conn::hello_request(
+        true,
+        false,
+        Vec::new(),
+        ConnectionRole::Control,
+    ))?;
+    drop(writer);
+    Ok((stdin, stdout, stderr))
 }
 
 /// One request line, read a byte at a time so nothing beyond it is consumed.
