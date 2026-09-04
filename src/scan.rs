@@ -871,14 +871,10 @@ mod tests {
         }
         let root = Arc::new(Root::from_directory(File::open(temp.path()).unwrap()).unwrap());
 
-        let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
-            0
-        );
+        let mut limits = crate::fsops::nofile_limits().unwrap();
         assert!(limits.rlim_max >= 64, "hard descriptor limit is below 64");
         limits.rlim_cur = 64;
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        crate::fsops::set_nofile_limits(&limits).unwrap();
 
         let (entries, ignored, warnings) = descriptor_entries(root);
         assert!(
