@@ -82,19 +82,19 @@ Targets keep their command-line order, and naming the same parsed user, host,
 and port twice is an error. A local copy has no target group and keeps its
 single placement form.
 
-The target connections are opened concurrently. Each target registers the
-local source through the ordinary descriptor-pinned source path, while one of
-them walks it and shares that scan with the others. SYQ waits until every
-target has connected, checked its placement, planned the complete copy, and
-passed its fresh-target capacity check before any target replays a destination
-mutation. A failure before that barrier leaves every target unchanged. This is
-not a distributed transaction: a connection or filesystem failure after the
-barrier can leave some targets complete and others partial, and `--prune`
-planning and removal run after each target's file transfers. Rerunning the same
-command safely converges the targets unless its placement is new-only. After a
-partial `--into-new` or `--as-new` run, inspect the targets and retry with
-`--into` or `--as`, respectively: the successful targets now exist, so the
-original new-only precondition cannot be reused.
+The target connections are opened concurrently. Each target opens the selected
+local source before scanning, so replacing a source path afterward cannot
+redirect the copy. One target walks the source and shares that list with the
+others. Before making any destination changes, SYQ waits for every target to
+connect, check its placement, plan the complete copy, and check the capacity of
+a new target. A failure before this point leaves every target unchanged. This
+is not a distributed transaction: a connection or filesystem failure later can
+leave some targets complete and others partial, and `--prune` planning and
+removal run after each target's file transfers. Rerunning the same command
+safely converges the targets unless its placement is new-only. After a partial
+`--into-new` or `--as-new` run, inspect the targets and retry with `--into` or
+`--as`, respectively: the successful targets now exist, so the original
+new-only precondition cannot be reused.
 
 Multi-target copies support the ordinary local-source `cp` options, including
 `--root`, directional link following, `--mapping` (stdin is acquired once),

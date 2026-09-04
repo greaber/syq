@@ -418,28 +418,9 @@ impl Group {
     }
 }
 
-fn target_label(target: &Location) -> String {
-    let host = match (&target.host, target.port) {
-        (Some(host), Some(port)) if host.contains(':') => format!("[{host}]:{port}"),
-        (Some(host), Some(port)) => format!("{host}:{port}"),
-        (Some(host), None) => host.clone(),
-        (None, _) => return "local".into(),
-    };
-    match &target.user {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    }
-}
-
 pub fn run(mut args: Args) -> Result<i32> {
     let started = std::time::Instant::now();
     let target_count = args.fanout_targets.len() + 1;
-    if args.connections_opt.is_some() && args.connections < target_count {
-        bail!(
-            "--connections {} is smaller than the {target_count} fan-out targets; allow at least one worker per target",
-            args.connections
-        );
-    }
     let results = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
@@ -519,7 +500,7 @@ fn run_group(
     let ticker = spawn_progress_ticker(group.clone(), args);
     let mut threads = Vec::with_capacity(target_count);
     for (index, destination) in destinations.iter().cloned().enumerate() {
-        let label = target_label(&destination.location);
+        let label = crate::transfer::endpoint_identity(&destination.location);
         let mut member = args.clone();
         member.locations = sources.to_vec();
         member.locations.push(destination.location);
@@ -554,7 +535,7 @@ fn run_group(
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("target engine panicked")));
                 match &result {
-                    Ok(0) => {}
+                    Ok(0 | 23 | 25) => {}
                     Ok(_) => member_group.cancel(),
                     Err(error) => member_group.failed(&member_label, error),
                 }
@@ -573,7 +554,6 @@ fn run_group(
                 }
             }
             Ok(Ok(code)) => {
-                group.cancel();
                 exit_code = combine_exit_codes(exit_code, code);
                 failures.push(format!("target {label} exited {code}"));
             }
@@ -737,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn file_failure_aborts_every_registered_target_scheduler() {
+    fn file_failure_does_not_abort_any_target_scheduler() {
         let group = Group::new(2, 0, true, 0, None);
         let first = Arc::new(Sched::new(64, 128));
         let second = Arc::new(Sched::new(64, 128));
@@ -745,6 +725,21 @@ mod tests {
         group.register_scheduler(&second);
 
         first.fail_file(7);
+
+        assert!(first.is_failed(7));
+        assert!(!first.is_aborted());
+        assert!(!second.is_aborted());
+    }
+
+    #[test]
+    fn fatal_scheduler_abort_still_aborts_every_target_scheduler() {
+        let group = Group::new(2, 0, true, 0, None);
+        let first = Arc::new(Sched::new(64, 128));
+        let second = Arc::new(Sched::new(64, 128));
+        group.register_scheduler(&first);
+        group.register_scheduler(&second);
+
+        first.abort();
 
         assert!(first.is_aborted());
         assert!(second.is_aborted());

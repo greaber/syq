@@ -928,6 +928,89 @@ fn fanout_preserves_inplace_and_prune_behavior() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn fanout_per_file_failure_is_partial_and_does_not_abort_peers() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    write(&t.path("source"), b"copy me");
+    let alpha = t.path("remotes/alpha");
+    let beta = t.path("remotes/beta");
+    fs::create_dir_all(alpha.join("fail")).unwrap();
+    fs::create_dir_all(beta.join("ok")).unwrap();
+    install_cached_remote_helper(&alpha);
+    install_cached_remote_helper(&beta);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--to",
+            "alpha",
+            "--into-existing",
+            "fail",
+            "--to",
+            "beta",
+            "--into-existing",
+            "ok",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "fail/source")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(!alpha.join("fail/source").exists());
+    assert_eq!(read(&beta.join("ok/source")), b"copy me");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn fanout_max_delete_refusal_does_not_abort_peers() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    let data = vec![b'x'; 8 * 1024 * 1024];
+    write(&t.path("src/file"), &data);
+    let alpha = t.path("remotes/alpha");
+    let beta = t.path("remotes/beta");
+    write(&alpha.join("dst/file"), &data);
+    write(&alpha.join("dst/remove"), b"keep after refusal");
+    fs::create_dir_all(beta.join("dst")).unwrap();
+    set_mtime(&t.path("src/file"), 1_600_000_000);
+    set_mtime(&alpha.join("dst/file"), 1_600_000_000);
+    install_cached_remote_helper(&alpha);
+    install_cached_remote_helper(&beta);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--src-src",
+            &t.s("src"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "dst",
+            "--prune",
+            "--max-delete",
+            "0",
+            "-q",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("SYQ_TEST_HOLD_PARTIAL_MS", "750")
+        .run()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(25), "{}", stderr_of(&output));
+    assert!(alpha.join("dst/remove").exists());
+    assert_eq!(read(&beta.join("dst/file")), data);
+}
+
 #[test]
 fn fanout_preserves_root_links_filters_and_metadata_behavior() {
     use std::os::unix::fs::symlink;

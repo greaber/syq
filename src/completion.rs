@@ -1030,7 +1030,7 @@ fn destination_group_endpoint(args: &[Vec<u8>]) -> Option<&str> {
 fn tos_group_accepts_another_endpoint(args: &[Vec<u8>]) -> bool {
     let mut open = false;
     for argument in option_arguments(args) {
-        if argument == b"--tos" || argument.starts_with(b"--tos=") {
+        if argument == b"--tos" {
             open = true;
         } else if argument.starts_with(b"-") {
             open = false;
@@ -1949,6 +1949,10 @@ mod tests {
 
         let inline = [b"--to=delta".to_vec(), b"--as".to_vec()];
         assert_eq!(destination_group_endpoint(&inline), Some("delta"));
+
+        let inline_tos = [b"--tos=epsilon".to_vec()];
+        assert_eq!(destination_group_endpoint(&inline_tos), Some("epsilon"));
+        assert!(!tos_group_accepts_another_endpoint(&inline_tos));
     }
 
     #[test]

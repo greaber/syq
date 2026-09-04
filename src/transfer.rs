@@ -635,7 +635,7 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
 
 /// The endpoint half of a job identity: `user@host[:port]` (the user and an
 /// explicit port matter — they may select different filesystems), or `local`.
-fn endpoint_identity(l: &Location) -> String {
+pub(crate) fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
         (_, None) => "local".into(),
         (user, Some(host)) => {

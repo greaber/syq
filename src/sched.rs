@@ -244,10 +244,6 @@ impl Sched {
 
     pub fn fail_file(&self, idx: usize) {
         self.inner.lock().unwrap().failed.insert(idx);
-        let fanout = self.fanout.lock().unwrap().clone();
-        if let Some(group) = fanout.and_then(|group| group.upgrade()) {
-            group.cancel();
-        }
     }
 
     pub fn is_failed(&self, idx: usize) -> bool {
