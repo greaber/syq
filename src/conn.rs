@@ -1225,7 +1225,7 @@ pub struct RemoteSpec {
 pub(crate) enum PrimedControl {
     #[default]
     Unchecked,
-    Checked(Option<RemoteConn>),
+    Checked(Option<Box<RemoteConn>>),
 }
 
 impl RemoteSpec {
@@ -1391,7 +1391,7 @@ impl RemoteSpec {
     /// reason to connect directly, never an error.
     fn take_pooled_control(&self, compress: bool) -> Option<RemoteConn> {
         if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
-            return conn.take();
+            return conn.take().map(|conn| *conn);
         }
         let multiplexer = self.ssh_multiplexer.as_ref()?;
         if !multiplexer.persistent
@@ -1441,7 +1441,7 @@ impl RemoteSpec {
             return;
         }
         let conn = self.take_pooled_control(compress);
-        *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn);
+        *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
     }
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
