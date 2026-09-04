@@ -534,8 +534,8 @@ syq map --src-src photos \
 ```
 
 `syq map` is local and destination-independent. Its options are `-C`,
-`--follow-src`/`--follow`, the source-selector family, and `--as` for renaming
-one selected root. Copy destinations, filtering, transfer policy, execution
+`--follow-src`/`--follow`, the source-selector family, and `--as PATH` for
+placing the single selected root at `PATH`. Copy destinations, filtering, transfer policy, execution
 controls, results, receiver ceilings, and receipts belong to the downstream `cp`
 invocation or the manifest transform.
 

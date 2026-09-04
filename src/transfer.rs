@@ -8031,7 +8031,7 @@ fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
     Ok(ManifestEntry { src, dst, kind })
 }
 
-fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
+pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
     if path.is_empty() {
         bail!("{which} path is empty");
     }

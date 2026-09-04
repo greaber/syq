@@ -11684,6 +11684,39 @@ fn native_map_named_cwd_and_as_rename() {
     assert_eq!(dsts, ["album", "album/x", "album/x/a.jpg"]);
     let srcs: Vec<String> = lines.iter().map(|v| map_path(v, "src")).collect();
     assert_eq!(srcs, ["photos", "photos/x", "photos/x/a.jpg"]);
+    // --as PATH may be nested; every component is honored, none is dropped.
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["photos", "--as", "2024/07/album"],
+    ));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(
+        dsts,
+        ["2024/07/album", "2024/07/album/x", "2024/07/album/x/a.jpg"]
+    );
+}
+
+#[test]
+fn native_map_as_nested_path_round_trips_through_cp_mapping() {
+    let t = Tmp::new();
+    write(&t.path("src/photos/x/a.jpg"), b"img");
+    let mapped = syq_map_in(&t.path("src"), &["photos", "--as", "2024/07/album"]);
+    assert!(
+        mapped.status.success(),
+        "map failed: {}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+    let copied = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(&mapped.stdout),
+    );
+    assert!(
+        copied.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(read(&t.path("dst/2024/07/album/x/a.jpg")), b"img");
 }
 
 #[test]
@@ -11701,6 +11734,9 @@ fn native_map_refusals() {
     refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
     refuse(&["--src-src", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
+    refuse(&["d1", "--as", "/abs"], "is absolute");
+    refuse(&["d1", "--as", "../up"], "`..` component");
+    refuse(&["d1", "--as", "a//b"], "empty, `.`, or `..` component");
     refuse(
         &["d1", "--into-new", "z"],
         "unexpected argument '--into-new'",
