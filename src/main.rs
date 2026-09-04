@@ -1,6 +1,7 @@
 mod agent_broker;
 mod bwlimit;
 mod cli;
+mod completion;
 mod conn;
 mod crypto;
 mod delegation;
@@ -145,6 +146,15 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(error) => {
                 eprintln!("syq persist: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("completion") {
+        match completion::run(&argv[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("syq completion: {error:#}");
                 std::process::exit(1);
             }
         }

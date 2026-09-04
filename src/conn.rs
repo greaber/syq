@@ -429,6 +429,7 @@ impl Conn for LocalConn {
             && matches!(
                 &req,
                 Request::TcpListen { .. }
+                    | Request::ListDir { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
@@ -1180,6 +1181,30 @@ impl RemoteSpec {
         self.connect_with_role(compress, limited, role)
     }
 
+    /// One non-retrying control connection for speculative shell completion.
+    /// The caller supplies BatchMode and SSH timeouts in `rsh`; this avoids the
+    /// transfer engine's exponential retries while retaining the exact same
+    /// managed-helper bootstrap and persistent control socket behavior.
+    pub(crate) fn connect_completion(&self) -> Result<RemoteConn> {
+        let role = ConnectionRole::Control;
+        let first = self.connect_once(false, SshConnection::Control, role.clone());
+        let Err(first_error) = first else {
+            return first;
+        };
+        if !self.auto_helper || !helper_needs_install(&first_error) {
+            return Err(first_error);
+        }
+        self.install_helper()?;
+        self.connect_once(false, SshConnection::Control, role)
+            .with_context(|| {
+                format!(
+                    "could not start the {} helper installed on {}",
+                    remote_helper::helper_identity(),
+                    self.label()
+                )
+            })
+    }
+
     fn connect_with_role(
         &self,
         compress: bool,
@@ -1316,6 +1341,20 @@ impl RemoteSpec {
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
+        if ssh_connection == SshConnection::Control
+            && !self.local_process
+            && self.restricted_grant.is_none()
+            && self
+                .rsh
+                .first()
+                .is_some_and(|program| program.ends_with("ssh"))
+        {
+            crate::completion::remember_endpoint_best_effort(
+                self.user.as_deref(),
+                &self.host,
+                self.port,
+            );
+        }
         Ok(conn)
     }
 
@@ -2438,6 +2477,18 @@ mod tests {
             matches!(response, Response::Err(error) if error.contains("not valid on a source worker"))
         );
         assert_eq!(std::fs::read(&marker).unwrap(), b"marker");
+
+        let response = source
+            .call(Request::ListDir {
+                directory: selected.as_os_str().as_bytes().to_vec(),
+                confined_root: None,
+                prefix: b"mar".to_vec(),
+                limit: 10,
+            })
+            .unwrap();
+        assert!(
+            matches!(response, Response::Err(error) if error.contains("only on the control connection"))
+        );
 
         let selection = [NativeRemoveSelection {
             path: b"marker".to_vec(),
