@@ -104,6 +104,17 @@ outlive its premise and steer later work in the wrong direction.
 - At review handoff, state the branch and exact short commit SHA, whether the
   worktree is clean, and which checks passed, failed, or were not run. Treat
   review-ready and merge-ready as separate states.
+- Run `scripts/branch-status.sh` from the task worktree before opening a pull
+  request, before asking for review, and before merging, and include its output
+  in the report. It prints the branch SHA and cleanliness, the pull request's
+  GitHub head and check results, and the latest post-merge `ci`,
+  `rsync-compat`, and `macos` runs on `master`. Pull requests run a reduced
+  suite, so a failure in the full suites first appears in those `master` runs,
+  and nothing else surfaces it. A red `master` run makes the script exit 1;
+  report it to the user even when the current task did not cause it, and do not
+  treat the task's own green pull-request checks as evidence that `master` is
+  healthy. `--check` also runs the Rust baseline below, and `--json` prints the
+  same facts for scripting.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
