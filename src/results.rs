@@ -16,7 +16,7 @@
 //! not reported per operation (dry runs do trace them as `metadata_differs`).
 //!
 //! Attached direct copies through a command-restricted receiver are the one
-//! exception: receipt_v2 emits their stream locally after verification, marks
+//! exception: receipt_policy emits their stream locally after verification, marks
 //! its provenance, omits source-side claims hostB cannot authenticate, and
 //! includes closure-time final-state records.
 

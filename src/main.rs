@@ -16,7 +16,7 @@ mod persistence;
 mod private_broker;
 mod progress;
 mod proto;
-mod receipt_v2;
+mod receipt;
 mod remote_helper;
 mod remote_to_remote;
 mod restricted;

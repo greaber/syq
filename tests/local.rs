@@ -3882,7 +3882,7 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     let identity = binary_identity("--build-identity");
     let target = helper_target();
     t.path(&format!(
-        "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
+        "remote-home/.cache/syq/helpers/{identity}-release/{target}/syq"
     ))
 }
 
@@ -8658,7 +8658,7 @@ fn local_copy_does_not_read_the_global_persistence_configuration() {
     write(&t.path("src/f"), b"data");
     // An eligible implicit SSH endpoint would report this malformed policy,
     // but a local copy has no persistence decision to make.
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("XDG_CONFIG_HOME", t.path("config"))
@@ -13689,7 +13689,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
     assert_output_ok(&listed);
     assert_eq!(listed.stdout, b"fake.example\n");
-    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints-v1.json")).unwrap();
+    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints.json")).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
     let suggested = completion_command(
@@ -13742,7 +13742,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
 
     let cleared = completion_command(&t, &["cache", "clear"]).run().unwrap();
     assert_output_ok(&cleared);
-    assert!(!t.path("cache/syq/completion-endpoints-v1.json").exists());
+    assert!(!t.path("cache/syq/completion-endpoints.json").exists());
 }
 
 fn ephemeral_scope(t: &Tmp) -> PathBuf {
@@ -13944,7 +13944,7 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
 fn remote_coordinator_does_not_resolve_local_persistence() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let ssh = t.path("bin/ssh");
     executable(
         &ssh,

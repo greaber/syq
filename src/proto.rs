@@ -907,7 +907,7 @@ pub enum Response {
     TransportStats(Option<TcpSocketStats>),
     /// One bounded frame of a signed receipt stream. The final frame is marked
     /// inside the canonical frame encoding.
-    ReceiptV2(#[serde(with = "serde_bytes")] Vec<u8>),
+    Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     /// An endpoint operation failed with a preserved OS error number. Server
     /// and authorization protocol failures continue to use Err(String).
@@ -1099,7 +1099,7 @@ impl SizeHint for Response {
                     + 32
             }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
-            Response::ReceiptV2(v) => v.len() + 16,
+            Response::Receipt(v) => v.len() + 16,
             _ => 256,
         }
     }

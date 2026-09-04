@@ -17,9 +17,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CONFIG_VERSION: u8 = 1;
-const CONFIG_FILE: &str = "persistence-v1.json";
-const SCOPE_MARKER: &str = ".syq-persistence-v1";
+const CONFIG_FILE: &str = "persistence.json";
+const SCOPE_MARKER: &str = ".syq-persistence";
 const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope v1\n";
 
 #[derive(Parser, Debug)]
@@ -58,14 +57,12 @@ enum PersistAction {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistenceConfig {
-    version: u8,
     enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EndpointRecord {
-    version: u8,
     pub(crate) user: Option<String>,
     pub(crate) host: String,
     pub(crate) port: Option<u16>,
@@ -74,7 +71,6 @@ pub(crate) struct EndpointRecord {
 impl EndpointRecord {
     fn new(user: Option<&str>, host: &str, port: Option<u16>) -> Self {
         Self {
-            version: CONFIG_VERSION,
             user: user.map(str::to_owned),
             host: host.to_owned(),
             port,
@@ -348,13 +344,6 @@ fn read_global_config() -> Result<Option<PersistenceConfig>> {
     file.read_to_end(&mut bytes)?;
     let config: PersistenceConfig = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse persistence configuration {}", path.display()))?;
-    if config.version != CONFIG_VERSION {
-        bail!(
-            "unsupported persistence configuration version {} in {}",
-            config.version,
-            path.display()
-        );
-    }
     Ok(Some(config))
 }
 
@@ -370,13 +359,7 @@ fn write_global_config(enabled: bool) -> Result<()> {
         .with_context(|| format!("create configuration directory {}", parent.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary configuration in {}", parent.display()))?;
-    serde_json::to_writer_pretty(
-        &mut temporary,
-        &PersistenceConfig {
-            version: CONFIG_VERSION,
-            enabled,
-        },
-    )?;
+    serde_json::to_writer_pretty(&mut temporary, &PersistenceConfig { enabled })?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary
@@ -580,13 +563,6 @@ fn read_endpoint_record(path: &Path) -> Result<EndpointRecord> {
     }
     let record: EndpointRecord = serde_json::from_reader(file)
         .with_context(|| format!("parse endpoint record {}", path.display()))?;
-    if record.version != CONFIG_VERSION {
-        bail!(
-            "unsupported endpoint record version {} in {}",
-            record.version,
-            path.display()
-        );
-    }
     Ok(record)
 }
 

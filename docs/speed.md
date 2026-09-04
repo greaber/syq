@@ -197,8 +197,8 @@ Remembered results are keyed only by the directional endpoint path and
 transport (TCP and ssh learn separately), not by RTT, workload, filesystem or
 other volatile telemetry. A stale hint only costs the tuner a probe or two. The
 cache is
-`$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
-`~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
+`$XDG_CACHE_HOME/syq/tuning.json` (normally
+`~/.cache/syq/tuning.json`; set `SYQ_TUNING_CACHE` to override it or to an
 empty value to disable it). An explicit connection count, dry runs, verification, short runs
 that compare no counts, failed/aborted copies, and runs whose TCP path falls
 back to ssh after workers start do not update it; the last case may contain
