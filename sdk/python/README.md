@@ -57,9 +57,12 @@ receiver rejects native removal because its signed grants currently authorize
 copy mutations only.
 
 Remote-copy controls use the same names with underscores, including `coordinate_at`,
-`rsh`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
+`rsh`, `pscope`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
 `tcp_congestion`, and the native agent-forwarding policy flags. `detach` stays
 on raw `run()` because a detached command cannot return typed attached results.
+`pscope` is also available on typed `rm`. Direct remote-to-remote copies can
+request native receiver receipt detail with `receipt="sizes"` or
+`receipt="hashed"`.
 Ignore rules retain native ordering when interleaved by using
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`; `ignore_from=` remains the
 simple form when every file follows the inline patterns.

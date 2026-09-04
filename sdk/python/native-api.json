@@ -29,6 +29,7 @@
         "connections",
         "coordinate-at",
         "rsh",
+        "pscope",
         "syq-path",
         "no-bootstrap",
         "tcp-plain",
@@ -41,6 +42,7 @@
         "max-entries",
         "max-total-bytes",
         "max-runtime",
+        "receipt",
         "hash",
         "no-compress",
         "bwlimit",
@@ -71,10 +73,7 @@
         "stats",
         "detach"
       ],
-      "follow_up": [
-        "pscope",
-        "receipt"
-      ]
+      "follow_up": []
     },
     "rm": {
       "sdk": "python",
@@ -92,7 +91,8 @@
         "dry-run",
         "connections",
         "syq-path",
-        "no-bootstrap"
+        "no-bootstrap",
+        "pscope"
       ],
       "internal": [
         "results-fd"
@@ -110,9 +110,7 @@
         "no-progress",
         "progress-json"
       ],
-      "follow_up": [
-        "pscope"
-      ]
+      "follow_up": []
     },
     "map": {
       "sdk": "python",

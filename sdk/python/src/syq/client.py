@@ -519,6 +519,7 @@ def _append_remote_arguments(
     *,
     coordinate_at: str | None,
     rsh: str | None,
+    pscope: PathArgument | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
     tcp_plain: bool,
@@ -535,8 +536,14 @@ def _append_remote_arguments(
                 "--coordinate-at must be auto, local, src, or dest"
             )
         argv.extend(("--coordinate-at", coordinate_at))
+    if pscope is not None and rsh is not None:
+        raise SyqInvocationError("--pscope cannot be used with --rsh")
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
+    if pscope is not None:
+        _append_path_option(
+            argv, "--pscope", _argument(pscope, label="pscope")
+        )
     if syq_path is not None:
         _append_path_option(
             argv, "--syq-path", _text_arg(syq_path, label="syq_path")
@@ -611,6 +618,7 @@ def _copy_arguments(
     max_entries: int | None,
     max_total_bytes: str | int | None,
     max_runtime: str | int | None,
+    receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
@@ -697,6 +705,11 @@ def _copy_arguments(
         argv.extend(("--max-entries", str(max_entries)))
     _append_text(argv, "--max-total-bytes", max_total_bytes)
     _append_text(argv, "--max-runtime", max_runtime)
+    if receipt is not None:
+        receipt_value = _text_arg(receipt, label="receipt")
+        if receipt_value not in {"sizes", "hashed"}:
+            raise SyqInvocationError("--receipt must be sizes or hashed")
+        argv.extend(("--receipt", receipt_value))
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
         for rule in rules:
@@ -749,6 +762,7 @@ def _rm_arguments(
     connections: int | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
+    pscope: PathArgument | None,
 ) -> tuple[list[Argument], int]:
     argv: list[Argument] = ["rm"]
     source_count = 0
@@ -793,6 +807,10 @@ def _rm_arguments(
         )
     if no_bootstrap:
         argv.append("--no-bootstrap")
+    if pscope is not None:
+        _append_path_option(
+            argv, "--pscope", _argument(pscope, label="pscope")
+        )
     return argv, source_count
 
 
@@ -1010,6 +1028,7 @@ class Client:
         connections: int | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
+        pscope: PathArgument | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
         tcp_plain: bool = False,
@@ -1022,6 +1041,7 @@ class Client:
         max_entries: int | None = None,
         max_total_bytes: str | int | None = None,
         max_runtime: str | int | None = None,
+        receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
@@ -1075,6 +1095,7 @@ class Client:
             max_entries=max_entries,
             max_total_bytes=max_total_bytes,
             max_runtime=max_runtime,
+            receipt=receipt,
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
@@ -1087,6 +1108,7 @@ class Client:
             argv,
             coordinate_at=coordinate_at,
             rsh=rsh,
+            pscope=pscope,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
             tcp_plain=tcp_plain,
@@ -1171,6 +1193,7 @@ class Client:
         connections: int | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
+        pscope: PathArgument | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
         timeout: float | None = None,
         check: bool = True,
@@ -1191,6 +1214,7 @@ class Client:
             connections=connections,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
+            pscope=pscope,
         )
         result = self._typed(
             argv,
@@ -1256,6 +1280,7 @@ class Client:
             max_entries=None,
             max_total_bytes=None,
             max_runtime=None,
+            receipt=None,
             ignore=None,
             ignore_from=None,
             preserve=None,
