@@ -251,6 +251,22 @@ pub(crate) fn configure_tcp_congestion<S: AsRawFd>(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn connect_tcp_stream(
+    address: &SocketAddr,
+    timeout: std::time::Duration,
+    congestion_control: Option<&str>,
+) -> Result<TcpStream> {
+    match congestion_control {
+        None => TcpStream::connect_timeout(address, timeout).map_err(Into::into),
+        Some(congestion_control) => Err(TcpCongestionError(format!(
+            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn connect_tcp_stream(
     address: &SocketAddr,
     timeout: std::time::Duration,
@@ -260,16 +276,6 @@ fn connect_tcp_stream(
         return TcpStream::connect_timeout(address, timeout).map_err(Into::into);
     };
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (address, timeout);
-        return Err(TcpCongestionError(format!(
-            "TCP congestion control {congestion_control:?} was requested, but per-socket selection is supported only on Linux"
-        ))
-        .into());
-    }
-
-    #[cfg(target_os = "linux")]
     {
         use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -330,10 +336,44 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     })
 }
 
+/// `struct tcp_connection_info` as the XNU kernel lays it out. The `libc`
+/// crate expands the kernel's single 32-bit TFO bit-field word into
+/// eighteen separate fields, which shifts every 64-bit counter and makes the
+/// kernel's returned length fall short of them.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DarwinTcpConnectionInfo {
+    tcpi_state: u8,
+    tcpi_snd_wscale: u8,
+    tcpi_rcv_wscale: u8,
+    __pad1: u8,
+    tcpi_options: u32,
+    tcpi_flags: u32,
+    tcpi_rto: u32,
+    tcpi_maxseg: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_snd_sbbytes: u32,
+    tcpi_rcv_wnd: u32,
+    tcpi_rttcur: u32,
+    tcpi_srtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_tfo: u32,
+    tcpi_txpackets: u64,
+    tcpi_txbytes: u64,
+    tcpi_txretransmitbytes: u64,
+    tcpi_rxpackets: u64,
+    tcpi_rxbytes: u64,
+    tcpi_rxoutoforderbytes: u64,
+    tcpi_txretransmitpackets: u64,
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
-    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    let mut info: DarwinTcpConnectionInfo = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<DarwinTcpConnectionInfo>() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
@@ -349,7 +389,7 @@ pub(crate) fn tcp_socket_stats(stream: &TcpStream) -> Option<TcpSocketStats> {
     macro_rules! field {
         ($name:ident, $value:expr) => {
             ((len as usize)
-                >= std::mem::offset_of!(libc::tcp_connection_info, $name)
+                >= std::mem::offset_of!(DarwinTcpConnectionInfo, $name)
                     + std::mem::size_of_val(&info.$name))
             .then(|| $value)
         };

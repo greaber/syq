@@ -55,7 +55,7 @@ for index in "${!targets[@]}"; do
   binary_hash=$(sha256_file "$binary")
   archive_hash=$(sha256_file "$archive")
   binary_size=$(wc -c < "$binary" | tr -d ' ')
-  archive_size=$(stat -c '%s' "$archive")
+  archive_size=$(wc -c < "$archive" | tr -d ' ')
   printf '%s  %s\n' "$binary_hash" "$asset" > "$binary.sha256"
   printf '%s  %s\n' "$archive_hash" "$asset.gz" > "$archive.sha256"
 
@@ -77,10 +77,10 @@ jq -n --sort-keys \
 
 "$script_dir/generate-installer.sh" "$manifest_core" "$dist/install.sh"
 "$script_dir/generate-homebrew-formula.sh" "$manifest_core" "$dist/syq.rb"
-installer_hash=$(sha256sum "$dist/install.sh" | awk '{print $1}')
-installer_size=$(stat -c '%s' "$dist/install.sh")
-formula_hash=$(sha256sum "$dist/syq.rb" | awk '{print $1}')
-formula_size=$(stat -c '%s' "$dist/syq.rb")
+installer_hash=$(sha256_file "$dist/install.sh")
+installer_size=$(wc -c < "$dist/install.sh" | tr -d ' ')
+formula_hash=$(sha256_file "$dist/syq.rb")
+formula_size=$(wc -c < "$dist/syq.rb" | tr -d ' ')
 jq --sort-keys \
   --arg installer_sha "$installer_hash" --argjson installer_size "$installer_size" \
   --arg formula_sha "$formula_hash" --argjson formula_size "$formula_size" \

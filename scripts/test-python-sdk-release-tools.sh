@@ -70,8 +70,10 @@ cp "$repo_dir/sdk/python/README.md" "$misaligned/sdk/python/README.md"
 cp "$repo_dir/sdk/python/pyproject.toml" "$misaligned/sdk/python/pyproject.toml"
 cp "$repo_dir/sdk/python/src/syq/syq-release-manifest.json" \
   "$misaligned/sdk/python/src/syq/syq-release-manifest.json"
-sed -i 's/^version = ".*"/version = "0.0.0"/' \
-  "$misaligned/sdk/python/pyproject.toml"
+# BSD sed spells in-place editing differently; rewrite through a temporary file.
+sed 's/^version = ".*"/version = "0.0.0"/' "$misaligned/sdk/python/pyproject.toml" \
+  > "$misaligned/sdk/python/pyproject.toml.tmp"
+mv "$misaligned/sdk/python/pyproject.toml.tmp" "$misaligned/sdk/python/pyproject.toml"
 if python3 "$script_dir/prepare-python-sdk-release.py" \
   --root "$misaligned" --manifest "$candidate" \
   > "$work/misaligned.out" 2>&1; then

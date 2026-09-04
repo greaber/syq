@@ -65,7 +65,7 @@ the line for your shell to its startup file:
 
 ```bash
 # Bash (~/.bashrc)
-source <(syq completion bash)
+eval "$(syq completion bash)"
 
 # Zsh (~/.zshrc)
 source <(syq completion zsh)

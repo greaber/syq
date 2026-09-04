@@ -875,7 +875,21 @@ impl SshsigPolicy {
             .args(["-I", signer, "-n", SSHSIG_NAMESPACE, "-s"])
             .arg(signature_child.path());
         if let Some(revocation) = &revocation_child {
-            command.arg("-r").arg(revocation.path());
+            // ssh-keygen opens a plain-text revocation list twice: once to
+            // probe for KRL magic and again to scan keys. On Darwin an open of
+            // /dev/fd/N duplicates the descriptor and shares its offset, so the
+            // second pass would start at EOF and a revoked key would verify.
+            // Hand macOS the snapshot's path inside the private store instead.
+            #[cfg(target_os = "macos")]
+            let argument = store.path.join(
+                &revocation_file
+                    .as_ref()
+                    .expect("revocation snapshot exists when its descriptor does")
+                    .name,
+            );
+            #[cfg(not(target_os = "macos"))]
+            let argument = revocation.path();
+            command.arg("-r").arg(argument);
         }
         let mut mappings = vec![signature_child.mapping(), allowed_child.mapping()];
         if let Some(revocation) = &revocation_child {

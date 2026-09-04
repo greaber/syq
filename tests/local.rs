@@ -1,6 +1,7 @@
 //! Integration tests: local -> local copies through the built binary.
 
 use base64::Engine as _;
+#[cfg(target_os = "linux")]
 use ed25519_dalek::{Signer, SigningKey};
 #[cfg(target_os = "linux")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
@@ -66,10 +67,27 @@ impl Tmp {
     fn s(&self, rel: &str) -> String {
         self.path(rel).to_string_lossy().into_owned()
     }
+    /// A runtime directory for `XDG_RUNTIME_DIR`. Unix socket paths beneath
+    /// it must fit `sun_path` (104 bytes on macOS), so when the test
+    /// directory itself is long, as under macOS's `TMPDIR`, the runtime
+    /// directory lives directly under `/tmp` instead.
+    fn runtime(&self) -> PathBuf {
+        let inside = self.path("runtime");
+        if inside.as_os_str().len() <= 48 {
+            return inside;
+        }
+        let tmp = fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let name = self.0.file_name().unwrap().to_string_lossy();
+        tmp.join(format!("{name}-rt"))
+    }
 }
 
 impl Drop for Tmp {
     fn drop(&mut self) {
+        let runtime = self.runtime();
+        if runtime != self.path("runtime") {
+            let _ = fs::remove_dir_all(runtime);
+        }
         // Make everything removable again (tests chmod 000 some files).
         fn fix(p: &Path) {
             if let Ok(md) = fs::symlink_metadata(p) {
@@ -3076,9 +3094,9 @@ fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
         .filter(|record| record["type"] == "selection_result")
         .map(|record| record["selector"].as_u64().unwrap())
         .collect();
-    assert_eq!(selectors, [0, 1]);
+    assert_eq!(selectors, [0, 1], "{records:?}");
     let terminal = records.last().unwrap();
-    assert_eq!(terminal["entries_removed"], 1);
+    assert_eq!(terminal["entries_removed"], 1, "{records:?}");
     assert_eq!(terminal["entries_already_absent"], 1);
 }
 
@@ -3600,13 +3618,20 @@ fn assert_output_ok(out: &Output) {
     );
 }
 
+/// The release target name syq uses for this test host.
+fn helper_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-arm64",
+        other => panic!("unsupported test platform {other:?}"),
+    }
+}
+
 fn cached_remote_helper(t: &Tmp) -> PathBuf {
     let identity = binary_identity("--build-identity");
-    let target = match std::env::consts::ARCH {
-        "x86_64" => "linux-x86_64",
-        "aarch64" => "linux-aarch64",
-        arch => panic!("unsupported test architecture {arch}"),
-    };
+    let target = helper_target();
     t.path(&format!(
         "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
     ))
@@ -3614,11 +3639,7 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn cached_local_helper(t: &Tmp) -> PathBuf {
-    let target = match std::env::consts::ARCH {
-        "x86_64" => "linux-x86_64",
-        "aarch64" => "linux-aarch64",
-        arch => panic!("unsupported test architecture {arch}"),
-    };
+    let target = helper_target();
     t.path(&format!(
         "cache/syq/helpers/v{}/{target}/syq",
         env!("CARGO_PKG_VERSION")
@@ -4764,7 +4785,9 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     );
 }
 
-#[cfg(debug_assertions)]
+// The expected tuner trajectory depends on measured loopback throughput and
+// is calibrated for Linux runners.
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     let t = Tmp::new();
@@ -5048,6 +5071,9 @@ fn single_file_to_new_name() {
     assert_same_tree(&t.path("src/f.txt"), &t.path("out.txt"));
 }
 
+// Pinning a mode-000 file without opening it needs Linux `O_PATH`; macOS
+// `O_EVTONLY` still fails the permission check, so the copy fails visibly.
+#[cfg(target_os = "linux")]
 #[test]
 fn archive_copies_mode_zero_empty_file_without_opening_source() {
     let t = Tmp::new();
@@ -7975,11 +8001,15 @@ fn unreadable_source_root_disables_delete() {
     fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(out.status.code(), Some(0));
     assert!(t.path("dst/precious").exists(), "{}", stderr_of(&out));
-    assert!(
-        stderr_of(&out).contains("skipping deletions"),
-        "{}",
-        stderr_of(&out)
-    );
+    // Linux opens the unreadable root with `O_PATH` and reaches the deletion
+    // decision; macOS cannot open it and fails at source registration.
+    if cfg!(target_os = "linux") {
+        assert!(
+            stderr_of(&out).contains("skipping deletions"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
 }
 
 #[test]
@@ -8863,6 +8893,9 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     assert_eq!(published.mtime(), 1_600_000_001);
 }
 
+// Repairing metadata on an unreadable destination file needs a Linux
+// `O_PATH` handle; macOS cannot open the file at all and reports the error.
+#[cfg(target_os = "linux")]
 #[test]
 fn quick_check_repairs_mode_without_destination_read_permission() {
     let t = Tmp::new();
@@ -12601,7 +12634,7 @@ fn persistence_command(t: &Tmp, args: &[&str]) -> Command {
         .arg("persist")
         .args(args)
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"));
+        .env("XDG_RUNTIME_DIR", t.runtime());
     command
 }
 
@@ -12613,7 +12646,7 @@ fn completion_command(t: &Tmp, args: &[&str]) -> Command {
         .env("HOME", t.path("home"))
         .env("XDG_CACHE_HOME", t.path("cache"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"));
+        .env("XDG_RUNTIME_DIR", t.runtime());
     command
 }
 
@@ -12668,7 +12701,7 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     let registered = Command::new("bash")
         .arg("-c")
         .arg(
-            r#"source <("$SYQ" completion bash)
+            r#"eval "$("$SYQ" completion bash)"
 COMP_LINE='FOO=x syq c'
 COMP_POINT=${#COMP_LINE}
 COMP_WORDS=(FOO=x syq c)
@@ -12702,7 +12735,7 @@ complete -p syq"#,
     let unicode = Command::new("bash")
         .arg("-c")
         .arg(
-            r#"source <("$SYQ" completion bash)
+            r#"eval "$("$SYQ" completion bash)"
 COMP_LINE='syq cp éa'
 COMP_POINT=${#COMP_LINE}
 COMP_WORDS=(syq cp éa)
@@ -12716,7 +12749,7 @@ printf '%s\n' "${COMPREPLY[@]}""#,
         .env("HOME", t.path("home"))
         .env("XDG_CACHE_HOME", t.path("cache"))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .env(
             "PATH",
             format!(
@@ -12850,7 +12883,7 @@ printf '%s\n' "${COMPREPLY[@]}""#,
 #[test]
 fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
     write(&t.path("remote-home/data/name with spaces"), b"remote");
     write(&t.path("from-local"), b"local");
@@ -13271,7 +13304,7 @@ fn ephemeral_scope(t: &Tmp) -> PathBuf {
 #[test]
 fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
 
     let status = persistence_command(&t, &["status"]).run().unwrap();
     assert_output_ok(&status);
@@ -13300,7 +13333,7 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
         .arg(&scope)
         .args(["--src-src", &t.s("src"), "--into", &t.s("out"), "-q"])
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert_output_ok(&copy);
@@ -13349,7 +13382,7 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
 #[test]
 fn remote_coordinator_does_not_resolve_local_persistence() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
     let ssh = t.path("bin/ssh");
     executable(
@@ -13375,7 +13408,7 @@ exit 23
                 "--no-progress",
             ])
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("FAKE_RSH_MARKER", t.path("ssh-called"))
             .env(
                 "PATH",
@@ -13428,7 +13461,7 @@ fn ephemeral_persistence_refuses_openssh_expanding_runtime_paths() {
 #[test]
 fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     let ssh = fake_ssh(&t);
     write(&t.path("src"), b"persistent");
 
@@ -13448,7 +13481,7 @@ fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
         .arg(t.path("global-dst"))
         .arg("-q")
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -13518,7 +13551,7 @@ exit 0
         .arg(t.path("scoped-dst"))
         .arg("-q")
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -13543,7 +13576,7 @@ exit 0
 #[test]
 fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     let scope = ephemeral_scope(&t);
     write(&t.path("src/a"), b"a");
 
@@ -13561,7 +13594,7 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
         .arg(&scope)
         .args([&t.s("src/"), &t.s("compat"), "--no-progress"])
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert_output_ok(&compat);
@@ -13574,7 +13607,7 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
         .args(["--src", "remove-me", "-q"])
         .current_dir(&t.0)
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert_output_ok(&removal);
@@ -13611,7 +13644,7 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
             "-q",
         ])
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert!(!refused.status.success());
@@ -13624,7 +13657,7 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
 #[test]
 fn explicit_pscope_is_refused_for_remote_coordinators() {
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     let scope = ephemeral_scope(&t);
     let scope = scope.to_str().unwrap();
 
@@ -13639,7 +13672,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
             "--no-progress",
         ])
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert!(!out.status.success());
@@ -13663,7 +13696,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
             "-q",
         ])
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
     assert!(!out.status.success());

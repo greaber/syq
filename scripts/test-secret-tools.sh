@@ -143,6 +143,14 @@ env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh" \
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
+# Portable SHA-256 of one file: GNU coreutils on Linux, Perl shasum on macOS.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
 [ "$(file_mode "$repo/.env.keys")" = 600 ] || fail ".env.keys is not mode 0600"
 grep -Fq 'BEGIN OPENSSH PRIVATE KEY' "$repo/.env.release" \
   && fail "encrypted inventory contains the plaintext Homebrew key"
@@ -161,13 +169,13 @@ derived_public=$(openssl pkey -in "$work/signing.pem" -pubout -outform DER \
 [ "$derived_public" = "$(cat "$fake_state/SYQ_RELEASE_PUBLIC_KEY")" ] \
   || fail "initializer stored a mismatched signing key pair"
 
-env_hash=$(sha256sum "$repo/.env.release")
-keys_hash=$(sha256sum "$repo/.env.keys")
+env_hash=$(sha256_file "$repo/.env.release")
+keys_hash=$(sha256_file "$repo/.env.keys")
 expect_failure "$work/reinit-output" \
   env "${common_env[@]}" "$repo/scripts/init-release-secrets.sh"
-[ "$env_hash" = "$(sha256sum "$repo/.env.release")" ] \
+[ "$env_hash" = "$(sha256_file "$repo/.env.release")" ] \
   || fail "reinitialization changed .env.release"
-[ "$keys_hash" = "$(sha256sum "$repo/.env.keys")" ] \
+[ "$keys_hash" = "$(sha256_file "$repo/.env.keys")" ] \
   || fail "reinitialization changed .env.keys"
 
 : > "$fake_state/calls"

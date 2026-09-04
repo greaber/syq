@@ -2439,12 +2439,14 @@ mod tests {
         excess.write_all(&[0]).unwrap();
         assert_closed(&mut excess);
 
-        drop(broker);
-        assert!(!path.exists());
-        for mut client in clients {
+        for client in &clients {
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
+        }
+        drop(broker);
+        assert!(!path.exists());
+        for mut client in clients {
             assert_closed(&mut client);
         }
     }
