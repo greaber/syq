@@ -557,24 +557,14 @@ because syq cannot safely infer how an arbitrary wrapper should be invoked.
 Connection and listing failures simply produce no candidates; set
 `SYQ_COMPLETION_DEBUG=1` to show their diagnostics.
 
-<<<<<<< HEAD
 The helper syq installs on a remote host serves one bounded, read-only
 directory listing. If the matching helper is absent, the first completion may
 install it through the same signed, verified bootstrap used by a transfer.
 With persistence enabled, completion uses the same per-endpoint SSH control
-connection as later transfers, which removes the repeated login latency.
-Without persistence, the completion process opens its own connection, which
-ends with that request.
-=======
-The remote helper serves one bounded, read-only directory listing. If the
-matching helper is absent, the first completion may install it through the
-same signed, verified bootstrap used by a transfer. With persistence enabled,
-completion uses the same per-endpoint SSH control connection as later
-transfers, which removes the repeated login latency, and takes the session
-pool's ready helper session when one is waiting, which makes a Tab one
-network round trip. Without persistence, the completion process uses a
-private connection that ends with that request.
->>>>>>> 8dcd2cd (Keep a ready helper session per persistent endpoint)
+connection as later transfers, which removes the repeated login latency. It
+also takes the session pool's ready helper when one is waiting, which makes a
+Tab one network round trip. Without persistence, the completion process opens
+its own connection, which ends with that request.
 
 After a successful SSH connection, syq remembers the endpoint as a future
 suggestion. It also suggests literal aliases from SSH configuration,

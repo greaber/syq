@@ -14196,6 +14196,50 @@ fn session_pool_serves_later_commands_without_new_ssh_sessions() {
     );
 }
 
+/// An SSH child can start successfully and only then refuse its exec
+/// channel. Such failures need the same delay as a failed master check.
+#[test]
+fn session_pool_backs_off_when_a_live_master_refuses_sessions() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let scope = ephemeral_scope(&t);
+    let ssh = t.path("bin/ssh");
+    executable(
+        &ssh,
+        br#"#!/bin/sh
+case " $* " in
+    *" -O check "*) exit 0 ;;
+esac
+# Wait for the pool's hello so this is an asynchronous session failure.
+dd bs=1 count=1 >/dev/null 2>&1
+sleep 0.05
+printf 'refused\n' >> "$FAKE_RSH_LOG"
+exit 255
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--session-pool")
+        .arg(scope.join("cm-00112233aabbccdd"))
+        .args(["", "fake.example", "", "unused --server"])
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("SYQ_TEST_POOL_IDLE_SECS", "8")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert_eq!(
+        log.lines().count(),
+        2,
+        "a refused spare should retry after five seconds: {log}"
+    );
+    assert!(!scope.join("cm-00112233aabbccdd.pool").exists());
+    assert!(!scope.join("cm-00112233aabbccdd.pool.lock").exists());
+}
+
 /// A pool never opens a session on its own authority: when the master is
 /// gone the check fails, no spare is opened, and commands connect directly.
 #[test]

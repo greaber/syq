@@ -1216,8 +1216,16 @@ pub struct RemoteSpec {
     /// User-facing facts gathered by the same connection path the transfer uses.
     pub diagnostics: std::sync::Arc<std::sync::Mutex<RemoteDiagnostics>>,
     /// A pooled control session taken ahead of time on the main thread, for
-    /// the control connection to consume. Shared across clones like `tcp`.
-    pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<Option<RemoteConn>>>,
+    /// the control connection to consume. An empty result also prevents
+    /// descriptor receipt during the later parallel connect.
+    pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<PrimedControl>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum PrimedControl {
+    #[default]
+    Unchecked,
+    Checked(Option<RemoteConn>),
 }
 
 impl RemoteSpec {
@@ -1382,8 +1390,8 @@ impl RemoteSpec {
     /// process reads the reply. Anything short of a usable session is a
     /// reason to connect directly, never an error.
     fn take_pooled_control(&self, compress: bool) -> Option<RemoteConn> {
-        if let Some(conn) = self.primed_control.lock().unwrap().take() {
-            return Some(conn);
+        if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
+            return conn.take();
         }
         let multiplexer = self.ssh_multiplexer.as_ref()?;
         if !multiplexer.persistent
@@ -1432,9 +1440,8 @@ impl RemoteSpec {
         if !compress {
             return;
         }
-        if let Some(conn) = self.take_pooled_control(compress) {
-            *self.primed_control.lock().unwrap() = Some(conn);
-        }
+        let conn = self.take_pooled_control(compress);
+        *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn);
     }
 
     /// A shell command that runs syq with `args` on this host.  Automatic mode
@@ -3543,6 +3550,31 @@ mod tests {
 
         let independent = args(SshConnection::Independent);
         assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
+        use std::os::unix::net::UnixListener;
+        let directory = crate::test_support::tempdir().unwrap();
+        let scope = directory.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None).unwrap();
+        let socket = crate::session_pool::socket_path(&multiplexer.path);
+        let mut spec = RemoteSpec::local_receiver(true);
+        spec.local_process = false;
+        spec.rsh = vec!["ssh".into()];
+        spec.ssh_multiplexer = Some(std::sync::Arc::new(multiplexer));
+
+        // The pool is absent during the main-thread prime, then starts
+        // before the parallel connect. The cloned spec must keep that miss.
+        spec.prime_pooled_control(true);
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(spec.clone().take_pooled_control(true).is_none());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

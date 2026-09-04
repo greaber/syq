@@ -403,6 +403,9 @@ impl Pool {
                     let mut spare = self.spares.remove(index - 1);
                     let _ = spare.child.kill();
                     let _ = spare.child.wait();
+                    // spawn can succeed before SSH refuses the session or
+                    // the helper exits. Back off these failures too.
+                    self.last_failure = Some(Instant::now());
                 }
             }
             if fds[0].revents & libc::POLLIN != 0 {
