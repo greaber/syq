@@ -376,7 +376,10 @@ no read-restricted receiver, and syq never silently downgrades to
 authentication-only confinement. Pull is available with an explicit `--rsh`, `--no-forward-agent` when the target owns source
 credentials, `--agent-broker-only`, or
 `--unrestricted-agent-forwarding`. The authentication options and `--detach`
-apply only to a direct copy between distinct remote endpoints. A detached
+apply only to a direct copy between distinct remote endpoints. Constrained forwarding
+needs OpenSSH 8.9 or newer for the client on the local machine, the client on
+the coordinator host, and the peer's server; syq checks both clients before
+connecting and names the older one together with these alternatives. A detached
 launch requires coordinator-owned credentials (`--no-forward-agent`) or an
 explicit remote-shell policy, and the coordinator host needs `/bin/kill` plus
 either `setsid` or `perl` to start the new session (macOS has no `setsid`);

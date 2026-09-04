@@ -97,6 +97,15 @@ EOF
 
 printf 'real-SSH environment: profile %s; %s; %s\n' \
     "${SYQ_REAL_SSH_PROFILE:-default}" "$(syq --build-identity)" "$(ssh -V 2>&1)"
+# The suite exercises constrained agent forwarding, which docs/install.md
+# supports from OpenSSH 8.9. Fail loudly if the image ever drifts below it.
+ssh_release=$(ssh -V 2>&1 | sed -n 's/^OpenSSH_\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+ssh_major=${ssh_release%% *}
+ssh_minor=${ssh_release#* }
+if [ -z "$ssh_release" ] || [ "$ssh_major" -lt 8 ] || { [ "$ssh_major" -eq 8 ] && [ "$ssh_minor" -lt 9 ]; }; then
+    echo "real-SSH suite needs OpenSSH 8.9 or newer in the container image; found: $(ssh -V 2>&1)" >&2
+    exit 1
+fi
 
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'

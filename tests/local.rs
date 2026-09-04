@@ -3594,6 +3594,10 @@ fn fake_ssh(t: &Tmp) -> PathBuf {
     executable(
         &path,
         br#"#!/bin/sh
+if [ "$1" = -V ]; then
+    printf 'OpenSSH_%s, fake\n' "${FAKE_SSH_VERSION:-9.9p1}" >&2
+    exit 0
+fi
 printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -3628,6 +3632,10 @@ fn fake_ssh_rejecting_multiplexed_workers(t: &Tmp) -> PathBuf {
     executable(
         &path,
         br#"#!/bin/sh
+if [ "$1" = -V ]; then
+    printf 'OpenSSH_9.9p1, fake\n' >&2
+    exit 0
+fi
 control_master=unset
 control_path=unset
 while [ "$#" -gt 0 ]; do
@@ -10818,6 +10826,53 @@ fn files_from_leaves_unlisted_destination_root_metadata_alone() {
         &t.s("dst2"),
     ]);
     assert!(t.path("dst2").is_dir());
+}
+
+#[test]
+fn constrained_agent_forwarding_requires_openssh_8_9() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src/file"), b"data");
+    let run = |version: &str| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--src-src",
+                "/src",
+                "--from",
+                "hosta",
+                "--to",
+                "hostb",
+                "--into",
+                "/dst",
+            ])
+            .env("FAKE_SSH_VERSION", version)
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+            )
+            .run()
+            .unwrap()
+    };
+    let old = run("8.2p1");
+    assert!(!old.status.success());
+    let stderr = String::from_utf8_lossy(&old.stderr);
+    assert!(
+        stderr.contains("needs OpenSSH 8.9 or newer on this machine, but ssh is OpenSSH 8.2"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-forward-agent"), "{stderr}");
+    // The version probe must not have been mistaken for a connection.
+    assert!(!t.path("rsh.log").exists(), "{stderr}");
+
+    // A new enough client proceeds to the next step, which is reading the
+    // real OpenSSH configuration that this fake cannot answer.
+    let new = run("8.9p1");
+    let stderr = String::from_utf8_lossy(&new.stderr);
+    assert!(!stderr.contains("needs OpenSSH 8.9"), "{stderr}");
 }
 
 #[test]

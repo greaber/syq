@@ -773,6 +773,7 @@ fn run_remote(
     } else if args.unrestricted_agent_forwarding {
         Some(AgentForwarding::Unrestricted)
     } else {
+        crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
         let coordinator_policy = crate::agent_broker::resolve_host_policy_at(
             &rsh[0],
             coordinator.user.as_deref(),
