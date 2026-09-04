@@ -1,10 +1,15 @@
 # Server performance tuning
 
-syq does not require a specially configured server. It installs its versioned
-remote helper automatically, encrypts its TCP data connections by default,
-falls back to ssh when a TCP listener cannot be reached, and tunes its worker
-count while a copy runs. Start with the defaults and change the host only when
-a representative transfer shows a specific bottleneck.
+This page is about setting up a server (its firewall, sshd, and sysctl
+settings) so syq can run fast on it. That is separate from syq's own
+auto-tuner, which adjusts the connection count during a copy without any
+change to the host. syq does not require a specially configured server. It
+installs the remote helper (a copy of syq that syq installs on the remote host
+the first time it connects) automatically, encrypts its TCP data connections
+by default, falls back to ssh when a TCP listener cannot be reached, and
+adjusts its connection count while a copy runs. Start with the defaults and
+change the host only when a representative transfer shows a specific
+bottleneck.
 
 This is deliberately a guide, not an installer. Firewall policy, ssh capacity,
 kernel versions, network paths, and storage differ too much for one script to
@@ -24,10 +29,10 @@ SYQ_DEBUG=1 syq rsync -a --stats SOURCE HOST:DESTINATION
 
 `-vv` reports the remote helper and platform, candidate TCP addresses, the
 planned data transport, and the initial connection count; `--stats` reports
-where automatic connection tuning settled. `SYQ_DEBUG=1` adds engineering
+the connection count the auto-tuner finished on. `SYQ_DEBUG=1` adds engineering
 timings showing connection setup and where workers spent their time. Check CPU,
 disk, and network utilization on both endpoints at the same time. More network
-tuning cannot fix a saturated disk, one busy CPU core, or a slow destination
+changes cannot fix a saturated disk, one busy CPU core, or a slow destination
 filesystem.
 
 Change one thing at a time and repeat the same transfer. Record the original
@@ -119,7 +124,7 @@ and interaction with per-source limits.
 
 ## 3. Change TCP buffer ceilings only when the window is limiting throughput
 
-Linux already auto-tunes TCP buffers. syq also uses several flows, so a single
+Linux already adjusts TCP buffer sizes on its own. syq also uses several flows, so a single
 flow's window often is not the transfer limit. Raising global ceilings consumes
 no full buffer up front, but it permits each busy connection to consume more
 kernel memory; multiplied across many connections and services, that can be
@@ -198,7 +203,7 @@ entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
 stops the transfer rather than silently changing the experiment. Without the
 option, each socket inherits its host's default.
 
-Compare algorithms with a fixed connection count so syq's worker tuning does
+Compare algorithms with a fixed connection count so syq's auto-tuner does
 not hide their effect. Use only a disposable test destination, and restore it
 to the same absent or empty state before every invocation. Otherwise the first
 command copies the data and the second measures an up-to-date no-op. Reset the
@@ -217,7 +222,7 @@ congestion control is sender-side, so a path can behave very differently in
 reverse. `--stats` reports the effective algorithm, retransmitted packets and
 bytes, round-trip time, congestion window, and delivery rate. If BBR wins
 repeatedly, pass `--syq-tcp-congestion bbr` for that workload and rerun once without
-`--syq-connections 1` to measure normal automatic worker tuning. Prefer this per-transfer
+`--syq-connections 1` to measure it with the auto-tuner active. Prefer this per-transfer
 choice to a global sysctl change.
 
 The server setting governs bulk downloads, while the uploading client setting
@@ -255,13 +260,13 @@ drops with `ip -s link` and the vendor's tools.
 
 - A single spinning disk often performs better with one fixed connection;
   use native `--connections 1` or compatibility `--syq-connections 1`. Syq's
-  automatic tuner can reduce active workers during longer runs, but short jobs
+  auto-tuner can reduce active workers during longer runs, but short jobs
   may finish before it measures the slowdown.
 - NVMe, RAID, NFS, and other high-latency filesystems often benefit from
   parallelism across files. A same-machine copy from a recognized local disk
   filesystem into one asynchronous NFS file is the exception: when kernel
-  offload is unavailable, syq automatically uses one sequential receiver-side
-  writer to avoid per-inode contention. Other source types and synchronous NFS
+  offload is unavailable, syq automatically uses one sequential writer on the
+  destination side to avoid per-inode contention. Other source types and synchronous NFS
   destinations keep the adaptive parallel path. NFS mount choices such as
   `nconnect` are client and server policy; see the
   [NFS notes](speed.md#nfs) and test with disposable data.

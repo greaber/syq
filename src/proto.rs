@@ -858,7 +858,7 @@ pub enum Response {
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
-    /// Paths (relative to the root) pruned by the ignore patterns.
+    /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     DirectoryEntries {
