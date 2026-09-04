@@ -899,6 +899,26 @@ impl Drop for ConnectSlot {
 
 pub const CIPHERS: &str = "Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr,chacha20-poly1305@openssh.com";
 
+/// Whether an advertised address belongs to an overlay network (CGNAT /
+/// Tailscale). Such routes are last in priority on both ends: the server
+/// buckets them last, and the client inserts the direct ssh target before
+/// them, so an overlay never wins over the public address ssh reached.
+/// Tailscale uses `100.64.0.0/10` and `fd7a:115c:a1e0::/48`; any other IPv6
+/// unique-local address is an ordinary private network.
+pub(crate) fn is_overlay_address(address: &str) -> bool {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let [a, b, _, _] = v4.octets();
+            a == 100 && (b & 0xc0) == 64
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+        Err(_) => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataAddressSource {
     RemoteInterface,
@@ -1486,7 +1506,7 @@ impl RemoteSpec {
             if !candidates.iter().any(|candidate| candidate.address == h) {
                 let at = candidates
                     .iter()
-                    .position(|candidate| candidate.address.starts_with("100."))
+                    .position(|candidate| is_overlay_address(&candidate.address))
                     .unwrap_or(candidates.len());
                 candidates.insert(
                     at,
@@ -1652,7 +1672,9 @@ impl RemoteSpec {
                             )
                         })
                     }
-                    Err(e) => last = anyhow!("{addr}:{}: {e}", info.port),
+                    Err(e) => {
+                        last = anyhow!("{}: {e}", crate::transfer::data_address(addr, info.port))
+                    }
                 }
             }
             let stream = match got {
@@ -1730,7 +1752,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         });
     }
     drop(resolved_tx);
-    let mut resolved = vec![Vec::new(); candidates.len()];
+    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     for _ in 0..candidates.len() {
         let Ok((i, addrs)) = resolved_rx.recv() else {
             break;
@@ -1738,18 +1760,37 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         resolved[i] = addrs;
     }
 
+    // Probe each distinct socket address once. An advertised literal and the
+    // ssh target name commonly resolve to the same address; one probe answers
+    // for every candidate that led there.
+    let mut targets: Vec<(SocketAddr, Vec<usize>)> = Vec::new();
+    let mut remaining: Vec<usize> = vec![0; candidates.len()];
+    for (i, addrs) in resolved.iter().enumerate() {
+        for &addr in addrs {
+            let owners = match targets.iter_mut().find(|(target, _)| *target == addr) {
+                Some((_, owners)) => owners,
+                None => {
+                    targets.push((addr, Vec::new()));
+                    &mut targets.last_mut().unwrap().1
+                }
+            };
+            if !owners.contains(&i) {
+                owners.push(i);
+                remaining[i] += 1;
+            }
+        }
+    }
+
     let timeout = std::time::Duration::from_millis(1000);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut remaining: Vec<usize> = resolved.iter().map(Vec::len).collect();
     let mut undetermined = remaining.iter().filter(|&&count| count > 0).count();
     let mut determined = vec![false; candidates.len()];
-    for (i, addrs) in resolved.into_iter().enumerate() {
-        for addr in addrs {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send((i, TcpStream::connect_timeout(&addr, timeout).is_ok()));
-            });
-        }
+    for (t, (addr, _)) in targets.iter().enumerate() {
+        let tx = tx.clone();
+        let addr = *addr;
+        std::thread::spawn(move || {
+            let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+        });
     }
     drop(tx);
 
@@ -1761,17 +1802,19 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
-        let Ok((i, reachable)) = rx.recv_timeout(wait) else {
+        let Ok((t, reachable)) = rx.recv_timeout(wait) else {
             break;
         };
-        if determined[i] {
-            continue;
-        }
-        remaining[i] -= 1;
-        if reachable || remaining[i] == 0 {
-            candidates[i].reachable = reachable;
-            determined[i] = true;
-            undetermined -= 1;
+        for &i in &targets[t].1 {
+            if determined[i] {
+                continue;
+            }
+            remaining[i] -= 1;
+            if reachable || remaining[i] == 0 {
+                candidates[i].reachable = reachable;
+                determined[i] = true;
+                undetermined -= 1;
+            }
         }
     }
 }
@@ -3205,5 +3248,50 @@ mod tests {
             args[control_index + 1].as_bytes(),
             b"/tmp/scope with space/%%h/non-utf8-\xff/socket"
         );
+    }
+
+    #[test]
+    fn probe_reachable_probes_each_socket_address_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let via_localhost = ("localhost", port)
+            .to_socket_addrs()
+            .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
+            .unwrap_or(false);
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            while let Ok((_stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let candidate = |address: &str| TcpCandidate {
+            address: address.to_string(),
+            speed_mbps: 0,
+            source: DataAddressSource::RemoteInterface,
+            reachable: false,
+            selected: false,
+        };
+        let mut candidates = vec![
+            candidate("127.0.0.1"),
+            candidate("localhost"),
+            candidate("127.0.0.1"),
+        ];
+        probe_reachable(&mut candidates, port);
+        assert!(candidates[0].reachable);
+        assert!(candidates[2].reachable);
+        assert_eq!(candidates[1].reachable, via_localhost);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn overlay_addresses_are_recognized_in_both_families() {
+        assert!(is_overlay_address("100.101.102.103"));
+        assert!(is_overlay_address("fd7a:115c:a1e0::1234"));
+        assert!(!is_overlay_address("100.1.2.3"));
+        assert!(!is_overlay_address("fdaa:0:1:a7b::2"));
+        assert!(!is_overlay_address("192.168.1.2"));
+        assert!(!is_overlay_address("gpu01.example.net"));
     }
 }
