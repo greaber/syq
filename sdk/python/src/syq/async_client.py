@@ -33,6 +33,7 @@ from .client import (
     _map_stream_cwd,
     _mapping_line,
     _prepare_results_file,
+    _rm_arguments,
     _results_pipe,
     _ResultsFileWriter,
     _text_arg,
@@ -51,6 +52,7 @@ from .models import (
     MappingEntry,
     OperationStatus,
     OperationSummary,
+    RmResult,
 )
 from .protocol import AutomationDecoder, parse_mapping_line
 
@@ -529,9 +531,11 @@ class AsyncClient:
         self,
         argv: list[Argument],
         *,
+        mode: str,
         prune: bool,
         mapping: bool,
         dry_run: bool,
+        selectors_total: int | None,
         on_event: AsyncEventCallback | None,
         results: BinaryIO | None,
         timeout: float | None,
@@ -540,9 +544,11 @@ class AsyncClient:
         process = await self._start_results(argv, timeout=timeout)
         writer = _ResultsFileWriter(results)
         decoder = AutomationDecoder(
+            mode=mode,
             prune=prune,
             mapping=mapping,
             dry_run=dry_run,
+            selectors_total=selectors_total,
         )
         terminal_line: bytes | None = None
         try:
@@ -713,9 +719,11 @@ class AsyncClient:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             result = await self._typed(
                 argv,
+                mode="cp",
                 prune=prune,
                 mapping=False,
                 dry_run=dry_run,
+                selectors_total=None,
                 on_event=on_event,
                 results=results,
                 timeout=timeout,
@@ -731,9 +739,11 @@ class AsyncClient:
             argv.extend(("--mapping", _argument(mapping, label="mapping")))
             result = await self._typed(
                 argv,
+                mode="cp",
                 prune=False,
                 mapping=True,
                 dry_run=dry_run,
+                selectors_total=None,
                 on_event=on_event,
                 results=results,
                 timeout=timeout,
@@ -760,9 +770,11 @@ class AsyncClient:
             argv.extend(("--mapping", os.path.realpath(manifest.name)))
             result = await self._typed(
                 argv,
+                mode="cp",
                 prune=False,
                 mapping=True,
                 dry_run=dry_run,
+                selectors_total=None,
                 on_event=on_event,
                 results=results,
                 timeout=timeout,
@@ -770,6 +782,61 @@ class AsyncClient:
             )
             assert isinstance(result, CpResult)
             return result
+
+    async def rm(
+        self,
+        *sources: PathArgument,
+        src: Selector | None = None,
+        src_src: Selector | None = None,
+        src_file: Selector | None = None,
+        src_dir: Selector | None = None,
+        from_: str | None = None,
+        cwd: PathArgument | None = None,
+        root: PathArgument | None = None,
+        follow: bool = False,
+        follow_src: bool = False,
+        results: BinaryIO | None = None,
+        dry_run: bool = False,
+        connections: int | None = None,
+        syq_path: str | os.PathLike[str] | None = None,
+        no_bootstrap: bool = False,
+        on_event: AsyncEventCallback | None = None,
+        timeout: float | None = None,
+        check: bool = True,
+    ) -> RmResult:
+        results = await _complete_task(
+            asyncio.create_task(asyncio.to_thread(_prepare_results_file, results))
+        )
+        argv, selectors_total = _rm_arguments(
+            sources,
+            src=src,
+            src_src=src_src,
+            src_file=src_file,
+            src_dir=src_dir,
+            from_=from_,
+            cwd=cwd,
+            root=root,
+            follow=follow,
+            follow_src=follow_src,
+            dry_run=dry_run,
+            connections=connections,
+            syq_path=syq_path,
+            no_bootstrap=no_bootstrap,
+        )
+        result = await self._typed(
+            argv,
+            mode="rm",
+            prune=False,
+            mapping=False,
+            dry_run=dry_run,
+            selectors_total=selectors_total,
+            on_event=on_event,
+            results=results,
+            timeout=timeout,
+            check=check,
+        )
+        assert isinstance(result, RmResult)
+        return result
 
     def map(
         self,

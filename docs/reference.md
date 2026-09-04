@@ -316,21 +316,23 @@ receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing
 would act on them.
-`cp` additionally accepts `--mapping` (see [Mappings](mappings.md))
-and a machine-readable NDJSON outcome stream: `--results FILE` creates
-the file fresh (an existing file is refused — one file, one run), and
+`cp` additionally accepts `--mapping` (see [Mappings](mappings.md)). Native
+`cp` and `rm` accept a machine-readable NDJSON outcome stream:
+`--results FILE` creates the file fresh (an existing file is refused — one
+file, one run), and
 `--results-fd N` writes to a descriptor the caller opened, e.g.
 `--results-fd 3 3>run.ndjson` (see
-[Automation results](automation-v1.md)). The stream is written
-by the transfer coordinator, so both forms require it to be local; a
-remote-to-remote copy is refused unless `--coordinate-at local` is passed
-explicitly — routing through this machine is never chosen implicitly
-on the stream's behalf — or through a command-restricted receiver
-enrollment, whose verified receipt becomes a receiver-attested stream
-written locally while data flows directly between the remotes. Both
-forms are rejected with `--detach`. Choose a results path outside the source and
-destination trees; one inside them can make the run's own accounting
-unpredictable. `--mapping` cannot be combined with `--prune` because
+[Automation results](automation-v1.md)). The stream is always written on the
+invoking machine. For a remote-to-remote copy the coordinator is normally
+elsewhere, so the copy is refused unless `--coordinate-at local` is passed
+explicitly — routing through this machine is never chosen implicitly on the
+stream's behalf — or a command-restricted receiver's verified receipt supplies
+a receiver-attested stream while data flows directly between the remotes.
+Both forms are rejected with `--detach`. Choose a results path outside the
+copy or removal trees; one inside them can make the run's own accounting
+unpredictable. An ordinary SSH `rm` returns structured endpoint outcomes, but a
+command-restricted receiver rejects native removal because its signed grants
+currently authorize copy mutations only. `--mapping` cannot be combined with `--prune` because
 mapping manifests define no deletion region; `--results` covers
 `--prune` runs, including their removals. `--max-delete` requires
 `--prune`; `rm` additionally accepts `--root` plus its endpoint-side

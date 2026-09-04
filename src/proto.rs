@@ -179,10 +179,41 @@ pub struct NativeRemoveSelection {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NativeRemoveOutcome {
+    /// Zero-based occurrence in the caller's ordered selector list. Repeated
+    /// and overlapping selectors deliberately retain distinct identities.
+    pub selector: u64,
     /// Diagnostic spelling rooted at the selector base, never a pathname used
     /// to rediscover the selected object.
     pub path: PathBytes,
-    pub error: Option<String>,
+    /// Absent only when the selected name itself is missing.
+    pub kind: Option<Kind>,
+    pub disposition: NativeRemoveDisposition,
+    /// Live removal attempts, including internal directory retries. Selection
+    /// and dry-run records have no attempts.
+    pub attempts: Option<u64>,
+    pub failure: Option<NativeRemoveFailure>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeRemoveDisposition {
+    Resolved,
+    Missing,
+    WouldRemove,
+    Removed,
+    AlreadyAbsent,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct NativeRemoveFailure {
+    pub error: WireError,
+    pub class: NativeRemoveErrorClass,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeRemoveErrorClass {
+    Io,
+    Conflict,
 }
 
 impl Entry {
@@ -1032,7 +1063,12 @@ impl SizeHint for Response {
             Response::NativeRemoveBatch(v) => {
                 v.iter()
                     .map(|outcome| {
-                        outcome.path.len() + outcome.error.as_ref().map_or(0, String::len) + 16
+                        outcome.path.len()
+                            + outcome
+                                .failure
+                                .as_ref()
+                                .map_or(0, |failure| failure.error.message.len())
+                            + 48
                     })
                     .sum::<usize>()
                     + 16

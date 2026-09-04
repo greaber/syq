@@ -56,13 +56,14 @@ startup seeds the exact candidate binary into its expected helper-cache path.
 The scenarios still use normal SSH control, constrained agent forwarding, and
 destination enrollment; they do not substitute a fake remote shell.
 
-The smoke suite currently covers source-side direct coordination with automatic
-restricted-destination enrollment over encrypted TCP, source-side coordination
-with constrained authentication, firewall-triggered TCP fallback, explicitly
-selected SSH data channels, destination-side coordination through the reversed
-constrained-agent edge, and an explicit local relay. Every path uses real SSH
-for control and bootstrap, and the suite compares the complete source and
-destination manifests afterward.
+The smoke suite currently covers rejection of a restricted destination that
+overlaps the receiver's SSH control plane, source-side direct coordination with
+automatic restricted-destination enrollment over encrypted TCP, source-side
+coordination with constrained authentication, firewall-triggered TCP fallback,
+explicitly selected SSH data channels, destination-side coordination through
+the reversed constrained-agent edge, and an explicit local relay. Every path
+uses real SSH for control and bootstrap, and the suite compares the complete
+source and destination manifests afterward.
 
 This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote

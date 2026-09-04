@@ -415,7 +415,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Ok(()) => wref.borrow_mut().write_msg(&Response::NativeRemoveDone)?,
                     Err(error) => wref
                         .borrow_mut()
-                        .write_msg(&Response::Err(format!("{error:#}")))?,
+                        .write_msg(&Response::EndpointError(crate::fsops::wire_error(&error)))?,
                 }
             }
             Request::Scan {

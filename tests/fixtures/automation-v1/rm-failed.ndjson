@@ -1,0 +1,3 @@
+{"dry_run":false,"endpoints":[{"kind":"local","role":"source"}],"mode":"rm","run_id":"6465616462656566000000000000cafe","schema":"syq.automation","schema_version":1,"seq":0,"started_at":1756800000,"syq_version":"0.0.0","type":"run"}
+{"class":"io","message":"resolve --cwd missing: inspect operator path component: No such file or directory (os error 2)","os_kind":"not_found","schema":"syq.automation","schema_version":1,"seq":1,"type":"error"}
+{"dry_run":false,"elapsed_ms":0,"entries_already_absent":0,"entries_failed":0,"entries_planned":0,"entries_removed":0,"errors":1,"exit_code":1,"mode":"rm","schema":"syq.automation","schema_version":1,"selectors_missing":0,"selectors_resolved":0,"selectors_total":1,"seq":2,"status":"failed","type":"result"}

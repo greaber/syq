@@ -869,88 +869,13 @@ pub fn run(args: Args) -> Result<i32> {
     // The detach and remote-coordinator combinations were refused at
     // argument parsing (exit 2, no stream); every request that reaches this
     // point settles with a terminal record.
-    let results_requested = args.native_results.is_some() || args.native_results_fd.is_some();
-    if results_requested {
-        let out: Box<dyn std::io::Write + Send> = if let Some(fd) = args.native_results_fd {
-            // The caller opened this descriptor (e.g. `3>run.ndjson`)
-            // before syq ran; verify it is actually connected so a
-            // forgotten redirection fails here, loudly, instead of at the
-            // first lost record.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags == -1 {
-                bail!(
-                    "--results-fd {fd}: descriptor is not open; connect it in the caller, e.g. --results-fd {fd} {fd}>run.ndjson"
-                );
-            }
-            // A read-only descriptor (e.g. {fd}<file) would fail on every
-            // write and silently produce no stream; refuse it up front.
-            if flags & libc::O_ACCMODE == libc::O_RDONLY {
-                bail!(
-                    "--results-fd {fd}: descriptor is open read-only; connect it for writing, e.g. --results-fd {fd} {fd}>run.ndjson"
-                );
-            }
-            // Children (ssh, helpers) must not inherit the stream's write
-            // end: a persistent child would hold a pipe open past syq's
-            // exit and its reader would never see EOF.
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                bail!("--results-fd {fd}: {}", std::io::Error::last_os_error());
-            }
-            // Safety: the fd is inherited, open, and named by the operator
-            // for exactly this purpose; syq owns it for the run.
-            Box::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
-        } else {
-            let results = args.native_results.as_deref().expect("results requested");
-            let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
-            // A results file is one run: created fresh, never truncated or
-            // appended. Refusal keeps yesterday's stream (and anything a
-            // hostile name points at) intact; recurring jobs use fresh
-            // names. Placement is the operator's job — a path inside the
-            // source or destination trees is documented as unpredictable,
-            // not policed.
-            let file = crate::fsops::create_operator_file(
-                results,
-                control_operator_symlink_policy(&args),
-            )
-            .map_err(|error| {
-                if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
-                }) {
-                    anyhow::anyhow!(
-                        "--results {}: the file already exists; a results file holds exactly one run — remove it or choose a new name (recurring jobs can timestamp: run-$(date +%s).ndjson)",
-                        path.display()
-                    )
-                } else {
-                    anyhow::anyhow!("--results {}: {error}", path.display())
-                }
-            })?;
-            Box::new(file)
-        };
-        let writer = Arc::new(crate::results::ResultsWriter::new(out));
-        let run_id = {
-            let mut bytes = [0u8; 16];
-            getrandom::fill(&mut bytes).context("generate run ID")?;
-            let mut hex = String::with_capacity(32);
-            for byte in bytes {
-                use std::fmt::Write as _;
-                write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-            }
-            hex
-        };
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        writer.emit_run(&crate::results::RunRecord {
-            run_id: &run_id,
-            started_at,
-            mode: "cp",
+    if let Some(writer) = crate::results::start(
+        &args,
+        crate::results::RunMode::Cp {
             prune: args.delete,
             mapping: args.native_mapping.is_some(),
-            dry_run: args.dry_run,
-            endpoints: run_endpoints(&args.locations),
-        });
+        },
+    )? {
         progress.set_results(writer);
     }
     let dry_run = args.dry_run;
@@ -991,27 +916,6 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
     outcome
-}
-
-fn run_endpoints(locations: &[Location]) -> Vec<crate::results::EndpointRecord> {
-    let mut endpoints = Vec::new();
-    if let Some(source) = locations.first() {
-        endpoints.push(crate::results::EndpointRecord {
-            role: "source",
-            host: source.host.clone(),
-            user: source.user.clone(),
-        });
-    }
-    if locations.len() >= 2 {
-        if let Some(destination) = locations.last() {
-            endpoints.push(crate::results::EndpointRecord {
-                role: "destination",
-                host: destination.host.clone(),
-                user: destination.user.clone(),
-            });
-        }
-    }
-    endpoints
 }
 
 pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {
@@ -3524,7 +3428,7 @@ impl FreshCapacityAssessment {
 
     fn inode_shortage(self) -> bool {
         self.available_inodes
-            .is_some_and(|available| self.objects > available)
+            .is_some_and(|available| self.objects.saturating_add(64) > available)
     }
 
     fn sufficient(self) -> bool {
@@ -7717,6 +7621,20 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_capacity_keeps_a_sixty_four_inode_margin() {
+        let assessment = |objects, available_inodes| FreshCapacityAssessment {
+            logical_bytes: 0,
+            objects,
+            available_bytes: 0,
+            available_inodes: Some(available_inodes),
+        };
+
+        assert!(assessment(1, 64).inode_shortage());
+        assert!(!assessment(1, 65).inode_shortage());
+        assert!(!assessment(u64::MAX, u64::MAX).inode_shortage());
+    }
 
     #[test]
     fn restricted_remote_diagnostics_name_the_grant_helper() {

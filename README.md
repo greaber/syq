@@ -38,6 +38,7 @@ syq rsync -a --dry-run -v src/ host:dst/           # preview; change nothing
 syq cp project --to server --into /backup          # native syntax → /backup/project
 syq cp --from hostA --src-src big --to hostB --into big   # direct server-to-server
 syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
+syq rm old-output --results removal.ndjson         # structured per-path outcomes
 ```
 
 The [documentation site](https://greaber.github.io/syq/) has the reasoning,

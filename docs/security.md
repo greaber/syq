@@ -182,11 +182,15 @@ exact running syq to hostB as a receiver, and appends one managed
 `restrict,command=...` line to hostB's `authorized_keys`. The private half of
 that key never leaves the local machine. HostA never sees it; the broker signs
 with it only along the verified path above. Before publishing the forced key,
-syq checks that the installed receiver and every path ancestor are owned by
-the trusted user or root and are not writable by anyone else (Linux access
-ACLs are judged by their effective permissions, and group-write is accepted
-only for a proven user-private group), so the account cannot broaden its own
-authority. Enrollment can also
+syq creates its private directories as mode 0700 and secret files as mode 0600.
+It does not try to infer receiver integrity from ownership, groups, ACLs, or an
+ancestor-directory walk: the receiver machine and the programs it runs are the
+trusted side of this boundary. Instead, a signed command-restricted transfer
+is refused before copying when its mutation scope overlaps the receiver's SSH
+configuration, installed receiver directory, enrollment state, or configured
+signature verifier. Thus a compromised hostA cannot use otherwise valid copy
+operations to replace the control plane used by a later connection. This rule
+does not apply to ordinary local or remote copies. Enrollment can also
 run through hostA as an ssh `ProxyJump`, in which case hostA carries encrypted
 bytes and sees no agent, key, or session.
 

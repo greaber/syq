@@ -2,10 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json",
   "title": "syq automation results stream, schema version 1",
-  "description": "One record per NDJSON line of a `syq cp --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation-v1.md.",
+  "description": "One record per NDJSON line of a native `syq cp --results` or `syq rm --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation-v1.md.",
   "oneOf": [
     {
       "$ref": "#/$defs/run"
+    },
+    {
+      "$ref": "#/$defs/rm_run"
     },
     {
       "$ref": "#/$defs/progress"
@@ -17,10 +20,22 @@
       "$ref": "#/$defs/operation_result"
     },
     {
+      "$ref": "#/$defs/selection_result"
+    },
+    {
+      "$ref": "#/$defs/removal_trace"
+    },
+    {
+      "$ref": "#/$defs/removal_result"
+    },
+    {
       "$ref": "#/$defs/error"
     },
     {
       "$ref": "#/$defs/result"
+    },
+    {
+      "$ref": "#/$defs/rm_result"
     },
     {
       "$ref": "#/$defs/final_state"
@@ -197,6 +212,76 @@
         "mode",
         "prune",
         "mapping",
+        "dry_run",
+        "endpoints"
+      ],
+      "additionalProperties": false
+    },
+    "rm_run": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "run"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "integer"
+        },
+        "syq_version": {
+          "type": "string"
+        },
+        "mode": {
+          "const": "rm"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "endpoints": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "const": "source"
+              },
+              "kind": {
+                "enum": [
+                  "local",
+                  "ssh"
+                ]
+              },
+              "host": {
+                "type": "string"
+              },
+              "user": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "role",
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "run_id",
+        "started_at",
+        "syq_version",
+        "mode",
         "dry_run",
         "endpoints"
       ],
@@ -400,6 +485,203 @@
       "required": [
         "action",
         "dst",
+        "disposition"
+      ],
+      "additionalProperties": false
+    },
+    "selection_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "resolved"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "kind"
+              ]
+            }
+          }
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "selection_result"
+        },
+        "selector": {
+          "$ref": "#/$defs/u64"
+        },
+        "path": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "missing"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/objectKind"
+        }
+      },
+      "required": [
+        "selector",
+        "path",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "removal_trace": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "removal_trace"
+        },
+        "selector": {
+          "$ref": "#/$defs/u64"
+        },
+        "path": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "kind": {
+          "$ref": "#/$defs/objectKind"
+        },
+        "disposition": {
+          "const": "would_remove"
+        }
+      },
+      "required": [
+        "selector",
+        "path",
+        "kind",
+        "disposition"
+      ],
+      "additionalProperties": false
+    },
+    "removal_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "attempts",
+              "retryable",
+              "class",
+              "message"
+            ]
+          },
+          "else": {
+            "required": [
+              "kind",
+              "attempts"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "retryable"
+                  ]
+                },
+                {
+                  "required": [
+                    "class"
+                  ]
+                },
+                {
+                  "required": [
+                    "os_kind"
+                  ]
+                },
+                {
+                  "required": [
+                    "message"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "removal_result"
+        },
+        "selector": {
+          "$ref": "#/$defs/u64"
+        },
+        "path": {
+          "$ref": "#/$defs/taggedPath"
+        },
+        "kind": {
+          "$ref": "#/$defs/objectKind"
+        },
+        "disposition": {
+          "enum": [
+            "removed",
+            "already_absent",
+            "failed"
+          ]
+        },
+        "attempts": {
+          "$ref": "#/$defs/u64"
+        },
+        "retryable": {
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ]
+        },
+        "class": {
+          "$ref": "#/$defs/errorClass"
+        },
+        "os_kind": {
+          "$ref": "#/$defs/osKind"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector",
+        "path",
         "disposition"
       ],
       "additionalProperties": false
@@ -612,6 +894,81 @@
         "errors",
         "bytes_transferred",
         "bytes_unchanged",
+        "elapsed_ms"
+      ],
+      "additionalProperties": false
+    },
+    "rm_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "result"
+        },
+        "mode": {
+          "const": "rm"
+        },
+        "status": {
+          "enum": [
+            "success",
+            "partial",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "selectors_total": {
+          "$ref": "#/$defs/u64"
+        },
+        "selectors_resolved": {
+          "$ref": "#/$defs/u64"
+        },
+        "selectors_missing": {
+          "$ref": "#/$defs/u64"
+        },
+        "entries_planned": {
+          "$ref": "#/$defs/u64"
+        },
+        "entries_removed": {
+          "$ref": "#/$defs/u64"
+        },
+        "entries_already_absent": {
+          "$ref": "#/$defs/u64"
+        },
+        "entries_failed": {
+          "$ref": "#/$defs/u64"
+        },
+        "errors": {
+          "$ref": "#/$defs/u64"
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "mode",
+        "status",
+        "exit_code",
+        "dry_run",
+        "selectors_total",
+        "selectors_resolved",
+        "selectors_missing",
+        "entries_planned",
+        "entries_removed",
+        "entries_already_absent",
+        "entries_failed",
+        "errors",
         "elapsed_ms"
       ],
       "additionalProperties": false

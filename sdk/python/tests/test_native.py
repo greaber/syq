@@ -62,6 +62,73 @@ if os.environ.get("SYQ_FAKE_STDOUT"):
     print("human presentation output", flush=True)
 
 dry_run = "--dry-run" in args
+if command == "rm":
+    status = os.environ.get("SYQ_FAKE_STATUS", "success")
+    exit_code = 0 if status == "success" else 23
+    selector_total = sum(
+        arg in {"--src", "--src-src", "--src-file", "--src-dir"}
+        for arg in args
+    ) or 1
+    records = [{
+        "schema": "syq.automation", "schema_version": 1, "seq": 0,
+        "type": "run", "run_id": "fake-rm", "started_at": 123,
+        "syq_version": "9.8.7", "mode": "rm", "dry_run": dry_run,
+        "endpoints": [{"role": "source", "kind": "local"}],
+    }]
+    for selector in range(selector_total):
+        records.append({
+            "schema": "syq.automation", "schema_version": 1,
+            "seq": len(records), "type": "selection_result",
+            "selector": selector,
+            "path": {"encoding": "utf-8", "value": f"victim-{selector}"},
+            "status": "resolved", "kind": "file",
+        })
+    if dry_run:
+        records.append({
+            "schema": "syq.automation", "schema_version": 1,
+            "seq": len(records),
+            "type": "removal_trace", "selector": 0,
+            "path": {"encoding": "utf-8", "value": "victim"},
+            "kind": "file", "disposition": "would_remove",
+        })
+    elif status == "success":
+        records.append({
+            "schema": "syq.automation", "schema_version": 1,
+            "seq": len(records),
+            "type": "removal_result", "selector": 0,
+            "path": {"encoding": "utf-8", "value": "victim"},
+            "kind": "file", "disposition": "removed", "attempts": 1,
+        })
+    else:
+        records.extend([{
+            "schema": "syq.automation", "schema_version": 1,
+            "seq": len(records),
+            "type": "removal_result", "selector": 0,
+            "path": {"encoding": "utf-8", "value": "victim"},
+            "kind": "file", "disposition": "failed", "attempts": 1,
+            "retryable": "unknown", "class": "io",
+            "os_kind": "permission_denied", "message": "denied",
+        }, {
+            "schema": "syq.automation", "schema_version": 1,
+            "seq": len(records) + 1,
+            "type": "error", "class": "io",
+            "os_kind": "permission_denied", "message": "denied",
+        }])
+    records.append({
+        "schema": "syq.automation", "schema_version": 1,
+        "seq": len(records), "type": "result", "mode": "rm",
+        "status": status, "exit_code": exit_code, "dry_run": dry_run,
+        "selectors_total": selector_total, "selectors_resolved": selector_total,
+        "selectors_missing": 0, "entries_planned": 1 if dry_run else 0,
+        "entries_removed": 1 if not dry_run and status == "success" else 0,
+        "entries_already_absent": 0,
+        "entries_failed": 1 if status != "success" else 0,
+        "errors": 1 if status != "success" else 0, "elapsed_ms": 2,
+    })
+    for record in records:
+        machine_output.write(json.dumps(record).encode("utf-8") + b"\n")
+    raise SystemExit(exit_code)
+
 prune = "--prune" in args
 records = [{
     "schema": "syq.automation", "schema_version": 1, "seq": 0,
@@ -263,6 +330,87 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
         self.assertEqual(argv.count("--src"), 2)
+
+    def test_rm_uses_native_names_and_returns_structured_outcomes(self) -> None:
+        events: list[syq.AutomationEvent] = []
+        output = io.BytesIO()
+
+        result = self.client.rm(
+            src="victim",
+            src_src="contents",
+            src_file="leaf",
+            src_dir="tree",
+            from_="source",
+            root="source-root",
+            follow_src=True,
+            dry_run=True,
+            connections=4,
+            syq_path="/opt/syq",
+            results=output,
+            on_event=events.append,
+        )
+
+        self.assertIsInstance(result, syq.RmResult)
+        self.assertEqual(result.entries_planned, 1)
+        self.assertEqual(result.entries_removed, 0)
+        self.assertIs(events[-1], result)
+        run = next(event for event in events if isinstance(event, syq.RunEvent))
+        self.assertEqual(run.mode, "rm")
+        self.assertIsNone(run.prune)
+        self.assertIsNone(run.mapping)
+        selection = next(
+            event for event in events if isinstance(event, syq.SelectionResult)
+        )
+        self.assertIs(selection.status, syq.SelectionStatus.RESOLVED)
+        trace = next(
+            event for event in events if isinstance(event, syq.RemovalTrace)
+        )
+        self.assertIs(trace.disposition, syq.RemovalDisposition.WOULD_REMOVE)
+        argv = self.argv()
+        for expected in (
+            "rm",
+            "--src",
+            "--src-src",
+            "--src-file",
+            "--src-dir",
+            "--from",
+            "--root",
+            "--follow-src",
+            "--dry-run",
+            "--connections",
+            "--syq-path",
+        ):
+            self.assertIn(expected, argv)
+        self.assertTrue(any(arg.startswith("--results-fd=") for arg in argv))
+        saved = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(saved[-1]["entries_planned"], result.entries_planned)
+
+    def test_rm_failure_can_raise_or_return_its_typed_result(self) -> None:
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_STATUS": "partial"},
+        )
+        with self.assertRaises(syq.SyqOperationError) as caught:
+            client.rm("victim")
+        self.assertIsInstance(caught.exception.result, syq.RmResult)
+        self.assertEqual(caught.exception.result.entries_failed, 1)
+
+        events: list[syq.AutomationEvent] = []
+        result = client.rm("victim", check=False, on_event=events.append)
+        self.assertEqual(result.exit_code, 23)
+        removal = next(
+            event for event in events if isinstance(event, syq.RemovalResult)
+        )
+        self.assertIs(removal.class_, syq.ErrorClass.IO)
+        self.assertIs(removal.os_kind, syq.OsKind.PERMISSION_DENIED)
+
+    def test_rm_rejects_invalid_local_helper_arguments_before_launch(self) -> None:
+        self.argv_log.unlink(missing_ok=True)
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.rm("victim", syq_path="/opt/syq")
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.rm()
+        self.assertFalse(self.argv_log.exists())
 
     def test_results_accepts_a_caller_owned_binary_file(self) -> None:
         output = io.BytesIO()

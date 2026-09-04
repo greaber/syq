@@ -1,0 +1,7 @@
+{"dry_run":false,"endpoints":[{"kind":"local","role":"source"}],"mode":"rm","run_id":"6465616462656566000000000000cafe","schema":"syq.automation","schema_version":1,"seq":0,"started_at":1756800000,"syq_version":"0.0.0","type":"run"}
+{"kind":"dir","path":{"encoding":"utf-8","value":"tree"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":1,"status":"resolved","type":"selection_result"}
+{"path":{"encoding":"utf-8","value":"missing"},"schema":"syq.automation","schema_version":1,"selector":1,"seq":2,"status":"missing","type":"selection_result"}
+{"attempts":1,"disposition":"removed","kind":"file","path":{"encoding":"utf-8","value":"tree/sub/file"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":3,"type":"removal_result"}
+{"attempts":1,"disposition":"removed","kind":"dir","path":{"encoding":"utf-8","value":"tree/sub"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":4,"type":"removal_result"}
+{"attempts":1,"disposition":"removed","kind":"dir","path":{"encoding":"utf-8","value":"tree"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":5,"type":"removal_result"}
+{"dry_run":false,"elapsed_ms":0,"entries_already_absent":0,"entries_failed":0,"entries_planned":0,"entries_removed":3,"errors":0,"exit_code":0,"mode":"rm","schema":"syq.automation","schema_version":1,"selectors_missing":1,"selectors_resolved":1,"selectors_total":2,"seq":6,"status":"success","type":"result"}
