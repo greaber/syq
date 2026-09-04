@@ -333,7 +333,7 @@ command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. On a direct remote-to-remote copy through that receiver, `cp` also
 accepts the receiver ceilings
-`--max-entries N` and `--max-total-bytes SIZE`, and `--receipt hashed`, which asks the
+`--receiver-max-entries N` and `--receiver-max-bytes SIZE`, and `--receiver-receipt digests`, which asks the
 receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing
@@ -383,14 +383,14 @@ endpoints.
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed, because there is
 no read-restricted receiver, and syq never silently downgrades to
-authentication-only confinement. Pull is available with an explicit `--rsh`, `--no-forward-agent` when the target owns source
-credentials, `--agent-broker-only`, or
-`--unrestricted-agent-forwarding`. The authentication options and `--detach`
+authentication-only confinement. Pull is available with an explicit `--rsh`, `--peer-auth own-credentials` when the destination host owns source
+credentials, `--peer-auth broker`, or
+`--peer-auth full-agent`. `--peer-auth` and `--detach`
 apply only to a direct copy between distinct remote endpoints. Constrained forwarding
 needs OpenSSH 8.9 or newer for the client on the local machine, the client on
 the coordinator host, and the peer's server; syq checks both clients before
 connecting and names the older one together with these alternatives. A detached
-launch requires coordinator-owned credentials (`--no-forward-agent`) or an
+launch requires coordinator-owned credentials (`--peer-auth own-credentials`) or an
 explicit remote-shell policy, and the coordinator host needs `/bin/kill` plus
 either `setsid` or `perl` to start the new session (macOS has no `setsid`);
 the launcher reports its coordinator and log only after

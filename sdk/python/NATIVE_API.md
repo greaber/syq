@@ -227,12 +227,10 @@ syq.cp(
     no_tcp=False,
     tcp_ports=None,
     tcp_congestion=None,
-    no_forward_agent=False,
-    unrestricted_agent_forwarding=False,
-    agent_broker_only=False,
-    max_entries=None,
-    max_total_bytes=None,
-    receipt=None,
+    peer_auth=None,
+    receiver_max_entries=None,
+    receiver_max_bytes=None,
+    receiver_receipt=None,
     ignore=None,
     ignore_from=None,
     preserve=None,
@@ -308,16 +306,16 @@ decoded merely to build argv.
 
 `follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
-`min_size`, and `dry_run` retain the exact native meanings. `max_entries` and
-`max_total_bytes` expose the native command-restricted receiver ceilings and are
+`min_size`, and `dry_run` retain the exact native meanings. `receiver_max_entries` and
+`receiver_max_bytes` expose the native command-restricted receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
 `pscope` selects a private SSH persistence scope created by
 `syq persist on --ephemeral` for `cp` or `rm`. It cannot be combined with
 `rsh`, and the executable remains authoritative for whether the selected
-topology can use the scope. `receipt` accepts `"sizes"` or `"hashed"` and has
-the native receiver-only meaning; `"hashed"` asks the receiver to include
+topology can use the scope. `receiver_receipt` accepts `"sizes"` or `"digests"` and has
+the native receiver-only meaning; `"digests"` asks the receiver to include
 closure-time BLAKE3 file digests.
 
 Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
@@ -345,8 +343,7 @@ enrollment — its verified receipt becomes the receiver-attested
 results stream — or an explicit `coordinate_at="local"`; syq refuses the
 combination at runtime otherwise): `coordinate_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
-`agent_broker_only`. Endpoint strings passed through `from_` and `to` include
+`tcp_congestion`, and `peer_auth`. Endpoint strings passed through `from_` and `to` include
 the native optional port syntax. The executable remains authoritative for
 topology, transport, platform, enrollment, and credential-policy constraints.
 
@@ -667,7 +664,7 @@ The existing escape hatch remains small and transparent:
 
 ```python
 result = client.run(
-    ["enrollments"],
+    ["receiver", "list"],
     check=True,
     timeout=30,
 )

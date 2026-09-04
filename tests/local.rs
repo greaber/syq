@@ -3009,30 +3009,30 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
 }
 
 #[test]
-fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
+fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
             .run()
             .unwrap()
     };
-    let help = run(&["enrollment", "--help"]);
+    let help = run(&["receiver", "--help"]);
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for verb in ["add", "list", "revoke"] {
+    for verb in ["enroll", "list", "revoke"] {
         assert!(text.contains(verb), "{text}");
     }
-    let bare = run(&["enrollment"]);
+    let bare = run(&["receiver"]);
     assert_eq!(bare.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq enrollment"));
-    let bogus = run(&["enrollment", "rotate"]);
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq receiver"));
+    let bogus = run(&["receiver", "rotate"]);
     assert!(!bogus.status.success());
-    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown enrollment command"));
-    for verb in ["add", "list", "revoke"] {
-        let verb_help = run(&["enrollment", verb, "--help"]);
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown receiver command"));
+    for verb in ["enroll", "list", "revoke"] {
+        let verb_help = run(&["receiver", verb, "--help"]);
         assert!(verb_help.status.success(), "{verb}");
         assert!(
-            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq enrollment {verb}")),
+            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq receiver {verb}")),
             "{verb}"
         );
     }
@@ -3040,6 +3040,7 @@ fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
     for old in [
         &["enroll", "host:dst"][..],
         &["enrollments"],
+        &["enrollment", "list"],
         &["revoke", "id"],
     ] {
         let out = run(old);
@@ -3051,7 +3052,11 @@ fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
 fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
-    for option in ["--max-entries=5", "--max-total-bytes=1M", "--receipt=sizes"] {
+    for option in [
+        "--receiver-max-entries=5",
+        "--receiver-max-bytes=1M",
+        "--receiver-receipt=sizes",
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
@@ -10979,7 +10984,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         stderr.contains("needs OpenSSH 8.9 or newer on this machine, but ssh is OpenSSH 8.2"),
         "{stderr}"
     );
-    assert!(stderr.contains("--no-forward-agent"), "{stderr}");
+    assert!(stderr.contains("--peer-auth own-credentials"), "{stderr}");
     // The version probe must not have been mistaken for a connection.
     assert!(!t.path("rsh.log").exists(), "{stderr}");
 
@@ -11810,8 +11815,8 @@ fn native_map_refusals() {
     refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
     refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
     refuse(
-        &["d1", "--receipt", "sizes"],
-        "unexpected argument '--receipt'",
+        &["d1", "--receiver-receipt", "sizes"],
+        "unexpected argument '--receiver-receipt'",
     );
 }
 
@@ -11851,9 +11856,9 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--ignore-from",
         "--preserve",
         "--inplace",
-        "--max-entries",
-        "--max-total-bytes",
-        "--receipt",
+        "--receiver-max-entries",
+        "--receiver-max-bytes",
+        "--receiver-receipt",
     ] {
         assert!(
             !help.contains(option),
@@ -13844,7 +13849,8 @@ exit 23
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
-                "--no-forward-agent",
+                "--peer-auth",
+                "own-credentials",
                 "--from",
                 "hostA",
                 "--src-src",
