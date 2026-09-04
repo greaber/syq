@@ -2,7 +2,7 @@ name: macOS suite
 
 on:
   push:
-    branches: [master]
+    branches: [master, macos-portability]
   workflow_dispatch:
 
 concurrency:
