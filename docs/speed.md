@@ -77,7 +77,7 @@ table](reference.md#compatibility-options)).
    deliberately does not `fsync` transfer data.
 9. **One authentication for direct remote-to-remote transfers.** The default
    restricted path authenticates hostB once with the enrollment key and then
-   runs token-authenticated TCP workers; `--agent-broker-only` instead pays an
+   runs token-authenticated TCP workers; `--peer-auth broker` instead pays an
    agent round trip per ssh connection.
 
 Two things are *not* on this list. Congestion control is not selected

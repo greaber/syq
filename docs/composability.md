@@ -116,8 +116,8 @@ or a stream can express too:
   failed mapping entry (with `retryable`, and an error `class` where known),
   `trace` records instead of results under `--dry-run`, an `error` record per
   counted error, and exactly one terminal `result` whose numbers also render
-  the human summary. It is schema version 1, with a stated compatibility
-  policy; [Automation results](automation-v1.md) is the contract. The stream
+  the human summary. It carries a `schema_version` and a stated
+  compatibility policy; [Automation results](automation.md) is the contract. The stream
   is always written on the machine you invoke syq from. For a remote-to-remote
   copy through an enrolled receiver it is *receiver-attested*: built from
   hostB's verified receipt (each record marked

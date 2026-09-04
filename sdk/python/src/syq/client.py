@@ -526,9 +526,7 @@ def _append_remote_arguments(
     no_tcp: bool,
     tcp_ports: str | None,
     tcp_congestion: str | None,
-    no_forward_agent: bool,
-    unrestricted_agent_forwarding: bool,
-    agent_broker_only: bool,
+    peer_auth: str | None,
 ) -> None:
     if coordinate_at is not None:
         if coordinate_at not in {"auto", "local", "src", "dest"}:
@@ -564,13 +562,12 @@ def _append_remote_arguments(
                 _text_arg(tcp_congestion, label="tcp_congestion"),
             )
         )
-    for enabled, option in (
-        (no_forward_agent, "--no-forward-agent"),
-        (unrestricted_agent_forwarding, "--unrestricted-agent-forwarding"),
-        (agent_broker_only, "--agent-broker-only"),
-    ):
-        if enabled:
-            argv.append(option)
+    if peer_auth is not None:
+        if peer_auth not in {"restricted", "broker", "own-credentials", "full-agent"}:
+            raise SyqInvocationError(
+                "--peer-auth must be restricted, broker, own-credentials, or full-agent"
+            )
+        argv.extend(("--peer-auth", peer_auth))
 
 
 def _nonnegative_integer(value: int | None, *, option: str) -> int | None:
@@ -615,10 +612,9 @@ def _copy_arguments(
     no_compress: bool,
     bwlimit: str | int | None,
     connections: int | None,
-    max_entries: int | None,
-    max_total_bytes: str | int | None,
-    max_runtime: str | int | None,
-    receipt: str | None,
+    receiver_max_entries: int | None,
+    receiver_max_bytes: str | int | None,
+    receiver_receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
@@ -700,16 +696,17 @@ def _copy_arguments(
     connections = _positive_integer(connections, option="--connections")
     if connections is not None:
         argv.extend(("--connections", str(connections)))
-    max_entries = _nonnegative_integer(max_entries, option="--max-entries")
-    if max_entries is not None:
-        argv.extend(("--max-entries", str(max_entries)))
-    _append_text(argv, "--max-total-bytes", max_total_bytes)
-    _append_text(argv, "--max-runtime", max_runtime)
-    if receipt is not None:
-        receipt_value = _text_arg(receipt, label="receipt")
-        if receipt_value not in {"sizes", "hashed"}:
-            raise SyqInvocationError("--receipt must be sizes or hashed")
-        argv.extend(("--receipt", receipt_value))
+    receiver_max_entries = _nonnegative_integer(
+        receiver_max_entries, option="--receiver-max-entries"
+    )
+    if receiver_max_entries is not None:
+        argv.extend(("--receiver-max-entries", str(receiver_max_entries)))
+    _append_text(argv, "--receiver-max-bytes", receiver_max_bytes)
+    if receiver_receipt is not None:
+        receipt_value = _text_arg(receiver_receipt, label="receiver_receipt")
+        if receipt_value not in {"sizes", "digests"}:
+            raise SyqInvocationError("--receiver-receipt must be sizes or digests")
+        argv.extend(("--receiver-receipt", receipt_value))
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
         for rule in rules:
@@ -1035,13 +1032,10 @@ class Client:
         no_tcp: bool = False,
         tcp_ports: str | None = None,
         tcp_congestion: str | None = None,
-        no_forward_agent: bool = False,
-        unrestricted_agent_forwarding: bool = False,
-        agent_broker_only: bool = False,
-        max_entries: int | None = None,
-        max_total_bytes: str | int | None = None,
-        max_runtime: str | int | None = None,
-        receipt: str | None = None,
+        peer_auth: str | None = None,
+        receiver_max_entries: int | None = None,
+        receiver_max_bytes: str | int | None = None,
+        receiver_receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
@@ -1092,10 +1086,9 @@ class Client:
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
-            max_entries=max_entries,
-            max_total_bytes=max_total_bytes,
-            max_runtime=max_runtime,
-            receipt=receipt,
+            receiver_max_entries=receiver_max_entries,
+            receiver_max_bytes=receiver_max_bytes,
+            receiver_receipt=receiver_receipt,
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
@@ -1115,9 +1108,7 @@ class Client:
             no_tcp=no_tcp,
             tcp_ports=tcp_ports,
             tcp_congestion=tcp_congestion,
-            no_forward_agent=no_forward_agent,
-            unrestricted_agent_forwarding=unrestricted_agent_forwarding,
-            agent_broker_only=agent_broker_only,
+            peer_auth=peer_auth,
         )
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")
@@ -1277,10 +1268,9 @@ class Client:
             no_compress=False,
             bwlimit=None,
             connections=None,
-            max_entries=None,
-            max_total_bytes=None,
-            max_runtime=None,
-            receipt=None,
+            receiver_max_entries=None,
+            receiver_max_bytes=None,
+            receiver_receipt=None,
             ignore=None,
             ignore_from=None,
             preserve=None,

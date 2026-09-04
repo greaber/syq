@@ -666,7 +666,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "rsync",
         "persist",
         "completion",
-        "enrollment",
+        "receiver",
         "--help",
         "--version",
         "--self-update",
@@ -867,7 +867,13 @@ fn value_completion(
                 "ownership",
                 "specials",
             ])),
-            b"--receipt" => Some(ValueCompletion::Enum(&["sizes", "hashed"])),
+            b"--receiver-receipt" => Some(ValueCompletion::Enum(&["sizes", "digests"])),
+            b"--peer-auth" => Some(ValueCompletion::Enum(&[
+                "restricted",
+                "broker",
+                "own-credentials",
+                "full-agent",
+            ])),
             _ => None,
         },
         "rm" => match option {

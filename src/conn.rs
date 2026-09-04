@@ -74,6 +74,7 @@ pub trait Conn: Send {
 pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
+    pub supports_confined_socket_nodes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1077,7 +1078,7 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
     match openssh_version(program) {
         Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => {
             Err(OpenSshVersionError(format!(
-                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --peer-auth own-credentials with credentials on the coordinator host, --peer-auth full-agent, or an explicit --rsh policy"
             ))
             .into())
         }
@@ -1964,8 +1965,16 @@ fn hello(
         role,
     })?;
     match conn.recv() {
-        Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
-            conn.peer = Some(PeerInfo { identity, platform });
+        Ok(Response::HelloOk {
+            identity,
+            platform,
+            supports_confined_socket_nodes,
+        }) if identity == crate::identity::build() => {
+            conn.peer = Some(PeerInfo {
+                identity,
+                platform,
+                supports_confined_socket_nodes,
+            });
         }
         Ok(Response::HelloOk { identity, .. }) => {
             bail!(
@@ -2948,6 +2957,8 @@ mod tests {
                 .write_msg(&Response::HelloOk {
                     identity: crate::identity::build().to_string(),
                     platform: crate::identity::platform(),
+                    supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(
+                    ),
                 })
                 .unwrap();
         });

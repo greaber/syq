@@ -1,7 +1,7 @@
 # Python native API
 
-Status: implemented for the upcoming automation-v1 syq version. Until a syq
-release containing v1 exists, source-tree users must select the candidate
+Status: implemented for the upcoming syq release that ships the automation
+results stream. Until such a release exists, source-tree users must select the candidate
 binary explicitly; the next Python SDK release updates its managed pin after
 conformance tests pass.
 
@@ -227,13 +227,10 @@ syq.cp(
     no_tcp=False,
     tcp_ports=None,
     tcp_congestion=None,
-    no_forward_agent=False,
-    unrestricted_agent_forwarding=False,
-    agent_broker_only=False,
-    max_entries=None,
-    max_total_bytes=None,
-    max_runtime=None,
-    receipt=None,
+    peer_auth=None,
+    receiver_max_entries=None,
+    receiver_max_bytes=None,
+    receiver_receipt=None,
     ignore=None,
     ignore_from=None,
     preserve=None,
@@ -309,17 +306,16 @@ decoded merely to build argv.
 
 `follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
-`min_size`, and `dry_run` retain the exact native meanings. `max_entries`,
-`max_total_bytes`, and `max_runtime` expose the native command-restricted
-receiver ceilings and are
+`min_size`, and `dry_run` retain the exact native meanings. `receiver_max_entries` and
+`receiver_max_bytes` expose the native command-restricted receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
 `pscope` selects a private SSH persistence scope created by
 `syq persist on --ephemeral` for `cp` or `rm`. It cannot be combined with
 `rsh`, and the executable remains authoritative for whether the selected
-topology can use the scope. `receipt` accepts `"sizes"` or `"hashed"` and has
-the native receiver-only meaning; `"hashed"` asks the receiver to include
+topology can use the scope. `receiver_receipt` accepts `"sizes"` or `"digests"` and has
+the native receiver-only meaning; `"digests"` asks the receiver to include
 closure-time BLAKE3 file digests.
 
 Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
@@ -347,8 +343,7 @@ enrollment — its verified receipt becomes the receiver-attested
 results stream — or an explicit `coordinate_at="local"`; syq refuses the
 combination at runtime otherwise): `coordinate_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
-`agent_broker_only`. Endpoint strings passed through `from_` and `to` include
+`tcp_congestion`, and `peer_auth`. Endpoint strings passed through `from_` and `to` include
 the native optional port syntax. The executable remains authoritative for
 topology, transport, platform, enrollment, and credential-policy constraints.
 
@@ -561,8 +556,8 @@ or `RmResult` carries `dry_run=True`; copy uses `TraceEvent` while removal uses
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
-will remain unchanged before a later operation. Automation v1 supplies the
-shared execution trace and terminal result.
+will remain unchanged before a later operation. The automation results stream
+supplies the shared execution trace and terminal result.
 
 ## Events and terminal results
 
@@ -575,8 +570,8 @@ receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
 Additive unknown record types are validated for a well-formed envelope and
 sequence position, then ignored.
 
-The product's [automation-v1 contract](../../docs/automation-v1.md) and
-[JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
+The product's [automation results contract](../../docs/automation.md) and
+[JSON Schema](../../schemas/automation.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 
@@ -661,7 +656,7 @@ the source/destination state is still appropriate belong to the application.
 An incomplete stream cannot produce a complete retry manifest: unobserved
 operations may exist. Collected entries must not be used until the terminal
 result arrives with status `success` or `partial`, the two statuses for which
-automation v1 guarantees that every queued operation settled.
+the automation contract guarantees that every queued operation settled.
 
 ## Raw execution
 
@@ -669,7 +664,7 @@ The existing escape hatch remains small and transparent:
 
 ```python
 result = client.run(
-    ["enrollments"],
+    ["receiver", "list"],
     check=True,
     timeout=30,
 )
@@ -776,9 +771,9 @@ The initial typed API does not provide:
 | Raw stdin and safe streaming | Process behavior only | Implemented |
 | `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
 | `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
-| Typed `cp`, including `prune=True` | Automation v1 | Implemented |
+| Typed `cp`, including `prune=True` | Automation results stream | Implemented |
 | Typed `rm` | Native `rm` result stream | Implemented for local and ordinary SSH endpoints |
-| Typed `dry_run=True` | Automation-v1 trace records | Implemented |
+| Typed `dry_run=True` | Automation trace records | Implemented |
 | Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
 
 The source inventory `native-api.json` records the disposition of every native

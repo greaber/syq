@@ -285,10 +285,9 @@ class NativeClientTests(unittest.TestCase):
             no_compress=True,
             bwlimit="10M",
             connections=4,
-            max_entries=100,
-            max_total_bytes="2G",
-            max_runtime="30m",
-            receipt="hashed",
+            receiver_max_entries=100,
+            receiver_max_bytes="2G",
+            receiver_receipt="digests",
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
@@ -320,8 +319,8 @@ class NativeClientTests(unittest.TestCase):
             "--follow-dest", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
-            "--max-entries", "--max-total-bytes",
-            "--max-runtime", "--receipt", "--ignore", "--ignore-from",
+            "--receiver-max-entries", "--receiver-max-bytes",
+            "--receiver-receipt", "--ignore", "--ignore-from",
             "--preserve",
             "--inplace", "--max-size", "--min-size",
         ):
@@ -333,7 +332,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
         self.assertIn("--pscope=-scope", argv)
-        self.assertEqual(argv[argv.index("--receipt") + 1], "hashed")
+        self.assertEqual(argv[argv.index("--receiver-receipt") + 1], "digests")
         self.assertEqual(argv.count("--src"), 2)
 
     def test_hyphen_prefixed_paths_use_attached_option_values(self) -> None:
@@ -551,12 +550,7 @@ class NativeClientTests(unittest.TestCase):
 
         for parameter, option in (
             ({"no_tcp": True}, "--no-tcp"),
-            ({"no_forward_agent": True}, "--no-forward-agent"),
-            (
-                {"unrestricted_agent_forwarding": True},
-                "--unrestricted-agent-forwarding",
-            ),
-            ({"agent_broker_only": True}, "--agent-broker-only"),
+            ({"peer_auth": "own-credentials"}, "--peer-auth"),
         ):
             with self.subTest(option=option):
                 self.client.cp(
@@ -774,8 +768,10 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
             self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
-        with self.assertRaisesRegex(syq.SyqInvocationError, "--receipt"):
-            self.client.cp("source", into="target", receipt="full")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--receiver-receipt"):
+            self.client.cp("source", into="target", receiver_receipt="full")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
+            self.client.cp("source", into="target", peer_auth="agent")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--pscope"):
             self.client.cp(
                 "source", into="target", pscope="scope", rsh="ssh"

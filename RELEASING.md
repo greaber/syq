@@ -136,8 +136,11 @@ connection, so enable it only for a trusted release host rather than globally.
 ## Cutting a release
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
-   `Cargo.lock`, then run the normal locked checks to validate it. Update
-   release notes and merge through the protected branch. Peer compatibility is
+   `Cargo.lock`, then run the normal locked checks to validate it. Write the
+   curated introduction and breaking-change notes in
+   `.github/release-notes/v<version>.md`; the release workflow prepends that
+   file to GitHub's generated contributor and change list. Merge the version
+   and release notes through the protected branch. Peer compatibility is
    the immutable release identity, so there is no separate protocol number to
    maintain. Native command changes must also be classified in
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
@@ -261,16 +264,21 @@ as their sole release identity.
 
 The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
 names are stable, but the work behind them differs before and after merge.
-Pull requests run a fast affected-surface gate: Rust changes get formatting,
-clippy, and native unit tests; SDK and rsync-owned changes get their respective
-suites; executable examples in `MAPPINGS.md` get their focused integration
-tests; and repository-tooling changes get the packaging, release, workflow, and
-shell checks. Ordinary native pull requests defer the complete filesystem,
-SDK, conformance, ARM, and macOS suites to `master`. The working agent chooses
-and reports any additional integration tests justified by the change.
+Pull requests run an affected-surface gate: Rust changes get formatting,
+clippy, native unit tests, focused Apple Silicon macOS tests, and the Linux and
+macOS rsync-conformance matrix. SDK-owned changes get their SDK suite;
+executable examples in `MAPPINGS.md` get focused integration tests; and
+repository-tooling changes get the packaging, release, workflow, and shell
+checks. Ordinary native pull requests still defer the complete filesystem and
+SDK suites, Linux ARM64 validation, and Intel macOS validation to `master`.
+The working agent chooses and reports any additional integration tests
+justified by the change.
 
-Every native push to `master` runs the complete native, SDK, conformance, ARM,
-and macOS suites. Workflow concurrency cancels an older run when a newer commit
+Every native push to `master` runs the complete native and SDK suites, Linux
+and macOS conformance, Linux ARM64 validation, focused Apple Silicon macOS
+tests, and an Intel macOS compile-and-updater check. The separate macOS workflow
+also runs the complete native and SDK suites on Apple Silicon. Workflow
+concurrency cancels an older run when a newer commit
 arrives on the same pull request. Each non-PR run has a unique concurrency
 group, including while it is pending, because a later push may affect a
 different subsystem and therefore cannot safely replace the earlier push's

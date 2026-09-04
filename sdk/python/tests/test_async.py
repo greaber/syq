@@ -65,10 +65,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             into_existing="out",
             dry_run=True,
             hash=True,
-            max_entries=100,
-            max_total_bytes="2G",
-            max_runtime="30m",
-            receipt="sizes",
+            receiver_max_entries=100,
+            receiver_max_bytes="2G",
+            receiver_receipt="sizes",
             pscope="scope",
             on_event=observe,
         )
@@ -86,13 +85,12 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
         self.assertIn("--follow-dest", self.argv())
-        self.assertIn("--max-entries", self.argv())
-        self.assertIn("--max-total-bytes", self.argv())
-        self.assertIn("--max-runtime", self.argv())
-        self.assertIn("--receipt", self.argv())
+        self.assertIn("--receiver-max-entries", self.argv())
+        self.assertIn("--receiver-max-bytes", self.argv())
+        self.assertIn("--receiver-receipt", self.argv())
         self.assertIn("--pscope", self.argv())
         self.assertEqual(
-            self.argv()[self.argv().index("--receipt") + 1], "sizes"
+            self.argv()[self.argv().index("--receiver-receipt") + 1], "sizes"
         )
         self.assertEqual(self.argv().count("--src"), 2)
 
@@ -268,12 +266,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
         for parameter, option in (
             ({"no_tcp": True}, "--no-tcp"),
-            ({"no_forward_agent": True}, "--no-forward-agent"),
-            (
-                {"unrestricted_agent_forwarding": True},
-                "--unrestricted-agent-forwarding",
-            ),
-            ({"agent_broker_only": True}, "--agent-broker-only"),
+            ({"peer_auth": "own-credentials"}, "--peer-auth"),
         ):
             with self.subTest(option=option):
                 await self.client.cp(

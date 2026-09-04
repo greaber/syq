@@ -73,7 +73,8 @@ yourself may use the base64 form for such names.
 `syq map` deliberately has a destination-independent surface: `-C`, `--root`,
 `--follow-src`/`--follow`, the source-selector family, and `--as`. It takes
 either `--src-src DIR` as the only selector or any number of relative named
-selectors. `--as` renames the single selected root. Destination, filtering,
+selectors. `--as PATH` places the single selected root at `PATH`, which may
+be nested; `cp --mapping` creates any missing parents. Destination, filtering,
 transfer, execution, result, receiver-ceiling, and receipt options belong to
 the later `syq cp --mapping` invocation or to a manifest transform, not to
 `syq map`.
@@ -232,7 +233,7 @@ those farms fall short — see [use-cases/link-farms.md](https://github.com/grea
   only; `syq rsync` is unchanged.
 - `syq map` accepts the local selector grammar, including the typed selectors
   `--src-file`/`--src-dir`, plus `--as PATH` (which emits the single selected
-  root under the destination's basename). Those selectors are validated exactly as
+  root at `PATH`). Those selectors are validated exactly as
   native `cp` validates them; see "Emitting a mapping" for the complete
   surface.
 - Fidelity is the native default (`-rlt`). There is no per-entry
@@ -305,7 +306,7 @@ output; `--results-fd N` writes to a caller-opened descriptor instead
 (`--results-fd 3 3>r.ndjson`, or a pipe). The
 full contract — every record type and field, the exit-code table,
 the JSON Schema, and example streams — is
-[Automation results](automation-v1.md). In brief: the
+[Automation results](automation.md). In brief: the
 stream carries `schema_version: 1`: a `run` record (run id, mode,
 endpoints), sampled `progress` records, one `operation_result` per
 settled mutation and per failed mapping entry (with `retryable`, and

@@ -19,7 +19,7 @@ syq cp project --to server --into /backup       # named object → /backup/proje
 syq cp --src-src project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
-syq cp --from server data --to backup --coordinate-at dest --no-forward-agent --into /archive  # pull with backup's own credentials
+syq cp --from server data --to backup --coordinate-at dest --peer-auth own-credentials --into /archive  # pull with backup's own credentials
 syq cp --src-file report --src-dir assets --into /backup
 syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
 syq cp report --to server --as-new /reports/final
@@ -308,10 +308,13 @@ Native copy fidelity defaults to `-rlt`: recurse through directories, copy
 symlinks as symlinks, and retain mtimes. `--preserve=permissions` additionally
 copies modes, `--preserve=ownership` requests numeric owner and group, and
 `--preserve=specials` copies device, FIFO, and socket nodes. The option is
-repeatable and accepts comma-separated values. Ownership follows the same
-receiver-side rules as archive mode: owner is set only when the receiver runs
-as root, while group changes that fail with `EPERM` are skipped. Hard links,
-ACLs, and xattrs are not preserved.
+repeatable and accepts comma-separated values. On macOS, socket nodes are
+reported and skipped, even under `--quiet`, because macOS cannot create them
+through the confined destination directory descriptor; regular files and
+other special files in the same copy continue normally. Ownership follows the
+same receiver-side rules as archive mode: owner is set only when the receiver
+runs as root, while group changes that fail with `EPERM` are skipped. Hard
+links, ACLs, and xattrs are not preserved.
 
 Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
 `-n`/`--dry-run`, `-v`/`--verbose`,
@@ -336,8 +339,7 @@ command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. On a direct remote-to-remote copy through that receiver, `cp` also
 accepts the receiver ceilings
-`--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
-(`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
+`--receiver-max-entries N` and `--receiver-max-bytes SIZE`, and `--receiver-receipt digests`, which asks the
 receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing
@@ -348,7 +350,7 @@ would act on them.
 file, one run), and
 `--results-fd N` writes to a descriptor the caller opened, e.g.
 `--results-fd 3 3>run.ndjson` (see
-[Automation results](automation-v1.md)). The stream is always written on the
+[Automation results](automation.md)). The stream is always written on the
 invoking machine. For a remote-to-remote copy the coordinator is normally
 elsewhere, so the copy is refused unless `--coordinate-at local` is passed
 explicitly — routing through this machine is never chosen implicitly on the
@@ -389,14 +391,14 @@ have two remote endpoints; `auto`, the default, is accepted everywhere.
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed, because there is
 no read-restricted receiver, and syq never silently downgrades to
-authentication-only confinement. Pull is available with an explicit `--rsh`, `--no-forward-agent` when the target owns source
-credentials, `--agent-broker-only`, or
-`--unrestricted-agent-forwarding`. The authentication options and `--detach`
+authentication-only confinement. Pull is available with an explicit `--rsh`, `--peer-auth own-credentials` when the destination host owns source
+credentials, `--peer-auth broker`, or
+`--peer-auth full-agent`. `--peer-auth` and `--detach`
 apply only to a direct copy between distinct remote endpoints. Constrained forwarding
 needs OpenSSH 8.9 or newer for the client on the local machine, the client on
 the coordinator host, and the peer's server; syq checks both clients before
 connecting and names the older one together with these alternatives. A detached
-launch requires coordinator-owned credentials (`--no-forward-agent`) or an
+launch requires coordinator-owned credentials (`--peer-auth own-credentials`) or an
 explicit remote-shell policy, and the coordinator host needs `/bin/kill` plus
 either `setsid` or `perl` to start the new session (macOS has no `setsid`);
 the launcher reports its coordinator and log only after
@@ -542,8 +544,8 @@ syq map --src-src photos \
 ```
 
 `syq map` is local and destination-independent. Its options are `-C` or `--root`,
-`--follow-src`/`--follow`, the source-selector family, and `--as` for renaming
-one selected root. Copy destinations, filtering, transfer policy, execution
+`--follow-src`/`--follow`, the source-selector family, and `--as PATH` for
+placing the single selected root at `PATH`. Copy destinations, filtering, transfer policy, execution
 controls, results, receiver ceilings, and receipts belong to the downstream `cp`
 invocation or the manifest transform.
 

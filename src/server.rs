@@ -275,6 +275,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
+        supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
     })?;
 
     // Requests are parsed on a reader thread so incoming data keeps flowing

@@ -175,7 +175,7 @@ assert_same_tree \
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress -j 2 --preserve=permissions \
-    --agent-broker-only --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
+    --peer-auth broker --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --src-src /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
 assert_same_tree \
@@ -186,7 +186,7 @@ assert_same_tree \
 printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --agent-broker-only \
+    --peer-auth broker \
     --from source --src-src /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
@@ -197,7 +197,7 @@ assert_same_tree \
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --agent-broker-only --coordinate-at dest \
+    --peer-auth broker --coordinate-at dest \
     --from source --src-src /tmp/syq-real-ssh/pull-source \
     --to destination --into /tmp/syq-real-ssh/pull-destination
 assert_same_tree \

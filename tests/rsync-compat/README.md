@@ -41,10 +41,14 @@ Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
 Only the classified runnable subset is executed, not all 351 inventoried
 tests. The 38 runnable upstream test sources currently produce 40 independently
-reported scenarios. A warm non-root Linux run selects 36 scenarios and takes
-about 22 seconds on the development machine; four more apply when run as root. A
-first run also downloads and prepares the pinned rsync checkout and may do a
-cold Rust build. The exact cold time depends mostly on network and Cargo state.
+reported scenarios. A non-root Linux run selects 36 scenarios and a root run
+adds four. A non-root macOS run selects 33 scenarios and a root run adds three;
+the four Linux-only cases depend on setgid-directory inheritance, Linux
+search-only-directory behavior, `/proc` interposition, or
+`fs.protected_regular`. Warm non-root runs take about 22 seconds on Linux and
+27 seconds on macOS on the development machines. A first run also downloads
+and prepares the pinned rsync checkout and may do a cold Rust build. The exact
+cold time depends mostly on network and Cargo state.
 
 ## What upstream's security testing means here
 
@@ -100,13 +104,15 @@ rsync's build prerequisites only on a suite-cache miss. To manage the SYQ build
 separately, use `--no-build-syq --syq-bin PATH`.
 
 The upstream runner gives each test a 300-second deadline by default; override
-it with `--test-timeout SECONDS`. CI uses 120 seconds per test, caps the entire
-job at 30 minutes, and passes `--require-tests` so an accidentally empty Linux
-selection cannot look successful. A local run with no applicable tests still
-writes a valid N/A report.
+it with `--test-timeout SECONDS`. CI uses 120 seconds per test, caps each
+platform job at 30 minutes, and passes `--require-tests` so an accidentally
+empty platform selection cannot look successful. A local run with no applicable
+tests still writes a valid N/A report.
 
 The harness requires Python 3.11 or newer. Preparing a fresh checkout also
-requires Git, a C toolchain, Make, Autoconf, and Automake.
+requires Git, a C toolchain, Make, Autoconf, and Automake. The pinned helper
+build disables rsync's optional OpenSSL integration so a locally installed,
+keg-only OpenSSL cannot make macOS configuration depend on undeclared flags.
 
 ## Inventory, observations, and product positions
 

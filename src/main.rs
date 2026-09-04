@@ -207,7 +207,7 @@ fn main() {
             }
         }
     }
-    if let Some(result) = restricted::dispatch_management(&argv) {
+    if let Some(result) = restricted::dispatch_receiver_command(&argv) {
         match result {
             Ok(code) => std::process::exit(code),
             Err(error) => {

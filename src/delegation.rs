@@ -66,6 +66,8 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_LOGIN_BYTES: usize = 256;
 const MAX_SIGNER_BYTES: usize = 512;
 const MAX_GRANT_VALIDITY_SECS: i64 = 24 * 60 * 60;
+/// Upper bound on how far past issuance a grant may let a transfer run.
+const MAX_FINISH_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
 const MAX_UNIX_TIMESTAMP: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 pub(crate) const MAX_ENTRIES: u64 = 1_000_000_000_000;
@@ -200,7 +202,6 @@ pub(crate) struct CopyLimits {
     pub hash_block_bytes: u64,
     pub max_connections: u16,
     pub max_deletions: u64,
-    pub max_runtime_seconds: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +212,10 @@ pub(crate) struct Grant {
     pub request_id: RequestId,
     pub issued_at: i64,
     pub not_before: i64,
-    pub not_after: i64,
+    /// The receiver must redeem the grant by this wall-clock time.
+    pub start_by: i64,
+    /// The transfer must finish by this wall-clock time.
+    pub finish_by: i64,
     pub operation: GrantOperation,
 }
 
@@ -225,31 +229,42 @@ impl Grant {
         for (name, value) in [
             ("issued-at", self.issued_at),
             ("not-before", self.not_before),
-            ("not-after", self.not_after),
+            ("start-by", self.start_by),
+            ("finish-by", self.finish_by),
         ] {
             if !(0..=MAX_UNIX_TIMESTAMP).contains(&value) {
                 bail!("grant {name} timestamp is out of range");
             }
         }
-        if self.not_before > self.issued_at || self.issued_at > self.not_after {
-            bail!("grant times must satisfy not-before <= issued-at <= not-after");
+        if self.not_before > self.issued_at
+            || self.issued_at > self.start_by
+            || self.start_by > self.finish_by
+        {
+            bail!("grant times must satisfy not-before <= issued-at <= start-by <= finish-by");
         }
         let validity = self
-            .not_after
+            .start_by
             .checked_sub(self.not_before)
             .ok_or_else(|| anyhow!("grant validity interval overflow"))?;
         if validity == 0 || validity > MAX_GRANT_VALIDITY_SECS {
-            bail!("grant validity must be between 1 second and 24 hours");
+            bail!("grant start-by time must be between 1 second and 24 hours after not-before");
+        }
+        let finish_window = self
+            .finish_by
+            .checked_sub(self.issued_at)
+            .ok_or_else(|| anyhow!("grant finish window overflow"))?;
+        if finish_window > MAX_FINISH_WINDOW_SECS {
+            bail!("grant finish-by time is more than 30 days after issue");
         }
 
         match &self.operation {
-            GrantOperation::Copy(copy) => copy.validate(validity),
+            GrantOperation::Copy(copy) => copy.validate(),
         }
     }
 }
 
 impl CopyOperation {
-    fn validate(&self, validity: i64) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         validate_absolute_path(&self.destination)?;
         if self.mutation_scopes.is_empty() || self.mutation_scopes.len() > 1024 {
             bail!("copy mutation-scope count is outside the supported range");
@@ -289,9 +304,6 @@ impl CopyOperation {
         }
         if limits.max_connections == 0 || limits.max_connections > MAX_CONNECTIONS {
             bail!("copy max-connections is outside the supported range");
-        }
-        if limits.max_runtime_seconds == 0 || i64::from(limits.max_runtime_seconds) > validity {
-            bail!("copy max-runtime exceeds the signed validity interval");
         }
         if self.options.tcp_port_hi < self.options.tcp_port_lo {
             bail!("copy TCP port range is reversed");
@@ -811,8 +823,8 @@ impl ReceiverContext<'_> {
         let earliest_for_expiry = latest_now
             .checked_sub(self.clock_skew_seconds)
             .ok_or_else(|| anyhow!("receiver time overflow"))?;
-        if earliest_for_expiry > grant.not_after {
-            bail!("grant has expired");
+        if earliest_for_expiry > grant.start_by {
+            bail!("grant start-by time has passed");
         }
         Ok(latest_now)
     }
@@ -1177,22 +1189,18 @@ fn execution_deadline(
     current_wall_time: i64,
     verified_at: Instant,
 ) -> Result<Instant> {
-    let authorization_end = grant
-        .not_after
+    let finish_by = grant
+        .finish_by
         .checked_add(clock_skew_seconds)
-        .ok_or_else(|| anyhow!("grant authorization deadline overflow"))?;
-    let remaining = authorization_end
+        .ok_or_else(|| anyhow!("grant finish-by overflow"))?;
+    let remaining = finish_by
         .checked_sub(current_wall_time)
-        .ok_or_else(|| anyhow!("grant remaining validity overflow"))?;
+        .ok_or_else(|| anyhow!("grant remaining finish window overflow"))?;
     if remaining <= 0 {
-        bail!("grant expired while it was being verified and claimed");
+        bail!("grant finish-by time passed while it was being verified and claimed");
     }
-    let max_runtime = match &grant.operation {
-        GrantOperation::Copy(copy) => u64::from(copy.limits.max_runtime_seconds),
-    };
-    let budget = max_runtime.min(remaining as u64);
     verified_at
-        .checked_add(Duration::from_secs(budget))
+        .checked_add(Duration::from_secs(remaining as u64))
         .ok_or_else(|| anyhow!("monotonic execution deadline overflow"))
 }
 
@@ -1940,7 +1948,8 @@ mod tests {
             request_id: RequestId([request_byte; 32]),
             issued_at: NOW,
             not_before: NOW - 30,
-            not_after: NOW + 600,
+            start_by: NOW + 600,
+            finish_by: NOW + 900,
             operation: GrantOperation::Copy(CopyOperation {
                 destination: b"/srv/archive/project".to_vec(),
                 mutation_scopes: vec![MutationScope {
@@ -1976,7 +1985,6 @@ mod tests {
                     hash_block_bytes: 4 << 20,
                     max_connections: 8,
                     max_deletions: 0,
-                    max_runtime_seconds: 300,
                 },
             }),
         }
@@ -2082,8 +2090,17 @@ mod tests {
         assert!(signing_payload_default(&relative, 0).is_err());
 
         let mut unbounded = fixture_grant(3);
-        unbounded.not_after = unbounded.not_before + MAX_GRANT_VALIDITY_SECS + 1;
+        unbounded.start_by = unbounded.not_before + MAX_GRANT_VALIDITY_SECS + 1;
+        unbounded.finish_by = unbounded.start_by;
         assert!(signing_payload_default(&unbounded, 0).is_err());
+
+        let mut endless = fixture_grant(3);
+        endless.finish_by = endless.issued_at + MAX_FINISH_WINDOW_SECS + 1;
+        assert!(signing_payload_default(&endless, 0).is_err());
+
+        let mut reversed = fixture_grant(3);
+        reversed.finish_by = reversed.start_by - 1;
+        assert!(signing_payload_default(&reversed, 0).is_err());
 
         let mut excessive = fixture_grant(4);
         let GrantOperation::Copy(copy) = &mut excessive.operation;
@@ -2412,7 +2429,7 @@ mod tests {
         let mut future = fixture_grant(10);
         future.issued_at = NOW + 100;
         future.not_before = NOW + 100;
-        future.not_after = NOW + 400;
+        future.start_by = NOW + 400;
         let encoded = fixture.signed(future);
         let replay = fixture.replay("future-replay");
         assert!(verify_and_claim(
@@ -2436,40 +2453,30 @@ mod tests {
     }
 
     #[test]
-    fn execution_deadline_is_monotonic_and_bounded_by_expiry_and_runtime() {
+    fn execution_deadline_is_monotonic_and_bounded_by_finish_by() {
         let started = Instant::now();
         let verified = started + Duration::from_secs(3);
 
-        let mut expiry_limited = fixture_grant(17);
-        expiry_limited.not_after = NOW + 20;
+        let mut bounded = fixture_grant(17);
+        bounded.finish_by = NOW + 20;
         assert_eq!(
-            execution_deadline(&expiry_limited, 5, NOW + 3, verified)
-                .expect("expiry-limited deadline"),
+            execution_deadline(&bounded, 5, NOW + 3, verified).expect("finish-by deadline"),
             verified + Duration::from_secs(22)
-        );
-
-        let runtime_limited = fixture_grant(18);
-        assert_eq!(
-            execution_deadline(&runtime_limited, 0, NOW + 3, verified,)
-                .expect("runtime-limited deadline"),
-            verified + Duration::from_secs(300)
         );
 
         let partially_elapsed = started + Duration::from_millis(1100);
         let mut rounded = fixture_grant(19);
-        rounded.not_after = NOW + 5;
+        rounded.finish_by = NOW + 5;
         assert_eq!(
             execution_deadline(&rounded, 0, NOW + 2, partially_elapsed)
                 .expect("subsecond verification is rounded conservatively"),
             partially_elapsed + Duration::from_secs(3)
         );
 
-        let mut expired = fixture_grant(20);
-        expired.not_after = NOW + 1;
-        let GrantOperation::Copy(copy) = &mut expired.operation;
-        copy.limits.max_runtime_seconds = 1;
+        let mut finished = fixture_grant(20);
+        finished.finish_by = NOW + 1;
         assert!(
-            execution_deadline(&expired, 0, NOW + 2, started + Duration::from_secs(2),).is_err()
+            execution_deadline(&finished, 0, NOW + 2, started + Duration::from_secs(2),).is_err()
         );
     }
 
@@ -2491,7 +2498,7 @@ mod tests {
         let encoded = fixture.signed(fixture_grant(22));
         let verified = verify_and_claim(&encoded, &context, &fixture.policy(), &replay)
             .expect("verify with a queued but still-valid clock observation");
-        assert!(verified.execution_deadline() <= Instant::now() + Duration::from_secs(300));
+        assert!(verified.execution_deadline() <= Instant::now() + Duration::from_secs(900));
         let claim = fs::read(
             replay
                 .path
@@ -2502,9 +2509,8 @@ mod tests {
         assert!(claimed_at >= NOW + 3);
 
         let mut expired = fixture_grant(23);
-        expired.not_after = NOW + 2;
-        let GrantOperation::Copy(copy) = &mut expired.operation;
-        copy.limits.max_runtime_seconds = 1;
+        expired.start_by = NOW + 2;
+        expired.finish_by = NOW + 2;
         let encoded = fixture.signed(expired);
         let expired_replay = fixture.replay("queued-expired-replay");
         assert!(verify_and_claim(&encoded, &context, &fixture.policy(), &expired_replay).is_err());

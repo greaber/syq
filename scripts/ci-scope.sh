@@ -149,12 +149,16 @@ if [ "$saw_path" = false ]; then
   linux_arm64=true
 fi
 
-# Pull requests run affected fast checks. The cumulative master state gets the
-# broad cross-subsystem and platform suites once after merge.
-if [ "$full_suite" = true ] && [ "$native" = true ]; then
-  sdks=true
+# Native pull requests exercise both host operating systems and rsync
+# conformance before merge. The cumulative master state still gets the broad
+# SDK, architecture, and complete native suites once after merge.
+if [ "$native" = true ]; then
   conformance=true
   macos=true
+fi
+
+if [ "$full_suite" = true ] && [ "$native" = true ]; then
+  sdks=true
   linux_arm64=true
 fi
 
