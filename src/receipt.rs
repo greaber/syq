@@ -1,4 +1,4 @@
-//! Receipt v2: a complete receiver-authored record stream, a small signed
+//! Receipts: a complete receiver-authored record stream, a small signed
 //! terminal commitment, and optional HPKE delivery to the invoking machine.
 //!
 //! The stream records logical pathname operations and closure-time state. It
@@ -25,14 +25,12 @@ type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
 
-pub(crate) const RECEIPT_NAMESPACE: &str = "syq-receipt-v2@greaber.github";
-pub(crate) const RECEIPT_LINE_PREFIX: &str = "syq-receipt-v2:";
-const TERMINAL_MAGIC: &[u8; 8] = b"SYQRCV2\0";
-const TERMINAL_VERSION: u16 = 2;
-const FRAME_MAGIC: &[u8; 8] = b"SYQRFV2\0";
-const FRAME_VERSION: u16 = 2;
-const HEADER_LEN: usize = 8 + 2 + 4;
-const TERMINAL_HEADER_LEN: usize = 8 + 2 + 4 + 4;
+pub(crate) const RECEIPT_NAMESPACE: &str = "syq-receipt@greaber.github";
+pub(crate) const RECEIPT_LINE_PREFIX: &str = "syq-receipt:";
+const TERMINAL_MAGIC: &[u8; 8] = b"SYQRCPT\0";
+const FRAME_MAGIC: &[u8; 8] = b"SYQRFRM\0";
+const HEADER_LEN: usize = 8 + 4;
+const TERMINAL_HEADER_LEN: usize = 8 + 4 + 4;
 const MAX_TERMINAL_BYTES: usize = 64 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_FRAME_BODY_BYTES: usize = 96 * 1024;
@@ -44,32 +42,32 @@ const STREAM_RECORD_HEADER_BYTES: usize = 4;
 const HPKE_TAG_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum HpkeSuiteV1 {
+pub(crate) enum HpkeSuite {
     X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ReceiptDeliveryV2 {
+pub(crate) enum ReceiptDelivery {
     AttachedEncrypted {
-        suite: HpkeSuiteV1,
+        suite: HpkeSuite,
         recipient_public_key: [u8; 32],
     },
     DetachedSignedPlaintext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReceiptPolicyV2 {
+pub(crate) struct ReceiptPolicy {
     pub required: bool,
     pub hashed: bool,
     pub max_records: u64,
     pub max_plaintext_bytes: u64,
-    pub delivery: ReceiptDeliveryV2,
+    pub delivery: ReceiptDelivery,
 }
 
-impl ReceiptPolicyV2 {
+impl ReceiptPolicy {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.required {
-            bail!("receipt v2 policy must require a receipt");
+            bail!("receipt policy must require a receipt");
         }
         if self.max_records == 0 || self.max_records > DEFAULT_MAX_RECORDS {
             bail!("receipt record limit is outside the supported range");
@@ -78,14 +76,14 @@ impl ReceiptPolicyV2 {
             bail!("receipt byte limit is outside the supported range");
         }
         match &self.delivery {
-            ReceiptDeliveryV2::AttachedEncrypted {
+            ReceiptDelivery::AttachedEncrypted {
                 recipient_public_key,
                 ..
             } if recipient_public_key.iter().all(|byte| *byte == 0) => {
                 bail!("receipt recipient public key must be nonzero")
             }
-            ReceiptDeliveryV2::AttachedEncrypted { .. }
-            | ReceiptDeliveryV2::DetachedSignedPlaintext => Ok(()),
+            ReceiptDelivery::AttachedEncrypted { .. }
+            | ReceiptDelivery::DetachedSignedPlaintext => Ok(()),
         }
     }
 }
@@ -120,7 +118,7 @@ pub(crate) fn generate_recipient() -> Result<(RecipientSecret, [u8; 32])> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum OperationActionV2 {
+pub(crate) enum OperationAction {
     PublishFile { size: u64, inplace: bool },
     EnsureDirectory,
     CreateSymlink,
@@ -132,15 +130,15 @@ pub(crate) enum OperationActionV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum OperationDispositionV2 {
-    Applied,
+pub(crate) enum OperationDisposition {
+    Succeeded,
     Failed,
     Incomplete,
     Observed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum OutcomeCodeV2 {
+pub(crate) enum OutcomeCode {
     None,
     ExecutionFailed,
     AuthorizationRefused,
@@ -149,25 +147,25 @@ pub(crate) enum OutcomeCodeV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OperationRecordV2 {
+pub(crate) struct ReceiptOperationRecord {
     pub sequence: u64,
     pub scope: u32,
     pub path: Vec<u8>,
-    pub action: OperationActionV2,
-    pub disposition: OperationDispositionV2,
-    pub code: OutcomeCodeV2,
+    pub action: OperationAction,
+    pub disposition: OperationDisposition,
+    pub code: OutcomeCode,
     pub diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RefusalRecordV2 {
+pub(crate) struct RefusalReceiptRecord {
     pub sequence: u64,
-    pub code: OutcomeCodeV2,
+    pub code: OutcomeCode,
     pub diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ObjectMetadataV2 {
+pub(crate) struct ObjectMetadata {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -177,41 +175,41 @@ pub(crate) struct ObjectMetadataV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum FinalObjectV2 {
+pub(crate) enum FinalObject {
     Absent,
     Present {
         kind: Kind,
         size: u64,
         digest: Option<[u8; 32]>,
         symlink_target: Option<Vec<u8>>,
-        metadata: ObjectMetadataV2,
+        metadata: ObjectMetadata,
         observation_error: Option<String>,
     },
     ObservationFailed {
-        code: OutcomeCodeV2,
+        code: OutcomeCode,
         diagnostic: Option<String>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FinalStateRecordV2 {
+pub(crate) struct FinalStateReceiptRecord {
     pub sequence: u64,
     pub scope: u32,
     pub path: Vec<u8>,
-    pub object: FinalObjectV2,
+    pub object: FinalObject,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RecordV2 {
-    Operation(OperationRecordV2),
-    Refusal(RefusalRecordV2),
-    FinalState(FinalStateRecordV2),
+pub(crate) enum ReceiptRecord {
+    Operation(ReceiptOperationRecord),
+    Refusal(RefusalReceiptRecord),
+    FinalState(FinalStateReceiptRecord),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReceiptSummaryV2 {
+pub(crate) struct ReceiptSummary {
     pub operations: u64,
-    pub applied: u64,
+    pub succeeded: u64,
     pub failed: u64,
     pub incomplete: u64,
     pub refusals: u64,
@@ -226,84 +224,84 @@ pub(crate) struct ReceiptSummaryV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ReceiptStatusV2 {
+pub(crate) enum ReceiptStatus {
     Clean,
     Failed,
     Incomplete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RecordingFailureV2 {
+pub(crate) enum RecordingFailure {
     LimitExceeded,
     StorageFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ManifestStatusV2 {
+pub(crate) enum ManifestStatus {
     NotProvided,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ReceiptSchemaV2 {
-    LogicalMutationsAndFinalStateV2,
+pub(crate) enum ReceiptSchema {
+    LogicalMutationsAndFinalState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DigestAlgorithmV2 {
+pub(crate) enum DigestAlgorithm {
     Blake3,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TerminalReceiptV2 {
-    pub schema: ReceiptSchemaV2,
+pub(crate) struct TerminalReceipt {
+    pub schema: ReceiptSchema,
     pub enrollment_id: EnrollmentId,
     pub request_id: RequestId,
     pub grant_digest: [u8; 32],
     pub issued_at: i64,
-    pub status: ReceiptStatusV2,
+    pub status: ReceiptStatus,
     pub authority_closed: bool,
     pub in_flight: u64,
     pub stream_digest: [u8; 32],
-    pub stream_digest_algorithm: DigestAlgorithmV2,
-    pub content_digest_algorithm: Option<DigestAlgorithmV2>,
+    pub stream_digest_algorithm: DigestAlgorithm,
+    pub content_digest_algorithm: Option<DigestAlgorithm>,
     pub record_count: u64,
     pub plaintext_bytes: u64,
-    pub summary: ReceiptSummaryV2,
-    pub policy: ReceiptPolicyV2,
-    pub recording_failure: Option<RecordingFailureV2>,
+    pub summary: ReceiptSummary,
+    pub policy: ReceiptPolicy,
+    pub recording_failure: Option<RecordingFailure>,
     pub expected_manifest_digest: Option<[u8; 32]>,
-    pub manifest_status: ManifestStatusV2,
+    pub manifest_status: ManifestStatus,
 }
 
 /// Append-only canonical receipt stream. The anonymous temporary file keeps
 /// receipt size off the heap; its signed policy bounds both records and bytes.
-pub(crate) struct StreamWriterV2 {
+pub(crate) struct ReceiptStreamWriter {
     file: File,
     hasher: blake3::Hasher,
     record_buffer: Vec<u8>,
     record_count: u64,
     plaintext_bytes: u64,
-    summary: ReceiptSummaryV2,
+    summary: ReceiptSummary,
     max_records: u64,
     max_plaintext_bytes: u64,
-    recording_failure: Option<RecordingFailureV2>,
+    recording_failure: Option<RecordingFailure>,
 }
 
-pub(crate) struct ReceiptClosureV2<'a> {
+pub(crate) struct ReceiptClosure<'a> {
     pub enrollment_id: EnrollmentId,
     pub request_id: RequestId,
     pub grant_digest: [u8; 32],
     pub issued_at: i64,
-    pub policy: ReceiptPolicyV2,
+    pub policy: ReceiptPolicy,
     pub entries_touched: u64,
     pub transferred_bytes: u64,
     pub signing_key: &'a PrivateKey,
 }
 
-impl std::fmt::Debug for StreamWriterV2 {
+impl std::fmt::Debug for ReceiptStreamWriter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("StreamWriterV2")
+            .debug_struct("ReceiptStreamWriter")
             .field("record_count", &self.record_count)
             .field("plaintext_bytes", &self.plaintext_bytes)
             .field("summary", &self.summary)
@@ -312,8 +310,8 @@ impl std::fmt::Debug for StreamWriterV2 {
     }
 }
 
-impl StreamWriterV2 {
-    pub(crate) fn new(policy: &ReceiptPolicyV2) -> Result<Self> {
+impl ReceiptStreamWriter {
+    pub(crate) fn new(policy: &ReceiptPolicy) -> Result<Self> {
         policy.validate()?;
         Ok(Self {
             file: tempfile::tempfile().context("create receiver receipt spool")?,
@@ -321,7 +319,7 @@ impl StreamWriterV2 {
             record_buffer: Vec::new(),
             record_count: 0,
             plaintext_bytes: 0,
-            summary: ReceiptSummaryV2::default(),
+            summary: ReceiptSummary::default(),
             max_records: policy.max_records,
             max_plaintext_bytes: policy.max_plaintext_bytes,
             recording_failure: None,
@@ -338,15 +336,15 @@ impl StreamWriterV2 {
 
     pub(crate) fn mark_recording_failure(&mut self) {
         self.recording_failure
-            .get_or_insert(RecordingFailureV2::StorageFailed);
+            .get_or_insert(RecordingFailure::StorageFailed);
     }
 
-    pub(crate) fn append(&mut self, record: &RecordV2) {
+    pub(crate) fn append(&mut self, record: &ReceiptRecord) {
         if self.recording_failure.is_some() {
             return;
         }
         if record_sequence(record) != self.record_count {
-            self.recording_failure = Some(RecordingFailureV2::StorageFailed);
+            self.recording_failure = Some(RecordingFailure::StorageFailed);
             return;
         }
         let mut body = std::mem::take(&mut self.record_buffer);
@@ -354,7 +352,7 @@ impl StreamWriterV2 {
         let body = match postcard::to_extend(record, body) {
             Ok(body) => body,
             Err(_) => {
-                self.recording_failure = Some(RecordingFailureV2::StorageFailed);
+                self.recording_failure = Some(RecordingFailure::StorageFailed);
                 return;
             }
         };
@@ -362,7 +360,7 @@ impl StreamWriterV2 {
             Some(length) => length,
             None => {
                 self.record_buffer = body;
-                self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
+                self.recording_failure = Some(RecordingFailure::LimitExceeded);
                 return;
             }
         };
@@ -370,20 +368,20 @@ impl StreamWriterV2 {
             Some(bytes) => bytes,
             None => {
                 self.record_buffer = body;
-                self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
+                self.recording_failure = Some(RecordingFailure::LimitExceeded);
                 return;
             }
         };
         if self.record_count >= self.max_records || new_bytes > self.max_plaintext_bytes {
             self.record_buffer = body;
-            self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
+            self.recording_failure = Some(RecordingFailure::LimitExceeded);
             return;
         }
         let length = match u32::try_from(body.len()) {
             Ok(length) => length.to_be_bytes(),
             Err(_) => {
                 self.record_buffer = body;
-                self.recording_failure = Some(RecordingFailureV2::LimitExceeded);
+                self.recording_failure = Some(RecordingFailure::LimitExceeded);
                 return;
             }
         };
@@ -394,7 +392,7 @@ impl StreamWriterV2 {
             .is_err()
         {
             self.record_buffer = body;
-            self.recording_failure = Some(RecordingFailureV2::StorageFailed);
+            self.recording_failure = Some(RecordingFailure::StorageFailed);
             return;
         }
         self.hasher.update(&length);
@@ -405,8 +403,8 @@ impl StreamWriterV2 {
         self.record_buffer = body;
     }
 
-    pub(crate) fn finish(mut self, closure: ReceiptClosureV2<'_>) -> Result<IssuedReceiptV2> {
-        let ReceiptClosureV2 {
+    pub(crate) fn finish(mut self, closure: ReceiptClosure<'_>) -> Result<IssuedReceipt> {
+        let ReceiptClosure {
             enrollment_id,
             request_id,
             grant_digest,
@@ -423,17 +421,17 @@ impl StreamWriterV2 {
         self.summary.entries_touched = entries_touched;
         self.summary.transferred_bytes = transferred_bytes;
         let status = if self.recording_failure.is_some() || self.summary.observation_failures > 0 {
-            ReceiptStatusV2::Incomplete
+            ReceiptStatus::Incomplete
         } else if self.summary.failed > 0
             || self.summary.incomplete > 0
             || self.summary.refusals > 0
         {
-            ReceiptStatusV2::Failed
+            ReceiptStatus::Failed
         } else {
-            ReceiptStatusV2::Clean
+            ReceiptStatus::Clean
         };
-        let terminal = TerminalReceiptV2 {
-            schema: ReceiptSchemaV2::LogicalMutationsAndFinalStateV2,
+        let terminal = TerminalReceipt {
+            schema: ReceiptSchema::LogicalMutationsAndFinalState,
             enrollment_id,
             request_id,
             grant_digest,
@@ -442,17 +440,17 @@ impl StreamWriterV2 {
             authority_closed: true,
             in_flight: 0,
             stream_digest: *self.hasher.finalize().as_bytes(),
-            stream_digest_algorithm: DigestAlgorithmV2::Blake3,
-            content_digest_algorithm: policy.hashed.then_some(DigestAlgorithmV2::Blake3),
+            stream_digest_algorithm: DigestAlgorithm::Blake3,
+            content_digest_algorithm: policy.hashed.then_some(DigestAlgorithm::Blake3),
             record_count: self.record_count,
             plaintext_bytes: self.plaintext_bytes,
             summary: self.summary,
             policy: policy.clone(),
             recording_failure: self.recording_failure,
             expected_manifest_digest: None,
-            manifest_status: ManifestStatusV2::NotProvided,
+            manifest_status: ManifestStatus::NotProvided,
         };
-        Ok(IssuedReceiptV2 {
+        Ok(IssuedReceipt {
             stream: self.file,
             stream_len: self.plaintext_bytes,
             signed_terminal: sign_terminal(&terminal, signing_key)?,
@@ -464,52 +462,52 @@ impl StreamWriterV2 {
     }
 }
 
-fn record_sequence(record: &RecordV2) -> u64 {
+fn record_sequence(record: &ReceiptRecord) -> u64 {
     match record {
-        RecordV2::Operation(record) => record.sequence,
-        RecordV2::Refusal(record) => record.sequence,
-        RecordV2::FinalState(record) => record.sequence,
+        ReceiptRecord::Operation(record) => record.sequence,
+        ReceiptRecord::Refusal(record) => record.sequence,
+        ReceiptRecord::FinalState(record) => record.sequence,
     }
 }
 
-fn summarize(record: &RecordV2, summary: &mut ReceiptSummaryV2) {
+fn summarize(record: &ReceiptRecord, summary: &mut ReceiptSummary) {
     match record {
-        RecordV2::Operation(record) => {
+        ReceiptRecord::Operation(record) => {
             summary.operations += 1;
             match record.disposition {
-                OperationDispositionV2::Applied | OperationDispositionV2::Observed => {
-                    summary.applied += 1
+                OperationDisposition::Succeeded | OperationDisposition::Observed => {
+                    summary.succeeded += 1
                 }
-                OperationDispositionV2::Failed => summary.failed += 1,
-                OperationDispositionV2::Incomplete => summary.incomplete += 1,
+                OperationDisposition::Failed => summary.failed += 1,
+                OperationDisposition::Incomplete => summary.incomplete += 1,
             }
             match record.action {
-                OperationActionV2::PublishFile { size, .. }
-                    if record.disposition == OperationDispositionV2::Applied =>
+                OperationAction::PublishFile { size, .. }
+                    if record.disposition == OperationDisposition::Succeeded =>
                 {
                     summary.published_files += 1;
                     summary.published_bytes = summary.published_bytes.saturating_add(size);
                 }
-                OperationActionV2::DeleteFile | OperationActionV2::DeleteDirectory
-                    if record.disposition == OperationDispositionV2::Applied =>
+                OperationAction::DeleteFile | OperationAction::DeleteDirectory
+                    if record.disposition == OperationDisposition::Succeeded =>
                 {
                     summary.deletions += 1;
                 }
-                OperationActionV2::ObserveFileHash
-                    if record.disposition == OperationDispositionV2::Observed =>
+                OperationAction::ObserveFileHash
+                    if record.disposition == OperationDisposition::Observed =>
                 {
                     summary.observed_hashes += 1;
                 }
                 _ => {}
             }
         }
-        RecordV2::Refusal(_) => summary.refusals += 1,
-        RecordV2::FinalState(record) => {
+        ReceiptRecord::Refusal(_) => summary.refusals += 1,
+        ReceiptRecord::FinalState(record) => {
             summary.final_states += 1;
             if matches!(
                 record.object,
-                FinalObjectV2::ObservationFailed { .. }
-                    | FinalObjectV2::Present {
+                FinalObject::ObservationFailed { .. }
+                    | FinalObject::Present {
                         observation_error: Some(_),
                         ..
                     }
@@ -520,26 +518,26 @@ fn summarize(record: &RecordV2, summary: &mut ReceiptSummaryV2) {
     }
 }
 
-pub(crate) struct IssuedReceiptV2 {
+pub(crate) struct IssuedReceipt {
     stream: File,
     stream_len: u64,
     signed_terminal: Vec<u8>,
     enrollment_id: EnrollmentId,
     request_id: RequestId,
     grant_digest: [u8; 32],
-    delivery: ReceiptDeliveryV2,
+    delivery: ReceiptDelivery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TransportModeV2 {
+pub(crate) enum ReceiptDeliveryKind {
     AttachedEncrypted,
     DetachedSignedPlaintext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TransportFrameV2 {
+pub(crate) enum ReceiptFrame {
     Start {
-        mode: TransportModeV2,
+        mode: ReceiptDeliveryKind,
         encapsulated_key: Vec<u8>,
     },
     Chunk {
@@ -553,9 +551,9 @@ pub(crate) enum TransportFrameV2 {
 }
 
 #[derive(Serialize)]
-enum BorrowedTransportFrameV2<'a> {
+enum BorrowedReceiptFrame<'a> {
     Start {
-        mode: TransportModeV2,
+        mode: ReceiptDeliveryKind,
         encapsulated_key: &'a [u8],
     },
     Chunk {
@@ -569,21 +567,21 @@ enum BorrowedTransportFrameV2<'a> {
 }
 
 #[cfg(test)]
-impl TransportFrameV2 {
-    fn as_borrowed(&self) -> BorrowedTransportFrameV2<'_> {
+impl ReceiptFrame {
+    fn as_borrowed(&self) -> BorrowedReceiptFrame<'_> {
         match self {
             Self::Start {
                 mode,
                 encapsulated_key,
-            } => BorrowedTransportFrameV2::Start {
+            } => BorrowedReceiptFrame::Start {
                 mode: *mode,
                 encapsulated_key,
             },
-            Self::Chunk { sequence, payload } => BorrowedTransportFrameV2::Chunk {
+            Self::Chunk { sequence, payload } => BorrowedReceiptFrame::Chunk {
                 sequence: *sequence,
                 payload,
             },
-            Self::End { sequence, payload } => BorrowedTransportFrameV2::End {
+            Self::End { sequence, payload } => BorrowedReceiptFrame::End {
                 sequence: *sequence,
                 payload,
             },
@@ -591,14 +589,14 @@ impl TransportFrameV2 {
     }
 }
 
-pub(crate) fn emit_transport_frames(
-    mut issued: IssuedReceiptV2,
+pub(crate) fn emit_receipt_frames(
+    mut issued: IssuedReceipt,
     mut emit: impl FnMut(Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     let info = hpke_info(issued.enrollment_id, issued.request_id, issued.grant_digest)?;
     match issued.delivery {
-        ReceiptDeliveryV2::AttachedEncrypted {
-            suite: HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+        ReceiptDelivery::AttachedEncrypted {
+            suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
             recipient_public_key,
         } => {
             let public = <Kem as hpke::Kem>::PublicKey::from_bytes(&recipient_public_key)
@@ -607,9 +605,9 @@ pub(crate) fn emit_transport_frames(
                 setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &public, &info)
                     .map_err(|_| anyhow!("set up HPKE receipt sender"))?;
             let encapsulated = encapsulated.to_bytes();
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::Start {
-                    mode: TransportModeV2::AttachedEncrypted,
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrame::Start {
+                    mode: ReceiptDeliveryKind::AttachedEncrypted,
                     encapsulated_key: encapsulated.as_slice(),
                 },
             )?)?;
@@ -626,8 +624,8 @@ pub(crate) fn emit_transport_frames(
                 let payload = sender
                     .seal(&buffer[..wanted], &frame_aad(sequence, false))
                     .map_err(|_| anyhow!("encrypt receipt stream frame"))?;
-                emit(encode_borrowed_transport_frame(
-                    &BorrowedTransportFrameV2::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrame::Chunk {
                         sequence,
                         payload: &payload,
                     },
@@ -638,17 +636,15 @@ pub(crate) fn emit_transport_frames(
             let payload = sender
                 .seal(&issued.signed_terminal, &frame_aad(sequence, true))
                 .map_err(|_| anyhow!("encrypt receipt terminal frame"))?;
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::End {
-                    sequence,
-                    payload: &payload,
-                },
-            )?)?;
+            emit(encode_borrowed_receipt_frame(&BorrowedReceiptFrame::End {
+                sequence,
+                payload: &payload,
+            })?)?;
         }
-        ReceiptDeliveryV2::DetachedSignedPlaintext => {
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::Start {
-                    mode: TransportModeV2::DetachedSignedPlaintext,
+        ReceiptDelivery::DetachedSignedPlaintext => {
+            emit(encode_borrowed_receipt_frame(
+                &BorrowedReceiptFrame::Start {
+                    mode: ReceiptDeliveryKind::DetachedSignedPlaintext,
                     encapsulated_key: &[],
                 },
             )?)?;
@@ -662,8 +658,8 @@ pub(crate) fn emit_transport_frames(
                     .stream
                     .read_exact(&mut buffer[..wanted])
                     .context("read receiver receipt spool")?;
-                emit(encode_borrowed_transport_frame(
-                    &BorrowedTransportFrameV2::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrame::Chunk {
                         sequence,
                         payload: &buffer[..wanted],
                     },
@@ -671,29 +667,28 @@ pub(crate) fn emit_transport_frames(
                 sequence += 1;
                 remaining -= wanted as u64;
             }
-            emit(encode_borrowed_transport_frame(
-                &BorrowedTransportFrameV2::End {
-                    sequence,
-                    payload: &issued.signed_terminal,
-                },
-            )?)?;
+            emit(encode_borrowed_receipt_frame(&BorrowedReceiptFrame::End {
+                sequence,
+                payload: &issued.signed_terminal,
+            })?)?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) fn encode_transport_frame(frame: &TransportFrameV2) -> Result<Vec<u8>> {
-    encode_borrowed_transport_frame(&frame.as_borrowed())
+pub(crate) fn encode_receipt_frame(frame: &ReceiptFrame) -> Result<Vec<u8>> {
+    encode_borrowed_receipt_frame(&frame.as_borrowed())
 }
 
-fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Result<Vec<u8>> {
+fn encode_borrowed_receipt_frame(frame: &BorrowedReceiptFrame<'_>) -> Result<Vec<u8>> {
     let payload_len = match frame {
-        BorrowedTransportFrameV2::Start {
+        BorrowedReceiptFrame::Start {
             encapsulated_key, ..
         } => encapsulated_key.len(),
-        BorrowedTransportFrameV2::Chunk { payload, .. }
-        | BorrowedTransportFrameV2::End { payload, .. } => payload.len(),
+        BorrowedReceiptFrame::Chunk { payload, .. } | BorrowedReceiptFrame::End { payload, .. } => {
+            payload.len()
+        }
     };
     // Postcard adds only enum tags and variable-length integer fields around
     // the byte payload. Leave modest headroom so normal frames need one
@@ -701,55 +696,49 @@ fn encode_borrowed_transport_frame(frame: &BorrowedTransportFrameV2<'_>) -> Resu
     let capacity = HEADER_LEN
         .checked_add(payload_len)
         .and_then(|length| length.checked_add(32))
-        .context("receipt transport frame length overflow")?;
+        .context("receipt frame length overflow")?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.resize(HEADER_LEN, 0);
-    encoded = postcard::to_extend(frame, encoded).context("encode receipt transport frame")?;
+    encoded = postcard::to_extend(frame, encoded).context("encode receipt frame")?;
     let body_len = encoded.len() - HEADER_LEN;
     if body_len == 0 || body_len > MAX_FRAME_BODY_BYTES {
-        bail!("receipt transport frame exceeds size limit");
+        bail!("receipt frame exceeds size limit");
     }
     encoded[..8].copy_from_slice(FRAME_MAGIC);
-    encoded[8..10].copy_from_slice(&FRAME_VERSION.to_be_bytes());
-    encoded[10..HEADER_LEN].copy_from_slice(&(body_len as u32).to_be_bytes());
+    encoded[8..HEADER_LEN].copy_from_slice(&(body_len as u32).to_be_bytes());
     Ok(encoded)
 }
 
-pub(crate) fn decode_transport_frame(encoded: &[u8]) -> Result<TransportFrameV2> {
+pub(crate) fn decode_receipt_frame(encoded: &[u8]) -> Result<ReceiptFrame> {
     if encoded.len() < HEADER_LEN || &encoded[..8] != FRAME_MAGIC {
-        bail!("not a receipt v2 transport frame");
+        bail!("not a receipt frame");
     }
-    let version = u16::from_be_bytes(encoded[8..10].try_into().expect("fixed header"));
-    if version != FRAME_VERSION {
-        bail!("unsupported receipt transport version {version}");
-    }
-    let body_len = u32::from_be_bytes(encoded[10..14].try_into().expect("fixed header")) as usize;
+    let body_len = u32::from_be_bytes(encoded[8..12].try_into().expect("fixed header")) as usize;
     if body_len == 0 || body_len > MAX_FRAME_BODY_BYTES || encoded.len() != HEADER_LEN + body_len {
-        bail!("receipt transport frame length is noncanonical");
+        bail!("receipt frame length is noncanonical");
     }
     let body = &encoded[HEADER_LEN..];
-    let frame: TransportFrameV2 =
-        postcard::from_bytes(body).context("decode receipt transport frame")?;
+    let frame: ReceiptFrame = postcard::from_bytes(body).context("decode receipt frame")?;
     if postcard::to_stdvec(&frame)? != body {
-        bail!("receipt transport frame uses a noncanonical encoding");
+        bail!("receipt frame uses a noncanonical encoding");
     }
     match &frame {
-        TransportFrameV2::Start {
-            mode: TransportModeV2::AttachedEncrypted,
+        ReceiptFrame::Start {
+            mode: ReceiptDeliveryKind::AttachedEncrypted,
             encapsulated_key,
         } if encapsulated_key.len() != 32 => bail!("invalid HPKE encapsulated-key length"),
-        TransportFrameV2::Start {
-            mode: TransportModeV2::DetachedSignedPlaintext,
+        ReceiptFrame::Start {
+            mode: ReceiptDeliveryKind::DetachedSignedPlaintext,
             encapsulated_key,
         } if !encapsulated_key.is_empty() => {
             bail!("plaintext receipt start frame carries an encapsulated key")
         }
-        TransportFrameV2::Chunk { payload, .. }
+        ReceiptFrame::Chunk { payload, .. }
             if payload.len() > PLAINTEXT_CHUNK_BYTES + HPKE_TAG_BYTES =>
         {
             bail!("receipt chunk payload exceeds size limit")
         }
-        TransportFrameV2::End { payload, .. }
+        ReceiptFrame::End { payload, .. }
             if payload.len()
                 > MAX_TERMINAL_BYTES
                     + MAX_SIGNATURE_BYTES
@@ -763,22 +752,22 @@ pub(crate) fn decode_transport_frame(encoded: &[u8]) -> Result<TransportFrameV2>
     Ok(frame)
 }
 
-pub(crate) fn transport_frame_is_end(encoded: &[u8]) -> Result<bool> {
+pub(crate) fn receipt_frame_is_end(encoded: &[u8]) -> Result<bool> {
     Ok(matches!(
-        decode_transport_frame(encoded)?,
-        TransportFrameV2::End { .. }
+        decode_receipt_frame(encoded)?,
+        ReceiptFrame::End { .. }
     ))
 }
 
-pub(crate) struct VerifiedReceiptV2 {
-    pub terminal: TerminalReceiptV2,
+pub(crate) struct VerifiedReceipt {
+    pub terminal: TerminalReceipt,
     stream: File,
 }
 
-impl VerifiedReceiptV2 {
+impl VerifiedReceipt {
     pub(crate) fn for_each_record(
         &mut self,
-        mut visit: impl FnMut(RecordV2) -> Result<()>,
+        mut visit: impl FnMut(ReceiptRecord) -> Result<()>,
     ) -> Result<()> {
         self.stream.seek(SeekFrom::Start(0))?;
         for _ in 0..self.terminal.record_count {
@@ -789,23 +778,22 @@ impl VerifiedReceiptV2 {
     }
 }
 
-/// Publish the already-verified receiver account as the version-0 automation
-/// stream. These records deliberately identify their provenance: unlike the
-/// coordinator's ordinary `--results`, every fact here came from the signed
-/// receipt. Scope-relative paths are not expanded into ambient hostB paths.
-/// Emit the receiver-attested automation records into the run's results
-/// stream: one v1-vocabulary `operation_result` per receipt operation, an
-/// `error` record per refusal, a `final_state` record per closure-time
-/// observation, and the sealed terminal `result`. Every attested record
-/// carries `provenance: "receiver_attested"`.
 /// What the emission produced, for the human summary that renders from the
 /// same data.
 pub(crate) struct EmittedAutomationRecords {
     pub errors: u64,
 }
 
+/// Publish the already-verified receiver account as automation records in the
+/// run's results stream: one `operation_result` per receipt operation, an
+/// `error` record per refusal, a `final_state` record per closure-time
+/// observation, and the sealed terminal `result`. These records identify their
+/// provenance: unlike the coordinator's ordinary `--results`, every fact here
+/// came from the signed receipt, and every attested record carries
+/// `provenance: "receiver_attested"`. Scope-relative paths are not expanded
+/// into ambient hostB paths.
 pub(crate) fn emit_automation_records(
-    receipt: &mut VerifiedReceiptV2,
+    receipt: &mut VerifiedReceipt,
     writer: &crate::results::ResultsWriter,
     results_status: &'static str,
     exit_code: i32,
@@ -817,33 +805,33 @@ pub(crate) fn emit_automation_records(
     let mut errors_emitted = 0u64;
     receipt.for_each_record(|record| {
         let value = match record {
-            RecordV2::Operation(record) => {
+            ReceiptRecord::Operation(record) => {
                 let (action, kind, bytes) = match record.action {
-                    OperationActionV2::PublishFile { size, .. } => {
+                    OperationAction::PublishFile { size, .. } => {
                         ("transfer_file", Some("file"), Some(size))
                     }
-                    OperationActionV2::EnsureDirectory => {
-                        if record.disposition == OperationDispositionV2::Applied {
+                    OperationAction::EnsureDirectory => {
+                        if record.disposition == OperationDisposition::Succeeded {
                             directories_created += 1;
                         }
                         ("create_directory", Some("dir"), None)
                     }
-                    OperationActionV2::CreateSymlink => {
-                        if record.disposition == OperationDispositionV2::Applied {
+                    OperationAction::CreateSymlink => {
+                        if record.disposition == OperationDisposition::Succeeded {
                             symlinks_created += 1;
                         }
                         ("create_symlink", Some("symlink"), None)
                     }
-                    OperationActionV2::CreateSpecial { .. } => {
-                        if record.disposition == OperationDispositionV2::Applied {
+                    OperationAction::CreateSpecial { .. } => {
+                        if record.disposition == OperationDisposition::Succeeded {
                             specials_created += 1;
                         }
                         ("create_special", Some("special"), None)
                     }
-                    OperationActionV2::SetMetadata { .. } => ("set_metadata", None, None),
-                    OperationActionV2::DeleteFile => ("delete", Some("file"), None),
-                    OperationActionV2::DeleteDirectory => ("delete", Some("dir"), None),
-                    OperationActionV2::ObserveFileHash => ("observe_hash", Some("file"), None),
+                    OperationAction::SetMetadata { .. } => ("set_metadata", None, None),
+                    OperationAction::DeleteFile => ("delete", Some("file"), None),
+                    OperationAction::DeleteDirectory => ("delete", Some("dir"), None),
+                    OperationAction::ObserveFileHash => ("observe_hash", Some("file"), None),
                 };
                 let mut value = serde_json::json!({
                     "type": "operation_result",
@@ -859,7 +847,7 @@ pub(crate) fn emit_automation_records(
                 if let Some(kind) = kind {
                     object.insert("kind".into(), kind.into());
                 }
-                if record.code != OutcomeCodeV2::None {
+                if record.code != OutcomeCode::None {
                     object.insert("code".into(), outcome_name(record.code).into());
                 }
                 if let Some(bytes) = bytes {
@@ -870,7 +858,7 @@ pub(crate) fn emit_automation_records(
                 }
                 if matches!(
                     record.disposition,
-                    OperationDispositionV2::Failed | OperationDispositionV2::Incomplete
+                    OperationDisposition::Failed | OperationDisposition::Incomplete
                 ) {
                     writer.emit_value(value);
                     errors_emitted += 1;
@@ -890,7 +878,7 @@ pub(crate) fn emit_automation_records(
                     value
                 }
             }
-            RecordV2::Refusal(record) => {
+            ReceiptRecord::Refusal(record) => {
                 errors_emitted += 1;
                 serde_json::json!({
                     "type": "error",
@@ -903,10 +891,10 @@ pub(crate) fn emit_automation_records(
                         .unwrap_or_else(|| "receiver refused the request".to_string()),
                 })
             }
-            RecordV2::FinalState(record) => {
+            ReceiptRecord::FinalState(record) => {
                 let object = match record.object {
-                    FinalObjectV2::Absent => serde_json::json!({"state": "absent"}),
-                    FinalObjectV2::ObservationFailed { code, diagnostic } => {
+                    FinalObject::Absent => serde_json::json!({"state": "absent"}),
+                    FinalObject::ObservationFailed { code, diagnostic } => {
                         writer.emit_value(serde_json::json!({
                             "type": "error",
                             "provenance": "receiver_attested",
@@ -932,7 +920,7 @@ pub(crate) fn emit_automation_records(
                         }
                         object
                     }
-                    FinalObjectV2::Present {
+                    FinalObject::Present {
                         kind,
                         size,
                         digest,
@@ -1005,7 +993,7 @@ pub(crate) fn emit_automation_records(
     // counted error, by construction.
     let errors = errors_emitted;
     // Aggregates describe receiver-visible work only: unchanged and
-    // excluded entries are orchestrator concepts a receipt cannot attest.
+    // excluded entries are coordinator concepts a receipt cannot attest.
     writer.emit_terminal_value(serde_json::json!({
         "type": "result",
         "provenance": "receiver_attested",
@@ -1056,44 +1044,42 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn disposition_name(disposition: OperationDispositionV2) -> &'static str {
+fn disposition_name(disposition: OperationDisposition) -> &'static str {
     match disposition {
-        OperationDispositionV2::Applied => "succeeded",
-        OperationDispositionV2::Failed => "failed",
-        OperationDispositionV2::Incomplete => "incomplete",
-        OperationDispositionV2::Observed => "observed",
+        OperationDisposition::Succeeded => "succeeded",
+        OperationDisposition::Failed => "failed",
+        OperationDisposition::Incomplete => "incomplete",
+        OperationDisposition::Observed => "observed",
     }
 }
 
-fn outcome_name(code: OutcomeCodeV2) -> &'static str {
+fn outcome_name(code: OutcomeCode) -> &'static str {
     match code {
-        OutcomeCodeV2::None => "none",
-        OutcomeCodeV2::ExecutionFailed => "execution_failed",
-        OutcomeCodeV2::AuthorizationRefused => "authorization_refused",
-        OutcomeCodeV2::FileLifecycleIncomplete => "file_lifecycle_incomplete",
-        OutcomeCodeV2::ObservationFailed => "observation_failed",
+        OutcomeCode::None => "none",
+        OutcomeCode::ExecutionFailed => "execution_failed",
+        OutcomeCode::AuthorizationRefused => "authorization_refused",
+        OutcomeCode::FileLifecycleIncomplete => "file_lifecycle_incomplete",
+        OutcomeCode::ObservationFailed => "observation_failed",
     }
 }
 
-pub(crate) fn receipt_status_label(status: ReceiptStatusV2) -> &'static str {
+pub(crate) fn receipt_status_label(status: ReceiptStatus) -> &'static str {
     receipt_status_name(status)
 }
 
-fn error_class_for(code: OutcomeCodeV2) -> &'static str {
+fn error_class_for(code: OutcomeCode) -> &'static str {
     match code {
-        OutcomeCodeV2::AuthorizationRefused => "safety_limit",
-        OutcomeCodeV2::FileLifecycleIncomplete => "integrity",
-        OutcomeCodeV2::ExecutionFailed | OutcomeCodeV2::ObservationFailed | OutcomeCodeV2::None => {
-            "io"
-        }
+        OutcomeCode::AuthorizationRefused => "safety_limit",
+        OutcomeCode::FileLifecycleIncomplete => "integrity",
+        OutcomeCode::ExecutionFailed | OutcomeCode::ObservationFailed | OutcomeCode::None => "io",
     }
 }
 
-fn receipt_status_name(status: ReceiptStatusV2) -> &'static str {
+fn receipt_status_name(status: ReceiptStatus) -> &'static str {
     match status {
-        ReceiptStatusV2::Clean => "clean",
-        ReceiptStatusV2::Failed => "failed",
-        ReceiptStatusV2::Incomplete => "incomplete",
+        ReceiptStatus::Clean => "clean",
+        ReceiptStatus::Failed => "failed",
+        ReceiptStatus::Incomplete => "incomplete",
     }
 }
 
@@ -1110,7 +1096,7 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-/// Decrypt and verify an attached receipt whose encoded transport frames have
+/// Decrypt and verify an attached receipt whose encoded frames have
 /// been captured in order. Decrypted bytes remain in an anonymous temporary
 /// file until the terminal signature and stream commitment have verified.
 pub(crate) fn open_attached_frames<I>(
@@ -1120,8 +1106,8 @@ pub(crate) fn open_attached_frames<I>(
     expected_enrollment_id: EnrollmentId,
     expected_request_id: RequestId,
     expected_grant_digest: [u8; 32],
-    expected_policy: &ReceiptPolicyV2,
-) -> Result<VerifiedReceiptV2>
+    expected_policy: &ReceiptPolicy,
+) -> Result<VerifiedReceipt>
 where
     I: IntoIterator<Item = Result<Vec<u8>>>,
 {
@@ -1129,13 +1115,13 @@ where
     let first = frames
         .next()
         .context("receipt stream has no start frame")??;
-    let encapsulated_key = match decode_transport_frame(&first)? {
-        TransportFrameV2::Start {
-            mode: TransportModeV2::AttachedEncrypted,
+    let encapsulated_key = match decode_receipt_frame(&first)? {
+        ReceiptFrame::Start {
+            mode: ReceiptDeliveryKind::AttachedEncrypted,
             encapsulated_key,
         } => encapsulated_key,
-        TransportFrameV2::Start {
-            mode: TransportModeV2::DetachedSignedPlaintext,
+        ReceiptFrame::Start {
+            mode: ReceiptDeliveryKind::DetachedSignedPlaintext,
             ..
         } => bail!("attached transfer received a detached plaintext receipt"),
         _ => bail!("receipt stream does not begin with a start frame"),
@@ -1158,8 +1144,8 @@ where
         let encoded = frames
             .next()
             .context("receipt stream has no terminal frame")??;
-        match decode_transport_frame(&encoded)? {
-            TransportFrameV2::Chunk {
+        match decode_receipt_frame(&encoded)? {
+            ReceiptFrame::Chunk {
                 sequence: observed,
                 payload,
             } => {
@@ -1174,7 +1160,7 @@ where
                     .context("write local decrypted receipt spool")?;
                 sequence += 1;
             }
-            TransportFrameV2::End {
+            ReceiptFrame::End {
                 sequence: observed,
                 payload,
             } => {
@@ -1186,7 +1172,7 @@ where
                     .map_err(|_| anyhow!("receipt terminal frame failed authentication"))?;
                 break terminal;
             }
-            TransportFrameV2::Start { .. } => bail!("receipt stream contains a second start frame"),
+            ReceiptFrame::Start { .. } => bail!("receipt stream contains a second start frame"),
         }
     };
     if frames.next().is_some() {
@@ -1206,14 +1192,14 @@ where
         bail!("receipt policy does not match the signed grant");
     }
     verify_stream(&mut stream, &terminal)?;
-    Ok(VerifiedReceiptV2 { terminal, stream })
+    Ok(VerifiedReceipt { terminal, stream })
 }
 
-fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> {
-    if terminal.schema != ReceiptSchemaV2::LogicalMutationsAndFinalStateV2
-        || terminal.stream_digest_algorithm != DigestAlgorithmV2::Blake3
+fn verify_stream(stream: &mut File, terminal: &TerminalReceipt) -> Result<()> {
+    if terminal.schema != ReceiptSchema::LogicalMutationsAndFinalState
+        || terminal.stream_digest_algorithm != DigestAlgorithm::Blake3
         || terminal.content_digest_algorithm
-            != terminal.policy.hashed.then_some(DigestAlgorithmV2::Blake3)
+            != terminal.policy.hashed.then_some(DigestAlgorithm::Blake3)
     {
         bail!("receipt schema or digest algorithms are inconsistent with its policy");
     }
@@ -1223,7 +1209,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
         bail!("receipt stream exceeds its signed policy limit");
     }
     if terminal.expected_manifest_digest.is_some()
-        || terminal.manifest_status != ManifestStatusV2::NotProvided
+        || terminal.manifest_status != ManifestStatus::NotProvided
     {
         bail!("receipt uses an expected-manifest result not supported by this version");
     }
@@ -1236,7 +1222,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
     }
     stream.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
-    let mut summary = ReceiptSummaryV2::default();
+    let mut summary = ReceiptSummary::default();
     let mut final_locations = BTreeSet::new();
     for expected_sequence in 0..terminal.record_count {
         let mut length = [0u8; STREAM_RECORD_HEADER_BYTES];
@@ -1251,7 +1237,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
         stream
             .read_exact(&mut body)
             .context("receipt record is truncated")?;
-        let record: RecordV2 = postcard::from_bytes(&body).context("decode receipt record")?;
+        let record: ReceiptRecord = postcard::from_bytes(&body).context("decode receipt record")?;
         if postcard::to_stdvec(&record)? != body {
             bail!("receipt record uses a noncanonical encoding");
         }
@@ -1259,7 +1245,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
             bail!("receipt record sequence is not contiguous");
         }
         validate_record(&record, &terminal.policy)?;
-        if let RecordV2::FinalState(record) = &record {
+        if let ReceiptRecord::FinalState(record) = &record {
             if !final_locations.insert((record.scope, record.path.clone())) {
                 bail!("receipt repeats a final-state location");
             }
@@ -1290,11 +1276,11 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
     }
     let expected_status =
         if terminal.recording_failure.is_some() || summary.observation_failures > 0 {
-            ReceiptStatusV2::Incomplete
+            ReceiptStatus::Incomplete
         } else if summary.failed > 0 || summary.incomplete > 0 || summary.refusals > 0 {
-            ReceiptStatusV2::Failed
+            ReceiptStatus::Failed
         } else {
-            ReceiptStatusV2::Clean
+            ReceiptStatus::Clean
         };
     if terminal.status != expected_status {
         bail!("receipt status is inconsistent with its records");
@@ -1303,7 +1289,7 @@ fn verify_stream(stream: &mut File, terminal: &TerminalReceiptV2) -> Result<()> 
     Ok(())
 }
 
-fn validate_record(record: &RecordV2, policy: &ReceiptPolicyV2) -> Result<()> {
+fn validate_record(record: &ReceiptRecord, policy: &ReceiptPolicy) -> Result<()> {
     let valid_relative_path = |path: &[u8]| {
         !path.starts_with(b"/")
             && !path.contains(&0)
@@ -1318,49 +1304,49 @@ fn validate_record(record: &RecordV2, policy: &ReceiptPolicyV2) -> Result<()> {
             .is_none_or(|message| message.len() <= MAX_DIAGNOSTIC_BYTES + '…'.len_utf8())
     };
     match record {
-        RecordV2::Operation(record) => {
+        ReceiptRecord::Operation(record) => {
             if !valid_relative_path(&record.path) || !valid_diagnostic(&record.diagnostic) {
                 bail!("receipt operation has an invalid path or diagnostic");
             }
             let expected_code = match record.disposition {
-                OperationDispositionV2::Applied | OperationDispositionV2::Observed => {
-                    OutcomeCodeV2::None
+                OperationDisposition::Succeeded | OperationDisposition::Observed => {
+                    OutcomeCode::None
                 }
-                OperationDispositionV2::Failed => OutcomeCodeV2::ExecutionFailed,
-                OperationDispositionV2::Incomplete => OutcomeCodeV2::FileLifecycleIncomplete,
+                OperationDisposition::Failed => OutcomeCode::ExecutionFailed,
+                OperationDisposition::Incomplete => OutcomeCode::FileLifecycleIncomplete,
             };
             if record.code != expected_code
-                || (record.disposition == OperationDispositionV2::Observed
-                    && record.action != OperationActionV2::ObserveFileHash)
-                || (record.action == OperationActionV2::ObserveFileHash
-                    && matches!(record.disposition, OperationDispositionV2::Applied))
+                || (record.disposition == OperationDisposition::Observed
+                    && record.action != OperationAction::ObserveFileHash)
+                || (record.action == OperationAction::ObserveFileHash
+                    && matches!(record.disposition, OperationDisposition::Succeeded))
                 || (matches!(
                     record.disposition,
-                    OperationDispositionV2::Applied | OperationDispositionV2::Observed
+                    OperationDisposition::Succeeded | OperationDisposition::Observed
                 ) && record.diagnostic.is_some())
             {
                 bail!("receipt operation code, disposition, and diagnostic are inconsistent");
             }
         }
-        RecordV2::Refusal(record) => {
-            if record.code != OutcomeCodeV2::AuthorizationRefused
+        ReceiptRecord::Refusal(record) => {
+            if record.code != OutcomeCode::AuthorizationRefused
                 || !valid_diagnostic(&record.diagnostic)
             {
                 bail!("receipt refusal is inconsistent");
             }
         }
-        RecordV2::FinalState(record) => {
+        ReceiptRecord::FinalState(record) => {
             if !valid_relative_path(&record.path) {
                 bail!("receipt final state has an invalid relative path");
             }
             match &record.object {
-                FinalObjectV2::Absent => {}
-                FinalObjectV2::ObservationFailed { code, diagnostic } => {
-                    if *code != OutcomeCodeV2::ObservationFailed || !valid_diagnostic(diagnostic) {
+                FinalObject::Absent => {}
+                FinalObject::ObservationFailed { code, diagnostic } => {
+                    if *code != OutcomeCode::ObservationFailed || !valid_diagnostic(diagnostic) {
                         bail!("receipt final-state failure is inconsistent");
                     }
                 }
-                FinalObjectV2::Present {
+                FinalObject::Present {
                     kind,
                     digest,
                     symlink_target,
@@ -1388,7 +1374,7 @@ fn validate_record(record: &RecordV2, policy: &ReceiptPolicyV2) -> Result<()> {
     Ok(())
 }
 
-fn read_record(stream: &mut File) -> Result<RecordV2> {
+fn read_record(stream: &mut File) -> Result<ReceiptRecord> {
     let mut length = [0u8; STREAM_RECORD_HEADER_BYTES];
     stream.read_exact(&mut length)?;
     let body_len = u32::from_be_bytes(length) as usize;
@@ -1397,14 +1383,14 @@ fn read_record(stream: &mut File) -> Result<RecordV2> {
     }
     let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body)?;
-    let record: RecordV2 = postcard::from_bytes(&body)?;
+    let record: ReceiptRecord = postcard::from_bytes(&body)?;
     if postcard::to_stdvec(&record)? != body {
         bail!("receipt record uses a noncanonical encoding");
     }
     Ok(record)
 }
 
-fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Result<Vec<u8>> {
+fn sign_terminal(receipt: &TerminalReceipt, private_key: &PrivateKey) -> Result<Vec<u8>> {
     if private_key.is_encrypted() {
         bail!("cannot sign a receipt with an encrypted key");
     }
@@ -1417,7 +1403,6 @@ fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Resul
     let mut encoded =
         Vec::with_capacity(TERMINAL_HEADER_LEN + measured_body_len + MAX_SIGNATURE_BYTES);
     encoded.extend_from_slice(TERMINAL_MAGIC);
-    encoded.extend_from_slice(&TERMINAL_VERSION.to_be_bytes());
     encoded.extend_from_slice(&[0; std::mem::size_of::<u32>()]);
     encoded = postcard::to_extend(receipt, encoded).context("encode receipt terminal")?;
     let body_len = encoded.len() - signed_header_len;
@@ -1425,7 +1410,7 @@ fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Resul
     if body_len > MAX_TERMINAL_BYTES {
         bail!("receipt terminal exceeds size limit");
     }
-    encoded[10..signed_header_len].copy_from_slice(&(body_len as u32).to_be_bytes());
+    encoded[8..signed_header_len].copy_from_slice(&(body_len as u32).to_be_bytes());
     let payload_len = encoded.len();
     let signature = private_key
         .sign(RECEIPT_NAMESPACE, HashAlg::Sha256, &encoded)
@@ -1444,17 +1429,13 @@ fn sign_terminal(receipt: &TerminalReceiptV2, private_key: &PrivateKey) -> Resul
     Ok(encoded)
 }
 
-fn verify_terminal(encoded: &[u8], public_key: &str) -> Result<TerminalReceiptV2> {
+fn verify_terminal(encoded: &[u8], public_key: &str) -> Result<TerminalReceipt> {
     if encoded.len() < TERMINAL_HEADER_LEN || &encoded[..8] != TERMINAL_MAGIC {
-        bail!("not a receipt v2 terminal envelope");
+        bail!("not a receipt terminal envelope");
     }
-    let version = u16::from_be_bytes(encoded[8..10].try_into().expect("fixed header"));
-    if version != TERMINAL_VERSION {
-        bail!("unsupported receipt terminal version {version}");
-    }
-    let body_len = u32::from_be_bytes(encoded[10..14].try_into().expect("fixed header")) as usize;
+    let body_len = u32::from_be_bytes(encoded[8..12].try_into().expect("fixed header")) as usize;
     let signature_len =
-        u32::from_be_bytes(encoded[14..18].try_into().expect("fixed header")) as usize;
+        u32::from_be_bytes(encoded[12..16].try_into().expect("fixed header")) as usize;
     if body_len == 0 || body_len > MAX_TERMINAL_BYTES {
         bail!("receipt terminal length is outside the supported range");
     }
@@ -1481,8 +1462,7 @@ fn verify_terminal(encoded: &[u8], public_key: &str) -> Result<TerminalReceiptV2
             &signature,
         )
         .context("receipt terminal signature does not verify")?;
-    let receipt: TerminalReceiptV2 =
-        postcard::from_bytes(body).context("decode receipt terminal")?;
+    let receipt: TerminalReceipt = postcard::from_bytes(body).context("decode receipt terminal")?;
     if postcard::to_stdvec(&receipt)? != body {
         bail!("receipt terminal uses a noncanonical encoding");
     }
@@ -1493,7 +1473,6 @@ fn verify_terminal(encoded: &[u8], public_key: &str) -> Result<TerminalReceiptV2
 fn terminal_signing_payload(body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + 2 + 4 + body.len());
     payload.extend_from_slice(TERMINAL_MAGIC);
-    payload.extend_from_slice(&TERMINAL_VERSION.to_be_bytes());
     payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
     payload.extend_from_slice(body);
     payload
@@ -1505,7 +1484,7 @@ fn hpke_info(
     grant_digest: [u8; 32],
 ) -> Result<Vec<u8>> {
     postcard::to_stdvec(&(
-        "syq-receipt-v2-hpke@greaber.github",
+        "syq-receipt-hpke@greaber.github",
         enrollment_id,
         request_id,
         grant_digest,
@@ -1515,7 +1494,7 @@ fn hpke_info(
 
 fn frame_aad(sequence: u64, terminal: bool) -> Vec<u8> {
     let mut aad = Vec::with_capacity(32);
-    aad.extend_from_slice(b"syq-receipt-v2-frame\0");
+    aad.extend_from_slice(b"syq-receipt-frame\0");
     aad.extend_from_slice(&sequence.to_be_bytes());
     aad.push(u8::from(terminal));
     aad
@@ -1568,17 +1547,17 @@ mod tests {
 
     fn key(seed: u8) -> PrivateKey {
         let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
-        PrivateKey::new(keypair.into(), "syq-receipt-v2-test").unwrap()
+        PrivateKey::new(keypair.into(), "syq-receipt-test").unwrap()
     }
 
-    fn policy(public: [u8; 32]) -> ReceiptPolicyV2 {
-        ReceiptPolicyV2 {
+    fn policy(public: [u8; 32]) -> ReceiptPolicy {
+        ReceiptPolicy {
             required: true,
             hashed: true,
             max_records: 32,
             max_plaintext_bytes: 64 * 1024,
-            delivery: ReceiptDeliveryV2::AttachedEncrypted {
-                suite: HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+            delivery: ReceiptDelivery::AttachedEncrypted {
+                suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
                 recipient_public_key: public,
             },
         }
@@ -1592,45 +1571,45 @@ mod tests {
         let request_id = RequestId::fresh(1_900_000_000).unwrap();
         let grant_digest = [7; 32];
         let signing_key = key(3);
-        let mut stream = StreamWriterV2::new(&policy).unwrap();
-        stream.append(&RecordV2::Operation(OperationRecordV2 {
+        let mut stream = ReceiptStreamWriter::new(&policy).unwrap();
+        stream.append(&ReceiptRecord::Operation(ReceiptOperationRecord {
             sequence: stream.next_sequence(),
             scope: 0,
             path: b"artifact".to_vec(),
-            action: OperationActionV2::PublishFile {
+            action: OperationAction::PublishFile {
                 size: 3,
                 inplace: false,
             },
-            disposition: OperationDispositionV2::Failed,
-            code: OutcomeCodeV2::ExecutionFailed,
+            disposition: OperationDisposition::Failed,
+            code: OutcomeCode::ExecutionFailed,
             diagnostic: Some("short write".to_string()),
         }));
-        stream.append(&RecordV2::Refusal(RefusalRecordV2 {
+        stream.append(&ReceiptRecord::Refusal(RefusalReceiptRecord {
             sequence: stream.next_sequence(),
-            code: OutcomeCodeV2::AuthorizationRefused,
+            code: OutcomeCode::AuthorizationRefused,
             diagnostic: None,
         }));
-        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+        stream.append(&ReceiptRecord::FinalState(FinalStateReceiptRecord {
             sequence: stream.next_sequence(),
             scope: 0,
             path: b"artifact".to_vec(),
-            object: FinalObjectV2::ObservationFailed {
-                code: OutcomeCodeV2::ObservationFailed,
+            object: FinalObject::ObservationFailed {
+                code: OutcomeCode::ObservationFailed,
                 diagnostic: None,
             },
         }));
         // A present object whose closure hash could not be taken: the object
         // is attested, but the partial observation still counts as an error.
-        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+        stream.append(&ReceiptRecord::FinalState(FinalStateReceiptRecord {
             sequence: stream.next_sequence(),
             scope: 0,
             path: b"partial".to_vec(),
-            object: FinalObjectV2::Present {
+            object: FinalObject::Present {
                 kind: Kind::File,
                 size: 4,
                 digest: None,
                 symlink_target: None,
-                metadata: ObjectMetadataV2 {
+                metadata: ObjectMetadata {
                     mode: 0o100644,
                     uid: 1000,
                     gid: 1000,
@@ -1642,7 +1621,7 @@ mod tests {
             },
         }));
         let issued = stream
-            .finish(ReceiptClosureV2 {
+            .finish(ReceiptClosure {
                 enrollment_id,
                 request_id,
                 grant_digest,
@@ -1654,7 +1633,7 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             frames.push(frame);
             Ok(())
         })
@@ -1669,7 +1648,7 @@ mod tests {
             &policy,
         )
         .unwrap();
-        assert_eq!(verified.terminal.status, ReceiptStatusV2::Incomplete);
+        assert_eq!(verified.terminal.status, ReceiptStatus::Incomplete);
 
         #[derive(Clone, Default)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1693,7 +1672,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record["seq"], index as u64);
@@ -1748,17 +1727,17 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_transport_frames_preserve_wire_encoding() {
+    fn borrowed_receipt_frames_preserve_wire_encoding() {
         let frames = [
-            TransportFrameV2::Start {
-                mode: TransportModeV2::AttachedEncrypted,
+            ReceiptFrame::Start {
+                mode: ReceiptDeliveryKind::AttachedEncrypted,
                 encapsulated_key: vec![3; 32],
             },
-            TransportFrameV2::Chunk {
+            ReceiptFrame::Chunk {
                 sequence: u64::MAX,
                 payload: vec![5; PLAINTEXT_CHUNK_BYTES],
             },
-            TransportFrameV2::End {
+            ReceiptFrame::End {
                 sequence: 17,
                 payload: vec![7; 257],
             },
@@ -1768,9 +1747,9 @@ mod tests {
             let borrowed = postcard::to_stdvec(&frame.as_borrowed()).unwrap();
             assert_eq!(borrowed, owned);
 
-            let encoded = encode_transport_frame(&frame).unwrap();
+            let encoded = encode_receipt_frame(&frame).unwrap();
             assert_eq!(&encoded[HEADER_LEN..], owned);
-            assert_eq!(decode_transport_frame(&encoded).unwrap(), frame);
+            assert_eq!(decode_receipt_frame(&encoded).unwrap(), frame);
         }
     }
 
@@ -1782,29 +1761,29 @@ mod tests {
         let request_id = RequestId::fresh(1_900_000_000).unwrap();
         let grant_digest = [7; 32];
         let signing_key = key(3);
-        let mut stream = StreamWriterV2::new(&policy).unwrap();
-        stream.append(&RecordV2::Operation(OperationRecordV2 {
+        let mut stream = ReceiptStreamWriter::new(&policy).unwrap();
+        stream.append(&ReceiptRecord::Operation(ReceiptOperationRecord {
             sequence: stream.next_sequence(),
             scope: 0,
             path: b"artifact".to_vec(),
-            action: OperationActionV2::PublishFile {
+            action: OperationAction::PublishFile {
                 size: 3,
                 inplace: false,
             },
-            disposition: OperationDispositionV2::Applied,
-            code: OutcomeCodeV2::None,
+            disposition: OperationDisposition::Succeeded,
+            code: OutcomeCode::None,
             diagnostic: None,
         }));
-        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+        stream.append(&ReceiptRecord::FinalState(FinalStateReceiptRecord {
             sequence: stream.next_sequence(),
             scope: 0,
             path: b"artifact".to_vec(),
-            object: FinalObjectV2::Present {
+            object: FinalObject::Present {
                 kind: Kind::File,
                 size: 3,
                 digest: Some([9; 32]),
                 symlink_target: None,
-                metadata: ObjectMetadataV2 {
+                metadata: ObjectMetadata {
                     mode: 0o100644,
                     uid: 1000,
                     gid: 1000,
@@ -1816,7 +1795,7 @@ mod tests {
             },
         }));
         let issued = stream
-            .finish(ReceiptClosureV2 {
+            .finish(ReceiptClosure {
                 enrollment_id,
                 request_id,
                 grant_digest,
@@ -1828,7 +1807,7 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             frames.push(frame);
             Ok(())
         })
@@ -1843,7 +1822,7 @@ mod tests {
             &policy,
         )
         .unwrap();
-        assert_eq!(verified.terminal.status, ReceiptStatusV2::Clean);
+        assert_eq!(verified.terminal.status, ReceiptStatus::Clean);
         let mut records = Vec::new();
         verified
             .for_each_record(|record| {
@@ -1876,7 +1855,7 @@ mod tests {
         // The records ride the shared envelope with contiguous sequencing
         // and validate against the committed automation schema.
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schemas/automation-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record["seq"], index as u64);
@@ -1920,18 +1899,18 @@ mod tests {
         .is_err());
 
         let issued = {
-            let mut stream = StreamWriterV2::new(&policy).unwrap();
-            stream.append(&RecordV2::Operation(OperationRecordV2 {
+            let mut stream = ReceiptStreamWriter::new(&policy).unwrap();
+            stream.append(&ReceiptRecord::Operation(ReceiptOperationRecord {
                 sequence: 0,
                 scope: 0,
                 path: b"artifact".to_vec(),
-                action: OperationActionV2::EnsureDirectory,
-                disposition: OperationDispositionV2::Applied,
-                code: OutcomeCodeV2::None,
+                action: OperationAction::EnsureDirectory,
+                disposition: OperationDisposition::Succeeded,
+                code: OutcomeCode::None,
                 diagnostic: None,
             }));
             stream
-                .finish(ReceiptClosureV2 {
+                .finish(ReceiptClosure {
                     enrollment_id,
                     request_id,
                     grant_digest,
@@ -1944,17 +1923,17 @@ mod tests {
                 .unwrap()
         };
         let mut tampered = Vec::new();
-        emit_transport_frames(issued, |frame| {
+        emit_receipt_frames(issued, |frame| {
             tampered.push(frame);
             Ok(())
         })
         .unwrap();
-        let mut chunk = decode_transport_frame(&tampered[1]).unwrap();
-        let TransportFrameV2::Chunk { payload, .. } = &mut chunk else {
+        let mut chunk = decode_receipt_frame(&tampered[1]).unwrap();
+        let ReceiptFrame::Chunk { payload, .. } = &mut chunk else {
             panic!("expected encrypted stream chunk");
         };
         payload[0] ^= 1;
-        tampered[1] = encode_transport_frame(&chunk).unwrap();
+        tampered[1] = encode_receipt_frame(&chunk).unwrap();
         assert!(open_attached_frames(
             tampered.into_iter().map(Ok),
             &secret,
@@ -1969,34 +1948,34 @@ mod tests {
 
     #[test]
     fn detached_delivery_is_a_signed_plaintext_stream() {
-        let policy = ReceiptPolicyV2 {
+        let policy = ReceiptPolicy {
             required: true,
             hashed: false,
             max_records: 8,
             max_plaintext_bytes: 4096,
-            delivery: ReceiptDeliveryV2::DetachedSignedPlaintext,
+            delivery: ReceiptDelivery::DetachedSignedPlaintext,
         };
         let enrollment_id = EnrollmentId::random();
         let request_id = RequestId::fresh(1_900_000_000).unwrap();
         let signing_key = key(8);
-        let mut stream = StreamWriterV2::new(&policy).unwrap();
-        stream.append(&RecordV2::Operation(OperationRecordV2 {
+        let mut stream = ReceiptStreamWriter::new(&policy).unwrap();
+        stream.append(&ReceiptRecord::Operation(ReceiptOperationRecord {
             sequence: 0,
             scope: 1,
             path: b"plain".to_vec(),
-            action: OperationActionV2::EnsureDirectory,
-            disposition: OperationDispositionV2::Applied,
-            code: OutcomeCodeV2::None,
+            action: OperationAction::EnsureDirectory,
+            disposition: OperationDisposition::Succeeded,
+            code: OutcomeCode::None,
             diagnostic: None,
         }));
-        stream.append(&RecordV2::FinalState(FinalStateRecordV2 {
+        stream.append(&ReceiptRecord::FinalState(FinalStateReceiptRecord {
             sequence: 1,
             scope: 1,
             path: b"plain".to_vec(),
-            object: FinalObjectV2::Absent,
+            object: FinalObject::Absent,
         }));
         let issued = stream
-            .finish(ReceiptClosureV2 {
+            .finish(ReceiptClosure {
                 enrollment_id,
                 request_id,
                 grant_digest: [8; 32],
@@ -2008,24 +1987,24 @@ mod tests {
             })
             .unwrap();
         let mut frames = Vec::new();
-        emit_transport_frames(issued, |frame| {
-            frames.push(decode_transport_frame(&frame)?);
+        emit_receipt_frames(issued, |frame| {
+            frames.push(decode_receipt_frame(&frame)?);
             Ok(())
         })
         .unwrap();
         assert!(matches!(
             frames[0],
-            TransportFrameV2::Start {
-                mode: TransportModeV2::DetachedSignedPlaintext,
+            ReceiptFrame::Start {
+                mode: ReceiptDeliveryKind::DetachedSignedPlaintext,
                 ref encapsulated_key,
             } if encapsulated_key.is_empty()
         ));
-        let TransportFrameV2::Chunk { payload, .. } = &frames[1] else {
+        let ReceiptFrame::Chunk { payload, .. } = &frames[1] else {
             panic!("expected plaintext receipt chunk");
         };
         let mut spool = tempfile::tempfile().unwrap();
         spool.write_all(payload).unwrap();
-        let TransportFrameV2::End { payload, .. } = &frames[2] else {
+        let ReceiptFrame::End { payload, .. } = &frames[2] else {
             panic!("expected signed terminal frame");
         };
         let terminal =
@@ -2038,22 +2017,22 @@ mod tests {
         let (_, public) = generate_recipient().unwrap();
         let mut policy = policy(public);
         policy.max_records = 1;
-        let mut stream = StreamWriterV2::new(&policy).unwrap();
+        let mut stream = ReceiptStreamWriter::new(&policy).unwrap();
         for path in [b"a".as_slice(), b"b".as_slice()] {
-            stream.append(&RecordV2::Operation(OperationRecordV2 {
+            stream.append(&ReceiptRecord::Operation(ReceiptOperationRecord {
                 sequence: stream.next_sequence(),
                 scope: 0,
                 path: path.to_vec(),
-                action: OperationActionV2::EnsureDirectory,
-                disposition: OperationDispositionV2::Applied,
-                code: OutcomeCodeV2::None,
+                action: OperationAction::EnsureDirectory,
+                disposition: OperationDisposition::Succeeded,
+                code: OutcomeCode::None,
                 diagnostic: None,
             }));
         }
         assert!(stream.is_failed());
         let signing_key = key(4);
         let terminal = stream
-            .finish(ReceiptClosureV2 {
+            .finish(ReceiptClosure {
                 enrollment_id: EnrollmentId::random(),
                 request_id: RequestId::fresh(1_900_000_000).unwrap(),
                 grant_digest: [1; 32],

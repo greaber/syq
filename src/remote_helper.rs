@@ -4,18 +4,18 @@
 //! identity but may not populate the managed cache. A cache hit adds no extra
 //! ssh round trip: the normal remote command computes the target name and execs
 //! the cached binary directly. On a miss, `conn` probes the target and either
-//! authorizes a direct download or uploads a locally verified matching asset.
+//! authorizes a remote download or uploads a locally verified matching asset.
 
 pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
 /// Direct download could not be used, but installing an uploaded helper may work.
-pub const DIRECT_FALLBACK_EXIT: i32 = 75;
+pub const REMOTE_DOWNLOAD_FALLBACK_EXIT: i32 = 75;
 /// Direct download completed, but its digest did not match the signed manifest.
-pub const DIRECT_INTEGRITY_EXIT: i32 = 76;
+pub const REMOTE_DOWNLOAD_INTEGRITY_EXIT: i32 = 76;
 /// The remote cache itself could not be written or finalized; upload cannot fix it.
 pub const INSTALL_FAILED_EXIT: i32 = 77;
-const DOWNLOAD_CACHE_GENERATION: &str = "release-v1";
+const DOWNLOAD_CACHE_GENERATION: &str = "release";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -144,7 +144,7 @@ download() {{
                 exit {install_failed_exit}
             fi
             echo "syq: remote helper download with curl failed" >&2
-            exit {direct_fallback_exit}
+            exit {remote_download_fallback_exit}
         fi
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout=10 --tries=1 -O "$destination" "$source"
@@ -155,11 +155,11 @@ download() {{
                 exit {install_failed_exit}
             fi
             echo "syq: remote helper download with wget failed" >&2
-            exit {direct_fallback_exit}
+            exit {remote_download_fallback_exit}
         fi
     else
         echo "syq: remote helper download needs curl or wget" >&2
-        exit {direct_fallback_exit}
+        exit {remote_download_fallback_exit}
     fi
 }}
 download {manifest_url} "$manifest"
@@ -169,35 +169,35 @@ if command -v sha256sum >/dev/null 2>&1; then
         actual=${{output%%[[:space:]]*}}
     else
         echo "syq: remote helper hashing with sha256sum failed" >&2
-        exit {direct_fallback_exit}
+        exit {remote_download_fallback_exit}
     fi
 elif command -v shasum >/dev/null 2>&1; then
     if output=$(shasum -a 256 "$archive" 2>/dev/null); then
         actual=${{output%%[[:space:]]*}}
     else
         echo "syq: remote helper hashing with shasum failed" >&2
-        exit {direct_fallback_exit}
+        exit {remote_download_fallback_exit}
     fi
 elif command -v openssl >/dev/null 2>&1; then
     if output=$(openssl dgst -sha256 "$archive" 2>/dev/null); then
         actual=${{output##* }}
     else
         echo "syq: remote helper hashing with openssl failed" >&2
-        exit {direct_fallback_exit}
+        exit {remote_download_fallback_exit}
     fi
 else
     echo "syq: remote helper verification needs sha256sum, shasum, or openssl" >&2
-    exit {direct_fallback_exit}
+    exit {remote_download_fallback_exit}
 fi
 case "$actual" in
     ''|*[!0-9a-f]*)
         echo "syq: remote helper hasher returned an invalid SHA-256 digest" >&2
-        exit {direct_fallback_exit}
+        exit {remote_download_fallback_exit}
         ;;
 esac
 if [ "${{#actual}}" -ne 64 ]; then
     echo "syq: remote helper hasher returned an invalid SHA-256 digest" >&2
-    exit {direct_fallback_exit}
+    exit {remote_download_fallback_exit}
 fi
 printf 'syq-helper-manifest-begin\n'
 while IFS= read -r line || [ -n "$line" ]; do
@@ -208,15 +208,15 @@ printf 'syq-helper-sha256:%s\n' "$actual"
 printf 'syq-helper-report-end\n'
 if ! IFS= read -r decision; then
     echo "syq: local client did not authorize the remote helper download" >&2
-    exit {direct_fallback_exit}
+    exit {remote_download_fallback_exit}
 fi
 if [ "$decision" != install ]; then
     echo "syq: remote helper download was discarded after local integrity verification" >&2
-    exit {direct_integrity_exit}
+    exit {remote_download_integrity_exit}
 fi
 if ! gzip -dc "$archive" > "$tmp"; then
     echo "syq: remote helper decompression failed" >&2
-    exit {direct_fallback_exit}
+    exit {remote_download_fallback_exit}
 fi
 if ! chmod 700 "$tmp"; then
     echo "syq: cannot make the remote helper executable" >&2
@@ -249,8 +249,8 @@ trap - EXIT HUP INT TERM"#,
         manifest_url = shell_words::quote(&manifest_url),
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
-        direct_fallback_exit = DIRECT_FALLBACK_EXIT,
-        direct_integrity_exit = DIRECT_INTEGRITY_EXIT,
+        remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
+        remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
     )
 }
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_the_complete_direct_download_toolchain() {
+    fn probe_reports_the_complete_remote_download_toolchain() {
         let command = probe_command();
         assert!(command.contains("curl"));
         assert!(command.contains("wget"));

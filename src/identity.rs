@@ -12,7 +12,21 @@ pub const fn build() -> &'static str {
 /// the wire handshake. This avoids a separate `uname` ssh round trip on a
 /// managed-helper cache hit.
 pub fn platform() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(platform) = std::env::var_os("SYQ_TEST_PLATFORM") {
+        return platform.to_string_lossy().into_owned();
+    }
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Whether this receiver can create an unbound socket node while keeping all
+/// destination traversal descriptor-relative.
+pub fn supports_confined_socket_nodes() -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(value) = std::env::var_os("SYQ_TEST_CONFINED_SOCKET_NODES") {
+        return value == "1";
+    }
+    !cfg!(target_os = "macos")
 }
 
 pub fn require_release_build() -> Result<()> {

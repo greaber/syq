@@ -133,7 +133,7 @@ the safer way to turn a link chain into an explicit operand.
 These rules form the hostile-namespace containment model for native copy and
 removal. Native `rm` retains the resolved directories and selected identities
 through mutation. Copy resolves and registers every
-selected source before destination mutation, and every source worker claims
+selected source before destination mutation, and every source worker acquires
 those exact directory or parent descriptors during authenticated startup,
 before it reports readiness. Source discovery and metadata stats, including
 retry checks, source content hashes, and range/small reads, use the resulting
@@ -187,7 +187,7 @@ opens the source and destination relative to those descriptors. Rsync-mode
 `--insecure-links` skips that optimization because its explicitly unconfined
 source names cannot be represented by the capability-only request. Directory
 self-copy preflight also uses capabilities: on a confined same-machine copy,
-the destination endpoint claims the exact opened source directory and walks
+the destination endpoint acquires the exact opened source directory and walks
 parents from its retained destination selection. Renaming either command-line
 spelling cannot redirect that decision.
 
@@ -214,8 +214,8 @@ Registration budgets the process's
 currently open descriptors, one retained parent descriptor per source root and
 one object descriptor per exact leaf for the registry, control connection, and
 every worker that may share its process, plus conservative per-worker
-file-cache, transport, and concurrent independent-worker broker-claim overhead.
-Same-machine Linux copies include the destination workers' cross-session claims
+file-cache, transport, and concurrent independent-worker descriptor-handoff overhead.
+Same-machine Linux copies include the destination workers' cross-session handoffs
 in that admission check. If the endpoint's open-file limit cannot hold that
 set, the copy fails before destination mutation with guidance to reduce
 selectors or `--connections`.
@@ -249,7 +249,7 @@ continue to use staged atomic publication.
 Mapping a non-directory source exactly onto an existing directory is rejected
 during the source's first scan batch, in both dry-run and execution. On the
 command-restricted remote-to-remote path the precondition is also signed: the
-receiver checks it against the enrolled root when it claims the grant, and a
+receiver checks it against the enrolled root when it redeems the grant, and a
 `new` root can only be created without replacing anything.
 
 `cp` copies or updates mapped source objects and keeps unrelated target objects
@@ -302,10 +302,13 @@ Native copy fidelity defaults to `-rlt`: recurse through directories, copy
 symlinks as symlinks, and retain mtimes. `--preserve=permissions` additionally
 copies modes, `--preserve=ownership` requests numeric owner and group, and
 `--preserve=specials` copies device, FIFO, and socket nodes. The option is
-repeatable and accepts comma-separated values. Ownership follows the same
-receiver-side rules as archive mode: owner is set only when the receiver runs
-as root, while group changes that fail with `EPERM` are skipped. Hard links,
-ACLs, and xattrs are not preserved.
+repeatable and accepts comma-separated values. On macOS, socket nodes are
+reported and skipped, even under `--quiet`, because macOS cannot create them
+through the confined destination directory descriptor; regular files and
+other special files in the same copy continue normally. Ownership follows the
+same receiver-side rules as archive mode: owner is set only when the receiver
+runs as root, while group changes that fail with `EPERM` are skipped. Hard
+links, ACLs, and xattrs are not preserved.
 
 Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
 `-n`/`--dry-run`, `-v`/`--verbose`,
@@ -313,7 +316,7 @@ Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
 `--progress-json` in addition to their endpoint and selector options. `cp`
 also accepts `--follow-dst`, `--hash`, `--no-compress`, `--bwlimit RATE`,
 `--stats`, repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`,
-and `--inplace`. Native `cp` and `rm` also accept an isolated SSH persistence
+and `--inplace`. Native `cp` and `rm` also accept an ephemeral SSH persistence
 scope through `--pscope PATH`. Filters
 use the gitignore semantics described below and apply at every source root;
 `--prune` protects excluded destination paths from pruning. `--hash`
@@ -330,8 +333,7 @@ command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. On a direct remote-to-remote copy through that receiver, `cp` also
 accepts the receiver ceilings
-`--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
-(`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
+`--receiver-max-entries N` and `--receiver-max-bytes SIZE`, and `--receiver-receipt digests`, which asks the
 receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing
@@ -342,7 +344,7 @@ would act on them.
 file, one run), and
 `--results-fd N` writes to a descriptor the caller opened, e.g.
 `--results-fd 3 3>run.ndjson` (see
-[Automation results](automation-v1.md)). The stream is always written on the
+[Automation results](automation.md)). The stream is always written on the
 invoking machine. For a remote-to-remote copy the coordinator is normally
 elsewhere, so the copy is refused unless `--coordinate-at local` is passed
 explicitly — routing through this machine is never chosen implicitly on the
@@ -381,14 +383,14 @@ endpoints.
 The default push uses destination-bound agent authentication plus the
 command-restricted write receiver. Default pull fails closed, because there is
 no read-restricted receiver, and syq never silently downgrades to
-authentication-only confinement. Pull is available with an explicit `--rsh`, `--no-forward-agent` when the target owns source
-credentials, `--agent-broker-only`, or
-`--unrestricted-agent-forwarding`. The authentication options and `--detach`
+authentication-only confinement. Pull is available with an explicit `--rsh`, `--peer-auth own-credentials` when the destination host owns source
+credentials, `--peer-auth broker`, or
+`--peer-auth full-agent`. `--peer-auth` and `--detach`
 apply only to a direct copy between distinct remote endpoints. Constrained forwarding
 needs OpenSSH 8.9 or newer for the client on the local machine, the client on
 the coordinator host, and the peer's server; syq checks both clients before
 connecting and names the older one together with these alternatives. A detached
-launch requires coordinator-owned credentials (`--no-forward-agent`) or an
+launch requires coordinator-owned credentials (`--peer-auth own-credentials`) or an
 explicit remote-shell policy, and the coordinator host needs `/bin/kill` plus
 either `setsid` or `perl` to start the new session (macOS has no `setsid`);
 the launcher reports its coordinator and log only after
@@ -422,8 +424,8 @@ per-command setup to milliseconds and avoiding another hardware-token
 interaction. `status` shows the global scope and its recorded endpoints;
 `off` disables the policy, asks every live syq-owned master to exit, and
 removes the global runtime scope. The durable preference lives in
-`$XDG_CONFIG_HOME/syq/persistence-v1.json` (normally under `~/.config`), while
-control sockets live in a private per-user runtime directory.
+`$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
+control sockets live in a mode-0700 per-user runtime directory.
 
 Scripts can avoid changing that shared preference by creating an ephemeral
 persistence scope:
@@ -447,9 +449,9 @@ with a literal `~` or containing `${...}` are refused because OpenSSH expands
 those forms before opening a control socket.
 
 `--pscope` is intentionally not an ordinary control-file selection. It names a
-private directory created and permission-checked by the persistence subsystem;
+mode-0700 directory created and permission-checked by the persistence subsystem;
 OpenSSH derives socket names beneath that directory. Its confinement therefore
-comes from that private-directory model, not from the retained single-file
+comes from that dedicated-directory model, not from the retained single-file
 descriptors used for filters, mappings, file lists, and results.
 
 During either persistence window, anything able to act as the same local user
@@ -503,8 +505,8 @@ scope. Port-specific entries are offered in native endpoint syntax only;
 `host:2222` is a remote path, not a port, in rsync syntax.
 
 The learned suggestions are a disposable local cache at
-`$XDG_CACHE_HOME/syq/completion-endpoints-v1.json`, normally
-`~/.cache/syq/completion-endpoints-v1.json`. It contains at most 100 recently
+`$XDG_CACHE_HOME/syq/completion-endpoints.json`, normally
+`~/.cache/syq/completion-endpoints.json`. It contains at most 100 recently
 successful endpoint names, users, ports, and timestamps. It contains no paths,
 credentials, keys, or transfer history. Manage it with:
 
@@ -534,8 +536,8 @@ syq map --srcs-in photos \
 ```
 
 `syq map` is local and destination-independent. Its options are `-C`,
-`--follow-src`/`--follow`, the source-selector family, and `--as` for renaming
-one selected root. Copy destinations, filtering, transfer policy, execution
+`--follow-src`/`--follow`, the source-selector family, and `--as PATH` for
+placing the single selected root at `PATH`. Copy destinations, filtering, transfer policy, execution
 controls, results, receiver ceilings, and receipts belong to the downstream `cp`
 invocation or the manifest transform.
 
@@ -597,7 +599,7 @@ accept them.
 | `--syq-no-tcp` | SYQ extension: send data over the ssh connection instead of separate TCP sockets |
 | `--syq-tcp-plain` | SYQ extension: TCP data connections without encryption (trusted networks only) |
 | `--syq-tcp-ports LO-HI` | SYQ extension: port range the remote listens on for TCP data (default 47600-47699) |
-| `--syq-tcp-congestion ALGO` | SYQ extension, Linux: use `ALGO` on both ends of direct TCP data sockets; the host default is unchanged |
+| `--syq-tcp-congestion ALGO` | SYQ extension, Linux: use `ALGO` on both ends of TCP data sockets; the host default is unchanged |
 | `--syq-pscope PATH` | SYQ extension: use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
 | `--syq-ignore PATTERN` | SYQ extension: skip paths matching a gitignore-style pattern (repeatable; see below) |
 | `--syq-ignore-from FILE` | SYQ extension: read ignore patterns from a file (repeatable, stacks with `--syq-ignore`) |
@@ -674,7 +676,7 @@ Identical to rsync:
   spelling afterward therefore cannot redirect its writes. A symlink
   encountered below the destination root is payload at that path: it is
   replaced rather than followed, even when it points to a directory.
-- Recognizable `.syq-part.<job-id>` paths in a source are copied as ordinary
+- Recognizable `.syq-part.<copy-id>` paths in a source are copied as ordinary
   payload and produce one warning summary. Before transfer starts, SYQ rejects
   the exceptional case where a mapped payload path exactly equals a sidecar
   this job would use for another mapped file.
@@ -785,7 +787,7 @@ left, so the tail of a transfer stays parallel without pre-deciding chunk
 counts.
 
 On the receiving side a file that needs content changes is written beside its
-target as `.name.syq-part.<job-id>`, written with `pwrite` from several workers,
+target as `.name.syq-part.<copy-id>`, written with `pwrite` from several workers,
 given its metadata, and `rename`d over the target. Eligible local filesystems
 preallocate fresh sidecars with `fallocate`; NFS sidecars grow from the data
 writes themselves so allocation and initial-size requests do not add
@@ -799,7 +801,7 @@ blocks are hashed.
 If every block matches, metadata is applied through the descriptor without
 allocating or publishing a sidecar; otherwise that exact descriptor seeds the
 sidecar.
-The job ID is a 128-bit digest of the normalized source/destination mapping and
+The copy ID is a 128-bit digest of the normalized source/destination mapping and
 content-affecting options, and is stable when the same logical command is
 rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
 semantics and block size, but not operational controls such as checksum
@@ -837,7 +839,7 @@ levels.
 **Within a file.** There is no per-file state file — the partial *is* the state:
 
 - Files whose size and mtime already match are skipped (the rsync quick check).
-- If this job's range-transfer `.name.syq-part.<job-id>` exists, both sides
+- If this copy's range-transfer `.name.syq-part.<copy-id>` exists, both sides
   hash it and the source with full BLAKE3 digests in `--block-size` blocks and
   only the mismatching blocks are sent. A leftover is reused only when it can
   be safely opened as a singly-linked regular file without following a symlink; numeric ownership is
@@ -858,7 +860,7 @@ databases, logs). It does **not** catch a byte inserted near the start of a
 file, which rsync's rolling checksum would — for syq's intended use (fresh
 uploads and downloads) that trade was made deliberately.
 
-The partial job ID includes `--block-size` and the ordered ignore rules, so
+The partial copy ID includes `--block-size` and the ordered ignore rules, so
 changing either starts a separate resumable namespace. Old sidecars are not
 garbage-collected automatically and may be deleted manually when the earlier
 command will not be resumed. Options that do not change the copy itself, such
@@ -936,7 +938,7 @@ rest.
 
 Compared with rsync: ordinary content-changing writes use the same
 temporary-file plus atomic rename model; `--inplace` explicitly gives that up.
-Rsync chooses a random temporary suffix, while SYQ uses a deterministic job ID
+Rsync chooses a random temporary suffix, while SYQ uses a deterministic copy ID
 so an interrupted command can find its partial again without a local state
 file. The change-during-transfer check is the same idea; `--delete` runs
 strictly after the transfer (see below); hardlinks aren't implemented.
@@ -1013,13 +1015,13 @@ have is removed. The rules are simpler than rsync's, deliberately:
   has begun, interruption can leave some planned extras removed; rerunning
   finishes the mirror. Directory mtimes are set after the deletes.
 - **Sidecar-patterned files are extras unless they are this job's live
-  resume state.** A `.name.syq-part.<job-id>` of *this* command whose `name`
+  resume state.** A `.name.syq-part.<copy-id>` of *this* command whose `name`
   is still in the source stays, whatever happened to that file this run
   (failed, filtered, already up to date): the next transfer of that file
   consumes it. Everything else matching the pattern — an orphan of this
-  command, or any other job id — is an ordinary extra: syq copies such names
+  command, or any other copy ID — is an ordinary extra: syq copies such names
   as payload, so the name alone proves nothing, and mirroring the source is
-  what --delete is for. Note that the job identity includes the command's
+  what --delete is for. Note that the copy identity includes the command's
   semantic options: change those (or the source/destination spelling they
   normalize to) and the previous identity's sidecars become orphans —
   removed by `--delete`, inert otherwise.
@@ -1109,7 +1111,7 @@ differs and why, what's missing, and the open issues. The short version:
   counters are collected for diagnosis, but a loss-tolerant transport would be
   a separate protocol and security design.
 - Preserving existing partial files from `rsync --partial`; only SYQ's own
-  `.name.syq-part.<job-id>` sidecars for the same logical command are
+  `.name.syq-part.<copy-id>` sidecars for the same logical command are
   recognised.
 
 ## Exit codes

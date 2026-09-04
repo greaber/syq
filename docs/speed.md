@@ -72,12 +72,12 @@ table](reference.md#compatibility-options)).
    deliberately does not `fsync` transfer data.
 9. **One authentication for direct remote-to-remote transfers.** The default
    restricted path authenticates hostB once with the enrollment key and then
-   runs token-authenticated TCP workers; `--agent-broker-only` instead pays an
+   runs token-authenticated TCP workers; `--peer-auth broker` instead pays an
    agent round trip per ssh connection.
 
 Two things are *not* on this list. Congestion control is not selected
 automatically: `--tcp-congestion ALGO` is an explicit per-socket experiment
-for both ends of syq's direct TCP sockets, and otherwise every socket inherits
+for both ends of syq's TCP data sockets, and otherwise every socket inherits
 its host's default (see [Server tuning](server-tuning.md)). And rsync's
 rolling-checksum delta transfer is not implemented; see [When rsync is
 faster](#when-rsync-or-cp-is-faster).
@@ -190,15 +190,15 @@ reachable TCP data path, 8 over ssh, or — when both ends are local — 16 if t
 process has at most two CPUs available and 32 otherwise. This uses the CPU
 affinity or container limit reported by the OS; the lower count remains large
 enough to overlap filesystem latency. A single same-machine file eligible for
-the whole-file or receiver-side direct-copy path starts with one worker because
+the whole-file or receiver-side kernel-copy path starts with one worker because
 extra loopback connections cannot help; finding a partial or an unsupported
 kernel offload immediately restores the ordinary local starting count.
 Remembered results are keyed only by the directional endpoint path and
 transport (TCP and ssh learn separately), not by RTT, workload, filesystem or
 other volatile telemetry. A stale hint only costs the tuner a probe or two. The
 cache is
-`$XDG_CACHE_HOME/syq/tuning-v1.json` (normally
-`~/.cache/syq/tuning-v1.json`; set `SYQ_TUNING_CACHE` to override it or to an
+`$XDG_CACHE_HOME/syq/tuning.json` (normally
+`~/.cache/syq/tuning.json`; set `SYQ_TUNING_CACHE` to override it or to an
 empty value to disable it). An explicit connection count, dry runs, verification, short runs
 that compare no counts, failed/aborted copies, and runs whose TCP path falls
 back to ssh after workers start do not update it; the last case may contain
@@ -286,7 +286,7 @@ private network such as a cloud provider's internal mesh the IPv6 address is
 the one that answers.
 
 On Linux, `--syq-tcp-congestion ALGO` requests a congestion-control algorithm for
-both ends of every direct TCP data connection. The connecting socket is
+both ends of every TCP data connection. The connecting socket is
 configured before `connect`, and the remote listener is configured before its
 port is advertised, so accepted sockets inherit the same algorithm. This is a
 per-socket override: syq does not change sysctls, load kernel modules, or alter
@@ -305,7 +305,7 @@ is sender-side, so setting it only on a download server does not also select it
 for uploads from a client. syq can cover both directions because it owns the
 data socket on each endpoint.
 
-With `--stats`, direct TCP copies also report the kernel counters available on
+With `--stats`, copies over TCP data connections also report the kernel counters available on
 both socket ends: the effective congestion-control algorithm, retransmitted
 packets and bytes (a packet-loss signal), current/minimum RTT, congestion window
 and delivery rate, receive-window and send-buffer limited time, and ECN CE
@@ -325,9 +325,9 @@ data connections across all of them (multipath) — it keeps only paths within
 2x of the fastest, so it never drags a fast transfer down by mixing in a slow
 link. Every candidate still gets its complete bounded probe window, but those
 independent probes run while the control connection prepares the destination.
-An unrestricted destination worker claims its registered directory as part of
+An unrestricted destination worker acquires its registered directory as part of
 its authenticated Hello, and the receiver acknowledges readiness only after
-that claim succeeds. Single-homed hosts and laptops use the one best path,
+that handoff succeeds. Single-homed hosts and laptops use the one best path,
 unchanged. With ufw:
 
 ```sh
@@ -336,7 +336,7 @@ sudo ufw allow from 203.0.113.5   to any port 47600:47699 proto tcp   # a specif
 ```
 
 Use `-vv` to see the route planned for the real transfer. For each remote
-endpoint seen by the active orchestrator it reports the authenticated helper
+endpoint seen by the active coordinator it reports the authenticated helper
 identity and platform, every TCP address syq considered, reachability and
 advertised link speed, why a reachable address was or was not selected by the
 preflight, the resulting planned TCP/ssh transport, and the initial connection
@@ -351,9 +351,9 @@ or start transfer workers, and verbosity does not change dry-run's success or
 failure. The reported route is therefore a plan for a real transfer, not a
 claim that a worker data connection was completed.
 
-Native remote-to-remote copies work the same way: the orchestrator on hostA
+Native remote-to-remote copies work the same way: the coordinator on hostA
 connects to hostB's listener. Diagnostics are relative to that active
-orchestrator. If both endpoints name hostA, `-vv` reports a local filesystem
+coordinator. If both endpoints name hostA, `-vv` reports a local filesystem
 route there.
 
 No special server setup is required. For a measurement-first checklist of

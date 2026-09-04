@@ -6,6 +6,8 @@ set -euo pipefail
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 grep -F 'rust,sdks,macos,linux-arm64,conformance' \
   "$script_dir/../.github/workflows/release.yml" >/dev/null
+grep -F ".github/release-notes/\$GITHUB_REF_NAME.md" \
+  "$script_dir/../.github/workflows/release.yml" >/dev/null
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-release-orchestration-test.XXXXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
@@ -24,20 +26,25 @@ expect_failure() {
   }
 }
 
-# Scope pull requests to affected fast checks and reserve the cumulative suites
-# for master pushes and explicit manual runs.
+# Scope pull requests to affected Linux checks; broader cross-subsystem,
+# architecture, and platform checks remain cumulative after merge.
 assert_scope() {
   local output=$1 key=$2 expected=$3
   grep -Fx "$key=$expected" <<<"$output" >/dev/null
 }
 
+scope_keys=(
+  native sdks python_sdk javascript_sdk go_sdk tooling shellcheck mapping_docs
+  conformance macos linux_arm64 full_suite
+)
+
 paths="$work/paths"
 printf 'README.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" false
 done
-printf 'MAPPINGS.md\n' >"$paths"
+printf 'docs/mappings.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" mapping_docs true
 assert_scope "$scope" native false
@@ -45,10 +52,26 @@ printf 'sdk/python/src/syq/syq-release-manifest.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" javascript_sdk false
+assert_scope "$scope" go_sdk false
+printf 'sdk/js/src/index.js\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk false
+assert_scope "$scope" javascript_sdk true
+assert_scope "$scope" go_sdk false
+printf 'sdk/go/client.go\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk false
+assert_scope "$scope" javascript_sdk false
+assert_scope "$scope" go_sdk true
 printf 'sdk/python/native-api.json\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 for sdk_script in \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
@@ -60,6 +83,7 @@ do
   scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
   assert_scope "$scope" tooling true
   assert_scope "$scope" sdks true
+  assert_scope "$scope" python_sdk true
   assert_scope "$scope" native false
 done
 printf 'tests/rsync-compat/LEDGER.md\n' >"$paths"
@@ -73,6 +97,16 @@ assert_scope "$scope" sdks false
 assert_scope "$scope" conformance false
 assert_scope "$scope" macos false
 assert_scope "$scope" linux_arm64 false
+printf 'docs/example.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" shellcheck true
+assert_scope "$scope" tooling false
+assert_scope "$scope" native false
+printf 'tests/real-ssh/scenarios.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" shellcheck true
+assert_scope "$scope" tooling false
+assert_scope "$scope" native false
 printf 'scripts/test-installer.sh\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
@@ -80,12 +114,9 @@ assert_scope "$scope" native false
 printf '.github/workflows/ci.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
-assert_scope "$scope" native true
-assert_scope "$scope" sdks true
-assert_scope "$scope" mapping_docs true
-assert_scope "$scope" conformance true
-assert_scope "$scope" macos true
-assert_scope "$scope" linux_arm64 true
+for key in native sdks python_sdk javascript_sdk go_sdk shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 printf '.github/workflows/rsync-compat.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
@@ -95,7 +126,26 @@ printf '.github/workflows/python-api-sync.yml\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" tooling true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 assert_scope "$scope" native false
+
+# The surface touched by PR #190 should run the Rust baseline, Python SDK, and
+# shell lint without promoting the pull request to unrelated suites.
+printf '%s\n' \
+  docs/reference.md \
+  sdk/python/native-api.json \
+  sdk/python/src/syq/client.py \
+  src/cli.rs \
+  tests/local.rs \
+  tests/real-ssh/scenarios.sh >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" native true
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" shellcheck true
+for key in javascript_sdk go_sdk tooling mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
 
 scope_repo="$work/scope-repo"
 mkdir "$scope_repo"
@@ -118,6 +168,7 @@ jq -n --arg base "$scope_base" --arg head "$scope_head" \
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
 assert_scope "$scope" native false
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
 assert_scope "$scope" full_suite false
 
 # A pull request branch may lag master. Scope its own three-dot diff rather
@@ -135,7 +186,7 @@ advanced_base=$(git -C "$scope_repo" rev-parse HEAD)
 jq -n --arg base "$advanced_base" --arg head "$docs_head" \
   '{pull_request:{base:{sha:$base},head:{sha:$head}}}' >"$scope_event"
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$scope_event")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" false
 done
 
@@ -158,6 +209,9 @@ jq -n --arg before "$scope_head" --arg after "$advanced_base" \
 scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
 assert_scope "$scope" native true
 assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+assert_scope "$scope" javascript_sdk true
+assert_scope "$scope" go_sdk true
 assert_scope "$scope" conformance true
 assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 true
@@ -166,7 +220,7 @@ assert_scope "$scope" full_suite true
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
-for key in native sdks tooling mapping_docs conformance macos linux_arm64 full_suite; do
+for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
 
@@ -371,7 +425,9 @@ status_bin="$work/status-bin"
 mkdir "$status_bin"
 status_commit=89abcdef0123456789abcdef0123456789abcdef
 status_tag_object=76543210abcdef9876543210abcdef9876543210
-status_formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/v0.1.8/syq"\n' | openssl base64 -A)
+status_tag=$(jq -er .tag sdk/python/src/syq/syq-release-manifest.json)
+status_version=$(jq -er .version sdk/python/src/syq/syq-release-manifest.json)
+status_formula_b64=$(printf 'url "https://github.com/greaber/syq/releases/download/%s/syq"\n' "$status_tag" | openssl base64 -A)
 cat >"$status_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -380,12 +436,15 @@ case "$1:$2" in
     {conclusion:null,databaseId:303,event:"push",headSha:$sha,status:"in_progress",url:"https://example.test/303",workflowName:"release"}]' ;;
   api:*)
     case " $* " in
-      *'/git/matching-refs/tags/v0.1.8 '*) jq -cn --arg sha "$SYQ_TEST_STATUS_TAG_OBJECT" '[{ref:"refs/tags/v0.1.8",object:{type:"tag",sha:$sha}}]' ;;
+      *"/git/matching-refs/tags/$SYQ_TEST_STATUS_TAG "*) jq -cn \
+        --arg sha "$SYQ_TEST_STATUS_TAG_OBJECT" --arg tag "$SYQ_TEST_STATUS_TAG" \
+        '[{ref:("refs/tags/" + $tag),object:{type:"tag",sha:$sha}}]' ;;
       *'/git/tags/'*) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" \
-        --arg tag "${SYQ_TEST_STATUS_OBJECT_TAG:-v0.1.8}" \
+        --arg tag "${SYQ_TEST_STATUS_OBJECT_TAG:-$SYQ_TEST_STATUS_TAG}" \
         --arg type "${SYQ_TEST_STATUS_TARGET_TYPE:-commit}" \
         '{tag:$tag,object:{type:$type,sha:$sha},verification:{verified:true,reason:"valid"}}' ;;
-      *'/releases?per_page=100 '*) printf '[[{"tag_name":"v0.1.8","draft":false,"immutable":true,"html_url":"https://example.test/v0.1.8"}]]\n' ;;
+      *'/releases?per_page=100 '*) jq -cn --arg tag "$SYQ_TEST_STATUS_TAG" \
+        '[[{tag_name:$tag,draft:false,immutable:true,html_url:("https://example.test/" + $tag)}]]' ;;
       *'/actions/runs/303/pending_deployments '*) printf '[{"environment":{"name":"release"}}]\n' ;;
       *'homebrew-tap/contents/Formula/syq.rb '*) jq -cn --arg content "$SYQ_TEST_STATUS_FORMULA_B64" '{content:$content}' ;;
       *) echo "unexpected fake gh api invocation: $*" >&2; exit 2 ;;
@@ -397,8 +456,10 @@ EOF
 cat >"$status_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
-  *'crates.io/'*) printf '{"versions":[{"num":"0.1.8"}]}\n' ;;
-  *'pypi.org/'*) printf '{"info":{"version":"0.1.8"},"releases":{"0.1.8":[{}]}}\n' ;;
+  *'crates.io/'*) jq -cn --arg version "$SYQ_TEST_STATUS_VERSION" \
+    '{versions:[{num:$version}]}' ;;
+  *'pypi.org/'*) jq -cn --arg version "$SYQ_TEST_STATUS_VERSION" \
+    '{info:{version:$version},releases:{($version):[{}]}}' ;;
   *) exit 2 ;;
 esac
 EOF
@@ -406,8 +467,10 @@ chmod 755 "$status_bin/gh" "$status_bin/curl"
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status.json"
 jq -e --arg commit "$status_commit" '
   .tag_state == "verified" and .tag_commit == $commit and
   .github_release.state == "published" and .github_release.immutable == true and
@@ -425,18 +488,22 @@ jq -e --arg commit "$status_commit" '
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
-SYQ_TEST_STATUS_OBJECT_TAG=v0.1.7 \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
+SYQ_TEST_STATUS_OBJECT_TAG="${status_tag}-mismatch" \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-name-mismatch.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-name-mismatch.json"
 jq -e '.tag_state == "name-mismatch" and .tag_commit == null' \
   "$work/status-name-mismatch.json" >/dev/null
 
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
 SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
 SYQ_TEST_STATUS_TARGET_TYPE=tag \
 SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
-  "$script_dir/release-status.sh" --json v0.1.8 >"$work/status-nested-tag.json"
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-nested-tag.json"
 jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
   "$work/status-nested-tag.json" >/dev/null
 

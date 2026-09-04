@@ -1,11 +1,8 @@
 //! Integration tests: local -> local copies through the built binary.
 
 use base64::Engine as _;
-#[cfg(target_os = "linux")]
 use ed25519_dalek::{Signer, SigningKey};
-#[cfg(target_os = "linux")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,7 +12,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -347,7 +343,7 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|fake>local|ssh": 64 }
+            "paths": { "fake>local|ssh": 64 }
         }))
         .unwrap()
         .as_bytes(),
@@ -2045,6 +2041,97 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
 }
 
 #[test]
+fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--preserve=specials",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/nested/ordinary")), b"ordinary");
+
+    #[cfg(target_os = "linux")]
+    assert!(fs::symlink_metadata(t.path("dst/nested/socket"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(!t.path("dst/nested/socket").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("skipping socket"), "{stderr}");
+        assert!(stderr.contains("confined destination"), "{stderr}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_remote_destination_socket_policy_uses_handshake_capability() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let command = |platform: &str, socket_capability: &str, destination: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args(["--no-tcp", "-j", "1", "--preserve=specials"])
+            .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
+            .arg(t.path(destination))
+            .arg("--no-progress")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_PLATFORM", platform)
+            .env("FAKE_REMOTE_CONFINED_SOCKET_NODES", socket_capability);
+        command
+    };
+
+    // A Linux coordinator must honor a macOS receiver's inability to create
+    // confined socket nodes. The warning is a fidelity diagnostic and remains
+    // visible even when ordinary output is quiet.
+    let mut macos_destination = command("macos-aarch64", "0", "dst-macos");
+    let output = macos_destination.arg("--quiet").run().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst-macos/nested/ordinary")), b"ordinary");
+    assert!(!t.path("dst-macos/nested/socket").exists());
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("skipping socket"), "{stderr}");
+    assert!(stderr.contains("confined destination"), "{stderr}");
+
+    // A macOS coordinator must not suppress a socket headed to a capable
+    // Linux receiver. Dry-run proves the receiver operation is planned without
+    // asking a macOS test host to execute Linux's mknodat behavior.
+    let mut linux_destination = command("linux-x86_64", "1", "dst-linux");
+    let output = linux_destination
+        .args(["--dry-run", "--verbose"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("create socket"), "{stdout}");
+    assert!(!stderr_of(&output).contains("skipping socket"));
+    assert!(!t.path("dst-linux").exists());
+}
+
+#[test]
 fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     let t = Tmp::new();
     let expected = vec![b'n'; 5 * 1024 * 1024];
@@ -2922,30 +3009,30 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
 }
 
 #[test]
-fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
+fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
             .run()
             .unwrap()
     };
-    let help = run(&["enrollment", "--help"]);
+    let help = run(&["receiver", "--help"]);
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for verb in ["add", "list", "revoke"] {
+    for verb in ["enroll", "list", "revoke"] {
         assert!(text.contains(verb), "{text}");
     }
-    let bare = run(&["enrollment"]);
+    let bare = run(&["receiver"]);
     assert_eq!(bare.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq enrollment"));
-    let bogus = run(&["enrollment", "rotate"]);
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq receiver"));
+    let bogus = run(&["receiver", "rotate"]);
     assert!(!bogus.status.success());
-    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown enrollment command"));
-    for verb in ["add", "list", "revoke"] {
-        let verb_help = run(&["enrollment", verb, "--help"]);
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown receiver command"));
+    for verb in ["enroll", "list", "revoke"] {
+        let verb_help = run(&["receiver", verb, "--help"]);
         assert!(verb_help.status.success(), "{verb}");
         assert!(
-            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq enrollment {verb}")),
+            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq receiver {verb}")),
             "{verb}"
         );
     }
@@ -2953,6 +3040,7 @@ fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
     for old in [
         &["enroll", "host:dst"][..],
         &["enrollments"],
+        &["enrollment", "list"],
         &["revoke", "id"],
     ] {
         let out = run(old);
@@ -2965,10 +3053,9 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
     for option in [
-        "--max-entries=5",
-        "--max-total-bytes=1M",
-        "--max-runtime=30m",
-        "--receipt=sizes",
+        "--receiver-max-entries=5",
+        "--receiver-max-bytes=1M",
+        "--receiver-receipt=sizes",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
@@ -2990,25 +3077,6 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         );
         assert!(!t.path("dst").exists(), "{option} copied anyway");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--max-runtime=0m",
-            "--srcs-in",
-            &t.s("src"),
-            "--to",
-            "hostb",
-            "--into",
-            "/dst",
-        ])
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("at least one second"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[test]
@@ -3624,6 +3692,18 @@ else
     PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
 fi
 export HOME PATH
+if [ -n "${FAKE_REMOTE_PLATFORM:-}" ]; then
+    SYQ_TEST_PLATFORM="$FAKE_REMOTE_PLATFORM"
+    export SYQ_TEST_PLATFORM
+else
+    unset SYQ_TEST_PLATFORM
+fi
+if [ -n "${FAKE_REMOTE_CONFINED_SOCKET_NODES:-}" ]; then
+    SYQ_TEST_CONFINED_SOCKET_NODES="$FAKE_REMOTE_CONFINED_SOCKET_NODES"
+    export SYQ_TEST_CONFINED_SOCKET_NODES
+else
+    unset SYQ_TEST_CONFINED_SOCKET_NODES
+fi
 # The remote helper advertises the address ssh arrived on; never leak the
 # developer's own session into the fixture.
 if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
@@ -3802,11 +3882,10 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     let identity = binary_identity("--build-identity");
     let target = helper_target();
     t.path(&format!(
-        "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
+        "remote-home/.cache/syq/helpers/{identity}-release/{target}/syq"
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn cached_local_helper(t: &Tmp) -> PathBuf {
     let target = helper_target();
     t.path(&format!(
@@ -3824,7 +3903,6 @@ fn binary_identity(argument: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -3832,7 +3910,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 struct ReleaseBootstrapFixture {
     archive: Vec<u8>,
     manifest: Vec<u8>,
@@ -3840,10 +3917,8 @@ struct ReleaseBootstrapFixture {
     asset: &'static str,
 }
 
-#[cfg(target_os = "linux")]
 static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
 
-#[cfg(target_os = "linux")]
 fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     RELEASE_BOOTSTRAP_FIXTURE.get_or_init(|| {
         let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
@@ -3853,10 +3928,13 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&binary_bytes).unwrap();
         let archive = encoder.finish().unwrap();
-        let (target, asset) = match std::env::consts::ARCH {
-            "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
-            "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
-            arch => panic!("unsupported test architecture {arch}"),
+        let target = helper_target();
+        let asset = match target {
+            "linux-x86_64" => "syq-linux-x86_64",
+            "linux-aarch64" => "syq-linux-aarch64",
+            "macos-x86_64" => "syq-macos-x86_64",
+            "macos-arm64" => "syq-macos-arm64",
+            other => panic!("unsupported release target {other}"),
         };
         let manifest = serde_json::json!({
             "schema": 1,
@@ -3897,7 +3975,6 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     })
 }
 
-#[cfg(target_os = "linux")]
 fn setup_release_bootstrap(t: &Tmp) {
     let fixture = release_bootstrap_fixture();
     write(&t.path("release.gz"), &fixture.archive);
@@ -3927,7 +4004,6 @@ esac
     );
 }
 
-#[cfg(target_os = "linux")]
 fn add_remote_tool(t: &Tmp, name: &str) {
     let destination = t.path(&format!("remote-bin/{name}"));
     if destination.exists() {
@@ -3943,7 +4019,6 @@ fn add_remote_tool(t: &Tmp, name: &str) {
     std::os::unix::fs::symlink(source, destination).unwrap();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
@@ -3991,7 +4066,6 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -4041,7 +4115,6 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     assert_eq!(cache_entries, ["syq"]);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_cannot_inject_digest_protocol_framing() {
     let t = Tmp::new();
@@ -4102,7 +4175,6 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     let t = Tmp::new();
@@ -4142,7 +4214,6 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn failed_remote_download_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -4172,7 +4243,6 @@ exit 22
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -4204,7 +4274,6 @@ fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     assert!(!t.path("curl.log").exists());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn broken_remote_hasher_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -4235,9 +4304,8 @@ exit 1
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn corrupted_local_helper_cache_is_discarded_and_refetched() {
+fn remote_corrupted_local_helper_cache_is_discarded_and_refetched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
@@ -4271,7 +4339,6 @@ exit 22
     assert!(stderr.contains("discarding it"), "{stderr}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_download_write_failure_does_not_retry_with_upload() {
     let t = Tmp::new();
@@ -4907,7 +4974,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 1 }
+            "paths": { "local>fake|ssh": 1 }
         }))
         .unwrap()
         .as_bytes(),
@@ -4954,7 +5021,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     let fixed = run("fixed", Some(3));
     assert_output_ok(&fixed);
     let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["v1|local>fake|ssh"], 1);
+    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
 }
 
 #[cfg(debug_assertions)]
@@ -5019,7 +5086,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 2 }
+            "paths": { "local>fake|ssh": 2 }
         }))
         .unwrap()
         .as_bytes(),
@@ -8591,7 +8658,7 @@ fn local_copy_does_not_read_the_global_persistence_configuration() {
     write(&t.path("src/f"), b"data");
     // An eligible implicit SSH endpoint would report this malformed policy,
     // but a local copy has no persistence decision to make.
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("XDG_CONFIG_HOME", t.path("config"))
@@ -10917,7 +10984,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         stderr.contains("needs OpenSSH 8.9 or newer on this machine, but ssh is OpenSSH 8.2"),
         "{stderr}"
     );
-    assert!(stderr.contains("--no-forward-agent"), "{stderr}");
+    assert!(stderr.contains("--peer-auth own-credentials"), "{stderr}");
     // The version probe must not have been mistaken for a connection.
     assert!(!t.path("rsh.log").exists(), "{stderr}");
 
@@ -11684,6 +11751,39 @@ fn native_map_named_cwd_and_as_rename() {
     assert_eq!(dsts, ["album", "album/x", "album/x/a.jpg"]);
     let srcs: Vec<String> = lines.iter().map(|v| map_path(v, "src")).collect();
     assert_eq!(srcs, ["photos", "photos/x", "photos/x/a.jpg"]);
+    // --as PATH may be nested; every component is honored, none is dropped.
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["photos", "--as", "2024/07/album"],
+    ));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(
+        dsts,
+        ["2024/07/album", "2024/07/album/x", "2024/07/album/x/a.jpg"]
+    );
+}
+
+#[test]
+fn native_map_as_nested_path_round_trips_through_cp_mapping() {
+    let t = Tmp::new();
+    write(&t.path("src/photos/x/a.jpg"), b"img");
+    let mapped = syq_map_in(&t.path("src"), &["photos", "--as", "2024/07/album"]);
+    assert!(
+        mapped.status.success(),
+        "map failed: {}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+    let copied = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(&mapped.stdout),
+    );
+    assert!(
+        copied.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(read(&t.path("dst/2024/07/album/x/a.jpg")), b"img");
 }
 
 #[test]
@@ -11701,6 +11801,9 @@ fn native_map_refusals() {
     refuse(&["--srcs-in", "d1", "--srcs-in", "d2"], "only selector");
     refuse(&["--srcs-in", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
+    refuse(&["d1", "--as", "/abs"], "is absolute");
+    refuse(&["d1", "--as", "../up"], "`..` component");
+    refuse(&["d1", "--as", "a//b"], "empty, `.`, or `..` component");
     refuse(
         &["d1", "--into-new", "z"],
         "unexpected argument '--into-new'",
@@ -11712,8 +11815,8 @@ fn native_map_refusals() {
     refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
     refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
     refuse(
-        &["d1", "--receipt", "sizes"],
-        "unexpected argument '--receipt'",
+        &["d1", "--receiver-receipt", "sizes"],
+        "unexpected argument '--receiver-receipt'",
     );
 }
 
@@ -11753,10 +11856,9 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--ignore-from",
         "--preserve",
         "--inplace",
-        "--max-entries",
-        "--max-total-bytes",
-        "--max-runtime",
-        "--receipt",
+        "--receiver-max-entries",
+        "--receiver-max-bytes",
+        "--receiver-receipt",
     ] {
         assert!(
             !help.contains(option),
@@ -13587,7 +13689,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
     assert_output_ok(&listed);
     assert_eq!(listed.stdout, b"fake.example\n");
-    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints-v1.json")).unwrap();
+    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints.json")).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
     let suggested = completion_command(
@@ -13640,7 +13742,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
 
     let cleared = completion_command(&t, &["cache", "clear"]).run().unwrap();
     assert_output_ok(&cleared);
-    assert!(!t.path("cache/syq/completion-endpoints-v1.json").exists());
+    assert!(!t.path("cache/syq/completion-endpoints.json").exists());
 }
 
 fn ephemeral_scope(t: &Tmp) -> PathBuf {
@@ -13650,6 +13752,114 @@ fn ephemeral_scope(t: &Tmp) -> PathBuf {
     assert_output_ok(&output);
     let path = output.stdout.strip_suffix(b"\n").unwrap();
     PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
+}
+
+/// Candidates reach the shell as soon as the listing arrives. Closing the
+/// remote connection waits for the helper's exit status, a whole network
+/// round trip on a distant host, so the completion process must print and
+/// exit while that connection is still open.
+#[test]
+fn remote_completion_replies_before_the_remote_connection_closes() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    let ssh = fake_ssh(&t);
+    // A remote helper that serves normally and then stays alive until it is
+    // released, like an ssh session whose exit status has not come back yet.
+    // The wait is bounded so a regression fails instead of hanging.
+    let helper = t.path("lingering-syq");
+    executable(
+        &helper,
+        format!(
+            r#"#!/bin/sh
+'{syq}' "$@"
+status=$?
+n=0
+until [ -e '{release}' ] || [ "$n" -ge 400 ]; do
+    sleep 0.05
+    n=$((n + 1))
+done
+printf 'helper-exit\n' >> "$FAKE_RSH_LOG"
+exit "$status"
+"#,
+            syq = env!("CARGO_BIN_EXE_syq"),
+            release = t.s("release-helper"),
+        )
+        .as_bytes(),
+    );
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "6",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            &t.s("lingering-syq"),
+            "--from",
+            "fake.example",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    // The lingering helper inherits stderr; a captured pipe would keep this
+    // wait open until the helper exits.
+    .stderr(Stdio::null())
+    .start()
+    .unwrap()
+    .wait_with_output()
+    .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !log.contains("helper-exit"),
+        "completion waited for the remote helper to exit:\n{log}"
+    );
+
+    write(&t.path("release-helper"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        if log.contains("helper-exit") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "released remote helper never exited:\n{log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -13734,7 +13944,7 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
 fn remote_coordinator_does_not_resolve_local_persistence() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let ssh = t.path("bin/ssh");
     executable(
         &ssh,
@@ -13747,7 +13957,8 @@ exit 23
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
-                "--no-forward-agent",
+                "--peer-auth",
+                "own-credentials",
                 "--from",
                 "hostA",
                 "--srcs-in",
@@ -14264,16 +14475,16 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
     assert_eq!(terminal["deletions_blocked"], 0);
 }
 
-fn automation_v1_validator() -> jsonschema::Validator {
+fn automation_validator() -> jsonschema::Validator {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schemas/automation-v1.schema.json"))
+        serde_json::from_str(include_str!("../schemas/automation.schema.json"))
             .expect("schema file is JSON");
     jsonschema::validator_for(&schema).expect("schema compiles")
 }
 
 /// Every line validates against the committed schema, seq is contiguous
 /// from 0, the first record is `run`, and the last is `result`.
-fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
+fn assert_automation_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
     let records: Vec<serde_json::Value> = content
         .lines()
         .enumerate()
@@ -14294,9 +14505,9 @@ fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str,
 }
 
 #[test]
-fn automation_v1_fixtures_validate_against_schema() {
-    let validator = automation_v1_validator();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation-v1");
+fn automation_fixtures_validate_against_schema() {
+    let validator = automation_validator();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("fixture dir")
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -14319,7 +14530,7 @@ fn automation_v1_fixtures_validate_against_schema() {
     );
     for name in names {
         let content = String::from_utf8(read(&dir.join(&name))).unwrap();
-        assert_automation_v1_stream(&validator, &content, &name);
+        assert_automation_stream(&validator, &content, &name);
     }
     // The strictness is the point: a shape change must fail, not slide by.
     let mut record: serde_json::Value = serde_json::from_str(
@@ -14347,8 +14558,8 @@ fn automation_v1_fixtures_validate_against_schema() {
 }
 
 #[test]
-fn automation_v1_live_streams_validate_against_schema() {
-    let validator = automation_v1_validator();
+fn automation_live_streams_validate_against_schema() {
+    let validator = automation_validator();
     let manifest = format!(
         "{}{}",
         entry_line("Berlin/IMG.JPG", "berlin/2024/img.jpg", Some("file")),
@@ -14367,7 +14578,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
         assert!(out.status.success(), "{name}: {}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path(&results))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
     }
 
     // partial: one mapping entry fails. Exit 23.
@@ -14391,7 +14602,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "partial");
+        assert_automation_stream(&validator, &content, "partial");
     }
 
     // refused: --max-delete blocks the deletion pass. Exit 25.
@@ -14419,7 +14630,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "refused");
+        assert_automation_stream(&validator, &content, "refused");
     }
 
     // failed: fatal setup failure still yields a valid stream. Exit 1.
@@ -14440,7 +14651,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "failed");
+        assert_automation_stream(&validator, &content, "failed");
     }
 
     // Native removal has command-specific selector, trace, outcome, and
@@ -14458,7 +14669,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = command.run().unwrap();
         assert_output_ok(&out);
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
         assert_eq!(t.path("tree").exists(), dry_run);
     }
 }

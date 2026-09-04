@@ -1,11 +1,11 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
-use crate::crypto::{Cipher, RecordReader, RecordWriter};
 use crate::fsops::{self, FsOps};
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
 use crate::proto::*;
 use crate::remote_helper::{self, Target};
+use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -32,12 +32,12 @@ pub trait Conn: Send {
     fn supports_request_pipelining(&self) -> bool {
         true
     }
-    /// Current kernel RTT estimate for a direct TCP connection. This is a
+    /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
         None
     }
-    /// Best-effort counters for a direct TCP data connection. Collection is
+    /// Best-effort counters for a TCP data connection. Collection is
     /// deliberately observational: unavailable kernels and SSH return None.
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
         None
@@ -74,6 +74,7 @@ pub trait Conn: Send {
 pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
+    pub supports_confined_socket_nodes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1077,7 +1078,7 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
     match openssh_version(program) {
         Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => {
             Err(OpenSshVersionError(format!(
-                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --peer-auth own-credentials with credentials on the coordinator host, --peer-auth full-agent, or an explicit --rsh policy"
             ))
             .into())
         }
@@ -1149,7 +1150,7 @@ pub struct RemoteSpec {
     pub rsh: Vec<String>,
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
-    pub auto_helper: bool,
+    pub bootstrap_helper: bool,
     /// One-time signed authorization for a command-restricted receiver. It is
     /// sent only on the SSH control connection; authenticated TCP workers are
     /// children of that already-authorized receiver.
@@ -1177,7 +1178,7 @@ impl RemoteSpec {
             port: None,
             rsh: vec!["local".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -1321,7 +1322,7 @@ impl RemoteSpec {
         if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
-        if self.auto_helper {
+        if self.bootstrap_helper {
             return remote_helper::launcher(args);
         }
         format!("syq {}", shell_words::join(args))
@@ -1350,7 +1351,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
         self.install_helper()?;
@@ -1374,7 +1375,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
 
@@ -1566,9 +1567,11 @@ impl RemoteSpec {
         let key = if plain {
             None
         } else {
-            Some(crate::crypto::random_bytes(crate::crypto::KEY_LEN))
+            Some(crate::tcp_records::random_bytes(
+                crate::tcp_records::KEY_LEN,
+            ))
         };
-        let token = crate::crypto::random_bytes(16);
+        let token = crate::tcp_records::random_bytes(16);
         let resp = ctl.call(Request::TcpListen {
             key: key.clone(),
             token: token.clone(),
@@ -1964,8 +1967,16 @@ fn hello(
         role,
     })?;
     match conn.recv() {
-        Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
-            conn.peer = Some(PeerInfo { identity, platform });
+        Ok(Response::HelloOk {
+            identity,
+            platform,
+            supports_confined_socket_nodes,
+        }) if identity == crate::identity::build() => {
+            conn.peer = Some(PeerInfo {
+                identity,
+                platform,
+                supports_confined_socket_nodes,
+            });
         }
         Ok(Response::HelloOk { identity, .. }) => {
             bail!(
@@ -2060,7 +2071,7 @@ impl RemoteSpec {
                 self.label()
             )
         })?;
-        let direct_download = text
+        let remote_download = text
             .lines()
             .find_map(|line| line.strip_prefix("syq-helper-tools:"))
             .is_some_and(|tools| {
@@ -2072,16 +2083,16 @@ impl RemoteSpec {
             });
         Ok(RemoteBootstrap {
             target,
-            direct_download,
+            remote_download,
         })
     }
 
     fn bootstrap_helper(&self, bootstrap: RemoteBootstrap) -> Result<()> {
         let mut trusted = None;
-        if bootstrap.direct_download {
-            match self.try_direct_helper(bootstrap.target)? {
-                DirectHelper::Installed => return Ok(()),
-                DirectHelper::Fallback { detail, helper } => {
+        if bootstrap.remote_download {
+            match self.try_remote_download(bootstrap.target)? {
+                RemoteDownloadOutcome::Installed => return Ok(()),
+                RemoteDownloadOutcome::Fallback { detail, helper } => {
                     trusted = helper;
                     if !self.quiet {
                         eprintln!(
@@ -2091,7 +2102,7 @@ impl RemoteSpec {
                         );
                     }
                 }
-                DirectHelper::Integrity { warning, helper } => {
+                RemoteDownloadOutcome::Integrity { warning, helper } => {
                     trusted = helper;
                     eprintln!(
                         "syq: warning: {}: {}; the remote download was discarded; uploading the verified helper over SSH",
@@ -2117,7 +2128,7 @@ impl RemoteSpec {
         self.upload_helper(bootstrap.target, &binary)
     }
 
-    fn try_direct_helper(&self, target: Target) -> Result<DirectHelper> {
+    fn try_remote_download(&self, target: Target) -> Result<RemoteDownloadOutcome> {
         let script = remote_helper::download_script(target);
         let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
@@ -2145,7 +2156,7 @@ impl RemoteSpec {
             bytes
         });
 
-        let report = read_direct_report(&mut BufReader::new(stdout));
+        let report = read_remote_download_report(&mut BufReader::new(stdout));
         let mut helper = None;
         let mut integrity_warning = None;
         let mut protocol_detail = None;
@@ -2204,9 +2215,9 @@ impl RemoteSpec {
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
             return if authorized {
-                Ok(DirectHelper::Installed)
+                Ok(RemoteDownloadOutcome::Installed)
             } else {
-                Ok(DirectHelper::Fallback {
+                Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail
                         .unwrap_or_else(|| "the remote ignored a discard decision".into()),
                     helper,
@@ -2214,17 +2225,19 @@ impl RemoteSpec {
             };
         }
         match status.code() {
-            Some(remote_helper::DIRECT_FALLBACK_EXIT) => Ok(DirectHelper::Fallback {
-                detail: if detail.is_empty() {
-                    protocol_detail.unwrap_or_default()
-                } else {
-                    detail
-                },
-                helper,
-            }),
-            Some(remote_helper::DIRECT_INTEGRITY_EXIT) => match integrity_warning {
-                Some(warning) => Ok(DirectHelper::Integrity { warning, helper }),
-                None => Ok(DirectHelper::Fallback {
+            Some(remote_helper::REMOTE_DOWNLOAD_FALLBACK_EXIT) => {
+                Ok(RemoteDownloadOutcome::Fallback {
+                    detail: if detail.is_empty() {
+                        protocol_detail.unwrap_or_default()
+                    } else {
+                        detail
+                    },
+                    helper,
+                })
+            }
+            Some(remote_helper::REMOTE_DOWNLOAD_INTEGRITY_EXIT) => match integrity_warning {
+                Some(warning) => Ok(RemoteDownloadOutcome::Integrity { warning, helper }),
+                None => Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail.unwrap_or(detail),
                     helper,
                 }),
@@ -2272,10 +2285,10 @@ impl RemoteSpec {
 #[derive(Clone, Copy)]
 struct RemoteBootstrap {
     target: Target,
-    direct_download: bool,
+    remote_download: bool,
 }
 
-enum DirectHelper {
+enum RemoteDownloadOutcome {
     Installed,
     Fallback {
         detail: String,
@@ -2288,12 +2301,14 @@ enum DirectHelper {
 }
 
 #[derive(Debug)]
-struct DirectReport {
+struct RemoteDownloadReport {
     manifest: Vec<u8>,
     sha256: String,
 }
 
-fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<DirectReport>> {
+fn read_remote_download_report(
+    reader: &mut impl BufRead,
+) -> std::io::Result<Option<RemoteDownloadReport>> {
     const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
     let mut line = Vec::new();
     if reader.read_until(b'\n', &mut line)? == 0 {
@@ -2363,7 +2378,7 @@ fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<Direc
             "remote helper report contained trailing or malformed protocol data",
         ));
     }
-    Ok(Some(DirectReport { manifest, sha256 }))
+    Ok(Some(RemoteDownloadReport { manifest, sha256 }))
 }
 
 fn protocol_line(mut line: &[u8]) -> &[u8] {
@@ -2596,7 +2611,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 1,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             })
             .unwrap();
         let Response::SourceRootsRegistered(roots) = response else {
@@ -2634,7 +2649,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 1,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             })
             .unwrap();
         let Response::SourceRootsRegistered(roots) = response else {
@@ -2859,7 +2874,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -2948,6 +2963,8 @@ mod tests {
                 .write_msg(&Response::HelloOk {
                     identity: crate::identity::build().to_string(),
                     platform: crate::identity::platform(),
+                    supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(
+                    ),
                 })
                 .unwrap();
         });
@@ -3170,19 +3187,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_frames_manifest_and_digest() {
+    fn remote_download_report_frames_manifest_and_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
         );
-        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        let report = read_remote_download_report(&mut bytes.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(report.manifest, b"{\n  \"schema\": 1\n}\n");
         assert_eq!(report.sha256, digest);
     }
 
     #[test]
-    fn direct_download_report_rejects_unterminated_manifest() {
-        let error = read_direct_report(
+    fn remote_download_report_rejects_unterminated_manifest() {
+        let error = read_remote_download_report(
             &mut b"syq-helper-manifest-begin\nsyq-helper-manifest-data:{\"schema\":1}\n".as_slice(),
         )
         .unwrap_err();
@@ -3190,13 +3209,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_keeps_injected_markers_inside_the_manifest() {
+    fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
         let spoofed = "a".repeat(64);
         let actual = "b".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
         );
-        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        let report = read_remote_download_report(&mut bytes.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(report.sha256, actual);
         assert!(report
             .manifest
@@ -3209,12 +3230,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_rejects_data_after_the_digest() {
+    fn remote_download_report_rejects_data_after_the_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
         );
-        let error = read_direct_report(&mut bytes.as_bytes()).unwrap_err();
+        let error = read_remote_download_report(&mut bytes.as_bytes()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -3227,7 +3248,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".to_string()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -3263,7 +3284,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(multiplexer),
@@ -3329,7 +3350,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
@@ -3379,7 +3400,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),

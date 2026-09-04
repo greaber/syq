@@ -143,7 +143,7 @@ fn endpoint_key(endpoint: &Endpoint) -> String {
     }
 }
 
-fn transport_key(endpoint: &Endpoint) -> Option<&'static str> {
+fn transport_label(endpoint: &Endpoint) -> Option<&'static str> {
     match endpoint {
         Endpoint::Local { .. } => None,
         Endpoint::Remote(spec) if spec.local_process => None,
@@ -161,13 +161,13 @@ pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
     if !src.is_remote() && !dst.is_remote() {
         return None;
     }
-    let transport = [transport_key(src), transport_key(dst)]
+    let transport = [transport_label(src), transport_label(dst)]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join("+");
     Some(format!(
-        "v1|{}>{}|{transport}",
+        "{}>{}|{transport}",
         endpoint_key(src),
         endpoint_key(dst)
     ))
@@ -185,7 +185,7 @@ fn cache_path() -> Option<PathBuf> {
                 .filter(|path| !path.is_empty())
                 .map(|home| PathBuf::from(home).join(".cache"))
         })
-        .map(|root| root.join("syq/tuning-v1.json"))
+        .map(|root| root.join("syq/tuning.json"))
 }
 
 fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
@@ -881,7 +881,7 @@ pub fn run(
             break;
         }
 
-        // A same-machine single-file copy starts with one cheap direct-copy
+        // A same-machine single-file copy starts with one cheap kernel copy
         // probe. If the receiver reports a partial or unsupported kernel
         // offload, skip the measurement ramp and restore the ordinary local
         // starting count before userspace ranges become the bottleneck.
@@ -1113,7 +1113,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,

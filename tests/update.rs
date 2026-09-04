@@ -1,9 +1,9 @@
 //! End-to-end standalone updater tests using a copied executable and signed,
 //! local fixtures. No test ever replaces the Cargo-built binary.
 //!
-//! Every test here exercises the Linux release layout, so the whole file is
-//! compiled only on Linux.
-#![cfg(target_os = "linux")]
+//! The fixtures select the release artifact for the current Linux or macOS
+//! host so the same update contract is exercised on every release platform.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
@@ -18,6 +18,16 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+fn release_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-arm64",
+        other => panic!("unsupported update-test platform {other:?}"),
+    }
+}
 
 struct TempDir(PathBuf);
 
@@ -43,7 +53,6 @@ impl Drop for TempDir {
     }
 }
 
-#[cfg(target_os = "linux")]
 struct UpdateFixture {
     temp: TempDir,
     installed: PathBuf,
@@ -52,7 +61,6 @@ struct UpdateFixture {
     original: Vec<u8>,
 }
 
-#[cfg(target_os = "linux")]
 impl UpdateFixture {
     fn new(release_version: &str, executable_identity: &str) -> Self {
         let temp = TempDir::new();
@@ -62,11 +70,7 @@ impl UpdateFixture {
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
         let original = fs::read(&installed).unwrap();
 
-        let target = if cfg!(target_arch = "x86_64") {
-            "linux-x86_64"
-        } else {
-            "linux-aarch64"
-        };
+        let target = release_target();
         let asset = format!("syq-{target}");
         let replacement = format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'syq {release_version}' ;;\n  --build-identity) echo '{executable_identity}' ;;\n  *) exit 2 ;;\nesac\n"
@@ -197,28 +201,38 @@ fn assert_failure_contains(output: &Output, expected: &str) {
     );
 }
 
-#[cfg(target_os = "linux")]
+fn next_release_version() -> String {
+    let mut version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    version.patch = version.patch.checked_add(1).unwrap();
+    version.to_string()
+}
+
 #[test]
 fn signed_self_update_replaces_only_the_receipted_copy() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
     fixture.register();
 
     let update = fixture.command("--self-update");
     assert_success(&update);
-    assert!(String::from_utf8_lossy(&update.stdout).contains("updated syq to 0.2.0"));
+    assert!(String::from_utf8_lossy(&update.stdout)
+        .contains(&format!("updated syq to {release_version}")));
 
     let version = Command::new(&fixture.installed)
         .arg("--version")
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "syq 0.2.0");
-    assert_eq!(fixture.receipt()["version"], "0.2.0");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("syq {release_version}")
+    );
+    assert_eq!(fixture.receipt()["version"], release_version);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_update_rejects_a_tampered_signed_manifest_without_changing_install() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
     fixture.register();
     let path = fixture.temp.path("fixtures/syq-release-manifest.json");
     let mut manifest: serde_json::Value =
@@ -231,16 +245,12 @@ fn self_update_rejects_a_tampered_signed_manifest_without_changing_install() {
     fixture.assert_original_unchanged();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_update_rejects_a_tampered_archive_without_changing_install() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
     fixture.register();
-    let target = if cfg!(target_arch = "x86_64") {
-        "linux-x86_64"
-    } else {
-        "linux-aarch64"
-    };
+    let target = release_target();
     let archive = fixture.temp.path(&format!("fixtures/syq-{target}.gz"));
     File::options()
         .append(true)
@@ -254,10 +264,10 @@ fn self_update_rejects_a_tampered_archive_without_changing_install() {
     fixture.assert_original_unchanged();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_update_rejects_an_executable_with_the_wrong_build_identity() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0+dev.wrong");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}+dev.wrong"));
     fixture.register();
 
     let update = fixture.command("--self-update");
@@ -265,7 +275,6 @@ fn self_update_rejects_an_executable_with_the_wrong_build_identity() {
     fixture.assert_original_unchanged();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_update_refuses_a_signed_downgrade() {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
@@ -287,10 +296,10 @@ fn self_update_refuses_a_signed_downgrade() {
     fixture.assert_original_unchanged();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn receipt_is_bound_to_the_exact_installed_executable() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
     fixture.register();
     let other = fixture.temp.path("other/syq");
     fs::create_dir_all(other.parent().unwrap()).unwrap();
@@ -303,10 +312,10 @@ fn receipt_is_bound_to_the_exact_installed_executable() {
     assert_eq!(fs::read(other).unwrap(), fixture.original);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn source_install_cannot_create_or_use_a_standalone_receipt_implicitly() {
-    let fixture = UpdateFixture::new("0.2.0", "v0.2.0");
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
 
     let update = fixture.command("--self-update");
     assert_failure_contains(&update, "self-update is only available");

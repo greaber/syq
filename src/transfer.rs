@@ -1,4 +1,4 @@
-//! The orchestrator: scan, diff, schedule, and the per-worker transfer loop.
+//! The coordinator: scan, diff, schedule, and the per-worker transfer loop.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
@@ -87,7 +87,7 @@ pub struct Opts {
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
-    pub partial_id: std::sync::OnceLock<PartialId>,
+    pub copy_id: std::sync::OnceLock<CopyId>,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
     /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
@@ -144,7 +144,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                auto_helper: args.restricted_grant.is_none()
+                bootstrap_helper: args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant: args.restricted_grant.clone(),
@@ -280,7 +280,7 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
 }
 
 fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
-    if spec.auto_helper {
+    if spec.bootstrap_helper {
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {
@@ -532,7 +532,7 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
 }
 
 /// The canonical form of a path (symlinks and `..` resolved the way the kernel
-/// does), normalized by the endpoint that holds it. Used for the job identity —
+/// does), normalized by the endpoint that holds it. Used for the copy identity —
 /// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
 fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
     if !remote {
@@ -592,7 +592,7 @@ fn destination_identity_plan(
     }
 }
 
-/// Encode the content/metadata-affecting options into the job identity.
+/// Encode the content/metadata-affecting options into the copy identity.
 fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     let source_modes: Vec<&str> = srcs
         .iter()
@@ -632,7 +632,7 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
     flags.to_string()
 }
 
-/// The endpoint half of a job identity: `user@host[:port]` (the user and an
+/// The endpoint half of a copy identity: `user@host[:port]` (the user and an
 /// explicit port matter — they may select different filesystems), or `local`.
 fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
@@ -716,7 +716,7 @@ pub(crate) fn validate_native_source_type(
     }
 }
 
-fn copy_identity(
+fn resolve_copy_identity(
     args: &Args,
     srcs: &[Location],
     dst: &Location,
@@ -754,7 +754,7 @@ fn copy_identity(
         None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
     };
     let dst_root = path_identity(&dst_root);
-    Ok(crate::resume::job_identity(
+    Ok(crate::resume::copy_identity(
         &endpoint_identity(&srcs[0]),
         &src_roots,
         &endpoint_identity(dst),
@@ -870,7 +870,7 @@ fn announce_detached_ready() -> Result<()> {
 pub fn run(args: Args) -> Result<i32> {
     // The results stream and progress exist before anything else can fail,
     // so every run that got past argument parsing settles with a terminal
-    // record — fatal setup failures included (spec: automation v1).
+    // record — fatal setup failures included (spec: automation results).
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         args.connections,
@@ -908,16 +908,16 @@ pub fn run(args: Args) -> Result<i32> {
                 exit_code: 1,
                 dry_run,
                 files_transferred: progress.files_done.load(Relaxed),
-                files_unchanged: progress.files_skipped.load(Relaxed),
+                files_unchanged: progress.files_unchanged.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
                 // Mutations that settled (and streamed their records)
                 // before the run died must not vanish from the aggregates.
-                directories_created: progress.dirs_created.load(Relaxed),
-                symlinks_created: progress.links_created.load(Relaxed),
+                directories_created: progress.directories_created.load(Relaxed),
+                symlinks_created: progress.symlinks_created.load(Relaxed),
                 specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
                 bytes_transferred: progress.bytes_done.load(Relaxed),
-                bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
                 // What the deletion pass did before the run died; zeros
                 // mean it never got that far, and status "failed" already
@@ -1029,10 +1029,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !original_srcs[0].same_host(dst)
         && !args.relay
         && args.coordinate_at != CoordinateAt::Local;
-    if (args.detach || args.no_forward_agent || args.agent_broker_only) && !direct_remote_to_remote
+    if (args.detach || args.peer_auth != crate::cli::PeerAuth::Restricted)
+        && !direct_remote_to_remote
     {
         bail!(
-            "--detach, --no-forward-agent, and --agent-broker-only apply only to a direct copy between two different remote endpoints"
+            "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
     if args.pscope_explicit && coordinator_is_remote {
@@ -1044,18 +1045,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote orchestrator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
         );
     }
     for source in original_srcs {
         if !source.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
         }
-    }
-    if args.unrestricted_agent_forwarding && !direct_remote_to_remote {
-        bail!(
-            "--unrestricted-agent-forwarding is only valid for a live direct transfer between two different remote hosts"
-        );
     }
     let source_operand_count = if native_locations {
         original_srcs.len()
@@ -1126,14 +1122,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_SSH;
         }
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Dst {
-            return crate::direct::coordinate_at_dst(
+            return crate::remote_to_remote::coordinate_at_dst(
                 &args,
                 srcs,
                 dst,
                 progress.results_writer().cloned(),
             );
         }
-        return crate::direct::run(&args, srcs, dst, progress.results_writer().cloned());
+        return crate::remote_to_remote::run(&args, srcs, dst, progress.results_writer().cloned());
     }
     if srcs[0].is_remote() && dst.is_remote() {
         if args.interface != Interface::Rsync && args.coordinate_at == CoordinateAt::Local {
@@ -1165,7 +1161,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // option forces SSH data.
     // A local receiver uses one child process and a loopback data listener so
     // every worker shares its retained destination cwd without changing the
-    // orchestrator process's cwd.
+    // coordinator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -1180,7 +1176,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(not(target_os = "linux"))]
     if let Some(algorithm) = &args.tcp_congestion {
         bail!(
-            "{} {algorithm} requires a Linux transfer orchestrator and Linux remote endpoints",
+            "{} {algorithm} requires a Linux transfer coordinator and Linux remote endpoints",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
@@ -1203,7 +1199,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
-        partial_id: std::sync::OnceLock::new(),
+        copy_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
         delete_excluded: args.delete_excluded,
@@ -1485,6 +1481,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    let destination_supports_confined_socket_nodes = match &dst_ep {
+        Endpoint::Remote(spec) => {
+            spec.diagnostics()
+                .peer
+                .context("destination handshake did not report receiver capabilities")?
+                .supports_confined_socket_nodes
+        }
+        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
+    };
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
     let mut pending_tcp_setups = Vec::new();
     if let Some(ports) = tcp_ports {
@@ -1520,7 +1525,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Remote(_) if use_tcp => maximum_workers,
         Endpoint::Remote(_) => 0,
     };
-    let source_independent_claim_workers = match &src_ep {
+    let source_independent_handoff_workers = match &src_ep {
         Endpoint::Local { .. } => 0,
         Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
@@ -1534,7 +1539,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             0
         };
-    let source_independent_claim_workers = source_independent_claim_workers
+    let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;
     let registered_sources = register_source_roots(
@@ -1542,7 +1547,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         srcs,
         &args,
         source_shared_workers,
-        source_independent_claim_workers,
+        source_independent_handoff_workers,
     )?;
     source_roots
         .set(registered_sources)
@@ -1558,7 +1563,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // canonical parent plus the operator-supplied leaf. Ordinary endpoints
     // compute that form here; restricted setup already supplied and signed
     // it. Canonicalizing the whole path would dereference an existing leaf
-    // symlink and give the self-copy guard and resumable-job identity the
+    // symlink and give the self-copy guard and resumable-copy identity the
     // wrong destination.
     let exact_native_destination =
         args.interface != Interface::Rsync && args.placement == Placement::As;
@@ -1917,7 +1922,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    let identity = copy_identity(
+    let identity = resolve_copy_identity(
         &args,
         srcs,
         dst,
@@ -1926,8 +1931,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Some(dst_canonical),
         &opts,
     )?;
-    opts.partial_id
-        .set(crate::resume::partial_id(&identity))
+    opts.copy_id
+        .set(crate::resume::copy_id(&identity))
         .expect("partial identity set once");
     if debug() {
         eprintln!(
@@ -2135,6 +2140,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        destination_supports_confined_socket_nodes,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
@@ -2150,7 +2156,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         scan_warned: false,
         max_delete_hit: false,
         delete_walk_failed: false,
-        root_path: dst_root.clone(),
+        dst_root: dst_root.clone(),
         exact_condition,
         mutation_root_condition,
         container_guard,
@@ -2501,15 +2507,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // summary count the same set (spec: summary renders from the record).
     dry_run_changes.directories.remove(&dst_root);
     let created_counts = (
-        progress.dirs_created.load(Relaxed),
-        progress.links_created.load(Relaxed),
+        progress.directories_created.load(Relaxed),
+        progress.symlinks_created.load(Relaxed),
         progress.specials_created.load(Relaxed),
     );
     drop(st);
 
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
-    // machine as marked lines. That machine verifies it; this orchestrator's
+    // machine as marked lines. That machine verifies it; this coordinator's
     // own report is not trusted for what landed.
     if args.restricted_grant.is_some() {
         use base64::Engine as _;
@@ -2518,8 +2524,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             loop {
                 match dst_ctl.recv() {
-                    Ok(Response::ReceiptV2(frame)) => {
-                        let terminal = match crate::receipt_v2::transport_frame_is_end(&frame) {
+                    Ok(Response::Receipt(frame)) => {
+                        let terminal = match crate::receipt::receipt_frame_is_end(&frame) {
                             Ok(terminal) => terminal,
                             Err(error) => {
                                 progress.error(&format!("syq: receipt: {error:#}"));
@@ -2528,7 +2534,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         };
                         println!(
                             "{}{}",
-                            crate::receipt_v2::RECEIPT_LINE_PREFIX,
+                            crate::receipt::RECEIPT_LINE_PREFIX,
                             base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
                         );
                         if terminal {
@@ -2591,7 +2597,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         exit_code,
         dry_run: opts.dry_run,
         files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_skipped.load(Relaxed),
+        files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
         // Live counters only move when mutations run; a dry run reports the
         // planned work it traced instead.
@@ -2612,7 +2618,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_skipped.load(Relaxed),
+        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned,
         deletions_completed,
@@ -2727,10 +2733,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
-                commas(progress.files_skipped.load(Relaxed)),
+                commas(progress.files_unchanged.load(Relaxed)),
                 commas(progress.files_excluded.load(Relaxed)),
                 commas(bytes_work),
-                commas(progress.bytes_skipped.load(Relaxed)),
+                commas(progress.bytes_unchanged.load(Relaxed)),
                 elapsed,
                 match &tuned {
                     Some(p) => format!(
@@ -2998,7 +3004,7 @@ fn register_source_roots(
     sources: &[Location],
     args: &Args,
     shared_workers: usize,
-    independent_claim_workers: usize,
+    independent_handoff_workers: usize,
 ) -> Result<Vec<RegisteredSourceRoot>> {
     let source_is_local = !sources.iter().any(Location::is_remote);
     let base = if let Some(path) = &args.native_source_root {
@@ -3030,7 +3036,7 @@ fn register_source_roots(
             symlink_policy: source_operator_symlink_policy(args, source_is_local),
             allow_unconfined_paths: rsync_insecure_links(args, source_is_local),
             shared_workers,
-            independent_claim_workers,
+            independent_handoff_workers,
         })?,
         "register source roots",
     )? {
@@ -3313,6 +3319,10 @@ fn kind_label(kind: Kind) -> &'static str {
         Kind::BlockDev => "block device",
         Kind::Other => "unsupported entry",
     }
+}
+
+fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) -> bool {
+    kind != Kind::Socket || destination_supports_sockets
 }
 
 fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
@@ -3615,8 +3625,8 @@ fn print_dry_run_summary(
         "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
         count_label(progress.files_total.load(Relaxed), "file", "files"),
-        human(progress.bytes_skipped.load(Relaxed)),
-        count_label(progress.files_skipped.load(Relaxed), "file", "files")
+        human(progress.bytes_unchanged.load(Relaxed)),
+        count_label(progress.files_unchanged.load(Relaxed), "file", "files")
     );
     if let Some(capacity) = capacity {
         let inode_detail = capacity.available_inodes.map_or_else(
@@ -3684,6 +3694,9 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
+    /// Capability reported by the destination receiver's authenticated
+    /// handshake. The coordinator may be running on a different platform.
+    destination_supports_confined_socket_nodes: bool,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -3744,7 +3757,7 @@ struct Planner<'a> {
     /// This run consumes a --mapping manifest (identity entries included).
     mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
-    root_path: PathBytes,
+    dst_root: PathBytes,
     exact_condition: TargetCondition,
     mutation_root_condition: TargetCondition,
     container_guard: Option<ContainerGuard>,
@@ -3854,13 +3867,19 @@ impl Planner<'_> {
                         .is_none_or(|minimum| entry.size >= minimum)
             }
             Kind::Symlink => self.opts.links,
-            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => self.opts.devices,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                self.opts.devices
+                    && special_creation_supported(
+                        self.destination_supports_confined_socket_nodes,
+                        entry.kind,
+                    )
+            }
             Kind::Other => false,
         };
         if !included {
             return;
         }
-        let reuses_existing_root = dst == self.root_path && entry.kind == Kind::Dir;
+        let reuses_existing_root = dst == self.dst_root && entry.kind == Kind::Dir;
         let Some(plan) = &mut self.fresh_capacity else {
             return;
         };
@@ -3911,7 +3930,7 @@ impl Planner<'_> {
     }
 
     fn exact_condition_for(&self, path: &[u8]) -> TargetCondition {
-        if path == self.root_path {
+        if path == self.dst_root {
             self.exact_condition
         } else {
             TargetCondition::Any
@@ -3934,14 +3953,14 @@ impl Planner<'_> {
             | TargetCondition::MatchesFingerprint { dev, ino, .. } => (dev, ino),
             TargetCondition::Any | TargetCondition::Absent => return Ok(()),
         };
-        let current = stat_many(self.dst, vec![self.root_path.clone()], false)?
+        let current = stat_many(self.dst, vec![self.dst_root.clone()], false)?
             .pop()
             .flatten();
         match current {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(()),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
-                display(&self.root_path)
+                display(&self.dst_root)
             ),
         }
     }
@@ -4607,7 +4626,13 @@ impl Planner<'_> {
                     ino: e.ino,
                 },
                 Kind::Symlink if opts.links => Claim::Leaf,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev if opts.devices => {
+                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+                    if opts.devices
+                        && special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
+                {
                     Claim::Leaf
                 }
                 _ => Claim::Weak,
@@ -4643,6 +4668,19 @@ impl Planner<'_> {
                 Claim::Dir => dirs.push((dst, dst_rel, e)),
                 Claim::Weak if e.kind == Kind::Other => {
                     // Unknown type: never transferred.
+                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                }
+                Claim::Weak
+                    if e.kind == Kind::Socket
+                        && opts.devices
+                        && !special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
+                {
+                    self.progress.eprintln(&format!(
+                        "syq: skipping socket \"{rel}\": macOS cannot create socket nodes through a confined destination"
+                    ));
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {
@@ -4931,7 +4969,7 @@ impl Planner<'_> {
                     .iter()
                     .filter(|(path, _, _, st)| {
                         let root_must_be_new = self.exact_condition == TargetCondition::Absent
-                            && path == &self.root_path;
+                            && path == &self.dst_root;
                         root_must_be_new
                             || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
@@ -4948,7 +4986,7 @@ impl Planner<'_> {
                             path,
                             condition: TargetCondition::Absent,
                             ..
-                        } if path == &self.root_path
+                        } if path == &self.dst_root
                     )
                 }) {
                     // Establish the new authority directory by itself. Every
@@ -4969,12 +5007,12 @@ impl Planner<'_> {
                         self.collision = true;
                         return Ok(());
                     }
-                    self.progress.dirs_created.fetch_add(1, Relaxed);
+                    self.progress.directories_created.fetch_add(1, Relaxed);
                     if opts.verbose > 0 {
                         self.progress
-                            .println(&format!("{}/", display(&self.root_path)));
+                            .println(&format!("{}/", display(&self.dst_root)));
                     }
-                    let created = stat_many(self.dst, vec![self.root_path.clone()], false)?
+                    let created = stat_many(self.dst, vec![self.dst_root.clone()], false)?
                         .pop()
                         .flatten()
                         .filter(|entry| entry.kind == Kind::Dir)
@@ -4982,7 +5020,7 @@ impl Planner<'_> {
                     self.exact_condition = target_identity(&created);
                     self.mutation_root_condition = target_identity(&created);
                     if self.guard_containers {
-                        self.container_guard = Some(target_container(&self.root_path, &created));
+                        self.container_guard = Some(target_container(&self.dst_root, &created));
                     }
                 }
                 for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
@@ -5012,7 +5050,7 @@ impl Planner<'_> {
                                 Some("io"),
                                 os_kind,
                             );
-                            if name == &self.root_path && *condition != TargetCondition::Any {
+                            if name == &self.dst_root && *condition != TargetCondition::Any {
                                 self.collision = true;
                             }
                         } else if opts.verbose > 0 && !preexisting {
@@ -5056,7 +5094,7 @@ impl Planner<'_> {
                         }
                     }
                     self.progress
-                        .dirs_created
+                        .directories_created
                         .fetch_add((n - failed - reopened) as u64, Relaxed);
                     if let Some(error) = capacity_error {
                         return Err(endpoint_error(error)).context("apply destination changes");
@@ -5265,8 +5303,8 @@ impl Planner<'_> {
                                 ff |= flags::GROUP;
                             }
                             if ff != 0 {
-                                self.progress.files_skipped.fetch_add(1, Relaxed);
-                                self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                                self.progress.files_unchanged.fetch_add(1, Relaxed);
+                                self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                                 if opts.dry_run {
                                     self.dry_run_changes.metadata_files += 1;
                                     self.emit_trace(
@@ -5296,8 +5334,8 @@ impl Planner<'_> {
                                 continue;
                             }
                         }
-                        self.progress.files_skipped.fetch_add(1, Relaxed);
-                        self.progress.bytes_skipped.fetch_add(e.size, Relaxed);
+                        self.progress.files_unchanged.fetch_add(1, Relaxed);
+                        self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
                     } else if opts.dry_run {
                         self.progress.files_total.fetch_add(1, Relaxed);
                         self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -5548,7 +5586,7 @@ impl Planner<'_> {
                     // phantom creations in the terminal aggregates.
                     match queued.action {
                         "create_symlink" => {
-                            self.progress.links_created.fetch_add(1, Relaxed);
+                            self.progress.symlinks_created.fetch_add(1, Relaxed);
                         }
                         _ => {
                             self.progress.specials_created.fetch_add(1, Relaxed);
@@ -5680,9 +5718,9 @@ impl Planner<'_> {
         let (sidecars, dir_stats, other_stats) = if pre_stat {
             let response = self.dst.call(Request::PlanBatch {
                 partial_paths,
-                partial_id: *self
+                copy_id: *self
                     .opts
-                    .partial_id
+                    .copy_id
                     .get()
                     .expect("partial identity initialized before planning"),
                 directories: directories.clone(),
@@ -5939,7 +5977,7 @@ impl Planner<'_> {
             dst_entry,
             target_condition,
             container_guard: self.container_guard.clone(),
-            attempts: 0,
+            attempt: 0,
             done: Arc::new(AtomicU64::new(0)),
             inplace: false,
             src_rel,
@@ -6033,7 +6071,7 @@ impl Planner<'_> {
                         // namespace preflight listed. Membership is the whole
                         // test: a path is only in that set if the receiver
                         // generated it for this job, and the compact
-                        // (near-PATH_MAX) form doesn't even embed the job id,
+                        // (near-PATH_MAX) form doesn't even embed the copy ID,
                         // so there is nothing valid to compare names against.
                         // Anything else matching the pattern is an ordinary
                         // extra: syq itself copies such names as payload now,
@@ -6113,7 +6151,7 @@ impl Planner<'_> {
     fn flush_dry_directory_traces(&mut self) {
         let creates = std::mem::take(&mut self.dry_run_changes.directory_creates);
         for (path, reason) in creates {
-            if let Some(dst_rel) = strip_dst_root(&path, &self.root_path) {
+            if let Some(dst_rel) = strip_dst_root(&path, &self.dst_root) {
                 self.emit_trace_with_src(
                     "create_directory",
                     dst_rel,
@@ -6143,7 +6181,7 @@ impl Planner<'_> {
                         .map(|(p, _, kind)| (p, *kind))
                         .chain(dirs.values().flatten().map(|(p, _, _)| (p, "dir")));
                     for (p, kind) in blocked {
-                        let Some(dst_rel) = strip_dst_root(p, &self.root_path) else {
+                        let Some(dst_rel) = strip_dst_root(p, &self.dst_root) else {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {
@@ -6176,7 +6214,7 @@ impl Planner<'_> {
                     for (p, rel, kind) in chunk {
                         n += 1;
                         me.progress.deletions_completed.fetch_add(1, Relaxed);
-                        if let Some(dst_rel) = strip_dst_root(p, &me.root_path) {
+                        if let Some(dst_rel) = strip_dst_root(p, &me.dst_root) {
                             me.emit_trace("delete", dst_rel, kind, None, "destination_only");
                         }
                         if opts.verbose > 0 {
@@ -6216,7 +6254,7 @@ impl Planner<'_> {
                         ),
                     }
                     if let Some(results) = me.progress.results_writer() {
-                        let Some(dst_rel) = strip_dst_root(p, &me.root_path) else {
+                        let Some(dst_rel) = strip_dst_root(p, &me.dst_root) else {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {
@@ -6344,9 +6382,9 @@ impl Planner<'_> {
         match ok(
             self.dst.call(Request::PartialPaths {
                 paths,
-                partial_id: *self
+                copy_id: *self
                     .opts
-                    .partial_id
+                    .copy_id
                     .get()
                     .expect("partial identity initialized before planning"),
                 guard: None,
@@ -6646,7 +6684,7 @@ impl Worker {
             .map(|job| SmallRead {
                 path: job.src.clone(),
                 source: self.source_reference(job),
-                attempt: job.attempts,
+                attempt: job.attempt,
                 len: job.entry.size as u32,
             })
             .collect();
@@ -6703,7 +6741,7 @@ impl Worker {
             meta.mode = self.create_mode(j);
             puts.push(SmallPut {
                 path: j.dst.clone(),
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 data,
                 hash,
                 meta,
@@ -6790,7 +6828,7 @@ impl Worker {
             if changed {
                 if let (Some(e), true, true) = (
                     now,
-                    j.attempts + 1 < MAX_ATTEMPTS,
+                    j.attempt + 1 < MAX_ATTEMPTS,
                     j.target_condition == TargetCondition::Any,
                 ) {
                     if !self.opts.quiet {
@@ -6807,7 +6845,7 @@ impl Worker {
                         path: job.entry.path.clone(),
                         ..e
                     };
-                    job.attempts += 1;
+                    job.attempt += 1;
                     job.dst_entry = Some(published);
                     drop(all);
                     self.sched.requeue(*idx);
@@ -6837,7 +6875,7 @@ impl Worker {
                     kind: "file",
                     disposition: "succeeded",
                     bytes: Some(j.entry.size),
-                    attempts: Some(u64::from(j.attempts) + 1),
+                    attempts: Some(u64::from(j.attempt) + 1),
                     retryable: None,
                     class: None,
                     os_kind: None,
@@ -6891,7 +6929,7 @@ impl Worker {
                 kind: "file",
                 disposition: "failed",
                 bytes: None,
-                attempts: Some(u64::from(job.attempts) + 1),
+                attempts: Some(u64::from(job.attempt) + 1),
                 retryable: Some(retryable),
                 class: Some("io"),
                 os_kind,
@@ -6985,9 +7023,9 @@ impl Worker {
                     path: job.dst.clone(),
                     size,
                     inplace,
-                    partial_id: self.partial_id(),
+                    copy_id: self.copy_id(),
                     mode: self.create_mode(&job),
-                    attempt: job.attempts,
+                    attempt: job.attempt,
                     create_if_missing: inplace || !final_is_file,
                     guard: job.container_guard.clone(),
                 })?,
@@ -7017,7 +7055,7 @@ impl Worker {
                     ok(
                         self.dst.call(Request::FinishBasis {
                             path: job.dst.clone(),
-                            partial_id: self.partial_id(),
+                            copy_id: self.copy_id(),
                             meta,
                             flags: publication_metadata_flags(self.opts.flags),
                             condition: job.target_condition,
@@ -7030,9 +7068,9 @@ impl Worker {
                 ok(
                     self.dst.call(Request::SeedBasis {
                         path: job.dst.clone(),
-                        partial_id: self.partial_id(),
+                        copy_id: self.copy_id(),
                         len: size,
-                        attempt: job.attempts,
+                        attempt: job.attempt,
                         guard: job.container_guard.clone(),
                     })?,
                     "seed partial from destination basis",
@@ -7055,7 +7093,7 @@ impl Worker {
         let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
         job.done.store(size - to_send, Relaxed);
         self.progress
-            .bytes_skipped
+            .bytes_unchanged
             .fetch_add(size - to_send, Relaxed);
         self.progress.bytes_total.fetch_sub(size - to_send, Relaxed);
         match self.sched.ranges_ready(idx, ranges) {
@@ -7126,7 +7164,7 @@ impl Worker {
             dst: job.dst.clone(),
             inplace,
             allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
-            partial_id: self.partial_id(),
+            copy_id: self.copy_id(),
             size: job.entry.size,
             mode,
         })?;
@@ -7171,10 +7209,10 @@ impl Worker {
         }
     }
 
-    fn partial_id(&self) -> PartialId {
+    fn copy_id(&self) -> CopyId {
         *self
             .opts
-            .partial_id
+            .copy_id
             .get()
             .expect("partial identity initialized before planning")
     }
@@ -7197,10 +7235,10 @@ impl Worker {
                 path: job.dst.clone(),
                 source: None,
                 which,
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 block: self.opts.block,
                 len: job.entry.size,
-                attempt: job.attempts,
+                attempt: job.attempt,
                 guard: None,
             },
             "hash destination",
@@ -7215,7 +7253,7 @@ impl Worker {
             job,
             Request::HashAndHold {
                 path: job.dst.clone(),
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 block: self.opts.block,
                 len: job.entry.size,
                 condition: job.target_condition,
@@ -7242,10 +7280,10 @@ impl Worker {
             path: job.src.clone(),
             source: self.source_reference(job),
             which: Which::Final,
-            partial_id: self.partial_id(),
+            copy_id: self.copy_id(),
             block,
             len: size,
-            attempt: job.attempts,
+            attempt: job.attempt,
             guard: None,
         })?;
         self.dst.send(destination_request)?;
@@ -7353,7 +7391,7 @@ impl Worker {
                 self.src.send(Request::ReadRange {
                     path: job.src.clone(),
                     source: self.source_reference(&job),
-                    attempt: job.attempts,
+                    attempt: job.attempt,
                     off,
                     len: n as u32,
                 })?;
@@ -7374,8 +7412,8 @@ impl Worker {
             self.dst.send(Request::WriteRange {
                 path: job.dst.clone(),
                 inplace,
-                partial_id: self.partial_id(),
-                attempt: job.attempts,
+                copy_id: self.copy_id(),
+                attempt: job.attempt,
                 off,
                 hash,
                 data,
@@ -7434,7 +7472,7 @@ impl Worker {
             self.dst.call(Request::Finalize {
                 path: job.dst.clone(),
                 inplace: job.inplace,
-                partial_id: self.partial_id(),
+                copy_id: self.copy_id(),
                 meta,
                 flags,
                 condition: job.target_condition,
@@ -7453,7 +7491,7 @@ impl Worker {
             let partial_missing = match ok(
                 self.dst.call(Request::ProbePartial {
                     path: job.dst.clone(),
-                    partial_id: self.partial_id(),
+                    copy_id: self.copy_id(),
                     guard: None,
                 })?,
                 "probe partial after finalize",
@@ -7533,7 +7571,7 @@ impl Worker {
             None => true,
         };
         if changed {
-            if job.attempts + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
+            if job.attempt + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
                 if let Some(e) = now {
                     if !self.opts.quiet {
                         self.progress.eprintln(&format!(
@@ -7549,7 +7587,7 @@ impl Worker {
                         path: j.entry.path.clone(),
                         ..e
                     };
-                    j.attempts += 1;
+                    j.attempt += 1;
                     j.dst_entry = Some(published);
                     j.done.store(0, Relaxed);
                     drop(jobs);
@@ -7561,7 +7599,7 @@ impl Worker {
         }
         if matched {
             self.progress.files_total.fetch_sub(1, Relaxed);
-            self.progress.files_skipped.fetch_add(1, Relaxed);
+            self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
@@ -7572,7 +7610,7 @@ impl Worker {
                     kind: "file",
                     disposition: "succeeded",
                     bytes: Some(job.entry.size),
-                    attempts: Some(u64::from(job.attempts) + 1),
+                    attempts: Some(u64::from(job.attempt) + 1),
                     retryable: None,
                     class: None,
                     os_kind: None,
@@ -8031,7 +8069,7 @@ fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
     Ok(ManifestEntry { src, dst, kind })
 }
 
-fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
+pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
     if path.is_empty() {
         bail!("{which} path is empty");
     }

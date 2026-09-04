@@ -137,7 +137,7 @@ binary is on the non-interactive remote `PATH`; `syq rsync` uses `--rsync-path
 /path/to/syq` or `--syq-no-bootstrap`.
 
 The local client verifies the manifest's embedded Ed25519 signature over its
-RFC 8785 canonical JSON. Direct remote download uses `curl` or `wget`, `gzip`,
+RFC 8785 canonical JSON. A remote download uses `curl` or `wget`, `gzip`,
 and one of `sha256sum`, `shasum`, or `openssl`; those programs are optional
 because missing or unusable tools select verified SSH upload instead. Version
 directories coexist and either helper cache can be removed at any time; syq
@@ -155,8 +155,8 @@ the client on your machine and on the coordinator host must be 8.9 or newer,
 and so must the `sshd` on the other remote. Syq checks the two clients it runs
 and stops with a message naming the older one. Ubuntu 22.04, Debian 12, RHEL 9
 with current updates, and macOS 13 or newer qualify; RHEL 8, Ubuntu 20.04, and
-Debian 11 do not. On such hosts pass `--no-forward-agent` and keep credentials
-on the coordinator host, or choose `--unrestricted-agent-forwarding` or an
+Debian 11 do not. On such hosts pass `--peer-auth own-credentials` and keep credentials
+on the coordinator host, or choose `--peer-auth full-agent` or an
 explicit `--rsh` policy. `syq cp -vv` prints the client version it found.
 
 On macOS, Apple's `ssh` ships without a built-in FIDO provider, so a

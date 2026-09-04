@@ -1,6 +1,7 @@
-//! Direct remote-to-remote: run the orchestrator on the source host so data
+//! Remote-to-remote copies: run the coordinator on one of the remote hosts so data
 //! flows source→destination without passing through this machine.
 
+use crate::cli::PeerAuth;
 use crate::cli::{parse_rsh, Args, Existence, Interface, Location, Placement, SourceSelection};
 use crate::delegation::RequestId;
 use crate::enrollment::EnrollmentId;
@@ -15,8 +16,8 @@ struct ReceiptExpectation {
     public_key: String,
     enrollment_id: EnrollmentId,
     request_id: RequestId,
-    recipient_secret: Option<crate::receipt_v2::RecipientSecret>,
-    policy: crate::receipt_v2::ReceiptPolicyV2,
+    recipient_secret: Option<crate::receipt::RecipientSecret>,
+    policy: crate::receipt::ReceiptPolicy,
     grant_digest: Option<[u8; 32]>,
 }
 
@@ -28,31 +29,29 @@ struct ReceiptSettlementOutcome {
 }
 
 fn receipt_settlement_outcome(
-    receipt_status: crate::receipt_v2::ReceiptStatusV2,
+    receipt_status: crate::receipt::ReceiptStatus,
     refusals: u64,
-    orchestrator_exit_code: i32,
+    coordinator_exit_code: i32,
 ) -> ReceiptSettlementOutcome {
     // The receipt decides whether verification fails the run: a non-clean
     // receipt against a coordinator that claimed success is a contradiction
     // the exit code must surface.
     let rejects_receipt = refusals > 0
-        || (receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
-            && orchestrator_exit_code == 0);
+        || (receipt_status != crate::receipt::ReceiptStatus::Clean && coordinator_exit_code == 0);
     // Status first, then the exit code the automation contract pairs with
     // it — the two can never disagree.
-    let results_status = if receipt_status == crate::receipt_v2::ReceiptStatusV2::Incomplete {
+    let results_status = if receipt_status == crate::receipt::ReceiptStatus::Incomplete {
         // An incomplete receipt stream can omit operations. Never describe it
         // as safe input for a per-entry retry, even when the coordinator also
         // reported a conventional partial-transfer exit.
         "aborted"
-    } else if orchestrator_exit_code == 1 {
+    } else if coordinator_exit_code == 1 {
         // A coordinator-fatal run may hold unsettled entries; the attested
         // records still describe what did land.
         "failed"
-    } else if refusals > 0 || orchestrator_exit_code == 25 {
+    } else if refusals > 0 || coordinator_exit_code == 25 {
         "refused"
-    } else if receipt_status != crate::receipt_v2::ReceiptStatusV2::Clean
-        || orchestrator_exit_code == 23
+    } else if receipt_status != crate::receipt::ReceiptStatus::Clean || coordinator_exit_code == 23
     {
         "partial"
     } else {
@@ -71,8 +70,8 @@ fn receipt_settlement_outcome(
     }
 }
 
-const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
-const MAX_RECEIPT_V2_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
+const MAX_RECEIPT_LINE_BYTES: usize = 192 * 1024;
+const MAX_RECEIPT_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
 
 struct CapturedReceipt {
     file: std::fs::File,
@@ -95,14 +94,14 @@ impl CapturedReceipt {
         if self.ended {
             bail!("the relayed receipt contains a frame after its terminal frame");
         }
-        let terminal = crate::receipt_v2::transport_frame_is_end(encoded)?;
+        let terminal = crate::receipt::receipt_frame_is_end(encoded)?;
         let length = u32::try_from(encoded.len()).context("receipt frame length exceeds u32")?;
         let added = 4u64 + u64::from(length);
         self.bytes = self
             .bytes
             .checked_add(added)
             .context("receipt capture byte count overflow")?;
-        if self.bytes > MAX_RECEIPT_V2_CAPTURE_BYTES {
+        if self.bytes > MAX_RECEIPT_CAPTURE_BYTES {
             bail!("the relayed receipt exceeds its local capture limit");
         }
         self.file.write_all(&length.to_be_bytes())?;
@@ -150,7 +149,7 @@ impl Iterator for CapturedFrames<'_> {
 /// other transfers inherit stdout untouched. Frames are decoded one line
 /// at a time and spooled rather than accumulated in memory.
 fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
-    let prefix = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes();
+    let prefix = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes();
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     let mut out = std::io::stdout().lock();
     let mut receipt = None;
@@ -171,7 +170,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
     loop {
         let buffer = reader
             .fill_buf()
-            .context("read remote orchestrator output")?;
+            .context("read remote coordinator output")?;
         if buffer.is_empty() {
             break;
         }
@@ -191,7 +190,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                         capturing = Some(head[prefix.len()..].to_vec());
                     } else {
                         out.write_all(&head)
-                            .context("relay remote orchestrator output")?;
+                            .context("relay remote coordinator output")?;
                     }
                     head.clear();
                 }
@@ -199,18 +198,18 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                 payload.extend_from_slice(segment);
             } else {
                 out.write_all(segment)
-                    .context("relay remote orchestrator output")?;
+                    .context("relay remote coordinator output")?;
             }
             if let Some(payload) = capturing.as_mut() {
-                if payload.len() > MAX_RECEIPT_V2_LINE_BYTES {
-                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_V2_LINE_BYTES} bytes");
+                if payload.len() > MAX_RECEIPT_LINE_BYTES {
+                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_LINE_BYTES} bytes");
                 }
             }
             if ends_line {
                 if let Some(mut payload) = capturing.take() {
                     store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
                 } else {
-                    out.flush().context("relay remote orchestrator output")?;
+                    out.flush().context("relay remote coordinator output")?;
                 }
                 decided = false;
             }
@@ -223,20 +222,20 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
             capturing = Some(head[prefix.len()..].to_vec());
         } else {
             out.write_all(&head)
-                .context("relay remote orchestrator output")?;
+                .context("relay remote coordinator output")?;
         }
     }
     if let Some(mut payload) = capturing.take() {
         store_receipt_line(&mut receipt, finish_capture(&mut payload))?;
     }
-    out.flush().context("relay remote orchestrator output")?;
+    out.flush().context("relay remote coordinator output")?;
     Ok(receipt)
 }
 
 fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload.trim_ascii())
-        .context("decode a receipt v2 frame relayed from the source host")?;
+        .context("decode a receipt frame relayed from the source host")?;
     let receipt = match captured {
         Some(receipt) => receipt,
         None => captured.insert(CapturedReceipt::new()?),
@@ -246,12 +245,12 @@ fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) 
 
 /// Verify hostB's receipt against the grant this machine signed. A missing,
 /// unverifiable, or mismatching receipt fails the transfer regardless of
-/// what the source-side orchestrator reported.
+/// what the source-side coordinator reported.
 /// The context a captured receipt settles against.
 struct ReceiptSettlement<'a> {
     src_host: &'a str,
     dst_host: &'a str,
-    orchestrator_exit_code: i32,
+    coordinator_exit_code: i32,
     results: Option<&'a crate::results::ResultsWriter>,
     elapsed_ms: u64,
     verbose: bool,
@@ -272,10 +271,10 @@ fn settle_receipt(
             settlement.src_host
         );
     };
-    settle_receipt_v2(expectation, captured, settlement)
+    settle_captured_receipt(expectation, captured, settlement)
 }
 
-fn settle_receipt_v2(
+fn settle_captured_receipt(
     expectation: &ReceiptExpectation,
     captured: &mut CapturedReceipt,
     settlement: ReceiptSettlement<'_>,
@@ -283,7 +282,7 @@ fn settle_receipt_v2(
     let ReceiptSettlement {
         src_host,
         dst_host,
-        orchestrator_exit_code,
+        coordinator_exit_code,
         results,
         elapsed_ms,
         verbose,
@@ -299,7 +298,7 @@ fn settle_receipt_v2(
     let policy = &expectation.policy;
     if !matches!(
         policy.delivery,
-        crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted { .. }
+        crate::receipt::ReceiptDelivery::AttachedEncrypted { .. }
     ) {
         bail!("an attached transfer has a detached receipt policy");
     }
@@ -307,7 +306,7 @@ fn settle_receipt_v2(
         .grant_digest
         .context("the signed grant digest is unavailable")?;
     let frames = captured.frames()?;
-    let mut receipt = crate::receipt_v2::open_attached_frames(
+    let mut receipt = crate::receipt::open_attached_frames(
         frames,
         secret,
         &expectation.public_key,
@@ -322,11 +321,11 @@ fn settle_receipt_v2(
     receipt.for_each_record(|record| {
         if first_problem.is_none() {
             first_problem = match record {
-                crate::receipt_v2::RecordV2::Operation(record)
+                crate::receipt::ReceiptRecord::Operation(record)
                     if !matches!(
                         record.disposition,
-                        crate::receipt_v2::OperationDispositionV2::Applied
-                            | crate::receipt_v2::OperationDispositionV2::Observed
+                        crate::receipt::OperationDisposition::Succeeded
+                            | crate::receipt::OperationDisposition::Observed
                     ) =>
                 {
                     Some(format!(
@@ -342,7 +341,7 @@ fn settle_receipt_v2(
                             .unwrap_or_default()
                     ))
                 }
-                crate::receipt_v2::RecordV2::Refusal(record) => Some(format!(
+                crate::receipt::ReceiptRecord::Refusal(record) => Some(format!(
                     "receiver refusal{}",
                     record
                         .diagnostic
@@ -350,11 +349,11 @@ fn settle_receipt_v2(
                         .map(|message| format!(": {message}"))
                         .unwrap_or_default()
                 )),
-                crate::receipt_v2::RecordV2::FinalState(record)
+                crate::receipt::ReceiptRecord::FinalState(record)
                     if matches!(
                         record.object,
-                        crate::receipt_v2::FinalObjectV2::ObservationFailed { .. }
-                            | crate::receipt_v2::FinalObjectV2::Present {
+                        crate::receipt::FinalObject::ObservationFailed { .. }
+                            | crate::receipt::FinalObject::Present {
                                 observation_error: Some(_),
                                 ..
                             }
@@ -376,7 +375,7 @@ fn settle_receipt_v2(
     let outcome = receipt_settlement_outcome(
         terminal.status,
         terminal.summary.refusals,
-        orchestrator_exit_code,
+        coordinator_exit_code,
     );
     let settlement_error = if terminal.summary.refusals > 0 {
         Some(format!(
@@ -384,8 +383,7 @@ fn settle_receipt_v2(
             terminal.summary.refusals,
             first_problem.as_deref().unwrap_or("(no detail recorded)")
         ))
-    } else if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean
-        && orchestrator_exit_code == 0
+    } else if terminal.status != crate::receipt::ReceiptStatus::Clean && coordinator_exit_code == 0
     {
         Some(format!(
             "the receiver on {dst_host} issued a {:?} receipt{}, yet {src_host} reported success",
@@ -400,7 +398,7 @@ fn settle_receipt_v2(
     };
     debug_assert_eq!(outcome.rejects_receipt, settlement_error.is_some());
     if let Some(writer) = results {
-        let emitted = crate::receipt_v2::emit_automation_records(
+        let emitted = crate::receipt::emit_automation_records(
             &mut receipt,
             writer,
             outcome.results_status,
@@ -418,7 +416,7 @@ fn settle_receipt_v2(
                 crate::progress::human(terminal.summary.transferred_bytes),
                 terminal.summary.deletions,
                 emitted.errors,
-                crate::receipt_v2::receipt_status_label(terminal.status),
+                crate::receipt::receipt_status_label(terminal.status),
                 outcome.results_status,
             );
         }
@@ -433,7 +431,7 @@ fn settle_receipt_v2(
     if let Some(message) = settlement_error {
         bail!(message);
     }
-    if terminal.status != crate::receipt_v2::ReceiptStatusV2::Clean {
+    if terminal.status != crate::receipt::ReceiptStatus::Clean {
         let message = format!(
             "the receiver on {dst_host} issued a {:?} receipt{}",
             terminal.status,
@@ -454,7 +452,7 @@ fn settle_receipt_v2(
             terminal.summary.deletions
         );
     }
-    Ok(orchestrator_exit_code)
+    Ok(coordinator_exit_code)
 }
 
 #[derive(Clone, Debug)]
@@ -727,14 +725,9 @@ pub fn coordinate_at_dst(
     if args.interface == Interface::Rsync {
         bail!("--coordinate-at dst is available only through native copy syntax");
     }
-    if !srcs[0].same_host(dst)
-        && args.rsh.is_none()
-        && !args.no_forward_agent
-        && !args.unrestricted_agent_forwarding
-        && !args.agent_broker_only
-    {
+    if !srcs[0].same_host(dst) && args.rsh.is_none() && args.peer_auth == PeerAuth::Restricted {
         bail!(
-            "--coordinate-at dst requires a read-restricted source enrollment, which is not implemented yet; use --agent-broker-only, --no-forward-agent with its own credentials for the peer, or an explicit --rsh policy"
+            "--coordinate-at dst requires a read-restricted source enrollment, which is not implemented yet; use --peer-auth broker, --peer-auth own-credentials with the coordinator's own credentials for the peer, or an explicit --rsh policy"
         );
     }
     run_remote(args, srcs, dst, true, results)
@@ -753,9 +746,10 @@ fn run_remote(
     let peer = if coordinator_at_dst { &srcs[0] } else { dst };
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
-    if args.detach && args.rsh.is_none() && !same_host && !args.no_forward_agent {
+    if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
+    {
         bail!(
-            "a constrained agent exists only while syq is attached; --detach requires --no-forward-agent and credentials on {coordinator_host}, or an explicit --rsh policy"
+            "a constrained agent exists only while syq is attached; --detach requires --peer-auth own-credentials and credentials on {coordinator_host}, or an explicit --rsh policy"
         );
     }
 
@@ -768,9 +762,9 @@ fn run_remote(
     let mut receipt_expectation = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
         None
-    } else if same_host || args.no_forward_agent {
+    } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
         Some(AgentForwarding::Disabled)
-    } else if args.unrestricted_agent_forwarding {
+    } else if args.peer_auth == PeerAuth::FullAgent {
         Some(AgentForwarding::Unrestricted)
     } else {
         crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
@@ -795,7 +789,7 @@ fn run_remote(
         // Native new/existing placement forms travel in the signed grant as the
         // root-existence precondition, so they use the receiver like any other
         // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_dst && !args.agent_broker_only)
+        let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
             .then(|| {
                 crate::restricted::prepare_transfer(
                     args,
@@ -808,7 +802,7 @@ fn run_remote(
             })
             .transpose()
             .context(
-                "prepare command-restricted destination enrollment; use --agent-broker-only to explicitly request authentication-only confinement",
+                "prepare command-restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
             )?;
         let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
         let limit = broker_connection_limit(args.connections_opt, args.connections)?;
@@ -845,14 +839,13 @@ fn run_remote(
             broker: socket,
         })
     };
-    if (args.max_entries.is_some()
-        || args.max_total_bytes.is_some()
-        || args.max_runtime_secs.is_some()
-        || args.receipt_requested)
+    if (args.receiver_max_entries.is_some()
+        || args.receiver_max_bytes.is_some()
+        || args.receiver_receipt.is_some())
         && restricted_grant.is_none()
     {
         bail!(
-            "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);
@@ -863,7 +856,7 @@ fn run_remote(
         port: coordinator.port,
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
-        auto_helper: args.syq_path.is_none() && !args.no_bootstrap,
+        bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: None,
@@ -872,7 +865,7 @@ fn run_remote(
         diagnostics: Default::default(),
     };
 
-    // Rebuild the native command for the remote orchestrator. Placement stays
+    // Rebuild the native command for the remote coordinator. Placement stays
     // explicit rather than being translated into trailing-slash heuristics.
     let mut remote: Vec<String> = vec![match args.interface {
         Interface::Rsync => unreachable!("checked above"),
@@ -1135,9 +1128,9 @@ fn run_remote(
             default_ssh_agent_policy.as_ref(),
         )
     };
-    if args.unrestricted_agent_forwarding {
+    if args.peer_auth == PeerAuth::FullAgent {
         eprintln!(
-            "syq: warning: --unrestricted-agent-forwarding exposes every capability in your SSH agent to {coordinator_host} for this transfer"
+            "syq: warning: --peer-auth full-agent exposes every capability in your SSH agent to {coordinator_host} for this transfer"
         );
     }
     if args.detach {
@@ -1149,7 +1142,7 @@ fn run_remote(
             cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))
         };
         let mut out = run()?;
-        if helper_missing(out.status.code(), spec.auto_helper) {
+        if helper_missing(out.status.code(), spec.bootstrap_helper) {
             spec.install_helper()?;
             out = run()?;
         }
@@ -1191,7 +1184,7 @@ fn run_remote(
         Ok((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
-    if helper_missing(status.code(), spec.auto_helper) {
+    if helper_missing(status.code(), spec.bootstrap_helper) {
         spec.install_helper()?;
         (status, receipt_payload) = run()?;
     }
@@ -1212,11 +1205,10 @@ fn run_remote(
         // must pass through the held-terminal settlement below.
         Some(c) => {
             if args.rsh.is_none()
-                && !args.no_forward_agent
-                && !args.unrestricted_agent_forwarding
+                && matches!(args.peer_auth, PeerAuth::Restricted | PeerAuth::Broker)
                 && !same_host
             {
-                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --no-forward-agent with coordinator-host credentials, or explicitly accept full agent exposure with --unrestricted-agent-forwarding", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
+                bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }
@@ -1232,7 +1224,7 @@ fn run_remote(
             ReceiptSettlement {
                 src_host: &coordinator_host,
                 dst_host: peer.host.as_deref().unwrap_or("the peer endpoint"),
-                orchestrator_exit_code: code,
+                coordinator_exit_code: code,
                 results: results.as_deref(),
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 verbose: args.verbose > 0,
@@ -1430,7 +1422,7 @@ mod tests {
 
     #[test]
     fn receipt_settlement_preserves_terminal_outcomes() {
-        use crate::receipt_v2::ReceiptStatusV2::{Clean, Failed, Incomplete};
+        use crate::receipt::ReceiptStatus::{Clean, Failed, Incomplete};
 
         // Every (status, exit_code) pair matches the automation contract's
         // table: success/0, partial/23, refused/25, failed/1, aborted/1.
@@ -1458,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_passes_output_through_and_spools_v2_frames() {
+    fn relay_passes_output_through_and_spools_receipt_frames() {
         // Ordinary output streams through byte for byte, including bytes
         // that are not UTF-8; a stream with no receipt lines captures
         // nothing.
@@ -1470,23 +1462,23 @@ mod tests {
         // Marker lines are decoded and spooled as separate bounded frames,
         // not accumulated into one receipt allocation.
         let frames = [
-            crate::receipt_v2::TransportFrameV2::Start {
-                mode: crate::receipt_v2::TransportModeV2::DetachedSignedPlaintext,
+            crate::receipt::ReceiptFrame::Start {
+                mode: crate::receipt::ReceiptDeliveryKind::DetachedSignedPlaintext,
                 encapsulated_key: Vec::new(),
             },
-            crate::receipt_v2::TransportFrameV2::Chunk {
+            crate::receipt::ReceiptFrame::Chunk {
                 sequence: 0,
                 payload: b"stream".to_vec(),
             },
-            crate::receipt_v2::TransportFrameV2::End {
+            crate::receipt::ReceiptFrame::End {
                 sequence: 1,
                 payload: b"terminal".to_vec(),
             },
         ]
-        .map(|frame| crate::receipt_v2::encode_transport_frame(&frame).unwrap());
+        .map(|frame| crate::receipt::encode_receipt_frame(&frame).unwrap());
         let mut output = b"ordinary line\n".to_vec();
         for frame in &frames {
-            output.extend_from_slice(crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes());
+            output.extend_from_slice(crate::receipt::RECEIPT_LINE_PREFIX.as_bytes());
             output.extend_from_slice(
                 base64::engine::general_purpose::STANDARD_NO_PAD
                     .encode(frame)
@@ -1496,13 +1488,13 @@ mod tests {
         }
         let mut captured = relay_stdout(&output[..])
             .unwrap()
-            .expect("captured receipt v2 frames");
+            .expect("captured receipt frames");
         let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
         assert_eq!(captured, frames);
 
         // An oversized marker line is refused instead of buffered.
-        let mut oversized = crate::receipt_v2::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
-        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES + 1));
+        let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
+        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_LINE_BYTES + 1));
         oversized.push(b'\n');
         assert!(relay_stdout(oversized.as_slice()).is_err());
     }

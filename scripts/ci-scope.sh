@@ -10,7 +10,11 @@ run_everything() {
   printf '%s\n' \
     'native=true' \
     'sdks=true' \
+    'python_sdk=true' \
+    'javascript_sdk=true' \
+    'go_sdk=true' \
     'tooling=true' \
+    'shellcheck=true' \
     'mapping_docs=true' \
     'conformance=true' \
     'macos=true' \
@@ -63,7 +67,11 @@ fi
 
 native=false
 sdks=false
+python_sdk=false
+javascript_sdk=false
+go_sdk=false
 tooling=false
+shellcheck=false
 mapping_docs=false
 conformance=false
 macos=false
@@ -72,16 +80,33 @@ saw_path=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   saw_path=true
+  # Shell lint is cheap and independent of the path's product surface.
+  # Keep it selected even when the case below deliberately ignores the path.
+  if [[ "$path" == *.sh ]]; then
+    shellcheck=true
+  fi
   case "$path" in
     sdk/python/native-api.json)
       # This SDK-owned specification is compiled into the Rust CLI.
       native=true
-      sdks=true
+      python_sdk=true
+      ;;
+    sdk/python/*)
+      python_sdk=true
+      ;;
+    sdk/js/*)
+      javascript_sdk=true
+      ;;
+    sdk/go/*)
+      go_sdk=true
       ;;
     sdk/*)
-      sdks=true
+      # Files shared by the language SDKs can affect all of them.
+      python_sdk=true
+      javascript_sdk=true
+      go_sdk=true
       ;;
-    MAPPINGS.md)
+    MAPPINGS.md|docs/mappings.md)
       # The documented jq programs are executable integration-test inputs.
       mapping_docs=true
       ;;
@@ -91,19 +116,13 @@ while IFS= read -r path; do
     tests/fixtures/*)
       # The same protocol fixtures are consumed by Rust and Python tests.
       native=true
-      sdks=true
+      python_sdk=true
       ;;
     Cargo.toml|Cargo.lock|rust-toolchain.toml|build.rs|src/*|tests/*.rs|schemas/*)
       native=true
       ;;
     .github/workflows/ci.yml)
-      native=true
       tooling=true
-      sdks=true
-      mapping_docs=true
-      conformance=true
-      macos=true
-      linux_arm64=true
       ;;
     .github/workflows/rsync-compat.yml)
       tooling=true
@@ -111,15 +130,16 @@ while IFS= read -r path; do
       ;;
     .github/workflows/prepare-python-sdk.yml|.github/workflows/publish-sdks.yml|.github/workflows/python-api-sync.yml)
       tooling=true
-      sdks=true
+      python_sdk=true
       ;;
     scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
       tooling=true
-      sdks=true
+      python_sdk=true
       ;;
     scripts/generate-homebrew-formula.sh|scripts/test-homebrew-formula.sh|scripts/generate-installer.sh|scripts/test-installer.sh)
       tooling=true
-      macos=true
+      ;;
+    tests/real-ssh/*)
       ;;
     scripts/*|.github/workflows/*|.env.release|deny.toml)
       tooling=true
@@ -129,35 +149,45 @@ while IFS= read -r path; do
     *)
       # Unknown inputs fail safe until their dependency boundary is explicit.
       native=true
-      sdks=true
+      python_sdk=true
+      javascript_sdk=true
+      go_sdk=true
       tooling=true
+      shellcheck=true
       mapping_docs=true
       conformance=true
-      macos=true
-      linux_arm64=true
       ;;
   esac
 done <<<"$changed_paths"
 
 if [ "$saw_path" = false ]; then
   native=true
-  sdks=true
+  python_sdk=true
+  javascript_sdk=true
+  go_sdk=true
   tooling=true
+  shellcheck=true
   mapping_docs=true
   conformance=true
-  macos=true
-  linux_arm64=true
 fi
 
-# Pull requests run affected fast checks. The cumulative master state gets the
-# broad cross-subsystem and platform suites once after merge.
+# Pull requests run only affected Linux checks. The cumulative master state
+# gets broad cross-subsystem and platform coverage once after merge.
 if [ "$full_suite" = true ] && [ "$native" = true ]; then
-  sdks=true
+  python_sdk=true
+  javascript_sdk=true
+  go_sdk=true
   conformance=true
   macos=true
   linux_arm64=true
 fi
 
-printf 'native=%s\nsdks=%s\ntooling=%s\nmapping_docs=%s\nconformance=%s\nmacos=%s\nlinux_arm64=%s\nfull_suite=%s\n' \
-  "$native" "$sdks" "$tooling" "$mapping_docs" "$conformance" "$macos" "$linux_arm64" "$full_suite"
-echo "CI scope: native=$native sdks=$sdks tooling=$tooling mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2
+if [ "$python_sdk" = true ] || [ "$javascript_sdk" = true ] || [ "$go_sdk" = true ]; then
+  sdks=true
+fi
+
+printf 'native=%s\nsdks=%s\npython_sdk=%s\njavascript_sdk=%s\ngo_sdk=%s\ntooling=%s\nshellcheck=%s\nmapping_docs=%s\nconformance=%s\nmacos=%s\nlinux_arm64=%s\nfull_suite=%s\n' \
+  "$native" "$sdks" "$python_sdk" "$javascript_sdk" "$go_sdk" \
+  "$tooling" "$shellcheck" "$mapping_docs" "$conformance" "$macos" \
+  "$linux_arm64" "$full_suite"
+echo "CI scope: native=$native sdks=$sdks python_sdk=$python_sdk javascript_sdk=$javascript_sdk go_sdk=$go_sdk tooling=$tooling shellcheck=$shellcheck mapping_docs=$mapping_docs conformance=$conformance macos=$macos linux_arm64=$linux_arm64 full_suite=$full_suite" >&2

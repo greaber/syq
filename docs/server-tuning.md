@@ -191,7 +191,7 @@ tc qdisc show
 ```
 
 For a scoped comparison on Linux, `syq rsync --syq-tcp-congestion ALGO` selects an
-algorithm only for syq's direct TCP data sockets, on both the connecting and
+algorithm only for syq's TCP data sockets, on both the connecting and
 listening hosts. It does not change the host default. Both kernels must have
 the algorithm registered, and an unprivileged syq process may choose only an
 entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
@@ -228,7 +228,7 @@ Changing
 interfaces, and virtual or multiqueue devices can have different behavior.
 Changing `net.ipv4.tcp_congestion_control` affects new connections from every
 application. If both endpoints already default to the wanted algorithm, syq's
-new direct TCP sockets inherit it and no application option is needed.
+new TCP data sockets inherit it and no application option is needed.
 
 Only test these settings when network measurements point to congestion, loss,
 or queueing rather than CPU or storage. Confirm kernel support, follow the

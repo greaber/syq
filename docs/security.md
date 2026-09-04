@@ -47,7 +47,7 @@ go further:
 - Every path a remote peer sends is validated before it reaches the
   filesystem: absolute names, NUL, empty components, `.` and `..` are rejected.
 - Every selected source is resolved and registered as an open descriptor
-  before anything on the destination changes, and every worker claims those
+  before anything on the destination changes, and every worker acquires those
   exact descriptors when it starts. Directory walks, stats, content hashes, and
   reads use that descriptor plus strict relative names; they never reopen the
   operator's spelling and never follow a symlink found inside the tree. A
@@ -99,7 +99,7 @@ go further:
 What is different from rsync, or weaker:
 
 - **Resume files.** Syq always keeps partials, at deterministic names
-  (`.name.syq-part.<job-id>`) so a rerun finds its state without a state file.
+  (`.name.syq-part.<copy-id>`) so a rerun finds its state without a state file.
   Rsync's equivalent, `--partial-dir`, is opt-in and its manual warns that the
   directory must not be writable by other users. The same warning applies to
   syq's destination directories, and applies by default: a user who can write
@@ -149,7 +149,7 @@ The evidence is split along the boundaries where authority changes form:
 | Boundary | What is exercised |
 | --- | --- |
 | Operator selection | Root replacement, intermediate-link substitution, exact-leaf replacement, and missing-path placement |
-| Source capability handoff | Local workers, remote TCP workers that clone the registered descriptor, and fresh remote worker processes that claim it from the descriptor broker |
+| Source capability handoff | Local workers, remote TCP workers that clone the registered descriptor, and fresh remote worker processes that acquire it from the descriptor broker |
 | Destination capability handoff | Local receivers, remote TCP receivers, and fresh remote receiver processes, for both root replacement and descendant-parent substitution |
 | Restricted receiver | A changed signed root identity is refused, and descendant parents are opened without following links |
 | Descriptor-rooted operations | Scanning, stat and hashing, content reads, sidecar preparation, writes, publication, metadata, and pruning are tested separately against the shared rooted primitives |
@@ -236,14 +236,14 @@ never move.
 
 What it does not protect, on its own: stock OpenSSH does not bind the
 *command*. If the broker is used with an ordinary key on hostB
-(`--agent-broker-only`), hostA holds the full authority of that destination
+(`--peer-auth broker`), hostA holds the full authority of that destination
 account for the lifetime of the session. That mode restricts where and as
 whom hostA may authenticate; the next layers restrict what it may do.
 
 ### Layer 2: enrollment
 
 The first transfer to a destination parent on hostB (or an explicit
-`syq enrollment add hostB:/path`) generates a dedicated Ed25519 key locally, uploads the
+`syq receiver enroll hostB:/path`) generates a dedicated Ed25519 key locally, uploads the
 exact running syq to hostB as a receiver, and appends one managed
 `restrict,command=...` line to hostB's `authorized_keys`. The private half of
 that key never leaves the local machine. HostA never sees it; the broker signs
@@ -264,8 +264,8 @@ That one setup session is the bootstrap trust boundary: during it your local
 ssh client has ordinary command authority on hostB, exactly as it would to
 install anything. Every later transfer uses only the forced key. The
 `syq-enrollment:ID` marker makes the managed line recognizable to users,
-administrators, and monitoring, and `syq enrollment list` and
-`syq enrollment revoke` manage its lifecycle. HostB also generates a receipt
+administrators, and monitoring, and `syq receiver list` and
+`syq receiver revoke` manage its lifecycle. HostB also generates a receipt
 signing key at installation and returns its public half, which the local
 machine records with the enrollment (see Layer 6).
 
@@ -273,18 +273,19 @@ machine records with the enrollment (see Layer 6).
 
 For each transfer, the local machine signs a typed request naming the exact
 destination, login, copy semantics, hash block size, TCP port range, entry,
-byte, deletion, and connection limits, a validity interval, and a fresh nonce.
+byte, deletion, and connection limits, a start-by time, a finish-by time, and
+a fresh nonce.
 HostA carries this request but cannot alter it. The forced receiver on hostB
 verifies the signature (via OpenSSH's SSHSIG verifier and a policy file hostB
-owns), durably claims the nonce before doing anything, enforces the deadline,
+owns), durably redeems the nonce before doing anything, enforces the deadline,
 and then accepts protocol requests only within the signed scope. Redemption is
 at most once; a replayed request is rejected.
 
 Filters, `--inplace`, preservation, existing-object policy, and placement
 preconditions are signed into the grant and enforced by the receiver on its
 own. Deletion through the receiver requires an explicit `--max-delete`, and
-the native `--max-entries`, `--max-total-bytes`, and `--max-runtime` options
-lower the signed ceilings for one transfer, so what a claimed grant is worth to
+the native `--receiver-max-entries` and `--receiver-max-bytes` options
+lower the signed ceilings for one transfer, so what a redeemed grant is worth to
 hostA is always bounded on the command line. Options whose semantics the
 receiver cannot enforce independently of hostA fail closed rather than
 trusting hostA: `--files-from`, `--mapping`, `--update`, unencrypted or ssh
@@ -320,7 +321,7 @@ with hostB issuing a receipt: a stream with one outcome for every pathname
 mutation the receiver saw (each file's lifecycle, each directory, symlink, or
 metadata operation, each individual prune deletion, and every failed,
 abandoned, or refused request), followed by the final type, size, and, with
-`--receipt hashed`, BLAKE3 digest of every path an admitted mutation could have
+`--receiver-receipt digests`, BLAKE3 digest of every path an admitted mutation could have
 changed. A small signed terminal record binds the stream to the complete
 signed grant, the enrollment and one-time request IDs, and a clean or
 non-clean status. HostB encrypts the stream and terminal to a fresh
@@ -335,7 +336,7 @@ what hostA omitted or invented, and it is neither a transaction nor a rollback.
 `--detach` is not available with this command-restricted receiver because its
 constrained agent exists only while syq remains attached. A detached launch
 instead requires coordinator-owned peer credentials through
-`--no-forward-agent`, or an explicit `--rsh` policy. Neither path prepares a
+`--peer-auth own-credentials`, or an explicit `--rsh` policy. Neither path prepares a
 restricted grant or signed receipt.
 
 ### Putting the layers together
@@ -343,10 +344,10 @@ restricted grant or signed receipt.
 | Mode | HostA receives | Protects hostB against a compromised hostA? | Data path |
 |---|---|---|---|
 | Default (enrolled receiver + broker + receipt) | A signed single-use grant; broker signs with the enrollment key for this path only | Yes: cannot escape the destination, widen semantics, exceed limits, replay, or misreport what landed | A → B directly |
-| `--agent-broker-only` | Broker access to your ambient agent, valid only for hostA→user@hostB | Partially: cannot reach other hosts or users, but has that account's full authority during the session | A → B directly |
+| `--peer-auth broker` | Broker access to your ambient agent, valid only for hostA→user@hostB | Partially: cannot reach other hosts or users, but has that account's full authority during the session | A → B directly |
 | `--coordinate-at local` | Nothing | Yes, by never involving hostA in authentication | A → you → B, at your bandwidth |
-| `--no-forward-agent` | Nothing; hostA must already hold its own hostB credential | Out of syq's hands | A → B directly |
-| `--unrestricted-agent-forwarding` | Your whole agent, as `ssh -A` would | No; compatibility escape hatch with a warning `-q` cannot silence | A → B directly |
+| `--peer-auth own-credentials` | Nothing; hostA must already hold its own hostB credential | Out of syq's hands | A → B directly |
+| `--peer-auth full-agent` | Your whole agent, as `ssh -A` would | No; compatibility escape hatch with a warning `-q` cannot silence | A → B directly |
 | `--rsh CMD` | Whatever the command does | Whatever the command does | A → B directly |
 
 In every mode, a compromised hostA remains an untrusted *source*: it can omit
@@ -360,7 +361,7 @@ two hosts sharing a private host key are the same host to the broker.
 The broker is not specific to file transfer: "forward my agent to this host,
 usable only to log into that user on that other host" is what most people
 actually want from `ssh -A`. It runs today as part of syq's remote-to-remote
-transfers, in the default path and in `--agent-broker-only`; it is not
+transfers, in the default path and in `--peer-auth broker`; it is not
 available as a standalone command.
 
 The enrollment and grant layers likewise turn a Unix account into narrow,
