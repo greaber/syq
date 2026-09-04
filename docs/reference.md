@@ -246,6 +246,16 @@ pool relative to the pinned directory handles. A namespace entry already
 removed by another selector is successful. Symlinks encountered while walking
 inside a selected directory are removed as entries and are never followed.
 
+Each pinned entry is atomically moved into an owner-only quarantine directory
+in a trusted ancestor on the same filesystem before it is unlinked. Syq checks
+the quarantined device, inode, and type, so a replacement that won the race is
+restored instead of deleted. If its original name has already been reused, syq
+reports the owner-only quarantine path and leaves both entries in place. A
+later writer at the selected name is likewise left alone and reported as a
+conflict. Removal fails without deleting the selected entry when the platform
+or filesystem cannot provide atomic no-replace rename, or when no writable
+trusted ancestor exists on that filesystem.
+
 By default, native `rm` follows no symlinks while resolving `--cwd`, `--root`,
 or a selector. A symlink selected by name is removed as a symlink without
 touching its referent. A symlink in `--cwd`, or in a selector before the
