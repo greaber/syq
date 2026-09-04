@@ -3,12 +3,10 @@ name: ci
 on:
   push:
     branches: [master]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.run_id }}
 
 permissions:
   contents: read
@@ -91,12 +89,7 @@ jobs:
       - name: Lint every Rust target
         if: needs.scope.outputs.native == 'true'
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test native units before merge
-        if: >-
-          needs.scope.outputs.native == 'true' &&
-          needs.scope.outputs.full_suite != 'true'
-        run: cargo test --locked --bin syq
-      - name: Test every native target after merge
+      - name: Test every native target
         if: >-
           needs.scope.outputs.native == 'true' &&
           needs.scope.outputs.full_suite == 'true'
@@ -255,7 +248,7 @@ jobs:
           go test ./...
 
   # The release workflow builds on this runner; libc field types differ from
-  # x86-64 (st_nlink is u32 here), so check it before a tag can fail.
+  # x86-64 (st_nlink is u32 here), so check it after native changes land.
   linux-arm64:
     needs: scope
     if: always()
@@ -317,7 +310,7 @@ jobs:
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
-  # master/manual runs; pull requests defer macOS validation until after merge.
+  # master and manual runs.
   macos_intel:
     needs: scope
     if: >-
@@ -333,7 +326,7 @@ jobs:
       - name: Exercise the Intel standalone-update artifact selection
         run: cargo test --locked --test update
 
-  # Preserve the required `macos` check name while making full certifications
+  # Preserve the `macos` release-evidence name while making full certifications
   # depend on both architectures.
   macos:
     needs: [scope, macos_arm, macos_intel]

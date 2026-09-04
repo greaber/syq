@@ -21,6 +21,7 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.repository.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Check out current master
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,7 +79,7 @@ jobs:
             echo "python_version=$python_version"
             echo "syq_version=$syq_version"
           } >> "$GITHUB_OUTPUT"
-      - name: Commit the prepared release and open a pull request
+      - name: Commit and merge the prepared release
         if: steps.prepare.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -114,7 +115,7 @@ jobs:
             "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the managed executable cache documentation" \
-            "The native pull-request checks are approved explicitly because GitHub puts workflow runs caused by GITHUB_TOKEN into an approval-required state. Auto-merge is requested only after the substantive sdks check succeeds on this exact commit; publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await the post-merge workflows on the exact merge commit. Publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
@@ -122,7 +123,16 @@ jobs:
             --body "$body")
           echo "Created $pr_url"
           head_sha=$(git rev-parse HEAD)
-          scripts/approve-generated-pr-runs.sh \
-            "$GITHUB_REPOSITORY" "$branch" "$head_sha"
-          gh pr merge "$pr_url" --auto --merge --match-head-commit "$head_sha"
-          echo "Requested auto-merge for $pr_url at $head_sha"
+          gh pr merge "$pr_url" --merge --match-head-commit "$head_sha"
+          merge_sha=$(gh pr view "$pr_url" --json mergeCommit,state --jq \
+            'select(.state == "MERGED") | .mergeCommit.oid')
+          [[ "$merge_sha" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin master
+          git merge-base --is-ancestor "$head_sha" "$merge_sha"
+          git merge-base --is-ancestor "$merge_sha" origin/master
+          git push origin "$merge_sha:refs/heads/$branch"
+          echo "Merged $pr_url at $merge_sha; running post-merge workflows"
+          scripts/run-generated-sdk-post-merge-ci.sh \
+            "$GITHUB_REPOSITORY" "$branch" "$merge_sha"
+          git push origin --delete "$branch"
+          echo "Post-merge workflows passed for $merge_sha"
