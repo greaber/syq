@@ -652,6 +652,10 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
 
     let mut descriptors = Vec::new();
     let mut malformed = message.msg_flags & libc::MSG_CTRUNC != 0;
+    // SAFETY: recvmsg filled `control` through `message` and set
+    // `msg_controllen` to the bytes it wrote, which bounds the header walk.
+    // Every SCM_RIGHTS payload holds descriptors this process now owns; each
+    // is wrapped exactly once so a later rejection closes all of them.
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
@@ -667,9 +671,7 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
                     let raw = std::ptr::read_unaligned(
                         libc::CMSG_DATA(header).cast::<RawFd>().add(index),
                     );
-                    let file = File::from_raw_fd(raw);
-                    set_close_on_exec(&file)?;
-                    descriptors.push(file);
+                    descriptors.push(File::from_raw_fd(raw));
                 }
             } else {
                 malformed = true;
@@ -684,7 +686,11 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
             "descriptor broker returned malformed ancillary data",
         ));
     }
-    Ok((status[0], descriptors.pop()))
+    let descriptor = descriptors.pop();
+    if let Some(file) = &descriptor {
+        set_close_on_exec(file)?;
+    }
+    Ok((status[0], descriptor))
 }
 
 fn set_close_on_exec(file: &File) -> io::Result<()> {

@@ -2229,26 +2229,18 @@ fn rename_exchange(
     new_parent: RawFd,
     new_name: &CString,
 ) -> io::Result<()> {
-    let result = loop {
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_parent,
-                old_name.as_ptr(),
-                new_parent,
-                new_name.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        if result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            break result;
-        }
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    // SAFETY: both names are NUL-terminated and outlive the call; the
+    // descriptors are only read. The typed wrapper avoids passing `c_int`
+    // arguments through `syscall(2)`'s `long` varargs.
+    retry_zero(|| unsafe {
+        libc::renameat2(
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2879,17 +2871,13 @@ mod tests {
         fs::create_dir_all(tree.path().join(&path)).unwrap();
         let base = File::open(tree.path()).unwrap();
 
-        let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
-            0
-        );
+        let mut limits = crate::fsops::nofile_limits().unwrap();
         assert!(
             limits.rlim_max >= 64,
             "hard file-descriptor limit is below 64"
         );
         limits.rlim_cur = 64;
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }, 0);
+        crate::fsops::set_nofile_limits(&limits).unwrap();
 
         let resolver =
             OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
