@@ -32,6 +32,8 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
         run: cargo test --locked --all-targets --no-fail-fast
+      - name: Use Homebrew OpenSSL for Ed25519 signing
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Release shell suites
         run: |
           status=0

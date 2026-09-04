@@ -27,6 +27,18 @@ test -n "${SYQ_RELEASE_SIGNING_KEY_PEM_B64:-}" || {
 }
 command -v openssl >/dev/null || { echo 'signing needs openssl' >&2; exit 1; }
 command -v jq >/dev/null || { echo 'signing needs jq' >&2; exit 1; }
+
+# Ed25519 raw signing needs OpenSSL 1.1.1 or newer. macOS ships LibreSSL as
+# `openssl`, which has no `pkeyutl -rawin`; Homebrew's openssl@3 works once
+# its bin directory is first on PATH.
+require_ed25519_openssl() {
+  if ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+    echo "$0 needs OpenSSL 1.1.1 or newer with Ed25519 raw signing; found: $(openssl version 2>/dev/null || echo unknown)" >&2
+    echo 'on macOS, install openssl@3 with Homebrew and put its bin directory first on PATH' >&2
+    exit 1
+  fi
+}
+require_ed25519_openssl
 jq -e '
   type == "object"
   and .signature_scheme == "ed25519-jcs-v1"
