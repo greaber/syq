@@ -1129,6 +1129,7 @@ mod tests {
                 next: Default::default(),
             }))),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         })
     }
 

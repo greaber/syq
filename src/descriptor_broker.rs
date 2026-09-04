@@ -605,6 +605,153 @@ fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()> {
     }
 }
 
+const MAX_MESSAGE_DESCRIPTORS: usize = 3;
+const MESSAGE_CONTROL_LEN: usize = unsafe {
+    libc::CMSG_SPACE((MAX_MESSAGE_DESCRIPTORS * size_of::<RawFd>()) as libc::c_uint) as usize
+};
+
+#[repr(C)]
+union MessageControl {
+    _align: libc::cmsghdr,
+    bytes: [u8; MESSAGE_CONTROL_LEN],
+}
+
+/// Send one payload together with up to three descriptors, as the session
+/// pool hands a session over. Payload and descriptors travel in one message,
+/// so a reader cannot consume one without the other.
+pub(crate) fn send_message(socket: RawFd, payload: &[u8], descriptors: &[RawFd]) -> io::Result<()> {
+    if payload.is_empty() || descriptors.len() > MAX_MESSAGE_DESCRIPTORS {
+        return Err(io::Error::other("unsupported descriptor message"));
+    }
+    let mut payload = payload.to_vec();
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control = MessageControl {
+        bytes: [0; MESSAGE_CONTROL_LEN],
+    };
+    let mut message: libc::msghdr = unsafe { zeroed() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    if !descriptors.is_empty() {
+        let data_len = std::mem::size_of_val(descriptors);
+        message.msg_control = unsafe { control.bytes.as_mut_ptr().cast() };
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(data_len as libc::c_uint) } as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            if header.is_null() {
+                return Err(io::Error::other("SCM_RIGHTS control buffer is too small"));
+            }
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(data_len as libc::c_uint) as _;
+            for (index, descriptor) in descriptors.iter().enumerate() {
+                std::ptr::write_unaligned(
+                    libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                    *descriptor,
+                );
+            }
+        }
+    }
+    loop {
+        let sent = unsafe { libc::sendmsg(socket, &message, 0) };
+        if sent == payload.len() as isize {
+            return Ok(());
+        }
+        if sent >= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "descriptor message was sent incompletely",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Receive one payload of at most `max_payload` bytes and the descriptors
+/// sent with it, each wrapped exactly once and close-on-exec.
+pub(crate) fn receive_message(
+    socket: RawFd,
+    max_payload: usize,
+) -> io::Result<(Vec<u8>, Vec<File>)> {
+    let mut payload = vec![0u8; max_payload];
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control = MessageControl {
+        bytes: [0; MESSAGE_CONTROL_LEN],
+    };
+    let mut message: libc::msghdr = unsafe { zeroed() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = unsafe { control.bytes.as_mut_ptr().cast() };
+    message.msg_controllen = MESSAGE_CONTROL_LEN as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let received = loop {
+        let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
+        if received > 0 {
+            break received as usize;
+        }
+        if received == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed without a message",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    payload.truncate(received);
+    let mut descriptors = Vec::new();
+    let mut malformed = message.msg_flags & libc::MSG_CTRUNC != 0;
+    // SAFETY: as in receive_descriptor; every received descriptor is wrapped
+    // exactly once so a rejection closes all of them.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            let header_len = libc::CMSG_LEN(0) as usize;
+            let control_len = (*header).cmsg_len as usize;
+            if (*header).cmsg_level == libc::SOL_SOCKET
+                && (*header).cmsg_type == libc::SCM_RIGHTS
+                && control_len >= header_len
+            {
+                let data_len = control_len - header_len;
+                malformed |= data_len == 0 || !data_len.is_multiple_of(size_of::<RawFd>());
+                for index in 0..data_len / size_of::<RawFd>() {
+                    let raw = std::ptr::read_unaligned(
+                        libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                    );
+                    descriptors.push(File::from_raw_fd(raw));
+                }
+            } else {
+                malformed = true;
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    if malformed || descriptors.len() > MAX_MESSAGE_DESCRIPTORS {
+        drop(descriptors);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor message carried malformed ancillary data",
+        ));
+    }
+    for descriptor in &descriptors {
+        set_close_on_exec(descriptor)?;
+    }
+    Ok((payload, descriptors))
+}
+
 fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     let mut status = [0u8];
     let mut iovec = libc::iovec {

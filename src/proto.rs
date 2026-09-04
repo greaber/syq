@@ -1120,6 +1120,16 @@ impl<W: Write> FrameWriter<W> {
         }
     }
 
+    /// A writer for a stream whose preamble another process already sent:
+    /// a control session taken from the session pool.
+    pub fn with_preamble_written(w: W, compress: bool) -> Self {
+        FrameWriter {
+            w: BufWriter::with_capacity(1 << 20, w),
+            compress,
+            preamble_written: true,
+        }
+    }
+
     pub fn write_preamble(&mut self) -> io::Result<()> {
         if self.preamble_written {
             return Ok(());

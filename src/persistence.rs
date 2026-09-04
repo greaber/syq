@@ -452,7 +452,7 @@ fn create_marker(scope: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_scope(scope: &Path) -> Result<()> {
+pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
     validate_openssh_control_path(scope)?;
     secure_directory(scope, false, false)?;
     let marker_path = scope.join(SCOPE_MARKER);
@@ -615,12 +615,18 @@ fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
     }
     println!("connections: {}", records.len());
     for (key, record) in records {
-        let state = if socket_is_live(&scope.join(key)) {
+        let control = scope.join(&key);
+        let state = if socket_is_live(&control) {
             "live"
         } else {
             "inactive"
         };
-        println!("  {}  {state}", record.label());
+        let pool = if crate::session_pool::is_running(&control) {
+            ", session pool"
+        } else {
+            ""
+        };
+        println!("  {}  {state}{pool}", record.label());
     }
     Ok(())
 }
@@ -640,6 +646,13 @@ fn close_scope(scope: &Path) -> Result<()> {
                 continue;
             }
         }
+        if let Some(owner) = crate::session_pool::owned_name(name.as_bytes())
+            .and_then(|owner| std::str::from_utf8(owner).ok())
+        {
+            if valid_endpoint_key(owner) && record_keys.contains(owner) {
+                continue;
+            }
+        }
         bail!(
             "refusing to remove persistence scope {} because it contains unrecognized entry {:?}",
             scope.display(),
@@ -649,6 +662,8 @@ fn close_scope(scope: &Path) -> Result<()> {
 
     for (key, record) in records {
         let socket = scope.join(&key);
+        // The pool holds live sessions on the master, so it goes first.
+        crate::session_pool::stop(&socket)?;
         if socket_is_live(&socket) {
             close_master(&socket, &record)?;
         }

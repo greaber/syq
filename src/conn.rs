@@ -599,6 +599,9 @@ pub struct RemoteConn {
     peer: Option<PeerInfo>,
     tcp_socket: Option<TcpStream>,
     multiplexed_ssh: bool,
+    /// A session taken from the session pool: no child of ours to wait for,
+    /// and a reader that ends when the remote closes the pipe.
+    detached: bool,
 }
 
 const READ_AHEAD: usize = 4;
@@ -662,7 +665,45 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
     Ok(())
 }
 
+impl std::fmt::Debug for RemoteConn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteConn")
+            .field("label", &self.label)
+            .field("detached", &self.detached)
+            .finish()
+    }
+}
+
 impl RemoteConn {
+    /// A control session taken from the session pool: the ssh client's
+    /// pipes, with the preamble and hello already sent by the pool and their
+    /// replies unread. The pool reaps the ssh client once this process has
+    /// closed the pipes.
+    pub(crate) fn from_pooled(
+        session: crate::session_pool::PooledSession,
+        compress: bool,
+        label: String,
+    ) -> Self {
+        let (rx, reader) = spawn_reader(Box::new(session.stdout));
+        let mut stderr = session.stderr;
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+        });
+        RemoteConn {
+            child: None,
+            w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
+            rx: Some(rx),
+            reader: Some(reader),
+            label,
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+            multiplexed_ssh: false,
+            detached: true,
+        }
+    }
+
     fn transport_stats_with_timeout(
         &mut self,
         timeout: std::time::Duration,
@@ -837,6 +878,13 @@ impl Drop for RemoteConn {
     fn drop(&mut self) {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
+        }
+        if self.detached {
+            // Closing the pipes is the whole teardown: the remote exits on
+            // Shutdown or EOF, and waiting for its exit status would cost
+            // the round trip the pool exists to save.
+            self.rx.take();
+            return;
         }
         // Sending Shutdown asks for an orderly peer exit; shutting down the
         // retained TCP descriptor also wakes our reader clone and the peer's
@@ -1167,6 +1215,9 @@ pub struct RemoteSpec {
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
     /// User-facing facts gathered by the same connection path the transfer uses.
     pub diagnostics: std::sync::Arc<std::sync::Mutex<RemoteDiagnostics>>,
+    /// A pooled control session taken ahead of time on the main thread, for
+    /// the control connection to consume. Shared across clones like `tcp`.
+    pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<Option<RemoteConn>>>,
 }
 
 impl RemoteSpec {
@@ -1185,6 +1236,7 @@ impl RemoteSpec {
             quiet,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         }
     }
 
@@ -1315,6 +1367,71 @@ impl RemoteSpec {
         }
     }
 
+    fn pool_endpoint(&self) -> crate::session_pool::PoolEndpoint {
+        crate::session_pool::PoolEndpoint {
+            user: self.user.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            program: self.program_command(&["--server".into()]),
+        }
+    }
+
+    /// A ready control session from the persistence scope's pool, if the
+    /// pool has one for exactly the remote command this connection would
+    /// run. The pool sent the hello with a default command's flags; this
+    /// process reads the reply. Anything short of a usable session is a
+    /// reason to connect directly, never an error.
+    fn take_pooled_control(&self, compress: bool) -> Option<RemoteConn> {
+        if let Some(conn) = self.primed_control.lock().unwrap().take() {
+            return Some(conn);
+        }
+        let multiplexer = self.ssh_multiplexer.as_ref()?;
+        if !multiplexer.persistent
+            || self.local_process
+            || self.restricted_grant.is_some()
+            || !self
+                .rsh
+                .first()
+                .is_some_and(|program| program.ends_with("ssh"))
+        {
+            return None;
+        }
+        let program = self.program_command(&["--server".into()]);
+        let session = crate::session_pool::take(&multiplexer.path, &program)?;
+        let conn = RemoteConn::from_pooled(session, compress, self.label());
+        match receive_hello(conn, false) {
+            Ok(conn) => {
+                if crate::transfer::debug() {
+                    eprintln!(
+                        "syq: {}: control connection from the session pool",
+                        self.label()
+                    );
+                }
+                self.record_peer(&conn);
+                Some(conn)
+            }
+            Err(error) => {
+                if crate::transfer::debug() {
+                    eprintln!(
+                        "syq: {}: pooled session unusable ({error:#}); connecting directly",
+                        self.label()
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Take a pooled control session now, on the calling thread, for the
+    /// control connection to use later. Pooled sessions arrive as
+    /// descriptors, and Darwin cannot receive those close-on-exec
+    /// atomically, so this runs before any child is spawned alongside.
+    pub(crate) fn prime_pooled_control(&self, compress: bool) {
+        if let Some(conn) = self.take_pooled_control(compress) {
+            *self.primed_control.lock().unwrap() = Some(conn);
+        }
+    }
+
     /// A shell command that runs syq with `args` on this host.  Automatic mode
     /// addresses the exact release/build-identified helper; explicit mode preserves the
     /// administrator-provided path; disabling bootstrap uses normal PATH lookup.
@@ -1346,6 +1463,9 @@ impl RemoteSpec {
     /// transfer engine's exponential retries while retaining the exact same
     /// managed-helper bootstrap and persistent control socket behavior.
     pub(crate) fn connect_completion(&self) -> Result<RemoteConn> {
+        if let Some(conn) = self.take_pooled_control(false) {
+            return Ok(conn);
+        }
         let role = ConnectionRole::Control;
         let first = self.connect_once(false, SshConnection::Control, role.clone());
         let Err(first_error) = first else {
@@ -1371,6 +1491,11 @@ impl RemoteSpec {
         limited: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        if matches!(role, ConnectionRole::Control) && compress {
+            if let Some(conn) = self.take_pooled_control(compress) {
+                return Ok(conn);
+            }
+        }
         let first = self.connect_retried(compress, limited, role.clone());
         let Err(first_error) = first else {
             return first;
@@ -1505,6 +1630,7 @@ impl RemoteSpec {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
+            detached: false,
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
@@ -1521,6 +1647,14 @@ impl RemoteSpec {
                 &self.host,
                 self.port,
             );
+            // With persistence on, the next command should find a session
+            // ready. The pool is started here, after this connection is up,
+            // so it never sits on the critical path.
+            if let Some(multiplexer) = &self.ssh_multiplexer {
+                if multiplexer.persistent {
+                    crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
+                }
+            }
         }
         Ok(conn)
     }
@@ -1819,6 +1953,7 @@ impl RemoteSpec {
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
+                detached: false,
             };
             let conn = hello(conn, compress, info.token.clone(), role.clone())?;
             self.record_peer(&conn);
@@ -1955,6 +2090,23 @@ impl std::fmt::Debug for TcpInfo {
     }
 }
 
+/// The first request on every connection. The session pool sends it on a
+/// command's behalf with a default command's flags.
+pub(crate) fn hello_request(
+    compress: bool,
+    debug: bool,
+    token: Vec<u8>,
+    role: ConnectionRole,
+) -> Request {
+    Request::Hello {
+        identity: crate::identity::build().to_string(),
+        compress,
+        debug,
+        token,
+        role,
+    }
+}
+
 fn hello(
     mut conn: RemoteConn,
     compress: bool,
@@ -1962,13 +2114,16 @@ fn hello(
     role: ConnectionRole,
 ) -> Result<RemoteConn> {
     let worker = !matches!(role, ConnectionRole::Control);
-    conn.send(Request::Hello {
-        identity: crate::identity::build().to_string(),
+    conn.send(hello_request(
         compress,
-        debug: crate::transfer::debug(),
+        crate::transfer::debug(),
         token,
         role,
-    })?;
+    ))?;
+    receive_hello(conn, worker)
+}
+
+fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     match conn.recv() {
         Ok(Response::HelloOk {
             identity,
@@ -2889,6 +3044,7 @@ mod tests {
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let info = TcpInfo {
             addrs: vec!["127.0.0.1".into()],
@@ -2907,8 +3063,7 @@ mod tests {
                 false,
                 ConnectionRole::SourceWorker { roots: Vec::new() },
             )
-            .err()
-            .expect("unregistered congestion control should fail locally");
+            .expect_err("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
         assert!(is_tcp_congestion_error(&error));
         assert!(message.contains(
@@ -2989,6 +3144,7 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let conn = hello(
             conn,
@@ -3034,10 +3190,10 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let error = hello(conn, false, Vec::new(), ConnectionRole::Control)
-            .err()
-            .expect("an operation response is not a valid handshake");
+            .expect_err("an operation response is not a valid handshake");
         let message = format!("{error:#}");
         assert!(
             message.contains("unexpected handshake response"),
@@ -3075,6 +3231,7 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let error = conn.io_err(
             std::io::Error::new(
@@ -3134,6 +3291,7 @@ mod tests {
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
+                detached: false,
             };
             let timeout = std::time::Duration::from_millis(5);
             let start = std::time::Instant::now();
@@ -3263,6 +3421,7 @@ mod tests {
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let command = spec.ssh_command(SshConnection::Independent);
         assert!(!command
@@ -3349,6 +3508,7 @@ mod tests {
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3415,6 +3575,7 @@ mod tests {
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3465,6 +3626,7 @@ mod tests {
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
 
         let command = spec.ssh_command(SshConnection::Control);

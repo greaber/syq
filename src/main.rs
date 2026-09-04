@@ -29,6 +29,7 @@ mod rooted;
 mod scan;
 mod sched;
 mod server;
+mod session_pool;
 mod tcp_records;
 #[cfg(test)]
 mod test_support;
@@ -167,6 +168,13 @@ fn main() {
         }
         if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
             crate::output::diagnostic!("syq restricted receiver: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--session-pool") {
+        if let Err(error) = session_pool::run(&argv[2..]) {
+            eprintln!("syq session pool: {error:#}");
             std::process::exit(1);
         }
         return;

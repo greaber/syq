@@ -153,6 +153,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 quiet: args.quiet,
                 tcp: Default::default(),
                 diagnostics: Default::default(),
+                primed_control: Default::default(),
             })
         }
     })
@@ -1463,6 +1464,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     };
     let t0 = std::time::Instant::now();
+    // Pooled sessions are received as descriptors; take them on this thread
+    // before the parallel connect can spawn a child beside the receipt.
+    for endpoint in [&src_ep, &dst_ep] {
+        if let Endpoint::Remote(spec) = endpoint {
+            spec.prime_pooled_control(args.compress);
+        }
+    }
     let (mut src_ctl, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
         let t = std::thread::spawn(move || connect_ctl(&a, &b));

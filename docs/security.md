@@ -396,6 +396,31 @@ rather than shell commands, which is what makes it auditable, and a grant names
 an operation, a destination directory, and limits. The policies it enforces
 are the copy, verify, and delete semantics of syq's own transfers.
 
+## Persistent connections
+
+`syq persist on` trades a little exposure for speed, and the trade should be
+understood before it is made. While it is on, an OpenSSH control connection
+to each endpoint you use stays authenticated for five minutes after the last
+command, and a small per-endpoint background process keeps one helper
+session opened on that connection ready for the next command. During that
+window, anything that can act as the same local user can run commands on
+those endpoints without touching your key or agent: through the control
+socket, or by taking the ready session. This is the same boundary as sudo's
+credential cache. The sockets live in a private runtime directory that only
+your user can open, the pool checks the caller's user id as well, and the
+window ends with `syq persist off`.
+
+The pool cannot widen that boundary. It never authenticates: a session is
+opened only after the master answers a liveness check, with every
+authentication method turned off, so a dead connection leaves the pool empty
+rather than logging in on its own, and a changed host key or a required
+prompt reaches you through the next command you run yourself. It never reads
+from the session it holds, so the command that takes it sees exactly what a
+fresh session would show. It matches the exact remote command and syq build
+of the command asking, and exits when a different build appears, when its
+scope is removed, or after five minutes idle. Restricted receivers, explicit
+remote shells, and remote coordinators do not use it.
+
 ## Release and bootstrap integrity
 
 Using a file tool over ssh means running its code on the other machine. With

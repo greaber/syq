@@ -3734,6 +3734,9 @@ fi
 printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        # A control-master query: answer for a live master unless the test
+        # says otherwise, as the session pool asks before every spare.
+        -O) if [ "$2" = check ]; then exit "${FAKE_SSH_CHECK_STATUS:-0}"; fi; shift 2 ;;
         -o|-l|-p|-S) shift 2 ;;
         -a|-A|-x|-k|-T) shift ;;
         --) shift; break ;;
@@ -14002,6 +14005,283 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     let status = persistence_command(&t, &["status"]).run().unwrap();
     assert_output_ok(&status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
+}
+
+/// Poll a condition with a hard deadline; the message names what never came.
+fn wait_for(what: &str, deadline: std::time::Duration, mut condition: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + deadline;
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The session pool's own ssh invocations, as the fake logs them: a master
+/// check, or a spare opened with every authentication method disabled.
+fn pool_lines(log: &str) -> (Vec<&str>, Vec<&str>) {
+    let checks = log
+        .lines()
+        .filter(|line| line.contains("-O check"))
+        .collect();
+    let spares = log
+        .lines()
+        .filter(|line| line.contains("PubkeyAuthentication=no") && line.contains("--server"))
+        .collect();
+    (checks, spares)
+}
+
+/// With persistence on, the first command starts a session pool for its
+/// endpoint. The pool opens a spare without authenticating, later commands
+/// take it instead of opening an ssh session of their own, and `persist off`
+/// stops the pool with the scope.
+#[test]
+fn session_pool_serves_later_commands_without_new_ssh_sessions() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    write(&t.path("local.txt"), b"hello");
+    fs::create_dir_all(t.path("remote-home/dest")).unwrap();
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    let scope_text = scope.to_str().unwrap().to_string();
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let complete = |t: &Tmp| {
+        completion_command(
+            t,
+            &[
+                "__complete",
+                "bash",
+                "8",
+                "--",
+                "syq",
+                "cp",
+                "--pscope",
+                &scope_text,
+                "--syq-path",
+                executable,
+                "--from",
+                "fake.example",
+                &path,
+            ],
+        )
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("SYQ_COMPLETION_DEBUG", "1")
+        .run()
+        .unwrap()
+    };
+    let log = |t: &Tmp| fs::read_to_string(t.path("rsh.log")).unwrap_or_default();
+
+    let first = complete(&t);
+    assert_output_ok(&first);
+    assert_eq!(completion_values(&first.stdout).len(), 2);
+    assert!(log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+    wait_for(
+        "the pool's first spare",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).1.is_empty(),
+    );
+    let warmed = log(&t);
+    let (checks, spares) = pool_lines(&warmed);
+    assert!(!checks.is_empty(), "{warmed}");
+    for option in [
+        "ControlMaster=no",
+        "BatchMode=yes",
+        "PubkeyAuthentication=no",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "GSSAPIAuthentication=no",
+        "HostbasedAuthentication=no",
+    ] {
+        assert!(
+            spares[0].contains(option),
+            "{option} missing: {}",
+            spares[0]
+        );
+    }
+    assert!(!spares[0].contains("ControlPersist"), "{}", spares[0]);
+    let status = persistence_command(&t, &["status", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("session pool"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // The next completion takes the spare: no session of its own.
+    write(&t.path("rsh.log"), b"");
+    let second = complete(&t);
+    assert_output_ok(&second);
+    assert_eq!(
+        completion_values(&second.stdout),
+        completion_values(&first.stdout)
+    );
+    assert!(!log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+    wait_for(
+        "the pool's replacement spare",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).1.is_empty(),
+    );
+
+    // So does a copy, which says so under SYQ_DEBUG.
+    write(&t.path("rsh.log"), b"");
+    let copy = Command::new(executable)
+        .args([
+            "cp",
+            "--pscope",
+            &scope_text,
+            "--syq-path",
+            executable,
+            "-q",
+        ])
+        .arg(t.path("local.txt"))
+        .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&copy);
+    assert!(
+        stderr_of(&copy).contains("control connection from the session pool"),
+        "{}",
+        stderr_of(&copy)
+    );
+    assert_eq!(read(&t.path("remote-home/dest/local.txt")), b"hello");
+    assert!(!log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+
+    // Closing the scope stops the pool and removes its files with the rest.
+    let closed = persistence_command(&t, &["off", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
+    wait_for(
+        "the pool process to exit",
+        std::time::Duration::from_secs(10),
+        || {
+            !Command::new("pgrep")
+                .args(["-f", &scope_text])
+                .run()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        },
+    );
+}
+
+/// A pool never opens a session on its own authority: when the master is
+/// gone the check fails, no spare is opened, and commands connect directly.
+#[test]
+fn session_pool_stays_empty_without_a_live_master() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    let scope_text = scope.to_str().unwrap().to_string();
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let complete = |t: &Tmp| {
+        completion_command(
+            t,
+            &[
+                "__complete",
+                "bash",
+                "8",
+                "--",
+                "syq",
+                "cp",
+                "--pscope",
+                &scope_text,
+                "--syq-path",
+                executable,
+                "--from",
+                "fake.example",
+                &path,
+            ],
+        )
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CHECK_STATUS", "255")
+        .env("SYQ_TEST_POOL_IDLE_SECS", "1")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("SYQ_COMPLETION_DEBUG", "1")
+        .run()
+        .unwrap()
+    };
+    let log = |t: &Tmp| fs::read_to_string(t.path("rsh.log")).unwrap_or_default();
+
+    let first = complete(&t);
+    assert_output_ok(&first);
+    wait_for(
+        "the pool's master check",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).0.is_empty(),
+    );
+    let second = complete(&t);
+    assert_output_ok(&second);
+    assert_eq!(completion_values(&second.stdout).len(), 1);
+    let checked = log(&t);
+    let (_, spares) = pool_lines(&checked);
+    assert!(spares.is_empty(), "{checked}");
+    assert_eq!(
+        log(&t)
+            .lines()
+            .filter(|line| line.contains("ControlMaster=auto"))
+            .count(),
+        2,
+        "{}",
+        log(&t)
+    );
+
+    // Idle, the pool leaves on its own; the scope's own files remain.
+    wait_for(
+        "the idle pool to exit",
+        std::time::Duration::from_secs(15),
+        || {
+            !scope.read_dir().unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pool.lock")
+            })
+        },
+    );
+    let status = persistence_command(&t, &["status", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("session pool"));
+    let closed = persistence_command(&t, &["off", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
 }
 
 #[test]

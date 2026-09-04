@@ -1162,6 +1162,7 @@ fn connect_completion_endpoint(
         quiet: true,
         tcp: Default::default(),
         diagnostics: Default::default(),
+        primed_control: Default::default(),
     };
     spec.connect_completion()
 }
