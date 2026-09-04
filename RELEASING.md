@@ -136,8 +136,11 @@ connection, so enable it only for a trusted release host rather than globally.
 ## Cutting a release
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
-   `Cargo.lock`, then run the normal locked checks to validate it. Update
-   release notes and merge through the protected branch. Peer compatibility is
+   `Cargo.lock`, then run the normal locked checks to validate it. Write the
+   curated introduction and breaking-change notes in
+   `.github/release-notes/v<version>.md`; the release workflow prepends that
+   file to GitHub's generated contributor and change list. Merge the version
+   and release notes through the protected branch. Peer compatibility is
    the immutable release identity, so there is no separate protocol number to
    maintain. Native command changes must also be classified in
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
