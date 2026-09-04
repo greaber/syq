@@ -3096,17 +3096,8 @@ fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
         .collect();
     assert_eq!(selectors, [0, 1], "{records:?}");
     let terminal = records.last().unwrap();
-    // Linux serializes the two unlinks so exactly one succeeds. macOS lets
-    // two concurrent unlinks of one name both report success (measured on a
-    // macOS 14 runner: 685 of 3000 races), so the count there can be 2.
-    if cfg!(target_os = "linux") {
-        assert_eq!(terminal["entries_removed"], 1, "{records:?}");
-        assert_eq!(terminal["entries_already_absent"], 1, "{records:?}");
-    } else {
-        let removed = terminal["entries_removed"].as_u64().unwrap();
-        let absent = terminal["entries_already_absent"].as_u64().unwrap();
-        assert!(removed >= 1 && removed + absent == 2, "{records:?}");
-    }
+    assert_eq!(terminal["entries_removed"], 1, "{records:?}");
+    assert_eq!(terminal["entries_already_absent"], 1, "{records:?}");
 }
 
 #[test]

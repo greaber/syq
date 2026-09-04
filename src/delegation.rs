@@ -879,9 +879,11 @@ impl SshsigPolicy {
             // probe for KRL magic and again to scan keys. On Darwin an open of
             // /dev/fd/N duplicates the descriptor and shares its offset, so the
             // second pass would start at EOF and a revoked key would verify.
-            // Hand macOS the snapshot's path inside the private store instead.
+            // macOS therefore names the snapshot relative to the store's
+            // retained directory descriptor, which the child enters with
+            // fchdir below, so a replaced path cannot substitute the list.
             let argument = if cfg!(target_os = "macos") {
-                store.path.join(
+                PathBuf::from(
                     &revocation_file
                         .as_ref()
                         .expect("revocation snapshot exists when its descriptor does")
@@ -896,10 +898,20 @@ impl SshsigPolicy {
         if let Some(revocation) = &revocation_child {
             mappings.push(revocation.mapping());
         }
+        let store_directory = if cfg!(target_os = "macos") && revocation_child.is_some() {
+            Some(store.directory.as_raw_fd())
+        } else {
+            None
+        };
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) == -1 {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(directory) = store_directory {
+                    if libc::fchdir(directory) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 for (source, target) in &mappings {
                     dup2_retry(*source, *target)?;
@@ -2749,6 +2761,35 @@ mod tests {
         let error = verify_and_claim(&encoded, &context(SIGNER, TARGET, NOW, 0), &policy, &replay)
             .expect_err("a key listed only for another principal must fail");
         assert!(error.to_string().starts_with("SSHSIG verification failed"));
+    }
+
+    #[test]
+    fn revocation_survives_replay_path_replacement() {
+        let fixture = Fixture::ordinary();
+        let revocations = fixture.directory.join("revocations");
+        let public_key =
+            fs::read(fixture.key.with_extension("pub")).expect("read revoked test public key");
+        write_private(&revocations, &public_key);
+        let mut policy = fixture.policy();
+        policy.revocation_file = Some(revocations);
+        let replay = fixture.replay("replaced-replay");
+        // Move the opened store aside and put a fresh, empty store at its
+        // old path. The verifier must keep using the retained directory.
+        let moved = fixture.directory.join("replaced-replay-moved");
+        fs::rename(&replay.path, &moved).expect("move replay directory");
+        provision_test_replay_directory(&replay.path);
+        let error = verify_and_claim(
+            &fixture.signed(fixture_grant(26)),
+            &context(SIGNER, TARGET, NOW, 0),
+            &policy,
+            &replay,
+        )
+        .expect_err("a revoked signer must fail after its store path is replaced");
+        assert!(
+            error.to_string().starts_with("SSHSIG verification failed"),
+            "{error:#}"
+        );
+        assert!(fs::read_dir(&replay.path).unwrap().next().is_none());
     }
 
     #[test]
