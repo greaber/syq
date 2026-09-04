@@ -97,6 +97,11 @@ assert_scope "$scope" sdks false
 assert_scope "$scope" conformance false
 assert_scope "$scope" macos false
 assert_scope "$scope" linux_arm64 false
+printf 'docs/example.sh\n' >"$paths"
+scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+assert_scope "$scope" shellcheck true
+assert_scope "$scope" tooling false
+assert_scope "$scope" native false
 printf 'tests/real-ssh/scenarios.sh\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
 assert_scope "$scope" shellcheck true

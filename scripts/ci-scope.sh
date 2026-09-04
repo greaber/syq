@@ -80,6 +80,11 @@ saw_path=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   saw_path=true
+  # Shell lint is cheap and independent of the path's product surface.
+  # Keep it selected even when the case below deliberately ignores the path.
+  if [[ "$path" == *.sh ]]; then
+    shellcheck=true
+  fi
   case "$path" in
     sdk/python/native-api.json)
       # This SDK-owned specification is compiled into the Rust CLI.
@@ -133,11 +138,6 @@ while IFS= read -r path; do
       ;;
     scripts/generate-homebrew-formula.sh|scripts/test-homebrew-formula.sh|scripts/generate-installer.sh|scripts/test-installer.sh)
       tooling=true
-      ;;
-    tests/real-ssh/*.sh)
-      # The real-SSH suite is run locally when affected; CI still lints its
-      # shell sources without promoting it to unrelated product suites.
-      shellcheck=true
       ;;
     tests/real-ssh/*)
       ;;

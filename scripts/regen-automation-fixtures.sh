@@ -142,4 +142,9 @@ mkdir -p "$dir"
     "$syq" rm -j1 --cwd missing --src victim --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/rm-failed.ndjson"
 
-echo "regenerated $(ls "$out" | wc -l) fixtures in $out"
+fixture_count=0
+for fixture in "$out"/*; do
+    [ -e "$fixture" ] || continue
+    fixture_count=$((fixture_count + 1))
+done
+echo "regenerated $fixture_count fixtures in $out"
