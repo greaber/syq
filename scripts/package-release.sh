@@ -100,7 +100,7 @@ for asset in "${assets[@]}"; do
 done | sort > "$expected"
 printf '%s\n' install.sh syq-release-manifest.json syq.rb >> "$expected"
 sort -o "$expected" "$expected"
-find "$dist" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$actual"
+find "$dist" -mindepth 1 -maxdepth 1 | sed 's|.*/||' | sort > "$actual"
 diff -u "$expected" "$actual" || {
   echo "release directory contains missing or unexpected files" >&2
   exit 1

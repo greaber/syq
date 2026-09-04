@@ -1,5 +1,8 @@
 name: macOS suite
 
+# The complete native test suite, clippy, and the release shell suites on
+# macOS. Pull-request CI runs a narrow macOS job in ci.yml; this cumulative
+# run happens after every merge to master and on demand.
 on:
   push:
     branches: [master, macos-portability]
@@ -27,17 +30,23 @@ jobs:
           echo "TMPDIR=$TMPDIR"
       - run: rustup component add clippy
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-        continue-on-error: true
-      - name: Unit tests
-        run: cargo test --locked --bin syq --no-fail-fast
-        continue-on-error: true
-      - name: Integration tests
+      - name: Native tests
         run: cargo test --locked --all-targets --no-fail-fast
-        continue-on-error: true
-      - name: Shell tool tests
-        continue-on-error: true
+      - name: Release shell suites
         run: |
-          set +e
-          for s in scripts/test-release-tools.sh scripts/test-release-orchestration.sh scripts/test-secret-tools.sh scripts/test-python-sdk-release-tools.sh scripts/test-installer.sh scripts/test-homebrew-formula.sh; do
-            echo "=== $s"; "$s"; echo "=== $s exit $?"
+          status=0
+          for suite in \
+            scripts/test-release-tools.sh \
+            scripts/test-release-orchestration.sh \
+            scripts/test-secret-tools.sh \
+            scripts/test-python-sdk-release-tools.sh \
+            scripts/test-installer.sh \
+            scripts/test-homebrew-formula.sh
+          do
+            echo "=== $suite"
+            if ! "$suite"; then
+              echo "=== $suite failed"
+              status=1
+            fi
           done
+          exit "$status"

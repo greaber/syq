@@ -880,15 +880,16 @@ impl SshsigPolicy {
             // /dev/fd/N duplicates the descriptor and shares its offset, so the
             // second pass would start at EOF and a revoked key would verify.
             // Hand macOS the snapshot's path inside the private store instead.
-            #[cfg(target_os = "macos")]
-            let argument = store.path.join(
-                &revocation_file
-                    .as_ref()
-                    .expect("revocation snapshot exists when its descriptor does")
-                    .name,
-            );
-            #[cfg(not(target_os = "macos"))]
-            let argument = revocation.path();
+            let argument = if cfg!(target_os = "macos") {
+                store.path.join(
+                    &revocation_file
+                        .as_ref()
+                        .expect("revocation snapshot exists when its descriptor does")
+                        .name,
+                )
+            } else {
+                revocation.path()
+            };
             command.arg("-r").arg(argument);
         }
         let mut mappings = vec![signature_child.mapping(), allowed_child.mapping()];
@@ -2509,9 +2510,12 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         let failures: Vec<_> = results.into_iter().filter_map(Result::err).collect();
         assert_eq!(failures.len(), 7);
-        assert!(failures.iter().all(|error| error
-            .to_string()
-            .contains("signed request has already been redeemed")));
+        assert!(
+            failures.iter().all(|error| error
+                .to_string()
+                .contains("signed request has already been redeemed")),
+            "{failures:?}"
+        );
         let mut no_verifier = fixture.policy();
         no_verifier.ssh_keygen = PathBuf::from("/missing/verifier-must-not-run");
         let error = verify_and_claim(
