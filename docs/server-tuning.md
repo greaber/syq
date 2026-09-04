@@ -1,15 +1,15 @@
-# Server performance tuning
+# Server setup
 
 This page is about setting up a server (its firewall, sshd, and sysctl
 settings) so syq can run fast on it. That is separate from syq's own
 auto-tuner, which adjusts the connection count during a copy without any
 change to the host. syq does not require a specially configured server. It
-installs the remote helper (a copy of syq that syq installs on the remote host
-the first time it connects) automatically, encrypts its TCP data connections
-by default, falls back to ssh when a TCP listener cannot be reached, and
-adjusts its connection count while a copy runs. Start with the defaults and
-change the host only when a representative transfer shows a specific
-bottleneck.
+installs a matching remote helper automatically when using an official
+release build, encrypts its TCP data connections by default, and adjusts its
+connection count while a copy runs. If TCP cannot be reached, syq falls back
+to ssh, except with the restricted receiver, which requires encrypted TCP
+and fails instead. Start with the defaults and change the host only when a
+representative transfer shows a specific bottleneck.
 
 This is deliberately a guide, not an installer. Firewall policy, ssh capacity,
 kernel versions, network paths, and storage differ too much for one script to
@@ -48,7 +48,8 @@ transfer. The default TCP records are encrypted with a key exchanged through
 ssh. The helper listens on that port over both IPv4 and IPv6, so a firewall
 rule must allow whichever family the client will use. If no advertised
 address and port is reachable, syq reports the fallback once and carries data
-over separate ssh sessions instead.
+over ssh instead. A restricted remote-to-remote copy requires encrypted TCP
+and fails instead of falling back.
 
 Allow the chosen port range only from clients or trusted networks that need it.
 For example, an administrator using ufw could adapt one of these rules:
@@ -67,8 +68,9 @@ per-transfer token and is encrypted unless `--syq-tcp-plain` was requested.
 Trade-offs:
 
 - A reachable TCP path avoids ssh's per-channel flow-control and cipher-process
-  limits. Fresh-small-file workers using default ssh reuse the authenticated
-  control connection; larger and mixed SSH workloads start independent data
+  limits. A job made only of new small files, using default ssh with no
+  bandwidth limit, reuses the authenticated control connection. Larger or
+  mixed workloads and bandwidth-limited copies use independent SSH data
   processes so they can use multiple flows and cipher processes.
 - A firewall exception increases reachable attack surface. A private LAN, VPN,
   or narrowly scoped source rule is preferable to a public allow rule.
@@ -81,9 +83,10 @@ Trade-offs:
 
 This setting matters when data falls back to independent ssh connections. It
 limits concurrent *unauthenticated* ssh connections; it does not limit
-established sessions, fresh-small-file workers multiplexed over default ssh, or
-workers using the TCP data path. syq already retries shed connections and
-reduces the number of simultaneous handshakes, so the default is functional but
+established sessions, small-file workers sharing the control connection
+(which a nonzero `--bwlimit` disables), or workers using the TCP data path.
+Syq already retries shed connections and reduces the number of simultaneous
+handshakes, so the default is functional but
 can make connection setup slower.
 
 Inspect the effective value rather than assuming the distribution default:
@@ -270,8 +273,8 @@ drops with `ip -s link` and the vendor's tools.
   destinations keep the adaptive parallel path. NFS mount choices such as
   `nconnect` are client and server policy; see the
   [NFS notes](speed.md#nfs) and test with disposable data.
-- Compression trades network bytes for CPU. Compare with and without `-z` when
-  either the link or CPU is near saturation.
+- Compression trades network bytes for CPU and is on by default. Compare the
+  default with `--no-compress` when either the link or CPU is near saturation.
 - `--bwlimit` is the appropriate control when the goal is coexistence with
   other traffic, not maximum benchmark throughput.
 

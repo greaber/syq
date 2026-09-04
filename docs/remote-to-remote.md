@@ -209,25 +209,13 @@ The signed publication policy distinguishes writing to a partial file and
 renaming it into place from `--inplace`; an in-place write opens and writes the
 final file relative to the open handle of the enrolled directory and cannot
 silently switch back to the partial-file method.
-The policy for objects that already exist at the destination is signed and
-enforced by the receiver. It can tell the receiver to create only: every
-creation and publication then refuses to replace anything, metadata or content
-changes to any non-directory that existed before the transfer are refused, and
-existing directories are reused, as in any copy. It can instead tell the
-receiver to update only: the receiver then refuses to create any object and
-ties each update to the object it observed, so an existing object cannot
-change type. These are policies inside the grant rather than options you type:
-the native commands do not have rsync mode's `--ignore-existing` and
-`--existing`, and rsync mode cannot run a remote-to-remote copy. What you can
-type is the placement: `--into-new`/`--as-new` and
-`--into-existing`/`--as-existing` travel as a signed precondition on the
-destination directory, checked against the enrolled directory when the grant
-is redeemed. `--inplace` is refused together with `--as-new` on this path,
-because an in-place write opens the final pathname directly and can neither
-refuse to replace nor be tied to an observed object.
-The native commands have no equivalent of rsync mode's `--update` (skip files
-that are newer on the destination), and the restricted path would refuse it
-anyway: it compares against source modification times that only hostA reports.
+
+Native placement options `--into-new`/`--as-new` and
+`--into-existing`/`--as-existing` are signed into the grant and checked against
+the enrolled destination when the grant is redeemed. `--inplace` is refused
+with `--as-new`: writing directly to the final path cannot guarantee that the
+copy will never replace an existing entry.
+
 `--mapping` and `--min-size` are refused because the receiver cannot check
 them independently of hostA.
 `--max-size` is enforced as a signed per-file limit, but is refused together
@@ -240,29 +228,20 @@ Deletion through the receiver (`cp --prune`) requires an explicit
 inside the scope is always stated on the command line rather than defaulting
 to a hundred million; `--max-delete 0` signs a grant that forbids deletion
 outright. The other signed ceilings default to 100 million entries and 8 TiB of
-file data; native `--receiver-max-entries` and `--receiver-max-bytes` lower them for one
-transfer, which bounds what a redeemed grant is worth to hostA. Every grant also
-carries two deadlines: hostA must start the transfer within 24 hours of the
-grant being issued, and the transfer must finish within 7 days of it.
+file data. `--receiver-max-entries` and `--receiver-max-bytes` replace those
+limits for one transfer and can increase or decrease them, within the allowed
+ranges. What hostA can do is bounded by these limits, whether you use the
+defaults or set your own. Every grant also carries two deadlines: hostA must
+start within 24 hours of issue and finish within 7 days of issue.
 
 `--dry-run` is read-only in a way hostA cannot override: the signed grant
 marks it read-only and the receiver rejects every mutation even if hostA sends
-one. (The native commands have no equivalent of rsync mode's
-`--syq-verify-only`.) A dry run uses an existing enrollment but does not
-install one; run `syq receiver enroll` first when previewing a new destination.
-A destination directory that is itself a symlink is also refused on this path;
-enroll the directory the link points to, so that the signed pathname and the
-opened directory identify the same object.
+one. A dry run uses an existing enrollment but does not install one; run
+`syq receiver enroll` first when previewing a new destination.
 
-One rsync-shaped edge case is handled conservatively inside the grant. In
-rsync's operand spelling, a named directory source such as `hostA:dir` lands
-either inside the destination or exactly at it, depending on whether the
-destination already exists; the grant authorizes only the reading where the
-destination is an existing directory, so if it does not exist, creating
-children at the exact-path reading is denied. The native commands avoid the
-ambiguity because `--as` and `--into` state the placement explicitly, and
-rsync mode cannot run a remote-to-remote copy in any case; create the
-destination directory first if that distinction ever matters.
+Enrollment never follows a destination-root symlink. Enroll the directory the
+link points to so the signed pathname and the opened directory identify the
+same object.
 
 ## Enrollment lifecycle
 

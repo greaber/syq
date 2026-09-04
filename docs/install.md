@@ -1,10 +1,10 @@
 # Installing syq
 
 Syq runs on Linux and macOS. The local machine needs one of the installation
-paths below; remote hosts need nothing installed in advance, because the first
-time syq connects to a remote host it installs the remote helper there, a copy
-of syq of the matching version (see [Remote helper
-bootstrap](#remote-helper-bootstrap)).
+paths below. With the standalone installer or Homebrew, syq installs a
+matching copy of itself on remote hosts the first time it connects (see
+[Remote helper bootstrap](#remote-helper-bootstrap)). A Cargo or checkout
+build needs a compatible remote `syq`, as the [Cargo section](#cargo) explains.
 
 ## Standalone installer
 
@@ -21,7 +21,7 @@ performs, do not depend on either command.
 
 To inspect it first, download the same URL without piping it to `sh`. Every
 release also has an immutable versioned installer, for example
-`https://github.com/greaber/syq/releases/download/v0.1.0/install.sh`. To choose
+`https://github.com/greaber/syq/releases/download/v0.1.8/install.sh`. To choose
 another directory, download the script and run `sh install.sh --bin-dir DIR`
 (or pipe it to `sh -s -- --bin-dir DIR`). The script detects your platform,
 verifies the archive's embedded SHA-256 and size, runs the temporary binary to
@@ -69,7 +69,7 @@ the line for your shell to its startup file:
 # Bash (~/.bashrc)
 eval "$(syq completion bash)"
 
-# Zsh (~/.zshrc)
+# Zsh (~/.zshrc), after `autoload -Uz compinit && compinit`
 source <(syq completion zsh)
 ```
 
@@ -101,15 +101,16 @@ with `brew upgrade syq`.
 Release binaries are published for Linux x86-64/ARM64 and macOS Apple
 Silicon/Intel. Terminal downloads and Homebrew normally do not attach macOS's
 quarantine attribute, which is why command-line tools installed this way do not
-usually produce Gatekeeper prompts. A binary downloaded through a browser may;
-browser-oriented distribution would need Apple Developer ID signing and
-notarization in addition to this terminal-first path.
+usually produce Gatekeeper prompts. The binaries are not Developer ID signed
+or notarized by Apple, so a browser download may prompt or be blocked by
+Gatekeeper. Use the terminal installer or Homebrew for the documented
+installation path.
 
 ## Remote helper bootstrap
 
-The remote side of a copy runs the remote helper, but nothing needs to be
-installed or configured there first. An official release build runs a helper
-of exactly its own version, kept on the remote under `~/.cache/syq/helpers/`.
+With an official release build, nothing needs to be installed on the remote
+host in advance. Syq installs a helper of exactly its own version, kept on the
+remote under `~/.cache/syq/helpers/`.
 On first use of a version it detects the remote
 platform and checks for a downloader, SHA-256 implementation, and `gzip`. When
 that complete toolchain is available, the remote downloads the matching
@@ -153,9 +154,9 @@ Git-derived identity when an explicit source-built helper is used.
 Syq runs your own `ssh`, so your configuration, keys, agent, and known hosts
 apply unchanged. Copies between your machine and a remote host need nothing
 special. A copy between two remote machines forwards the constrained agent
-broker (a temporary stand-in for your ssh agent that holds no keys and passes
-on only signing requests for that copy) to the coordinator, the host that runs
-the copy, by default, and that relies on OpenSSH features from release 8.9
+broker (a temporary local SSH agent that signs only for the intended
+destination) to the coordinator, the host that runs the copy, by default.
+This relies on OpenSSH features from release 8.9
 (February 2022):
 the client on your machine and on the coordinator host must be 8.9 or newer,
 and so must the `sshd` on the other remote. Syq checks the two clients it runs

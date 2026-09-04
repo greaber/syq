@@ -2,7 +2,11 @@
 
 This directory tracks what selected upstream rsync tests tell us about SYQ's
 rsync-compatible command surface. It is both a regression suite and a reviewable
-map of compatibility work. It is not an overall compatibility score.
+map of compatibility work. It is not an overall compatibility score: many
+upstream tests exercise unsupported options, rsync's wire protocol, daemon,
+or internal helpers. The [public compatibility guide](../../docs/rsync-compat.md)
+describes user-visible behavior; [LOCAL-TESTS.md](LOCAL-TESTS.md) links its
+claims to local integration tests and records unresolved review questions.
 
 Run it from the repository root:
 
@@ -116,7 +120,10 @@ keg-only OpenSSL cannot make macOS configuration depend on undeclared flags.
 
 ## Inventory, observations, and product positions
 
-`inventory.tsv` names every test at the pinned commit. Updating the pin without
+`inventory.tsv` names every test at the pinned commit. At the current pin,
+all 351 are classified: 38 runnable sources, 130 unsupported user features,
+and 183 tests of rsync internals, protocol, daemon, or restricted wrappers.
+None are unassessed. Updating the pin without
 classifying every added or removed test is an error. Its classifications are:
 
 - `conformance`: a relevant upstream test used without modification.

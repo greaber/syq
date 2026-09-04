@@ -43,9 +43,10 @@ One JSON object per line (NDJSON):
   removes any ambiguity: mapping a file and mapping a directory
   (non-recursively; entries are never recursive) are different
   operations. If the object at `src` (an object is a file, directory,
-  symlink, or special file) is not the declared kind, that entry fails,
-  exactly as if `src` did not exist. Without `kind`, the entry maps
-  whatever is there.
+  symlink, or special file) is not the declared kind, that entry fails and
+  the run continues. Its result is `conflict` with `retryable: "no"`; a missing
+  source instead produces `io` / `not_found` with `retryable: "unknown"`.
+  Without `kind`, the entry maps whatever is there.
 - `size`, `mtime` (optional, informational): emitted by `syq map` for
   transforms to filter on; execution ignores them. Unknown keys are
   rejected, so a typo cannot be silently dropped.
@@ -236,11 +237,12 @@ those farms fall short, see [use-cases/link-farms.md](https://github.com/greaber
 - `syq map` accepts the same local selectors as native `cp`, including the
   typed selectors `--src-file`/`--src-dir`, plus `--as PATH` (which emits the
   single selected path at `PATH`, honoring the whole path rather than only
-  its last component). Those selectors are validated exactly as native `cp`
-  validates them; see "Emitting a mapping" for the complete list.
-- What is preserved follows the native default (the equivalent of rsync's
-  `-rlt`). There is no per-entry setting: what is preserved and how files
-  are compared stay the same for the whole run.
+  its last component). Source types and follow options work as in native
+  `cp`; named map selectors also need to stay inside their source base, as
+  described below. See "Emitting a mapping" for the complete list.
+- Preservation follows the native default (the equivalent of rsync's
+  `-rlt`) unless you add `--preserve`. What is preserved and how files are
+  compared stay the same for the whole run; there is no per-entry setting.
 - An entry claims exactly one object. A `dir` entry claims the
   directory itself, without its contents.
 - The command-line path naming a manifest, the `-C`/`--root` source base, and the
@@ -271,10 +273,13 @@ those farms fall short, see [use-cases/link-farms.md](https://github.com/greaber
   swap cannot change which tree is emitted. With `--follow-src`, a named
   selector's emitted `src` comes from the same step-by-step walk that opened
   the handle, not from a second `realpath` lookup.
-- `-C` is only a base for resolving paths: selectors typed on the command line
-  may contain `.` and `..` and may resolve outside it. `--root` is mutually
-  exclusive with `-C` and keeps those selectors inside the selected root
-  directory, whose open handle syq keeps for the whole run. A mapping emitted
+- `-C` is a base for resolving paths: selectors may contain `.` and `..`.
+  Named `syq map` selectors must still be relative and resolve inside that
+  base, because their emitted `src` paths are relative to it. A contents
+  selector (`--srcs-in DIR`) can point anywhere; its entries are relative to
+  `DIR` itself. `--root` is mutually exclusive with `-C` and keeps every
+  selector inside the selected root directory, whose open handle syq keeps
+  for the whole run. A mapping emitted
   from a contents selector is relative to the selected directory, so the
   `syq cp` that consumes it must use that directory as its source base. These
   rules for command-line paths do not relax the strict manifest format
@@ -283,12 +288,12 @@ those farms fall short, see [use-cases/link-farms.md](https://github.com/greaber
   a symlink maps as a symlink, and a destination path that would traverse a
   symlink inside the destination container fails that entry. Resolve links before
   emitting the manifest if you want the files they point to instead.
-- `kind: "special"` asserts the source's type; it does not override the
-  fixed `-rlt` preservation default, which copies no special files. Such an
+- `kind: "special"` asserts the source's type; it does not by itself enable
+  copying special files. Under the default preservation settings, such an
   entry is excluded by rule, like a file under `--min-size`: the run still
-  succeeds and the entry is only counted among the excluded files in the
-  summary. Filter with `jq -c 'select(.kind != "special")'` to drop such
-  entries up front.
+  succeeds and the entry is counted among the excluded files in the summary.
+  Pass `--preserve=specials` to copy it, or filter with
+  `jq -c 'select(.kind != "special")'` to drop such entries up front.
 - A mapping does not define a destination area to prune (there is no rule for
   which paths would count as destination-only), so `--mapping` cannot be
   combined with `--prune`.
@@ -329,14 +334,10 @@ terminal status other than `success` or `partial` means some entries may
 never have been resolved.
 
 The results stream is always written on the machine you invoke syq from.
-For a remote-to-remote copy through the restricted receiver (the
-command-restricted receiver, a forced command on hostB that syq installs
-when you enroll a destination), the stream is receiver-attested: built
-from hostB's signed receipt rather than from what hostA reported, with
-each record marked `"provenance":"receiver_attested"`, while the data
-flows directly between the two hosts. Without an enrollment the run fails
-unless `--coordinate-at local` explicitly routes the data through your
-machine. `--results` cannot be combined with `--detach`, because the
+A mapping copy requires one local endpoint; `--mapping` refuses two remote
+endpoints. General remote-to-remote results, including receiver-attested
+streams, are covered in [Automation results](automation.md#the-channel).
+`--results` cannot be combined with `--detach`, because the
 caller would no longer be attached for the complete stream and its
 terminal record. A named file is created fresh inside its parent
 directory, which syq opens first and keeps open; an existing entry is
@@ -345,8 +346,9 @@ the link's resolved target, so replacing the link later cannot redirect
 the output. Use an inherited `--results-fd` when the caller needs another
 kind of output, such as a pipe or socket.
 
-Failed operation records carry `src`, `dst`, and `kind`, so a retry
-manifest is one filter away:
+Failed records for entries in the mapping carry `src`, `dst`, and `kind`,
+so a retry manifest is one filter away. A failed implicit ancestor directory
+has no `src` and is marked `retryable: "no"`; the filter below skips it:
 
 ```bash
 set -o pipefail
@@ -364,10 +366,9 @@ jq -cs 'if (.[-1].type? // "") != "result"
 
 The jq program first checks the stream's terminal record: a results
 file without one is from a run that did not finish (a crash, a kill),
-and a terminal status other than `success` or `partial` (an `aborted`
-incomplete receipt or a `refused` run) means queued entries were never
-resolved or their receipt records may be missing. In both cases, entries
-may have no records at all, so a retry manifest built from
+and a terminal status other than `success` or `partial` means the run stopped
+early, for example on a manifest error after the stream opened. In either
+case, entries may have no records at all, so a retry manifest built from
 what is there would look complete while it is not. With the
 terminal record present, the filter is what an exit code cannot
 express: which entries failed, and whether a retry could help.
