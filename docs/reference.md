@@ -330,8 +330,7 @@ command-restricted remote-to-remote receiver independently enforces the signed
 aggregate limit, signed filters, and the selected staged or in-place publication
 policy. On a direct remote-to-remote copy through that receiver, `cp` also
 accepts the receiver ceilings
-`--max-entries N`, `--max-total-bytes SIZE`, and `--max-runtime DURATION`
-(`s`, `m`, or `h`; at most 23h), and `--receipt hashed`, which asks the
+`--max-entries N` and `--max-total-bytes SIZE`, and `--receipt hashed`, which asks the
 receiver to record a closure-time BLAKE3 digest for every regular file whose
 path the transfer could have changed. They are signed into the grant and
 enforced or honored by hostB, and are refused anywhere else because nothing

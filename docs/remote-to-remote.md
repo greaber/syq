@@ -81,7 +81,7 @@ recognizable to users, administrators, and monitoring tools.
 
 For each transfer, the local machine signs a typed request naming the exact
 destination, login, copy semantics, hash block size, TCP port range, limits,
-validity interval, and a fresh one-time nonce. The temporary broker advertises
+start-by and finish-by times, and a fresh one-time nonce. The temporary broker advertises
 only that enrollment key to hostA and releases its signature only after
 validating this path:
 
@@ -220,10 +220,11 @@ Deletion through the receiver (`cp --prune`) requires an explicit
 `--max-delete`, so the deletion authority a compromised hostA could exercise
 inside the scope is always stated on the command line rather than defaulting
 to a hundred million; `--max-delete 0` signs a grant that forbids deletion
-outright. The other signed ceilings default to 100 million entries, 8 TiB of
-file data, and a 23-hour grant; native `--max-entries`, `--max-total-bytes`,
-and `--max-runtime` lower them for one transfer, which bounds what a claimed
-grant is worth to hostA.
+outright. The other signed ceilings default to 100 million entries and 8 TiB of
+file data; native `--max-entries` and `--max-total-bytes` lower them for one
+transfer, which bounds what a claimed grant is worth to hostA. Every grant also
+carries two deadlines: hostA must start the transfer within 24 hours of the
+grant being issued, and the transfer must finish within 7 days of it.
 
 `--dry-run` and `--verify-only` are cryptographically read-only: the signed
 grant marks them as such and the receiver rejects every mutation even if hostA

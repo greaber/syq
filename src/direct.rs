@@ -845,14 +845,11 @@ fn run_remote(
             broker: socket,
         })
     };
-    if (args.max_entries.is_some()
-        || args.max_total_bytes.is_some()
-        || args.max_runtime_secs.is_some()
-        || args.receipt_requested)
+    if (args.max_entries.is_some() || args.max_total_bytes.is_some() || args.receipt_requested)
         && restricted_grant.is_none()
     {
         bail!(
-            "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
+            "--max-entries, --max-total-bytes, and --receipt address the command-restricted receiver, but this transfer does not use the enrolled receiver"
         );
     }
     let coordinator_target = endpoint_display(coordinator);

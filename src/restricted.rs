@@ -40,8 +40,10 @@ const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
 const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
-const DEFAULT_RUNTIME_SECONDS: u32 = 23 * 60 * 60;
+/// A grant must be redeemed within this long of being issued.
 const GRANT_VALIDITY_SECONDS: i64 = 24 * 60 * 60;
+/// A transfer must finish within this long of its grant being issued.
+const FINISH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const CLOCK_SKEW_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3793,14 +3795,6 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
-    if let Some(runtime) = args.max_runtime_secs {
-        if runtime > DEFAULT_RUNTIME_SECONDS {
-            bail!(
-                "--max-runtime exceeds the {}-hour signed grant ceiling",
-                DEFAULT_RUNTIME_SECONDS / 3600
-            );
-        }
-    }
     if args
         .max_entries
         .is_some_and(|entries| entries == 0 || entries > delegation::MAX_ENTRIES)
@@ -3886,20 +3880,12 @@ fn grant_for(
             .context("deletion through the command-restricted receiver needs --max-delete")?
             .min(max_entries),
     };
-    let (not_after, max_runtime_seconds) = match args.max_runtime_secs {
-        None => (
-            issued_at
-                .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
-                .context("signed grant expiration overflow")?,
-            DEFAULT_RUNTIME_SECONDS,
-        ),
-        Some(runtime) => (
-            issued_at
-                .checked_add(i64::from(runtime))
-                .context("signed grant expiration overflow")?,
-            runtime,
-        ),
-    };
+    let start_by = issued_at
+        .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
+        .context("signed grant start-by overflow")?;
+    let finish_by = issued_at
+        .checked_add(FINISH_WINDOW_SECONDS)
+        .context("signed grant finish-by overflow")?;
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
         Placement::As => DestinationPlacement::ExactPath,
@@ -3957,7 +3943,8 @@ fn grant_for(
         request_id: RequestId::fresh(issued_at)?,
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
-        not_after,
+        start_by,
+        finish_by,
         operation: GrantOperation::Copy(CopyOperation {
             destination: destination_bytes,
             mutation_scopes,
@@ -4000,7 +3987,6 @@ fn grant_for(
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
-                max_runtime_seconds,
             },
         }),
     };
@@ -4738,7 +4724,8 @@ pub(crate) mod tests {
             request_id: RequestId::fresh(1_900_000_000).unwrap(),
             issued_at: 1,
             not_before: 1,
-            not_after: 100,
+            start_by: 100,
+            finish_by: 100,
             operation: GrantOperation::Copy(CopyOperation {
                 destination: destination.as_os_str().as_bytes().to_vec(),
                 mutation_scopes: vec![MutationScope {
@@ -4774,7 +4761,6 @@ pub(crate) mod tests {
                     hash_block_bytes: 4 << 20,
                     max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
                     max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
-                    max_runtime_seconds: 60,
                 },
             }),
         };
@@ -7612,9 +7598,6 @@ pub(crate) mod tests {
         // the enrollment lookup or installation.
         let mut args = parse(&[]);
         validate_restricted_args(&args).unwrap();
-        args.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
-        assert!(validate_restricted_args(&args).is_err());
-        let mut args = parse(&[]);
         args.max_entries = Some(0);
         assert!(validate_restricted_args(&args).is_err());
         args.max_entries = Some(delegation::MAX_ENTRIES + 1);
@@ -7670,12 +7653,12 @@ pub(crate) mod tests {
         assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(
-            default_copy.limits.max_runtime_seconds,
-            DEFAULT_RUNTIME_SECONDS
+            default_grant.start_by - default_grant.not_before,
+            GRANT_VALIDITY_SECONDS
         );
         assert_eq!(
-            default_grant.not_after - default_grant.not_before,
-            GRANT_VALIDITY_SECONDS
+            default_grant.finish_by - default_grant.issued_at,
+            FINISH_WINDOW_SECONDS
         );
 
         // Explicit ceilings land in the signed limits; the per-file bound
@@ -7683,7 +7666,6 @@ pub(crate) mod tests {
         let mut ceilings = parse(&["--max-size", "3M"]);
         ceilings.max_entries = Some(12);
         ceilings.max_total_bytes = Some(2 << 20);
-        ceilings.max_runtime_secs = Some(1800);
         let grant = grant_for(
             &ceilings,
             std::slice::from_ref(&source),
@@ -7696,20 +7678,7 @@ pub(crate) mod tests {
         assert_eq!(copy.limits.max_entries, 12);
         assert_eq!(copy.limits.max_total_bytes, 2 << 20);
         assert_eq!(copy.limits.max_file_bytes, 2 << 20);
-        assert_eq!(copy.limits.max_runtime_seconds, 1800);
-        assert_eq!(grant.not_after - grant.issued_at, 1800);
         assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
-
-        let mut too_long = parse(&[]);
-        too_long.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
-        assert!(grant_for(
-            &too_long,
-            std::slice::from_ref(&source),
-            id,
-            "backup",
-            b"/backup"
-        )
-        .is_err());
 
         // Deletion authority must be stated; it is then capped by the entry
         // ceiling so the grant stays self-consistent.

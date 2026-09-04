@@ -232,7 +232,6 @@ syq.cp(
     agent_broker_only=False,
     max_entries=None,
     max_total_bytes=None,
-    max_runtime=None,
     receipt=None,
     ignore=None,
     ignore_from=None,
@@ -309,9 +308,8 @@ decoded merely to build argv.
 
 `follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
-`min_size`, and `dry_run` retain the exact native meanings. `max_entries`,
-`max_total_bytes`, and `max_runtime` expose the native command-restricted
-receiver ceilings and are
+`min_size`, and `dry_run` retain the exact native meanings. `max_entries` and
+`max_total_bytes` expose the native command-restricted receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.

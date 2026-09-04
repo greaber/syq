@@ -2964,12 +2964,7 @@ fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
 fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
-    for option in [
-        "--max-entries=5",
-        "--max-total-bytes=1M",
-        "--max-runtime=30m",
-        "--receipt=sizes",
-    ] {
+    for option in ["--max-entries=5", "--max-total-bytes=1M", "--receipt=sizes"] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
@@ -2990,25 +2985,6 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         );
         assert!(!t.path("dst").exists(), "{option} copied anyway");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--max-runtime=0m",
-            "--src-src",
-            &t.s("src"),
-            "--to",
-            "hostb",
-            "--into",
-            "/dst",
-        ])
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("at least one second"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[test]
@@ -11755,7 +11731,6 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--inplace",
         "--max-entries",
         "--max-total-bytes",
-        "--max-runtime",
         "--receipt",
     ] {
         assert!(

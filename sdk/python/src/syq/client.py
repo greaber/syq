@@ -617,7 +617,6 @@ def _copy_arguments(
     connections: int | None,
     max_entries: int | None,
     max_total_bytes: str | int | None,
-    max_runtime: str | int | None,
     receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
@@ -704,7 +703,6 @@ def _copy_arguments(
     if max_entries is not None:
         argv.extend(("--max-entries", str(max_entries)))
     _append_text(argv, "--max-total-bytes", max_total_bytes)
-    _append_text(argv, "--max-runtime", max_runtime)
     if receipt is not None:
         receipt_value = _text_arg(receipt, label="receipt")
         if receipt_value not in {"sizes", "hashed"}:
@@ -1040,7 +1038,6 @@ class Client:
         agent_broker_only: bool = False,
         max_entries: int | None = None,
         max_total_bytes: str | int | None = None,
-        max_runtime: str | int | None = None,
         receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
@@ -1094,7 +1091,6 @@ class Client:
             connections=connections,
             max_entries=max_entries,
             max_total_bytes=max_total_bytes,
-            max_runtime=max_runtime,
             receipt=receipt,
             ignore=ignore,
             ignore_from=ignore_from,
@@ -1279,7 +1275,6 @@ class Client:
             connections=None,
             max_entries=None,
             max_total_bytes=None,
-            max_runtime=None,
             receipt=None,
             ignore=None,
             ignore_from=None,

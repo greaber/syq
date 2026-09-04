@@ -41,7 +41,6 @@
         "agent-broker-only",
         "max-entries",
         "max-total-bytes",
-        "max-runtime",
         "receipt",
         "hash",
         "no-compress",
