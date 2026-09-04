@@ -843,6 +843,7 @@ pub enum Response {
     HelloOk {
         identity: String,
         platform: String,
+        supports_confined_socket_nodes: bool,
     },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.

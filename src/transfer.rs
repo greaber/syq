@@ -1485,6 +1485,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    let destination_supports_confined_socket_nodes = match &dst_ep {
+        Endpoint::Remote(spec) => {
+            spec.diagnostics()
+                .peer
+                .context("destination handshake did not report receiver capabilities")?
+                .supports_confined_socket_nodes
+        }
+        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
+    };
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
     let mut pending_tcp_setups = Vec::new();
     if let Some(ports) = tcp_ports {
@@ -2135,6 +2144,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        destination_supports_confined_socket_nodes,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
@@ -3315,17 +3325,8 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
-// Linux can create an unbound socket inode with mknodat(2). macOS can only
-// create one by binding a pathname, which would give up the rooted
-// destination's descriptor-relative confinement guarantee.
-#[cfg(target_os = "macos")]
-fn special_creation_supported(kind: Kind) -> bool {
-    kind != Kind::Socket
-}
-
-#[cfg(not(target_os = "macos"))]
-fn special_creation_supported(_: Kind) -> bool {
-    true
+fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) -> bool {
+    kind != Kind::Socket || destination_supports_sockets
 }
 
 fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
@@ -3697,6 +3698,9 @@ struct Planner<'a> {
     sched: &'a Sched,
     progress: &'a Progress,
     opts: &'a Opts,
+    /// Capability reported by the destination receiver's authenticated
+    /// handshake. The coordinator may be running on a different platform.
+    destination_supports_confined_socket_nodes: bool,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -3868,7 +3872,11 @@ impl Planner<'_> {
             }
             Kind::Symlink => self.opts.links,
             Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                self.opts.devices && special_creation_supported(entry.kind)
+                self.opts.devices
+                    && special_creation_supported(
+                        self.destination_supports_confined_socket_nodes,
+                        entry.kind,
+                    )
             }
             Kind::Other => false,
         };
@@ -4623,7 +4631,11 @@ impl Planner<'_> {
                 },
                 Kind::Symlink if opts.links => Claim::Leaf,
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
-                    if opts.devices && special_creation_supported(e.kind) =>
+                    if opts.devices
+                        && special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
                 {
                     Claim::Leaf
                 }
@@ -4665,13 +4677,14 @@ impl Planner<'_> {
                 Claim::Weak
                     if e.kind == Kind::Socket
                         && opts.devices
-                        && !special_creation_supported(e.kind) =>
+                        && !special_creation_supported(
+                            self.destination_supports_confined_socket_nodes,
+                            e.kind,
+                        ) =>
                 {
-                    if !opts.quiet {
-                        self.progress.eprintln(&format!(
-                            "syq: skipping socket \"{rel}\": macOS cannot create socket nodes through a confined destination"
-                        ));
-                    }
+                    self.progress.eprintln(&format!(
+                        "syq: skipping socket \"{rel}\": macOS cannot create socket nodes through a confined destination"
+                    ));
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                 }
                 Claim::Weak => {

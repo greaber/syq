@@ -2077,6 +2077,60 @@ fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn native_remote_destination_socket_policy_uses_handshake_capability() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let command = |platform: &str, socket_capability: &str, destination: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args(["--no-tcp", "-j", "1", "--preserve=specials"])
+            .args(["--src-src", &t.s("src"), "--to", "fake", "--into"])
+            .arg(t.path(destination))
+            .arg("--no-progress")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_PLATFORM", platform)
+            .env("FAKE_REMOTE_CONFINED_SOCKET_NODES", socket_capability);
+        command
+    };
+
+    // A Linux coordinator must honor a macOS receiver's inability to create
+    // confined socket nodes. The warning is a fidelity diagnostic and remains
+    // visible even when ordinary output is quiet.
+    let mut macos_destination = command("macos-aarch64", "0", "dst-macos");
+    let output = macos_destination.arg("--quiet").run().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst-macos/nested/ordinary")), b"ordinary");
+    assert!(!t.path("dst-macos/nested/socket").exists());
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("skipping socket"), "{stderr}");
+    assert!(stderr.contains("confined destination"), "{stderr}");
+
+    // A macOS coordinator must not suppress a socket headed to a capable
+    // Linux receiver. Dry-run proves the receiver operation is planned without
+    // asking a macOS test host to execute Linux's mknodat behavior.
+    let mut linux_destination = command("linux-x86_64", "1", "dst-linux");
+    let output = linux_destination
+        .args(["--dry-run", "--verbose"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("create socket"), "{stdout}");
+    assert!(!stderr_of(&output).contains("skipping socket"));
+    assert!(!t.path("dst-linux").exists());
+}
+
 #[test]
 fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     let t = Tmp::new();
@@ -3633,6 +3687,18 @@ else
     PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
 fi
 export HOME PATH
+if [ -n "${FAKE_REMOTE_PLATFORM:-}" ]; then
+    SYQ_TEST_PLATFORM="$FAKE_REMOTE_PLATFORM"
+    export SYQ_TEST_PLATFORM
+else
+    unset SYQ_TEST_PLATFORM
+fi
+if [ -n "${FAKE_REMOTE_CONFINED_SOCKET_NODES:-}" ]; then
+    SYQ_TEST_CONFINED_SOCKET_NODES="$FAKE_REMOTE_CONFINED_SOCKET_NODES"
+    export SYQ_TEST_CONFINED_SOCKET_NODES
+else
+    unset SYQ_TEST_CONFINED_SOCKET_NODES
+fi
 # The remote helper advertises the address ssh arrived on; never leak the
 # developer's own session into the fixture.
 if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then

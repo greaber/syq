@@ -300,9 +300,9 @@ jobs:
       - name: Exercise macOS managed remote-helper bootstrap
         run: cargo test --locked --test local remote_
       - name: Exercise macOS socket-special behavior
-        run: >-
-          cargo test --locked --test local
-          native_preserve_specials_copies_or_visibly_skips_socket_nodes -- --exact
+        run: |
+          cargo test --locked --test local native_preserve_specials_copies_or_visibly_skips_socket_nodes -- --exact
+          cargo test --locked --test local native_remote_destination_socket_policy_uses_handshake_capability -- --exact
       - run: scripts/test-installer.sh
       - run: scripts/test-homebrew-formula.sh
 
