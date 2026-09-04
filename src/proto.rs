@@ -125,6 +125,17 @@ pub enum Kind {
     Other,
 }
 
+/// One raw directory entry returned for interactive shell completion.
+///
+/// Completion deliberately needs only the entry name and whether another
+/// path component can follow it. Keeping this separate from `Entry` avoids a
+/// recursive scan or unnecessary metadata on every press of Tab.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct CompletionEntry {
+    pub name: PathBytes,
+    pub directory: bool,
+}
+
 /// How a directly supplied endpoint pathname treats symlink components.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OperatorSymlinkPolicy {
@@ -571,6 +582,15 @@ pub enum Request {
         report_ignored: bool,
         guard: Option<ContainerGuard>,
     },
+    /// List at most one bounded page of names in a single directory. This is
+    /// a read-only control-connection operation used by shell completion.
+    ListDir {
+        directory: PathBytes,
+        /// When present, the resolved directory must remain beneath this root.
+        confined_root: Option<PathBytes>,
+        prefix: PathBytes,
+        limit: u16,
+    },
     /// Resolve all native removal selectors to endpoint-owned handles before
     /// mutation, then remove through those handles using an endpoint-local
     /// worker pool.
@@ -840,6 +860,10 @@ pub enum Response {
     /// Paths (relative to the root) pruned by the ignore patterns.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
+    DirectoryEntries {
+        entries: Vec<CompletionEntry>,
+        truncated: bool,
+    },
     NativeRemoveTrace(Vec<String>),
     /// An empty batch is an attached native-rm liveness frame.
     NativeRemoveBatch(Vec<NativeRemoveOutcome>),
@@ -1016,6 +1040,12 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 64
             }
+            Request::ListDir {
+                directory,
+                confined_root,
+                prefix,
+                ..
+            } => directory.len() + confined_root.as_ref().map_or(0, Vec::len) + prefix.len() + 32,
             _ => 256,
         }
     }
@@ -1046,6 +1076,13 @@ impl SizeHint for Response {
                                 .map_or(0, |failure| failure.error.message.len())
                             + 48
                     })
+                    .sum::<usize>()
+                    + 16
+            }
+            Response::DirectoryEntries { entries, .. } => {
+                entries
+                    .iter()
+                    .map(|entry| entry.name.len() + 8)
                     .sum::<usize>()
                     + 16
             }

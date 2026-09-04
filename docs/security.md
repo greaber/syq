@@ -71,7 +71,19 @@ go further:
   sides.
 - Native `rm` resolves and pins every selector before its first change,
   enumerates opened directories, re-checks device, inode, and type, and removes
-  with `unlinkat`. A name swapped to a different inode is refused, not deleted.
+  with `unlinkat`. A name swapped to a different inode before that re-check is
+  refused, not deleted. The re-check and `unlinkat` are separate system calls,
+  and no POSIX call removes a name only if it still refers to a given inode, so
+  an entry renamed over the name in that window is removed as a single entry:
+  a swapped-in symlink is unlinked without being followed, a swapped-in
+  directory is refused by the kernel where a file was expected, and a
+  non-empty directory is never descended into. The selected object survives
+  under its new name. For a selected or walked directory, syq holds a
+  descriptor on the pinned directory and reports the removal as a failure when
+  that directory is still linked afterwards; a swapped file has no descriptor
+  to check and is reported as removed. Exploiting the window needs write
+  permission on the pinned parent, which already permits removing the entry
+  that gets swapped in.
 - The restricted remote-to-remote receiver performs every operation relative
   to an opened root; descendant symlinks are payload, never traversal.
 - Native `cp` defaults to `-rlt`: no owner, group, mode, or device is applied

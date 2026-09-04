@@ -58,6 +58,29 @@ PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
 rsync` uses the rsync-compatible `--rsync-path PATH`, or
 `--syq-no-bootstrap` for the same `PATH` lookup.
 
+## Shell completion
+
+Syq can complete commands, options, endpoints, and local or remote paths. Add
+the line for your shell to its startup file:
+
+```bash
+# Bash (~/.bashrc)
+source <(syq completion bash)
+
+# Zsh (~/.zshrc)
+source <(syq completion zsh)
+```
+
+```fish
+# fish (~/.config/fish/config.fish)
+syq completion fish | source
+```
+
+Remote completion logs in with ordinary noninteractive SSH. The first Tab on
+a remote endpoint can take a few seconds if syq must install its verified
+helper there. `syq persist on` makes later completions much faster by keeping
+the authenticated SSH connection available between commands.
+
 ## Update checks and self-update
 
 Standalone installs download and verify one signed release manifest at most
