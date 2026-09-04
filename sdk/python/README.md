@@ -1,9 +1,9 @@
 # syq for Python
 
 The official Python client for [syq](https://github.com/greaber/syq), a fast
-file transfer tool. Call `syq.cp(...)` (including `cp --prune`) and
-`syq.map(...)` and get typed results back; anything else syq can do, such as
-`rm`, is one `syq.run([...])` away.
+file transfer tool. Call `syq.cp(...)` (including `cp --prune`), `syq.rm(...)`,
+and `syq.map(...)` and get typed results back; every other syq command remains
+one `syq.run([...])` away.
 
 ```sh
 python -m pip install syq
@@ -43,7 +43,18 @@ preview = client.cp(
     max_delete=100,
     dry_run=True,
 )
+
+removal = client.rm(
+    src_dir="old-output",
+    from_="server",
+    root="/srv",
+)
+print(removal.entries_removed, removal.selectors_missing)
 ```
+
+Typed `rm` works for local and ordinary SSH endpoints. A command-restricted
+receiver rejects native removal because its signed grants currently authorize
+copy mutations only.
 
 Remote-copy controls use the same names with underscores, including `coordinate_at`,
 `rsh`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
@@ -60,12 +71,14 @@ potentially enormous operation ledger in memory:
 def observe(event: syq.AutomationEvent) -> None:
     if isinstance(event, (syq.TraceEvent, syq.OperationResult)):
         print(event.action, event.dst)
+    elif isinstance(event, (syq.RemovalTrace, syq.RemovalResult)):
+        print(event.disposition, event.path)
 
 result = syq.cp("data", into="backup", on_event=observe)
 ```
 
 Pass a caller-owned binary file-like object as `results=` to retain the same
-validated NDJSON stream that produced the returned `CpResult`:
+validated NDJSON stream that produced the returned `CpResult` or `RmResult`:
 
 ```python
 with open("run.ndjson", "wb") as records:
@@ -99,6 +112,8 @@ result = await client.cp(
     into="backup",
     on_event=observe,
 )
+
+removed = await client.rm("old-data", from_="server", on_event=observe)
 ```
 
 Mapping output is streaming and context-managed. Passing Python mapping

@@ -41,21 +41,20 @@ key stays under `~/.local/state/syq/restricted/` on the local machine and is
 never copied to hostA. HostB keeps its forced public key, SSHSIG verifier
 policy, replay state, and a receipt signing key it generates at installation
 under `~/.local/share/syq/restricted/`; the receipt key's public half is
-returned to the local machine and recorded with the enrollment. Before
-publishing the forced key, syq verifies that the installed receiver is a
-regular executable and that it and every path ancestor are trusted-owner- or
-root-owned and non-writable by other users. On Linux, access ACLs are evaluated
-by their effective permissions: named entries are accepted when they are
-read-only or identify root, the target user, or its verified user-private
-group. A default ACL does not make its existing directory writable, and every
-new directory or file syq creates is validated before use. Group-write from the
-conventional umask 002 is accepted only when account and group database lookups
-check that the group is user-private (same name and no other member or non-root
-primary-group user). Otherwise group-write still fails closed. Private
-enrollment directories require exactly 0700 access bits; directory special bits
-do not affect this check. Secret files remain exactly mode 0600. A
-failure names the machine and reports every unsafe component of the path that
-syq could securely inspect.
+returned to the local machine and recorded with the enrollment. Syq creates
+private enrollment directories with mode 0700 and secret files with mode 0600;
+it does not reject the invoking binary, verifier, or their ancestor directories
+based on Unix ownership, group membership, or ACLs. Those files are part of the
+trusted receiver machine, not something a hostile source can make trustworthy
+through a permission check.
+
+Instead, every command-restricted grant is rejected before copying if any of
+its mutation scopes overlaps the receiver's SSH configuration, installed
+receiver directory, enrollment state, or configured signature verifier. The
+local machine performs the same preflight where it knows the paths, and the
+receiver enforces it authoritatively. This protection applies only to the
+enrolled command-restricted receiver; ordinary local and remote copies retain
+their normal destination semantics.
 
 Enrollment first tries local→hostB directly. If SSH reports a transport
 failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation

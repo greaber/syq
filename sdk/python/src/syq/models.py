@@ -104,6 +104,7 @@ class OsKind(_StringEnum):
     ALREADY_EXISTS = "already_exists"
     INVALID_INPUT = "invalid_input"
     NO_SPACE = "no_space"
+    QUOTA_EXCEEDED = "quota_exceeded"
     READ_ONLY = "read_only"
     OTHER = "other"
 
@@ -121,6 +122,18 @@ class OperationStatus(_StringEnum):
     PARTIAL = "partial"
     REFUSED = "refused"
     ABORTED = "aborted"
+    FAILED = "failed"
+
+
+class SelectionStatus(_StringEnum):
+    RESOLVED = "resolved"
+    MISSING = "missing"
+
+
+class RemovalDisposition(_StringEnum):
+    WOULD_REMOVE = "would_remove"
+    REMOVED = "removed"
+    ALREADY_ABSENT = "already_absent"
     FAILED = "failed"
 
 
@@ -246,8 +259,8 @@ class RunEvent:
     started_at: int
     syq_version: str
     mode: str
-    prune: bool
-    mapping: bool
+    prune: bool | None
+    mapping: bool | None
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
     type: str = "run"
@@ -327,6 +340,47 @@ class OperationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectionResult:
+    schema: str
+    schema_version: int
+    seq: int
+    selector: int
+    path: PathValue
+    status: SelectionStatus
+    kind: EntryKind | None
+    type: str = "selection_result"
+
+
+@dataclass(frozen=True, slots=True)
+class RemovalTrace:
+    schema: str
+    schema_version: int
+    seq: int
+    selector: int
+    path: PathValue
+    kind: EntryKind
+    disposition: RemovalDisposition
+    type: str = "removal_trace"
+
+
+@dataclass(frozen=True, slots=True)
+class RemovalResult:
+    schema: str
+    schema_version: int
+    seq: int
+    selector: int
+    path: PathValue
+    kind: EntryKind | None
+    disposition: RemovalDisposition
+    attempts: int
+    retryable: Retryability | None
+    class_: ErrorClass | None
+    os_kind: OsKind | None
+    message: str | None
+    type: str = "removal_result"
+
+
+@dataclass(frozen=True, slots=True)
 class ErrorEvent:
     schema: str
     schema_version: int
@@ -381,8 +435,23 @@ class FinalStateEvent:
     type: str = "final_state"
 
 
-@dataclass(frozen=True, slots=True)
 class OperationSummary:
+    """Common runtime type for typed terminal results."""
+
+    __slots__ = ()
+
+    schema: str
+    schema_version: int
+    seq: int
+    status: OperationStatus
+    exit_code: int
+    dry_run: bool
+    errors: int
+    elapsed_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CpResult(OperationSummary):
     schema: str
     schema_version: int
     seq: int
@@ -411,8 +480,24 @@ class OperationSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class CpResult(OperationSummary):
-    pass
+class RmResult(OperationSummary):
+    schema: str
+    schema_version: int
+    seq: int
+    status: OperationStatus
+    exit_code: int
+    dry_run: bool
+    selectors_total: int
+    selectors_resolved: int
+    selectors_missing: int
+    entries_planned: int
+    entries_removed: int
+    entries_already_absent: int
+    entries_failed: int
+    errors: int
+    elapsed_ms: int
+    mode: str = "rm"
+    type: str = "result"
 
 
 AutomationEvent = (
@@ -420,9 +505,13 @@ AutomationEvent = (
     | ProgressEvent
     | TraceEvent
     | OperationResult
+    | SelectionResult
+    | RemovalTrace
+    | RemovalResult
     | ErrorEvent
     | FinalStateEvent
     | CpResult
+    | RmResult
 )
 
 

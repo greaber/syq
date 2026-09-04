@@ -95,4 +95,51 @@ mkdir -p "$dir"
     "$syq" cp -j1 --src-src missing --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/failed.ndjson"
 
+# rm-success: one directory tree is removed and one explicit selector is
+# already missing. Both selector occurrences remain visible. Exit 0.
+dir="$work/rm-success"
+mkdir -p "$dir/tree/sub"
+printf 'remove' >"$dir/tree/sub/file"
+(cd "$dir" &&
+    "$syq" rm -j1 --src-dir tree --src missing --results raw.ndjson -q)
+normalize <"$dir/raw.ndjson" >"$out/rm-success.ndjson"
+
+# rm-dry-run: removal traces describe every intended mutation and no object is
+# changed. Exit 0.
+dir="$work/rm-dry-run"
+mkdir -p "$dir/tree/sub"
+printf 'keep' >"$dir/tree/sub/file"
+(cd "$dir" &&
+    "$syq" rm -j1 -n --src-dir tree --results raw.ndjson -q)
+normalize <"$dir/raw.ndjson" >"$out/rm-dry-run.ndjson"
+
+# rm-dry-partial: preview can resolve the selected root but cannot inspect one
+# descendant, so it reports a failed per-path result alongside the incomplete
+# plan. Exit 23.
+dir="$work/rm-dry-partial"
+mkdir -p "$dir/tree/blocked"
+chmod 000 "$dir/tree/blocked"
+(cd "$dir" &&
+    "$syq" rm -j1 -n --src-src tree --results raw.ndjson -q) || true
+chmod 700 "$dir/tree/blocked"
+normalize <"$dir/raw.ndjson" >"$out/rm-dry-partial.ndjson"
+
+# rm-partial: the selected directory can be read but neither its child nor the
+# resulting non-empty parent can be removed. Each entry is reported once. Exit 23.
+dir="$work/rm-partial"
+mkdir -p "$dir/tree"
+printf 'blocked' >"$dir/tree/file"
+chmod 500 "$dir/tree"
+(cd "$dir" &&
+    "$syq" rm -j1 --src-dir tree --results raw.ndjson -q) || true
+chmod 700 "$dir/tree"
+normalize <"$dir/raw.ndjson" >"$out/rm-partial.ndjson"
+
+# rm-failed: a fatal base-resolution failure still settles the stream. Exit 1.
+dir="$work/rm-failed"
+mkdir -p "$dir"
+(cd "$dir" &&
+    "$syq" rm -j1 --cwd missing --src victim --results raw.ndjson -q) || true
+normalize <"$dir/raw.ndjson" >"$out/rm-failed.ndjson"
+
 echo "regenerated $(ls "$out" | wc -l) fixtures in $out"

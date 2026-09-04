@@ -196,6 +196,29 @@ class CandidateCompatibilityTests(unittest.TestCase):
             )
             self.assertEqual(raw_operation.dst.raw, raw_name)
 
+            removal_tree = root / "remove-tree"
+            removal_tree.mkdir()
+            (removal_tree / "child").write_bytes(b"remove")
+            removal_events: list[syq.AutomationEvent] = []
+            removal_stream = io.BytesIO()
+            removal_preview = client.rm(
+                src_dir=removal_tree.name,
+                dry_run=True,
+                results=removal_stream,
+                on_event=removal_events.append,
+            )
+            self.assertEqual(removal_preview.entries_planned, 2)
+            self.assertTrue(removal_tree.exists())
+            self.assertTrue(
+                any(
+                    isinstance(event, syq.RemovalTrace)
+                    for event in removal_events
+                )
+            )
+            removed = client.rm(src_dir=removal_tree.name)
+            self.assertEqual(removed.entries_removed, 2)
+            self.assertFalse(removal_tree.exists())
+
     def test_candidate_failure_is_retained(self) -> None:
         assert EXECUTABLE is not None
         result = syq.run(
@@ -315,6 +338,12 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(pruned.deletions_completed, 1)
             self.assertFalse((root / "destination" / "extra").exists())
+
+            (root / "async-remove").mkdir()
+            (root / "async-remove" / "file").write_bytes(b"remove")
+            removed = await client.rm(src_dir="async-remove")
+            self.assertEqual(removed.entries_removed, 2)
+            self.assertFalse((root / "async-remove").exists())
 
 
 if __name__ == "__main__":

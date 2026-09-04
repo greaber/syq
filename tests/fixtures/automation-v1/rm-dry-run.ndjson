@@ -1,0 +1,6 @@
+{"dry_run":true,"endpoints":[{"kind":"local","role":"source"}],"mode":"rm","run_id":"6465616462656566000000000000cafe","schema":"syq.automation","schema_version":1,"seq":0,"started_at":1756800000,"syq_version":"0.0.0","type":"run"}
+{"kind":"dir","path":{"encoding":"utf-8","value":"tree"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":1,"status":"resolved","type":"selection_result"}
+{"disposition":"would_remove","kind":"file","path":{"encoding":"utf-8","value":"tree/sub/file"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":2,"type":"removal_trace"}
+{"disposition":"would_remove","kind":"dir","path":{"encoding":"utf-8","value":"tree/sub"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":3,"type":"removal_trace"}
+{"disposition":"would_remove","kind":"dir","path":{"encoding":"utf-8","value":"tree"},"schema":"syq.automation","schema_version":1,"selector":0,"seq":4,"type":"removal_trace"}
+{"dry_run":true,"elapsed_ms":0,"entries_already_absent":0,"entries_failed":0,"entries_planned":3,"entries_removed":0,"errors":0,"exit_code":0,"mode":"rm","schema":"syq.automation","schema_version":1,"selectors_missing":0,"selectors_resolved":1,"selectors_total":1,"seq":5,"status":"success","type":"result"}

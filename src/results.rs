@@ -1,30 +1,34 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
-//! native cp. Automation schema version 1: every record carries `schema`
+//! native cp and rm. Automation schema version 1: every record carries `schema`
 //! (`syq.automation`), `schema_version`, and a monotonic `seq`. The stream
 //! target is a freshly created file (`--results FILE`) or a descriptor the
 //! caller opened (`--results-fd N`); human output is untouched.
 //!
-//! Version-1 coverage: one `run` record first (run id, mode, prune/mapping/
-//! dry-run flags, sanitized endpoints); sampled `progress` records; one
-//! `operation_result` per settled mutation (file transfers, directory/
-//! symlink/special creation inside the target container, `--prune`
-//! deletions) and per failed mapping entry, with `retryable` and
-//! `class`/`os_kind` where known; an `error` record for every counted
-//! error; `trace` records instead of operation results on dry runs; exactly
-//! one terminal `result` whose numbers also feed the human summary, so the
-//! two cannot disagree. Unchanged and excluded entries are aggregated in
-//! the terminal record only, and metadata-only updates are not reported
-//! per operation (dry runs do trace them as `metadata_differs`).
+//! Version-1 coverage: one `run` record first (run id, mode, dry-run flags,
+//! sanitized endpoints, and copy-only prune/mapping flags); sampled `progress`
+//! records; command-specific per-path records; an `error` record for every
+//! counted error; and exactly one terminal `result` whose numbers also feed the
+//! human summary, so the two cannot disagree. Copy emits `operation_result` or
+//! dry-run `trace` records. Removal emits one `selection_result` per explicit
+//! selector followed by `removal_result` or dry-run `removal_trace` records for
+//! entries in the selected trees. Unchanged and excluded copy entries are
+//! aggregated in the terminal record only, and metadata-only copy updates are
+//! not reported per operation (dry runs do trace them as `metadata_differs`).
 //!
 //! Attached direct copies through a command-restricted receiver are the one
 //! exception: receipt_v2 emits their stream locally after verification, marks
 //! its provenance, omits source-side claims hostB cannot authenticate, and
-//! includes closure-time final-state records. (Not yet reachable while
-//! remote-to-remote copies refuse the file/descriptor targets.)
+//! includes closure-time final-state records.
 
+use crate::cli::{Args, Interface, Location};
+use crate::proto::OperatorSymlinkPolicy;
+use anyhow::{bail, Context, Result};
+use std::ffi::OsStr;
 use std::io::Write;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
 pub const SCHEMA_VERSION: u64 = 1;
@@ -62,8 +66,10 @@ pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
-    pub prune: bool,
-    pub mapping: bool,
+    /// Copy-only fields. Omitting them gives rm a distinct shape instead of
+    /// assigning copy semantics to false values.
+    pub prune: Option<bool>,
+    pub mapping: Option<bool>,
     pub dry_run: bool,
     pub endpoints: Vec<EndpointRecord>,
 }
@@ -96,6 +102,25 @@ pub struct TraceRecord<'a> {
     pub reason: &'static str,
 }
 
+pub struct RemovalSelectionRecord<'a> {
+    pub selector: u64,
+    pub path: &'a [u8],
+    pub status: &'static str,
+    pub kind: Option<&'static str>,
+}
+
+pub struct RemovalRecord<'a> {
+    pub selector: u64,
+    pub path: &'a [u8],
+    pub kind: Option<&'static str>,
+    pub disposition: &'static str,
+    pub attempts: Option<u64>,
+    pub retryable: Option<&'static str>,
+    pub class: Option<&'static str>,
+    pub os_kind: Option<&'static str>,
+    pub message: Option<&'a str>,
+}
+
 pub struct ResultRecord {
     pub status: &'static str,
     pub exit_code: i32,
@@ -114,6 +139,135 @@ pub struct ResultRecord {
     pub deletions_planned: Option<u64>,
     pub deletions_completed: Option<u64>,
     pub deletions_blocked: Option<u64>,
+}
+
+pub struct RemovalResultRecord {
+    pub status: &'static str,
+    pub exit_code: i32,
+    pub dry_run: bool,
+    pub selectors_total: u64,
+    pub selectors_resolved: u64,
+    pub selectors_missing: u64,
+    pub entries_planned: u64,
+    pub entries_removed: u64,
+    pub entries_already_absent: u64,
+    pub entries_failed: u64,
+    pub errors: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+pub enum RunMode {
+    Cp { prune: bool, mapping: bool },
+    Rm,
+}
+
+/// Create the caller-side result target and emit its first record. Both
+/// native commands use this path so descriptor ownership, symlink policy,
+/// fresh-file semantics, and run identity cannot drift.
+pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
+    let requested = args.native_results.is_some() || args.native_results_fd.is_some();
+    if !requested {
+        return Ok(None);
+    }
+    let out: Box<dyn std::io::Write + Send> = if let Some(fd) = args.native_results_fd {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 {
+            bail!(
+                "--results-fd {fd}: descriptor is not open; connect it in the caller, e.g. --results-fd {fd} {fd}>run.ndjson"
+            );
+        }
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            bail!(
+                "--results-fd {fd}: descriptor is open read-only; connect it for writing, e.g. --results-fd {fd} {fd}>run.ndjson"
+            );
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            bail!("--results-fd {fd}: {}", std::io::Error::last_os_error());
+        }
+        // Safety: the descriptor is inherited, open, and explicitly handed
+        // to syq. The operation owns it until the writer is dropped.
+        Box::new(unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) })
+    } else {
+        let results = args.native_results.as_deref().expect("results requested");
+        let path = std::path::PathBuf::from(OsStr::from_bytes(results).to_os_string());
+        let policy = if args.interface == Interface::Rsync {
+            OperatorSymlinkPolicy::TrustedOwner
+        } else if args.native_follow {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::Refuse
+        };
+        let file = crate::fsops::create_operator_file(results, policy).map_err(|error| {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+            }) {
+                anyhow::anyhow!(
+                    "--results {}: the file already exists; a results file holds exactly one run — remove it or choose a new name (recurring jobs can timestamp: run-$(date +%s).ndjson)",
+                    path.display()
+                )
+            } else {
+                anyhow::anyhow!("--results {}: {error}", path.display())
+            }
+        })?;
+        Box::new(file)
+    };
+    let writer = Arc::new(ResultsWriter::new(out));
+    let run_id = {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).context("generate run ID")?;
+        let mut hex = String::with_capacity(32);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        hex
+    };
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let include_destination = !matches!(mode, RunMode::Rm);
+    let (name, prune, mapping) = match mode {
+        RunMode::Cp { prune, mapping } => ("cp", Some(prune), Some(mapping)),
+        RunMode::Rm => ("rm", None, None),
+    };
+    writer.emit_run(&RunRecord {
+        run_id: &run_id,
+        started_at,
+        mode: name,
+        prune,
+        mapping,
+        dry_run: args.dry_run,
+        endpoints: run_endpoints(&args.locations, include_destination),
+    });
+    if writer.is_dead() {
+        bail!("--results stream failed before the run record was written");
+    }
+    Ok(Some(writer))
+}
+
+fn run_endpoints(locations: &[Location], include_destination: bool) -> Vec<EndpointRecord> {
+    let mut endpoints = Vec::new();
+    if let Some(source) = locations.first() {
+        endpoints.push(EndpointRecord {
+            role: "source",
+            host: source.host.clone(),
+            user: source.user.clone(),
+        });
+    }
+    if include_destination && locations.len() >= 2 {
+        if let Some(destination) = locations.last() {
+            endpoints.push(EndpointRecord {
+                role: "destination",
+                host: destination.host.clone(),
+                user: destination.user.clone(),
+            });
+        }
+    }
+    endpoints
 }
 
 impl ResultsWriter {
@@ -145,17 +299,23 @@ impl ResultsWriter {
                 value
             })
             .collect();
-        self.write(serde_json::json!({
+        let mut record = serde_json::json!({
             "type": "run",
             "run_id": run.run_id,
             "started_at": run.started_at,
             "syq_version": env!("CARGO_PKG_VERSION"),
             "mode": run.mode,
-            "prune": run.prune,
-            "mapping": run.mapping,
             "dry_run": run.dry_run,
             "endpoints": endpoints,
-        }));
+        });
+        let object = record.as_object_mut().expect("record is an object");
+        if let Some(prune) = run.prune {
+            object.insert("prune".into(), prune.into());
+        }
+        if let Some(mapping) = run.mapping {
+            object.insert("mapping".into(), mapping.into());
+        }
+        self.write(record);
     }
 
     pub fn emit_progress(&self, progress: &ProgressRecord) {
@@ -190,6 +350,64 @@ impl ResultsWriter {
         }
         if let Some(bytes) = trace.bytes {
             object.insert("bytes".into(), bytes.into());
+        }
+        self.write(record);
+    }
+
+    pub fn emit_removal_selection(&self, selection: &RemovalSelectionRecord) {
+        let mut record = serde_json::json!({
+            "type": "selection_result",
+            "selector": selection.selector,
+            "path": tagged(selection.path),
+            "status": selection.status,
+        });
+        if let Some(kind) = selection.kind {
+            record
+                .as_object_mut()
+                .expect("record is an object")
+                .insert("kind".into(), kind.into());
+        }
+        self.write(record);
+    }
+
+    pub fn emit_removal_trace(&self, removal: &RemovalRecord) {
+        let kind = removal
+            .kind
+            .expect("a planned removal always has a resolved object kind");
+        self.write(serde_json::json!({
+            "type": "removal_trace",
+            "selector": removal.selector,
+            "path": tagged(removal.path),
+            "kind": kind,
+            "disposition": "would_remove",
+        }));
+    }
+
+    pub fn emit_removal(&self, removal: &RemovalRecord) {
+        let mut record = serde_json::json!({
+            "type": "removal_result",
+            "selector": removal.selector,
+            "path": tagged(removal.path),
+            "disposition": removal.disposition,
+        });
+        let object = record.as_object_mut().expect("record is an object");
+        if let Some(kind) = removal.kind {
+            object.insert("kind".into(), kind.into());
+        }
+        if let Some(attempts) = removal.attempts {
+            object.insert("attempts".into(), attempts.into());
+        }
+        if let Some(retryable) = removal.retryable {
+            object.insert("retryable".into(), retryable.into());
+        }
+        if let Some(class) = removal.class {
+            object.insert("class".into(), class.into());
+        }
+        if let Some(os_kind) = removal.os_kind {
+            object.insert("os_kind".into(), os_kind.into());
+        }
+        if let Some(message) = removal.message {
+            object.insert("message".into(), message.into());
         }
         self.write(record);
     }
@@ -287,6 +505,32 @@ impl ResultsWriter {
             object.insert("deletions_blocked".into(), blocked.into());
         }
         self.write_and_seal(record, true);
+    }
+
+    pub fn emit_removal_result(&self, result: &RemovalResultRecord) {
+        self.write_and_seal(
+            serde_json::json!({
+                "type": "result",
+                "mode": "rm",
+                "status": result.status,
+                "exit_code": result.exit_code,
+                "dry_run": result.dry_run,
+                "selectors_total": result.selectors_total,
+                "selectors_resolved": result.selectors_resolved,
+                "selectors_missing": result.selectors_missing,
+                "entries_planned": result.entries_planned,
+                "entries_removed": result.entries_removed,
+                "entries_already_absent": result.entries_already_absent,
+                "entries_failed": result.entries_failed,
+                "errors": result.errors,
+                "elapsed_ms": result.elapsed_ms,
+            }),
+            true,
+        );
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Relaxed)
     }
 
     fn write(&self, record: serde_json::Value) {

@@ -143,6 +143,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
     } = session;
     let mut r = FrameReader::new(r);
     let mut w = FrameWriter::new(w, false);
+    // Send our build identity before waiting for the client's first postcard
+    // frame. Both peers can therefore diagnose version skew even when their
+    // Request or Response enum layouts no longer agree.
+    w.write_preamble().context("write wire preamble")?;
 
     let debug;
     let role;
@@ -414,7 +418,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Ok(()) => wref.borrow_mut().write_msg(&Response::NativeRemoveDone)?,
                     Err(error) => wref
                         .borrow_mut()
-                        .write_msg(&Response::Err(format!("{error:#}")))?,
+                        .write_msg(&Response::EndpointError(crate::fsops::wire_error(&error)))?,
                 }
             }
             Request::Scan {
@@ -1224,7 +1228,8 @@ mod tests {
         }
         // Give the accept loop (which polls every 25ms) time to take every
         // pending socket, then confirm each is being served rather than
-        // dropped: a served socket stays silent, a dropped one reads EOF.
+        // dropped. A socket with no connection id stays silent; the one that
+        // supplied an id receives the server's proactive wire preamble.
         std::thread::sleep(Duration::from_millis(200));
         for socket in &pending {
             socket
@@ -1234,6 +1239,7 @@ mod tests {
             match (&*socket).read(&mut byte) {
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Ok(1) => {}
                 other => panic!("pending socket was not held open: {other:?}"),
             }
         }

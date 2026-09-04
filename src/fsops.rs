@@ -1181,7 +1181,17 @@ fn errstr(e: &anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-fn wire_error(error: &anyhow::Error) -> WireError {
+pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
+    if let Some(wire) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WireError>())
+    {
+        return WireError {
+            message: errstr(error),
+            io_kind: wire.io_kind,
+            raw_os_error: wire.raw_os_error,
+        };
+    }
     let io_error = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<io::Error>());
@@ -7882,11 +7892,7 @@ mod tests {
         assert_eq!(fs::read(&external).unwrap(), b"sentinel");
         fs::remove_file(&partial).unwrap();
 
-        #[cfg(target_os = "macos")]
-        let fifo_mode = u32::from(libc::S_IFIFO) | 0o600;
-        #[cfg(not(target_os = "macos"))]
-        let fifo_mode = libc::S_IFIFO | 0o600;
-        create_node_any(&partial, fifo_mode, 0).unwrap();
+        create_node_any(&partial, MODE_FIFO | 0o600, 0).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert!(before.file_type().is_fifo());
         assert_eq!(observe(&mut operations), None);

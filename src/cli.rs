@@ -116,7 +116,7 @@ pub struct Args {
     /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
     pub native_mapping: Option<Vec<u8>>,
-    /// `--results` NDJSON outcome stream for native cp (`-` writes stdout).
+    /// `--results` NDJSON outcome stream for native cp or rm.
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,
     /// `--results-fd`: an inherited descriptor the caller opened for the
@@ -751,6 +751,18 @@ struct NativeOperationalArgs {
     progress_json: bool,
 }
 
+#[derive(clap::Args, Debug, Default)]
+struct NativeResultsArgs {
+    /// Write the machine-readable NDJSON result stream to FILE (created
+    /// fresh; an existing file is refused). Automation schema version 1
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    results: Option<OsString>,
+    /// Write the result stream to an inherited file descriptor the caller
+    /// opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2
+    #[arg(long, value_name = "FD", conflicts_with = "results")]
+    results_fd: Option<i32>,
+}
+
 #[derive(clap::Args, Debug)]
 struct NativeCopyOperationalArgs {
     #[command(flatten)]
@@ -935,14 +947,8 @@ struct NativeCopyFields {
     /// -C and dst paths are relative to the --into container
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     mapping: Option<OsString>,
-    /// Write the machine-readable NDJSON result stream to FILE (created
-    /// fresh; an existing file is refused). Automation schema version 1
-    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
-    results: Option<OsString>,
-    /// Write the result stream to an inherited file descriptor the caller
-    /// opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2
-    #[arg(long, value_name = "FD", conflicts_with = "results")]
-    results_fd: Option<i32>,
+    #[command(flatten)]
+    results_output: NativeResultsArgs,
     #[command(flatten)]
     operational: NativeCopyOperationalArgs,
 }
@@ -1014,6 +1020,8 @@ struct NativeRmCommand {
     operational: NativeOperationalArgs,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
+    #[command(flatten)]
+    results_output: NativeResultsArgs,
     /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
@@ -1097,13 +1105,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         decode_delegated_operands(&mut copy)?;
     }
     let mapping = copy.mapping.take();
-    let results = copy.results.take();
-    let results_fd = copy.results_fd.take();
-    if results_fd.is_some_and(|fd| fd <= 2) {
-        bail!(
-            "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
-        );
-    }
+    let results = copy.results_output.results.take();
+    let results_fd = copy.results_output.results_fd.take();
+    validate_native_results_fd(results_fd)?;
     let mut locations = if mapping.is_some() {
         let source = &copy.selection.source;
         let has_selectors = !(source.src.is_empty()
@@ -1339,7 +1343,10 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let matches = NativeRmCommand::command()
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
-    let parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    let mut parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    let results = parsed.results_output.results.take();
+    let results_fd = parsed.results_output.results_fd.take();
+    validate_native_results_fd(results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         (
@@ -1415,12 +1422,23 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
+    args.native_results = results.map(OsStringExt::into_vec);
+    args.native_results_fd = results_fd;
     args.pscope = parsed.pscope;
     args.syq_path = parsed.helper.syq_path;
     args.no_bootstrap = parsed.helper.no_bootstrap;
     args.rm = true;
     apply_native_operational(&mut args, parsed.operational);
     Ok(args)
+}
+
+fn validate_native_results_fd(results_fd: Option<i32>) -> Result<()> {
+    if results_fd.is_some_and(|fd| fd <= 2) {
+        bail!(
+            "--results-fd needs a descriptor above 2 (0-2 are stdin, stdout, and stderr); open one in the caller, e.g. --results-fd 3 3>run.ndjson"
+        );
+    }
+    Ok(())
 }
 
 fn lower_native_selection(
