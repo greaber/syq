@@ -65,9 +65,10 @@ per-transfer token and is encrypted unless `--syq-tcp-plain` was requested.
 Trade-offs:
 
 - A reachable TCP path avoids ssh's per-channel flow-control and cipher-process
-  limits. Fresh-small-file workers using default ssh reuse the authenticated
-  control connection; larger and mixed SSH workloads start independent data
-  processes so they can use multiple flows and cipher processes.
+  limits. Fresh-small-file workers using default ssh, without `--bwlimit`,
+  reuse the authenticated control connection; larger and mixed SSH workloads,
+  and any run with `--bwlimit`, start independent data processes so they can
+  use multiple flows and cipher processes.
 - A firewall exception increases reachable attack surface. A private LAN, VPN,
   or narrowly scoped source rule is preferable to a public allow rule.
 - `--syq-tcp-plain` saves encryption work but removes data confidentiality and
@@ -79,8 +80,8 @@ Trade-offs:
 
 This setting matters when data falls back to independent ssh connections. It
 limits concurrent *unauthenticated* ssh connections; it does not limit
-established sessions, fresh-small-file workers multiplexed over default ssh, or
-workers using the TCP data path. syq already retries shed connections and
+established sessions, fresh-small-file workers multiplexed over default ssh
+(which `--bwlimit` disables), or workers using the TCP data path. syq already retries shed connections and
 reduces the number of simultaneous handshakes, so the default is functional but
 can make connection setup slower.
 
