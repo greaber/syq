@@ -70,8 +70,8 @@ fn receipt_settlement_outcome(
     }
 }
 
-const MAX_RECEIPT_V2_LINE_BYTES: usize = 192 * 1024;
-const MAX_RECEIPT_V2_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
+const MAX_RECEIPT_LINE_BYTES: usize = 192 * 1024;
+const MAX_RECEIPT_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
 
 struct CapturedReceipt {
     file: std::fs::File,
@@ -101,7 +101,7 @@ impl CapturedReceipt {
             .bytes
             .checked_add(added)
             .context("receipt capture byte count overflow")?;
-        if self.bytes > MAX_RECEIPT_V2_CAPTURE_BYTES {
+        if self.bytes > MAX_RECEIPT_CAPTURE_BYTES {
             bail!("the relayed receipt exceeds its local capture limit");
         }
         self.file.write_all(&length.to_be_bytes())?;
@@ -201,8 +201,8 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
                     .context("relay remote coordinator output")?;
             }
             if let Some(payload) = capturing.as_mut() {
-                if payload.len() > MAX_RECEIPT_V2_LINE_BYTES {
-                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_V2_LINE_BYTES} bytes");
+                if payload.len() > MAX_RECEIPT_LINE_BYTES {
+                    bail!("the relayed receipt line exceeds {MAX_RECEIPT_LINE_BYTES} bytes");
                 }
             }
             if ends_line {
@@ -235,7 +235,7 @@ fn relay_stdout(stdout: impl std::io::Read) -> Result<Option<CapturedReceipt>> {
 fn store_receipt_line(captured: &mut Option<CapturedReceipt>, payload: Vec<u8>) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload.trim_ascii())
-        .context("decode a receipt v2 frame relayed from the source host")?;
+        .context("decode a receipt frame relayed from the source host")?;
     let receipt = match captured {
         Some(receipt) => receipt,
         None => captured.insert(CapturedReceipt::new()?),
@@ -1450,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_passes_output_through_and_spools_v2_frames() {
+    fn relay_passes_output_through_and_spools_receipt_frames() {
         // Ordinary output streams through byte for byte, including bytes
         // that are not UTF-8; a stream with no receipt lines captures
         // nothing.
@@ -1488,13 +1488,13 @@ mod tests {
         }
         let mut captured = relay_stdout(&output[..])
             .unwrap()
-            .expect("captured receipt v2 frames");
+            .expect("captured receipt frames");
         let captured: Vec<Vec<u8>> = captured.frames().unwrap().map(Result::unwrap).collect();
         assert_eq!(captured, frames);
 
         // An oversized marker line is refused instead of buffered.
         let mut oversized = crate::receipt::RECEIPT_LINE_PREFIX.as_bytes().to_vec();
-        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_V2_LINE_BYTES + 1));
+        oversized.extend(std::iter::repeat_n(b'A', MAX_RECEIPT_LINE_BYTES + 1));
         oversized.push(b'\n');
         assert!(relay_stdout(oversized.as_slice()).is_err());
     }

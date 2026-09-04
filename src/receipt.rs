@@ -1,4 +1,4 @@
-//! Receipt v2: a complete receiver-authored record stream, a small signed
+//! Receipts: a complete receiver-authored record stream, a small signed
 //! terminal commitment, and optional HPKE delivery to the invoking machine.
 //!
 //! The stream records logical pathname operations and closure-time state. It
@@ -67,7 +67,7 @@ pub(crate) struct ReceiptPolicy {
 impl ReceiptPolicy {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.required {
-            bail!("receipt v2 policy must require a receipt");
+            bail!("receipt policy must require a receipt");
         }
         if self.max_records == 0 || self.max_records > DEFAULT_MAX_RECORDS {
             bail!("receipt record limit is outside the supported range");
@@ -624,8 +624,8 @@ pub(crate) fn emit_receipt_frames(
                 let payload = sender
                     .seal(&buffer[..wanted], &frame_aad(sequence, false))
                     .map_err(|_| anyhow!("encrypt receipt stream frame"))?;
-            emit(encode_borrowed_receipt_frame(
-                &BorrowedReceiptFrame::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrame::Chunk {
                         sequence,
                         payload: &payload,
                     },
@@ -636,12 +636,10 @@ pub(crate) fn emit_receipt_frames(
             let payload = sender
                 .seal(&issued.signed_terminal, &frame_aad(sequence, true))
                 .map_err(|_| anyhow!("encrypt receipt terminal frame"))?;
-            emit(encode_borrowed_receipt_frame(
-                &BorrowedReceiptFrame::End {
-                    sequence,
-                    payload: &payload,
-                },
-            )?)?;
+            emit(encode_borrowed_receipt_frame(&BorrowedReceiptFrame::End {
+                sequence,
+                payload: &payload,
+            })?)?;
         }
         ReceiptDelivery::DetachedSignedPlaintext => {
             emit(encode_borrowed_receipt_frame(
@@ -660,8 +658,8 @@ pub(crate) fn emit_receipt_frames(
                     .stream
                     .read_exact(&mut buffer[..wanted])
                     .context("read receiver receipt spool")?;
-            emit(encode_borrowed_receipt_frame(
-                &BorrowedReceiptFrame::Chunk {
+                emit(encode_borrowed_receipt_frame(
+                    &BorrowedReceiptFrame::Chunk {
                         sequence,
                         payload: &buffer[..wanted],
                     },
@@ -669,12 +667,10 @@ pub(crate) fn emit_receipt_frames(
                 sequence += 1;
                 remaining -= wanted as u64;
             }
-            emit(encode_borrowed_receipt_frame(
-                &BorrowedReceiptFrame::End {
-                    sequence,
-                    payload: &issued.signed_terminal,
-                },
-            )?)?;
+            emit(encode_borrowed_receipt_frame(&BorrowedReceiptFrame::End {
+                sequence,
+                payload: &issued.signed_terminal,
+            })?)?;
         }
     }
     Ok(())

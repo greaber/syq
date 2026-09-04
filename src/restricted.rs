@@ -4419,10 +4419,11 @@ pub(crate) mod tests {
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let directory = open_directory(temporary.path()).unwrap();
         atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-binary").unwrap();
-        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v2").unwrap();
+        atomic_replace_executable_locked(&directory, "syq-receiver", b"replacement-receiver")
+            .unwrap();
 
         let path = temporary.path().join("syq-receiver");
-        assert_eq!(fs::read(&path).unwrap(), b"receiver-v2");
+        assert_eq!(fs::read(&path).unwrap(), b"replacement-receiver");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
     }
@@ -5922,7 +5923,7 @@ pub(crate) mod tests {
         fs::write(&kept, b"old").unwrap();
         fs::write(&gone, b"bye").unwrap();
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(true);
+        let (secret, policy) = encrypted_policy(true);
         let authority = test_authority_with_receipt(
             &root,
             DeletionPolicy::DeleteDestinationOnly,
@@ -6033,7 +6034,7 @@ pub(crate) mod tests {
         // A published file that cannot be read back at closure is attested
         // present with the hash failure recorded rather than silently
         // unhashed.
-        let (hashing_secret, hashing_policy) = encrypted_v2_policy(true);
+        let (hashing_secret, hashing_policy) = encrypted_policy(true);
         let hashing = existence_authority_with_receipt(&root, &hashing_policy, 5_000);
         let unreadable = target.join("unreadable");
         let settlement = hashing
@@ -6071,7 +6072,7 @@ pub(crate) mod tests {
         // The receipt states the final tree, not settlement order: a file
         // republished then deleted is absent, and one deleted then
         // republished is present.
-        let (racing_secret, racing_policy) = encrypted_v2_policy(false);
+        let (racing_secret, racing_policy) = encrypted_policy(false);
         let racing = existence_authority_with_receipt(&root, &racing_policy, 5_000);
         let vanished = target.join("vanished");
         let returned = target.join("returned");
@@ -6373,7 +6374,7 @@ pub(crate) mod tests {
         let image = target.join("image");
         fs::create_dir_all(&target).unwrap();
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(false);
+        let (secret, policy) = encrypted_policy(false);
         let authority = test_authority_with_receipt(
             &root,
             DeletionPolicy::Forbid,
@@ -6424,7 +6425,7 @@ pub(crate) mod tests {
 
         // With it, the same file is complete and the receipt is clean.
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(false);
+        let (secret, policy) = encrypted_policy(false);
         let finished = test_authority_with_receipt(
             &root,
             DeletionPolicy::Forbid,
@@ -6473,7 +6474,7 @@ pub(crate) mod tests {
         authority.receipt_key.public_key().to_openssh().unwrap()
     }
 
-    fn encrypted_v2_policy(
+    fn encrypted_policy(
         hashed: bool,
     ) -> (
         crate::receipt::RecipientSecret,

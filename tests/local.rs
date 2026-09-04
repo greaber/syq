@@ -343,7 +343,7 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|fake>local|ssh": 64 }
+            "paths": { "fake>local|ssh": 64 }
         }))
         .unwrap()
         .as_bytes(),
@@ -4974,7 +4974,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 1 }
+            "paths": { "local>fake|ssh": 1 }
         }))
         .unwrap()
         .as_bytes(),
@@ -5021,7 +5021,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     let fixed = run("fixed", Some(3));
     assert_output_ok(&fixed);
     let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["v1|local>fake|ssh"], 1);
+    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
 }
 
 #[cfg(debug_assertions)]
@@ -5086,7 +5086,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 2 }
+            "paths": { "local>fake|ssh": 2 }
         }))
         .unwrap()
         .as_bytes(),

@@ -167,7 +167,7 @@ pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
         .collect::<Vec<_>>()
         .join("+");
     Some(format!(
-        "v1|{}>{}|{transport}",
+        "{}>{}|{transport}",
         endpoint_key(src),
         endpoint_key(dst)
     ))

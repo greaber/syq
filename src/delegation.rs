@@ -2221,9 +2221,9 @@ mod tests {
             &receipted,
             &context(SIGNER, TARGET, NOW, 0),
             &fixture.policy(),
-            &fixture.replay("in-process-receipt-v2-signature-replay"),
+            &fixture.replay("in-process-receipt-signature-replay"),
         )
-        .expect("OpenSSH must accept the signed receipt v2 policy");
+        .expect("OpenSSH must accept the signed receipt policy");
         let (_, extensions, digest, _) = verified.into_parts();
         assert_eq!(extensions.receipt_policy, expected_receipt_policy);
         assert_eq!(digest, expected_digest);
