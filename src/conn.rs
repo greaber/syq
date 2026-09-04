@@ -132,7 +132,7 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || message.contains("build identity mismatch")
-        || message.contains("wire preamble")
+        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
         || message.contains("unexpected handshake response")
         || message.contains("exit status: 127")
         || message.contains(&format!(
@@ -646,17 +646,20 @@ impl RemoteConn {
         if let Some(child) = &mut self.child {
             for _ in 0..20 {
                 if let Ok(Some(status)) = child.try_wait() {
-                    if self.multiplexed_ssh && status.code() == Some(255) {
-                        return MultiplexedSshSessionError(format!(
-                            "{}: multiplexed SSH session was rejected ({status})",
-                            self.label
-                        ))
-                        .into();
+                    if status.code() == Some(255) {
+                        if self.multiplexed_ssh {
+                            return MultiplexedSshSessionError(format!(
+                                "{}: multiplexed SSH session was rejected ({status})",
+                                self.label
+                            ))
+                            .into();
+                        }
+                        return anyhow!("{}: remote syq exited ({status})", self.label);
                     }
                     // For other early exits, a preamble failure is the
                     // actionable version-skew diagnosis; the exit status is
                     // commonly just the old helper rejecting unknown bytes.
-                    if detail.contains("wire preamble")
+                    if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
                         || detail.contains("build identity mismatch")
                     {
                         return anyhow!("{}: {detail}", self.label);
@@ -666,7 +669,9 @@ impl RemoteConn {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        if detail.contains("wire preamble") || detail.contains("build identity mismatch") {
+        if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
+            || detail.contains("build identity mismatch")
+        {
             return anyhow!("{}: {detail}", self.label);
         }
         let msg = if e
@@ -1616,7 +1621,7 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
         "exit status: {}",
         remote_helper::HELPER_NOT_EXECUTABLE_EXIT
     )) || message.contains("build identity mismatch")
-        || message.contains("wire preamble")
+        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
 }
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
@@ -2724,12 +2729,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_wire_preamble_is_non_retryable_and_refreshes_a_managed_helper() {
-        let error = anyhow!(
-            "wire preamble magic mismatch; remote syq may predate the build-identified preamble"
-        );
+    fn malformed_wire_preamble_is_non_retryable_and_refreshes_a_managed_helper() {
+        let error =
+            anyhow!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq sent an invalid build identity");
         assert!(is_non_retryable_connect_error(&error));
         assert!(helper_needs_install(&error));
+    }
+
+    #[test]
+    fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 255"])
+            .spawn()
+            .unwrap();
+        let mut conn = RemoteConn {
+            child: Some(child),
+            w: FrameWriter::new(Box::new(std::io::sink()), false),
+            rx: None,
+            reader: None,
+            label: "retryable SSH test".into(),
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+            multiplexed_ssh: false,
+        };
+        let error = conn.io_err(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: read header from remote syq"),
+            )
+            .into(),
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("exit status: 255"), "{diagnostic}");
+        assert!(!diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR));
+        assert!(!is_non_retryable_connect_error(&error));
+        assert!(!helper_needs_install(&error));
     }
 
     #[test]

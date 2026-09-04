@@ -22,6 +22,7 @@ const COMPRESS_LEVEL: i32 = 1;
 const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
 const WIRE_PREAMBLE_FIXED_LEN: usize = WIRE_PREAMBLE_MAGIC.len() + 2;
 const MAX_BUILD_IDENTITY_BYTES: usize = 512;
+pub(crate) const WIRE_PREAMBLE_PROTOCOL_ERROR: &str = "wire preamble protocol error";
 #[cfg(target_os = "linux")]
 const MODE_SYMLINK: u32 = libc::S_IFLNK;
 #[cfg(not(target_os = "linux"))]
@@ -1056,7 +1057,9 @@ impl<W: Write> FrameWriter<W> {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "local build identity exceeds the wire preamble limit",
+                    format!(
+                        "{WIRE_PREAMBLE_PROTOCOL_ERROR}: local build identity exceeds the supported limit"
+                    ),
                 )
             })?;
         self.w.write_all(WIRE_PREAMBLE_MAGIC)?;
@@ -1118,7 +1121,7 @@ impl<R: Read> FrameReader<R> {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "read wire preamble from remote syq: {error}; remote may be incompatible with local build {}",
+                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: read header from remote syq: {error}; remote may be incompatible with local build {}",
                     crate::identity::build()
                 ),
             )
@@ -1127,7 +1130,7 @@ impl<R: Read> FrameReader<R> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "wire preamble magic mismatch; remote syq may predate the build-identified preamble (local {})",
+                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: magic mismatch; remote syq may predate the build-identified preamble (local {})",
                     crate::identity::build()
                 ),
             ));
@@ -1140,27 +1143,31 @@ impl<R: Read> FrameReader<R> {
         if identity_len == 0 || identity_len > MAX_BUILD_IDENTITY_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("remote syq build identity length {identity_len} is invalid"),
+                format!(
+                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq build identity length {identity_len} is invalid"
+                ),
             ));
         }
         let mut identity = vec![0u8; identity_len];
         self.r.read_exact(&mut identity).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("read remote syq build identity: {error}"),
+                format!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: read remote syq build identity: {error}"),
             )
         })?;
         let identity = std::str::from_utf8(&identity).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("remote syq build identity is not UTF-8: {error}"),
+                format!(
+                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq build identity is not UTF-8: {error}"
+                ),
             )
         })?;
         if identity != crate::identity::build() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "build identity mismatch (remote {identity}, local {})",
+                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: build identity mismatch (remote {identity}, local {})",
                     crate::identity::build()
                 ),
             ));
@@ -1293,8 +1300,41 @@ mod tests {
             .read_msg::<Request>()
             .unwrap_err();
         let diagnostic = error.to_string();
-        assert!(diagnostic.contains("wire preamble magic mismatch"));
+        assert!(diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR));
+        assert!(diagnostic.contains("magic mismatch"));
         assert!(diagnostic.contains("may predate"));
+    }
+
+    #[test]
+    fn every_malformed_build_identity_is_a_preamble_protocol_error() {
+        let preamble = |length: u16, identity: &[u8]| {
+            let mut input = Vec::new();
+            input.extend_from_slice(WIRE_PREAMBLE_MAGIC);
+            input.extend_from_slice(&length.to_be_bytes());
+            input.extend_from_slice(identity);
+            input
+        };
+        let cases = [
+            (preamble(0, b""), "length 0 is invalid"),
+            (
+                preamble((MAX_BUILD_IDENTITY_BYTES + 1) as u16, b""),
+                "length 513 is invalid",
+            ),
+            (preamble(4, b"ab"), "read remote syq build identity"),
+            (preamble(1, &[0xff]), "not UTF-8"),
+        ];
+
+        for (input, expected) in cases {
+            let error = FrameReader::new(input.as_slice())
+                .read_msg::<Response>()
+                .unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
     }
 
     #[test]
