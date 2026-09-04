@@ -3101,13 +3101,12 @@ fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
     // macOS 14 runner: 685 of 3000 races), so the count there can be 2.
     if cfg!(target_os = "linux") {
         assert_eq!(terminal["entries_removed"], 1, "{records:?}");
+        assert_eq!(terminal["entries_already_absent"], 1, "{records:?}");
     } else {
-        assert!(
-            terminal["entries_removed"] == 1 || terminal["entries_removed"] == 2,
-            "{records:?}"
-        );
+        let removed = terminal["entries_removed"].as_u64().unwrap();
+        let absent = terminal["entries_already_absent"].as_u64().unwrap();
+        assert!(removed >= 1 && removed + absent == 2, "{records:?}");
     }
-    assert_eq!(terminal["entries_already_absent"], 1);
 }
 
 #[test]
