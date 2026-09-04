@@ -521,7 +521,8 @@ can open sessions through the socket without touching the key or agent, and
 can take the ready helper session the pool holds. This is comparable to
 sudo's credential cache; do not enable it where that window is unacceptable.
 On the remote side the pool keeps one idle SSH session and one idle helper
-process per endpoint for as long as the window lasts, and nothing else. Data connections are unaffected: they remain separate TCP
+process per endpoint for as long as the window lasts, and nothing else. Data
+connections are unaffected: they remain separate TCP
 streams (or independent SSH processes under `--no-tcp`), so bulk throughput
 does not change. Persistence is not applied to an explicit `--rsh`, a
 coordinator running on a remote host, or authentication to the restricted

@@ -96,7 +96,10 @@ fn suffixed(path: &Path, suffix: &[u8]) -> PathBuf {
 
 /// Whether a pool holds this endpoint's lock. Liveness is the lock, not the
 /// socket file: a stale socket cannot claim to be alive, and two pools
-/// cannot race each other's sockets.
+/// cannot race each other's sockets. A `flock` lock is held by every copy of
+/// its descriptor, so a process that forked while a pool held it keeps it
+/// until it execs; that window is microseconds, and every caller tolerates
+/// a briefly stale answer: `ensure` is best effort and `stop` waits.
 pub(crate) fn is_running(control: &Path) -> bool {
     matches!(try_lock(control, false), Ok(None))
 }
@@ -748,7 +751,16 @@ mod tests {
         assert!(is_running(&control));
         assert!(try_lock(&control, true).unwrap().is_none());
         drop(held);
-        assert!(!is_running(&control));
+        // Another test in this process may be between fork and exec with a
+        // copy of the descriptor, which keeps the lock for a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(&control) {
+            assert!(
+                Instant::now() < deadline,
+                "released lock still reported held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         stop(&control).unwrap();
         assert!(!lock_path(&control).exists());
     }
