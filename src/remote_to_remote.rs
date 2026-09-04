@@ -885,6 +885,7 @@ fn run_remote(
         quiet: args.quiet,
         tcp: Default::default(),
         diagnostics: Default::default(),
+        primed_control: Default::default(),
     };
 
     // Rebuild the native command for the remote coordinator. Placement stays

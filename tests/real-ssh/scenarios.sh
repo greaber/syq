@@ -109,34 +109,71 @@ fi
 
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
-rm -f /tmp/syq-real-ssh-ssh.trace
+trace=/tmp/syq-real-ssh-ssh.trace
+rm -f "$trace"
 syq persist on >/dev/null
 completion_output=/tmp/syq-real-ssh-completion.out
 completion_expected=/tmp/syq-real-ssh-completion.expected
-for _ in 1 2; do
+{
+    printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
+    printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
+} >"$completion_expected"
+complete_remote() {
     syq completion __complete fish 6 -- \
         syq cp --syq-path /usr/local/bin/syq --from source \
         /tmp/syq-real-ssh/completion/al >"$completion_output"
-    {
-        printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
-        printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
-    } >"$completion_expected"
     cmp "$completion_expected" "$completion_output"
+}
+# Completed logins of the completion's own: the first becomes the master.
+direct_logins() {
+    awk -F '\t' '
+        $1 == "phase=end" &&
+        $3 == "host=source" &&
+        $4 == "control_master=auto" &&
+        $8 == "status=0" { count++ }
+        END { print count + 0 }
+    ' "$trace"
+}
+# Sessions the pool holds open through the master: attached with
+# ControlMaster=no to a present socket and not yet ended. A master check
+# starts and ends at once, so it never counts here.
+open_spares() {
+    awk -F '\t' '
+        $3 == "host=source" &&
+        $4 == "control_master=no" &&
+        $6 == "control_socket=present" {
+            if ($1 == "phase=start") open++
+            if ($1 == "phase=end") open--
+        }
+        END { print open + 0 }
+    ' "$trace"
+}
+complete_remote
+test "$(direct_logins)" -eq 1
+n=0
+while [ "$(open_spares)" -lt 1 ] && [ "$n" -lt 150 ]; do
+    sleep 0.1
+    n=$((n + 1))
 done
-test "$(syq completion cache list)" = source
-reused_completion=$(awk -F '\t' '
-    $1 == "phase=end" &&
-    $3 == "host=source" &&
-    $4 == "control_master=auto" &&
-    $6 == "control_socket=present" &&
-    $8 == "status=0" { count++ }
-    END { print count + 0 }
-' /tmp/syq-real-ssh-ssh.trace)
-if [ "$reused_completion" -lt 1 ]; then
-    echo 'second remote completion did not reuse the persistent SSH socket:' >&2
-    cat /tmp/syq-real-ssh-ssh.trace >&2
+if [ "$(open_spares)" -lt 1 ]; then
+    echo 'session pool did not open a spare through the persistent master:' >&2
+    cat "$trace" >&2
     exit 1
 fi
+syq persist status | grep -q 'session pool' || {
+    echo 'persist status does not show the session pool:' >&2
+    syq persist status >&2
+    exit 1
+}
+# Later completions take the ready session: no login of their own.
+complete_remote
+complete_remote
+if [ "$(direct_logins)" -ne 1 ]; then
+    echo 'a later completion opened its own SSH login instead of taking the pooled session:' >&2
+    cat "$trace" >&2
+    exit 1
+fi
+test "$(syq completion cache list)" = source
 syq completion cache clear >/dev/null
 syq persist off >/dev/null
 

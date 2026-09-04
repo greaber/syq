@@ -467,14 +467,34 @@ syq persist off
 While it is on, transfer and removal commands that use syq's implicit SSH
 transport keep one control connection per `user@host:port` alive for five
 minutes after its last session (OpenSSH `ControlMaster` with
-`ControlPersist`). Later commands reuse that authenticated connection, cutting
-per-command setup to milliseconds and avoiding another hardware-token
-interaction. `status` shows the global scope and its recorded endpoints;
-`off` disables the policy, asks every live syq-owned master to exit, and
-removes the global runtime scope. The durable preference lives in
+`ControlPersist`). Later commands reuse that authenticated connection and
+avoid another hardware-token interaction.
+
+Reusing the connection alone still costs each command a new SSH session, a
+helper launch, and a handshake before its first request: three network round
+trips, which on a distant host is most of a second. So while persistence is
+on, the first command to reach an endpoint also starts a small background
+process, the session pool, that keeps one helper session ready for that
+endpoint. The next command takes the ready session instead of opening its
+own, so a remote completion or a small copy costs one round trip. The pool
+opens its session through the existing control connection only: it checks
+that the master is alive, attaches to it with every authentication method
+disabled, no agent, display, or port forwarding, and no proxy of its own, and
+never reads from the session it holds. If the master has gone away the pool
+simply stays empty, and the next command logs in normally and shows whatever
+OpenSSH has to say. The pool exits after five minutes without
+handing over a session, and the control connection's own five-minute window
+begins after that, so the reuse window after your last command can reach ten
+minutes in total. It also exits when its scope is removed or when a newer
+syq binary starts using the endpoint.
+
+`status` shows the global scope and its recorded endpoints, marking an
+endpoint whose session pool is running; `off` disables the policy, stops
+every session pool, asks every live syq-owned master to exit, and removes the
+global runtime scope. The durable preference lives in
 `$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
-control sockets live in a per-user runtime directory that only that user can
-read.
+control sockets and pool sockets live in a per-user runtime directory that
+only that user can read.
 
 Scripts can avoid changing that shared preference by creating an ephemeral
 persistence scope:
@@ -505,9 +525,12 @@ not from the open file handles syq uses for filters, mappings, file lists, and
 results.
 
 During either persistence window, anything able to act as the same local user
-can open sessions through the socket without touching the key or agent. This
-is comparable to sudo's credential cache; do not enable it where that window
-is unacceptable. Data connections are unaffected: they remain separate TCP
+can open sessions through the socket without touching the key or agent, and
+can take the ready helper session the pool holds. This is comparable to
+sudo's credential cache; do not enable it where that window is unacceptable.
+On the remote side the pool keeps one idle SSH session and one idle helper
+process per endpoint for as long as the window lasts, and nothing else. Data
+connections are unaffected: they remain separate TCP
 streams (or independent SSH processes under `--no-tcp`), so bulk throughput
 does not change. Persistence is not applied to an explicit `--rsh`, a
 coordinator running on a remote host, or authentication to the restricted
@@ -546,9 +569,10 @@ The helper syq installs on a remote host serves one bounded, read-only
 directory listing. If the matching helper is absent, the first completion may
 install it through the same signed, verified bootstrap used by a transfer.
 With persistence enabled, completion uses the same per-endpoint SSH control
-connection as later transfers, which removes the repeated login latency.
-Without persistence, the completion process opens its own connection, which
-ends with that request.
+connection as later transfers, which removes the repeated login latency. It
+also takes the session pool's ready helper when one is waiting, which makes a
+Tab one network round trip. Without persistence, the completion process opens
+its own connection, which ends with that request.
 
 After a successful SSH connection, syq remembers the endpoint as a future
 suggestion. It also suggests literal aliases from SSH configuration,

@@ -81,7 +81,8 @@ syq completion fish | source
 Remote completion logs in with a normal noninteractive SSH session. The first
 Tab on a remote endpoint can take a few seconds if syq must install the remote
 helper there. `syq persist on` makes later completions much faster by keeping
-the authenticated SSH connection available between commands.
+the authenticated SSH connection, and a ready helper session on it,
+available between commands.
 
 ## Update checks and self-update
 
