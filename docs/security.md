@@ -337,10 +337,12 @@ become a valid clean receipt, though suppression remains a denial of service.
 
 The receipt is hostB's closure-time account of hostB: it says what landed, not
 what hostA omitted or invented, and it is neither a transaction nor a rollback.
-`--detach` cannot use this path at all: unless both endpoints are the same
-host, a detached transfer needs `--no-forward-agent`, with the coordinator
-host holding its own credential for the other endpoint, or an explicit
-`--rsh`, so no enrolled receiver runs and no receipt is produced.
+`--detach` is not available with this command-restricted receiver because its
+constrained agent exists only while syq remains attached. Unless both
+endpoints are the same host, a detached launch instead requires
+coordinator-owned peer credentials through `--no-forward-agent`, or an
+explicit `--rsh` policy. Neither path prepares a restricted grant or signed
+receipt.
 
 ### Putting the layers together
 

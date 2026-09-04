@@ -288,6 +288,8 @@ class NativeClientTests(unittest.TestCase):
             max_entries=100,
             max_total_bytes="2G",
             max_runtime="30m",
+            receipt="hashed",
+            pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
             preserve=["permissions", "ownership"],
@@ -319,7 +321,8 @@ class NativeClientTests(unittest.TestCase):
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
             "--max-entries", "--max-total-bytes",
-            "--max-runtime", "--ignore", "--ignore-from", "--preserve",
+            "--max-runtime", "--receipt", "--ignore", "--ignore-from",
+            "--preserve",
             "--inplace", "--max-size", "--min-size",
         ):
             self.assertIn(expected, argv)
@@ -329,6 +332,8 @@ class NativeClientTests(unittest.TestCase):
         )
         self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
+        self.assertIn("--pscope=-scope", argv)
+        self.assertEqual(argv[argv.index("--receipt") + 1], "hashed")
         self.assertEqual(argv.count("--src"), 2)
 
     def test_hyphen_prefixed_paths_use_attached_option_values(self) -> None:
@@ -370,6 +375,7 @@ class NativeClientTests(unittest.TestCase):
             dry_run=True,
             connections=4,
             syq_path="/opt/syq",
+            pscope="scope",
             results=output,
             on_event=events.append,
         )
@@ -403,8 +409,10 @@ class NativeClientTests(unittest.TestCase):
             "--dry-run",
             "--connections",
             "--syq-path",
+            "--pscope",
         ):
             self.assertIn(expected, argv)
+        self.assertEqual(argv[argv.index("--pscope") + 1], "scope")
         self.assertTrue(any(arg.startswith("--results-fd=") for arg in argv))
         saved = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(saved[-1]["entries_planned"], result.entries_planned)
@@ -766,6 +774,12 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
             self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--receipt"):
+            self.client.cp("source", into="target", receipt="full")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--pscope"):
+            self.client.cp(
+                "source", into="target", pscope="scope", rsh="ssh"
+            )
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):

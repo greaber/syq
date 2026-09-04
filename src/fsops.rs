@@ -2138,26 +2138,26 @@ impl FsOps {
         let blocks_available = statvfs_counter(stats.f_bavail);
         let files = statvfs_counter(stats.f_files);
         let files_available = statvfs_counter(stats.f_favail);
-        let mut available_bytes = blocks_available.saturating_mul(fragment_size);
-        let mut available_inodes =
-            (files != 0 && files_available <= files).then_some(files_available);
+        let available_bytes = blocks_available.saturating_mul(fragment_size);
+        let available_inodes = (files != 0 && files_available <= files).then_some(files_available);
         #[cfg(debug_assertions)]
-        {
-            if let Some(value) = std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
-                available_bytes = value
+        let available_bytes = match std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
+            Some(value) => value
+                .to_string_lossy()
+                .parse()
+                .context("parse SYQ_TEST_AVAILABLE_BYTES")?,
+            None => available_bytes,
+        };
+        #[cfg(debug_assertions)]
+        let available_inodes = match std::env::var_os("SYQ_TEST_AVAILABLE_INODES") {
+            Some(value) => Some(
+                value
                     .to_string_lossy()
                     .parse()
-                    .context("parse SYQ_TEST_AVAILABLE_BYTES")?;
-            }
-            if let Some(value) = std::env::var_os("SYQ_TEST_AVAILABLE_INODES") {
-                available_inodes = Some(
-                    value
-                        .to_string_lossy()
-                        .parse()
-                        .context("parse SYQ_TEST_AVAILABLE_INODES")?,
-                );
-            }
-        }
+                    .context("parse SYQ_TEST_AVAILABLE_INODES")?,
+            ),
+            None => available_inodes,
+        };
         let empty = check_empty
             .then(|| Self::selected_directory_empty(&directory))
             .flatten();

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import json
 import os
@@ -16,6 +17,12 @@ EXECUTABLE = os.environ.get("SYQ_CANDIDATE_EXECUTABLE")
 EXPECTED_VERSION = os.environ.get("SYQ_CANDIDATE_VERSION")
 
 
+def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
+    """Create product-facing fixtures below the physical temporary directory."""
+
+    return tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
+
+
 @unittest.skipUnless(
     EXECUTABLE and EXPECTED_VERSION,
     "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
@@ -27,7 +34,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
         executable = Path(EXECUTABLE)
         self.assertEqual(syq.version(executable=executable), EXPECTED_VERSION)
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with resolved_temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source = root / "source; $(not-a-command)"
             destination = root / "destination"
@@ -175,27 +182,6 @@ class CandidateCompatibilityTests(unittest.TestCase):
             self.assertEqual(pruned.deletions_completed, 1)
             self.assertFalse((prune_target / "extra").exists())
 
-            raw_name = b"raw-\xff"
-            raw_source = os.fsencode(root) + b"/" + raw_name
-            descriptor = os.open(raw_source, os.O_WRONLY | os.O_CREAT, 0o600)
-            try:
-                os.write(descriptor, b"raw")
-            finally:
-                os.close(descriptor)
-            raw_events: list[syq.AutomationEvent] = []
-            raw_result = client.cp(
-                src=raw_name,
-                into=b"raw-target",
-                on_event=raw_events.append,
-            )
-            self.assertEqual(raw_result.files_transferred, 1)
-            raw_operation = next(
-                event
-                for event in raw_events
-                if isinstance(event, syq.OperationResult) and event.kind == "file"
-            )
-            self.assertEqual(raw_operation.dst.raw, raw_name)
-
             removal_tree = root / "remove-tree"
             removal_tree.mkdir()
             (removal_tree / "child").write_bytes(b"remove")
@@ -219,6 +205,45 @@ class CandidateCompatibilityTests(unittest.TestCase):
             self.assertEqual(removed.entries_removed, 2)
             self.assertFalse(removal_tree.exists())
 
+    def test_candidate_preserves_raw_filename_bytes(self) -> None:
+        assert EXECUTABLE is not None
+        executable = Path(EXECUTABLE)
+        with resolved_temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_name = b"raw-\xff"
+            raw_source = os.fsencode(root) + b"/" + raw_name
+            try:
+                descriptor = os.open(
+                    raw_source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except OSError as error:
+                if error.errno == errno.EILSEQ:
+                    self.skipTest(
+                        "the temporary filesystem rejects non-UTF-8 filenames"
+                    )
+                raise
+            try:
+                os.write(descriptor, b"raw")
+            finally:
+                os.close(descriptor)
+
+            client = syq.Client(executable=executable, process_cwd=root)
+            raw_events: list[syq.AutomationEvent] = []
+            raw_result = client.cp(
+                src=raw_name,
+                into=b"raw-target",
+                on_event=raw_events.append,
+            )
+            self.assertEqual(raw_result.files_transferred, 1)
+            raw_operation = next(
+                event
+                for event in raw_events
+                if isinstance(event, syq.OperationResult) and event.kind == "file"
+            )
+            self.assertEqual(raw_operation.dst.raw, raw_name)
+
     def test_candidate_failure_is_retained(self) -> None:
         assert EXECUTABLE is not None
         result = syq.run(
@@ -232,7 +257,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
 
     def test_candidate_remote_to_remote_copy_can_keep_results_local(self) -> None:
         assert EXECUTABLE is not None
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with resolved_temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source = root / "source"
             destination = root / "destination"
@@ -288,7 +313,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_client_uses_the_candidate_native_surface(self) -> None:
         assert EXECUTABLE is not None
         assert EXPECTED_VERSION is not None
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with resolved_temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "source").mkdir()
             (root / "source" / "a").write_bytes(b"async")

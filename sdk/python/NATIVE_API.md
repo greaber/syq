@@ -220,6 +220,7 @@ syq.cp(
     connections=None,
     coordinate_at=None,
     rsh=None,
+    pscope=None,
     syq_path=None,
     no_bootstrap=False,
     tcp_plain=False,
@@ -232,6 +233,7 @@ syq.cp(
     max_entries=None,
     max_total_bytes=None,
     max_runtime=None,
+    receipt=None,
     ignore=None,
     ignore_from=None,
     preserve=None,
@@ -265,6 +267,7 @@ syq.rm(
     connections=None,
     syq_path=None,
     no_bootstrap=False,
+    pscope=None,
     on_event=None,
     timeout=None,
     check=True,
@@ -312,9 +315,12 @@ receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
-Managed SSH persistence scopes (`--pscope`) and receiver receipts
-(`--receipt`) are not yet exposed; they are classified as follow-up in
-`native-api.json`.
+`pscope` selects a private SSH persistence scope created by
+`syq persist on --ephemeral` for `cp` or `rm`. It cannot be combined with
+`rsh`, and the executable remains authoritative for whether the selected
+topology can use the scope. `receipt` accepts `"sizes"` or `"hashed"` and has
+the native receiver-only meaning; `"hashed"` asks the receiver to include
+closure-time BLAKE3 file digests.
 
 Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
 take effect in command-line order, and the last matching rule wins. A simple

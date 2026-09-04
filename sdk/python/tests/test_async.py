@@ -68,6 +68,8 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             max_entries=100,
             max_total_bytes="2G",
             max_runtime="30m",
+            receipt="sizes",
+            pscope="scope",
             on_event=observe,
         )
 
@@ -87,6 +89,11 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--max-entries", self.argv())
         self.assertIn("--max-total-bytes", self.argv())
         self.assertIn("--max-runtime", self.argv())
+        self.assertIn("--receipt", self.argv())
+        self.assertIn("--pscope", self.argv())
+        self.assertEqual(
+            self.argv()[self.argv().index("--receipt") + 1], "sizes"
+        )
         self.assertEqual(self.argv().count("--src"), 2)
 
         prune = await self.client.cp(
@@ -103,7 +110,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             events.append(event)
 
         result = await self.client.rm(
-            "victim", dry_run=True, on_event=observe
+            "victim", dry_run=True, pscope="scope", on_event=observe
         )
 
         self.assertIsInstance(result, syq.RmResult)
@@ -115,6 +122,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(arg.startswith("--results-fd=") for arg in self.argv())
         )
+        self.assertIn("--pscope", self.argv())
 
     async def test_results_accepts_a_caller_owned_binary_file(self) -> None:
         output = io.BytesIO()

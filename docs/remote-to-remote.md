@@ -177,13 +177,12 @@ Diagnostic text is bounded context rather than a stable interface; structured
 codes and dispositions are authoritative. An authenticated expected manifest
 is required for source completeness and byte authenticity.
 
-`--detach` cannot use the command-restricted path: the constrained agent
-exists only while syq is attached, so unless both endpoints are the same host
-a detached transfer needs `--no-forward-agent`, with the coordinator host
-holding its own credential for the other endpoint, or an explicit `--rsh`
-policy. No enrolled receiver runs and no receipt is produced; the launcher
-reports only that the job started and where its log is on the coordinator
-host.
+`--detach` is not available with the command-restricted receiver because its
+constrained agent exists only while syq remains attached. Unless both
+endpoints are the same host, a detached launch instead requires
+coordinator-owned peer credentials (`--no-forward-agent`) or an explicit
+`--rsh` policy. Neither path prepares a restricted grant or signed receipt;
+the returned remote log is not a locally authenticated receipt.
 
 ## Signed policies and options that fail closed
 

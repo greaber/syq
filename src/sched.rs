@@ -71,13 +71,23 @@ struct Inner {
     abort: bool,
 }
 
+impl Inner {
+    fn finished(&self) -> bool {
+        self.scan_done
+            && self.probing == 0
+            && self.inflight.is_empty()
+            && self.files.is_empty()
+            && self.ranges.is_empty()
+            && self.finishes.is_empty()
+    }
+}
+
 pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
+    tune_cv: Condvar,
     direct_fallback_workers: AtomicUsize,
     tune_request: AtomicUsize,
-    tune_wait: Mutex<()>,
-    tune_cv: Condvar,
     pub jobs: Mutex<Vec<FileJob>>,
     pub block: u64,
     pub min_split: u64,
@@ -101,10 +111,9 @@ impl Sched {
                 abort: false,
             }),
             cv: Condvar::new(),
+            tune_cv: Condvar::new(),
             direct_fallback_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
-            tune_wait: Mutex::new(()),
-            tune_cv: Condvar::new(),
             jobs: Mutex::new(Vec::new()),
             block,
             min_split: min_split.max(2 * block),
@@ -140,7 +149,9 @@ impl Sched {
     /// Wake the tuner when a speculative direct local copy discovers that it
     /// needs the ordinary parallel userspace path after all.
     pub fn request_worker_count(&self, workers: usize) {
-        let _guard = self.tune_wait.lock().unwrap();
+        // Share the scheduler mutex with the tuning wait predicate so a
+        // request cannot land between the driver's check and its sleep.
+        let _guard = self.inner.lock().unwrap();
         self.tune_request.fetch_max(workers, Relaxed);
         self.tune_cv.notify_one();
     }
@@ -161,11 +172,13 @@ impl Sched {
     }
 
     pub fn wait_for_tuning(&self, timeout: Duration) {
-        let guard = self.tune_wait.lock().unwrap();
-        if self.tune_request.load(Relaxed) == 0 {
+        let guard = self.inner.lock().unwrap();
+        if self.tune_request.load(Relaxed) == 0 && !guard.abort && !guard.finished() {
             drop(
                 self.tune_cv
-                    .wait_timeout_while(guard, timeout, |_| self.tune_request.load(Relaxed) == 0)
+                    .wait_timeout_while(guard, timeout, |inner| {
+                        self.tune_request.load(Relaxed) == 0 && !inner.abort && !inner.finished()
+                    })
                     .unwrap(),
             );
         }
@@ -202,11 +215,13 @@ impl Sched {
     pub fn scan_done(&self) {
         self.inner.lock().unwrap().scan_done = true;
         self.cv.notify_all();
+        self.tune_cv.notify_one();
     }
 
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
+        self.tune_cv.notify_one();
     }
 
     pub fn is_aborted(&self) -> bool {
@@ -223,13 +238,7 @@ impl Sched {
 
     /// All work handed out and finished (what makes `next` return Exit).
     pub fn finished(&self) -> bool {
-        let g = self.inner.lock().unwrap();
-        g.scan_done
-            && g.probing == 0
-            && g.inflight.is_empty()
-            && g.files.is_empty()
-            && g.ranges.is_empty()
-            && g.finishes.is_empty()
+        self.inner.lock().unwrap().finished()
     }
 
     /// Whether useful capacity is queued or about to emerge from an ordinary
@@ -329,6 +338,7 @@ impl Sched {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.abort {
+                self.tune_cv.notify_one();
                 return Item::Exit;
             }
             if g.scan_done {
@@ -349,6 +359,7 @@ impl Sched {
                 }
             }
             if g.scan_done && g.probing == 0 && g.inflight.is_empty() {
+                self.tune_cv.notify_one();
                 return Item::Exit;
             }
             g = self.cv.wait(g).unwrap();
@@ -476,6 +487,36 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_exit_wakes_the_tuning_wait() {
+        let sched = Arc::new(Sched::new(64, 128));
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.scan_done = true;
+            inner.probing = 1;
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let sched = sched.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let started = std::time::Instant::now();
+                sched.wait_for_tuning(Duration::from_secs(2));
+                started.elapsed()
+            })
+        };
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(sched.ranges_ready(0, Vec::new()).is_none());
+        assert!(matches!(sched.next(), Item::Exit));
+
+        let elapsed = waiter.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "worker exit left the tuner asleep for {elapsed:?}"
+        );
+    }
 
     #[test]
     fn eager_connections_wait_for_a_planned_file_and_skip_empty_scans() {
