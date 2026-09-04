@@ -95,6 +95,27 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(prune, syq.CpResult)
         self.assertEqual(prune.deletions_completed, 1)
 
+    async def test_rm_matches_the_sync_typed_surface(self) -> None:
+        events: list[syq.AutomationEvent] = []
+
+        async def observe(event: syq.AutomationEvent) -> None:
+            await asyncio.sleep(0)
+            events.append(event)
+
+        result = await self.client.rm(
+            "victim", dry_run=True, on_event=observe
+        )
+
+        self.assertIsInstance(result, syq.RmResult)
+        self.assertEqual(result.entries_planned, 1)
+        self.assertIs(events[-1], result)
+        self.assertTrue(
+            any(isinstance(event, syq.RemovalTrace) for event in events)
+        )
+        self.assertTrue(
+            any(arg.startswith("--results-fd=") for arg in self.argv())
+        )
+
     async def test_results_accepts_a_caller_owned_binary_file(self) -> None:
         output = io.BytesIO()
         client = syq.AsyncClient(

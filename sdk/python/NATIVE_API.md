@@ -44,7 +44,7 @@ learn a second set of names for concepts that syq already names.
 |---|---|
 | `syq cp` | `syq.cp()` or `Client.cp()` |
 | `syq cp --prune` | `syq.cp(prune=True)` or `Client.cp(prune=True)` |
-| `syq rm` | `syq.run(["rm", ...])` or `Client.run(["rm", ...])` |
+| `syq rm` | `syq.rm()` or `Client.rm()` |
 | `syq map` | `syq.map()` or `Client.map()` |
 | `--root` | `root=` |
 | `--src-src` | `src_src=` |
@@ -92,12 +92,11 @@ iterables.
 
 ## Scope
 
-The typed interface covers native `cp`, including its `--prune` mode, and
-`map`. It does not wrap `syq rm` yet because automation v1 does not define an
-`rm` result stream, and it does not wrap `syq rsync`. Both remain available
-through `Client.run` and the module-level `syq.run` function. Enrollment and
-other administrative commands also remain raw operations until they have a
-stable machine contract that benefits from Python types.
+The typed interface covers native `cp`, including its `--prune` mode, `rm`,
+and `map`. It does not wrap `syq rsync`, which remains available through
+`Client.run` and the module-level `syq.run` function. Enrollment and other
+administrative commands also remain raw operations until they have a stable
+machine contract that benefits from Python types.
 
 Module functions and client methods have the same operation names and
 signatures. A module function uses a default `Client`; applications that need
@@ -245,6 +244,32 @@ syq.cp(
 )
 ```
 
+The conceptual `rm` signature keeps the subset of that grammar which native
+removal accepts:
+
+```python
+syq.rm(
+    *sources,
+    src=None,
+    src_src=None,
+    src_file=None,
+    src_dir=None,
+    from_=None,
+    cwd=None,
+    root=None,
+    follow=False,
+    follow_src=False,
+    results=None,
+    dry_run=False,
+    connections=None,
+    syq_path=None,
+    no_bootstrap=False,
+    on_event=None,
+    timeout=None,
+    check=True,
+)
+```
+
 Bare positional paths have the native bare-source meaning. Selector keywords
 retain the native meanings:
 
@@ -269,7 +294,7 @@ and filesystem state. Errors use native option names so they remain searchable
 in `syq --help` and the README.
 
 `cwd` and `root` are mutually exclusive and retain the native source-base
-meanings for both `cp` and `map`. `cwd` is a resolution base rather than a
+meanings for `cp`, `rm`, and `map`. `cwd` is a resolution base rather than a
 containment boundary; relative selectors may leave it through `..`, and
 absolute selectors ignore it. `root` confines component-by-component
 resolution beneath the pinned directory, so its selectors must be relative.
@@ -327,7 +352,8 @@ presentation. Callers that specifically want native human output use `run`.
 If a presentation option is later useful on a typed method, it must appear
 under its native name rather than under a Python synonym.
 
-Typed `cp` always consumes the automation stream to produce its `CpResult`.
+Typed `cp` and `rm` always consume the automation stream to produce their
+`CpResult` and `RmResult`.
 Passing `results=` also copies the validated NDJSON records to a caller-owned
 binary file-like object:
 
@@ -344,7 +370,7 @@ withheld if the stream, process exit, or callback does not complete
 consistently. Sink failures abort the operation rather than making an
 incomplete saved stream look successful.
 
-Internally, typed `cp` creates a dedicated pipe and passes its write end using
+Internally, each typed operation creates a dedicated pipe and passes its write end using
 native `--results-fd`. It never asks syq to put machine output on stdout and
 never parses stdout as automation data. `--results-fd` is an implementation
 detail rather than a caller parameter. Callers that specifically need native
@@ -478,16 +504,31 @@ does not infer a deletion scope or retry a refused prune.
 
 ## Removal
 
-Automation v1 currently covers only `cp [--prune]`. Until `rm` has a stable
-result stream, callers use the raw escape hatch and interpret only the process
-status unless they deliberately own some other output format:
+Typed removal uses the native selector and endpoint grammar and returns a
+validated `RmResult`:
 
 ```python
-client.run(["rm", "--src-dir", "old-output", "--from", "server", "--root", "/srv"])
+result = client.rm(
+    src_dir="old-output",
+    from_="server",
+    root="/srv",
+)
+print(result.entries_removed, result.selectors_missing)
 ```
 
-The Python SDK will add `rm` when the native command exposes a structured
-completion contract. It does not parse `rm`'s human output in the meantime.
+`SelectionResult` attributes every explicit selector by its zero-based order
+and records whether it resolved or was already missing. A live removal emits
+`RemovalResult` for each settled entry; a preview emits `RemovalTrace` for each
+entry it could inspect and a failed `RemovalResult` for an inspection failure.
+Duplicate and overlapping selectors remain distinct, and an entry removed by
+one before another reaches it has `ALREADY_ABSENT` disposition rather than
+being silently lost from the account.
+
+Local and ordinary SSH endpoints support typed removal. A command-restricted
+receiver rejects native `rm`: the current signed receiver grants authorize
+copy mutations, not arbitrary deletion, and the SDK does not weaken that
+boundary or fall back to parsing human output. Designing an explicit signed
+delete scope and safety ceiling is separate product work.
 
 ## Dry runs
 
@@ -502,12 +543,14 @@ preview = syq.cp(
     max_delete=100,
     dry_run=True,
 )
+removal_preview = syq.rm(src_dir="old-output", root="/srv", dry_run=True)
 ```
 
 There are no `preview_copy` or `preview_copy_prune` commands. Those would
 rename the native operation and make flags change the Python verb. `CpResult`
-carries `dry_run=True`; `TraceEvent` records describe planned mutations, while
-a live run emits `OperationResult` records for settled mutations.
+or `RmResult` carries `dry_run=True`; copy uses `TraceEvent` while removal uses
+`RemovalTrace` to describe planned mutations. Live runs use their corresponding
+`OperationResult` or `RemovalResult` records.
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
@@ -518,10 +561,12 @@ shared execution trace and terminal result.
 
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to its known records: `RunEvent`, sampled
-`ProgressEvent`, dry-run `TraceEvent` or live `OperationResult`, `ErrorEvent`,
-receiver-attested `FinalStateEvent`, and the terminal `CpResult`. Additive
-unknown record types are validated for a well-formed envelope and sequence
-position, then ignored.
+`ProgressEvent`, copy `TraceEvent` or `OperationResult`, removal
+`SelectionResult`, `RemovalTrace`, or `RemovalResult` (including inspection
+failures during a preview), `ErrorEvent`,
+receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
+Additive unknown record types are validated for a well-formed envelope and
+sequence position, then ignored.
 
 The product's [automation-v1 contract](../../docs/automation-v1.md) and
 [JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
@@ -538,17 +583,21 @@ The client validates at least these stream invariants:
 - the final-state object's per-state field variants and the
   receiver-attested terminal shape (receipt status vocabulary, required
   bookkeeping, and `deletions_completed`);
-- agreement between the invocation and the run's `prune`, `mapping`, and
-  `dry_run` flags;
+- agreement between the invocation and the run's `mode`, command-specific
+  fields, and `dry_run` flag;
+- agreement between removal selector, per-path, and error records and every
+  corresponding terminal counter;
 - exactly one terminal result, with nothing after it; and
 - agreement between the terminal exit code and the reaped process status.
 
 EOF without a terminal result is never success, even if every observed
 operation succeeded or the process status is zero.
 
-Successful operation events are not retained by default. A copy may contain
-millions of entries; callers that need a ledger consume `on_event` and write
-one. Terminal aggregates are retained in the returned `CpResult`. Prune-only
+Successful operation events are not retained by default. A copy or removal
+may contain millions of entries; callers that need a ledger consume `on_event`
+and write one. Terminal aggregates are retained in the returned command-specific
+result. `RmResult` separates selector resolution from planned, removed,
+already-absent, and failed entry totals. Prune-only
 deletion totals are optional fields on that same type. An ordinary terminal
 carries all three exactly when the run has `prune=True`; a receiver-attested
 terminal carries only `deletions_completed` (planning and `--max-delete`
@@ -634,15 +683,15 @@ guarantees of typed methods.
 ## Synchrony, asyncio, and resource ownership
 
 `Client` and `AsyncClient` both expose `run`, `version`, typed `cp` (including
-`prune=True`), and `map`. Their public method names, parameter names, defaults,
-result objects, validation, and failure types match. `AsyncClient` uses native
-asyncio subprocesses rather than wrapping the synchronous client in a thread;
-commands such as `rm` remain available through
-`await client.run(["rm", ...])`.
+`prune=True`), `rm`, and `map`. Their public method names, parameter names,
+defaults, result objects, validation, and failure types match. `AsyncClient`
+uses native asyncio subprocesses rather than wrapping the synchronous client
+in a thread.
 
 ```python
 client = syq.AsyncClient(process_cwd="/srv/jobs")
 result = await client.cp("project", to="server", into="/backup")
+removed = await client.rm("old-project", from_="server")
 
 async with client.map(src_src="photos") as mapping:
     result = await client.cp(mapping=mapping, cwd=mapping.cwd, into="photos")
@@ -704,7 +753,6 @@ The initial typed API does not provide:
 - a Python implementation of the transfer engine;
 - FFI or an in-process Rust runtime;
 - a typed mirror of `syq rsync`;
-- typed `rm` before the command has an automation result stream;
 - semantic aliases for native commands or options;
 - a generic `extra_args` hole in typed methods—use `run` instead;
 - automatic retries or rollback;
@@ -722,7 +770,7 @@ The initial typed API does not provide:
 | `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
 | `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
 | Typed `cp`, including `prune=True` | Automation v1 | Implemented |
-| Typed `rm` | Native `rm` result stream | Awaiting product support |
+| Typed `rm` | Native `rm` result stream | Implemented for local and ordinary SSH endpoints |
 | Typed `dry_run=True` | Automation-v1 trace records | Implemented |
 | Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
 

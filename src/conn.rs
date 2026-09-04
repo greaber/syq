@@ -752,6 +752,9 @@ impl Conn for RemoteConn {
                 Response::NativeRemoveTrace(messages) => trace(messages)?,
                 Response::NativeRemoveBatch(outcomes) => sink(outcomes)?,
                 Response::NativeRemoveDone => return Ok(()),
+                Response::EndpointError(error) => {
+                    return Err(endpoint_error(error)).context(format!("{}: remove", self.label));
+                }
                 Response::Err(error) => bail!("{}: remove: {error}", self.label),
                 other => bail!(
                     "{}: unexpected response during native removal: {other:?}",

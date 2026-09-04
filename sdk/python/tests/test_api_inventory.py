@@ -22,6 +22,7 @@ class NativeApiInventoryTests(unittest.TestCase):
     def test_every_python_option_is_in_the_matching_signature(self) -> None:
         sdk_parameters = {
             "cp": {"self", "sources", "on_event", "timeout", "check"},
+            "rm": {"self", "sources", "on_event", "timeout", "check"},
             "map": {"self", "sources", "timeout"},
         }
         for command, classified in self.inventory["commands"].items():
@@ -67,7 +68,7 @@ class NativeApiInventoryTests(unittest.TestCase):
 
         sync = public_methods(syq.Client)
         async_ = public_methods(syq.AsyncClient)
-        self.assertEqual(set(sync), {"cp", "map", "run", "version"})
+        self.assertEqual(set(sync), {"cp", "rm", "map", "run", "version"})
         self.assertEqual(set(async_), set(sync))
         for name in sync:
             with self.subTest(method=name):

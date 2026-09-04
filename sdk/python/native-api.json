@@ -77,16 +77,8 @@
       ]
     },
     "rm": {
-      "sdk": "raw_only",
-      "python": [],
-      "internal": [],
-      "aliases": {
-        "srcs": "src",
-        "src-srcs": "src-src",
-        "src-files": "src-file",
-        "src-dirs": "src-dir"
-      },
-      "raw_only": [
+      "sdk": "python",
+      "python": [
         "from",
         "cwd",
         "root",
@@ -96,15 +88,27 @@
         "src-src",
         "src-file",
         "src-dir",
+        "results",
         "dry-run",
-        "verbose",
-        "quiet",
         "connections",
-        "progress",
-        "no-progress",
-        "progress-json",
         "syq-path",
         "no-bootstrap"
+      ],
+      "internal": [
+        "results-fd"
+      ],
+      "aliases": {
+        "srcs": "src",
+        "src-srcs": "src-src",
+        "src-files": "src-file",
+        "src-dirs": "src-dir"
+      },
+      "raw_only": [
+        "verbose",
+        "quiet",
+        "progress",
+        "no-progress",
+        "progress-json"
       ],
       "follow_up": [
         "pscope"

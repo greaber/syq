@@ -209,8 +209,8 @@ does not. Report vulnerabilities as described in
    remote-to-remote copies, a parallel `rm`, exact placement, filters and
    preservation as ordinary options, mappings. Native mode is experimental,
    and its grammar may change between releases.
-3. **Programmatic.** `--progress-json` streams progress, `--results` writes a
-   machine-readable NDJSON outcome stream with a versioned contract
+3. **Programmatic.** `--progress-json` streams progress, native `cp` and `rm`
+   accept `--results` for a machine-readable NDJSON outcome stream with a versioned contract
    ([Automation results](automation-v1.md)), and mappings let a program
    supply selection and placement as data. See
    [Composability](composability.md).

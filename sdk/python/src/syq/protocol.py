@@ -34,7 +34,13 @@ from .models import (
     PathValue,
     ProgressEvent,
     Retryability,
+    RmResult,
     RunEvent,
+    SelectionResult,
+    SelectionStatus,
+    RemovalDisposition,
+    RemovalResult,
+    RemovalTrace,
     TraceEvent,
     TraceReason,
 )
@@ -199,15 +205,47 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
 
 
 class AutomationDecoder:
-    """Validate one complete automation-v1 cp stream incrementally."""
+    """Validate one complete automation-v1 typed-operation stream incrementally."""
 
-    def __init__(self, *, prune: bool, mapping: bool, dry_run: bool) -> None:
+    def __init__(
+        self,
+        *,
+        dry_run: bool,
+        mode: str = "cp",
+        prune: bool = False,
+        mapping: bool = False,
+        selectors_total: int | None = None,
+    ) -> None:
+        if mode not in {"cp", "rm"}:
+            raise ValueError("automation decoder mode must be 'cp' or 'rm'")
+        self.expected_mode = mode
         self.expected_prune = prune
         self.expected_mapping = mapping
         self.expected_dry_run = dry_run
+        self.expected_selectors_total = selectors_total
         self.run: RunEvent | None = None
         self.result: OperationSummary | None = None
         self._next_seq = 0
+        self._rm_selections: dict[int, SelectionStatus] = {}
+        self._rm_removal_started = False
+        self._rm_entries = {
+            RemovalDisposition.WOULD_REMOVE: 0,
+            RemovalDisposition.REMOVED: 0,
+            RemovalDisposition.ALREADY_ABSENT: 0,
+            RemovalDisposition.FAILED: 0,
+        }
+        self._rm_error_records = 0
+
+    def _validate_removal_selector(self, selector: int) -> None:
+        status = self._rm_selections.get(selector)
+        if status is None:
+            raise SyqProtocolError(
+                f"rm removal outcome references selector {selector} before resolution"
+            )
+        if status is not SelectionStatus.RESOLVED:
+            raise SyqProtocolError(
+                f"rm removal outcome references missing selector {selector}"
+            )
 
     def feed(self, line: bytes) -> AutomationEvent | None:
         if self.result is not None:
@@ -233,18 +271,30 @@ class AutomationDecoder:
             if not run_id:
                 raise SyqProtocolError("automation run_id may not be empty")
             mode = _string(record, "mode")
-            prune = _boolean(record, "prune")
-            mapping = _boolean(record, "mapping")
             dry_run = _boolean(record, "dry_run")
-            if mode != "cp":
+            if mode != self.expected_mode:
                 raise SyqProtocolError(
-                    f"automation mode is {mode!r}, expected 'cp'"
+                    f"automation mode is {mode!r}, expected {self.expected_mode!r}"
                 )
-            for actual, expected, label in (
-                (prune, self.expected_prune, "prune"),
-                (mapping, self.expected_mapping, "mapping"),
-                (dry_run, self.expected_dry_run, "dry_run"),
-            ):
+            if mode == "cp":
+                prune = _boolean(record, "prune")
+                mapping = _boolean(record, "mapping")
+                expected_values = (
+                    (prune, self.expected_prune, "prune"),
+                    (mapping, self.expected_mapping, "mapping"),
+                    (dry_run, self.expected_dry_run, "dry_run"),
+                )
+            else:
+                if "prune" in record or "mapping" in record:
+                    raise SyqProtocolError(
+                        "an rm run record may not contain copy-mode fields"
+                    )
+                prune = None
+                mapping = None
+                expected_values = (
+                    (dry_run, self.expected_dry_run, "dry_run"),
+                )
+            for actual, expected, label in expected_values:
                 if actual != expected:
                     raise SyqProtocolError(
                         f"automation run {label} disagrees with the invocation"
@@ -260,6 +310,13 @@ class AutomationDecoder:
                 dry_run=dry_run,
                 endpoints=_endpoints(record),
             )
+            if mode == "rm" and (
+                len(event.endpoints) != 1
+                or event.endpoints[0].role is not EndpointRole.SOURCE
+            ):
+                raise SyqProtocolError(
+                    "an rm run must contain exactly one source endpoint"
+                )
             self.run = event
             return event
 
@@ -280,6 +337,8 @@ class AutomationDecoder:
                 elapsed_ms=_integer(record, "elapsed_ms"),
             )
         if record_type == "trace":
+            if self.run.mode != "cp":
+                raise SyqProtocolError("an rm automation stream contains a cp trace")
             if not self.run.dry_run:
                 raise SyqProtocolError("a live automation stream contains a trace")
             return TraceEvent(
@@ -292,6 +351,10 @@ class AutomationDecoder:
                 reason=_enum(record, "reason", TraceReason),
             )
         if record_type == "operation_result":
+            if self.run.mode != "cp":
+                raise SyqProtocolError(
+                    "an rm automation stream contains a cp operation result"
+                )
             if self.run.dry_run:
                 raise SyqProtocolError(
                     "a dry-run automation stream contains an operation result"
@@ -325,6 +388,111 @@ class AutomationDecoder:
                 scope=_optional_integer(record, "scope"),
                 code=_optional_enum(record, "code", ReceiptCode),
             )
+        if record_type == "selection_result":
+            if self.run.mode != "rm":
+                raise SyqProtocolError(
+                    "a cp automation stream contains an rm selection result"
+                )
+            status = _enum(record, "status", SelectionStatus)
+            kind = _optional_enum(record, "kind", EntryKind)
+            selector = _integer(record, "selector")
+            if self._rm_removal_started:
+                raise SyqProtocolError(
+                    "an rm selection result appears after removal outcomes"
+                )
+            if selector in self._rm_selections:
+                raise SyqProtocolError(
+                    f"rm selector {selector} has more than one selection result"
+                )
+            if (
+                self.expected_selectors_total is not None
+                and selector >= self.expected_selectors_total
+            ):
+                raise SyqProtocolError(
+                    f"rm selector {selector} exceeds the invocation's selector count"
+                )
+            if status is SelectionStatus.RESOLVED and kind is None:
+                raise SyqProtocolError("a resolved selector must contain its kind")
+            if status is SelectionStatus.MISSING and kind is not None:
+                raise SyqProtocolError("a missing selector may not contain a kind")
+            self._rm_selections[selector] = status
+            return SelectionResult(
+                **common,
+                selector=selector,
+                path=_tagged(record.get("path"), label="path"),
+                status=status,
+                kind=kind,
+            )
+        if record_type == "removal_trace":
+            if self.run.mode != "rm":
+                raise SyqProtocolError(
+                    "a cp automation stream contains an rm removal trace"
+                )
+            if not self.run.dry_run:
+                raise SyqProtocolError("a live rm stream contains a removal trace")
+            disposition = _enum(record, "disposition", RemovalDisposition)
+            if disposition is not RemovalDisposition.WOULD_REMOVE:
+                raise SyqProtocolError(
+                    "a removal trace disposition must be would_remove"
+                )
+            selector = _integer(record, "selector")
+            self._validate_removal_selector(selector)
+            self._rm_removal_started = True
+            self._rm_entries[disposition] += 1
+            return RemovalTrace(
+                **common,
+                selector=selector,
+                path=_tagged(record.get("path"), label="path"),
+                kind=_enum(record, "kind", EntryKind),
+                disposition=disposition,
+            )
+        if record_type == "removal_result":
+            if self.run.mode != "rm":
+                raise SyqProtocolError(
+                    "a cp automation stream contains an rm removal result"
+                )
+            disposition = _enum(record, "disposition", RemovalDisposition)
+            if disposition is RemovalDisposition.WOULD_REMOVE:
+                raise SyqProtocolError(
+                    "a removal result disposition may not be would_remove"
+                )
+            if self.run.dry_run and disposition is not RemovalDisposition.FAILED:
+                raise SyqProtocolError(
+                    "a dry-run rm stream contains a successful live removal result"
+                )
+            selector = _integer(record, "selector")
+            self._validate_removal_selector(selector)
+            kind = _optional_enum(record, "kind", EntryKind)
+            retryable = _optional_enum(record, "retryable", Retryability)
+            class_ = _optional_enum(record, "class", ErrorClass)
+            os_kind = _optional_enum(record, "os_kind", OsKind)
+            message = _optional_string(record, "message")
+            failure_fields = (retryable, class_, os_kind, message)
+            if disposition is RemovalDisposition.FAILED:
+                if retryable is None or class_ is None or message is None:
+                    raise SyqProtocolError(
+                        "a failed removal result needs retryability, class, and message"
+                    )
+            elif kind is None:
+                raise SyqProtocolError("a successful removal result needs its kind")
+            elif any(value is not None for value in failure_fields):
+                raise SyqProtocolError(
+                    "a successful removal result may not contain failure fields"
+                )
+            self._rm_removal_started = True
+            self._rm_entries[disposition] += 1
+            return RemovalResult(
+                **common,
+                selector=selector,
+                path=_tagged(record.get("path"), label="path"),
+                kind=kind,
+                disposition=disposition,
+                attempts=_integer(record, "attempts"),
+                retryable=retryable,
+                class_=class_,
+                os_kind=os_kind,
+                message=message,
+            )
         if record_type == "error":
             provenance = _attested_provenance(record, "error record")
             if provenance is None and "code" in record:
@@ -332,7 +500,7 @@ class AutomationDecoder:
                     "a receipt code appears on an error record without "
                     "receiver_attested provenance"
                 )
-            return ErrorEvent(
+            event = ErrorEvent(
                 **common,
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
@@ -340,7 +508,14 @@ class AutomationDecoder:
                 provenance=provenance,
                 code=_optional_enum(record, "code", ReceiptCode),
             )
+            if self.run.mode == "rm":
+                self._rm_error_records += 1
+            return event
         if record_type == "final_state":
+            if self.run.mode != "cp":
+                raise SyqProtocolError(
+                    "an rm automation stream contains a receiver final state"
+                )
             state = record.get("object")
             if not isinstance(state, dict):
                 raise SyqProtocolError("final_state record has no object")
@@ -459,6 +634,145 @@ class AutomationDecoder:
             if dry_run != self.run.dry_run:
                 raise SyqProtocolError(
                     "automation result dry_run disagrees with the run record"
+                )
+            if self.run.mode == "rm":
+                if _string(record, "mode") != "rm":
+                    raise SyqProtocolError("an rm terminal result must carry mode 'rm'")
+                if status not in {
+                    OperationStatus.SUCCESS,
+                    OperationStatus.PARTIAL,
+                    OperationStatus.FAILED,
+                }:
+                    raise SyqProtocolError(
+                        "an rm terminal result has an unsupported status"
+                    )
+                selectors_total = _integer(record, "selectors_total")
+                selectors_resolved = _integer(record, "selectors_resolved")
+                selectors_missing = _integer(record, "selectors_missing")
+                entries_planned = _integer(record, "entries_planned")
+                entries_removed = _integer(record, "entries_removed")
+                entries_already_absent = _integer(
+                    record, "entries_already_absent"
+                )
+                entries_failed = _integer(record, "entries_failed")
+                errors = _integer(record, "errors")
+                if (
+                    self.expected_selectors_total is not None
+                    and selectors_total != self.expected_selectors_total
+                ):
+                    raise SyqProtocolError(
+                        "rm selectors_total disagrees with the invocation"
+                    )
+                if selectors_resolved + selectors_missing > selectors_total:
+                    raise SyqProtocolError(
+                        "rm selector totals exceed selectors_total"
+                    )
+                if any(selector >= selectors_total for selector in self._rm_selections):
+                    raise SyqProtocolError(
+                        "an rm selection result exceeds terminal selectors_total"
+                    )
+                if status is not OperationStatus.FAILED and (
+                    selectors_resolved + selectors_missing != selectors_total
+                ):
+                    raise SyqProtocolError(
+                        "a settled rm result does not account for every selector"
+                    )
+                observed_resolved = sum(
+                    status is SelectionStatus.RESOLVED
+                    for status in self._rm_selections.values()
+                )
+                observed_missing = sum(
+                    status is SelectionStatus.MISSING
+                    for status in self._rm_selections.values()
+                )
+                if (
+                    selectors_resolved != observed_resolved
+                    or selectors_missing != observed_missing
+                ):
+                    raise SyqProtocolError(
+                        "rm terminal selector totals disagree with selection results"
+                    )
+                expected_entries = {
+                    "entries_planned": self._rm_entries[
+                        RemovalDisposition.WOULD_REMOVE
+                    ],
+                    "entries_removed": self._rm_entries[
+                        RemovalDisposition.REMOVED
+                    ],
+                    "entries_already_absent": self._rm_entries[
+                        RemovalDisposition.ALREADY_ABSENT
+                    ],
+                    "entries_failed": self._rm_entries[RemovalDisposition.FAILED],
+                }
+                actual_entries = {
+                    "entries_planned": entries_planned,
+                    "entries_removed": entries_removed,
+                    "entries_already_absent": entries_already_absent,
+                    "entries_failed": entries_failed,
+                }
+                for field, expected in expected_entries.items():
+                    if actual_entries[field] != expected:
+                        raise SyqProtocolError(
+                            f"rm terminal {field} disagrees with per-path records"
+                        )
+                if errors != self._rm_error_records:
+                    raise SyqProtocolError(
+                        "rm terminal errors disagree with error records"
+                    )
+                if dry_run and (
+                    entries_removed != 0
+                    or entries_already_absent != 0
+                ):
+                    raise SyqProtocolError(
+                        "a dry-run rm result contains live removal totals"
+                    )
+                if not dry_run and entries_planned != 0:
+                    raise SyqProtocolError(
+                        "a live rm result contains planned removal totals"
+                    )
+                if entries_failed > errors:
+                    raise SyqProtocolError(
+                        "rm entries_failed exceeds its error count"
+                    )
+                if status is OperationStatus.SUCCESS and errors != 0:
+                    raise SyqProtocolError(
+                        "a successful rm result contains errors"
+                    )
+                if status is OperationStatus.PARTIAL and entries_failed == 0:
+                    raise SyqProtocolError(
+                        "a partial rm result contains no failed entries"
+                    )
+                if (
+                    status is OperationStatus.PARTIAL
+                    and errors != entries_failed
+                ):
+                    raise SyqProtocolError(
+                        "a partial rm result has errors not attributable to failed entries"
+                    )
+                if status is OperationStatus.FAILED and errors == 0:
+                    raise SyqProtocolError(
+                        "a failed rm result contains no error"
+                    )
+                result = RmResult(
+                    **common,
+                    status=status,
+                    exit_code=exit_code,
+                    dry_run=dry_run,
+                    selectors_total=selectors_total,
+                    selectors_resolved=selectors_resolved,
+                    selectors_missing=selectors_missing,
+                    entries_planned=entries_planned,
+                    entries_removed=entries_removed,
+                    entries_already_absent=entries_already_absent,
+                    entries_failed=entries_failed,
+                    errors=errors,
+                    elapsed_ms=_integer(record, "elapsed_ms"),
+                )
+                self.result = result
+                return result
+            if "mode" in record:
+                raise SyqProtocolError(
+                    "a cp terminal result may not contain an rm mode field"
                 )
             deletion_values = tuple(
                 _optional_integer(record, field)

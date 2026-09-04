@@ -1,7 +1,8 @@
 # Automation results, schema version 1
 
-`syq cp --results FILE` writes a machine-readable NDJSON stream of
-operation outcomes. This document is the contract for that stream:
+Native `syq cp --results FILE` and `syq rm --results FILE` write a
+machine-readable NDJSON stream of operation outcomes. This document is the
+contract for those streams:
 what each record means, which fields a consumer may rely on, and how
 exit codes correspond to terminal statuses. The machine-checkable
 counterpart is [`schemas/automation-v1.schema.json`](https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json);
@@ -16,6 +17,8 @@ this stream, and the two formats never mix.
 ```text
 syq cp [--prune] ... --results FILE
 syq cp [--prune] ... --results-fd N
+syq rm ... --results FILE
+syq rm ... --results-fd N
 ```
 
 One stream, two ways to name its destination. `--results FILE`
@@ -29,17 +32,21 @@ and a descriptor nobody connected is a startup error. Human output is
 untouched in both forms: stdout and stderr keep their ordinary roles
 and are not part of this contract.
 
-Choose a `FILE` outside the transfer's source and destination trees.
+Choose a `FILE` outside the copy or removal trees.
 syq does not police this: a results file inside the trees it is
-copying or pruning can be copied mid-write, deleted as
-destination-only, or otherwise make the run's own accounting
-unpredictable. Placing output files in directories only you can write
-is the same rule as for any `>` redirect. The file is opened once and
-the descriptor held for the whole run; the default operator-path
-policy refuses a symlinked `FILE` (pass `--follow` to allow it).
+copying, pruning, or removing can be copied mid-write, deleted, or otherwise
+make the run's own accounting unpredictable. Placing output files in
+directories only you can write is the same rule as for any `>` redirect. The
+file is opened once and the descriptor held for the whole run; the default
+operator-path policy refuses a symlinked `FILE` (pass `--follow` to allow it).
 
-The results writer always lives on the invoking machine. For a
-remote-to-remote copy there are two ways to fill it. Through a
+The results writer always lives on the invoking machine. A local removal and
+an ordinary SSH removal both stream their endpoint's structured outcomes back
+to that writer. A command-restricted receiver deliberately rejects native
+removal: its signed grants currently authorize copy mutations only, and no
+deletion authorization or deletion ceiling is inferred from them.
+
+For a remote-to-remote copy there are two ways to fill the stream. Through a
 command-restricted receiver enrollment, the stream is
 **receiver-attested**: hostB records every operation and closure-time
 final state inside its encrypted, signed receipt, the invoking
@@ -56,12 +63,11 @@ narration is discarded), so the numbers a person reads and a machine
 parses come from the same verified record. `--dry-run` with
 `--results` needs a local coordinator today: traces and planned
 totals exist only on the coordinator, and a receipt cannot attest a
-plan, and the coordinator's own stream is not relayed. `--results` is not available on
-`syq map` (its stdout is the manifest format) or, yet, on other
-commands, and cannot be combined with `--detach`. `--dry-run`
-composes; see below. `--results` cannot be combined with `--detach`, because
-the caller would not remain attached for the stream and its terminal
-record.
+plan, and the coordinator's own stream is not relayed. `--results` is not
+available on `syq map` (its stdout is the manifest format) or other commands.
+It cannot be combined with `--detach`, because the caller would not remain
+attached for the stream and its terminal record. `--dry-run` composes; see
+below.
 
 Records land in `seq` order. Error and terminal records are flushed
 immediately. If writing the stream itself fails, syq warns once on
@@ -80,7 +86,7 @@ Every record is one JSON object per line carrying:
 | `schema` | `"syq.automation"` |
 | `schema_version` | `1` |
 | `seq` | integer from 0, strictly increasing within the stream |
-| `type` | one of the six record types below |
+| `type` | one of the record types below |
 
 Paths are tagged objects, lossless for arbitrary filenames:
 `{"encoding": "utf-8", "value": "docs/a.txt"}` when the path is valid
@@ -93,12 +99,14 @@ non-negative integers within `u64` range.
 ### `run` — always first
 
 Identifies the run: `run_id` (opaque string, unique per invocation),
-`started_at` (unix seconds, wall clock), `syq_version`, `mode`
-(`"cp"`), `prune` (bool), `mapping` (bool), `dry_run` (bool), and
-`endpoints` — sanitized identities only: `role`
+`started_at` (unix seconds, wall clock), `syq_version`, `mode` (`"cp"` or
+`"rm"`), `dry_run` (bool), and `endpoints` — sanitized identities only: `role`
 (`source`|`destination`), `kind` (`local`|`ssh`), and for ssh
 endpoints `host` and, when given, `user`. Never credentials, ports,
-or raw shell arguments.
+or raw shell arguments. A copy run also has `prune` and `mapping` booleans and
+source and destination endpoints. A removal run omits those copy-only fields
+and has exactly one source endpoint, regardless of how many selectors it
+contains.
 
 ### `progress` — sampled telemetry
 
@@ -107,6 +115,8 @@ Emitted at most about once per second: `bytes_done`, `bytes_total`,
 `files_excluded`, `scanned`, `scan_done`, `elapsed_ms`. Progress is
 lossy by design — drive spinners and dashboards from it, never final
 accounting; the terminal record is the only authority on totals.
+Removal has no byte accounting, so its byte and unchanged/excluded fields are
+zero; its file counts reflect endpoint outcomes delivered so far.
 
 ### `trace` — dry-run only, one per intended mutation
 
@@ -145,6 +155,41 @@ them, while a dry run does emit a `metadata_differs` trace for the
 same situation. Closing that asymmetry with a metadata result action
 is a candidate additive extension.
 
+Copy streams use `trace` and `operation_result`; removal streams use the next
+three record types instead.
+
+### `selection_result` — one per explicit removal selector
+
+Normally emitted after all selectors have been resolved and pinned, before
+mutation outcomes. If a later selector fails resolution, already resolved
+selector records can precede the fatal error and terminal record. `selector`
+is the selector's zero-based argv order, `path` is its
+lossless endpoint spelling, and `status` is `resolved` or `missing`. A resolved
+selector includes its `kind` (`file`|`dir`|`symlink`|`special`); a missing
+selector omits it. Missing selectors are successful no-ops. Duplicate and
+overlapping selectors retain distinct indexes, so consumers can attribute
+every later entry to the explicit request that produced it.
+
+### `removal_trace` — dry-run only, one per entry that would be removed
+
+Carries `selector`, a lossless diagnostic `path` built from that selector's
+spelling, `kind`, and `disposition: "would_remove"`. Directory entries appear after their
+descendants, matching executable removal order. A dry run never emits
+successful `removal_result` records; an entry that could not be inspected still
+emits a failed result so the incomplete plan has a stable per-path outcome.
+
+### `removal_result` — one per settled removal or inspection failure
+
+Carries `selector`, a lossless diagnostic `path` built from that selector's
+spelling, `kind` when known, `attempts`, and `disposition`: `removed` |
+`already_absent` | `failed`. Already-absent entries are successful: another
+duplicate or overlapping selector may have removed the same pinned name first.
+Failures additionally carry `retryable`, `class`, `message`, and `os_kind`
+when the endpoint supplied one, and may appear during a dry run when inspection
+of an entry fails. A failed entry also has a corresponding counted `error`
+record; the result is the stable per-path identity, while the error is the
+aggregate error ledger.
+
 ### `error` — one per counted error
 
 `message` is display text, never a parsing contract. Optional `class`
@@ -179,11 +224,12 @@ audits: they attest the tree, not the transfer's own narration.
 
 ### `result` — exactly one, always last, flushed
 
-`status`: `success` | `partial` | `refused` | `aborted` | `failed`.
-Plus `exit_code`, `dry_run`, and the aggregates:
+Every terminal carries `status`, `exit_code`, `dry_run`, `errors`, and
+`elapsed_ms`. A copy result has `status`: `success` | `partial` | `refused` |
+`aborted` | `failed`, plus the aggregates:
 `files_transferred`, `files_unchanged`, `files_excluded`,
 `directories_created`, `symlinks_created`, `specials_created`,
-`errors`, `bytes_transferred`, `bytes_unchanged`, `elapsed_ms`, and
+`bytes_transferred`, `bytes_unchanged`, and
 on `--prune` runs `deletions_planned`, `deletions_completed`,
 `deletions_blocked`. On a `failed` terminal record the aggregates
 describe what settled before the run died. A receiver-attested
@@ -201,6 +247,16 @@ receiver-attested `error` records emitted on the stream: one per
 failed or incomplete operation, per refusal, and per failed or
 partial final-state observation (a present object whose hash or link
 target could not be read).
+
+A removal result is distinguished by `mode: "rm"`, has `status`: `success` |
+`partial` | `failed`, and carries `selectors_total`, `selectors_resolved`,
+`selectors_missing`, `entries_planned`, `entries_removed`,
+`entries_already_absent`, and `entries_failed`. Live runs leave
+`entries_planned` at zero; dry runs leave `entries_removed` and
+`entries_already_absent` at zero but may count entries that could not be
+inspected in `entries_failed`. A fatal setup or transport failure reports what
+settled before the failure and exits 1. Per-entry failures finish the remaining
+independent work, report `partial`, and exit 23.
 
 The human summary is rendered from this same record, so the numbers a
 person reads and a machine parses cannot disagree.
@@ -220,19 +276,20 @@ The process exit status always equals the terminal record's
 
 ## Dry runs
 
-`--dry-run --results` performs everything except mutations — full
-scan, destination stats, per-entry decisions — and emits `trace`
-records instead of `operation_result`s. The terminal record carries
-`dry_run: true` with the same aggregate fields, meaning planned
-rather than committed work. Deletion planning reports exact counts,
-reports `blocked` under `--max-delete`, and skips as unsafe on scan
-trouble exactly as a real run would.
+`--dry-run --results` performs everything except mutations. Copy performs its
+full scan, destination stats, and per-entry decisions and emits `trace` records
+instead of `operation_result`s. Its terminal aggregate fields mean planned
+rather than committed work. Prune planning reports exact counts, reports
+`blocked` under `--max-delete`, and skips as unsafe on scan trouble exactly as
+a real run would. Removal resolves and pins all selectors, walks every selected
+tree, and emits `selection_result` plus `removal_trace` records; its terminal
+`entries_planned` is the exact number of entries it would remove.
 
 ## Consumer rules
 
 - EOF without a terminal record means the outcome is unknown. Do not
   treat the absence of errors as success.
-- Build retry manifests from the stream only when the terminal status
+- For copy, build retry manifests from the stream only when the terminal status
   is `success` or `partial`. Any other status means entries may be
   unsettled — rerun instead. (The retry recipe in [the mappings guide](mappings.md)
   enforces both checks.)

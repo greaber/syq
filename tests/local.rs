@@ -2788,7 +2788,7 @@ fn native_rm_never_follows_symlinks_found_inside_a_selected_directory() {
 fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
     let t = Tmp::new();
     write(&t.path("duplicate"), b"data");
-    run_native_ok(&[
+    let output = native_syq(&[
         "rm",
         "--cwd",
         &t.s(""),
@@ -2796,14 +2796,67 @@ fn native_rm_duplicate_selectors_are_idempotent_without_deduplication() {
         "duplicate",
         "--src",
         "duplicate",
+        "--results",
+        &t.s("results.ndjson"),
     ]);
+    assert_output_ok(&output);
     assert!(!t.path("duplicate").exists());
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let selectors: Vec<u64> = records
+        .iter()
+        .filter(|record| record["type"] == "selection_result")
+        .map(|record| record["selector"].as_u64().unwrap())
+        .collect();
+    assert_eq!(selectors, [0, 1]);
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["entries_removed"], 1);
+    assert_eq!(terminal["entries_already_absent"], 1);
 }
 
 #[test]
 fn native_rm_missing_selectors_succeed() {
     let t = Tmp::new();
     run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "absent"]);
+}
+
+#[test]
+fn native_rm_results_preserve_non_utf8_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = Tmp::new();
+    let raw_name = b"remove-\xff";
+    write(&t.path("").join(OsStr::from_bytes(raw_name)), b"data");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("rm")
+        .arg("--cwd")
+        .arg(t.path(""))
+        .arg("--src-file")
+        .arg(OsStr::from_bytes(raw_name))
+        .args(["--results", &t.s("results.ndjson"), "-q"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let removal = records
+        .iter()
+        .find(|record| record["type"] == "removal_result")
+        .unwrap();
+    assert_eq!(removal["path"]["encoding"], "base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(removal["path"]["value"].as_str().unwrap())
+            .unwrap(),
+        raw_name
+    );
 }
 
 #[test]
@@ -6369,10 +6422,12 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
 
     let run = |helper: &[&str], selected: &str| {
+        let results = t.s(&format!("{selected}-results.ndjson"));
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("rm")
             .args(helper)
-            .args(["--from", "fake", "--cwd", &t.s(""), "--src", selected, "-q"])
+            .args(["--from", "fake", "--cwd", &t.s(""), "--src", selected])
+            .args(["--results", &results, "-q"])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -6384,6 +6439,14 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
             .expect("run native remote removal");
         assert_output_ok(&output);
         assert!(!t.path(selected).exists());
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["mode"], "rm");
+        assert_eq!(records[0]["endpoints"][0]["kind"], "ssh");
+        assert_eq!(records.last().unwrap()["status"], "success");
     };
     run(&["--syq-path", env!("CARGO_BIN_EXE_syq")], "explicit");
     run(&["--no-bootstrap"], "path");
@@ -6433,6 +6496,93 @@ fn native_rm_contents_requires_a_directory() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read(&t.path("file")), b"keep");
+}
+
+#[test]
+fn native_rm_reports_each_failed_entry_once_without_rescanning_known_failures() {
+    let t = Tmp::new();
+    write(&t.path("tree/file"), b"keep");
+    fs::set_permissions(t.path("tree"), fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--cwd",
+            &t.s(""),
+            "--src-dir",
+            "tree",
+            "--results",
+            &t.s("results.ndjson"),
+            "-q",
+        ])
+        .run()
+        .unwrap();
+    fs::set_permissions(t.path("tree"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failed_paths = records
+        .iter()
+        .filter(|record| record["type"] == "removal_result" && record["disposition"] == "failed")
+        .map(|record| record["path"]["value"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(failed_paths, ["tree/file", "tree"]);
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["entries_failed"], 2);
+    assert_eq!(terminal["errors"], 2);
+}
+
+#[test]
+fn native_rm_endpoint_conflicts_have_the_same_local_and_remote_classification() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+
+    for (name, remote) in [("local-file", false), ("remote-file", true)] {
+        write(&t.path(name), b"keep");
+        let results = t.s(&format!("{name}.ndjson"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "rm",
+            "--cwd",
+            &t.s(""),
+            "--src-dir",
+            name,
+            "--results",
+            &results,
+            "-q",
+        ]);
+        if remote {
+            command.args(["--from", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")]);
+            command
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+                );
+        }
+
+        let output = command.run().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+        assert_eq!(read(&t.path(name)), b"keep");
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let error = records
+            .iter()
+            .find(|record| record["type"] == "error")
+            .unwrap();
+        assert_eq!(error["class"], "conflict", "{name}: {error}");
+        assert!(error.get("os_kind").is_none(), "{name}: {error}");
+    }
 }
 
 #[test]
@@ -12832,6 +12982,11 @@ fn automation_v1_fixtures_validate_against_schema() {
             "failed.ndjson",
             "partial.ndjson",
             "refused.ndjson",
+            "rm-dry-partial.ndjson",
+            "rm-dry-run.ndjson",
+            "rm-failed.ndjson",
+            "rm-partial.ndjson",
+            "rm-success.ndjson",
             "success.ndjson"
         ]
     );
@@ -12959,6 +13114,25 @@ fn automation_v1_live_streams_validate_against_schema() {
         assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
         assert_automation_v1_stream(&validator, &content, "failed");
+    }
+
+    // Native removal has command-specific selector, trace, outcome, and
+    // terminal shapes under the same versioned envelope.
+    for (name, dry_run) in [("rm-live", false), ("rm-dry-run", true)] {
+        let t = Tmp::new();
+        write(&t.path("tree/file"), b"remove");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["rm", "--cwd", &t.s(""), "--src-dir", "tree"])
+            .args(["--results", &t.s("r.ndjson"), "-q"]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
+        assert_automation_v1_stream(&validator, &content, name);
+        assert_eq!(t.path("tree").exists(), dry_run);
     }
 }
 
