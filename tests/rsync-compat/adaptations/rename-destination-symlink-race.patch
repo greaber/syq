@@ -1,9 +1,9 @@
 diff --git a/testsuite/receiver-rename-symlink-race_test.py b/testsuite/receiver-rename-symlink-race_test.py
 new file mode 100755
-index 0000000..a8b4e14
+index 0000000..b6a44bc
 --- /dev/null
 +++ b/testsuite/receiver-rename-symlink-race_test.py
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,200 @@
 +#!/usr/bin/env python3
 +"""Normal staged-publication rename stays beneath the destination root.
 +
@@ -21,13 +21,17 @@ index 0000000..a8b4e14
 +is left swapping two ordinary directories for the rest of the budget and the
 +oracle stops seeing the attack.  Here the flipper is stopped, the
 +directory/symlink pair is rebuilt, and the flipper is restarted before every
-+push.  The test also fails as vacuous unless at least one push published files
-+into the real directory while the symlink was still present, so a pass is
-+evidence that staged publication ran under a live flip.
++push.  The flipper counts the swap cycles it completes and the test samples
++that count on both sides of each push, so a round only counts when the names
++actually changed underneath the transfer.  The test fails as vacuous unless at
++least one such round also published files into the real directory while the
++symlink was still present, so a pass is evidence that staged publication ran
++under a live flip rather than beside an idle one.
 +"""
 +
 +import os
 +import shutil
++import signal
 +import subprocess
 +import sys
 +import time
@@ -98,22 +102,27 @@ index 0000000..a8b4e14
 +
 +# Keep dest/sub alternating between the real directory and a symlink to the
 +# outside sentinel directory while a transfer stages and publishes files.  The
-+# swap is upstream's 3-rename dance through a scratch name.  The child reports
-+# readiness on stdout so the push starts under a running flipper, terminates
-+# with this test process, and has a hard backstop so an interrupted suite
-+# cannot leave a namespace-mutating process behind.
++# swap is upstream's 3-rename dance through a scratch name.  The child counts
++# each fully completed swap cycle and prints the count whenever it receives
++# SIGUSR1, reports readiness on stdout only after that handler is installed so
++# the push starts under a running flipper, terminates with this test process,
++# and has a hard backstop so an interrupted suite cannot leave a
++# namespace-mutating process behind.
 +flip_code = (
-+    "import os, sys, time\n"
++    "import os, signal, sys, time\n"
 +    "sub, link = sys.argv[1], sys.argv[2]\n"
 +    "scratch = sub + '.flip'\n"
 +    "parent = os.getppid()\n"
 +    "deadline = time.monotonic() + 120\n"
++    "cycles = 0\n"
++    "signal.signal(signal.SIGUSR1, lambda *_: print(cycles, flush=True))\n"
 +    "print('ready', flush=True)\n"
 +    "while time.monotonic() < deadline and os.getppid() == parent:\n"
 +    "    try:\n"
 +    "        os.makedirs(sub, exist_ok=True)\n"
 +    "        os.rename(sub, scratch); os.rename(link, sub); os.rename(scratch, link)\n"
 +    "        os.rename(sub, scratch); os.rename(link, sub); os.rename(scratch, link)\n"
++    "        cycles += 1\n"
 +    "    except OSError:\n"
 +    "        pass\n"
 +)
@@ -140,16 +149,29 @@ index 0000000..a8b4e14
 +    return flip
 +
 +
-+rounds = armed = productive = 0
++def completed_cycles(flip):
++    """How many full swap cycles the running flipper has finished so far."""
++    flip.send_signal(signal.SIGUSR1)
++    line = flip.stdout.readline().strip()
++    if not line:
++        stop_flipper(flip)
++        test_fail("the destination parent flipper exited during a round")
++    return int(line)
++
++
++rounds = armed = productive = swaps = 0
 +deadline = time.monotonic() + race_budget(10.0)
 +while time.monotonic() < deadline:
 +    rounds += 1
 +    arm()
 +    flip = start_flipper()
 +    try:
++        before = completed_cycles(flip)
 +        push()
++        flipped = completed_cycles(flip) - before
 +    finally:
 +        stop_flipper(flip)
++    swaps += flipped
 +    escaped = sorted(entry.name for entry in outside.iterdir())
 +    if escaped:
 +        test_fail(
@@ -158,22 +180,27 @@ index 0000000..a8b4e14
 +        )
 +    # With the flipper stopped this is a consistent view of the three names.
 +    # A round counts as armed when the target never consumed the symlink, and
-+    # as productive when it also published payload into the real directory
-+    # under that live flip.
++    # as productive when the names also changed underneath the push and the
++    # target still published payload into the real directory.
 +    if any(name.is_symlink() for name in names):
 +        armed += 1
 +        real = real_dir()
-+        if real is not None and any((real / f'f{i}').is_file() for i in range(40)):
++        if (
++            flipped
++            and real is not None
++            and any((real / f'f{i}').is_file() for i in range(40))
++        ):
 +            productive += 1
 +
 +if productive == 0:
 +    test_fail(
-+        f"vacuous race: {rounds} rounds, {armed} of them with the attacker's "
-+        "symlink still present after the push, but no push published a file "
-+        "into the real directory while the symlink was live"
++        f"vacuous race: {rounds} rounds and {swaps} swap cycles, {armed} rounds "
++        "with the attacker's symlink still present after the push, but none in "
++        "which the names changed under the push and it still published a file "
++        "into the real directory"
 +    )
 +
 +print(
 +    "receiver-rename-symlink-race: publication stayed beneath destination root "
-+    f"({rounds} rounds, {armed} armed, {productive} productive)"
++    f"({rounds} rounds, {swaps} swap cycles, {armed} armed, {productive} productive)"
 +)
