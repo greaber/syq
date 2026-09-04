@@ -13754,6 +13754,114 @@ fn ephemeral_scope(t: &Tmp) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
 }
 
+/// Candidates reach the shell as soon as the listing arrives. Closing the
+/// remote connection waits for the helper's exit status, a whole network
+/// round trip on a distant host, so the completion process must print and
+/// exit while that connection is still open.
+#[test]
+fn remote_completion_replies_before_the_remote_connection_closes() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    let ssh = fake_ssh(&t);
+    // A remote helper that serves normally and then stays alive until it is
+    // released, like an ssh session whose exit status has not come back yet.
+    // The wait is bounded so a regression fails instead of hanging.
+    let helper = t.path("lingering-syq");
+    executable(
+        &helper,
+        format!(
+            r#"#!/bin/sh
+'{syq}' "$@"
+status=$?
+n=0
+until [ -e '{release}' ] || [ "$n" -ge 400 ]; do
+    sleep 0.05
+    n=$((n + 1))
+done
+printf 'helper-exit\n' >> "$FAKE_RSH_LOG"
+exit "$status"
+"#,
+            syq = env!("CARGO_BIN_EXE_syq"),
+            release = t.s("release-helper"),
+        )
+        .as_bytes(),
+    );
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "6",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            &t.s("lingering-syq"),
+            "--from",
+            "fake.example",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    // The lingering helper inherits stderr; a captured pipe would keep this
+    // wait open until the helper exits.
+    .stderr(Stdio::null())
+    .start()
+    .unwrap()
+    .wait_with_output()
+    .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !log.contains("helper-exit"),
+        "completion waited for the remote helper to exit:\n{log}"
+    );
+
+    write(&t.path("release-helper"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        if log.contains("helper-exit") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "released remote helper never exited:\n{log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     let t = Tmp::new();
