@@ -303,18 +303,18 @@ fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
 
 fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     let diagnostics = spec.diagnostics();
-    eprintln!("syq: {}:", spec.label());
+    crate::output::diagnostic!("syq: {}:", spec.label());
     if let Some(peer) = &diagnostics.peer {
-        eprintln!(
+        crate::output::diagnostic!(
             "  control: connected via {}; remote {}",
             spec.remote_shell_name(),
             peer.platform
         );
         if let Some(version) = crate::conn::openssh_version(&spec.rsh[0]) {
-            eprintln!("  ssh client: {version}");
+            crate::output::diagnostic!("  ssh client: {version}");
         }
         let helper_mode = remote_helper_mode(spec, args.interface);
-        eprintln!("  helper: {} ({helper_mode})", peer.identity);
+        crate::output::diagnostic!("  helper: {} ({helper_mode})", peer.identity);
     }
 
     if let Some(probe) = &diagnostics.tcp_probe {
@@ -331,7 +331,7 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             } else {
                 ""
             };
-            eprintln!(
+            crate::output::diagnostic!(
                 "  TCP {}{source}: {}",
                 data_address(&candidate.address, probe.port),
                 candidate_status(candidate, fastest)
@@ -339,10 +339,10 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
         }
         let remote = probe.congestion_control.as_deref().unwrap_or("unavailable");
         match &args.tcp_congestion {
-            Some(requested) => eprintln!(
+            Some(requested) => crate::output::diagnostic!(
                 "  congestion control: remote listener {remote}; local data sockets request {requested}"
             ),
-            None => eprintln!("  congestion control: remote listener {remote} (host default)"),
+            None => crate::output::diagnostic!("  congestion control: remote listener {remote} (host default)"),
         }
     }
 
@@ -359,7 +359,9 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
             } else {
                 "plaintext TCP"
             };
-            eprintln!("  transport: {name} {route_state} (reachability preflight passed)");
+            crate::output::diagnostic!(
+                "  transport: {name} {route_state} (reachability preflight passed)"
+            );
         }
         DataTransport::Ssh => {
             let tcp_failure = spec
@@ -370,17 +372,17 @@ fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 .and_then(|info| info.failure.clone())
                 .or(diagnostics.tcp_setup_error.clone());
             if args.no_tcp {
-                eprintln!(
+                crate::output::diagnostic!(
                     "  transport: SSH {route_state} ({})",
                     interface_option(args, "--no-tcp", "--syq-no-tcp")
                 );
             } else if let Some(error) = tcp_failure {
-                eprintln!(
+                crate::output::diagnostic!(
                     "  transport: SSH {route_state} (TCP unavailable: {})",
                     one_line(&error)
                 );
             } else {
-                eprintln!("  transport: SSH {route_state}");
+                crate::output::diagnostic!("  transport: SSH {route_state}");
             }
         }
     }
@@ -410,15 +412,15 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
         "fixed"
     };
     if !remote {
-        eprintln!("syq: transport: local filesystem");
+        crate::output::diagnostic!("syq: transport: local filesystem");
     }
     if args.dry_run {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: concurrency: a real transfer would start with {} {unit} ({policy}); dry-run starts no workers",
             args.connections
         );
     } else {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: concurrency: starting with {} {unit} ({policy})",
             args.connections
         );
@@ -841,7 +843,7 @@ fn handle_tcp_setup_error(
     if !args.quiet || debug() {
         let congestion_note =
             crate::conn::tcp_congestion_fallback_note(args.tcp_congestion.as_deref());
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: {}: data over ssh (TCP ports {}-{} not reachable: {error:#}{congestion_note}); a Tailscale address or an open port is faster",
             spec.label(),
             ports.0,
@@ -1140,7 +1142,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // only way here is the operator's explicit --coordinate-at local.
         debug_assert!(args.relay);
         if !args.quiet {
-            eprintln!("syq: remote-to-remote transfer: relaying data through this machine");
+            crate::output::diagnostic!(
+                "syq: remote-to-remote transfer: relaying data through this machine"
+            );
         }
     } else if args.interface != Interface::Rsync && args.coordinate_at != CoordinateAt::Auto {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
@@ -1366,7 +1370,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }
                             gate.mark_warming(id);
                             if !opts.quiet {
-                                eprintln!(
+                                crate::output::diagnostic!(
                                     "syq: worker {id}: connection setup failed; retrying in {}s ({error:#})",
                                     1 << (failures - 1)
                                 );
@@ -1396,7 +1400,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                     };
                     if debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: worker {id} connected in {:.2}s",
                             t0.elapsed().as_secs_f64()
                         );
@@ -1421,7 +1425,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }
                             gate.mark_warming(id);
                             if !opts.quiet {
-                                eprintln!(
+                                crate::output::diagnostic!(
                                     "syq: worker {id}: connection dropped; reopening in {}s ({error:#})",
                                     1 << (failures - 1)
                                 );
@@ -1476,7 +1480,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     };
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: control connections up in {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -1510,7 +1514,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: TCP route probes started at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -1612,7 +1616,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         _ => (operator_dst_root.clone(), dst_root_entry),
     };
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: destination stat complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -1741,7 +1745,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         None
     };
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: destination selection complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -1935,7 +1939,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .set(crate::resume::copy_id(&identity))
         .expect("partial identity set once");
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: copy identity complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2029,7 +2033,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: destination preflight complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2047,7 +2051,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             )?;
         }
         if debug() {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: tcp data port {:?}",
                 spec.label(),
                 spec.tcp
@@ -2075,7 +2079,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: data transport setup complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2106,7 +2110,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     print_transport_diagnostics(&args, &src_ep, &dst_ep);
     if args.verbose >= 2 {
         if let Some(remembered) = remembered_start {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: auto-tuning: starting with {remembered} connections remembered for this path"
             );
         }
@@ -2316,7 +2320,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: payload planning complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2447,7 +2451,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         None => None,
     };
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: file workers complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2495,7 +2499,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         st.apply_deferred()?;
     }
     if debug() {
-        eprintln!(
+        crate::output::diagnostic!(
             "syq: deferred metadata complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
@@ -2532,11 +2536,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 break;
                             }
                         };
-                        println!(
+                        if let Err(error) = crate::output::write_stdout(format_args!(
                             "{}{}",
                             crate::receipt::RECEIPT_LINE_PREFIX,
                             base64::engine::general_purpose::STANDARD_NO_PAD.encode(frame)
-                        );
+                        )) {
+                            progress.error(&format!("syq: write receipt: {error}"));
+                            break;
+                        }
                         if terminal {
                             break;
                         }
@@ -2642,7 +2649,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 if final_key.as_deref() == Some(initial_key) {
                     tune::remember(initial_key, policy.settled());
                 } else if debug() {
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: auto-tuning: transport changed during transfer; not updating cache"
                     );
                 }
@@ -2656,7 +2663,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
-                println!(
+                crate::output::human_stdout!(
                     "create directory {} (destination missing)",
                     display_directory(&dst_root)
                 );
@@ -2675,7 +2682,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 fresh_capacity_assessment,
             );
         } else if opts.verify_only {
-            println!(
+            crate::output::human_stdout!(
                 "syq: verified {} files, {} differ/missing, {} in {}",
                 commas(progress.files_done.load(Relaxed) + errors),
                 errors,
@@ -2683,7 +2690,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 crate::progress::hms(elapsed)
             );
         } else {
-            println!(
+            crate::output::human_stdout!(
                 "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
                 commas(terminal.files_transferred),
                 human(terminal.bytes_transferred),
@@ -2729,7 +2736,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        println!(
+        crate::output::human_stdout!(
                 "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
@@ -3593,35 +3600,37 @@ fn print_dry_run_summary(
     changes: &DryRunChanges,
     capacity: Option<FreshCapacityAssessment>,
 ) {
-    println!("syq: dry-run summary");
+    crate::output::human_stdout!("syq: dry-run summary");
     for (source, mapping) in srcs.iter().zip(mappings) {
-        println!(
+        crate::output::human_stdout!(
             "  mapping: {} -> {} ({})",
             display_plan_source(source, args),
             display_plan_target(dst, &mapping.target, args),
             mapping.semantics
         );
     }
-    println!("  changes: {}", changes.summary());
+    crate::output::human_stdout!("  changes: {}", changes.summary());
 
     match deletes {
-        DeletePlan::Disabled => println!("  deletions: disabled"),
+        DeletePlan::Disabled => crate::output::human_stdout!("  deletions: disabled"),
         DeletePlan::Planned(n) => {
             if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
-                println!(
+                crate::output::human_stdout!(
                     "  deletions: {} planned; blocked by --max-delete {limit}",
                     count_label(n, "entry", "entries")
                 );
             } else {
-                println!(
+                crate::output::human_stdout!(
                     "  deletions: {} planned after a successful copy",
                     count_label(n, "entry", "entries")
                 );
             }
         }
-        DeletePlan::Skipped(reason) => println!("  deletions: skipped ({reason})"),
+        DeletePlan::Skipped(reason) => {
+            crate::output::human_stdout!("  deletions: skipped ({reason})")
+        }
     }
-    println!(
+    crate::output::human_stdout!(
         "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
         count_label(progress.files_total.load(Relaxed), "file", "files"),
@@ -3644,7 +3653,7 @@ fn print_dry_run_summary(
                 )
             },
         );
-        println!(
+        crate::output::human_stdout!(
             "  capacity: {} logical data required; {} available; {inode_detail} ({})",
             human(capacity.logical_bytes),
             human(capacity.available_bytes),
@@ -3668,7 +3677,7 @@ fn print_dry_run_summary(
     if other > 0 {
         exclusions.push(count_label(other, "other entry", "other entries"));
     }
-    println!(
+    crate::output::human_stdout!(
         "  exclusions: {}",
         if exclusions.is_empty() {
             if opts.ignore.is_empty() {
@@ -3681,7 +3690,7 @@ fn print_dry_run_summary(
         }
     );
 
-    println!("  route: {}", selected_route(src_ep, dst_ep, args));
+    crate::output::human_stdout!("  route: {}", selected_route(src_ep, dst_ep, args));
 }
 
 fn path_has_partial_component(path: &[u8]) -> bool {
@@ -6518,7 +6527,7 @@ impl Worker {
             match item {
                 Item::Exit => {
                     if debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s; small: {} files in {} batches, src {:.2}s, dst send {:.2}s, dst ack {:.2}s, restat {:.2}s, bookkeeping {:.2}s",
                             self.id,
                             self.t[0],

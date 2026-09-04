@@ -135,18 +135,28 @@ impl Progress {
 
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+        let mut term = Some(self.term.lock().unwrap());
+        self.erase(term.as_mut().unwrap());
+        // A redirected stdout cannot disturb the terminal display. Let the
+        // ticker keep running while a slow pipe blocks this printing worker.
+        if !std::io::stdout().is_terminal() {
+            drop(term.take());
+        }
+        let result = {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{line}").and_then(|()| out.flush())
+        };
+        drop(term);
+        if let Err(error) = result {
+            crate::output::warn_stdout(&error);
+        }
     }
 
     /// Print a line to stderr (errors and warnings), keeping the progress area intact.
     pub fn eprintln(&self, line: &str) {
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
-        eprintln!("{line}");
+        crate::output::diagnostic!("{line}");
     }
 
     pub fn error(&self, line: &str) {
@@ -170,7 +180,7 @@ impl Progress {
         let mut term = self.term.lock().unwrap();
         self.erase(&mut term);
         if self.json {
-            eprintln!(
+            crate::output::diagnostic!(
                 "{}",
                 serde_json::json!({
                     "type": "warning",
@@ -180,13 +190,13 @@ impl Progress {
                 })
             );
         } else {
-            eprintln!("syq: warning: {message}");
+            crate::output::diagnostic!("syq: warning: {message}");
         }
     }
 
     fn erase(&self, t: &mut TermState) {
         if t.lines_drawn > 0 {
-            eprint!("\r\x1b[{}A\x1b[J", t.lines_drawn);
+            let _ = write!(std::io::stderr().lock(), "\r\x1b[{}A\x1b[J", t.lines_drawn);
             t.lines_drawn = 0;
         }
     }
@@ -256,7 +266,7 @@ impl Progress {
                 .is_none_or(|l| now - l >= Duration::from_secs(1))
             {
                 t.last_json = Some(now);
-                eprintln!(
+                crate::output::diagnostic!(
                     "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_unchanged\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_unchanged\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
                     self.files_unchanged.load(Relaxed),
                     self.files_excluded.load(Relaxed),

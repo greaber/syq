@@ -65,7 +65,7 @@ fn copy_one(
     match copy_slowly(input, output, pace) {
         Ok(()) => Ok(true),
         Err(CopyError::Read(error)) => {
-            eprintln!("syq cat: {}: {error}", Path::new(label).display());
+            crate::output::diagnostic!("syq cat: {}: {error}", Path::new(label).display());
             Ok(false)
         }
         Err(CopyError::Write(error)) => bail!("writing standard output: {error}"),
@@ -120,7 +120,10 @@ pub fn run(arguments: &[OsString]) -> Result<i32> {
                     succeeded &= copy_one(&mut file, operand, &mut output, &mut pace)?;
                 }
                 Err(error) => {
-                    eprintln!("syq cat: {}: {error}", Path::new(operand).display());
+                    crate::output::diagnostic!(
+                        "syq cat: {}: {error}",
+                        Path::new(operand).display()
+                    );
                     succeeded = false;
                 }
             }

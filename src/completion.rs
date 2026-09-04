@@ -181,7 +181,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-                        eprintln!("syq completion: {error:#}");
+                        crate::output::diagnostic!("syq completion: {error:#}");
                     }
                     Vec::new()
                 }
@@ -201,7 +201,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 }
                 Err(error) => {
                     if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-                        eprintln!("syq completion: {error:#}");
+                        crate::output::diagnostic!("syq completion: {error:#}");
                     }
                     Vec::new()
                 }
@@ -274,7 +274,7 @@ fn run_cache(action: CacheAction) -> Result<()> {
 pub(crate) fn remember_endpoint_best_effort(user: Option<&str>, host: &str, port: Option<u16>) {
     if let Err(error) = remember_endpoint(user, host, port) {
         if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-            eprintln!("syq completion cache: {error:#}");
+            crate::output::diagnostic!("syq completion cache: {error:#}");
         }
     }
 }

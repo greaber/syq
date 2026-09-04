@@ -76,7 +76,13 @@ below.
 Records land in `seq` order. Error and terminal records are flushed
 immediately. If writing the stream itself fails, syq warns once on
 stderr and stops writing; the consumer detects this as a missing
-terminal record. Argument and usage errors exit `2` with no stream at
+terminal record. Failure to write human output does not change the copy or
+removal result. For an attached receiver-attested copy, syq continues reading
+and verifying the receipt even if forwarding human output to stdout fails;
+a missing or invalid receipt still fails verification. Warnings are best effort
+when stderr is also unavailable.
+
+Argument and usage errors exit `2` with no stream at
 all: a consumer constructs its own argv, so a usage error is a
 consumer bug and gets no JSON. Every run that gets past argument
 parsing emits a terminal record, fatal setup failures included.

@@ -12,6 +12,7 @@ mod identity;
 mod janky_cat;
 mod native_map;
 mod native_rm;
+mod output;
 mod persistence;
 mod private_broker;
 mod progress;
@@ -122,33 +123,35 @@ fn main() {
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--release-manifest-signing-payload") {
         if argv.len() != 3 {
-            eprintln!("syq: --release-manifest-signing-payload requires one manifest path");
+            crate::output::diagnostic!(
+                "syq: --release-manifest-signing-payload requires one manifest path"
+            );
             std::process::exit(2);
         }
         if let Err(e) = update::write_manifest_signing_payload(std::path::Path::new(&argv[2])) {
-            eprintln!("syq: {e:#}");
+            crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(1);
         }
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-install") {
         if argv.len() != 2 {
-            eprintln!("syq: restricted installer takes no command-line arguments");
+            crate::output::diagnostic!("syq: restricted installer takes no command-line arguments");
             std::process::exit(2);
         }
         if let Err(error) = restricted::remote_install() {
-            eprintln!("syq restricted installer: {error:#}");
+            crate::output::diagnostic!("syq restricted installer: {error:#}");
             std::process::exit(1);
         }
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--restricted-revoke") {
         if argv.len() != 2 {
-            eprintln!("syq: restricted revoker takes no command-line arguments");
+            crate::output::diagnostic!("syq: restricted revoker takes no command-line arguments");
             std::process::exit(2);
         }
         if let Err(error) = restricted::remote_revoke() {
-            eprintln!("syq restricted revoker: {error:#}");
+            crate::output::diagnostic!("syq restricted revoker: {error:#}");
             std::process::exit(1);
         }
         return;
@@ -159,11 +162,11 @@ fn main() {
             .and_then(|argument| argument.to_str())
             .and_then(|argument| argument.strip_prefix("--enrollment="));
         if argv.len() != 3 || enrollment.is_none() {
-            eprintln!("syq: restricted receiver requires exactly --enrollment=ID");
+            crate::output::diagnostic!("syq: restricted receiver requires exactly --enrollment=ID");
             std::process::exit(2);
         }
         if let Err(error) = restricted::run_receiver(enrollment.unwrap()) {
-            eprintln!("syq restricted receiver: {error:#}");
+            crate::output::diagnostic!("syq restricted receiver: {error:#}");
             std::process::exit(1);
         }
         return;
@@ -175,7 +178,7 @@ fn main() {
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
     if server_mode {
         if let Err(e) = server::run() {
-            eprintln!("syq server: {e:#}");
+            crate::output::diagnostic!("syq server: {e:#}");
             std::process::exit(1);
         }
         return;
@@ -184,7 +187,7 @@ fn main() {
         match janky_cat::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
-                eprintln!("syq cat: {error:#}");
+                crate::output::diagnostic!("syq cat: {error:#}");
                 std::process::exit(1);
             }
         }
@@ -193,7 +196,7 @@ fn main() {
         match persistence::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
-                eprintln!("syq persist: {error:#}");
+                crate::output::diagnostic!("syq persist: {error:#}");
                 std::process::exit(1);
             }
         }
@@ -202,7 +205,7 @@ fn main() {
         match completion::run(&argv[2..]) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
-                eprintln!("syq completion: {error:#}");
+                crate::output::diagnostic!("syq completion: {error:#}");
                 std::process::exit(1);
             }
         }
@@ -211,7 +214,7 @@ fn main() {
         match result {
             Ok(code) => std::process::exit(code),
             Err(error) => {
-                eprintln!("syq: {error:#}");
+                crate::output::diagnostic!("syq: {error:#}");
                 std::process::exit(1);
             }
         }
@@ -219,21 +222,21 @@ fn main() {
     let mut args = match cli::Args::parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("syq: {e:#}");
+            crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(2);
         }
     };
     args.normalize();
     if args.self_update {
         if let Err(e) = update::self_update() {
-            eprintln!("syq: {e:#}");
+            crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(1);
         }
         return;
     }
     if args.register_standalone_install {
         if let Err(e) = update::register_standalone_install() {
-            eprintln!("syq: {e:#}");
+            crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(1);
         }
         return;
@@ -255,7 +258,7 @@ fn main() {
             std::process::exit(code)
         }
         Err(e) => {
-            eprintln!("syq: {e:#}");
+            crate::output::diagnostic!("syq: {e:#}");
             std::process::exit(1);
         }
     }
