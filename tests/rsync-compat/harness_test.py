@@ -29,6 +29,9 @@ def sample_report(tests: list[dict] | None = None) -> dict:
         "target_args": [],
         "platform": "linux",
         "run_as": "non-root",
+        "selected_areas": [],
+        "environment_excluded": [],
+        "selection_excluded": [],
         "applicable": len(tests),
         "position_counts": {
             position: sum(test["position"] == position for test in tests)
@@ -162,6 +165,29 @@ deleted file mode 100644
         test = {"name": "alpha", "classification": "conformance"}
 
         self.assertEqual(rsync_compat.upstream_test_name(test), "alpha")
+
+    def test_area_selection_precedes_environment_selection(self) -> None:
+        manifest = {
+            "tests": [
+                {"name": "security-user", "area": "security"},
+                {"name": "security-root", "area": "security", "run_as": "root"},
+                {"name": "paths-user", "area": "paths"},
+            ]
+        }
+
+        with mock.patch.object(rsync_compat, "platform_name", return_value="linux"):
+            with mock.patch.object(rsync_compat, "running_as", return_value="non-root"):
+                selected, environment_excluded, selection_excluded = (
+                    rsync_compat.select_tests(manifest, {"security"})
+                )
+
+        self.assertEqual([test["name"] for test in selected], ["security-user"])
+        self.assertEqual(
+            [test["name"] for test in environment_excluded], ["security-root"]
+        )
+        self.assertEqual(
+            [test["name"] for test in selection_excluded], ["paths-user"]
+        )
 
     def test_historical_regression_refs_resolve(self) -> None:
         manifest = rsync_compat.load_manifest()

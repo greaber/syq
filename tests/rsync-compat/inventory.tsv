@@ -35,7 +35,7 @@ chgrp	conformance	-
 chmod	unsupported	unsupported-metadata
 chmod-option	unsupported	unsupported-metadata
 chmod-setid	unsupported	unsupported-metadata
-chmod-symlink-race	unsupported	unsupported-metadata
+chmod-symlink-race	out-of-scope	rsync-internal
 chmod-temp-dir	unsupported	unsupported-metadata
 chown	adapted	-
 chown-fake	unsupported	unsupported-xattrs
@@ -217,7 +217,7 @@ operator-path-dir-daemon-inmodule	out-of-scope	rsync-daemon
 operator-path-dir-daemon-leaf	out-of-scope	rsync-daemon
 operator-path-dir-daemon-mkdir	out-of-scope	rsync-daemon
 operator-path-dir-daemon-outside	out-of-scope	rsync-daemon
-operator-path-files-from	unsupported	unsupported-transfer-mode
+operator-path-files-from	conformance	-
 operator-path-inplace-backup-dir	unsupported	unsupported-alt-dest
 operator-path-insecure-links-daemon	out-of-scope	rsync-daemon
 operator-path-insecure-links-refused	out-of-scope	rsync-daemon
@@ -268,7 +268,7 @@ relative-mkpath-symlink	unsupported	unsupported-relative
 relative-symlinked-parent	unsupported	unsupported-relative
 relative-symlinked-parent-dotdot	unsupported	unsupported-relative
 remote-shell-newline-escaping	adapted	-
-rename-fullpath-symlink-race	unsupported	unsupported-transfer-mode
+rename-fullpath-symlink-race	adapted	-
 rename-mixed-parent-escape-poc	out-of-scope	rsync-internal
 rename-mixed-parent-symlink-race	out-of-scope	rsync-internal
 rename-mixed-parent-transfer	out-of-scope	rsync-daemon

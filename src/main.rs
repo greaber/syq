@@ -49,24 +49,70 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
-/// Many workers each keep a few files open; the default soft limit (1024) is
-/// too small for -j32, so use whatever the hard limit allows.
+/// Many workers each keep a few files open; the default soft limit (1024 on
+/// Linux, 256 on macOS) is too small for -j32, so use whatever the hard limit
+/// allows. Best effort: the source descriptor budget later reports what the
+/// endpoint actually permits.
 fn raise_nofile() {
-    unsafe {
-        let mut rl = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < rl.rlim_max {
-            rl.rlim_cur = rl.rlim_max.min(1 << 20);
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
-        }
-    }
+    let Some((limits, wanted)) = nofile_raise_target() else {
+        return;
+    };
+    let _ = fsops::set_nofile_limits(&libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limits.rlim_max,
+    });
+}
+
+/// The current limits and the soft limit worth requesting, or `None` when the
+/// soft limit is already as high as it can usefully go. The request stays at
+/// or below one million descriptors and the platform ceiling.
+fn nofile_raise_target() -> Option<(libc::rlimit, libc::rlim_t)> {
+    let limits = fsops::nofile_limits().ok()?;
+    let wanted = platform_nofile_ceiling(limits.rlim_max.min(1 << 20));
+    (wanted > limits.rlim_cur).then_some((limits, wanted))
+}
+
+/// macOS usually reports an unlimited hard limit but enforces
+/// `kern.maxfilesperproc` as the real per-process ceiling. macOS 11 and later
+/// store a higher soft limit and apply the ceiling internally; macOS 10.15 and
+/// earlier rejected such a request with EINVAL instead of clamping it, which
+/// left the default soft limit of 256 in place. Requesting at most the ceiling
+/// behaves the same on both. `OPEN_MAX` is the kernel's initial value for the
+/// ceiling and stands in when the sysctl is unavailable.
+#[cfg(target_os = "macos")]
+fn platform_nofile_ceiling(wanted: libc::rlim_t) -> libc::rlim_t {
+    const OPEN_MAX: libc::rlim_t = 10240;
+    wanted.min(max_files_per_process().unwrap_or(OPEN_MAX))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_nofile_ceiling(wanted: libc::rlim_t) -> libc::rlim_t {
+    wanted
+}
+
+#[cfg(target_os = "macos")]
+fn max_files_per_process() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>();
+    // SAFETY: sysctlbyname writes at most `length` bytes into `value` and
+    // stores the bytes written back through `length`; no new value is set.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of::<libc::c_int>() && value > 0)
+        .then(|| value as libc::rlim_t)
 }
 
 fn main() {
     tune_allocator();
     raise_nofile();
+    fsops::capture_process_umask();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
@@ -210,5 +256,29 @@ fn main() {
             eprintln!("syq: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn raise_nofile_reaches_its_target() {
+        let target = super::nofile_raise_target();
+        super::raise_nofile();
+        let after = crate::fsops::nofile_limits().unwrap();
+        if let Some((before, wanted)) = target {
+            assert!(wanted > before.rlim_cur);
+            assert_eq!(
+                after.rlim_cur, wanted,
+                "soft descriptor limit {} did not reach {wanted} under hard limit {}",
+                after.rlim_cur, before.rlim_max
+            );
+        }
+        assert!(
+            super::nofile_raise_target().is_none(),
+            "soft descriptor limit {} can still be raised under hard limit {}",
+            after.rlim_cur,
+            after.rlim_max
+        );
     }
 }

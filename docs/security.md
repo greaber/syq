@@ -76,7 +76,10 @@ go further:
   swapped to a different inode is restored or preserved in the reported
   quarantine, not deleted, and a later entry at the selected name is left
   alone. If the filesystem has no atomic no-replace rename, or no writable
-  trusted ancestor can hold the quarantine, removal fails closed.
+  trusted ancestor can hold the quarantine, removal fails closed. On Linux, an
+  open descriptor also lets syq report a selected directory renamed away
+  before quarantine as a failure; macOS cannot expose that directory state and
+  reports it as already absent.
 - The restricted remote-to-remote receiver performs every operation relative
   to an opened root; descendant symlinks are payload, never traversal.
 - Native `cp` defaults to `-rlt`: no owner, group, mode, or device is applied
@@ -98,10 +101,17 @@ What is different from rsync, or weaker:
   creation and the singly-linked-regular-file check limit what that buys, but
   they cannot prove who created a predictable pathname. Do not run a
   privileged copy into a directory writable by untrusted users.
-- **The rsync-mode escape hatch.** `syq rsync --insecure-links` restores the
-  unconfined, name-based source traversal, including through symlinked
+- **The rsync-mode escape hatch.** `syq rsync --insecure-links` turns off the
+  symlink ownership check for every path the operator supplies: the source
+  and destination arguments and control files such as `--files-from` and
+  `--syq-ignore-from`. A symlink in any of those paths is then followed
+  whoever owns it, so the flag also drops the destination-side refusal of an
+  attacker-owned link, not only the source-side one. It additionally restores
+  the unconfined, name-based source traversal, including through symlinked
   `--files-from` parents. It exists for compatibility and is never selected
-  automatically. It does not enable rsync's separate descendant-link modes:
+  automatically; do not reach for it to satisfy a source-side need without
+  accepting that destination and control paths lose the same check. It does
+  not enable rsync's separate descendant-link modes:
   `-L`/`--copy-links`, `--copy-unsafe-links`, `-k`/`--copy-dirlinks`, and
   `-K`/`--keep-dirlinks` remain unsupported and are rejected before either
   endpoint is contacted. `--safe-links` and `--munge-links` are likewise not

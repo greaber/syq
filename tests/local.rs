@@ -9327,6 +9327,10 @@ fn foreign_owned_destination_root_symlink_is_refused() {
         stderr_of(&refused)
     );
     assert!(!t.path("outside/f").exists());
+
+    let opted_out = syq(&["-a", "--insecure-links", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&opted_out);
+    assert_eq!(read(&t.path("outside/f")), b"payload");
 }
 
 #[cfg(debug_assertions)]

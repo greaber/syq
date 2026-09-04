@@ -11,10 +11,10 @@ Configured command prefix: `syq rsync`.
 
 | Classification | Tests |
 |---|---:|
-| conformance | 15 |
-| adapted | 21 |
-| unsupported | 133 |
-| out-of-scope | 182 |
+| conformance | 16 |
+| adapted | 22 |
+| unsupported | 130 |
+| out-of-scope | 183 |
 | unassessed | 0 |
 
 ## Runnable behavioral tests
@@ -50,6 +50,8 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | robustness | `change-vanish` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Continue a transfer when a source file vanishes after the source scan. |
 | robustness | `growing-file` | pass | Compatible | invocation adaptation (source-mutation-cli) | platform=linux; threads; bandwidth limiting | Copy the final contents of a file that grows after the source scan. |
 | robustness | `highfd-hang` | pass | Compatible | unmodified upstream | platform=linux; C compiler; soft fd limit above FD_SETSIZE | An ordinary transfer completes when the child inherits high-numbered descriptors. |
+| security | `operator-path-files-from` | pass | Compatible | unmodified upstream | platform=linux; symlinks | Apply rsync's trusted-owner policy to leaf and parent symlinks in absolute and relative --files-from paths, with --insecure-links as the explicit opt-out. |
+| security | `receiver-rename-symlink-race` | pass | Compatible | subset adaptation (rename-destination-symlink-race) of upstream rename-fullpath-symlink-race | platform=linux; symlinks | Race a destination parent between a directory and an out-of-tree symlink during normal staged publication; the adaptation removes upstream's unsupported absolute --temp-dir trigger, keeps its flipper, positive control, and outside-write oracle, and re-arms the symlink before every push so a pass proves publication ran under a live flip. |
 | security | `remote-shell-newline-escaping` | pass | Compatible | invocation adaptation (remote-shell-syq-cli) | platform=linux; rsync lsh test helper | A newline-bearing remote destination cannot split SYQ's quoted remote command and execute an injected shell command. |
 | security | `sender-scan-dir-escape` | pass | Compatible | unmodified upstream | platform=linux; symlinks; C compiler; renameat2 | A raced source parent cannot make the copy enumerate outside the source tree. |
 | security | `symlink-race-dest` | pass | Compatible | unmodified upstream | platform=linux; run-as=root; root; a second uid; symlinks | The receiver refuses an attacker-owned symlink in an operator-named absolute destination path, retains the selected directory, and continues to follow a root-owned administrative link. |
@@ -110,7 +112,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `chmod` | `unsupported-metadata` |
 | `chmod-option` | `unsupported-metadata` |
 | `chmod-setid` | `unsupported-metadata` |
-| `chmod-symlink-race` | `unsupported-metadata` |
 | `chmod-temp-dir` | `unsupported-metadata` |
 | `chown-fake` | `unsupported-xattrs` |
 | `compress-options` | `unsupported-transfer-mode` |
@@ -170,7 +171,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `operator-path-backup-symlink` | `unsupported-alt-dest` |
 | `operator-path-compare-dest` | `unsupported-alt-dest` |
 | `operator-path-copy-dest` | `unsupported-alt-dest` |
-| `operator-path-files-from` | `unsupported-transfer-mode` |
 | `operator-path-inplace-backup-dir` | `unsupported-alt-dest` |
 | `operator-path-link-dest` | `unsupported-alt-dest` |
 | `operator-path-log-file` | `unsupported-transfer-mode` |
@@ -192,7 +192,6 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `relative-mkpath-symlink` | `unsupported-relative` |
 | `relative-symlinked-parent` | `unsupported-relative` |
 | `relative-symlinked-parent-dotdot` | `unsupported-relative` |
-| `rename-fullpath-symlink-race` | `unsupported-transfer-mode` |
 | `safe-links` | `unsupported-transfer-mode` |
 | `safe-links-absolute-intree` | `unsupported-transfer-mode` |
 | `safe-links-unsafe-def` | `unsupported-transfer-mode` |
@@ -227,6 +226,7 @@ The baseline is the last reviewed observation, not a claim that rsync's behavior
 | `bare-do-open-symlink-race` | `rsync-internal` |
 | `chdir-symlink-race` | `rsync-internal` |
 | `checksum-zero-blocklen` | `rsync-internal` |
+| `chmod-symlink-race` | `rsync-internal` |
 | `chroot-alt-dest-inner-module` | `rsync-daemon` |
 | `chroot-basis-forge-inner-module` | `rsync-daemon` |
 | `chroot-copy-dest-inner-module` | `rsync-daemon` |

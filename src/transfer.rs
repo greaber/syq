@@ -2,8 +2,8 @@
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{
-    parse_rsh, parse_size, Args, CoordinateAt, Existence, Interface, Location, Placement,
-    SourceSelection,
+    parse_rsh, parse_size, rsync_operator_symlink_policy, Args, CoordinateAt, Existence, Interface,
+    Location, Placement, SourceSelection,
 };
 use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
@@ -160,7 +160,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
 
 fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        OperatorSymlinkPolicy::TrustedOwner
+        rsync_operator_symlink_policy(args.insecure_links)
     } else if args.follows_native_source_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -170,7 +170,7 @@ fn source_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
 
 fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        OperatorSymlinkPolicy::TrustedOwner
+        rsync_operator_symlink_policy(args.insecure_links)
     } else if args.follows_native_destination_paths() {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -180,7 +180,7 @@ fn destination_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
 
 fn control_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
     if args.interface == Interface::Rsync {
-        OperatorSymlinkPolicy::TrustedOwner
+        rsync_operator_symlink_policy(args.insecure_links)
     } else if args.native_follow {
         OperatorSymlinkPolicy::FollowAll
     } else {
@@ -787,14 +787,6 @@ pub fn debug() -> bool {
     std::env::var_os("SYQ_DEBUG").is_some()
 }
 
-fn read_umask() -> u32 {
-    unsafe {
-        let m = libc::umask(0o022);
-        libc::umask(m);
-        m as u32
-    }
-}
-
 fn handle_tcp_setup_error(
     args: &Args,
     spec: &RemoteSpec,
@@ -1195,7 +1187,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dry_run: args.dry_run,
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
-        umask: read_umask(),
+        umask: crate::fsops::process_umask(),
         partial_id: std::sync::OnceLock::new(),
         ignore: args.ignore_lines.clone(),
         delete: args.delete,

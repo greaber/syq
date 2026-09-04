@@ -776,7 +776,7 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
                     None,
                 )
             } else {
-                match remove_pinned(&name, false) {
+                match remove_pinned(&name, None) {
                     Ok(RemovePinnedOutcome::Removed) => removal_outcome(
                         selector,
                         label,
@@ -931,7 +931,7 @@ fn finish_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let result = if pool.dry_run {
         Ok(RemovePinnedOutcome::Removed)
     } else {
-        remove_pinned(removal, true)
+        remove_pinned(removal, Some(&job.directory))
     };
     match result {
         Ok(outcome) => {
@@ -1014,8 +1014,12 @@ enum RemovePinnedOutcome {
     AlreadyAbsent,
 }
 
-fn remove_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutcome> {
-    remove_pinned_with_hook(name, directory, |_, _| Ok(()))
+fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<RemovePinnedOutcome> {
+    let outcome = remove_pinned_with_hook(name, held_directory.is_some(), |_, _| Ok(()))?;
+    if let Some(directory) = held_directory {
+        require_unlinked_directory(directory)?;
+    }
+    Ok(outcome)
 }
 
 fn remove_pinned_with_hook(
@@ -1116,6 +1120,28 @@ fn remove_pinned_with_hook(
         Ok(_) => bail!("removal target was replaced during removal"),
         Err(error) => Err(error).context("inspect removal name after quarantine"),
     }
+}
+
+/// Once the pinned name is gone, the held descriptor must refer to an
+/// unlinked directory; otherwise the selected directory survives under
+/// another name. Linux clears the link count of a removed directory. macOS
+/// keeps reporting the old count, so this check is not available there.
+#[cfg(target_os = "linux")]
+fn require_unlinked_directory(directory: &File) -> Result<()> {
+    let metadata = directory.metadata().context("inspect removed directory")?;
+    if metadata.nlink() != 0 {
+        bail!(
+            "removal target {}:{} is still linked after its name was removed; the selected directory remains under another name",
+            metadata.dev(),
+            metadata.ino()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_unlinked_directory(_directory: &File) -> Result<()> {
+    Ok(())
 }
 
 struct RemovalQuarantine {
@@ -1627,13 +1653,15 @@ mod tests {
     use std::path::Path;
     use std::sync::OnceLock;
 
-    type QuarantineHook = Box<dyn Fn(&CStr) + Send + Sync>;
+    type QuarantineHook = Arc<dyn Fn(&CStr) + Send + Sync>;
 
     /// Hooks that run immediately before an entry is moved to quarantine,
     /// keyed by the identity of its parent directory. Tests register a hook
-    /// for their own temporary directory so concurrent tests never observe it.
-    fn quarantine_hooks() -> &'static Mutex<Vec<(Identity, QuarantineHook)>> {
-        static HOOKS: OnceLock<Mutex<Vec<(Identity, QuarantineHook)>>> = OnceLock::new();
+    /// for their own temporary directory so concurrent tests never observe it,
+    /// and the returned guard removes the hook again so a later test whose
+    /// temporary directory reuses the inode does not fire it.
+    fn quarantine_hooks() -> &'static Mutex<Vec<(u64, Identity, QuarantineHook)>> {
+        static HOOKS: OnceLock<Mutex<Vec<(u64, Identity, QuarantineHook)>>> = OnceLock::new();
         HOOKS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
@@ -1647,17 +1675,41 @@ mod tests {
             return;
         }
         let identity = identity_from_stat(&stat);
-        let hooks = quarantine_hooks().lock().unwrap();
-        for (target, hook) in hooks.iter() {
-            if *target == identity {
-                hook(name);
-            }
+        let matching: Vec<QuarantineHook> = quarantine_hooks()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, target, _)| *target == identity)
+            .map(|(_, _, hook)| hook.clone())
+            .collect();
+        for hook in matching {
+            hook(name);
         }
     }
 
-    fn hook_quarantines_in(directory: &std::path::Path, hook: QuarantineHook) {
+    struct QuarantineHookGuard(u64);
+
+    impl Drop for QuarantineHookGuard {
+        fn drop(&mut self) {
+            quarantine_hooks()
+                .lock()
+                .unwrap()
+                .retain(|(token, _, _)| *token != self.0);
+        }
+    }
+
+    fn hook_quarantines_in(
+        directory: &std::path::Path,
+        hook: impl Fn(&CStr) + Send + Sync + 'static,
+    ) -> QuarantineHookGuard {
+        static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) as u64;
         let identity = identity_from_file(&File::open(directory).unwrap()).unwrap();
-        quarantine_hooks().lock().unwrap().push((identity, hook));
+        quarantine_hooks()
+            .lock()
+            .unwrap()
+            .push((token, identity, Arc::new(hook)));
+        QuarantineHookGuard(token)
     }
 
     fn remove_selectors(
@@ -1861,7 +1913,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_pinned(&selected, false).unwrap_err();
+        let error = remove_pinned(&selected, None).unwrap_err();
 
         assert!(format!("{error:#}").contains("removal target changed identity"));
         assert_eq!(
@@ -2091,15 +2143,12 @@ mod tests {
         fs::create_dir(base.join("tree")).unwrap();
         fs::write(base.join("tree/old"), b"old").unwrap();
         let swap = base.clone();
-        hook_quarantines_in(
-            &base,
-            Box::new(move |name| {
-                if name.to_bytes() == b"tree" {
-                    fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
-                    fs::create_dir(swap.join("tree")).unwrap();
-                }
-            }),
-        );
+        let _hook = hook_quarantines_in(&base, move |name| {
+            if name.to_bytes() == b"tree" {
+                fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
+                fs::create_dir(swap.join("tree")).unwrap();
+            }
+        });
 
         let outcomes = remove_selectors(&base, &[selector(b"tree", NativeRemoveKind::Directory)]);
 
@@ -2134,20 +2183,17 @@ mod tests {
         fs::create_dir(base.join("full")).unwrap();
         fs::write(base.join("full/keep"), b"keep").unwrap();
         let swap = base.clone();
-        hook_quarantines_in(
-            &base,
-            Box::new(move |name| match name.to_bytes() {
-                b"file" => {
-                    fs::rename(swap.join("file"), swap.join("file-moved")).unwrap();
-                    symlink("referent", swap.join("file")).unwrap();
-                }
-                b"dir-file" => {
-                    fs::rename(swap.join("dir-file"), swap.join("dir-file-moved")).unwrap();
-                    fs::rename(swap.join("full"), swap.join("dir-file")).unwrap();
-                }
-                _ => {}
-            }),
-        );
+        let _hook = hook_quarantines_in(&base, move |name| match name.to_bytes() {
+            b"file" => {
+                fs::rename(swap.join("file"), swap.join("file-moved")).unwrap();
+                symlink("referent", swap.join("file")).unwrap();
+            }
+            b"dir-file" => {
+                fs::rename(swap.join("dir-file"), swap.join("dir-file-moved")).unwrap();
+                fs::rename(swap.join("full"), swap.join("dir-file")).unwrap();
+            }
+            _ => {}
+        });
 
         let outcomes = remove_selectors(
             &base,
@@ -2173,5 +2219,76 @@ mod tests {
                 outcome.path == path && outcome.disposition == NativeRemoveDisposition::Failed
             }));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_still_linked_failure(outcomes: &[NativeRemoveOutcome], path: &[u8]) {
+        let failure = outcomes
+            .iter()
+            .find(|outcome| {
+                outcome.path == path && outcome.disposition == NativeRemoveDisposition::Failed
+            })
+            .and_then(|outcome| outcome.failure.as_ref())
+            .expect("renamed-away directory is reported as a failure");
+        assert!(
+            failure.error.message.contains("still linked")
+                && failure.class == NativeRemoveErrorClass::Conflict,
+            "{failure:?}"
+        );
+        assert!(!outcomes.iter().any(|outcome| {
+            outcome.path == path
+                && matches!(
+                    outcome.disposition,
+                    NativeRemoveDisposition::Removed | NativeRemoveDisposition::AlreadyAbsent
+                )
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_renamed_away_before_quarantine_is_reported_as_a_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().to_path_buf();
+        fs::create_dir(base.join("tree")).unwrap();
+        let swap = base.clone();
+        let _hook = hook_quarantines_in(&base, move |name| {
+            if name.to_bytes() == b"tree" {
+                fs::rename(swap.join("tree"), swap.join("moved")).unwrap();
+            }
+        });
+
+        let outcomes = remove_selectors(&base, &[selector(b"tree", NativeRemoveKind::Directory)]);
+
+        assert!(base.join("moved").is_dir());
+        assert_still_linked_failure(&outcomes, b"tree");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_renamed_away_after_pinning_is_reported_as_a_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().to_path_buf();
+        fs::create_dir(base.join("tree")).unwrap();
+        let mut outcomes = Vec::new();
+        remove(
+            Some(base.as_os_str().as_bytes()),
+            None,
+            &[selector(b"tree", NativeRemoveKind::Directory)],
+            false,
+            false,
+            2,
+            &mut |_| {
+                fs::rename(base.join("tree"), base.join("moved"))?;
+                Ok(())
+            },
+            &mut |batch| {
+                outcomes.extend(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(base.join("moved").is_dir());
+        assert_still_linked_failure(&outcomes, b"tree");
     }
 }

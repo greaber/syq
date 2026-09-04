@@ -178,8 +178,9 @@ parents from its retained destination selection. Renaming either command-line
 spelling cannot redirect that decision.
 
 Rsync-mode `--insecure-links` is the explicit compatibility opt-out: that
-session uses the legacy unconfined pathname discovery and content-read paths,
-including traversal through symlinked `--files-from` ancestors. Native
+session follows symlinks regardless of ownership in its operator-supplied
+source, destination, and control paths, and uses the legacy unconfined source
+discovery and content-read paths. Native
 mapping/generated names never inherit native `--follow`; they remain strict
 descendants of the registered source root. Rsync-compatible operator control
 paths retain rsync's implicit policy of following a symlink owned by root or
@@ -254,7 +255,10 @@ reports the owner-only quarantine path and leaves both entries in place. A
 later writer at the selected name is likewise left alone and reported as a
 conflict. Removal fails without deleting the selected entry when the platform
 or filesystem cannot provide atomic no-replace rename, or when no writable
-trusted ancestor exists on that filesystem.
+trusted ancestor exists on that filesystem. On Linux, syq also uses the open
+descriptor for a selected directory to report a failure if it is renamed away
+before the quarantine move. macOS does not expose the corresponding unlinked
+directory state, so there the same rename is reported as already absent.
 
 By default, native `rm` follows no symlinks while resolving `--cwd`, `--root`,
 or a selector. A symlink selected by name is removed as a symlink without
@@ -595,7 +599,7 @@ accept them.
 | `--max-size SIZE`, `--min-size SIZE` | Don't transfer regular files larger / smaller than SIZE |
 | `--files-from FILE` | Copy only the listed paths (relative to the one source directory; see below) |
 | `--from0` | `--files-from` entries are NUL-separated |
-| `--insecure-links` | Permit legacy unconfined traversal through symlinked source ancestors, including `--files-from` implied parents |
+| `--insecure-links` | Permit legacy traversal through symlinks in rsync operator paths and source descendants, regardless of ownership |
 | `-h` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 
 Like rsync, `-q` suppresses ordinary non-error output: progress, summaries,
