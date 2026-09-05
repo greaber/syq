@@ -1,73 +1,95 @@
 # Server setup
 
-Syq needs no special server tuning. If a representative copy is slow, use
-`-vv --stats` and check CPU, disk, and network use on both ends before changing
-host settings. [Speed](speed.md) covers syq's own controls.
+A few server settings can make a substantial difference, especially on
+long-distance links or when syq must carry data over SSH.
 
 ## Make TCP reachable
 
-The most useful server change is often allowing syq's TCP data port.
-The remote listens on one available port in `47600–47699`, or your
-`--tcp-ports LO-HI` range, for the transfer's duration.
+Allowing syq's encrypted TCP connections often gives the biggest improvement.
+The server listens on one available port in `47600–47699` for the duration of
+the copy. Choose another range with `--tcp-ports LO-HI`.
 
-For a host using ufw, an administrator can adapt this rule:
+For a server using ufw, an administrator can allow a trusted client:
 
 ```sh
 sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 ```
 
-Use the host's existing firewall policy and allow the address family the
-client uses. Limit access to the clients or networks that need it, then check
-with `syq cp -vv --stats`.
+Allow the port range in any cloud firewall too. Check the selected route with
+`syq cp -vv --stats`. Ordinary copies fall back to SSH when TCP is blocked;
+the default direct server-to-server mode requires encrypted TCP.
 
-Ordinary copies fall back to SSH if TCP is unreachable. Restricted
-remote-to-remote copies require encrypted TCP and fail instead.
+### Tailscale
 
-## SSH connections are being dropped
+[Tailscale](https://tailscale.com/kb/1181/firewalls) is a useful way to make
+servers reachable across NAT and firewalls without exposing syq's ports to
+the public internet. Allow the data ports through the host firewall and your
+tailnet's access rules; syq can discover the Tailscale addresses.
 
-If SSH data connections are refused during startup, inspect the server's
-unauthenticated-connection limit:
-
-```sh
-sudo sshd -T | awk '$1 == "maxstartups" { print }'
-```
-
-Prefer making the TCP data route reachable. Raise `MaxStartups` only if
-observed connection drops justify it: the limit also affects unrelated logins
-and exposure to connection floods. Follow your distribution's configuration
-procedure, validate with `sshd -t`, and keep an administrative session open
-while reloading. See [OpenSSH's option reference](https://man.openbsd.org/sshd_config#MaxStartups).
+TCP over Tailscale can be faster than sending data over SSH without it.
+The tunnel can also limit throughput, especially if Tailscale uses a relay.
+Compare on your own route, and use `tailscale status` to check whether the
+connection is direct. See [Tailscale's performance guide](https://tailscale.com/docs/reference/best-practices/performance).
 
 ## Test congestion control
 
-On a lossy or long-distance Linux path, compare an alternative algorithm per
-transfer. First check both endpoints:
+TCP's congestion-control algorithm decides how quickly to send and when to
+slow down. On long-distance links with packet loss, **BBR can be dramatically
+faster than CUBIC**: loss does not always mean the link is full. It is worth
+trying even when copies finish successfully. Results depend on the route and
+direction; BBR does not win everywhere.
+
+On Linux, check both endpoints:
 
 ```sh
 sysctl net.ipv4.tcp_available_congestion_control
 sysctl net.ipv4.tcp_allowed_congestion_control
 ```
 
-The algorithm must be available and permitted on both. Syq changes only its
-sockets, not the system default. The restricted receiver does not support
-this option.
-
-Use a disposable destination and return it to the same empty or absent state
-before each run:
+If `bbr` is available and permitted on both, try it for a copy:
 
 ```sh
-syq cp --connections 1 --tcp-congestion cubic --stats SOURCE --to HOST --into DISPOSABLE-DESTINATION
-syq cp --connections 1 --tcp-congestion bbr --stats SOURCE --to HOST --into DISPOSABLE-DESTINATION
+syq cp --tcp-congestion bbr --stats data --to server --into /backup
 ```
 
-Alternate runs and try the reverse direction. Keep the fixed connection count
-for comparison, then test the better choice with normal automatic tuning.
-A faster result can have fairness costs for other traffic; use `--bwlimit`
-when sharing bandwidth matters.
+This changes only syq's TCP sockets, not the host default. If BBR is missing,
+ask the server administrator to enable it; see the
+[BBR setup guidance](https://github.com/google/bbr/blob/master/Documentation/bbr-faq.md#how-can-i-try-out-linux-tcp-bbr).
+The option cannot tune SSH's own connections and is not supported by the
+restricted server-to-server receiver.
 
-## Stop at the actual bottleneck
+Compare with `--tcp-congestion cubic` using the same data and an empty test
+destination each time. Try both directions. Use `--bwlimit` if you need to
+leave bandwidth for other users.
 
-More network tuning will not help a saturated disk or CPU. Try one connection
-for a spinning disk, or `--no-compress` when compression costs more than the
-network bytes it saves. Leave global TCP buffers, MTU, routing, and storage
-mount settings to the host or network administrator.
+## Let SSH connections start promptly
+
+When data travels over SSH, syq opens several connections. OpenSSH's usual
+`MaxStartups 10:30:100` starts randomly rejecting logins once ten are still
+authenticating. Syq retries and reduces simultaneous logins, so the symptom
+can be a slow start rather than a failed copy.
+
+For a server handling parallel transfers, an administrator can consider:
+
+```text
+MaxStartups 100:30:200
+```
+
+This allows 100 simultaneous unauthenticated connections before random
+rejection begins, and rejects all new ones at 200. It also allows larger
+bursts from unrelated clients, so choose limits that suit the server.
+
+`MaxSessions` is a different limit: channels sharing one SSH connection.
+Very low values can force extra logins when syq tries to reuse a connection.
+Syq's SSH data workers use independent connections, so raising this limit
+alone does not increase their capacity.
+
+Validate configuration changes with `sshd -t`, then reload SSH using your
+system's normal procedure. Keep an administrative session open while doing
+so. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
+
+## Measure and track improvements
+
+Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) to compare
+settings on your machines and save repeatable results over time. Test the
+workloads and transfer directions you actually use.

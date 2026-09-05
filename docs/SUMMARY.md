@@ -21,5 +21,6 @@
 
 # Reference
 
+- [Remote copy details](remote-reference.md)
 - [Automation results](automation.md)
 - [Rsync compatibility](rsync-compat.md)

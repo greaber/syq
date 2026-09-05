@@ -4,6 +4,13 @@ Syq copies and removes files in parallel, on one machine or over SSH. It can
 resume interrupted copies and transfer directly between servers without
 forwarding your SSH agent.
 
+In published tests, syq copied a folder from Amsterdam to Tokyo
+[5.2× faster than rsync](https://greaber.github.io/syq-bench/#fly-cross-region-memory),
+and 20,000 small files to NFS
+[4.6× faster than cp](https://greaber.github.io/syq-bench/#nfs-directory-trees).
+These are workload-specific results; the benchmarks include cases where other
+tools win.
+
 [Install syq](install.md), then try a copy:
 
 ```sh
@@ -17,7 +24,8 @@ of `project` directly into `/backup`, use `--srcs-in`:
 syq cp --srcs-in project --to server --into /backup
 ```
 
-Preview either command with `--dry-run`; add `-v` to see individual changes.
+Use `--dry-run` to preview a summary without copying, or `--dry-run -v`
+to list the planned changes by path.
 Existing destination files are updated when needed. Unrelated files stay
 unless you request `--prune`.
 
@@ -42,7 +50,7 @@ substituting it in an existing script.
 | Choose exactly where files land | [Copy and placement](reference.md) |
 | Preview changes | [Dry runs](reference.md#preview-changes) |
 | Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |
-| Mirror a directory | [Deleting extras](reference.md#mirror-a-directory) |
+| Mirror a directory | [Mirroring](reference.md#mirror-a-directory) |
 | Remove files in parallel | [Removal](remove.md) |
 | Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
 | Rename or reorganize files during a copy | [Mappings](mappings.md) |

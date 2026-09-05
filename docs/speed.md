@@ -1,26 +1,17 @@
 # Speed
 
 Start with the defaults. Syq copies files in parallel, splits large files
-between workers, and adjusts connection count during the transfer. Over SSH,
-it normally sends data through separate encrypted TCP connections.
+between workers, and adjusts connection count during the transfer. If a TCP
+data port is reachable, it sends data through separate encrypted connections.
+Otherwise, ordinary copies send their data over SSH.
 
-## Measurements so far
+## Benchmarks
 
-These are development-machine measurements, not a controlled benchmark suite.
-Most comparisons are against `cp`, not rsync. Measure your workload with
-[syq-bench](https://github.com/greaber/syq-bench).
-
-| Workload | syq | Comparison |
-|---|---|---|
-| 20,000 small files written to NFS | 28 s | `cp -r`: 72 s |
-| 20,000 files removed from NFS, 32 workers | 2.5 s | `rm -rf`: 9.7 s |
-| One 8 GB file, same-machine NFS server-side copy | 3.3 GB/s | `cp`: 0.4 GB/s |
-| One 4 GiB file, local disk to asynchronous NFS | 9.93 s median | `cp`: 10.94 s median |
-| Germany–Japan, 1 Gbit link, 265 ms RTT, TCP | Line rate | |
-| Same route using SSH for data | About 110 MB/s with tuning | Fixed eight workers: 44 MB/s |
-
-Methods, additional measurements, and the measured cost of path safety are in
-[the performance note](https://github.com/greaber/syq/blob/master/design/performance.md).
+See the [published syq-bench results](https://greaber.github.io/syq-bench/)
+for comparisons with rsync, cp, and other tools, including the workloads,
+commands, and measured limitations. Use
+[syq-bench on your own machines](https://greaber.github.io/syq-bench/reproduce.html)
+to compare settings and track performance over time.
 
 ## When rsync or cp is faster
 
@@ -69,8 +60,8 @@ through worker count. Short copies may finish before tuning has enough data.
 
 ## TCP data connections
 
-SSH authenticates and controls remote copies. File data normally uses
-encrypted TCP on one port from `47600–47699`; change it with
+SSH authenticates and controls remote copies. When reachable, encrypted TCP
+carries file data on one port from `47600–47699`; change it with
 `--tcp-ports LO-HI`. Syq discovers reachable IPv4 and IPv6 addresses and can
 use multiple network interfaces.
 
@@ -103,10 +94,14 @@ traffic have different limits.
 
 ## Options that change the tradeoff
 
-`--inplace` saves the space for a second file but exposes incomplete updates
-to readers and after interruption. Keep the default unless that tradeoff is
-necessary. `--no-compress` saves CPU at the cost of potentially sending more
-bytes; it does not affect file contents or integrity checks.
+By default, syq builds an updated file beside the old one, then replaces the
+old file when the new version is complete. `--inplace` writes directly into
+the destination file instead. This uses less disk space, but readers can see
+a mixture of old and new contents while the copy runs. If interrupted, that
+incomplete version stays at the final filename until you finish the copy.
+
+`--no-compress` saves CPU at the cost of potentially sending more bytes; it
+does not affect file contents or integrity checks.
 
 Examples use native options. In rsync mode, syq-specific options have a
 `--syq-` prefix, such as `--syq-connections` and `--syq-no-tcp`.
