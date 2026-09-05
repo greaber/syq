@@ -79,6 +79,10 @@ outlive its premise and steer later work in the wrong direction.
 
 ## Branch synchronization and handoff
 
+- Open regular pull requests by default. Use a draft only when the user asks
+  or there is a concrete reason to prevent that particular PR from being
+  merged. The user prefers to review ordinary task work without a draft gate.
+
 - Durable task work belongs in commits on the task branch. Changes intended for
   `master` go through a pull request; do not commit them directly on `master` or
   merge task branches from the coordination checkout. Do not merge a pull

@@ -8,7 +8,7 @@
 
 use crate::cli::{parse_native_endpoint, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
-use crate::proto::{CompletionEntry, Request, Response};
+use crate::proto::{CompletionEntry, OperatorSymlinkPolicy, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -523,8 +523,10 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" => Ok(completion_command_candidates(args_before, current)),
-        "persist" => Ok(persist_candidates(args_before, current)),
+        "completion" | "persist" | "receiver" => {
+            management_candidates(command, args_before, current)
+        }
+        "help" => Ok(help_candidates(args_before, current)),
         "cp" | "rm" | "map" | "rsync" => {
             filesystem_command_candidates(command, args_before, current)
         }
@@ -685,43 +687,119 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     .collect()
 }
 
-fn completion_command_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
-    let values: &[&str] = match args.first().map(Vec::as_slice) {
-        None => &["bash", "zsh", "fish", "cache", "--help", "--help-all"],
-        Some(b"cache") if args.len() == 1 => &["list", "forget", "clear", "--help", "--help-all"],
-        Some(b"cache") if args.get(1).is_some_and(|value| value == b"forget") => {
-            return endpoint_candidates(current, EndpointSyntax::Native, None)
-        }
-        _ => &[],
-    };
-    values
-        .iter()
-        .filter(|value| value.as_bytes().starts_with(current))
-        .map(|value| Candidate::text(value.as_bytes().to_vec()))
+fn public_command(name: &str) -> Option<clap::Command> {
+    match name {
+        "completion" => Some(command_for_help()),
+        "persist" => Some(crate::persistence::command_for_help()),
+        "receiver" => Some(crate::help::receiver()),
+        "--self-update" => Some(crate::help::lifecycle()),
+        _ => crate::cli::command_for_completion(name),
+    }
+}
+
+fn subcommand_candidates(meta: &clap::Command, current: &[u8]) -> Vec<Candidate> {
+    meta.get_subcommands()
+        .filter(|child| !child.is_hide_set())
+        .filter(|child| child.get_name().as_bytes().starts_with(current))
+        .map(|child| Candidate::text(child.get_name().as_bytes().to_vec()))
         .collect()
 }
 
-fn persist_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
-    if args.is_empty() {
-        return ["on", "off", "status", "--help", "--help-all"]
+fn help_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
+    let Some(first) = args.first() else {
+        let mut values = subcommand_candidates(&crate::help::root(), current);
+        values.retain(|candidate| candidate.value != b"help");
+        if b"--self-update".starts_with(current) {
+            values.push(Candidate::text(b"--self-update".to_vec()));
+        }
+        return values;
+    };
+    let Some(mut meta) = std::str::from_utf8(first).ok().and_then(public_command) else {
+        return Vec::new();
+    };
+    for topic in &args[1..] {
+        let Some(child) = std::str::from_utf8(topic)
+            .ok()
+            .and_then(|topic| meta.find_subcommand(topic))
+            .filter(|child| !child.is_hide_set())
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        meta = child;
+    }
+    let mut values = subcommand_candidates(&meta, current);
+    values.extend(
+        ["--help", "--help-all"]
             .into_iter()
             .filter(|value| value.as_bytes().starts_with(current))
-            .map(|value| Candidate::text(value.as_bytes().to_vec()))
-            .collect();
+            .map(|value| Candidate::text(value.as_bytes().to_vec())),
+    );
+    values
+}
+
+fn management_candidates(
+    command: &str,
+    args: &[Vec<u8>],
+    current: &[u8],
+) -> Result<Vec<Candidate>> {
+    let mut meta = public_command(command).expect("public management command");
+    meta.build();
+    let mut rest = args;
+    while let Some(child) = rest
+        .first()
+        .and_then(|word| std::str::from_utf8(word).ok())
+        .and_then(|word| meta.find_subcommand(word))
+        .filter(|child| !child.is_hide_set())
+        .cloned()
+    {
+        if child.get_name() == "help" {
+            let mut topics = vec![command.as_bytes().to_vec()];
+            topics.extend_from_slice(&args[..args.len() - rest.len()]);
+            topics.extend_from_slice(&rest[1..]);
+            return Ok(help_candidates(&topics, current));
+        }
+        meta = child;
+        rest = &rest[1..];
     }
-    if previous_is(args, &[b"--pscope"]) {
-        return local_path_candidates(current, true);
+    let context = CompletionContext::scan(&meta, rest);
+    if !context.terminated {
+        if let Some((arg, _)) = context.pending {
+            if arg.is_allow_hyphen_values_set() || !current.starts_with(b"-") {
+                return complete_argument(command, &context, &meta, arg, current);
+            }
+        }
+        if let Some((arg, value, prefix)) = attached_value(&meta, current) {
+            let mut values = complete_argument(command, &context, &meta, arg, value)?;
+            for candidate in &mut values {
+                let mut full = prefix.to_vec();
+                full.extend_from_slice(&candidate.value);
+                candidate.value = full;
+            }
+            return Ok(values);
+        }
+        if current.starts_with(b"-") {
+            return Ok(option_candidates(&meta, current)
+                .into_iter()
+                .filter(|candidate| {
+                    option_arg(&meta, &candidate.value)
+                        .is_some_and(|arg| context.allowed(command, &meta, arg))
+                })
+                .collect());
+        }
     }
-    let options: &[&str] = match args.first().map(Vec::as_slice) {
-        Some(b"on") => &["--ephemeral", "--help", "--help-all"],
-        Some(b"off" | b"status") => &["--pscope", "--help", "--help-all"],
-        _ => &[],
-    };
-    options
-        .iter()
-        .filter(|value| value.as_bytes().starts_with(current))
-        .map(|value| Candidate::text(value.as_bytes().to_vec()))
-        .collect()
+    if context.positional_count != 0 {
+        return Ok(Vec::new());
+    }
+    let subcommands = subcommand_candidates(&meta, current);
+    if meta.get_subcommands().any(|child| !child.is_hide_set()) {
+        return Ok(subcommands);
+    }
+    match (command, meta.get_name()) {
+        ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
+        ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
+        _ => Ok(Vec::new()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -735,7 +813,6 @@ enum ValueCompletion {
     SourcePath { apply_base: bool },
     DestinationPath,
     LocalPath { directories_only: bool },
-    Enum(&'static [&'static str]),
     None,
 }
 
@@ -750,74 +827,306 @@ struct CompletionDirectory {
     confined_root: Option<Vec<u8>>,
 }
 
+/// Parse the completed portion without requiring an otherwise valid command.
+/// Metadata supplies arity, aliases, short clusters, and hyphen-value rules.
+/// Encode values inline in `options` so later lookups never mistake value
+/// bytes for flags or the option terminator.
+#[derive(Default)]
+struct CompletionContext<'a> {
+    options: Vec<Vec<u8>>,
+    present: HashSet<String>,
+    pending: Option<(&'a clap::Arg, usize)>,
+    positional_count: usize,
+    selector_count: usize,
+    terminated: bool,
+}
+
+fn option_arg<'a>(meta: &'a clap::Command, name: &[u8]) -> Option<&'a clap::Arg> {
+    meta.get_arguments().find(|arg| {
+        arg.get_long()
+            .is_some_and(|long| name == format!("--{long}").as_bytes())
+            || arg
+                .get_all_aliases()
+                .unwrap_or_default()
+                .iter()
+                .any(|alias| name == format!("--{alias}").as_bytes())
+            || arg
+                .get_short()
+                .is_some_and(|short| name == format!("-{short}").as_bytes())
+    })
+}
+
+fn option_name(arg: &clap::Arg) -> Vec<u8> {
+    arg.get_long()
+        .map(|long| format!("--{long}"))
+        .unwrap_or_else(|| format!("-{}", arg.get_short().unwrap()))
+        .into_bytes()
+}
+
+fn selector_id(id: &str) -> bool {
+    matches!(
+        id,
+        "src" | "srcs_in" | "src_file" | "src_dir" | "srcs" | "src_files" | "src_dirs"
+    )
+}
+
+impl<'a> CompletionContext<'a> {
+    fn value(&mut self, arg: &'a clap::Arg, value: &[u8], count: usize) {
+        let mut encoded = option_name(arg);
+        encoded.push(b'=');
+        encoded.extend_from_slice(value);
+        self.options.push(encoded);
+        self.selector_count += usize::from(selector_id(arg.get_id().as_str()));
+        let max = arg.get_num_args().map_or(1, |range| range.max_values());
+        self.pending = (count < max).then_some((arg, count));
+    }
+
+    fn scan(meta: &'a clap::Command, args: &[Vec<u8>]) -> Self {
+        let mut context = Self::default();
+        for word in args {
+            if let Some((arg, count)) = context.pending.take() {
+                if arg.is_allow_hyphen_values_set() || !word.starts_with(b"-") || word == b"-" {
+                    context.value(arg, word, count + 1);
+                    continue;
+                }
+            }
+            if context.terminated {
+                context.positional_count += 1;
+                context.selector_count += 1;
+                continue;
+            }
+            if word == b"--" {
+                context.terminated = true;
+                continue;
+            }
+            let mut parsed = Vec::new();
+            if word.starts_with(b"--") {
+                let (name, value) = split_inline_option(word)
+                    .map_or((word.as_slice(), None), |(name, value)| (name, Some(value)));
+                if let Some(arg) = option_arg(meta, name) {
+                    parsed.push((arg, value));
+                }
+            } else if word.starts_with(b"-") && word.len() > 1 {
+                for index in 1..word.len() {
+                    let Some(arg) = option_arg(meta, &[b'-', word[index]]) else {
+                        break;
+                    };
+                    if arg.get_action().takes_values() {
+                        let tail = &word[index + 1..];
+                        parsed.push((
+                            arg,
+                            (!tail.is_empty()).then(|| tail.strip_prefix(b"=").unwrap_or(tail)),
+                        ));
+                        break;
+                    }
+                    parsed.push((arg, None));
+                }
+            }
+            if parsed.is_empty() {
+                if !word.starts_with(b"-") || word == b"-" {
+                    context.positional_count += 1;
+                    context.selector_count += 1;
+                }
+                continue;
+            }
+            for (arg, value) in parsed {
+                context.present.insert(arg.get_id().to_string());
+                if let Some(value) = value {
+                    context.value(arg, value, 1);
+                } else if arg.get_action().takes_values() {
+                    context.pending = Some((arg, 0));
+                } else {
+                    context.options.push(option_name(arg));
+                }
+            }
+        }
+        context
+    }
+
+    fn allowed(&self, command: &str, meta: &clap::Command, arg: &clap::Arg) -> bool {
+        let id = arg.get_id().as_str();
+        if meta.get_groups().any(|group| {
+            !group.clone().is_multiple()
+                && group.get_args().any(|member| member == arg.get_id())
+                && group
+                    .get_args()
+                    .any(|member| member != arg.get_id() && self.present.contains(member.as_str()))
+        }) {
+            return false;
+        }
+        if meta.get_arg_conflicts_with(arg).iter().any(|other| {
+            other.get_id() != arg.get_id() && self.present.contains(other.get_id().as_str())
+        }) || meta.get_arguments().any(|other| {
+            other.get_id() != arg.get_id()
+                && self.present.contains(other.get_id().as_str())
+                && meta
+                    .get_arg_conflicts_with(other)
+                    .iter()
+                    .any(|conflict| conflict.get_id() == arg.get_id())
+        }) {
+            return false;
+        }
+        if command == "cp" {
+            if self.destination_started() && native_copy_source_option(&option_name(arg)) {
+                return false;
+            }
+            if (self.present.contains("mapping") && selector_id(id))
+                || (id == "mapping" && self.selector_count > 0)
+            {
+                return false;
+            }
+        }
+        if command == "map" {
+            if self.present.contains("srcs_in") && (selector_id(id) || id == "as") {
+                // The first pending value still needs completion.
+                if !(id == "srcs_in" && self.selector_count == 0) {
+                    return false;
+                }
+            }
+            if id == "srcs_in" && (self.selector_count > 0 || self.present.contains("as")) {
+                return false;
+            }
+            if id == "as" && self.selector_count > 1 {
+                return false;
+            }
+            if selector_id(id) && self.present.contains("as") && self.selector_count >= 1 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn destination_started(&self) -> bool {
+        [
+            "to",
+            "into",
+            "into_new",
+            "into_existing",
+            "as",
+            "as_new",
+            "as_existing",
+        ]
+        .iter()
+        .any(|id| self.present.contains(*id))
+    }
+
+    fn sources_allowed(&self, command: &str) -> bool {
+        !(command == "cp" && (self.destination_started() || self.present.contains("mapping"))
+            || command == "map"
+                && (self.present.contains("srcs_in")
+                    || self.present.contains("as") && self.selector_count >= 1))
+    }
+}
+
+/// Return the argument, its value, and the exact prefix to preserve for an
+/// attached value, including short clusters such as `-nvCdir`.
+fn attached_value<'a, 'b>(
+    meta: &'a clap::Command,
+    current: &'b [u8],
+) -> Option<(&'a clap::Arg, &'b [u8], &'b [u8])> {
+    if let Some((name, value)) = split_inline_option(current) {
+        let arg = option_arg(meta, name)?;
+        return arg
+            .get_action()
+            .takes_values()
+            .then_some((arg, value, &current[..name.len() + 1]));
+    }
+    if current.starts_with(b"--") || !current.starts_with(b"-") {
+        return None;
+    }
+    for index in 1..current.len() {
+        let arg = option_arg(meta, &[b'-', current[index]])?;
+        if arg.get_action().takes_values() {
+            let mut start = index + 1;
+            if current.get(start) == Some(&b'=') {
+                start += 1;
+            }
+            return Some((arg, &current[start..], &current[..start]));
+        }
+    }
+    None
+}
+
 fn filesystem_command_candidates(
     command: &str,
     args: &[Vec<u8>],
     current: &[u8],
 ) -> Result<Vec<Candidate>> {
-    let command_meta = crate::cli::command_for_completion(command)
+    let mut meta = crate::cli::command_for_completion(command)
         .ok_or_else(|| anyhow!("missing completion metadata for {command}"))?;
-    let after_double_dash = args.iter().any(|arg| arg == b"--");
-    let copy_destination_started = command == "cp" && native_copy_destination_started(args);
-    if !after_double_dash {
-        if let Some((option, value)) = split_inline_option(current) {
-            if copy_destination_started && native_copy_source_option(option) {
-                return Ok(Vec::new());
-            }
-            if let Some(kind) = value_completion(command, option, &command_meta) {
-                let mut values = complete_value(command, args, value, kind)?;
-                for candidate in &mut values {
-                    let mut prefixed = option.to_vec();
-                    prefixed.push(b'=');
-                    prefixed.extend_from_slice(&candidate.value);
-                    candidate.value = prefixed;
-                }
-                return Ok(values);
+    meta.build();
+    let context = CompletionContext::scan(&meta, args);
+    if !context.terminated {
+        if let Some((arg, _)) = context.pending {
+            if arg.is_allow_hyphen_values_set() || !current.starts_with(b"-") {
+                return complete_argument(command, &context, &meta, arg, current);
             }
         }
-        if let Some(previous) = args.last() {
-            if copy_destination_started && native_copy_source_option(previous) {
-                return Ok(Vec::new());
+        if let Some((arg, value, prefix)) = attached_value(&meta, current) {
+            let mut values = complete_argument(command, &context, &meta, arg, value)?;
+            for candidate in &mut values {
+                let mut full = prefix.to_vec();
+                full.extend_from_slice(&candidate.value);
+                candidate.value = full;
             }
-            if let Some(kind) = value_completion(command, previous, &command_meta) {
-                if command == "rsync" || !current.starts_with(b"-") {
-                    return complete_value(command, args, current, kind);
-                }
-            }
+            return Ok(values);
         }
         if current.starts_with(b"-") {
-            let mut candidates = option_candidates(&command_meta, current);
-            if copy_destination_started {
-                candidates.retain(|candidate| !native_copy_source_option(&candidate.value));
-            }
-            return Ok(candidates);
+            return Ok(option_candidates(&meta, current)
+                .into_iter()
+                .filter(|candidate| {
+                    option_arg(&meta, &candidate.value)
+                        .is_some_and(|arg| context.allowed(command, &meta, arg))
+                })
+                .collect());
         }
     }
-
     match command {
-        "cp" if copy_destination_started => Ok(Vec::new()),
-        "cp" | "rm" | "map" => complete_path_for(command, args, current, true),
-        "rsync" => complete_rsync_operand(args, current),
+        "cp" | "rm" | "map" if context.sources_allowed(command) => {
+            complete_path_for(command, &context.options, current, true)
+        }
+        "rsync" => complete_rsync_operand(&context.options, current),
         _ => Ok(Vec::new()),
     }
 }
 
-fn native_copy_destination_started(args: &[Vec<u8>]) -> bool {
-    const OPTIONS: &[&[u8]] = &[
-        b"--to",
-        b"--into",
-        b"--into-new",
-        b"--into-existing",
-        b"--as",
-        b"--as-new",
-        b"--as-existing",
-    ];
-    args.iter().any(|argument| {
-        OPTIONS.iter().any(|option| {
-            argument == option
-                || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
-        })
-    })
+fn complete_argument(
+    command: &str,
+    context: &CompletionContext<'_>,
+    meta: &clap::Command,
+    arg: &clap::Arg,
+    current: &[u8],
+) -> Result<Vec<Candidate>> {
+    if !context.allowed(command, meta, arg) {
+        return Ok(Vec::new());
+    }
+    if let Some(values) = arg.get_value_parser().possible_values() {
+        let split = arg
+            .get_value_delimiter()
+            .filter(|delimiter| delimiter.is_ascii())
+            .and_then(|delimiter| current.iter().rposition(|byte| *byte == delimiter as u8))
+            .map_or(0, |index| index + 1);
+        return Ok(values
+            .filter(|value| {
+                !value.is_hide_set() && value.get_name().as_bytes().starts_with(&current[split..])
+            })
+            .map(|value| {
+                let mut full = current[..split].to_vec();
+                full.extend_from_slice(value.get_name().as_bytes());
+                Candidate::text(full)
+            })
+            .collect());
+    }
+    let name = option_name(arg);
+    let kind = value_completion(command, &name, meta).unwrap_or(ValueCompletion::None);
+    let mut values = complete_value(command, &context.options, current, kind)?;
+    if matches!(
+        arg.get_id().as_str(),
+        "cwd" | "root" | "srcs_in" | "src_dir" | "src_dirs" | "into" | "into_new" | "into_existing"
+    ) {
+        values.retain(|candidate| candidate.value.ends_with(b"/"));
+    }
+    Ok(values)
 }
 
 fn native_copy_source_option(option: &[u8]) -> bool {
@@ -866,22 +1175,12 @@ fn value_completion(
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
-            b"--coordinate-at" => Some(ValueCompletion::Enum(&["auto", "src", "dst", "local"])),
-            b"--preserve" => Some(ValueCompletion::Enum(&[
-                "permissions",
-                "ownership",
-                "specials",
-            ])),
-            b"--receiver-receipt" => Some(ValueCompletion::Enum(&["sizes", "digests"])),
-            b"--peer-auth" => Some(ValueCompletion::Enum(&[
-                "restricted",
-                "broker",
-                "own-credentials",
-                "full-agent",
-            ])),
             _ => None,
         },
         "rm" => match option {
+            b"--results" => Some(ValueCompletion::LocalPath {
+                directories_only: false,
+            }),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
@@ -898,6 +1197,16 @@ fn value_completion(
             b"--as" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
+            _ => None,
+        },
+        "persist" => match option {
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
+            _ => None,
+        },
+        "receiver" => match option {
+            b"--via" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             _ => None,
         },
         "rsync" => match option {
@@ -947,11 +1256,6 @@ fn complete_value(
         ValueCompletion::LocalPath { directories_only } => {
             Ok(local_path_candidates(current, directories_only))
         }
-        ValueCompletion::Enum(values) => Ok(values
-            .iter()
-            .filter(|value| value.as_bytes().starts_with(current))
-            .map(|value| Candidate::text(value.as_bytes().to_vec()))
-            .collect()),
         ValueCompletion::None => Ok(Vec::new()),
     }
 }
@@ -978,6 +1282,26 @@ fn option_candidates(command: &clap::Command, current: &[u8]) -> Vec<Candidate> 
         .collect()
 }
 
+fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> OperatorSymlinkPolicy {
+    if command == "rsync" {
+        return OperatorSymlinkPolicy::TrustedOwner;
+    }
+    if contains_option(args, b"--follow")
+        || contains_option(
+            args,
+            if source {
+                b"--follow-src"
+            } else {
+                b"--follow-dst"
+            },
+        )
+    {
+        OperatorSymlinkPolicy::FollowAll
+    } else {
+        OperatorSymlinkPolicy::Refuse
+    }
+}
+
 fn complete_path_for(
     command: &str,
     args: &[Vec<u8>],
@@ -988,12 +1312,30 @@ fn complete_path_for(
         return complete_source_path(command, args, current, true);
     }
     let Some(endpoint_text) = find_option_value(args, b"--to") else {
-        return Ok(local_path_candidates_at(current, false, None));
+        return Ok(local_path_candidates_at(
+            current,
+            false,
+            None,
+            path_policy(command, args, false),
+        ));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(current, false, None));
+        return Ok(local_path_candidates_at(
+            current,
+            false,
+            None,
+            path_policy(command, args, false),
+        ));
     };
-    remote_path_candidates(command, args, endpoint, current, Vec::new(), None)
+    remote_path_candidates(
+        command,
+        args,
+        endpoint,
+        current,
+        Vec::new(),
+        None,
+        path_policy(command, args, false),
+    )
 }
 
 fn complete_source_path(
@@ -1004,15 +1346,38 @@ fn complete_source_path(
 ) -> Result<Vec<Candidate>> {
     let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
-        return Ok(local_path_candidates_at(current, false, base));
+        return Ok(local_path_candidates_at(
+            current,
+            false,
+            base,
+            path_policy(command, args, true),
+        ));
     }
     let Some(endpoint_text) = find_option_value(args, b"--from") else {
-        return Ok(local_path_candidates_at(current, false, base));
+        return Ok(local_path_candidates_at(
+            current,
+            false,
+            base,
+            path_policy(command, args, true),
+        ));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(current, false, base));
+        return Ok(local_path_candidates_at(
+            current,
+            false,
+            base,
+            path_policy(command, args, true),
+        ));
     };
-    remote_path_candidates(command, args, endpoint, current, Vec::new(), base)
+    remote_path_candidates(
+        command,
+        args,
+        endpoint,
+        current,
+        Vec::new(),
+        base,
+        path_policy(command, args, true),
+    )
 }
 
 fn source_base(args: &[Vec<u8>]) -> Option<SourceBase<'_>> {
@@ -1034,9 +1399,18 @@ fn complete_rsync_operand(args: &[Vec<u8>], current: &[u8]) -> Result<Vec<Candid
         }
         let mut wrapper = authority.to_vec();
         wrapper.push(b':');
-        return remote_path_candidates("rsync", args, endpoint, path, wrapper, None);
+        return remote_path_candidates(
+            "rsync",
+            args,
+            endpoint,
+            path,
+            wrapper,
+            None,
+            OperatorSymlinkPolicy::TrustedOwner,
+        );
     }
-    let mut candidates = local_path_candidates_at(current, false, None);
+    let mut candidates =
+        local_path_candidates_at(current, false, None, OperatorSymlinkPolicy::TrustedOwner);
     candidates.extend(endpoint_candidates(
         current,
         EndpointSyntax::Rsync,
@@ -1078,6 +1452,7 @@ fn remote_path_candidates(
     current: &[u8],
     wrapper: Vec<u8>,
     base: Option<SourceBase<'_>>,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<Vec<Candidate>> {
     if has_explicit_rsh(command, args) {
         return Ok(Vec::new());
@@ -1123,6 +1498,7 @@ fn remote_path_candidates(
                     directory_for_thread,
                     root_for_thread,
                     prefix_for_thread,
+                    symlink_policy,
                 );
                 (result, Some(connection))
             }
@@ -1198,12 +1574,14 @@ fn list_remote_entries(
     directory: Vec<u8>,
     confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<Vec<CompletionEntry>> {
     match connection.call(Request::ListDir {
         directory,
         confined_root,
         prefix: prefix.clone(),
         limit: MAX_DIRECTORY_CANDIDATES,
+        symlink_policy,
     })? {
         Response::DirectoryEntries { entries, .. } => validate_completion_entries(entries, &prefix),
         Response::EndpointError(error) => Err(crate::conn::endpoint_error(error)),
@@ -1234,13 +1612,19 @@ fn validate_completion_entries(
 }
 
 fn local_path_candidates(current: &[u8], directories_only: bool) -> Vec<Candidate> {
-    local_path_candidates_at(current, directories_only, None)
+    local_path_candidates_at(
+        current,
+        directories_only,
+        None,
+        OperatorSymlinkPolicy::FollowAll,
+    )
 }
 
 fn local_path_candidates_at(
     current: &[u8],
     directories_only: bool,
     base: Option<SourceBase<'_>>,
+    symlink_policy: OperatorSymlinkPolicy,
 ) -> Vec<Candidate> {
     if current == b"~" && !matches!(base, Some(SourceBase::Root(_))) {
         return std::env::var_os("HOME")
@@ -1254,16 +1638,14 @@ fn local_path_candidates_at(
     let Some(directory) = apply_path_base(base, &directory) else {
         return Vec::new();
     };
-    if let Some(root) = directory.confined_root.as_deref() {
-        let Ok(root) = std::fs::canonicalize(crate::fsops::resolve(root)) else {
-            return Vec::new();
-        };
-        let Ok(resolved) = std::fs::canonicalize(crate::fsops::resolve(&directory.path)) else {
-            return Vec::new();
-        };
-        if !resolved.starts_with(root) {
-            return Vec::new();
-        }
+    if crate::fsops::check_completion_directory(
+        &directory.path,
+        directory.confined_root.as_deref(),
+        symlink_policy,
+    )
+    .is_err()
+    {
+        return Vec::new();
     }
     let mut entries = Vec::new();
     let Ok(items) = std::fs::read_dir(crate::fsops::resolve(&directory.path)) else {
@@ -1279,7 +1661,12 @@ fn local_path_candidates_at(
         };
         let is_directory = file_type.is_dir()
             || (file_type.is_symlink()
-                && std::fs::metadata(item.path()).is_ok_and(|metadata| metadata.is_dir()));
+                && crate::fsops::check_completion_directory(
+                    item.path().as_os_str().as_bytes(),
+                    directory.confined_root.as_deref(),
+                    symlink_policy,
+                )
+                .is_ok());
         if directories_only && !is_directory {
             continue;
         }
@@ -1344,8 +1731,7 @@ fn root_relative_directory_is_safe(directory: &[u8]) -> bool {
     let mut depth = 0usize;
     for component in directory.split(|byte| *byte == b'/') {
         match component {
-            b"" => return false,
-            b"." => {}
+            b"" | b"." => {}
             b".." if depth == 0 => return false,
             b".." => depth -= 1,
             _ => depth += 1,
@@ -1627,13 +2013,6 @@ fn contains_option(args: &[Vec<u8>], option: &[u8]) -> bool {
     option_arguments(args).any(|argument| argument == option)
 }
 
-fn previous_is(args: &[Vec<u8>], options: &[&[u8]]) -> bool {
-    !args.iter().any(|argument| argument == b"--")
-        && args
-            .last()
-            .is_some_and(|previous| options.iter().any(|option| previous == *option))
-}
-
 fn option_arguments(args: &[Vec<u8>]) -> impl Iterator<Item = &[u8]> {
     args.iter()
         .map(Vec::as_slice)
@@ -1899,11 +2278,6 @@ mod tests {
         );
         assert!(!has_explicit_rsh("cp", &args));
         assert!(!contains_option(&args, b"--no-bootstrap"));
-        assert!(!previous_is(
-            &[b"--pscope".to_vec(), b"--".to_vec()],
-            &[b"--pscope"]
-        ));
-
         let terminated_value = vec![
             b"--from".to_vec(),
             b"--".to_vec(),

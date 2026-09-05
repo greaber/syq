@@ -590,6 +590,7 @@ pub enum Request {
         confined_root: Option<PathBytes>,
         prefix: PathBytes,
         limit: u16,
+        symlink_policy: OperatorSymlinkPolicy,
     },
     /// Resolve all native removal selectors to endpoint-owned handles before
     /// mutation, then remove through those handles using an endpoint-local
