@@ -99,8 +99,11 @@ impl Cancellation {
     }
 
     fn register(&self, resource: Resource) -> Registration {
+        Self::register_locked(&mut self.state.lock().unwrap(), resource)
+    }
+
+    fn register_locked(state: &mut State, resource: Resource) -> Registration {
         let resource = Arc::new(Mutex::new(Some(resource)));
-        let mut state = self.state.lock().unwrap();
         if state.cancelled {
             resource.lock().unwrap().as_ref().unwrap().interrupt();
         } else {
@@ -146,12 +149,20 @@ pub(crate) fn spawn(
     command: &mut Command,
     cancellation: Option<&Arc<Cancellation>>,
 ) -> io::Result<TrackedChild> {
-    if let Some(cancellation) = cancellation {
-        cancellation.check()?;
+    // Hold the state lock across spawn and registration. In particular, the
+    // signal cleanup thread must not finish cancelling and exit our process
+    // while an unregistered child is being created in its own process group.
+    let mut state = cancellation.map(|token| token.state.lock().unwrap());
+    if let Some(state) = &state {
+        if state.cancelled {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "copy cancelled"));
+        }
         command.process_group(0);
     }
     let child = command.spawn()?;
-    let registration = cancellation.map(|token| token.register(Resource::ProcessGroup(child.id())));
+    let registration = state
+        .as_mut()
+        .map(|state| Cancellation::register_locked(state, Resource::ProcessGroup(child.id())));
     Ok(TrackedChild {
         child,
         registration,

@@ -2220,8 +2220,10 @@ impl RemoteSpec {
     /// Ensure the exact release helper exists in the remote cache.
     /// Only authorized release assets may populate the managed helper cache.
     pub fn install_helper(&self) -> Result<()> {
+        self.check_cancelled()?;
         crate::identity::require_release_build()?;
         let mut installed = self.helper_install.lock().unwrap();
+        self.check_cancelled()?;
         if *installed {
             return Ok(());
         }
@@ -2325,11 +2327,13 @@ impl RemoteSpec {
             );
         }
 
+        self.check_cancelled()?;
         let helper = match trusted {
             Some(helper) => helper,
             None => crate::update::trusted_current_helper(bootstrap.target)
                 .context("download and verify the signed release manifest")?,
         };
+        self.check_cancelled()?;
         let binary = crate::update::verified_current_helper(&helper)
             .context("download and verify the helper for SSH upload")?;
         self.upload_helper(bootstrap.target, &binary)
@@ -2363,6 +2367,7 @@ impl RemoteSpec {
         });
 
         let report = read_remote_download_report(&mut BufReader::new(stdout));
+        self.check_cancelled()?;
         let mut helper = None;
         let mut integrity_warning = None;
         let mut protocol_detail = None;
