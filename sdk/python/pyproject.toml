@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syq"
-version = "0.3.1"
+version = "0.3.2"
 description = "Official client for the syq file transfer tool"
 readme = "README.md"
 requires-python = ">=3.10"
