@@ -3585,7 +3585,12 @@ fn top_level_rsync_syntax_is_rejected_without_mutation() {
         .run()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("syq rsync"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized command or option"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("syq --help"), "{stderr}");
     assert!(!t.path("dst").exists());
 }
 
@@ -13874,6 +13879,328 @@ fn completion_values(output: &[u8]) -> Vec<(u8, Vec<u8>)> {
         .collect()
 }
 
+/// Check meaning as well as framing, against explicit fixture expectations in
+/// every backend format. The expected values never come from another adapter.
+fn assert_completion_candidates(t: &Tmp, words: &[&str], expected: &[&str]) {
+    for shell in ["bash", "zsh", "fish"] {
+        let index = (words.len() - 1).to_string();
+        let mut args = vec!["__complete", shell, &index, "--"];
+        args.extend_from_slice(words);
+        let output = completion_command(t, &args)
+            .current_dir(t.path(""))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stderr.is_empty(), "{shell} {words:?}: {output:?}");
+        let mut actual: Vec<Vec<u8>> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(|record| {
+                if shell == "fish" {
+                    record.to_vec()
+                } else {
+                    record[1..].to_vec()
+                }
+            })
+            .collect();
+        actual.sort();
+        let mut expected: Vec<Vec<u8>> = expected
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        expected.sort();
+        assert_eq!(actual, expected, "{shell} {words:?}");
+    }
+}
+
+#[test]
+fn completion_source_bases_types_and_symlink_policies_match_operations() {
+    let t = Tmp::new();
+    write(&t.path("base/inside.txt"), b"inside");
+    write(&t.path("base/inner-dir/nested.txt"), b"nested");
+    write(&t.path("outside.txt"), b"outside");
+    std::os::unix::fs::symlink("base", t.path("link")).unwrap();
+    std::os::unix::fs::symlink("../..", t.path("base/escape")).unwrap();
+    for command in ["cp", "rm", "map"] {
+        for base in [
+            vec!["--cwd", "base"],
+            vec!["-C", "base"],
+            vec!["--root", "base"],
+            vec!["--cwd=base"],
+            vec!["--root=base"],
+            vec!["-Cbase"],
+            vec!["-C=base"],
+        ] {
+            let mut words = vec!["syq", command];
+            words.extend(base);
+            words.push("in");
+            assert_completion_candidates(&t, &words, &["inner-dir/", "inside.txt"]);
+        }
+        assert_completion_candidates(&t, &["syq", command, "-Cba"], &["-Cbase/"]);
+        assert_completion_candidates(&t, &["syq", command, "--cwd", ""], &["base/"]);
+        for selector in ["--src-dir", "--src-dirs", "--srcs-in"] {
+            assert_completion_candidates(
+                &t,
+                &["syq", command, "--cwd", "base", selector, "in"],
+                &["inner-dir/"],
+            );
+        }
+        assert_completion_candidates(
+            &t,
+            &["syq", command, "--root", "base", "inner-dir//"],
+            &["inner-dir//nested.txt"],
+        );
+        assert_completion_candidates(&t, &["syq", command, "--root", "base", "../"], &[]);
+        assert_completion_candidates(
+            &t,
+            &["syq", command, "--root", "base", "--follow-src", "escape/"],
+            &[],
+        );
+        assert_completion_candidates(&t, &["syq", command, "link/"], &[]);
+        assert_completion_candidates(
+            &t,
+            &["syq", command, "--follow-src", "link/in"],
+            &["link/inner-dir/", "link/inside.txt"],
+        );
+    }
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "-nCbase", "in"],
+        &["inner-dir/", "inside.txt"],
+    );
+    assert_completion_candidates(&t, &["syq", "cp", "--follow-dst", "link/"], &[]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "--cwd", "base", "inside.txt", "--into", ""],
+        &["base/"],
+    );
+    assert_completion_candidates(&t, &["syq", "cp", "outside.txt", "--into", "link/"], &[]);
+    assert_completion_candidates(
+        &t,
+        &[
+            "syq",
+            "cp",
+            "outside.txt",
+            "--follow-dst",
+            "--into",
+            "link/in",
+        ],
+        &["link/inner-dir/"],
+    );
+    assert_completion_candidates(
+        &t,
+        &[
+            "syq",
+            "cp",
+            "outside.txt",
+            "--into",
+            "base",
+            "--results",
+            "ba",
+        ],
+        &["base/"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "rm", "--cwd", "base", "--results", "ba"],
+        &["base/"],
+    );
+}
+
+#[test]
+fn completion_covers_public_command_routes_and_parser_value_grammar() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("scope")).unwrap();
+    assert_completion_candidates(
+        &t,
+        &["syq", "receiver", ""],
+        &["enroll", "list", "revoke", "help"],
+    );
+    assert_completion_candidates(&t, &["syq", "receiver", "enroll", "--v"], &["--via"]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "help", ""],
+        &[
+            "cp",
+            "rm",
+            "map",
+            "rsync",
+            "persist",
+            "completion",
+            "receiver",
+            "--self-update",
+        ],
+    );
+    assert_completion_candidates(&t, &["syq", "help", "receiver", "e"], &["enroll"]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "completion", "cache", ""],
+        &["list", "forget", "clear", "help"],
+    );
+    assert_completion_candidates(&t, &["syq", "persist", "o"], &["on", "off"]);
+    for action in ["off", "status"] {
+        assert_completion_candidates(
+            &t,
+            &["syq", "persist", action, "--pscope", "sc"],
+            &["scope/"],
+        );
+        assert_completion_candidates(
+            &t,
+            &["syq", "persist", action, "--pscope=sc"],
+            &["--pscope=scope/"],
+        );
+    }
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "--preserve", "permissions,ow"],
+        &["permissions,ownership"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "--preserve=permissions,ow"],
+        &["--preserve=permissions,ownership"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "rsync", "--syq-ignore", "--", "--d"],
+        &["--delete", "--delete-excluded", "--dry-run"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "rsync", "--syq-ignore", "--files-from", "--d"],
+        &["--delete", "--delete-excluded", "--dry-run"],
+    );
+    assert_completion_candidates(&t, &["syq", "rsync", "--", "--d"], &[]);
+}
+
+#[test]
+fn completion_respects_conflicts_selection_modes_and_source_order() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    for destination in [
+        "--to",
+        "--into",
+        "--into-new",
+        "--into-existing",
+        "--as",
+        "--as-new",
+        "--as-existing",
+    ] {
+        let attached = format!("{destination}=target");
+        for arguments in [vec![destination, "target"], vec![attached.as_str()]] {
+            let mut words = vec!["syq", "cp", "source"];
+            words.extend(arguments);
+            words.push("");
+            assert_completion_candidates(&t, &["syq", "cp", "source", "--to", "--src"], &[]);
+            assert_completion_candidates(&t, &words, &[]);
+            for forbidden in ["--src", "--cwd", "--root", "--from", "--mapping", "-C"] {
+                *words.last_mut().unwrap() = forbidden;
+                assert_completion_candidates(&t, &words, &[]);
+            }
+            *words.last_mut().unwrap() = "--dry";
+            assert_completion_candidates(&t, &words, &["--dry-run"]);
+        }
+    }
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "source", "--into", "target", "--as"],
+        &[],
+    );
+    assert_completion_candidates(&t, &["syq", "cp", "--cwd", ".", "--root"], &[]);
+    assert_completion_candidates(&t, &["syq", "cp", "--root", ".", "--cwd"], &[]);
+    assert_completion_candidates(&t, &["syq", "cp", "--mapping", "manifest", "--src"], &[]);
+    assert_completion_candidates(&t, &["syq", "cp", "--mapping", "manifest", "s"], &[]);
+    assert_completion_candidates(&t, &["syq", "cp", "source", "--mapping"], &[]);
+    assert_completion_candidates(&t, &["syq", "map", "--srcs-in", ".", "s"], &[]);
+    assert_completion_candidates(&t, &["syq", "map", "source", "--srcs-in"], &[]);
+    assert_completion_candidates(&t, &["syq", "map", "--srcs-in", ".", "--src"], &[]);
+}
+
+#[test]
+fn completion_bash_repeated_tabs_accept_option_fragments() {
+    let t = Tmp::new();
+    write(&t.path("--help"), b"literal filename");
+    for (line, fragment, expected) in [
+        ("syq --", "--", "--help"),
+        ("syq --help", "--help", "--help"),
+        ("syq -h", "-h", ""),
+        ("syq help", "help", "help"),
+        ("syq --version", "--version", "--version"),
+        ("syq cp --", "--", "--coordinate-at"),
+        ("syq cp --co", "--co", "--coordinate-at"),
+        ("syq cp --coordinate-at=sr", "sr", "src"),
+        ("syq cp -- --help", "--help", "--help"),
+    ] {
+        let backend = completion_command(&t, &["__complete-bash", fragment, "--", line])
+            .current_dir(t.path(""))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&backend);
+        assert!(backend.stderr.is_empty(), "{line:?}: {backend:?}");
+        let values = completion_values(&backend.stdout);
+        if !expected.is_empty() {
+            assert!(
+                values.iter().any(|(_, value)| value == expected.as_bytes()),
+                "{line:?}: {values:?}"
+            );
+        }
+        let output = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                r#"
+eval "$("$SYQ" completion bash)"
+COMP_LINE=$1
+COMP_POINT=${#COMP_LINE}
+COMP_WORDS=(syq "$2")
+COMP_CWORD=1
+for ((tab=0; tab<3; tab++)); do
+    _syq_complete
+    for candidate in "${COMPREPLY[@]}"; do
+        printf '%s\0' "$candidate"
+    done
+    printf '\0'
+done
+"#,
+                "bash",
+                line,
+                fragment,
+            ])
+            .current_dir(t.path(""))
+            .env("SYQ", env!("CARGO_BIN_EXE_syq"))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env(
+                "PATH",
+                format!(
+                    "{}:/usr/bin:/bin",
+                    Path::new(env!("CARGO_BIN_EXE_syq"))
+                        .parent()
+                        .unwrap()
+                        .display()
+                ),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stderr.is_empty(), "{line:?}: {output:?}");
+        let mut frame = Vec::new();
+        for (_, value) in values {
+            frame.extend(value);
+            frame.push(0);
+        }
+        frame.push(0);
+        assert_eq!(output.stdout, frame.repeat(3), "{line:?}");
+    }
+}
+
 #[test]
 fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     let t = Tmp::new();
@@ -14097,6 +14424,122 @@ printf '%s\n' "${COMPREPLY[@]}""#,
 }
 
 #[test]
+fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    write(&t.path("remote-home/base/inside.txt"), b"inside");
+    fs::create_dir(t.path("remote-home/base/inner-dir")).unwrap();
+    std::os::unix::fs::symlink("base", t.path("remote-home/link")).unwrap();
+    let ssh = fake_ssh(&t);
+    let binary = env!("CARGO_BIN_EXE_syq");
+    let base = t.s("remote-home/base");
+    let link = format!("{}/in", t.s("remote-home/link"));
+    let attached_base = format!("-C{base}");
+    let remote_link = format!("fake.example:{link}");
+    for (words, expected) in [
+        (
+            vec![
+                "syq",
+                "cp",
+                "--syq-path",
+                binary,
+                "--from",
+                "fake.example",
+                &attached_base,
+                "--src-dir",
+                "in",
+            ],
+            vec!["inner-dir/".to_string()],
+        ),
+        (
+            vec![
+                "syq",
+                "cp",
+                "--syq-path",
+                binary,
+                "--from",
+                "fake.example",
+                &link,
+            ],
+            vec![],
+        ),
+        (
+            vec![
+                "syq",
+                "cp",
+                "--syq-path",
+                binary,
+                "--from",
+                "fake.example",
+                "--follow-src",
+                &link,
+            ],
+            vec![format!("{}ner-dir/", link), format!("{}side.txt", link)],
+        ),
+        (
+            vec![
+                "syq",
+                "cp",
+                "--syq-path",
+                binary,
+                "--to",
+                "fake.example",
+                "--follow-dst",
+                "--into",
+                &link,
+            ],
+            vec![format!("{}ner-dir/", link)],
+        ),
+        // --rsh is the ignore pattern, so this must still perform the normal
+        // remote completion through the test SSH transport.
+        (
+            vec![
+                "syq",
+                "rsync",
+                "--rsync-path",
+                binary,
+                "--syq-ignore",
+                "--rsh",
+                &remote_link,
+            ],
+            vec![
+                format!("{}ner-dir/", remote_link),
+                format!("{}side.txt", remote_link),
+            ],
+        ),
+    ] {
+        let index = (words.len() - 1).to_string();
+        let mut args = vec!["__complete", "bash", &index, "--"];
+        args.extend_from_slice(&words);
+        let output = completion_command(&t, &args)
+            .env_remove("SYQ_COMPLETION_DEBUG")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stderr.is_empty(), "{words:?}: {output:?}");
+        let actual: Vec<Vec<u8>> = completion_values(&output.stdout)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            "{words:?}"
+        );
+    }
+}
+
+#[test]
 fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
@@ -14256,22 +14699,13 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     assert_output_ok(&destination);
     assert_eq!(
         completion_values(&destination.stdout),
-        vec![
-            (
-                b'f',
-                t.path("remote-home/data/name with spaces")
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .to_vec(),
-            ),
-            (
-                b'p',
-                t.path("remote-home/data/nested/")
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .to_vec(),
-            ),
-        ]
+        vec![(
+            b'p',
+            t.path("remote-home/data/nested/")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+        ),]
     );
 
     let remote_operand = format!("fake.example:{path}");
