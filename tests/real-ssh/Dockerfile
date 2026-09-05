@@ -23,6 +23,8 @@ RUN apt-get update \
         openssh-client \
         openssh-server \
         procps \
+        rsync \
+        openssl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 syq \
     && useradd --uid 1000 --gid syq --create-home --shell /bin/sh syq \
@@ -34,6 +36,7 @@ COPY --from=builder /tmp/syq /usr/local/bin/syq
 COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
 COPY --chmod=0755 tests/real-ssh/entrypoint.sh /usr/local/libexec/syq-real-ssh-entrypoint
 COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-scenarios
+COPY --chmod=0755 scripts/try-benchmark.sh /usr/local/libexec/syq-try-benchmark
 COPY tests/real-ssh/sshd_config /etc/ssh/sshd_config
 
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

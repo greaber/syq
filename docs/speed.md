@@ -14,6 +14,40 @@ commands, and measured limitations. Use
 [syq-bench on your own machines](https://greaber.github.io/syq-bench/reproduce.html)
 to compare settings and track performance over time.
 
+## Quick comparison
+
+The [interactive benchmark](install.md#try-a-benchmark) gives you a small
+comparison without installing a benchmark package. After downloading the
+script, you can repeat the same choices explicitly:
+
+```sh
+bash try-benchmark.sh --yes --mode push --host server --workload both --size medium --rounds 3
+bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
+```
+
+Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
+scratch parent, including when pulling; `--source-dir` is always the local
+scratch parent. Budget roughly twice the selected data size locally and one
+copy remotely. Sizes are quick (64 MiB and 8 MiB), medium (1 GiB and 32 MiB),
+and large (8 GiB and 128 MiB), for the large-file and small-file workloads.
+
+Data comes from a fixed AES-CTR byte stream, making it reproducible and
+hard to compress. Every trial has an empty destination. The script rotates
+tool order and reports each elapsed time and the mean for each tool. It uses
+syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
+These copy the same regular files and request permissions and modification
+times; the tools still differ in compression, integrity checks, and filesystem
+optimizations. Syq prints its transfer statistics.
+
+Generation, a small syq helper warm-up, and POSIX `cksum` comparisons are
+outside the timer. A failed command or content check stops the comparison.
+Caches are not flushed, so this is a cache-friendly test rather than a cold
+disk benchmark. Times include process startup and buffered writes, without
+waiting for durable storage. Small tests can mostly measure startup costs;
+local filesystem cloning can favor cp. Results do not predict every workload,
+and syq may be slower. Use the full published benchmark methodology for more
+controlled measurements.
+
 ## When rsync or cp is faster
 
 - **Tiny jobs:** setup can cost more than the copy. [`syq persist on`](install.md#keep-connections-open) avoids
