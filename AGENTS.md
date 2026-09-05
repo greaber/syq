@@ -244,9 +244,13 @@ report actual access or decision blockers instead of bypassing them.
 ## Compatibility before implementation
 
 When a task changes an external interface or state that can survive a process,
-read [the compatibility inventory](design/compatibility.md) before choosing the
-implementation. This includes renames: trace serialized names, filenames,
-command arguments, SDK keywords, URLs, and signing domains, not just Rust types.
+identify every boundary it crosses before choosing the implementation: the
+helper wire protocol, enrollment and receiver state, signed grants and
+redemption records, receipts, resume identities, persistence preferences,
+tuning and completion caches, automation output, the CLI and SDK surfaces,
+release manifests and updaters, and published documentation URLs. This
+includes renames: trace serialized names, filenames, command arguments, SDK
+keywords, URLs, and signing domains, not just Rust types.
 
 - Identify the producer, consumer, lifetime, and supported release baseline.
   Check released artifacts or tags rather than assuming current tests represent
@@ -266,8 +270,7 @@ command arguments, SDK keywords, URLs, and signing domains, not just Rust types.
 
 The public support baseline and duration are not yet decided. Surface that
 choice when it matters; do not add speculative compatibility implementations
-or promise indefinite support. The inventory records current mechanisms and
-proposed launch work separately.
+or promise indefinite support.
 
 ## Release secrets
 

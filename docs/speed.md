@@ -124,8 +124,7 @@ On a deliberately short, metadata-heavy local ext4 workload, this added about
 1.1 seconds per 100,000 files: a 47–53% increase. A shallow tree increased by
 12–18%. NFS measurements showed no large consistent penalty, but varied too
 much to rule out a small one. These results depend on the filesystem, tree,
-and cache state; the [measurement note](https://github.com/greaber/syq/blob/master/design/performance.md#path-safety-measurements-2026-09-04)
-records the builds, method, and sample ranges.
+and cache state.
 
 ## When rsync or cp is faster
 
@@ -213,8 +212,6 @@ workers start do not update it. A stale entry costs the next run a probe or two.
 On a 265 ms path from Germany to Japan, TCP data connections reached 1 Gbit
 line rate at 8–13 connections. Over ssh, tuning reached about 110 MB/s around
 30 seconds after connecting, compared with 44 MB/s for a fixed eight workers.
-The [engineering note](https://github.com/greaber/syq/blob/master/design/performance.md)
-has the detailed tuning rules and the small-file SSH comparison.
 
 `-j N`/`--connections N` (`--syq-connections N` under `syq rsync`) fixes the
 count and disables tuning. One worker can help on a spinning disk; use
