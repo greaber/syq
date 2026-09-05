@@ -689,14 +689,19 @@ impl Receiver {
                     }
                     Arc::clone(&session.authority)
                 };
-                write_message(&mut stream, &Reply::Ready)?;
-                let writer = stream.try_clone()?;
-                // Active streams die when SSH detects disconnect, when the
-                // receiver stops, or at the executor's fixed transfer deadline.
-                writer.set_read_timeout(None)?;
-                writer.set_write_timeout(None)?;
-                let result = crate::server::run_named(stream, writer, authority, control);
+                let result = (|| {
+                    write_message(&mut stream, &Reply::Ready)?;
+                    let writer = stream.try_clone()?;
+                    // Active streams die when SSH detects disconnect or the
+                    // receiver stops. The executor enforces its fixed deadline.
+                    writer.set_read_timeout(None)?;
+                    writer.set_write_timeout(None)?;
+                    crate::server::run_named(stream, writer, Arc::clone(&authority), control)
+                })();
                 if control {
+                    // Opening consumes the token even if the reply fails. Do
+                    // not leave an opened session occupying a slot forever.
+                    authority.close_control();
                     self.sessions.lock().unwrap().remove(&token);
                 }
                 result
@@ -1377,6 +1382,38 @@ mod tests {
             Duration::from_secs(2)
         )
         .is_err());
+    }
+
+    #[test]
+    fn named_abandoned_open_releases_its_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        fs::create_dir(&root).unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let (request, _) = request(&args(Path::new("source"), "."));
+        let approved = approve(&registration, request);
+        let mut stream = UnixStream::connect(&registration.socket).unwrap();
+        // Refuse the opening reply before sending the request, forcing its
+        // write to fail instead of reaching the normal control cleanup.
+        stream.shutdown(std::net::Shutdown::Read).unwrap();
+        write_message(
+            &mut stream,
+            &Envelope {
+                version: VERSION,
+                identity: crate::identity::build().into(),
+                secret: registration.secret,
+                message: Message::Open {
+                    token: approved.token,
+                    control: true,
+                },
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(receiver.sessions.lock().unwrap().is_empty());
     }
 
     #[test]
