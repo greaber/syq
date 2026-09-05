@@ -1565,6 +1565,7 @@ fn connect_completion_endpoint(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     spec.connect_completion()
 }

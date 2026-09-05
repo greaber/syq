@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-const WINDOW: usize = 4;
 const MAX_ATTEMPTS: u32 = 3;
 pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 const FAST_BATCH_FILES: usize = 128;
@@ -69,6 +68,7 @@ fn initial_fast_workers(max_connections: usize, file_jobs: usize, file_bytes: u6
 
 pub struct Opts {
     pub block: u64,
+    pub tuning: crate::transfer_tuning::TransferTuning,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -154,6 +154,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
+                read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
     })
@@ -1669,7 +1670,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     if matches!(dst_ep, Endpoint::Local { .. }) {
-        dst_ep = Endpoint::Remote(RemoteSpec::local_receiver(args.quiet));
+        let mut receiver = RemoteSpec::local_receiver(args.quiet);
+        receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
+        dst_ep = Endpoint::Remote(receiver);
     }
     // TCP data connections are the default (auto-selecting the fastest reachable
     // NIC and falling back to ssh if unreachable); the interface's no-TCP
@@ -1698,6 +1701,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let opts = Arc::new(Opts {
         block,
+        tuning: args.tuning_options.unwrap_or_default(),
         flags: args.meta_flags(),
         recursive: args.recursive,
         links: args.links,
@@ -1727,6 +1731,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_size,
         min_size,
     });
+    if args.tuning_options.is_some() && !args.quiet && (args.stats || args.verbose > 0 || debug()) {
+        crate::output::diagnostic!(
+            "syq: tuning: request-size={} bytes (after bandwidth limit), pipeline-depth={}, hash-block-size={} bytes",
+            opts.tuning.request_size(block, bwlimit.as_deref()), opts.tuning.pipeline_depth(), block
+        );
+    }
     // Acquire the entire mapping through its retained selection before any
     // destination root can be created. The planner already consumes the whole
     // manifest; retaining these bytes also makes later namespace replacement
@@ -2643,7 +2653,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         args.connections = tune::START_TCP;
         gate.set_active(args.connections);
     }
-    let tuning_key = autotune.then(|| tune::path_key(&src_ep, &dst_ep)).flatten();
+    let tuning_key = (autotune && args.tuning_options.is_none())
+        .then(|| tune::path_key(&src_ep, &dst_ep))
+        .flatten();
     let remembered_start = tuning_key.as_deref().and_then(tune::cached);
     if let Some(remembered) = remembered_start {
         args.connections = remembered;
@@ -7201,7 +7213,7 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
-            && j.entry.size <= self.transfer_block()
+            && j.entry.size <= self.opts.block.min(self.transfer_block())
             && j.dst_entry.is_none()
             && (!self.opts.inplace
                 || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
@@ -7915,12 +7927,12 @@ impl Worker {
         );
         let block = self.transfer_block();
         let read_window = if self.src.supports_request_pipelining() {
-            WINDOW
+            self.opts.tuning.pipeline_depth()
         } else {
             1
         };
         let write_window = if self.dst.supports_request_pipelining() {
-            WINDOW
+            self.opts.tuning.pipeline_depth()
         } else {
             1
         };
@@ -8006,9 +8018,9 @@ impl Worker {
     }
 
     fn transfer_block(&self) -> u64 {
-        self.bwlimit.as_ref().map_or(self.opts.block, |limit| {
-            self.opts.block.min(limit.burst_bytes())
-        })
+        self.opts
+            .tuning
+            .request_size(self.opts.block, self.bwlimit.as_deref())
     }
 
     fn limit(&self, bytes: u64) {

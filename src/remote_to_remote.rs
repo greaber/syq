@@ -886,6 +886,7 @@ fn run_remote(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
 
     // Rebuild the native command for the remote coordinator. Placement stays
@@ -969,6 +970,9 @@ fn run_remote(
     }
     if let Some(minimum) = &args.min_size {
         remote.push(format!("--min-size={minimum}"));
+    }
+    if let Some(tuning) = args.tuning_options {
+        remote.push(format!("--tuning-options={tuning}"));
     }
     if let Some(rate) = &args.bwlimit {
         remote.push(format!("--bwlimit={rate}"));

@@ -5773,6 +5773,164 @@ fn large_file_parallel_chunks() {
 }
 
 #[test]
+fn tuning_options_are_in_full_help_and_validate_before_copying() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    for interface in ["cp", "rsync"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([interface, "--help"])
+            .run()
+            .unwrap();
+        assert_output_ok(&help);
+        assert!(!String::from_utf8_lossy(&help.stdout).contains("--tuning-options"));
+        let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([interface, "--help-all"])
+            .run()
+            .unwrap();
+        assert_output_ok(&help);
+        let text = String::from_utf8_lossy(&help.stdout);
+        assert!(
+            text.contains("--tuning-options") && text.contains("pipeline-depth"),
+            "{text}"
+        );
+        for options in [
+            "typo=4",
+            "pipeline-depth=0",
+            "request-size=65M",
+            "pipeline-depth=4,pipeline-depth=8",
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([interface, "--tuning-options", options, &t.s("source")]);
+            if interface == "cp" {
+                command.arg("--as");
+            }
+            let out = command.arg(t.s("destination")).run().unwrap();
+            assert!(!out.status.success(), "{out:?}");
+            assert!(stderr_of(&out).contains("--tuning-options"), "{out:?}");
+            assert!(!t.path("destination").exists());
+        }
+    }
+}
+
+#[test]
+fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(9 * 1024 * 1024 + 123, 904);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for pull in [false, true] {
+            for (size, depth) in [(64 << 10, 1), (1 << 20, 8), (64 << 10, 64), (8 << 20, 8)] {
+                let destination = t.s(&format!("dst-{tcp}-{pull}-{size}-{depth}"));
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--connections",
+                    "1",
+                    "--no-progress",
+                    "--stats",
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--tuning-options",
+                    &format!("request-size={size},pipeline-depth={depth}"),
+                ]);
+                if !tcp {
+                    command.arg("--no-tcp");
+                } else {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                }
+                if pull {
+                    command.args(["--from", "host"]);
+                }
+                command.arg(t.s("source"));
+                if !pull {
+                    command.args(["--to", "host"]);
+                }
+                command
+                    .args(["--as", &destination])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+                let out = command.run().unwrap();
+                assert_output_ok(&out);
+                let diagnostic = stderr_of(&out);
+                assert!(
+                    diagnostic.contains(&format!("request-size={size} bytes")),
+                    "{diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains(&format!("pipeline-depth={depth}")),
+                    "{diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("hash-block-size=4194304 bytes"),
+                    "{diagnostic}"
+                );
+                assert_eq!(read(Path::new(&destination)), data);
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024, 905);
+    write(&t.path("source"), &data);
+    set_mtime(&t.path("source"), 1_600_000_000);
+    let src = t.s("source");
+    let dst = t.s("destination");
+    let initial = ["-a", "--block-size=1M", "--bwlimit=1G", &src, &dst];
+    let partial = interrupted_partial(&initial, &t.0);
+    let f = File::create(&partial).unwrap();
+    (&f).write_all(&data[..3 * 1024 * 1024]).unwrap();
+    f.set_len(data.len() as u64).unwrap();
+    drop(f);
+    let out = run_ok(&[
+        "-a",
+        "--block-size=1M",
+        "--bwlimit=1G",
+        "--tuning-options=request-size=128K,pipeline-depth=8",
+        &src,
+        &dst,
+    ]);
+    assert_eq!(read(&t.path("destination")), data);
+    assert!(!partial.exists(), "override stranded the existing partial");
+    assert!(
+        out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
+        "{out}"
+    );
+}
+
+#[test]
+fn tuning_options_keep_the_aggregate_bandwidth_limit() {
+    let t = Tmp::new();
+    let data = prng(2 * 1024 * 1024, 906);
+    write(&t.path("source"), &data);
+    let start = std::time::Instant::now();
+    let out = run_ok(&[
+        "-a",
+        "--bwlimit=1M",
+        "--syq-connections=4",
+        "--tuning-options=request-size=64M,pipeline-depth=64",
+        &t.s("source"),
+        &t.s("destination"),
+    ]);
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(1600),
+        "{out}"
+    );
+    assert_eq!(read(&t.path("destination")), data);
+}
+
+#[test]
 fn bwlimit_is_aggregate_across_workers() {
     let t = Tmp::new();
     for i in 0..4 {
