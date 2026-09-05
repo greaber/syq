@@ -524,7 +524,24 @@ every session pool, asks every live syq-owned master to exit, and removes the
 global runtime scope. The durable preference lives in
 `$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
 control sockets and pool sockets live in a per-user runtime directory that
-only that user can read.
+only that user can read. Syq uses `$XDG_RUNTIME_DIR` when set. Otherwise,
+macOS uses `/tmp/syq-persist-<uid>` so its long default temporary-directory
+path does not exceed the SSH socket limit; other platforms use their temporary
+directory. Syq checks socket paths, including OpenSSH's temporary creation
+suffix, before starting SSH. An overly long explicit runtime path or scope
+fails immediately with an explanation.
+
+An initial SSH connection failure is reported after one attempt. Syq does not
+repeat authentication or wait through backoff before showing that error.
+Concurrent data-worker connections can still retry when a server limits new
+connections.
+
+For startup diagnostics, prefix a command with `SYQ_DEBUG=1`. It prints syq's
+transfer phases and enables OpenSSH's verbose startup diagnostics for ordinary
+connections, including errors that happen before the remote helper starts.
+SSH command logging is not enabled for signed receivers because their remote
+command carries an authorization token. A helper taken from the session pool
+keeps the debug setting it started with.
 
 Scripts can avoid changing that shared preference by creating an ephemeral
 persistence scope:
@@ -877,6 +894,23 @@ is opened up for the duration and gets its own mode back at the end — or the
 source's mode with `-p`.
 
 ## How it works
+
+A native push of up to 64 explicitly named regular files, each at most 1 MiB
+and at most 4 MiB in total, can finish over its SSH control connection. This
+covers new files, unchanged files, and small replacements in an existing
+destination directory (`--into`) or at an exact file path (`--as`). It skips
+TCP discovery and additional SSH data connections. The receiver uses the same
+size/mtime quick check, reconciles requested metadata, and stages changed
+content beside its final path before publishing it. Existing files with equal
+content but different mtimes can finish with only a metadata update. A
+replacement fails if the destination name changes to a different inode before
+publication.
+
+Directory sources, missing destination directories, non-file target types,
+restricted receivers, and options requiring the full scan or verification path
+use the general transfer path. The control-connection path sends the bounded
+source contents with its request, including files the receiver then finds
+unchanged; unchanged files are not rewritten.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.

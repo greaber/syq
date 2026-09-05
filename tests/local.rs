@@ -66,13 +66,14 @@ impl Tmp {
     /// A runtime directory for `XDG_RUNTIME_DIR`. Unix socket paths beneath
     /// it must fit `sun_path` (104 bytes on macOS), so when the test
     /// directory itself is long, as under macOS's `TMPDIR`, the runtime
-    /// directory lives directly under `/tmp` instead.
+    /// directory lives directly under `/tmp` instead. Reserve space for
+    /// OpenSSH's 17-byte temporary suffix as well as the final socket name.
     fn runtime(&self) -> PathBuf {
         let inside = self.path("runtime");
-        if inside.as_os_str().len() <= 48 {
+        if inside.as_os_str().len() <= 32 {
             return inside;
         }
-        let tmp = fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let tmp = PathBuf::from("/tmp");
         let name = self.0.file_name().unwrap().to_string_lossy();
         tmp.join(format!("{name}-rt"))
     }
@@ -7224,6 +7225,72 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         comparable(&exact_engine_records)
     );
 
+    // Changed existing files keep destination permissions by default.
+    for dir in ["dest-fast", "dest-engine"] {
+        fs::set_permissions(
+            t.path(&format!("{dir}/renamed.txt")),
+            fs::Permissions::from_mode(0o604),
+        )
+        .unwrap();
+        write(&t.path(&format!("{dir}/renamed.txt")), b"old contents");
+    }
+    let (fast, _) = push(
+        "kept-mode",
+        false,
+        &sources[..1],
+        &["--as", &t.s("dest-fast/renamed.txt")],
+    );
+    let (engine, _) = push(
+        "kept-mode-engine",
+        true,
+        &sources[..1],
+        &["--as", &t.s("dest-engine/renamed.txt")],
+    );
+    assert_output_ok(&fast);
+    assert_output_ok(&engine);
+    for dir in ["dest-fast", "dest-engine"] {
+        assert_eq!(
+            fs::metadata(t.path(&format!("{dir}/renamed.txt")))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o604
+        );
+    }
+    // Explicit source-mode preservation repairs a quick-checked file in place.
+    let (fast, fast_records) = push(
+        "repair-mode",
+        false,
+        &sources[..1],
+        &[
+            "--as",
+            &t.s("dest-fast/renamed.txt"),
+            "--preserve=permissions",
+        ],
+    );
+    let (engine, engine_records) = push(
+        "repair-mode-engine",
+        true,
+        &sources[..1],
+        &[
+            "--as",
+            &t.s("dest-engine/renamed.txt"),
+            "--preserve=permissions",
+        ],
+    );
+    assert_output_ok(&fast);
+    assert_output_ok(&engine);
+    assert_eq!(comparable(&fast_records), comparable(&engine_records));
+    for dir in ["dest-fast", "dest-engine"] {
+        assert_eq!(
+            fs::metadata(t.path(&format!("{dir}/renamed.txt")))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+    }
+
     // Relative exact placement uses the same request-prefix spelling as the
     // receiver. A plain leaf must not cost a declined request and fallback.
     for (label, prefix) in [("relative", ""), ("dot-relative", "./")] {
@@ -7255,8 +7322,8 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         );
     }
 
-    // An existing target is the engine's case: the one-turn path writes
-    // nothing and hands over on the same connection.
+    // A mixed update and quick-check finishes without TCP discovery or
+    // additional SSH data sessions, and matches the general engine.
     write(&t.path("dest-fast/one.txt"), b"stale");
     write(&t.path("dest-engine/one.txt"), b"stale");
     let (fast_existing, fast_existing_records) = push(
@@ -7274,14 +7341,67 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
     assert_output_ok(&fast_existing);
     assert_output_ok(&engine_existing);
     let declined = stderr_of(&fast_existing);
-    assert!(declined.contains("using the ordinary engine"), "{declined}");
-    assert!(!declined.contains("small copy: published"), "{declined}");
+    assert!(declined.contains("small copy: published"), "{declined}");
+    assert!(!declined.contains("TCP route probes started"), "{declined}");
+    assert_eq!(
+        fs::read_to_string(t.path("fast-existing.rsh.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     assert_eq!(summary(&fast_existing), summary(&engine_existing));
     assert_eq!(
         comparable(&fast_existing_records),
         comparable(&engine_existing_records)
     );
     assert_eq!(read(&t.path("dest-fast/one.txt")), b"one");
+
+    for (label, change_mtime, change_mode) in [
+        ("unchanged", false, false),
+        ("same-content", true, false),
+        ("metadata", false, true),
+    ] {
+        let before = fs::metadata(t.path("dest-fast/one.txt")).unwrap().ino();
+        if change_mtime {
+            set_mtime(&t.path("src/one.txt"), 1_700_000_100);
+        }
+        if change_mode {
+            fs::set_permissions(t.path("src/one.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (fast, fast_records) = push(label, false, &sources, &["--into", &t.s("dest-fast")]);
+        let (engine, engine_records) = push(
+            &format!("{label}-engine"),
+            true,
+            &sources,
+            &["--into", &t.s("dest-engine")],
+        );
+        assert_output_ok(&fast);
+        assert_output_ok(&engine);
+        assert_eq!(summary(&fast), summary(&engine), "{label}");
+        assert_eq!(
+            comparable(&fast_records),
+            comparable(&engine_records),
+            "{label}"
+        );
+        assert_eq!(
+            fs::metadata(t.path("dest-fast/one.txt")).unwrap().ino(),
+            before
+        );
+        assert_eq!(
+            fs::metadata(t.path("dest-fast/one.txt")).unwrap().mtime(),
+            fs::metadata(t.path("dest-engine/one.txt")).unwrap().mtime()
+        );
+        assert!(stderr_of(&fast).contains("small copy: published"));
+        assert!(!stderr_of(&fast).contains("TCP route probes started"));
+        assert_eq!(
+            fs::read_to_string(t.path(format!("{label}.rsh.log").as_str()))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
 
     // A missing directory is the engine's to create after the receiver
     // declines the one-turn request.
@@ -14959,6 +15079,90 @@ exit 23
         "remote-coordinator handoff recorded inactive local endpoints"
     );
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+}
+
+#[test]
+fn initial_ssh_failure_is_reported_once_with_debug_diagnostics() {
+    let t = Tmp::new();
+    let ssh = t.path("bin/ssh");
+    executable(
+        &ssh,
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
+printf 'ssh: test control socket could not be created\n' >&2
+exit 255
+"#,
+    );
+    write(&t.path("source"), b"payload");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--no-bootstrap"])
+        .arg(t.path("source"))
+        .args(["--to", "fake.example", "--into", "."])
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.split_whitespace().any(|arg| arg == "-v"), "{log}");
+    let diagnostic = stderr_of(&output);
+    assert!(
+        diagnostic.contains("ssh: test control socket could not be created"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("exit status: 255"), "{diagnostic}");
+    assert!(!diagnostic.contains("attempt"), "{diagnostic}");
+}
+
+#[test]
+fn persistence_rejects_long_socket_paths_before_enabling() {
+    let t = Tmp::new();
+    let runtime = t.path(&"r".repeat(100));
+    fs::create_dir(&runtime).unwrap();
+    let output = persistence_command(&t, &["on"])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    let diagnostic = stderr_of(&output);
+    assert!(
+        diagnostic.contains("SSH control socket path"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("OpenSSH's temporary suffix"),
+        "{diagnostic}"
+    );
+    assert!(!t.path("config/syq/persistence.json").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_default_persistence_avoids_long_tmpdir() {
+    let t = Tmp::new();
+    let temporary = t.path(&"t".repeat(80));
+    fs::create_dir(&temporary).unwrap();
+    let output = persistence_command(&t, &["on", "--ephemeral"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &temporary)
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let scope = String::from_utf8(output.stdout).unwrap();
+    let scope = scope.trim();
+    assert!(scope.starts_with("/tmp/syq-persist-"), "{scope}");
+    let closed = persistence_command(&t, &["off", "--pscope", scope])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &temporary)
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
 }
 
 #[test]

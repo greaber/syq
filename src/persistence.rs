@@ -250,6 +250,26 @@ pub(crate) fn validate_openssh_control_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// OpenSSH binds a temporary name with a dot and 16 random characters
+/// before linking the control socket into place (openssh-portable/mux.c).
+/// Account for that name and the terminating NUL, not only the final path.
+pub(crate) fn validate_openssh_socket_path(path: &Path) -> Result<()> {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    validate_openssh_socket_capacity(path, address.sun_path.len())
+}
+
+fn validate_openssh_socket_capacity(path: &Path, capacity: usize) -> Result<()> {
+    validate_openssh_control_path(path)?;
+    let limit = capacity - 18;
+    if path.as_os_str().as_bytes().len() > limit {
+        bail!(
+            "SSH control socket path {} is too long (maximum {limit} bytes, including room for OpenSSH's temporary suffix); use a shorter XDG_RUNTIME_DIR or persistence scope",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Return the stable socket path for one endpoint and record enough metadata
 /// for `persist status` and `persist off` to inspect or close it later.
 pub(crate) fn prepare_endpoint(
@@ -261,6 +281,7 @@ pub(crate) fn prepare_endpoint(
     validate_scope(scope)?;
     let key = endpoint_key(user, host, port);
     let socket = scope.join(&key);
+    validate_openssh_socket_path(&socket)?;
     let record_path = scope.join(format!("{key}.json"));
     let expected = EndpointRecord::new(user, host, port);
     let record_bytes = serde_json::to_vec(&expected)?;
@@ -376,7 +397,16 @@ fn runtime_parent_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| {
+            // Darwin's default TMPDIR is long enough that even the global
+            // endpoint socket exceeds sun_path once OpenSSH adds its suffix.
+            // This parent is still checked for ownership, mode and symlinks.
+            if cfg!(target_os = "macos") {
+                PathBuf::from("/tmp")
+            } else {
+                std::env::temp_dir()
+            }
+        });
     base.join(format!("syq-persist-{}", unsafe { libc::geteuid() }))
 }
 
@@ -432,6 +462,7 @@ fn create_ephemeral_scope() -> Result<PathBuf> {
 }
 
 pub(crate) fn initialize_scope(scope: &Path) -> Result<()> {
+    validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None)))?;
     secure_directory(scope, true, true)?;
     create_marker(scope)?;
     validate_scope(scope)
@@ -457,6 +488,7 @@ fn create_marker(scope: &Path) -> Result<()> {
 
 pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
     validate_openssh_control_path(scope)?;
+    validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None)))?;
     secure_directory(scope, false, false)?;
     let marker_path = scope.join(SCOPE_MARKER);
     let mut marker = OpenOptions::new()
@@ -733,8 +765,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn control_socket_budget_includes_openssh_temporary_suffix() {
+        let reported = Path::new("/var/folders/bb/zjydfp6x4zsbx55jb_zqhksr0000gn/T/syq-persist-501/global/cm-0123456789abcdef");
+        assert_eq!(reported.as_os_str().len(), 91);
+        for capacity in [104, 108] {
+            assert!(validate_openssh_socket_capacity(reported, capacity).is_err());
+            let fits = "/".to_owned() + &"x".repeat(capacity - 19);
+            assert!(validate_openssh_socket_capacity(Path::new(&fits), capacity).is_ok());
+            assert!(validate_openssh_socket_capacity(Path::new(&(fits + "x")), capacity).is_err());
+        }
+    }
+
+    #[test]
     fn endpoint_records_are_stable_and_inactive_scopes_close_cleanly() {
-        let temporary = crate::test_support::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let first = prepare_endpoint(&scope, Some("alice"), "example", None).unwrap();
@@ -749,7 +793,7 @@ mod tests {
 
     #[test]
     fn concurrent_endpoint_registration_publishes_one_complete_record() {
-        let temporary = crate::test_support::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));

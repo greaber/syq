@@ -1142,7 +1142,7 @@ impl SshMultiplexer {
             .tempdir()
             .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
-        crate::persistence::validate_openssh_control_path(&path)?;
+        crate::persistence::validate_openssh_socket_path(&path)?;
         Ok(Self {
             _directory: Some(directory),
             path,
@@ -1304,6 +1304,12 @@ impl RemoteSpec {
         let mut cmd = Command::new(&self.rsh[0]);
         cmd.args(&self.rsh[1..]);
         if self.rsh[0].ends_with("ssh") {
+            // SSH's startup diagnostics explain failures before a remote
+            // helper exists. Do not enable its command logging for signed
+            // receiver grants, which are carried in the remote command.
+            if crate::transfer::debug() && self.restricted_grant.is_none() {
+                cmd.arg("-v");
+            }
             let multiplex = match (connection, &self.ssh_multiplexer) {
                 (SshConnection::Control, Some(multiplexer)) => Some((multiplexer, true)),
                 (SshConnection::Worker, Some(multiplexer)) => Some((multiplexer, false)),
@@ -1536,7 +1542,11 @@ impl RemoteSpec {
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
-        for attempt in 0..6 {
+        // Initial control failures should surface after one SSH invocation.
+        // Backoff serves concurrent worker admission (sshd MaxStartups), not
+        // repeated authentication or deterministic local configuration errors.
+        let attempts = if limited { 6 } else { 1 };
+        for attempt in 0..attempts {
             let _slot = limited.then(connect_slot);
             let ssh_connection = self.ssh_connection(limited);
             match self.connect_once(compress, ssh_connection, role.clone()) {
@@ -1561,7 +1571,9 @@ impl RemoteSpec {
                 }
                 // Don't retry what won't change: a missing binary or an
                 // incompatible protocol/build identity.
-                Err(e) if attempt == 5 || is_non_retryable_connect_error(&e) => return Err(e),
+                Err(e) if attempt + 1 == attempts || is_non_retryable_connect_error(&e) => {
+                    return Err(e)
+                }
                 Err(e) => {
                     let limit = if limited {
                         Some(tighten_connect_limit())
@@ -3557,7 +3569,7 @@ mod tests {
     #[test]
     fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
         use std::os::unix::net::UnixListener;
-        let directory = crate::test_support::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let scope = directory.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None).unwrap();
@@ -3582,7 +3594,7 @@ mod tests {
     #[test]
     fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = crate::test_support::tempdir().unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         let base = directory.path().join("scope");
         crate::persistence::initialize_scope(&base).unwrap();
         // The socket name is stable per endpoint, and a dead leftover at the

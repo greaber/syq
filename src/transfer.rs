@@ -869,7 +869,7 @@ fn small_copy_eligible(
         && clean_root(&dst.path) != b"~"
 }
 
-/// Push fresh small regular files in one control-connection turn. Sources
+/// Push small regular files in one control-connection turn. Sources
 /// are read through the same registered references the engine's workers
 /// use; the receiver selects, anchors, checks, stages, and publishes in one
 /// request. Every result record and the summary come from the same counters
@@ -1039,12 +1039,12 @@ fn attempt_small_copy(
             ..
         }) if results.len() == srcs.len() => results,
         Response::SmallFilesCopied(SmallCopyResponse {
-            outcome: SmallCopyOutcome::NotFresh,
+            outcome: SmallCopyOutcome::UnsupportedTarget,
             ..
         }) => {
             if debug() {
                 crate::output::diagnostic!(
-                    "syq: small copy: a destination exists; using the ordinary engine"
+                    "syq: small copy: a destination is not a regular file; using the ordinary engine"
                 );
             }
             return Ok(SmallCopy::Declined);
@@ -1109,31 +1109,34 @@ fn attempt_small_copy(
     for (((entry, (_, rel_bytes, rel)), result), now) in
         entries.iter().zip(&targets).zip(results).zip(now)
     {
+        let source_changed = now.as_ref().is_none_or(|e| {
+            e.kind != Kind::File
+                || e.size != entry.size
+                || e.mtime != entry.mtime
+                || e.mtime_nsec != entry.mtime_nsec
+        });
+        if result.unchanged && !source_changed {
+            progress.files_unchanged.fetch_add(1, Relaxed);
+            progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            if let Some(error) = result.error {
+                progress.error(&format!("syq: {}", endpoint_error(error)));
+            }
+            continue;
+        }
         progress.files_total.fetch_add(1, Relaxed);
         progress.bytes_total.fetch_add(entry.size, Relaxed);
-        let failure = match result {
+        let failure = match result.error {
             Some(error) => {
                 let error = endpoint_error(error).context("put");
                 Some(("unknown", os_kind_of(&error), format!("{error:#}")))
             }
-            None => {
-                let changed = match &now {
-                    Some(e) => {
-                        e.kind != Kind::File
-                            || e.size != entry.size
-                            || e.mtime != entry.mtime
-                            || e.mtime_nsec != entry.mtime_nsec
-                    }
-                    None => true,
-                };
-                changed.then(|| {
-                    (
-                        "yes",
-                        None,
-                        "source changed during transfer (or vanished)".to_string(),
-                    )
-                })
-            }
+            None => source_changed.then(|| {
+                (
+                    "yes",
+                    None,
+                    "source changed during transfer (or vanished)".to_string(),
+                )
+            }),
         };
         if let Some((retryable, os_kind, message)) = failure {
             progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
@@ -1189,14 +1192,14 @@ fn attempt_small_copy(
         exit_code,
         dry_run: false,
         files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: 0,
+        files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: 0,
         directories_created: 0,
         symlinks_created: 0,
         specials_created: 0,
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: 0,
+        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned: None,
         deletions_completed: None,
