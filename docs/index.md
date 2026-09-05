@@ -1,8 +1,8 @@
 # Copy files with syq
 
-Syq copies and removes files in parallel, on one machine or over SSH. It can
-resume interrupted copies and transfer directly between servers without
-forwarding your SSH agent.
+Syq (pronounced "sick") copies and removes files in parallel, on one machine
+or over SSH. It can resume interrupted copies and transfer directly between
+servers without forwarding your SSH agent.
 
 [Discussions](https://github.com/greaber/syq/discussions)
 

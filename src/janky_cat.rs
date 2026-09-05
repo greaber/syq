@@ -6,8 +6,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 
-const CHUNK_SIZES: [usize; 8] = [1, 3, 1, 2, 5, 1, 8, 2];
-const PAUSE_MILLIS: [u64; 8] = [80, 25, 140, 45, 10, 110, 30, 175];
+// Emit a few lines at once, then visibly stall before the next burst.
+const CHUNK_SIZES: [usize; 8] = [128, 384, 192, 512, 256, 128, 768, 256];
+const PAUSE_MILLIS: [u64; 8] = [600, 250, 900, 350, 200, 800, 300, 1100];
 
 enum CopyError {
     Read(io::Error),
@@ -40,7 +41,7 @@ fn copy_slowly(
     output: &mut dyn Write,
     pace: &mut Pace,
 ) -> std::result::Result<(), CopyError> {
-    let mut buffer = [0_u8; 8];
+    let mut buffer = [0_u8; 1024];
     loop {
         let count = input
             .read(&mut buffer[..pace.chunk_size()])
