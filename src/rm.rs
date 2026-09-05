@@ -38,7 +38,6 @@ pub fn run(mut args: Args) -> Result<i32> {
         .is_some_and(|location| location.is_remote());
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
-        args.connections,
         show_progress,
         args.progress,
         args.width,
@@ -68,6 +67,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         Ok(()) => {
             let exit_code = if summary.entries_failed > 0 { 23 } else { 0 };
             let status = if exit_code == 0 { "success" } else { "partial" };
+            progress.finish(exit_code == 0);
             emit_terminal(
                 results.as_deref(),
                 &progress,
@@ -83,6 +83,7 @@ pub fn run(mut args: Args) -> Result<i32> {
             Ok(exit_code)
         }
         Err(error) => {
+            progress.finish(false);
             summary.errors += 1;
             if let Some(writer) = results.as_deref().filter(|writer| !writer.is_dead()) {
                 let (class, os_kind) = fatal_classification(&error, remote);

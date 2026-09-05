@@ -5773,6 +5773,124 @@ fn large_file_parallel_chunks() {
 }
 
 #[test]
+fn progress_bar_slow_copy_stays_on_one_line_and_leaves_final_counts() {
+    let t = Tmp::new();
+    let data = prng(2 * 1024 * 1024, 451);
+    write(&t.path("src"), &data);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "--progress",
+            "--connections",
+            "4",
+            "--bwlimit",
+            "1M",
+        ])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&t.path("dst")), data);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("100%  done  2.00 MiB/2.00 MiB"),
+        "{stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "only final frame ends a line: {stderr:?}"
+    );
+    assert!(
+        !stderr
+            .replace("\x1b[K", "")
+            .replace("\x1b[2K", "")
+            .contains("\x1b"),
+        "no screen clearing or cursor-up: {stderr:?}"
+    );
+    assert!(
+        stderr
+            .split('\r')
+            .filter(|frame| frame.starts_with('['))
+            .count()
+            > 2,
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn progress_bar_reports_incomplete_verification_and_entry_removal() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"source");
+    write(&t.path("dst"), b"different");
+    let out = compat_command()
+        .args(["--syq-verify-only", "--progress", &t.s("src"), &t.s("dst")])
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("incomplete"), "{stderr:?}");
+    assert!(!stderr.contains("%  done"), "{stderr:?}");
+    assert_eq!(read(&t.path("dst")), b"different");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--progress", &t.s("dst")])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("100%  done  1/1 entries"), "{stderr:?}");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn progress_bar_does_not_mix_with_json_progress() {
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(1024 * 1024, 452));
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "--progress",
+            "--progress-json",
+            "--bwlimit",
+            "1M",
+        ])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.is_empty());
+    for line in stderr.lines() {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("JSON without a terminal bar");
+        assert!(value["bytes_done"].is_u64(), "{line}");
+    }
+}
+
+#[test]
+fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"payload");
+    for (dst, flags) in [
+        ("default", vec![]),
+        ("disabled", vec!["--progress", "--no-progress"]),
+        ("quiet", vec!["--progress", "--quiet"]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", &t.s("src"), "--as", &t.s(dst)])
+            .args(flags)
+            .run()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stderr.is_empty(), "{dst}: {out:?}");
+    }
+}
+
+#[test]
 fn bwlimit_is_aggregate_across_workers() {
     let t = Tmp::new();
     for i in 0..4 {

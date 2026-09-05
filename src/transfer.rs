@@ -10,7 +10,7 @@ use crate::conn::{
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
 use crate::fsops::{content_digest, is_partial_name, join};
-use crate::progress::{commas, human, Progress, WorkerStatus};
+use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
 use crate::sched::{FileJob, Item, RangeHandle, Sched};
@@ -1230,6 +1230,7 @@ fn attempt_small_copy(
         deletions_completed: None,
         deletions_blocked: None,
     };
+    progress.finish(exit_code == 0);
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
     }
@@ -1377,7 +1378,6 @@ pub fn run(args: Args) -> Result<i32> {
     // record — fatal setup failures included (spec: automation results).
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
-        args.connections,
         show_progress,
         args.progress,
         args.width,
@@ -1929,7 +1929,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                         Err(error) if dropped => {
                             failures += 1;
-                            progress.set_worker(id, None);
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
                                 gate.mark_failed(id);
                                 return Err(error);
@@ -3126,6 +3125,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         ("success", 0)
     };
+    progress.finish(exit_code == 0);
     let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
         let planned = match delete_plan {
             DeletePlan::Planned(n) => n,
@@ -7190,7 +7190,6 @@ impl Worker {
                     }
                 }
             }
-            self.progress.set_worker(self.id, None);
         }
     }
 
@@ -7214,16 +7213,6 @@ impl Worker {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all[i].clone()).collect()
         };
-        if let Some(j) = jobs.last() {
-            self.progress.set_worker(
-                self.id,
-                Some(WorkerStatus {
-                    path: format!("{} (+{} small files)", j.rel, jobs.len() - 1),
-                    done: j.done.clone(),
-                    total: j.entry.size,
-                }),
-            );
-        }
         // Reads.
         let phase = std::time::Instant::now();
         for j in &jobs {
@@ -7507,14 +7496,6 @@ impl Worker {
         let size = job.entry.size;
         let opts = self.opts.clone();
         let _ = &opts;
-        self.progress.set_worker(
-            self.id,
-            Some(WorkerStatus {
-                path: job.rel.clone(),
-                done: job.done.clone(),
-                total: size,
-            }),
-        );
 
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
@@ -7730,14 +7711,6 @@ impl Worker {
         })?;
         match resp {
             Response::Ok => {
-                self.progress.set_worker(
-                    self.id,
-                    Some(WorkerStatus {
-                        path: job.rel.clone(),
-                        done: job.done.clone(),
-                        total: job.entry.size,
-                    }),
-                );
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
                 if let Err(e) = self.finish_file(idx) {
@@ -7905,14 +7878,7 @@ impl Worker {
         if self.sched.is_failed(idx) {
             return Ok(());
         }
-        self.progress.set_worker(
-            self.id,
-            Some(WorkerStatus {
-                path: job.rel.clone(),
-                done: job.done.clone(),
-                total: job.entry.size,
-            }),
-        );
+
         let block = self.transfer_block();
         let read_window = if self.src.supports_request_pipelining() {
             WINDOW
@@ -8183,14 +8149,7 @@ impl Worker {
 
     fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
-        self.progress.set_worker(
-            self.id,
-            Some(WorkerStatus {
-                path: job.rel.clone(),
-                done: job.done.clone(),
-                total: job.entry.size,
-            }),
-        );
+
         let r = (|| -> Result<bool> {
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
