@@ -1400,10 +1400,10 @@ pub fn run(args: Args) -> Result<i32> {
     let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
     if outcome.is_err() {
-        // An error can unwind past run_transfer's own ticker shutdown; stop
-        // it here so no progress render races the terminal record below
-        // (the writer additionally seals itself after emit_result).
+        // run_transfer's ticker guard has stopped and joined on every return,
+        // including failures in deferred metadata and deletion finalization.
         progress.stop();
+        progress.finish(false);
         // The error text reaches stderr via main; the stream still gets its
         // terminal record so a consumer never mistakes a handled fatal for a
         // crash (only a real crash leaves the terminal record missing).

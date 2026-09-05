@@ -1,7 +1,7 @@
 //! A fixed-height aggregate progress bar. Byte accounting belongs to the engine.
 
 use std::collections::VecDeque;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,20 +53,32 @@ pub struct Progress {
 }
 
 struct TermState {
-    line: Option<String>,
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
     last_results: Option<Instant>,
 }
 
-impl TermState {
-    fn draw(&mut self, out: &mut impl Write, line: String) -> std::io::Result<()> {
-        if self.line.as_ref() != Some(&line) {
-            out.write_all(format!("\r{line}\x1b[K").as_bytes())?;
-            out.flush()?;
-            self.line = Some(line);
-        }
-        Ok(())
+/// Own the ticker until it has stopped. In particular, `?` must not detach a
+/// thread that can clear or redraw the final bar after a fatal copy error.
+pub struct ProgressTicker {
+    progress: Arc<Progress>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressTicker {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.progress.stop();
+        self.thread.take().map_or(Ok(()), |thread| thread.join())
+    }
+
+    pub fn join(mut self) -> std::thread::Result<()> {
+        self.stop_and_join()
+    }
+}
+
+impl Drop for ProgressTicker {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -98,7 +110,6 @@ impl Progress {
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
             term: Mutex::new(TermState {
-                line: None,
                 samples: VecDeque::from([(Instant::now(), 0)]),
                 last_json: None,
                 last_results: None,
@@ -123,29 +134,11 @@ impl Progress {
 
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
-        let mut term = Some(self.term.lock().unwrap());
-        if std::io::stdout().is_terminal() {
-            self.erase(term.as_mut().unwrap());
-        }
-        // A redirected stdout cannot disturb the terminal display. Let the
-        // ticker keep running while a slow pipe blocks this printing worker.
-        if !std::io::stdout().is_terminal() {
-            drop(term.take());
-        }
-        let result = {
-            let mut out = std::io::stdout().lock();
-            writeln!(out, "{line}").and_then(|()| out.flush())
-        };
-        drop(term);
-        if let Err(error) = result {
-            crate::output::warn_stdout(&error);
-        }
+        crate::output::emit_human_stdout(format_args!("{line}"));
     }
 
-    /// Print a line to stderr (errors and warnings), keeping the progress area intact.
+    /// Print diagnostics through the same output lock as the live bar.
     pub fn eprintln(&self, line: &str) {
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
         crate::output::diagnostic!("{line}");
     }
 
@@ -167,8 +160,6 @@ impl Progress {
     }
 
     pub fn warning(&self, code: &str, count: u64, message: &str) {
-        let mut term = self.term.lock().unwrap();
-        self.erase(&mut term);
         if self.json {
             crate::output::diagnostic!(
                 "{}",
@@ -181,12 +172,6 @@ impl Progress {
             );
         } else {
             crate::output::diagnostic!("syq: warning: {message}");
-        }
-    }
-
-    fn erase(&self, t: &mut TermState) {
-        if t.line.take().is_some() {
-            let _ = write!(std::io::stderr().lock(), "\r\x1b[2K");
         }
     }
 
@@ -336,38 +321,42 @@ impl Progress {
         );
         // Never blank the display between frames or move through worker rows.
         // One buffered write replaces this line and clears only its old tail.
-        let _ = t.draw(&mut std::io::stderr().lock(), line);
+        crate::output::draw_progress(line);
     }
 
     /// Leave the final bar visible. Call after joining the ticker, with the
     /// actual operation outcome; a full byte counter alone is not success.
     pub fn finish(&self, success: bool) {
         self.render_status(Some(if success { "done" } else { "incomplete" }));
-        let mut t = self.term.lock().unwrap();
-        if t.line.take().is_some() {
-            let _ = writeln!(std::io::stderr().lock());
+        if self.enabled {
+            crate::output::finish_progress();
         }
     }
 
     pub fn clear(&self) {
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
+        if self.enabled {
+            crate::output::clear_progress();
+        }
     }
 
-    pub fn spawn_ticker(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
+    pub fn spawn_ticker(self: &Arc<Self>) -> Option<ProgressTicker> {
         // A results stream needs the ticker too: sampled progress records
         // are emitted from render() even when stderr is not a terminal.
         if !self.enabled && !self.json && self.results.get().is_none() {
             return None;
         }
         let p = self.clone();
-        Some(std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             while !p.stop.load(Relaxed) {
                 p.render();
                 std::thread::sleep(Duration::from_millis(100));
             }
             p.clear();
-        }))
+        });
+        Some(ProgressTicker {
+            progress: self.clone(),
+            thread: Some(thread),
+        })
     }
 
     pub fn stop(&self) {
@@ -537,8 +526,7 @@ mod tests {
 
     #[test]
     fn bar_stays_visible_across_sparse_updates_without_scrolling_or_clearing() {
-        let progress = Progress::new(false, false, None, false);
-        let mut term = progress.term.lock().unwrap();
+        let mut term = crate::output::Terminal::default();
         let mut output = Vec::new();
         let first = bar_line(
             79,
@@ -600,5 +588,34 @@ mod tests {
         assert!(scanning.contains("---") && !scanning.contains("100%"));
         let empty = bar_line(79, 0, 0, true, true, "0 B/0 B", &["done".into()]);
         assert!(empty.contains("100%") && empty.contains("done"));
+    }
+
+    #[test]
+    fn ticker_is_joined_when_an_error_leaves_its_scope() {
+        let progress = Progress::new(false, false, None, false);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let p = progress.clone();
+        let done = stopped.clone();
+        let result: Result<(), ()> = (|| {
+            let _ticker = ProgressTicker {
+                progress: progress.clone(),
+                thread: Some(std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !p.stop.load(Relaxed) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(p.stop.load(Relaxed), "ticker was detached on error");
+                    done.store(true, Relaxed);
+                })),
+            };
+            Err(())?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(
+            stopped.load(Relaxed),
+            "finalization must wait for the ticker to exit"
+        );
+        assert_eq!(Arc::strong_count(&progress), 1);
     }
 }
