@@ -767,7 +767,7 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Compare selected contents without writing; differences or inspection errors exit 23
+    /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
     /// Keep existing non-directory entries; still descend into existing directories
