@@ -82,7 +82,9 @@ outlive its premise and steer later work in the wrong direction.
 - Durable task work belongs in commits on the task branch. Changes intended for
   `master` go through a pull request; do not commit them directly on `master` or
   merge task branches from the coordination checkout. Do not merge a pull
-  request unless the user explicitly asks.
+  request unless the user explicitly asks. An explicit `$syq-release`
+  invocation authorizes release preparation and necessary repair PRs into
+  `master` under the release authorization section below.
 - When the conversation is unambiguously about completing the pull request for
   the agent's own task branch, a bare instruction such as "merge" counts as an
   explicit request to merge that pull request into its configured base branch.
@@ -117,6 +119,33 @@ outlive its premise and steer later work in the wrong direction.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
+
+## Release authorization
+
+Releases require the user to explicitly invoke `$syq-release` or select that
+skill in the UI. The skill is committed at
+[`.agents/skills/syq-release/SKILL.md`](.agents/skills/syq-release/SKILL.md)
+with implicit invocation disabled. An ordinary “cut a release” request,
+release-related code, a merge instruction, or a request to create/edit the
+skill does not activate it. Without an invocation, agents may inspect release
+state and prepare requested changes, but must not create or push release tags,
+publish packages or releases, or approve publication deployments. Do not work
+around the gate by using release commands directly.
+
+Invoking the skill authorizes the complete requested release: preparation,
+required fixes, commits, pushes, merging release preparation and necessary
+repair PRs into `master`, CI, signed tagging, publication, eligible environment
+approvals, verification, and recovery within the tag-lifecycle rules. Do not
+ask for further user approvals for these steps. This is a scoped exception to
+the general PR merge rule, not permission to merge unrelated feature work.
+Authorization continues through retries and resumed turns for the same release
+and ends when it completes or is cancelled. Another release requires another
+invocation. Read-only or dry-run invocations stay within their stated scope.
+
+The user chose this explicit invocation boundary to prevent accidental
+publication while allowing an invoked release to finish autonomously. Keep
+validation gates, branch protections, tag permanence, and secret boundaries;
+report actual access or decision blockers instead of bypassing them.
 
 ## Release tag lifecycle
 
