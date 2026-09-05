@@ -144,7 +144,7 @@ while IFS= read -r path; do
     scripts/*|.github/workflows/*|.env.release|deny.toml)
       tooling=true
       ;;
-    *.md|docs/*|use-cases/*|.github/ISSUE_TEMPLATE/*|.github/dependabot.yml|LICENSE|.gitignore|.claude/*)
+    *.md|docs/*|.github/ISSUE_TEMPLATE/*|.github/dependabot.yml|LICENSE|.gitignore|.claude/*)
       ;;
     *)
       # Unknown inputs fail safe until their dependency boundary is explicit.
