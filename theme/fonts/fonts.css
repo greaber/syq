@@ -1,0 +1,7 @@
+@font-face{font-family:"Manrope";font-style:normal;font-weight:400 800;font-display:swap;src:url('{{ resource "fonts/manrope-latin.woff2" }}') format("woff2")}
+@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:400;font-display:swap;src:url('{{ resource "fonts/plexmono-400-latin.woff2" }}') format("woff2")}
+@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:600;font-display:swap;src:url('{{ resource "fonts/plexmono-600-latin.woff2" }}') format("woff2")}
+@font-face{font-family:"Open Sans";font-style:normal;font-weight:400;font-display:swap;src:url('{{ resource "fonts/open-sans-400.woff2" }}') format("woff2")}
+@font-face{font-family:"Open Sans";font-style:normal;font-weight:600;font-display:swap;src:url('{{ resource "fonts/open-sans-600.woff2" }}') format("woff2")}
+@font-face{font-family:"Open Sans";font-style:normal;font-weight:700;font-display:swap;src:url('{{ resource "fonts/open-sans-700.woff2" }}') format("woff2")}
+@font-face{font-family:"Open Sans";font-style:normal;font-weight:800;font-display:swap;src:url('{{ resource "fonts/open-sans-800.woff2" }}') format("woff2")}
