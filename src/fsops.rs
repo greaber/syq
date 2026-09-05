@@ -296,6 +296,31 @@ pub fn resolve(p: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(p))
 }
 
+/// Completion follows the same operator-path symlink policy as the command.
+/// Keep the explicit root check even when following symlinks is requested.
+pub(crate) fn check_completion_directory(
+    directory: &[u8],
+    confined_root: Option<&[u8]>,
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<()> {
+    let path = resolve(directory);
+    OperatorResolver::resolve_process(
+        path.as_os_str().as_bytes(),
+        symlink_policy,
+        OperatorFinalComponent::Directory,
+        false,
+        &mut Vec::new(),
+    )?;
+    if let Some(root) = confined_root {
+        let root = std::fs::canonicalize(resolve(root))?;
+        let directory = std::fs::canonicalize(path)?;
+        if !directory.starts_with(root) {
+            bail!("completion directory is outside the requested root");
+        }
+    }
+    Ok(())
+}
+
 /// A receiver-side selection retained from the ownership walk until it is
 /// either created or made the connection's working directory. Keeping the fd,
 /// rather than just its identity, closes the post-check pathname race.
@@ -2632,6 +2657,7 @@ impl FsOps {
         confined_root: Option<&[u8]>,
         prefix: &[u8],
         requested_limit: u16,
+        symlink_policy: OperatorSymlinkPolicy,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
         if directory.contains(&0)
@@ -2641,13 +2667,7 @@ impl FsOps {
         {
             bail!("invalid completion directory or prefix");
         }
-        if let Some(root) = confined_root {
-            let resolved_root = std::fs::canonicalize(resolve(root))?;
-            let resolved_directory = std::fs::canonicalize(resolve(directory))?;
-            if !resolved_directory.starts_with(&resolved_root) {
-                bail!("completion directory is outside the requested root");
-            }
-        }
+        check_completion_directory(directory, confined_root, symlink_policy)?;
         let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
         if limit == 0 {
             return Ok(Response::DirectoryEntries {
@@ -2673,7 +2693,12 @@ impl FsOps {
             let file_type = item.file_type()?;
             let directory = file_type.is_dir()
                 || (file_type.is_symlink()
-                    && std::fs::metadata(item.path()).is_ok_and(|metadata| metadata.is_dir()));
+                    && check_completion_directory(
+                        item.path().as_os_str().as_bytes(),
+                        confined_root,
+                        symlink_policy,
+                    )
+                    .is_ok());
             entries.push(CompletionEntry { name, directory });
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -5816,7 +5841,14 @@ impl FsOps {
                 confined_root,
                 prefix,
                 limit,
-            } => self.completion_entries(directory, confined_root.as_deref(), prefix, *limit),
+                symlink_policy,
+            } => self.completion_entries(
+                directory,
+                confined_root.as_deref(),
+                prefix,
+                *limit,
+                *symlink_policy,
+            ),
             Request::StatMany {
                 paths,
                 sources,

@@ -2892,6 +2892,7 @@ mod tests {
                 confined_root: None,
                 prefix: b"mar".to_vec(),
                 limit: 10,
+                symlink_policy: crate::proto::OperatorSymlinkPolicy::Refuse,
             })
             .unwrap();
         assert!(
