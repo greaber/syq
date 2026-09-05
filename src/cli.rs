@@ -767,6 +767,18 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Compare selected contents without writing; differences or inspection errors exit 23
+    #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
+    verify_only: bool,
+    /// Keep existing non-directory entries; still descend into existing directories
+    #[arg(long, conflicts_with_all = ["existing", "update", "inplace"])]
+    ignore_existing: bool,
+    /// Update only entries already present; create no missing entries or directories
+    #[arg(long, conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
+    existing: bool,
+    /// Skip regular files newer at the destination; type replacements still occur
+    #[arg(long, conflicts_with_all = ["ignore_existing", "inplace"])]
+    update: bool,
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
@@ -948,8 +960,8 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
-    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
+    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
     long_about = "Copy files and directories locally or over SSH.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
@@ -1363,6 +1375,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         // follow-up), remote dry-run streams are refused up front.
         let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
+        if args.verify_only && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local
+        {
+            bail!(
+                "--verify-only with --results needs --coordinate-at local for a remote-to-remote copy: a receiver receipt cannot attest source comparison claims"
+            );
+        }
         if args.dry_run && src_remote && dst_remote && args.coordinate_at != CoordinateAt::Local {
             bail!(
                 "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
@@ -1694,6 +1712,10 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        verify_only,
+        ignore_existing,
+        existing,
+        update,
         no_compress,
         bwlimit,
         stats,
@@ -1709,6 +1731,10 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.verify_only = verify_only;
+    args.ignore_existing = ignore_existing;
+    args.existing = existing;
+    args.update = update;
     args.no_compress = no_compress;
     if no_compress {
         args.compress = false;

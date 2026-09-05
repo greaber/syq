@@ -26,6 +26,19 @@ of `project` directly into `/backup`, use `--srcs-in`:
 syq cp --srcs-in project --to server --into /backup
 ```
 
+Directories are copied recursively; no recursion flag is needed. Native
+copies preserve modification times. To preserve permissions too, including
+executable permissions on scripts, add `--preserve=permissions`:
+
+```sh
+syq cp --preserve=permissions project --to server --into /backup
+```
+
+The final summary shows transferred and unchanged files and bytes, directories
+created, elapsed time, rate, and errors. Add `-v` for copied paths, `-vv` for
+helper and transport details, or `--stats` for more totals and connection
+statistics. See [understanding a copy result](reference.md).
+
 Use `--dry-run` to preview a summary without copying, or `--dry-run -v`
 to list the planned changes by path.
 Existing destination files are updated when needed. Unrelated files stay

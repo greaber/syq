@@ -36,7 +36,8 @@ For direct restricted remote-to-remote copies, they are derived from the
 verified destination receipt and marked `provenance: "receiver_attested"`.
 Those records arrive after receipt verification. Otherwise remote-to-remote
 results require `--coordinate-at local`, which relays data through your
-machine. Remote-to-remote `--dry-run --results` also requires that local route.
+machine. Remote-to-remote `--dry-run --results` and `--verify-only --results`
+also require that local route.
 
 `--results` supports native `cp` (including pruning) and `rm`. It cannot be
 combined with `--detach`. The restricted receiver supports copy changes,
@@ -90,8 +91,17 @@ seconds), `syq_version`, `mode` (`cp` or `rm`), `dry_run`, and `endpoints`.
 Endpoints identify role, local/SSH kind, and SSH host/user; they omit
 credentials, ports, and raw command arguments.
 
-Copy runs also carry `prune` and `mapping`. Removal has one source endpoint
+Copy runs also carry `prune` and `mapping`. Compare-only runs add optional
+`verify_only: true`; absence means false. Removal has one source endpoint
 regardless of selector count and omits those copy fields.
+
+With `--verify-only`, differences and inspection failures produce `error`
+records and a nonzero terminal status. Matching regular files count as
+`files_unchanged` and `bytes_unchanged`; transfer and creation totals remain
+zero. Successful comparisons do not emit copy operations. Progress bytes
+measure comparison work, not bytes written. As with dry runs, use
+`--coordinate-at local` for JSON comparison results between two remote hosts;
+a receiver receipt cannot attest the source's comparison claims.
 
 ### `progress`
 

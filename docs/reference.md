@@ -5,7 +5,35 @@ syq cp project --into backup
 ```
 
 This copies `project` to `backup/project`. Existing files are updated when
-needed; unrelated files stay.
+needed; unrelated files stay. Directories are copied recursively without a
+special option. Modification times are preserved; permissions are not
+preserved unless requested. For a project with executable scripts, use:
+
+```sh
+syq cp --preserve=permissions project --into backup
+```
+
+Without that option, new files use the source permissions limited by the
+destination umask, and existing files keep their destination permissions.
+`--preserve=permissions` copies the source permission bits in both cases. See
+[metadata preservation](#preserve-metadata) for ownership and special files.
+
+The default final summary reports transferred files and bytes, unchanged
+files and bytes, directories created, elapsed time, rate, and any errors.
+An unchanged file needed no content transfer; by default, matching size and
+modification time are enough to skip it. Progress appears while copying when
+stderr is a terminal.
+
+Add `-v` to list copied paths. `-vv` also explains helper selection and
+transport; `--stats` adds scan totals, excluded-file counts, connection count,
+and available TCP statistics. For example:
+
+```sh
+syq cp -vv --stats --preserve=permissions project --into backup
+```
+
+See [diagnosing a slow copy](speed.md#diagnose-a-slow-copy) for interpreting
+transport and performance details.
 
 ## See where files go
 
@@ -91,6 +119,46 @@ syq cp report.txt --as-new reports/final.txt
 
 `--into` uses or creates a directory. `--as` can rename a directory too.
 Sources that would collide at one destination are refused before copying.
+
+## Choose which existing files to update
+
+By default, selected destination entries are updated when needed.
+These options apply to individual entries inside the copy:
+
+| Option | Behavior |
+|---|---|
+| `--ignore-existing` | Copy missing entries; keep existing files, symlinks, and special nodes |
+| `--existing` | Update existing entries; create no missing entries or directories |
+| `--update` | Skip regular files whose destination modification time is newer |
+
+```sh
+# Import new files without replacing existing files.
+syq cp --ignore-existing --srcs-in incoming --into archive
+
+# Refresh only files already in the destination.
+syq cp --existing --srcs-in project --into deployed
+```
+
+`--ignore-existing` still descends into existing directories and can update
+their metadata. If a source directory meets an existing non-directory,
+it keeps the destination entry and skips that source subtree.
+`--existing` also skips a source directory and its subtree when the destination
+is missing or is not a directory. `--existing` cannot combine with
+`--into-new` or `--as-new`. These policies differ from
+`--into-existing` and `--as-existing`, which check the placement path only.
+
+`--update` compares timestamps, not the age of the contents. It affects only
+regular-file pairs: replacing a different entry type still occurs.
+Combine it with `--existing` to avoid creating missing entries too.
+`--ignore-existing` cannot combine with either policy. Neither
+`--ignore-existing` nor `--update` can combine with `--inplace`: an interrupted
+in-place write could otherwise leave an incomplete file that the next run skips.
+
+These options do not disable `--prune`; requested pruning still removes extras.
+For command-restricted remote-to-remote copies, `--update` is refused because
+the receiver cannot independently enforce the source timestamp claim.
+Use `--coordinate-at local` to make that comparison on your machine.
+The restricted path also refuses `--existing --inplace`.
 
 ## Preview changes
 
@@ -186,8 +254,29 @@ Transferred data is always checked for corruption. For files being changed by
 another program, stop the writer or copy a snapshot. No copy makes the whole
 tree transactional or guarantees durability across power loss.
 
-To compare without writing, use
-[`syq rsync --syq-verify-only`](rsync-compat.md#compare-without-copying).
+To compare without writing, use `--verify-only`:
+
+```sh
+syq cp --verify-only --srcs-in project --into backup
+```
+
+This hashes selected regular files even when size and modification time match,
+compares symlink targets, and checks selected directory and special-file types
+(and device identity). It reports differences and missing entries; either a
+difference or an inspection error makes the run fail. It does not compare
+permissions, ownership, or timestamps, or look for destination-only entries.
+Special files are selected only with `--preserve=specials`.
+
+Source and destination contents stay unchanged; a requested results file is
+still written and remote helper setup may write cache files. Verification
+cannot combine with `--dry-run`, `--prune`, `--inplace`, or overwrite policies.
+Filters and size limits still select what is compared. Matching regular files
+appear as unchanged in [automation results](automation.md); no files or bytes
+are reported as transferred.
+
+Restricted remote-to-remote verification requires an existing receiver
+enrollment; it will not install one. Use `--coordinate-at local` to compare
+through your machine, including when you need comparison results in JSON.
 
 ## Preserve metadata
 

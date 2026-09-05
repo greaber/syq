@@ -347,6 +347,38 @@ assert_same_tree \
     destination /tmp/syq-real-ssh/direct-destination \
     direct
 
+printf 'case: native verification and overwrite policies through the restricted receiver\n'
+syq cp --verify-only --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination
+ssh source 'printf source > /tmp/syq-real-ssh/direct-source/policy-file; printf new > /tmp/syq-real-ssh/direct-source/policy-new'
+ssh destination 'printf destination > /tmp/syq-real-ssh/direct-destination/policy-file'
+syq cp --ignore-existing --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination
+ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = destination; test "$(cat /tmp/syq-real-ssh/direct-destination/policy-new)" = new; rm /tmp/syq-real-ssh/direct-destination/policy-new'
+syq cp --existing --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination
+ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
+policy_status=0
+syq cp --verify-only --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
+test "$policy_status" -eq 23
+ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
+policy_status=0
+syq cp --update --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
+test "$policy_status" -ne 0
+ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
+ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'
+syq cp --update --coordinate-at local --no-progress -j 2 \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
+    --to destination --into /tmp/syq-real-ssh/direct-destination
+ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
+
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress -j 2 --preserve=permissions \

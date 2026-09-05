@@ -305,6 +305,7 @@ class AutomationDecoder:
                 started_at=_integer(record, "started_at"),
                 syq_version=_string(record, "syq_version"),
                 mode=mode,
+                verify_only=_boolean(record, "verify_only") if "verify_only" in record else False,
                 prune=prune,
                 mapping=mapping,
                 dry_run=dry_run,

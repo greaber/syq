@@ -1396,6 +1396,7 @@ pub fn run(args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let dry_run = args.dry_run;
+    let verify_only = args.verify_only;
     let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
     if outcome.is_err() {
@@ -1411,7 +1412,11 @@ pub fn run(args: Args) -> Result<i32> {
                 status: "failed",
                 exit_code: 1,
                 dry_run,
-                files_transferred: progress.files_done.load(Relaxed),
+                files_transferred: if verify_only {
+                    0
+                } else {
+                    progress.files_done.load(Relaxed)
+                },
                 files_unchanged: progress.files_unchanged.load(Relaxed),
                 files_excluded: progress.files_excluded.load(Relaxed),
                 // Mutations that settled (and streamed their records)
@@ -1420,7 +1425,11 @@ pub fn run(args: Args) -> Result<i32> {
                 symlinks_created: progress.symlinks_created.load(Relaxed),
                 specials_created: progress.specials_created.load(Relaxed),
                 errors: progress.errors.load(Relaxed),
-                bytes_transferred: progress.bytes_done.load(Relaxed),
+                bytes_transferred: if verify_only {
+                    0
+                } else {
+                    progress.bytes_done.load(Relaxed)
+                },
                 bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
                 // What the deletion pass did before the run died; zeros
@@ -3136,7 +3145,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         status,
         exit_code,
         dry_run: opts.dry_run,
-        files_transferred: progress.files_done.load(Relaxed),
+        files_transferred: if opts.verify_only {
+            0
+        } else {
+            progress.files_done.load(Relaxed)
+        },
         files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: progress.files_excluded.load(Relaxed),
         // Live counters only move when mutations run; a dry run reports the
@@ -3157,7 +3170,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             created_counts.2
         },
         errors,
-        bytes_transferred: progress.bytes_done.load(Relaxed),
+        bytes_transferred: if opts.verify_only {
+            0
+        } else {
+            progress.bytes_done.load(Relaxed)
+        },
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned,
@@ -3216,8 +3233,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         } else if opts.verify_only {
             crate::output::human_stdout!(
-                "syq: verified {} files, {} differ/missing, {} in {}",
-                commas(progress.files_done.load(Relaxed) + errors),
+                "syq: verified {} files match, {} differences or errors, checked {} in {}",
+                commas(terminal.files_unchanged),
                 errors,
                 human(done),
                 crate::progress::hms(elapsed)
@@ -3241,6 +3258,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "logical bytes needing content work",
                     "logical bytes with unchanged content",
                     progress.bytes_total.load(Relaxed),
+                )
+            } else if opts.verify_only {
+                (
+                    "regular files to compare",
+                    "regular files matched",
+                    "bytes checked",
+                    "bytes matched",
+                    done,
                 )
             } else {
                 (
@@ -7451,6 +7476,11 @@ impl Worker {
         os_kind: Option<&'static str>,
         message: &str,
     ) {
+        // Verification reports differences and inspection failures as errors,
+        // never as a transfer operation that could be mistaken for a write.
+        if self.opts.verify_only {
+            return;
+        }
         if let Some(results) = self.progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
                 action: "transfer_file",
@@ -8192,6 +8222,10 @@ impl Worker {
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
                 self.progress.files_done.fetch_add(1, Relaxed);
+                self.progress.files_unchanged.fetch_add(1, Relaxed);
+                self.progress
+                    .bytes_unchanged
+                    .fetch_add(job.entry.size, Relaxed);
                 if self.opts.verbose > 0 {
                     self.progress.println(&format!("ok      {}", job.rel));
                 }
