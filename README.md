@@ -27,15 +27,16 @@ cargo build --locked --release
 ```
 
 Local edits work without a commit or published branch. A source build uploads
-its running executable to compatible remote hosts; OS, CPU, and required
-system libraries must match. This caches a helper for syq's own use, not a
-`syq` command on the remote `PATH`. Source builds do not check for release
-updates or support `--self-update`.
+its running executable to compatible SSH hosts automatically; OS, CPU, and
+required system libraries must match.
 
-For another platform, build the same commit and source changes there. Both
-binaries must report the same `--build-identity`. Select that remote executable
-with `--syq-path /path/to/syq`, or use `--no-bootstrap` when it is already on
-the remote `PATH` (rsync mode: `--rsync-path` or `--syq-no-bootstrap`).
+Direct server-to-server copies use a separate restricted receiver. The first
+copy can enroll it automatically, but after rebuilding, repeat
+`./target/release/syq receiver enroll hostB:/archive` to update an existing
+receiver. The local executable must run on hostB.
+
+See [Developing syq](docs/development.md) for the rebuild/copy workflow,
+manual setup on another platform, and checks to run before a pull request.
 
 ## License
 
