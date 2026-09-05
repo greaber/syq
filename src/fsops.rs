@@ -33,8 +33,9 @@ const SOURCE_FD_RESERVE: usize = 32;
 // transport socket in a TCP serving process, and open one uncached source file
 // for HashBlocks or FileHash. Those operations are sequential per worker, so
 // one uncached descriptor is the peak. Local source workers have no transport
-// themselves and retain only three client-side copies of a destination TCP
-// socket, but budget the larger remote-source shape for both shared variants.
+// themselves and retain three client-side copies of a destination TCP socket
+// (four with coordinated cancellation), but budget the larger remote-source
+// shape for both shared variants.
 const SOURCE_TCP_TRANSPORT_FDS: usize = 5;
 const SOURCE_UNCACHED_FILE_FDS: usize = 1;
 const SOURCE_SHARED_WORKER_FD_RESERVE: usize =

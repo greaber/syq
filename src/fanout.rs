@@ -2,7 +2,7 @@
 //!
 //! Each member uses the single-target transfer engine. The group shares the
 //! descriptor-backed source scan, holds every destination mutation behind one
-//! barrier, and cancels all peer schedulers after a fatal member failure.
+//! barrier, and cancels peer schedulers and owned transports after a fatal failure.
 
 use crate::bwlimit::BandwidthLimit;
 use crate::cli::{Args, Location};
