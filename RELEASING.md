@@ -133,6 +133,16 @@ git config --local tag.gpgSign true
 Agent forwarding lets the server request signatures for the duration of the
 connection, so enable it only for a trusted release host rather than globally.
 
+## Agent-driven releases
+
+Explicitly invoke `$syq-release` to authorize an agent to perform a release.
+The [release skill](.agents/skills/syq-release/SKILL.md) is configured for
+explicit invocation only. Its invocation covers the complete operation,
+including preparation and repair PR merges, CI, tag creation, publication,
+eligible environment approvals, and verification without repeated user
+confirmations. An ordinary release request or merge instruction does not
+activate publication. Validation and repository protections still apply.
+
 ## Cutting a release
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh

@@ -8,7 +8,7 @@
 //! next command over a Unix socket beside the control socket.
 //!
 //! Two invariants keep it simple and safe. The pool never reads from a
-//! session: it writes the hello and watches the pipe for hang-up only, so a
+//! session: it writes the hello and checks the child for exit only, so a
 //! taken session is byte-for-byte what a fresh one would be, and the command
 //! completes the hello itself. And the pool never authenticates: a spare is
 //! attached to a live master with every authentication method disabled, so a
@@ -222,28 +222,50 @@ pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
 /// Ask a running pool to exit, wait for it, and remove its files. A pool
 /// that is not running leaves only stale files, which are removed too.
 pub(crate) fn stop(control: &Path) -> Result<()> {
-    if is_running(control) {
-        if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
-            let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
-            let request = ClientRequest {
-                identity: crate::identity::build().to_string(),
-                program: None,
-                exit: true,
-            };
-            let mut line = serde_json::to_vec(&request)?;
-            line.push(b'\n');
-            let _ = stream.write_all(&line);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    let mut requested = false;
+    while is_running(control) {
+        if Instant::now() >= deadline {
+            bail!(
+                "session pool for {} did not exit",
+                control.file_name().unwrap_or_default().to_string_lossy()
+            );
         }
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while is_running(control) {
-            if Instant::now() >= deadline {
-                bail!(
-                    "session pool for {} did not exit",
-                    control.file_name().unwrap_or_default().to_string_lossy()
-                );
+        // Startup holds the lock before binding the socket. Retry delivery
+        // within the stop deadline instead of waiting on an unsent request.
+        if !requested {
+            if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
+                let timeout =
+                    CLIENT_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+                if timeout.is_zero() {
+                    continue;
+                }
+                stream.set_write_timeout(Some(timeout))?;
+                stream.set_read_timeout(Some(timeout))?;
+                let request = ClientRequest {
+                    identity: crate::identity::build().to_string(),
+                    program: None,
+                    exit: true,
+                };
+                let mut line = serde_json::to_vec(&request)?;
+                line.push(b'\n');
+                if stream.write_all(&line).is_ok() {
+                    // Keep the connection open until the pool consumes the
+                    // request. Closing a queued Unix connection can discard
+                    // its unread data on macOS.
+                    requested = receive_message(stream.as_raw_fd(), MAX_MESSAGE)
+                        .ok()
+                        .and_then(|(payload, descriptors)| {
+                            if !descriptors.is_empty() {
+                                return None;
+                            }
+                            serde_json::from_slice::<PoolReply>(&payload).ok()
+                        })
+                        .is_some_and(|reply| reply.status == "exiting");
+                }
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
     for path in [socket_path(control), lock_path(control)] {
         match fs::symlink_metadata(&path) {
@@ -368,28 +390,15 @@ impl Pool {
             if let Verdict::Exit = self.housekeeping() {
                 return Ok(());
             }
-            // Spares are watched for hang-up only: a readable pipe just
-            // holds the hello reply the taker will read.
-            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(1 + self.spares.len());
-            fds.push(libc::pollfd {
+            // Check child exits during housekeeping without consuming the
+            // hello reply. Darwin does not monitor poll entries with events=0.
+            let mut listener = libc::pollfd {
                 fd: self.listener.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
-            });
-            for spare in &self.spares {
-                fds.push(libc::pollfd {
-                    fd: spare.stdout.as_raw_fd(),
-                    events: 0,
-                    revents: 0,
-                });
-            }
-            let ready = unsafe {
-                libc::poll(
-                    fds.as_mut_ptr(),
-                    fds.len() as libc::nfds_t,
-                    HOUSEKEEPING.as_millis() as libc::c_int,
-                )
             };
+            let ready =
+                unsafe { libc::poll(&mut listener, 1, HOUSEKEEPING.as_millis() as libc::c_int) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -397,18 +406,7 @@ impl Pool {
                 }
                 return Err(error).context("poll session pool descriptors");
             }
-            let hung_up = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-            for (index, pollfd) in fds.iter().enumerate().skip(1).rev() {
-                if pollfd.revents & hung_up != 0 {
-                    let mut spare = self.spares.remove(index - 1);
-                    let _ = spare.child.kill();
-                    let _ = spare.child.wait();
-                    // spawn can succeed before SSH refuses the session or
-                    // the helper exits. Back off these failures too.
-                    self.last_failure = Some(Instant::now());
-                }
-            }
-            if fds[0].revents & libc::POLLIN != 0 {
+            if listener.revents & libc::POLLIN != 0 {
                 loop {
                     match self.listener.accept() {
                         Ok((stream, _)) => {
@@ -426,6 +424,13 @@ impl Pool {
     }
 
     fn housekeeping(&mut self) -> Verdict {
+        for index in (0..self.spares.len()).rev() {
+            if matches!(self.spares[index].child.try_wait(), Ok(Some(_))) {
+                self.spares.remove(index);
+                // An SSH process can start and then refuse the session.
+                self.last_failure = Some(Instant::now());
+            }
+        }
         self.handed
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         if self.last_handoff.elapsed() >= self.idle {
@@ -548,7 +553,6 @@ impl Pool {
     }
 
     fn handle_client(&mut self, mut stream: UnixStream) -> Verdict {
-        let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
         if peer_uid(&stream).ok() != Some(unsafe { libc::geteuid() }) {
             return Verdict::Continue;
@@ -666,6 +670,10 @@ fn greet_spare(child: &mut Child) -> Result<(File, File, File)> {
 
 /// One request line, read a byte at a time so nothing beyond it is consumed.
 fn read_request(stream: &mut UnixStream) -> Option<ClientRequest> {
+    // BSD accepts inherit the listener's nonblocking mode. The request can
+    // arrive after accept, so use bounded blocking I/O on the client stream.
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok()?;
     let mut line = Vec::new();
     let mut byte = [0u8];
     loop {
@@ -766,6 +774,60 @@ mod tests {
         }
         stop(&control).unwrap();
         assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn stop_waits_for_a_starting_pool_to_bind_its_socket() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        let held = try_lock(&control, true).unwrap().unwrap();
+        let socket = socket_path(&control);
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        assert!(read_request(&mut stream).unwrap().exit);
+                        let reply = serde_json::to_vec(&PoolReply {
+                            status: "exiting".into(),
+                            identity: crate::identity::build().to_string(),
+                        })
+                        .unwrap();
+                        send_message(stream.as_raw_fd(), &reply, &[]).unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no stop request arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept stop request: {error}"),
+                }
+            }
+            drop(held);
+        });
+        let stopped = stop(&control);
+        starter.join().unwrap();
+        stopped.unwrap();
+        assert!(!socket_path(&control).exists());
+        assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn a_nonblocking_client_waits_for_the_rest_of_its_request() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"{\"identity\":\"test\",").unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"\"exit\":true}\n").unwrap();
+        });
+        let request = read_request(&mut server).expect("complete delayed request");
+        assert!(request.exit);
+        assert_eq!(request.identity, "test");
+        sender.join().unwrap();
     }
 
     #[test]

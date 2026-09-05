@@ -1,0 +1,6 @@
+interface:
+  display_name: "Release syq"
+  short_description: "Explicitly authorize and complete a syq release"
+  default_prompt: "Use $syq-release to complete the next syq release, including required fixes, PR merges, validation, and publication."
+policy:
+  allow_implicit_invocation: false
