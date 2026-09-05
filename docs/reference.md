@@ -72,6 +72,25 @@ resolution, known-host lookup, automatic enrollment, and later enrollment
 reuse. A local path containing `:` stays local because native mode never
 guesses endpoints from path text.
 
+A **placement** specifies the destination path and how to use it. `--into DIR`
+puts selected names inside a directory (`foo` becomes `DIR/foo`); `--as PATH`
+copies one named object to that exact path. The `-new` and `-existing` variants
+also require the destination to be absent or present.
+
+For remote copies, omitting placement defaults to `--into .` at the destination:
+
+```sh
+syq cp foo --to j5        # copy foo into your home directory on j5
+syq cp --from j5 foo      # copy foo from j5's home into your local current directory
+```
+
+With both `--from` and `--to`, the default is the destination host's home
+directory. `--cwd` changes only the source base, not this destination default.
+`--prune` always requires an explicit placement, even for remote copies.
+Matching destination files may be overwritten; use `--dry-run` to preview a copy.
+Local-only copies still require a placement option; bare paths always select
+sources, so `syq cp foo bar` does not treat `bar` as a destination.
+
 In `cp`, finish the source specification before starting the destination. The
 source endpoint, `--cwd` or `--root`, every positional or `--src*` selector,
 and `--mapping` must all appear before the first `--to` or placement option.
@@ -268,7 +287,7 @@ destination changes, with guidance to reduce selectors or `--connections`.
 syq promises no particular minimum limit; the transports and the files
 already open in the invoking environment count against the same limit.
 
-Placement is always explicit:
+Placement options choose the destination path and how to use it:
 
 | Placement | Mapping | Destination precondition |
 |---|---|---|

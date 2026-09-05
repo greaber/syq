@@ -446,7 +446,7 @@ impl Args {
                 Ok(args)
             },
             _ => bail!(
-                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `receiver`); rsync-shaped syntax now starts with `syq rsync`"
+                "unrecognized command or option {command:?}; run `syq --help` for commands and standalone options such as `--self-update`"
             ),
         }
     }
@@ -899,7 +899,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Destination endpoint ([USER@]HOST[:PORT]); without --into/--as, copy into its home directory
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
@@ -948,10 +948,10 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Destination-only objects remain unless --prune is selected.\nSource arguments must precede destination arguments.",
-    before_help = "Examples:\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] SOURCE... PLACEMENT"
+    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
+    long_about = "Copy files and directories locally or over SSH.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -1254,8 +1254,12 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
+        None if prune => bail!("--prune requires an explicit placement, such as --into DIR"),
+        None if copy.to.is_some() || copy.selection.from.is_some() => {
+            (Some(OsString::from(".")), Placement::Into, Existence::Any)
+        }
         None => bail!(
-            "syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
+            "local-only syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
         ),
     };
     if placement == Placement::As && mapping.is_some() {
@@ -2568,6 +2572,39 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn native_remote_copy_default_placement_and_prune_guard() {
+        use super::Existence;
+        use std::ffi::OsString;
+        for argv in [
+            vec!["foo", "--to", "j5"],
+            vec!["foo", "--from", "j5"],
+            vec!["--from", "j5", "foo"],
+            vec!["--from", "j5", "foo", "--to", "j6"],
+            vec!["--from", "j5", "--mapping", "manifest"],
+        ] {
+            let argv = argv.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let args = parse_native_copy(&argv).unwrap();
+            assert_eq!(args.placement, Placement::Into);
+            assert_eq!(args.target_existence, Existence::Any);
+            assert_eq!(args.locations.last().unwrap().path, b".");
+            let mut pruning = argv;
+            // Mapping has a separate clap-level conflict with --prune.
+            if pruning.iter().any(|arg| arg == "--mapping") {
+                continue;
+            }
+            pruning.push(OsString::from("--prune"));
+            let error = parse_native_copy(&pruning).unwrap_err().to_string();
+            assert!(
+                error.contains("--prune requires an explicit placement"),
+                "{error}"
+            );
+            pruning.extend(["--into", "."].map(OsString::from));
+            assert!(parse_native_copy(&pruning).unwrap().delete);
+        }
+        assert!(parse_native_copy(&[OsString::from("foo")]).is_err());
     }
 
     #[test]

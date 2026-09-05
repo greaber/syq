@@ -7728,6 +7728,64 @@ fn native_rm_endpoint_conflicts_have_the_same_local_and_remote_classification() 
 }
 
 #[test]
+fn native_remote_copy_omitted_placement_uses_destination_base() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    // Real SSH starts commands in the remote user's home directory.
+    let script = fs::read_to_string(&ssh)
+        .unwrap()
+        .replace("exec /bin/sh -c", "cd \"$HOME\" || exit 1\nexec /bin/sh -c");
+    executable(&ssh, script.as_bytes());
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    fs::create_dir_all(t.path("local-dest")).unwrap();
+    // Exercise both the small-copy optimization and the full engine.
+    for engine in [false, true] {
+        let name = if engine { "engine" } else { "small" };
+        write(&t.path(&format!("sources/{name}")), b"uploaded");
+        let run = |args: &[&str]| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .current_dir(t.path("local-dest"))
+                .args([
+                    "cp",
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-tcp",
+                    "-q",
+                ])
+                .args(args)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                );
+            if engine {
+                command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+            }
+            let output = command.run().unwrap();
+            assert!(output.status.success(), "{}", stderr_of(&output));
+        };
+        run(&["-C", &t.s("sources"), name, "--to", "fake.example"]);
+        assert_eq!(read(&t.path(&format!("remote-home/{name}"))), b"uploaded");
+        run(&[name, "--from", "fake.example"]);
+        assert_eq!(read(&t.path(&format!("local-dest/{name}"))), b"uploaded");
+        write(
+            &t.path(&format!("remote-home/tree-{name}/child")),
+            b"contents",
+        );
+        run(&[
+            "--from",
+            "fake.example",
+            "--srcs-in",
+            &format!("tree-{name}"),
+        ]);
+        assert_eq!(read(&t.path("local-dest/child")), b"contents");
+    }
+}
+
+#[test]
 fn native_copy_supports_all_six_placements() {
     let t = Tmp::new();
     for source in [
@@ -7820,6 +7878,23 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
 }
 
 #[test]
+fn unknown_root_option_reports_standalone_options_and_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--self-updat")
+        .run()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = stderr_of(&output);
+    assert!(
+        error.contains("unrecognized command or option \"--self-updat\""),
+        "{error}"
+    );
+    assert!(error.contains("--self-update"), "{error}");
+    assert!(error.contains("syq --help"), "{error}");
+    assert!(!error.contains("rsync-shaped"), "{error}");
+}
+
+#[test]
 fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
     let positional = native_syq(&["cp", "foo", "bar", "dst"]);
     assert!(!positional.status.success());
@@ -7834,14 +7909,14 @@ fn native_rejects_positional_destinations_implicit_verbs_and_compat_flags() {
         .run()
         .unwrap();
     assert_eq!(implicit.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&implicit.stderr).contains("expected a command"));
+    assert!(String::from_utf8_lossy(&implicit.stderr).contains("unrecognized command or option"));
 
     let removed = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp-prune", "source", "--into", "dest"])
         .run()
         .unwrap();
     assert_eq!(removed.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&removed.stderr).contains("expected a command"));
+    assert!(String::from_utf8_lossy(&removed.stderr).contains("unrecognized command or option"));
 
     for args in [
         ["cp", "-a", "source", "--into", "dest"].as_slice(),
