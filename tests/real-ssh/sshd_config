@@ -22,6 +22,7 @@ AllowTcpForwarding no
 X11Forwarding no
 PermitTunnel no
 PermitUserEnvironment no
+AcceptEnv SYQ_REAL_SSH_SENT_ENV
 GatewayPorts no
 PermitTTY no
 

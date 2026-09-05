@@ -31,6 +31,7 @@ Host source destination
     UserKnownHostsFile /home/syq/.ssh/known_hosts
     GlobalKnownHostsFile /dev/null
     UpdateHostKeys no
+    SendEnv SYQ_REAL_SSH_SENT_ENV
 EOF
 chmod 0600 "$config"
 
@@ -109,6 +110,14 @@ fi
 
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
+# Observe the environment at the remote helper, after real SendEnv/AcceptEnv
+# processing. The helper still executes the candidate syq binary unchanged.
+ssh source 'cat > /tmp/syq-real-ssh/completion-helper; chmod 0700 /tmp/syq-real-ssh/completion-helper' <<'EOF'
+#!/bin/sh
+printf '%s\n' "${SYQ_REAL_SSH_SENT_ENV-unset}" >> /tmp/syq-real-ssh/completion-env.log
+exec /usr/local/bin/syq "$@"
+EOF
+export SYQ_REAL_SSH_SENT_ENV=pool-original
 trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
 syq persist on >/dev/null
@@ -120,7 +129,7 @@ completion_expected=/tmp/syq-real-ssh-completion.expected
 } >"$completion_expected"
 complete_remote() {
     syq completion __complete fish 6 -- \
-        syq cp --syq-path /usr/local/bin/syq --from source \
+        syq cp --syq-path /tmp/syq-real-ssh/completion-helper --from source \
         /tmp/syq-real-ssh/completion/al >"$completion_output"
     cmp "$completion_expected" "$completion_output"
 }
@@ -150,22 +159,33 @@ open_spares() {
 }
 complete_remote
 test "$(direct_logins)" -eq 1
-n=0
-while [ "$(open_spares)" -lt 1 ] && [ "$n" -lt 150 ]; do
+deadline=$(($(date +%s) + 15))
+next_progress=$(($(date +%s) + 5))
+while :; do
+    spares=$(open_spares)
+    if [ "$spares" -ge 1 ]; then
+        break
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+        echo "session pool readiness timed out: open_spares=$spares" >&2
+        cat "$trace" >&2
+        exit 1
+    fi
+    if [ "$now" -ge "$next_progress" ]; then
+        echo "waiting for session pool: open_spares=$spares" >&2
+        next_progress=$((now + 5))
+    fi
     sleep 0.1
-    n=$((n + 1))
 done
-if [ "$(open_spares)" -lt 1 ]; then
-    echo 'session pool did not open a spare through the persistent master:' >&2
-    cat "$trace" >&2
-    exit 1
-fi
 syq persist status | grep -q 'session pool' || {
     echo 'persist status does not show the session pool:' >&2
     syq persist status >&2
     exit 1
 }
-# Later completions take the ready session: no login of their own.
+# Later completions take the ready session: no login of their own, and
+# their changed environment does not replace the pool's inherited values.
+export SYQ_REAL_SSH_SENT_ENV=caller-changed
 complete_remote
 complete_remote
 if [ "$(direct_logins)" -ne 1 ]; then
@@ -176,6 +196,31 @@ fi
 test "$(syq completion cache list)" = source
 syq completion cache clear >/dev/null
 syq persist off >/dev/null
+
+ssh source 'cat /tmp/syq-real-ssh/completion-env.log' > /tmp/syq-real-ssh-completion-env.out
+awk '
+    $0 != "pool-original" { bad = 1 }
+    END { exit (bad || NR < 2) }
+' /tmp/syq-real-ssh-completion-env.out || {
+    echo 'pooled helper did not keep the spawning environment:' >&2
+    cat /tmp/syq-real-ssh-completion-env.out >&2
+    exit 1
+}
+printf 'case: direct SSH helper sees the current SendEnv value\n'
+complete_remote
+test "$(ssh source 'tail -n 1 /tmp/syq-real-ssh/completion-env.log')" = caller-changed
+printf 'case: restarting persistence adopts the new environment\n'
+ssh source ': > /tmp/syq-real-ssh/completion-env.log'
+syq persist on >/dev/null
+complete_remote
+syq persist off >/dev/null
+ssh source 'cat /tmp/syq-real-ssh/completion-env.log' > /tmp/syq-real-ssh-completion-env.out
+awk '
+    $0 != "caller-changed" { bad = 1 }
+    END { exit (bad || NR < 1) }
+' /tmp/syq-real-ssh-completion-env.out
+unset SYQ_REAL_SSH_SENT_ENV
+syq completion cache clear >/dev/null
 
 printf 'case: small native push to an ordinary SSH destination takes one turn\n'
 small_source=/tmp/syq-real-ssh-small.bin
