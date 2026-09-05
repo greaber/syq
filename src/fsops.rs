@@ -4202,6 +4202,12 @@ fn fail_set_meta_for_test(p: &Path) -> Result<()> {
 fn fail_apply_capacity_for_test(p: &Path) -> Result<()> {
     if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_APPLY_ENOSPC") {
         if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
+            test_race_barrier(
+                "SYQ_TEST_CAPACITY_FAILURE_READY_FILE",
+                "SYQ_TEST_CAPACITY_FAILURE_CONTINUE_FILE",
+                "SYQ_TEST_HOLD_CAPACITY_FAILURE_MS",
+                "capacity-failure-ready",
+            )?;
             return Err(io::Error::from_raw_os_error(libc::ENOSPC))
                 .with_context(|| format!("apply {}: injected capacity failure", p.display()));
         }

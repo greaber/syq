@@ -238,6 +238,15 @@ impl Sched {
         self.tune_cv.notify_one();
     }
 
+    /// Backoff and bandwidth waits must release promptly on peer failure.
+    pub fn wait_for_abort(&self, duration: Duration) -> bool {
+        self.cv
+            .wait_timeout_while(self.inner.lock().unwrap(), duration, |inner| !inner.abort)
+            .unwrap()
+            .0
+            .abort
+    }
+
     pub fn is_aborted(&self) -> bool {
         self.inner.lock().unwrap().abort
     }

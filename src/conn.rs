@@ -1,5 +1,6 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
+use crate::cancellation::{self, Cancellation, Registration, TrackedChild};
 use crate::fsops::{self, FsOps};
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
@@ -12,7 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Conn: Send {
@@ -589,7 +590,7 @@ impl Conn for LocalConn {
 }
 
 pub struct RemoteConn {
-    child: Option<Child>,
+    child: Option<TrackedChild>,
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
@@ -603,6 +604,7 @@ pub struct RemoteConn {
     /// A session taken from the session pool: no child of ours to wait for,
     /// and a reader that ends when the remote closes the pipe.
     detached: bool,
+    socket_registration: Option<Registration>,
 }
 
 const READ_AHEAD: usize = 4;
@@ -702,6 +704,7 @@ impl RemoteConn {
             tcp_socket: None,
             multiplexed_ssh: false,
             detached: true,
+            socket_registration: None,
         }
     }
 
@@ -897,8 +900,9 @@ impl Drop for RemoteConn {
         }
         self.rx.take();
         if let Some(child) = &mut self.child {
-            let _ = child.wait();
+            child.finish();
         }
+        self.socket_registration.take();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -1220,6 +1224,7 @@ pub struct RemoteSpec {
     /// the control connection to consume. An empty result also prevents
     /// descriptor receipt during the later parallel connect.
     pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<PrimedControl>>,
+    pub(crate) cancellation: Option<std::sync::Arc<Cancellation>>,
 }
 
 #[derive(Debug, Default)]
@@ -1230,6 +1235,12 @@ pub(crate) enum PrimedControl {
 }
 
 impl RemoteSpec {
+    fn check_cancelled(&self) -> Result<()> {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        Ok(())
+    }
     pub fn local_receiver(quiet: bool) -> Self {
         Self {
             local_process: true,
@@ -1246,6 +1257,7 @@ impl RemoteSpec {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         }
     }
 
@@ -1391,6 +1403,12 @@ impl RemoteSpec {
     /// process reads the reply. Anything short of a usable session is a
     /// reason to connect directly, never an error.
     fn take_pooled_control(&self, compress: bool) -> Option<RemoteConn> {
+        // A pooled session is owned by another process. Coordinated copies
+        // need an owned channel to interrupt setup and I/O on peer failure;
+        // they still reuse the persistent SSH master through normal sessions.
+        if self.cancellation.is_some() {
+            return None;
+        }
         if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
             return conn.take().map(|conn| *conn);
         }
@@ -1509,6 +1527,7 @@ impl RemoteSpec {
                 return Ok(conn);
             }
         }
+        self.check_cancelled()?;
         let first = self.connect_retried(compress, limited, role.clone());
         let Err(first_error) = first else {
             return first;
@@ -1537,7 +1556,9 @@ impl RemoteSpec {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
         for attempt in 0..6 {
+            self.check_cancelled()?;
             let _slot = limited.then(connect_slot);
+            self.check_cancelled()?;
             let ssh_connection = self.ssh_connection(limited);
             match self.connect_once(compress, ssh_connection, role.clone()) {
                 Ok(c) => return Ok(c),
@@ -1579,7 +1600,11 @@ impl RemoteSpec {
                         );
                     }
                     last = Some(e);
-                    std::thread::sleep(delay);
+                    if let Some(cancellation) = &self.cancellation {
+                        cancellation.sleep(delay)?;
+                    } else {
+                        std::thread::sleep(delay);
+                    }
                     delay *= 2;
                 }
             }
@@ -1593,6 +1618,7 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        self.check_cancelled()?;
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
@@ -1623,13 +1649,14 @@ impl RemoteSpec {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = cmd.spawn().with_context(|| {
-            if self.local_process {
-                "spawn local receiver".to_string()
-            } else {
-                format!("spawn {:?}", self.rsh[0])
-            }
-        })?;
+        let mut child =
+            cancellation::spawn(&mut cmd, self.cancellation.as_ref()).with_context(|| {
+                if self.local_process {
+                    "spawn local receiver".to_string()
+                } else {
+                    format!("spawn {:?}", self.rsh[0])
+                }
+            })?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (rx, reader) = spawn_reader(Box::new(stdout));
@@ -1644,6 +1671,7 @@ impl RemoteSpec {
             tcp_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
             detached: false,
+            socket_registration: None,
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
@@ -1861,7 +1889,8 @@ impl RemoteSpec {
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());
         }
-        let out = Command::new(&self.rsh[0])
+        let mut command = Command::new(&self.rsh[0]);
+        command
             .args(&self.rsh[1..])
             .arg("-G")
             .args(
@@ -1870,9 +1899,8 @@ impl RemoteSpec {
                     .unwrap_or_default(),
             )
             .arg("--")
-            .arg(&self.host)
-            .output()
-            .ok()?;
+            .arg(&self.host);
+        let out = cancellation::output(&mut command, self.cancellation.as_ref()).ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.lines()
             .find_map(|l| l.strip_prefix("hostname "))
@@ -1894,6 +1922,7 @@ impl RemoteSpec {
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         let mut last = anyhow!("no data address");
         for k in 0..n {
+            self.check_cancelled()?;
             let addr = &info.addrs[(start + k) % n];
             let resolved: Vec<_> = match (addr.as_str(), info.port).to_socket_addrs() {
                 Ok(it) => it.collect(),
@@ -1906,6 +1935,7 @@ impl RemoteSpec {
             // unreachable family first).
             let mut got = None;
             for sa in &resolved {
+                self.check_cancelled()?;
                 match connect_tcp_stream(
                     sa,
                     std::time::Duration::from_secs(4),
@@ -1942,6 +1972,12 @@ impl RemoteSpec {
                     self.label()
                 );
             }
+            let socket_registration = self
+                .cancellation
+                .as_ref()
+                .map(|token| token.socket(&stream))
+                .transpose()?;
+            self.check_cancelled()?;
             stream.set_nodelay(true)?;
             let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (&stream).write_all(&conn_id.to_be_bytes())?;
@@ -1967,6 +2003,7 @@ impl RemoteSpec {
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
                 detached: false,
+                socket_registration,
             };
             let conn = hello(conn, compress, info.token.clone(), role.clone())?;
             self.record_peer(&conn);
@@ -2217,8 +2254,7 @@ impl RemoteSpec {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = cmd
-            .output()
+        let out = cancellation::output(&mut cmd, self.cancellation.as_ref())
             .with_context(|| format!("probe platform on {}", self.label()))?;
         if !out.status.success() {
             bail!(
@@ -2306,8 +2342,7 @@ impl RemoteSpec {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
+        let mut child = cancellation::spawn(&mut cmd, self.cancellation.as_ref())
             .with_context(|| format!("start helper download on {}", self.label()))?;
         let mut stdin = child
             .stdin
@@ -2430,8 +2465,7 @@ impl RemoteSpec {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
+        let mut child = cancellation::spawn(&mut cmd, self.cancellation.as_ref())
             .with_context(|| format!("start helper upload to {}", self.label()))?;
         let mut stdin = child
             .stdin
@@ -3058,6 +3092,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
         let info = TcpInfo {
             addrs: vec!["127.0.0.1".into()],
@@ -3158,6 +3193,7 @@ mod tests {
             tcp_socket: None,
             multiplexed_ssh: false,
             detached: false,
+            socket_registration: None,
         };
         let conn = hello(
             conn,
@@ -3204,6 +3240,7 @@ mod tests {
             tcp_socket: None,
             multiplexed_ssh: false,
             detached: false,
+            socket_registration: None,
         };
         let error = hello(conn, false, Vec::new(), ConnectionRole::Control)
             .expect_err("an operation response is not a valid handshake");
@@ -3235,7 +3272,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut conn = RemoteConn {
-            child: Some(child),
+            child: Some(child.into()),
             w: FrameWriter::new(Box::new(std::io::sink()), false),
             rx: None,
             reader: None,
@@ -3245,6 +3282,7 @@ mod tests {
             tcp_socket: None,
             multiplexed_ssh: false,
             detached: false,
+            socket_registration: None,
         };
         let error = conn.io_err(
             std::io::Error::new(
@@ -3305,6 +3343,7 @@ mod tests {
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
                 detached: false,
+                socket_registration: None,
             };
             let timeout = std::time::Duration::from_millis(5);
             let start = std::time::Instant::now();
@@ -3435,6 +3474,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
         let command = spec.ssh_command(SshConnection::Independent);
         assert!(!command
@@ -3495,6 +3535,7 @@ mod tests {
             }))),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
         let endpoint = Endpoint::Remote(spec.clone());
         assert!(endpoint
@@ -3523,6 +3564,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3615,6 +3657,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3666,6 +3709,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         };
 
         let command = spec.ssh_command(SshConnection::Control);

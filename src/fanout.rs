@@ -67,6 +67,7 @@ pub struct Group {
     ready: Condvar,
     sources: Vec<SourceCache>,
     cancelled: AtomicBool,
+    pub(crate) cancellation: Arc<crate::cancellation::Cancellation>,
     schedulers: Mutex<Vec<Weak<Sched>>>,
     progresses: Mutex<Vec<Option<Arc<Progress>>>>,
     terminals: Mutex<Vec<Option<crate::results::ResultRecord>>>,
@@ -90,6 +91,7 @@ impl Group {
     fn new(
         total: usize,
         source_count: usize,
+        cancellation: Arc<crate::cancellation::Cancellation>,
         quiet: bool,
         bytes_per_second: u64,
         results: Option<Arc<crate::results::ResultsWriter>>,
@@ -110,6 +112,7 @@ impl Group {
                 })
                 .collect(),
             cancelled: AtomicBool::new(false),
+            cancellation,
             schedulers: Mutex::new(Vec::with_capacity(total)),
             progresses: Mutex::new(vec![None; total]),
             terminals: Mutex::new(vec![None; total]),
@@ -375,6 +378,7 @@ impl Group {
                 self.ready.notify_all();
             }
         }
+        self.cancellation.cancel();
         for source in &self.sources {
             // Pair the notification with the cache predicate lock so a source
             // waiter cannot miss cancellation between its check and wait.
@@ -394,6 +398,8 @@ impl Group {
 }
 
 pub fn run(mut args: Args) -> Result<i32> {
+    let cancellation = Arc::default();
+    crate::private_broker::register_transfer_cancellation(&cancellation)?;
     let started = std::time::Instant::now();
     let target_count = args.fanout_targets.len() + 1;
     let results = crate::results::start(
@@ -414,7 +420,6 @@ pub fn run(mut args: Args) -> Result<i32> {
     });
     destinations.append(&mut args.fanout_targets);
     let sources = args.locations.clone();
-    let source_count = crate::transfer::deduplicate_native_sources(&sources).len();
     if args.native_mapping.is_some() {
         match crate::transfer::read_native_mapping(&args) {
             Ok(mapping) => args.fanout_mapping = mapping.map(Arc::new),
@@ -436,7 +441,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         &args,
         &sources,
         &destinations,
-        source_count,
+        cancellation,
         results,
         started,
     )
@@ -446,7 +451,7 @@ fn run_group(
     args: &Args,
     sources: &[Location],
     destinations: &[crate::cli::FanoutTarget],
-    source_count: usize,
+    cancellation: Arc<crate::cancellation::Cancellation>,
     results: Option<Arc<crate::results::ResultsWriter>>,
     started: std::time::Instant,
 ) -> Result<i32> {
@@ -457,7 +462,8 @@ fn run_group(
         .collect();
     let group = Group::new(
         target_count,
-        source_count,
+        crate::transfer::deduplicate_native_sources(sources).len(),
+        cancellation,
         args.quiet,
         args.bwlimit_bytes,
         results,
@@ -731,7 +737,7 @@ mod tests {
 
     #[test]
     fn failed_member_releases_preflight_waiters() {
-        let group = Group::new(2, 0, true, 0, None);
+        let group = Group::new(2, 0, Arc::default(), true, 0, None);
         let waiter = {
             let group = group.clone();
             std::thread::spawn(move || group.arrive("ready"))
@@ -743,7 +749,7 @@ mod tests {
 
     #[test]
     fn file_failure_does_not_abort_any_target_scheduler() {
-        let group = Group::new(2, 0, true, 0, None);
+        let group = Group::new(2, 0, Arc::default(), true, 0, None);
         let first = Arc::new(Sched::new(64, 128));
         let second = Arc::new(Sched::new(64, 128));
         group.register_scheduler(&first);
@@ -758,7 +764,7 @@ mod tests {
 
     #[test]
     fn fatal_scheduler_abort_still_aborts_every_target_scheduler() {
-        let group = Group::new(2, 0, true, 0, None);
+        let group = Group::new(2, 0, Arc::default(), true, 0, None);
         let first = Arc::new(Sched::new(64, 128));
         let second = Arc::new(Sched::new(64, 128));
         group.register_scheduler(&first);
@@ -772,7 +778,7 @@ mod tests {
 
     #[test]
     fn cancellation_releases_source_cache_waiters() {
-        let group = Group::new(2, 1, true, 0, None);
+        let group = Group::new(2, 1, Arc::default(), true, 0, None);
         assert!(matches!(
             group.claim_source(0).unwrap(),
             ScanClaim::Populate
@@ -804,7 +810,7 @@ mod tests {
 
     #[test]
     fn one_member_populates_each_source_cache() {
-        let group = Group::new(2, 1, true, 0, None);
+        let group = Group::new(2, 1, Arc::default(), true, 0, None);
         assert!(matches!(
             group.claim_source(0).unwrap(),
             ScanClaim::Populate

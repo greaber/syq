@@ -155,6 +155,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
+                cancellation: args
+                    .fanout_run
+                    .as_ref()
+                    .map(|run| run.group.cancellation.clone()),
             })
         }
     })
@@ -1829,7 +1833,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .clone();
                 let mut failures = 0u32;
                 loop {
-                    if !gate.retained(id) {
+                    if sched.is_aborted() || !gate.retained(id) {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -1876,7 +1880,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            sched.wait_for_abort(std::time::Duration::from_secs(
+                                1 << (failures - 1),
+                            ));
                             continue;
                         }
                     };
@@ -1931,7 +1937,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            sched.wait_for_abort(std::time::Duration::from_secs(
+                                1 << (failures - 1),
+                            ));
                         }
                         Err(error) => {
                             gate.mark_failed(id);
@@ -8197,7 +8205,9 @@ impl Worker {
 
     fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
-            limit.wait(bytes);
+            limit.wait(bytes, |duration| {
+                self.sched.wait_for_abort(duration);
+            });
         }
     }
 

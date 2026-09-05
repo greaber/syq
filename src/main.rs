@@ -1,5 +1,6 @@
 mod agent_broker;
 mod bwlimit;
+mod cancellation;
 mod cli;
 mod completion;
 mod conn;

@@ -106,7 +106,8 @@ new-only precondition cannot be reused.
 A target that finishes with some file errors (exit 23), or refuses its deletion
 phase because of `--max-delete` (exit 25), does not stop the other targets. A
 fatal setup, connection, or filesystem failure (exit 1) cancels unfinished
-targets. Copies they have already completed remain in place; syq does not roll
+targets, interrupting their active SSH sessions and TCP connections as well
+as pending transfer work. Copies they have already completed remain in place; syq does not roll
 them back. The command returns the most severe target outcome: 1 takes
 precedence over 23, which takes precedence over 25, which takes precedence over
 success (0).
@@ -120,7 +121,8 @@ budget divided among targets, and a value smaller than the number of targets
 is refused. `--bwlimit` is likewise one aggregate file-data limit. Human
 progress has one labelled row per destination; progress JSON has one record
 per destination with its label and zero-based index. Human summaries are also
-labelled by destination. `--results` and `--results-fd` produce one stream; its
+labelled by destination. Multi-target commands reuse persistent SSH masters,
+but open their own helper sessions so cancellation can close them. `--results` and `--results-fd` produce one stream; its
 run record lists all destinations and each target-specific progress, trace,
 operation, or error carries a zero-based `destination_index` into that ordered
 destination list. A `destination_result` records each target's outcome before

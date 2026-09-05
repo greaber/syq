@@ -1213,6 +1213,7 @@ fn connect_completion_endpoint(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        cancellation: None,
     };
     spec.connect_completion()
 }

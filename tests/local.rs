@@ -1353,6 +1353,257 @@ fn fanout_closed_summary_stdout_does_not_change_copy_outcomes() {
     }
 }
 
+#[test]
+fn fanout_closed_stderr_preserves_success_and_failure_results() {
+    for refuse in [false, true] {
+        let t = Tmp::new();
+        let rsh = fanout_fake_rsh(&t);
+        write(&t.path("source"), b"copy despite a closed diagnostic pipe");
+        for host in ["alpha", "beta"] {
+            let home = t.path(&format!("remotes/{host}"));
+            fs::create_dir_all(&home).unwrap();
+            if !refuse || host == "alpha" {
+                fs::create_dir(home.join("dst")).unwrap();
+            }
+            install_cached_remote_helper(&home);
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--tos",
+                "alpha",
+                "beta",
+                "--into-existing",
+                "dst",
+                "--no-tcp",
+                "--no-progress",
+                "--results",
+                &t.s("results.ndjson"),
+            ])
+            .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+            .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+            .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        drop(child.stderr.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(i32::from(refuse)));
+        let content = fs::read_to_string(t.path("results.ndjson")).unwrap();
+        assert_automation_stream(&automation_validator(), &content, "closed fan-out stderr");
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["type"] == "destination_result")
+                .count(),
+            2
+        );
+        assert_eq!(records.last().unwrap()["type"], "result");
+        assert_eq!(records.last().unwrap()["exit_code"], i32::from(refuse));
+        for host in ["alpha", "beta"] {
+            let file = t.path(&format!("remotes/{host}/dst/source"));
+            if refuse {
+                assert!(!file.exists());
+            } else {
+                assert_eq!(read(&file), b"copy despite a closed diagnostic pipe");
+            }
+        }
+    }
+}
+
+#[test]
+fn fanout_small_copy_cannot_bypass_group_preflight_or_settlement() {
+    for beta_exists in [false, true] {
+        let t = Tmp::new();
+        let rsh = fanout_fake_rsh(&t);
+        write(&t.path("source"), b"eligible for one-turn copying");
+        for host in ["alpha", "beta"] {
+            let home = t.path(&format!("remotes/{host}"));
+            fs::create_dir_all(&home).unwrap();
+            if host == "alpha" || beta_exists {
+                fs::create_dir(home.join("dst")).unwrap();
+            }
+            install_cached_remote_helper(&home);
+        }
+        // Alpha qualifies for the optimization; beta uses an existence
+        // precondition and must join the ordinary planning barrier.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "alpha",
+                "--into",
+                "dst",
+                "--to",
+                "beta",
+                "--into-existing",
+                "dst",
+                "--no-tcp",
+                "-q",
+                "--results",
+                &t.s("results.ndjson"),
+            ])
+            .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+            .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+            .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                // The regression strands a member at the barrier. SIGTERM
+                // runs the command's owned-transport cleanup before exit.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                let output = child.wait_with_output().unwrap();
+                panic!("mixed small-copy eligibility stranded a target: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!beta_exists)),
+            "{output:?}"
+        );
+        for host in ["alpha", "beta"] {
+            let file = t.path(&format!("remotes/{host}/dst/source"));
+            if beta_exists {
+                assert_eq!(read(&file), b"eligible for one-turn copying");
+            } else {
+                assert!(!file.exists());
+            }
+        }
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["type"] == "destination_result")
+                .count(),
+            2
+        );
+        assert_eq!(records.last().unwrap()["type"], "result");
+    }
+}
+
+#[test]
+fn fanout_preflight_failure_interrupts_stalled_helper_and_its_children() {
+    let t = Tmp::new();
+    let rsh = fanout_fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap().replace(
+        "shift\n",
+        r#"shift
+if [ "$host" = alpha ]; then
+    printf '%s\n' "$$" > "$FAKE_STALLED_PID"
+    sleep 30 &
+    wait
+    exit 98
+fi
+n=0
+while [ ! -s "$FAKE_STALLED_PID" ] && [ "$n" -lt 100 ]; do
+    sleep 0.05
+    n=$((n + 1))
+    if [ "$n" -eq 20 ]; then echo 'waiting for alpha fixture' >&2; fi
+done
+if [ ! -s "$FAKE_STALLED_PID" ]; then echo 'alpha fixture never started' >&2; exit 99; fi
+"#,
+    );
+    executable(&rsh, script.as_bytes());
+    write(&t.path("source"), b"unchanged on preflight failure");
+    let beta = t.path("remotes/beta");
+    fs::create_dir_all(&beta).unwrap();
+    install_cached_remote_helper(&beta);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--tos",
+            "alpha",
+            "beta",
+            "--into-existing",
+            "missing",
+            "--no-tcp",
+            "-q",
+            "--results",
+            &t.s("results.ndjson"),
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", &rsh)
+        .env("FAKE_REMOTE_ROOT", t.path("remotes"))
+        .env("FAKE_RSH_LOG", t.path("fanout-rsh.log"))
+        .env("FAKE_STALLED_PID", t.path("stalled.pid"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut timed_out = false;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            if let Ok(pid) = fs::read_to_string(t.path("stalled.pid")) {
+                let pid: i32 = pid.trim().parse().unwrap();
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            child.kill().unwrap();
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !timed_out,
+        "fan-out did not interrupt the stalled helper: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let pid: i32 = fs::read_to_string(t.path("stalled.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let processes = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+        .unwrap();
+    assert!(processes.status.success());
+    for line in String::from_utf8_lossy(&processes.stdout).lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert!(
+            fields[1] != pid.to_string() || fields[2].starts_with('Z'),
+            "a live process survived cancellation of group {pid}: {line}"
+        );
+    }
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["type"] == "destination_result")
+            .count(),
+        2
+    );
+    assert_eq!(records.last().unwrap()["type"], "result");
+    assert!(!beta.join("missing").exists());
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn fanout_progress_json_keeps_standard_fields_and_labels_each_target() {
@@ -4612,13 +4863,9 @@ exec /bin/sh -c "$1"
 
 fn install_cached_remote_helper(home: &Path) {
     let identity = binary_identity("--build-identity");
-    let target = match std::env::consts::ARCH {
-        "x86_64" => "linux-x86_64",
-        "aarch64" => "linux-aarch64",
-        arch => panic!("unsupported test architecture {arch}"),
-    };
+    let target = helper_target();
     let helper = home.join(format!(
-        ".cache/syq/helpers/{identity}-release-v1/{target}/syq"
+        ".cache/syq/helpers/{identity}-release/{target}/syq"
     ));
     fs::create_dir_all(helper.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), helper).unwrap();

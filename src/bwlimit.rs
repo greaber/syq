@@ -100,14 +100,14 @@ impl BandwidthLimit {
         (self.bytes_per_sec / 8).max(512)
     }
 
-    pub fn wait(&self, bytes: u64) {
+    pub fn wait(&self, bytes: u64, sleep: impl FnOnce(Duration)) {
         if bytes == 0 {
             return;
         }
         let now = Instant::now();
         let at = self.reserve_at(now, bytes);
         if at > now {
-            std::thread::sleep(at - now);
+            sleep(at - now);
         }
     }
 

@@ -69,3 +69,9 @@ This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
+
+The lab also runs `fanout.py`: two remote destinations over SSH and encrypted
+TCP, refusal before either target changes, SIGINT during both active transfers,
+helper cleanup, and checksum-verified retries. A debug-only capacity-failure
+barrier lets one destination fail after its peer has started transferring; both
+terminal results must arrive promptly, and another retry must converge.
