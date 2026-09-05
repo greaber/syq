@@ -103,6 +103,26 @@ A colon in a native path is simply part of the path.
 
 For two remote endpoints, see [Copy between servers](remote-to-remote.md).
 
+## Progress
+
+When stderr is a terminal, syq shows one progress bar for the whole copy.
+The bar stays in place as files and workers change. It shows bytes processed
+out of the discovered total; while syq is still scanning, the percentage is
+unknown. Wider terminals also show elapsed time, speed, ETA, and file counts.
+Use `--progress` to force the display or `--no-progress` to hide it. `--quiet`
+hides it too. `--progress-json` selects JSON progress instead of the bar.
+
+The bar advances when syq processes a block or completes a file. On a slow
+link, or during a local server-side copy, it can stay at the same position
+for a while. After five seconds without a byte update, `no update` shows how
+long it has been; this does not mean the connection has failed. Syq does not
+guess extra completed bytes between updates. A final `done` or `incomplete`
+bar stays visible when the copy settles. Reaching the end of the byte bar
+alone does not mean all files have finished or that the copy succeeded.
+
+The bar also covers `syq rm`, counting entries instead of bytes. For scripts,
+use [results records](automation.md) rather than parsing the terminal bar.
+
 ## Choose a destination
 
 | Option | Meaning |
