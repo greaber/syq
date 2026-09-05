@@ -56,6 +56,11 @@ startup seeds the exact candidate binary into its expected helper-cache path.
 The scenarios still use normal SSH control, constrained agent forwarding, and
 destination enrollment; they do not substitute a fake remote shell.
 
+The smoke suite also checks that pooled helpers keep the spawning command’s
+`SendEnv` values, while direct sessions and restarted persistence use the new
+values. A remote wrapper records one test variable and executes the candidate
+helper, so the check exercises real OpenSSH environment forwarding.
+
 The smoke suite currently covers rejection of a restricted destination that
 overlaps the receiver's SSH control plane, source-side direct coordination with
 automatic restricted-destination enrollment over encrypted TCP, source-side

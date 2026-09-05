@@ -488,6 +488,15 @@ begins after that, so the reuse window after your last command can reach ten
 minutes in total. It also exits when its scope is removed or when a newer
 syq binary starts using the endpoint.
 
+The pool keeps the environment variables it inherited from the command that
+started it; later commands do not update them. If your SSH configuration uses
+`SendEnv`, sessions opened by the pool send values from that original
+environment, subject to the server's `AcceptEnv` settings. For example, changing
+`LANG` before a later syq command does not change the value sent by the pool.
+A session opened directly by that later command uses its current environment.
+To start again with a changed environment, run `syq persist off`, then
+`syq persist on`, and run your next command with the desired values.
+
 `status` shows the global scope and its recorded endpoints, marking an
 endpoint whose session pool is running; `off` disables the policy, stops
 every session pool, asks every live syq-owned master to exit, and removes the
