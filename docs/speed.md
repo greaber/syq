@@ -74,7 +74,8 @@ encrypted TCP on one port from `47600–47699`; change it with
 `--tcp-ports LO-HI`. Syq discovers reachable IPv4 and IPv6 addresses and can
 use multiple network interfaces.
 
-If no TCP route is reachable, it reports a fallback to SSH. **The restricted
+If no TCP route is reachable, it reports `data over ssh`. Use `-vv` for
+the connection details. **The restricted
 remote-to-remote receiver requires encrypted TCP and fails instead.**
 
 `--no-tcp` selects SSH data transport. `--tcp-plain` removes data encryption

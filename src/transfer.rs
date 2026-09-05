@@ -1313,12 +1313,16 @@ fn handle_tcp_setup_error(
     if !args.quiet || debug() {
         let congestion_note =
             crate::conn::tcp_congestion_fallback_note(args.tcp_congestion.as_deref());
-        crate::output::diagnostic!(
-            "syq: {}: data over ssh (TCP ports {}-{} not reachable: {error:#}{congestion_note}); a Tailscale address or an open port is faster",
-            spec.label(),
-            ports.0,
-            ports.1
-        );
+        if args.verbose >= 2 || debug() {
+            crate::output::diagnostic!(
+                "syq: {}: data over ssh (TCP ports {}-{} not reachable: {error:#}{congestion_note})",
+                spec.label(),
+                ports.0,
+                ports.1
+            );
+        } else {
+            crate::output::diagnostic!("syq: {}: data over ssh{congestion_note}", spec.label());
+        }
     }
     Ok(())
 }
