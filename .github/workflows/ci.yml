@@ -228,6 +228,8 @@ jobs:
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
+            # Restored Cargo caches can contain distributions from an older SDK.
+            rm -rf -- "$output"
             uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
