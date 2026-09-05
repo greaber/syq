@@ -13,8 +13,8 @@ Installing the package does not install syq itself. The first default call that
 needs syq downloads the matching syq release if it is not
 already cached, checks it against the signed release manifest, and uses that
 managed binary for subsequent default calls.
-The Python package and its managed syq executable share one version: package `0.3.0`
-manages syq `0.3.0`.
+The Python package and its managed syq executable share one version: package `0.3.1`
+manages syq `0.3.1`.
 syq always runs as a subprocess with an argument list, never through a shell.
 
 ```python
@@ -157,8 +157,8 @@ pin. During that development interval, use `Client(executable=...)` or
 updates the immutable pin only after candidate conformance tests pass.
 
 The managed executable is stored below
-`$XDG_CACHE_HOME/syq/sdk/python/v0.3.0/` or, when `XDG_CACHE_HOME` is not an
-absolute path, `~/.cache/syq/sdk/python/v0.3.0/`. The SDK checks the complete
+`$XDG_CACHE_HOME/syq/sdk/python/v0.3.1/` or, when `XDG_CACHE_HOME` is not an
+absolute path, `~/.cache/syq/sdk/python/v0.3.1/`. The SDK checks the complete
 cached binary against its embedded release manifest before every use. A corrupt
 or missing cache entry is replaced atomically with a freshly downloaded,
 verified binary.
