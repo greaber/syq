@@ -28,7 +28,7 @@ rsync meaning (human-readable sizes); use `syq rsync --help` for common help
 or `syq rsync --help-all` for all options.
 
 `syq --self-update --help` explains standalone upgrades and update reminders.
-Homebrew installs use `brew upgrade syq`; see [Installation](install.md#update-checks-and-self-update).
+Homebrew installs use `brew upgrade syq`; see [Installation](install.md#standalone-installer).
 
 ## Native commands
 
