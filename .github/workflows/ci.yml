@@ -357,3 +357,18 @@ jobs:
           (needs.scope.outputs.full_suite != 'true' ||
            needs.macos_intel.result == 'success')
         run: echo 'Required macOS validation succeeded.'
+
+  # A skipped certificate cannot certify successful selective stubs.
+  release-certification:
+    needs: [scope, rust, sdks, linux-arm64, macos]
+    if: >-
+      needs.scope.outputs.full_suite == 'true' &&
+      needs.scope.outputs.native == 'true' &&
+      needs.scope.outputs.python_sdk == 'true' &&
+      needs.scope.outputs.javascript_sdk == 'true' &&
+      needs.scope.outputs.go_sdk == 'true' &&
+      needs.scope.outputs.linux_arm64 == 'true' &&
+      needs.scope.outputs.macos == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Every release validation suite in this workflow succeeded.'
