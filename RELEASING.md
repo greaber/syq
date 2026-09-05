@@ -344,6 +344,8 @@ with release flags and the configured public key. A cache hit never substitutes
 for a test or certificate. GitHub scopes tag caches to that tag; later tags can
 reuse master caches, not earlier tag caches. Source-package identity testing
 extracts and compiles the crate once, using a separate reusable target directory.
+It clears only syq's own build outputs before compiling: normalized archive
+mtimes cannot prove unchanged source or VCS identity across cached packages.
 
 The checked-in classifier uses each push's exact diff. Documentation-only
 changes select no test jobs unless a document is consumed by a test or
