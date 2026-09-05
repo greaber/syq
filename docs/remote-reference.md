@@ -25,6 +25,11 @@ Repeating `enroll` updates the receiver to match your local build. A pending
 enrollment can be retried or revoked. Revoke and enroll again to rotate its
 receipt key.
 
+Enrollment uploads the executable running on your machine, which must also run
+on the destination. It does not use `--syq-path` or fetch a release for another
+platform. See [Developing syq](development.md#direct-server-to-server-copies)
+for refreshing a receiver after rebuilding.
+
 ## Limits and unsupported options
 
 Default limits are 100 million entries and 8 TiB of file data. Override them
