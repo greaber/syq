@@ -603,7 +603,8 @@ remote filenames. In native commands, source path options are listed at the
 `--from` endpoint and placement paths at the `--to` endpoint. In `syq rsync`,
 an operand such as `host:dir/fi` is listed on `host`. Files named with spaces,
 newlines, or non-UTF-8 bytes remain single candidates in shells that support
-those names.
+those names. You can press Tab repeatedly while an option such as `--co` or
+a quoted filename is unfinished.
 
 Remote completion uses a normal SSH login in batch mode: it never opens a
 password prompt, starts TCP data listeners, or uses the enrollment key (the

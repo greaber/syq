@@ -13875,6 +13875,89 @@ fn completion_values(output: &[u8]) -> Vec<(u8, Vec<u8>)> {
 }
 
 #[test]
+fn completion_bash_repeated_tabs_accept_option_fragments() {
+    let t = Tmp::new();
+    write(&t.path("--help"), b"literal filename");
+    for (line, fragment, expected) in [
+        ("syq --", "--", "--help"),
+        ("syq --help", "--help", "--help"),
+        ("syq -h", "-h", ""),
+        ("syq help", "help", "help"),
+        ("syq --version", "--version", "--version"),
+        ("syq cp --", "--", "--coordinate-at"),
+        ("syq cp --co", "--co", "--coordinate-at"),
+        ("syq cp --coordinate-at=sr", "sr", "src"),
+        ("syq cp -- --help", "--help", "--help"),
+    ] {
+        let backend = completion_command(&t, &["__complete-bash", fragment, "--", line])
+            .current_dir(t.path(""))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&backend);
+        assert!(backend.stderr.is_empty(), "{line:?}: {backend:?}");
+        let values = completion_values(&backend.stdout);
+        if !expected.is_empty() {
+            assert!(
+                values.iter().any(|(_, value)| value == expected.as_bytes()),
+                "{line:?}: {values:?}"
+            );
+        }
+        let output = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                r#"
+eval "$("$SYQ" completion bash)"
+COMP_LINE=$1
+COMP_POINT=${#COMP_LINE}
+COMP_WORDS=(syq "$2")
+COMP_CWORD=1
+for ((tab=0; tab<3; tab++)); do
+    _syq_complete
+    for candidate in "${COMPREPLY[@]}"; do
+        printf '%s\0' "$candidate"
+    done
+    printf '\0'
+done
+"#,
+                "bash",
+                line,
+                fragment,
+            ])
+            .current_dir(t.path(""))
+            .env("SYQ", env!("CARGO_BIN_EXE_syq"))
+            .env("SYQ_COMPLETION_DEBUG", "1")
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env(
+                "PATH",
+                format!(
+                    "{}:/usr/bin:/bin",
+                    Path::new(env!("CARGO_BIN_EXE_syq"))
+                        .parent()
+                        .unwrap()
+                        .display()
+                ),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stderr.is_empty(), "{line:?}: {output:?}");
+        let mut frame = Vec::new();
+        for (_, value) in values {
+            frame.extend(value);
+            frame.push(0);
+        }
+        frame.push(0);
+        assert_eq!(output.stdout, frame.repeat(3), "{line:?}");
+    }
+}
+
+#[test]
 fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     let t = Tmp::new();
     write(&t.path("alpha file"), b"file");

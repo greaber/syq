@@ -161,14 +161,27 @@ impl Candidate {
     }
 }
 
-pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
+fn parse_action(argv: &[OsString]) -> Result<CompletionAction, clap::Error> {
+    // The installed Bash adapter sends exactly REPLACEMENT -- LINE. Both
+    // payloads are arbitrary shell text: even `--`, `--help`, and `help` are
+    // data here. Decode that fixed envelope before clap can interpret them.
+    if let [action, replacement, separator, line] = argv {
+        if action == "__complete-bash" && separator == "--" {
+            return Ok(CompletionAction::CompleteBash {
+                replacement: replacement.clone(),
+                line: line.clone(),
+            });
+        }
+    }
     let mut full_argv = vec![OsString::from("syq completion")];
     full_argv.extend_from_slice(argv);
-    let matches = command_for_help()
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
-    let command = CompletionCommand::from_arg_matches(&matches)?;
-    match command.action {
+    let matches = command_for_help().try_get_matches_from(full_argv)?;
+    Ok(CompletionCommand::from_arg_matches(&matches)?.action)
+}
+
+pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
+    let action = parse_action(argv).unwrap_or_else(|error| error.exit());
+    match action {
         CompletionAction::Bash => print!("{BASH_ADAPTER}"),
         CompletionAction::Zsh => print!("{ZSH_ADAPTER}"),
         CompletionAction::Fish => print!("{FISH_ADAPTER}"),
@@ -483,8 +496,13 @@ fn write_candidates(shell: CompletionShell, candidates: Vec<Candidate>) -> Resul
 }
 
 fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
+    // Shells can omit the empty word at the cursor, but an index beyond that
+    // is not a usable request. Do not allocate based on an unchecked index.
+    if index > words.len() {
+        return Ok(Vec::new());
+    }
     let mut words: Vec<Vec<u8>> = words.iter().map(|word| word.as_bytes().to_vec()).collect();
-    while words.len() <= index {
+    if words.len() == index {
         words.push(Vec::new());
     }
     let Some(command_start) = words
@@ -1696,6 +1714,74 @@ mod tests {
         );
         assert_eq!(split_rsync_remote(b"./a:b"), None);
         assert_eq!(split_rsync_remote(b"host::module"), None);
+    }
+
+    #[test]
+    fn bash_request_treats_every_replacement_as_literal_data() {
+        for replacement in ["", "-", "--", "--co", "--help", "-h", "help", "--version"] {
+            let line = format!("syq cp {replacement}");
+            let argv = ["__complete-bash", replacement, "--", &line].map(OsString::from);
+            let action = parse_action(&argv)
+                .unwrap_or_else(|error| panic!("replacement {replacement:?}: {error}"));
+            let CompletionAction::CompleteBash {
+                replacement: parsed,
+                line: parsed_line,
+            } = action
+            else {
+                panic!("wrong action for {replacement:?}");
+            };
+            assert_eq!(parsed, replacement);
+            assert_eq!(parsed_line, line.as_str());
+        }
+    }
+
+    #[test]
+    fn completion_indices_allow_an_omitted_empty_word_but_reject_out_of_range() {
+        let words = [OsString::from("syq")];
+        assert!(values(candidates(1, &words).unwrap()).contains(&b"cp".to_vec()));
+        assert!(candidates(2, &words).unwrap().is_empty());
+        assert!(candidates(usize::MAX, &words).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bash_request_mini_fuzzer_preserves_raw_bytes() {
+        // All non-NUL bytes can occur in argv, including invalid UTF-8. Test
+        // each byte next to syntax that clap and Bash would normally parse.
+        for byte in 1..=255 {
+            for prefix in [
+                b"".as_slice(),
+                b"-",
+                b"--",
+                b"'",
+                b"\"",
+                b"\\",
+                b"a=",
+                b"a:",
+            ] {
+                let mut fragment = prefix.to_vec();
+                fragment.push(byte);
+                let mut line = b"syq cp ".to_vec();
+                line.extend_from_slice(&fragment);
+                let argv = [
+                    OsString::from("__complete-bash"),
+                    OsString::from_vec(fragment.clone()),
+                    OsString::from("--"),
+                    OsString::from_vec(line.clone()),
+                ];
+                let CompletionAction::CompleteBash {
+                    replacement,
+                    line: parsed,
+                } = parse_action(&argv).unwrap()
+                else {
+                    panic!("wrong action for {fragment:?}");
+                };
+                assert_eq!(replacement.as_bytes(), fragment);
+                assert_eq!(parsed.as_bytes(), line);
+                let (index, words) = bash_command_words(parsed.as_bytes());
+                assert!(index < words.len());
+                assert!(words.iter().map(Vec::len).sum::<usize>() <= line.len());
+            }
+        }
     }
 
     #[test]
