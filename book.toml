@@ -7,10 +7,13 @@ src = "docs"
 [build]
 build-dir = "target/book"
 create-missing = false
+extra-watch-dirs = ["theme"]
 
 [output.html]
-additional-css = ["theme/copy-demo.css"]
-additional-js = ["theme/copy-demo.js"]
 site-url = "/syq/"
 git-repository-url = "https://github.com/greaber/syq"
 edit-url-template = "https://github.com/greaber/syq/edit/master/{path}"
+
+# Shared branding and mdBook layout, plus the interactive copy examples.
+additional-css = ["theme/brand.css", "theme/docs.css", "theme/copy-demo.css"]
+additional-js = ["theme/docs.js", "theme/copy-demo.js"]

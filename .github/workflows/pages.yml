@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
+      - 'theme/**'
       - 'book.toml'
       - 'scripts/check-doc-links.py'
       - '.github/workflows/pages.yml'
