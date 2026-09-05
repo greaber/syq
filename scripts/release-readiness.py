@@ -51,14 +51,14 @@ def ssh_evidence():
 
 def check_ssh():
     commit, tree = clean_candidate()
+    # Invalidate an earlier success before a deliberate rerun, including on failure.
+    path = receipt_path(tree)
+    path.unlink(missing_ok=True)
     receipt = {
         "schema": 1, "commit": commit, "tree": tree, "profile": "default",
         "host": platform.platform(), "docker": run("docker", "--version"),
         "compose": run("docker", "compose", "version"),
     }
-    # Invalidate an earlier success before a deliberate rerun, including on failure.
-    path = receipt_path(tree)
-    path.unlink(missing_ok=True)
     subprocess.run([str(SCRIPTS / "test-real-ssh.sh")], check=True, stdout=sys.stderr)
     if clean_candidate() != (commit, tree):
         raise ValueError("checkout changed during real-SSH validation; no evidence recorded")

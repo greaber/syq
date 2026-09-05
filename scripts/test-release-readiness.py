@@ -85,6 +85,18 @@ class ReleaseTests(unittest.TestCase):
             self.record("exit 1\n")
         self.assertIsNone(readiness.ssh_evidence())
 
+    def test_missing_tool_on_rerun_invalidates_prior_success(self):
+        self.record()
+        real_run = readiness.run
+        def run(*args):
+            if args[0] == "docker":
+                raise FileNotFoundError("docker unavailable")
+            return real_run(*args)
+        with mock.patch.object(readiness, "run", run):
+            with self.assertRaises(FileNotFoundError):
+                readiness.check_ssh()
+        self.assertIsNone(readiness.ssh_evidence())
+
     def test_checkout_mutation_during_check_does_not_certify(self):
         with self.assertRaisesRegex(ValueError, "not clean"):
             self.record("echo changed > source\n")
