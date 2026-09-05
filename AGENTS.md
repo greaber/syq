@@ -241,6 +241,34 @@ report actual access or decision blockers instead of bypassing them.
 
 **Do not drop agreed requirements silently**: If you agreed to implement a user requirement and later conclude it is unsafe, incorrect, infeasible, or should be deferred, stop and tell the user before proceeding. Explain the technical reason and ask whether to change scope. Do not quietly omit, reverse, or postpone the requirement and leave it to a summary for the user to notice.
 
+## Compatibility before implementation
+
+When a task changes an external interface or state that can survive a process,
+read [the compatibility inventory](design/compatibility.md) before choosing the
+implementation. This includes renames: trace serialized names, filenames,
+command arguments, SDK keywords, URLs, and signing domains, not just Rust types.
+
+- Identify the producer, consumer, lifetime, and supported release baseline.
+  Check released artifacts or tags rather than assuming current tests represent
+  what users have. A prior no-users exception applies to its recorded scope;
+  do not silently turn it into a permanent compatibility exemption.
+- State what happens when a new binary reads old state, an old client runs after
+  an upgrade, and both versions share a host. Exact helper pinning covers only
+  exchanges that actually enforce it before interpreting incompatible bytes.
+- Choose preservation, migration, safe cache invalidation, or explicit rejection
+  with a recovery path. A version bump identifies a break; it does not perform
+  an upgrade. Never reset replay protection or reinterpret signed authority to
+  make old state readable.
+- For a compatibility-sensitive change, keep an unchanged old fixture or use
+  an old binary to test the affected direction. Updating both writer and reader,
+  or regenerating every fixture, does not demonstrate compatibility. Name the
+  baseline and result in the PR description, including any authorized break.
+
+The public support baseline and duration are not yet decided. Surface that
+choice when it matters; do not add speculative compatibility implementations
+or promise indefinite support. The inventory records current mechanisms and
+proposed launch work separately.
+
 ## Release secrets
 
 Once provisioned, `.env.release` is the committed dotenvx-encrypted source of
