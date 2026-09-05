@@ -10,7 +10,8 @@ It is built for large files, large trees, and fast networks.
 
 [Documentation](https://greaber.github.io/syq/) ·
 [Speed](https://greaber.github.io/syq/speed.html) ·
-[Security](https://greaber.github.io/syq/security.html)
+[Security](https://greaber.github.io/syq/security.html) ·
+[Discussions](https://github.com/greaber/syq/discussions)
 
 ## Install
 
