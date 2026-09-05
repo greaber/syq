@@ -297,7 +297,7 @@ expect_failure 'ci.yml run 501 sdks job is completed/failure' env \
 # response from fixtures. The preflight must not create a tag or publication.
 preflight_repo="$work/preflight-repo"
 preflight_bin="$work/preflight-bin"
-mkdir -p "$preflight_repo/.github/workflows" "$preflight_repo/scripts" \
+mkdir -p "$preflight_repo/.github/release-notes" "$preflight_repo/.github/workflows" "$preflight_repo/scripts" \
   "$preflight_repo/sdk/python" "$preflight_bin"
 cp "$script_dir/check-python-api-sync.py" "$preflight_repo/scripts/"
 cat >"$preflight_repo/sdk/python/native-api.json" <<'EOF'
@@ -320,6 +320,7 @@ steps:
   - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
   - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
 EOF
+printf 'Release fixture notes\n' >"$preflight_repo/.github/release-notes/v9.9.9.md"
 git -C "$preflight_repo" init -b master -q
 git -C "$preflight_repo" config user.name Test
 git -C "$preflight_repo" config user.email test@example.com
@@ -327,6 +328,11 @@ git -C "$preflight_repo" add .
 git -C "$preflight_repo" commit -qm initial
 git -C "$preflight_repo" remote add origin git@github.com:greaber/syq.git
 preflight_head=$(git -C "$preflight_repo" rev-parse HEAD)
+preflight_tree=$(git -C "$preflight_repo" rev-parse 'HEAD^{tree}')
+mkdir -p "$preflight_repo/.git/syq-release/real-ssh"
+jq -n --arg commit "$preflight_head" --arg tree "$preflight_tree" \
+  '{schema:1,commit:$commit,tree:$tree,profile:"default",result:"success"}' \
+  >"$preflight_repo/.git/syq-release/real-ssh/$preflight_tree.json"
 git -C "$preflight_repo" update-ref refs/remotes/origin/master "$preflight_head"
 ssh-keygen -q -t ed25519 -N '' -f "$work/tag-signing-key"
 signing_key=$(awk '{print $1 " " $2}' "$work/tag-signing-key.pub")
@@ -423,6 +429,47 @@ if (cd "$preflight_repo" && env "${preflight_env[@]}" \
 fi
 grep -F 'already published on crates.io' "$work/failure.out" >/dev/null
 
+# Branch names and the coordination branch tip do not define the candidate.
+git -C "$preflight_repo" switch -qc release-task
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  "$script_dir/release-preflight.sh" v9.9.9) >/dev/null
+git -C "$preflight_repo" switch --detach -q
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  "$script_dir/release-preflight.sh" v9.9.9) >/dev/null
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  "$script_dir/release-readiness.py" v9.9.9 --json) >"$work/readiness.json"
+jq -e '.ready and (.ci.workflows | length == 3) and (.ssh.profile == "default")' \
+  "$work/readiness.json" >/dev/null
+# A detached checkout of an old master cannot pass against advancing remote master.
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PREFLIGHT_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted stale HEAD' >&2; exit 1
+fi
+grep -F 'HEAD is not synchronized with the remote master' "$work/failure.out" >/dev/null
+printf 'uncommitted' >"$preflight_repo/untracked"
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted dirty HEAD' >&2; exit 1
+fi
+grep -F 'working tree is not clean' "$work/failure.out" >/dev/null
+rm "$preflight_repo/untracked"
+rm "$preflight_repo/.git/syq-release/real-ssh/$preflight_tree.json"
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted missing SSH evidence' >&2; exit 1
+fi
+grep -F 'real-SSH evidence is missing' "$work/failure.out" >/dev/null
+
+# Existing releases resume immediately, even without local SSH receipts or CI.
+git -C "$preflight_repo" -c tag.gpgsign=false tag v9.9.9
+status=0
+(cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' \
+  "$script_dir/release-readiness.py" v9.9.9 --json) >"$work/resume.json" || status=$?
+test "$status" -eq 1
+jq -e '.ci == null and .next_action == "scripts/release-status.sh v9.9.9"' "$work/resume.json" >/dev/null
+
 # Release status correlates the exact tag commit with runs, pending protected
 # environments, and every publication destination.
 status_bin="$work/status-bin"
@@ -510,5 +557,7 @@ SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
   "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-nested-tag.json"
 jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
   "$work/status-nested-tag.json" >/dev/null
+
+python3 "$script_dir/test-release-readiness.py"
 
 echo 'release orchestration tests passed'

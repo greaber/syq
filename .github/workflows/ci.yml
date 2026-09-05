@@ -61,6 +61,16 @@ jobs:
           needs.scope.outputs.mapping_docs == 'true'
         with:
           persist-credentials: false
+      - name: Cache Cargo dependencies and build output
+        if: needs.scope.outputs.native == 'true' || needs.scope.outputs.tooling == 'true' || needs.scope.outputs.mapping_docs == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - name: Install Rust check components
         if: needs.scope.outputs.native == 'true'
         run: rustup component add rustfmt clippy
@@ -165,6 +175,16 @@ jobs:
         if: needs.scope.outputs.sdks == 'true'
         with:
           persist-credentials: false
+      - name: Cache Cargo dependencies and build output
+        if: needs.scope.outputs.python_sdk == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: needs.scope.outputs.python_sdk == 'true'
         with:
@@ -264,49 +284,18 @@ jobs:
         if: needs.scope.outputs.linux_arm64 == 'true'
         with:
           persist-credentials: false
+      - name: Cache Cargo dependencies and build output
+        if: needs.scope.outputs.linux_arm64 == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-ci-linux-arm64-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - if: needs.scope.outputs.linux_arm64 == 'true'
         run: cargo check --locked --all-targets
-
-  macos_arm:
-    needs: scope
-    if: >-
-      needs.scope.result == 'success' &&
-      needs.scope.outputs.macos == 'true'
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: cargo check --locked --all-targets
-      - name: Exercise macOS symlink descriptor pinning
-        run: >-
-          cargo test --locked
-          rooted::tests::operator_resolver_selects_a_last_component_symlink_without_following_it
-          -- --exact
-      - name: Exercise macOS cross-process descriptor handoff
-        run: >-
-          cargo test --locked
-          descriptor_broker::tests::independent_process_receives_exact_registered_descriptor
-          -- --exact
-      - name: Exercise macOS descriptor soft-limit raise and umask read
-        run: >-
-          cargo test --locked --bin syq --
-          --exact tests::raise_nofile_reaches_its_target
-          fsops::tests::process_umask_matches_file_creation
-      - name: Exercise macOS descriptor-pressure bounds
-        run: cargo test --locked --test local source_fd_budget_
-      - name: Exercise macOS adversarial confinement matrix
-        run: cargo test --locked confinement_matrix_
-      - name: Exercise macOS standalone updates
-        run: cargo test --locked --test update
-      - name: Exercise macOS managed remote-helper bootstrap
-        run: cargo test --locked --test local remote_
-      - name: Exercise macOS socket-special behavior
-        run: |
-          cargo test --locked --test local native_preserve_specials_copies_or_visibly_skips_socket_nodes -- --exact
-          cargo test --locked --test local native_remote_destination_socket_policy_uses_handshake_capability -- --exact
-      - run: scripts/test-installer.sh
-      - run: scripts/test-homebrew-formula.sh
 
   # An actual Intel runner catches host-architecture cfg and libc differences
   # before the release workflow builds its x86-64 artifact. Keep this on full
@@ -322,14 +311,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-ci-macos_intel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - run: cargo check --locked --all-targets
       - name: Exercise the Intel standalone-update artifact selection
         run: cargo test --locked --test update
 
-  # Preserve the `macos` release-evidence name while making full certifications
-  # depend on both architectures.
+  # Preserve the `macos` check for Intel. Apple Silicon is certified once by
+  # the full macos.yml workflow, required separately by verify-release-ci.sh.
   macos:
-    needs: [scope, macos_arm, macos_intel]
+    needs: [scope, macos_intel]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -339,11 +337,6 @@ jobs:
       - name: Complete the required check when macOS validation is unaffected
         if: needs.scope.outputs.macos != 'true'
         run: echo 'macOS validation is not needed for this change set.'
-      - name: Require Apple Silicon validation
-        if: >-
-          needs.scope.outputs.macos == 'true' &&
-          needs.macos_arm.result != 'success'
-        run: echo 'Apple Silicon macOS validation failed or did not complete.' >&2; exit 1
       - name: Require Intel validation in a full suite
         if: >-
           needs.scope.outputs.macos == 'true' &&
@@ -353,7 +346,6 @@ jobs:
       - name: Record successful macOS validation
         if: >-
           needs.scope.outputs.macos == 'true' &&
-          needs.macos_arm.result == 'success' &&
           (needs.scope.outputs.full_suite != 'true' ||
            needs.macos_intel.result == 'success')
         run: echo 'Required macOS validation succeeded.'

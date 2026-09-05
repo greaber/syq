@@ -149,9 +149,13 @@ report actual access or decision blockers instead of bypassing them.
 
 ## Release tag lifecycle
 
-- Before pushing a syq release tag, require successful full-suite runs of both
-  `ci.yml` and `rsync-compat.yml` on the exact clean, synchronized `master`
-  commit. Reuse post-merge or manual runs when `scripts/verify-release-ci.sh`
+- Before pushing a syq release tag, require successful full-suite runs of
+  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the exact clean remote
+  `master` commit. A task branch or detached checkout at that SHA is sufficient;
+  do not update the coordination checkout or clone solely to obtain a branch
+  named `master`. Start with `scripts/release-readiness.py v<version>` and reuse
+  its recorded default real-SSH validation when the entire committed tree is
+  unchanged. Its `--check-ssh` mode runs and records missing local validation. Reuse post-merge or manual runs when `scripts/verify-release-ci.sh`
   accepts their full-suite certificates; dispatch only workflows missing that
   evidence and wait for them to succeed. Then run
   `scripts/release-preflight.sh v<version>` from that same commit. Treat any

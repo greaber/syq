@@ -28,8 +28,6 @@ done
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'run this from the syq repository'
 cd "$root"
-[ "$(git symbolic-ref --short HEAD 2>/dev/null)" = master ] \
-  || die 'release preflight must run on the master branch'
 [ -z "$(git status --porcelain)" ] || die 'working tree is not clean'
 python3 scripts/check-python-api-sync.py
 
@@ -45,13 +43,14 @@ fi
   || die "gh resolved an unexpected repository"
 
 head=$(git rev-parse HEAD)
-local_master=$(git rev-parse refs/heads/master)
 tracking_master=$(git rev-parse refs/remotes/origin/master 2>/dev/null) \
   || die 'origin/master is unavailable; fetch it first'
 remote_master=$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')
-[ "$head" = "$local_master" ] || die 'HEAD is not the local master tip'
-[ "$head" = "$tracking_master" ] || die "master is not synchronized with origin/master ($tracking_master)"
-[ "$head" = "$remote_master" ] || die "master is not synchronized with the remote master ($remote_master)"
+[ "$head" = "$tracking_master" ] || die "HEAD is not synchronized with origin/master ($tracking_master)"
+[ "$head" = "$remote_master" ] || die "HEAD is not synchronized with the remote master ($remote_master)"
+
+[ -s ".github/release-notes/$tag.md" ] || die "release notes are missing: .github/release-notes/$tag.md"
+"$script_dir/release-readiness.py" "$tag" --verify-ssh
 
 cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 [ "$cargo_version" = "$version" ] \
