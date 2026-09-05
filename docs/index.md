@@ -4,6 +4,8 @@ Syq copies and removes files in parallel, on one machine or over SSH. It can
 resume interrupted copies and transfer directly between servers without
 forwarding your SSH agent.
 
+[Discussions](https://github.com/greaber/syq/discussions)
+
 In published tests, syq copied a folder from Amsterdam to Tokyo
 [5.2× faster than rsync](https://greaber.github.io/syq-bench/#fly-cross-region-memory),
 and 20,000 small files to NFS
