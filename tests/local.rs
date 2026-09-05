@@ -3027,7 +3027,7 @@ fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
     assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq receiver"));
     let bogus = run(&["receiver", "rotate"]);
     assert!(!bogus.status.success());
-    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown receiver command"));
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unrecognized subcommand"));
     for verb in ["enroll", "list", "revoke"] {
         let verb_help = run(&["receiver", verb, "--help"]);
         assert!(verb_help.status.success(), "{verb}");
@@ -12441,13 +12441,22 @@ fn native_map_refusals() {
 #[test]
 fn native_map_exposes_only_manifest_shaping_options() {
     let help = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["map", "--help"])
+        .args(["map", "--help-all"])
         .run()
-        .expect("run syq map --help");
+        .expect("run syq map --help-all");
     assert_output_ok(&help);
     let help = String::from_utf8(help.stdout).expect("map help is UTF-8");
+    // Examples may mention downstream cp options; inspect option declarations.
+    let declarations = help
+        .lines()
+        .filter(|line| line.starts_with("  -") || line.starts_with("      --"))
+        .collect::<Vec<_>>()
+        .join("\n");
     for option in ["--cwd", "--follow", "--src", "--srcs-in", "--as"] {
-        assert!(help.contains(option), "map help omitted {option}:\n{help}");
+        assert!(
+            declarations.contains(option),
+            "map help omitted {option}:\n{help}"
+        );
     }
     for option in [
         "--from",
@@ -12479,7 +12488,7 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--receiver-receipt",
     ] {
         assert!(
-            !help.contains(option),
+            !declarations.contains(option),
             "map help unexpectedly exposed {option}:\n{help}"
         );
     }

@@ -10,7 +10,7 @@ use crate::cli::{parse_native_endpoint, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
 use crate::proto::{CompletionEntry, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::{CString, OsString};
@@ -81,7 +81,10 @@ enum CacheAction {
     /// List learned endpoint suggestions, most recently used first
     List,
     /// Forget one exact native endpoint spelling
-    Forget { endpoint: String },
+    Forget {
+        /// Endpoint to forget: [USER@]HOST[:PORT], e.g. alice@nas:2222
+        endpoint: String,
+    },
     /// Remove all learned endpoint suggestions
     Clear,
 }
@@ -161,7 +164,10 @@ impl Candidate {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let mut full_argv = vec![OsString::from("syq completion")];
     full_argv.extend_from_slice(argv);
-    let command = CompletionCommand::try_parse_from(full_argv).unwrap_or_else(|error| error.exit());
+    let matches = command_for_help()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let command = CompletionCommand::from_arg_matches(&matches)?;
     match command.action {
         CompletionAction::Bash => print!("{BASH_ADAPTER}"),
         CompletionAction::Zsh => print!("{ZSH_ADAPTER}"),
@@ -649,7 +655,9 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "persist",
         "completion",
         "receiver",
+        "help",
         "--help",
+        "--help-all",
         "--version",
         "--self-update",
     ]
@@ -661,8 +669,8 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
 
 fn completion_command_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
     let values: &[&str] = match args.first().map(Vec::as_slice) {
-        None => &["bash", "zsh", "fish", "cache", "--help"],
-        Some(b"cache") if args.len() == 1 => &["list", "forget", "clear", "--help"],
+        None => &["bash", "zsh", "fish", "cache", "--help", "--help-all"],
+        Some(b"cache") if args.len() == 1 => &["list", "forget", "clear", "--help", "--help-all"],
         Some(b"cache") if args.get(1).is_some_and(|value| value == b"forget") => {
             return endpoint_candidates(current, EndpointSyntax::Native, None)
         }
@@ -677,7 +685,7 @@ fn completion_command_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candid
 
 fn persist_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
     if args.is_empty() {
-        return ["on", "off", "status", "--help"]
+        return ["on", "off", "status", "--help", "--help-all"]
             .into_iter()
             .filter(|value| value.as_bytes().starts_with(current))
             .map(|value| Candidate::text(value.as_bytes().to_vec()))
@@ -687,8 +695,8 @@ fn persist_candidates(args: &[Vec<u8>], current: &[u8]) -> Vec<Candidate> {
         return local_path_candidates(current, true);
     }
     let options: &[&str] = match args.first().map(Vec::as_slice) {
-        Some(b"on") => &["--ephemeral", "--help"],
-        Some(b"off" | b"status") => &["--pscope", "--help"],
+        Some(b"on") => &["--ephemeral", "--help", "--help-all"],
+        Some(b"off" | b"status") => &["--pscope", "--help", "--help-all"],
         _ => &[],
     };
     options
@@ -1657,6 +1665,10 @@ end
 complete -c syq -f -a '(__syq_complete)'
 "#;
 
+pub(crate) fn command_for_help() -> clap::Command {
+    crate::help::configure(CompletionCommand::command())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1859,6 +1871,11 @@ mod tests {
         let command = crate::cli::command_for_completion("cp").unwrap();
         let options = values(option_candidates(&command, b"--coor"));
         assert_eq!(options, vec![b"--coordinate-at".to_vec()]);
+        assert_eq!(
+            values(option_candidates(&command, b"--help-a")),
+            vec![b"--help-all".to_vec()]
+        );
+        assert!(values(root_candidates(b"--help-a")).contains(&b"--help-all".to_vec()));
     }
 
     #[test]

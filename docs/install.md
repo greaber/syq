@@ -167,7 +167,8 @@ available between commands.
 Standalone installs download and verify one signed release manifest at most
 once a day after a successful interactive command. When a newer release is
 available they print a reminder; updates are never installed as a side effect
-of a copy. Run `syq --self-update` to install the update, or set
+of a copy. Run `syq --self-update` to install the update (`syq --self-update --help`
+explains eligibility and reminders), or set
 `SYQ_NO_UPDATE_CHECK=1` to disable automatic checks and reminders. Explicit
 `syq --self-update` checks still work when that variable is set. The install
 receipt lives at

@@ -9,6 +9,27 @@ transfers](remote-to-remote.md), [Security](security.md), and
 authoritative where this document and the binary disagree; please report the
 disagreement.
 
+## Command-line help
+
+`syq --help` lists commands and top-level options. For each command, `-h`
+and `--help` show the same examples and commonly used options; `--help-all`
+shows the complete option reference, grouped by purpose. For example:
+
+```sh
+syq cp --help
+syq cp --help-all
+syq help receiver enroll
+```
+
+Small management commands show the same options at both levels. Every common
+help page points to its full reference. Options omitted from common help still
+work and remain available in shell completion. In rsync mode, `-h` keeps its
+rsync meaning (human-readable sizes); use `syq rsync --help` for common help
+or `syq rsync --help-all` for all options.
+
+`syq --self-update --help` explains standalone upgrades and update reminders.
+Homebrew installs use `brew upgrade syq`; see [Installation](install.md#update-checks-and-self-update).
+
 ## Native commands
 
 A native command starts with an operation and keeps endpoints, selectors,
@@ -665,7 +686,7 @@ names make clear that an rsync installation will not accept them.
 | `-v`/`--verbose`, `-vv` | `-v` lists files as they complete; for copies, `-vv` also explains remote helpers, candidate TCP addresses, the planned transport, and initial concurrency |
 | `-q`, `--quiet` | Errors only |
 | `-z`, `--compress` / `--no-compress` | Enable (the default) or disable zstd compression in syq's protocol; this is not `ssh -C` |
-| `-n`, `--dry-run` | Resolve mappings and transport, estimate transfers/exclusions/deletions; change nothing |
+| `-n`, `--dry-run` | Resolve mappings and transport, estimate transfers/exclusions/deletions; leave source and destination data unchanged |
 | `--syq-connections N` | Syq extension: parallel data connections (default: auto-tuned, see [Speed](speed.md#how-many-connections)) |
 | `--bwlimit RATE` | Limit aggregate file-data throughput (bare rate is KiB/s; `0` disables) |
 | `-B SIZE`, `--block-size SIZE` | Transfer and hash block size (default 4M) |
@@ -773,9 +794,10 @@ Identical to rsync:
 
 ### Previewing a copy
 
-`-n` / `--dry-run` connects to the endpoints and scans both sides, but creates,
-updates, and deletes nothing. Its concise summary, printed before anything
-would be written, makes path placement, intended changes, logical work, and
+`-n` / `--dry-run` connects to the endpoints and scans both sides without
+creating, updating, or deleting copy data. Requested `--results` files are
+still written, and remote connections may install helpers or update caches.
+Its concise summary makes path placement, intended changes, logical work, and
 the selected data route explicit before a real copy:
 
 ```text

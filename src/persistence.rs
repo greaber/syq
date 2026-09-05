@@ -6,7 +6,7 @@
 
 use crate::cli::Args;
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -24,8 +24,8 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[derive(Parser, Debug)]
 #[command(
     name = "syq persist",
-    about = "Manage reusable SSH control connections",
-    long_about = "Manage reusable SSH control connections. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
+    about = "Manage reusable SSH connections and helper sessions",
+    long_about = "Manage reusable SSH connections and helper sessions. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -124,7 +124,10 @@ pub(crate) fn completion_endpoints(explicit_scope: Option<&Path>) -> Result<Vec<
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let mut full_argv = vec![OsString::from("syq persist")];
     full_argv.extend_from_slice(argv);
-    let command = PersistCommand::try_parse_from(full_argv).unwrap_or_else(|error| error.exit());
+    let matches = command_for_help()
+        .try_get_matches_from(full_argv)
+        .unwrap_or_else(|error| error.exit());
+    let command = PersistCommand::from_arg_matches(&matches)?;
     match command.action {
         PersistAction::On { ephemeral: true } => {
             let scope = create_ephemeral_scope()?;
@@ -718,6 +721,10 @@ fn master_exit_command(socket: &Path, record: &EndpointRecord) -> Command {
     }
     command.arg("--").arg(&record.host);
     command
+}
+
+pub(crate) fn command_for_help() -> clap::Command {
+    crate::help::configure(PersistCommand::command())
 }
 
 #[cfg(test)]
