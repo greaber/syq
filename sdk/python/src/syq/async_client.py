@@ -20,7 +20,7 @@ from collections.abc import (
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
-from .bootstrap import managed_executable
+from .managed import managed_executable
 from .client import (
     Argument,
     IgnoreSelector,
@@ -593,7 +593,7 @@ class AsyncClient:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -601,7 +601,7 @@ class AsyncClient:
         root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
-        follow_dest: bool = False,
+        follow_dst: bool = False,
         to: str | None = None,
         tos: Iterable[str] | None = None,
         into: PathArgument | None = None,
@@ -632,13 +632,10 @@ class AsyncClient:
         no_tcp: bool = False,
         tcp_ports: str | None = None,
         tcp_congestion: str | None = None,
-        no_forward_agent: bool = False,
-        unrestricted_agent_forwarding: bool = False,
-        agent_broker_only: bool = False,
-        max_entries: int | None = None,
-        max_total_bytes: str | int | None = None,
-        max_runtime: str | int | None = None,
-        receipt: str | None = None,
+        peer_auth: str | None = None,
+        receiver_max_entries: int | None = None,
+        receiver_max_bytes: str | int | None = None,
+        receiver_receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
@@ -669,7 +666,7 @@ class AsyncClient:
             "cp",
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -677,7 +674,7 @@ class AsyncClient:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=follow_dest,
+            follow_dst=follow_dst,
             to=to,
             tos=tos,
             into=into,
@@ -692,10 +689,9 @@ class AsyncClient:
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
-            max_entries=max_entries,
-            max_total_bytes=max_total_bytes,
-            max_runtime=max_runtime,
-            receipt=receipt,
+            receiver_max_entries=receiver_max_entries,
+            receiver_max_bytes=receiver_max_bytes,
+            receiver_receipt=receiver_receipt,
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
@@ -715,9 +711,7 @@ class AsyncClient:
             no_tcp=no_tcp,
             tcp_ports=tcp_ports,
             tcp_congestion=tcp_congestion,
-            no_forward_agent=no_forward_agent,
-            unrestricted_agent_forwarding=unrestricted_agent_forwarding,
-            agent_broker_only=agent_broker_only,
+            peer_auth=peer_auth,
         )
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")
@@ -798,7 +792,7 @@ class AsyncClient:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -822,7 +816,7 @@ class AsyncClient:
         argv, selectors_total = _rm_arguments(
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -855,7 +849,7 @@ class AsyncClient:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
@@ -866,14 +860,14 @@ class AsyncClient:
         timeout: float | None = None,
     ) -> AsyncMapStream:
         src_values = _values(src, label="--src")
-        src_src_values = _values(src_src, label="--src-src")
+        srcs_in_values = _values(srcs_in, label="--srcs-in")
         src_file_values = _values(src_file, label="--src-file")
         src_dir_values = _values(src_dir, label="--src-dir")
         argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,
-            src_src=src_src_values,
+            srcs_in=srcs_in_values,
             src_file=src_file_values,
             src_dir=src_dir_values,
             from_=None,
@@ -881,7 +875,7 @@ class AsyncClient:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=False,
+            follow_dst=False,
             to=None,
             tos=None,
             into=None,
@@ -896,10 +890,9 @@ class AsyncClient:
             no_compress=False,
             bwlimit=None,
             connections=None,
-            max_entries=None,
-            max_total_bytes=None,
-            max_runtime=None,
-            receipt=None,
+            receiver_max_entries=None,
+            receiver_max_bytes=None,
+            receiver_receipt=None,
             ignore=None,
             ignore_from=None,
             preserve=None,
@@ -912,12 +905,12 @@ class AsyncClient:
             raise SyqInvocationError("syq map needs a source selector")
         selected_base = root if root is not None else cwd
         contents_selector = None
-        if src_src_values:
-            if len(src_src_values) != 1 or source_count != 1:
+        if srcs_in_values:
+            if len(srcs_in_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
-                    "syq map takes --src-src as its only selector"
+                    "syq map takes --srcs-in as its only selector"
                 )
-            contents_selector = src_src_values[0]
+            contents_selector = srcs_in_values[0]
         effective_cwd = _map_stream_cwd(
             self.process_cwd,
             self.env,

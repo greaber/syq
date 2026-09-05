@@ -1,7 +1,7 @@
 # Python native API
 
-Status: implemented for the upcoming automation-v1 syq version. Until a syq
-release containing v1 exists, source-tree users must select the candidate
+Status: implemented for the upcoming syq release that ships the automation
+results stream. Until such a release exists, source-tree users must select the candidate
 binary explicitly; the next Python SDK release updates its managed pin after
 conformance tests pass.
 
@@ -47,9 +47,9 @@ learn a second set of names for concepts that syq already names.
 | `syq rm` | `syq.rm()` or `Client.rm()` |
 | `syq map` | `syq.map()` or `Client.map()` |
 | `--root` | `root=` |
-| `--src-src` | `src_src=` |
+| `--srcs-in` | `srcs_in=` |
 | `--follow-src` | `follow_src=` |
-| `--follow-dest` | `follow_dest=` |
+| `--follow-dst` | `follow_dst=` |
 | `--into-existing` | `into_existing=` |
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
@@ -77,7 +77,7 @@ accepts a Python binary file-like object instead of a path so applications can
 choose files, in-memory buffers, and their own stream adapters naturally.
 
 Not every command-line parsing convenience needs another Python parameter.
-The plural options `--srcs`, `--src-srcs`, `--src-files`, and `--src-dirs`
+The plural options `--srcs`, `--src-files`, and `--src-dirs`
 only batch values on a command line. Python passes a sequence to the matching
 singular keyword instead. This removes redundant syntax without renaming a
 product concept:
@@ -210,7 +210,7 @@ The conceptual `cp` signature is:
 syq.cp(
     *sources,
     src=None,
-    src_src=None,
+    srcs_in=None,
     src_file=None,
     src_dir=None,
     from_=None,
@@ -218,7 +218,7 @@ syq.cp(
     root=None,
     follow=False,
     follow_src=False,
-    follow_dest=False,
+    follow_dst=False,
     to=None,
     tos=None,
     into=None,
@@ -244,13 +244,10 @@ syq.cp(
     no_tcp=False,
     tcp_ports=None,
     tcp_congestion=None,
-    no_forward_agent=False,
-    unrestricted_agent_forwarding=False,
-    agent_broker_only=False,
-    max_entries=None,
-    max_total_bytes=None,
-    max_runtime=None,
-    receipt=None,
+    peer_auth=None,
+    receiver_max_entries=None,
+    receiver_max_bytes=None,
+    receiver_receipt=None,
     ignore=None,
     ignore_from=None,
     preserve=None,
@@ -271,7 +268,7 @@ removal accepts:
 syq.rm(
     *sources,
     src=None,
-    src_src=None,
+    srcs_in=None,
     src_file=None,
     src_dir=None,
     from_=None,
@@ -297,7 +294,7 @@ retain the native meanings:
 | Python keyword | Native option | Meaning |
 |---|---|---|
 | `src` | `--src` | Select a named object |
-| `src_src` | `--src-src` | Select a directory's contents |
+| `srcs_in` | `--srcs-in` | Select a directory's contents |
 | `src_file` | `--src-file` | Require a non-directory object |
 | `src_dir` | `--src-dir` | Require a directory |
 
@@ -324,19 +321,18 @@ paths retain their separate strict relative grammar. Input paths accept text
 and byte path-like objects on supported Unix systems; byte paths are not
 decoded merely to build argv.
 
-`follow`, `follow_src`, `follow_dest`, `hash`, `no_compress`, `bwlimit`,
+`follow`, `follow_src`, `follow_dst`, `hash`, `no_compress`, `bwlimit`,
 `connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
-`min_size`, and `dry_run` retain the exact native meanings. `max_entries`,
-`max_total_bytes`, and `max_runtime` expose the native command-restricted
-receiver ceilings and are
+`min_size`, and `dry_run` retain the exact native meanings. `receiver_max_entries` and
+`receiver_max_bytes` expose the native command-restricted receiver ceilings and are
 therefore accepted only for a direct remote-to-remote copy using an enrolled
 receiver. Rate, size, and duration values accept the native spellings; the
 Python API does not replace them with differently defined unit types.
-`pscope` selects a private SSH persistence scope created by
+`pscope` selects an ephemeral SSH persistence scope created by
 `syq persist on --ephemeral` for `cp` or `rm`. It cannot be combined with
 `rsh`, and the executable remains authoritative for whether the selected
-topology can use the scope. `receipt` accepts `"sizes"` or `"hashed"` and has
-the native receiver-only meaning; `"hashed"` asks the receiver to include
+topology can use the scope. `receiver_receipt` accepts `"sizes"` or `"digests"` and has
+the native receiver-only meaning; `"digests"` asks the receiver to include
 closure-time BLAKE3 file digests.
 
 Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
@@ -364,8 +360,7 @@ enrollment — its verified receipt becomes the receiver-attested
 results stream — or an explicit `coordinate_at="local"`; syq refuses the
 combination at runtime otherwise): `coordinate_at`, `rsh`,
 `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, `no_forward_agent`, `unrestricted_agent_forwarding`, and
-`agent_broker_only`. Endpoint strings passed through `from_` and `to` include
+`tcp_congestion`, and `peer_auth`. Endpoint strings passed through `from_` and `to` include
 the native optional port syntax. The executable remains authoritative for
 topology, transport, platform, enrollment, and credential-policy constraints.
 
@@ -439,7 +434,7 @@ import syq
 
 prefix = syq.RelativePath("by-year")
 
-with syq.map(src_src="photos") as mapping:
+with syq.map(srcs_in="photos") as mapping:
     entries = (
         replace(entry, dst=prefix / entry.dst)
         for entry in mapping
@@ -453,7 +448,7 @@ with syq.map(src_src="photos") as mapping:
     )
 ```
 
-This corresponds to `syq map --src-src photos` followed by a transformed
+This corresponds to `syq map --srcs-in photos` followed by a transformed
 manifest and `syq cp --mapping ... -C photos --to storage --into /archive`.
 `MapStream.cwd` is the absolute, unresolved spelling of the source base needed
 to execute its emitted `src` paths. Keeping that property named `cwd` makes it
@@ -512,7 +507,7 @@ The typed API does not initially expose a `stream=True` switch.
 
 ```python
 result = syq.cp(
-    src_src="build",
+    srcs_in="build",
     to="server",
     into_existing="/srv/app",
     prune=True,
@@ -559,9 +554,9 @@ delete scope and safety ceiling is separate product work.
 `--dry-run` remains `dry_run=True` on the same operation:
 
 ```python
-preview = syq.cp(src_src="build", into="staging", dry_run=True)
+preview = syq.cp(srcs_in="build", into="staging", dry_run=True)
 preview = syq.cp(
-    src_src="build",
+    srcs_in="build",
     into_existing="staging",
     prune=True,
     max_delete=100,
@@ -578,8 +573,8 @@ or `RmResult` carries `dry_run=True`; copy uses `TraceEvent` while removal uses
 
 A dry run describes what syq observed and would have done. It is not an
 executable transaction, authorization token, or promise that the filesystem
-will remain unchanged before a later operation. Automation v1 supplies the
-shared execution trace and terminal result.
+will remain unchanged before a later operation. The automation results stream
+supplies the shared execution trace and terminal result.
 
 ## Events and terminal results
 
@@ -593,8 +588,8 @@ receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
 Additive unknown record types are validated for a well-formed envelope and
 sequence position, then ignored.
 
-The product's [automation-v1 contract](../../docs/automation-v1.md) and
-[JSON Schema](../../schemas/automation-v1.schema.json), not this document, own
+The product's [automation results contract](../../docs/automation.md) and
+[JSON Schema](../../schemas/automation.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 
@@ -679,7 +674,7 @@ the source/destination state is still appropriate belong to the application.
 An incomplete stream cannot produce a complete retry manifest: unobserved
 operations may exist. Collected entries must not be used until the terminal
 result arrives with status `success` or `partial`, the two statuses for which
-automation v1 guarantees that every queued operation settled.
+the automation contract guarantees that every queued operation settled.
 
 ## Raw execution
 
@@ -687,7 +682,7 @@ The existing escape hatch remains small and transparent:
 
 ```python
 result = client.run(
-    ["enrollments"],
+    ["receiver", "list"],
     check=True,
     timeout=30,
 )
@@ -718,7 +713,7 @@ client = syq.AsyncClient(process_cwd="/srv/jobs")
 result = await client.cp("project", to="server", into="/backup")
 removed = await client.rm("old-project", from_="server")
 
-async with client.map(src_src="photos") as mapping:
+async with client.map(srcs_in="photos") as mapping:
     result = await client.cp(mapping=mapping, cwd=mapping.cwd, into="photos")
 ```
 
@@ -794,9 +789,9 @@ The initial typed API does not provide:
 | Raw stdin and safe streaming | Process behavior only | Implemented |
 | `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
 | `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
-| Typed `cp`, including `prune=True` | Automation v1 | Implemented |
+| Typed `cp`, including `prune=True` | Automation results stream | Implemented |
 | Typed `rm` | Native `rm` result stream | Implemented for local and ordinary SSH endpoints |
-| Typed `dry_run=True` | Automation-v1 trace records | Implemented |
+| Typed `dry_run=True` | Automation trace records | Implemented |
 | Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
 
 The source inventory `native-api.json` records the disposition of every native

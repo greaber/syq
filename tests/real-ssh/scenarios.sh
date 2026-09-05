@@ -109,41 +109,105 @@ fi
 
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
-rm -f /tmp/syq-real-ssh-ssh.trace
+trace=/tmp/syq-real-ssh-ssh.trace
+rm -f "$trace"
 syq persist on >/dev/null
 completion_output=/tmp/syq-real-ssh-completion.out
 completion_expected=/tmp/syq-real-ssh-completion.expected
-for _ in 1 2; do
+{
+    printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
+    printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
+} >"$completion_expected"
+complete_remote() {
     syq completion __complete fish 6 -- \
         syq cp --syq-path /usr/local/bin/syq --from source \
         /tmp/syq-real-ssh/completion/al >"$completion_output"
-    {
-        printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
-        printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
-    } >"$completion_expected"
     cmp "$completion_expected" "$completion_output"
+}
+# Completed logins of the completion's own: the first becomes the master.
+direct_logins() {
+    awk -F '\t' '
+        $1 == "phase=end" &&
+        $3 == "host=source" &&
+        $4 == "control_master=auto" &&
+        $8 == "status=0" { count++ }
+        END { print count + 0 }
+    ' "$trace"
+}
+# Sessions the pool holds open through the master: attached with
+# ControlMaster=no to a present socket and not yet ended. A master check
+# starts and ends at once, so it never counts here.
+open_spares() {
+    awk -F '\t' '
+        $3 == "host=source" &&
+        $4 == "control_master=no" &&
+        $6 == "control_socket=present" {
+            if ($1 == "phase=start") open++
+            if ($1 == "phase=end") open--
+        }
+        END { print open + 0 }
+    ' "$trace"
+}
+complete_remote
+test "$(direct_logins)" -eq 1
+n=0
+while [ "$(open_spares)" -lt 1 ] && [ "$n" -lt 150 ]; do
+    sleep 0.1
+    n=$((n + 1))
 done
-test "$(syq completion cache list)" = source
-reused_completion=$(awk -F '\t' '
-    $1 == "phase=end" &&
-    $3 == "host=source" &&
-    $4 == "control_master=auto" &&
-    $6 == "control_socket=present" &&
-    $8 == "status=0" { count++ }
-    END { print count + 0 }
-' /tmp/syq-real-ssh-ssh.trace)
-if [ "$reused_completion" -lt 1 ]; then
-    echo 'second remote completion did not reuse the persistent SSH socket:' >&2
-    cat /tmp/syq-real-ssh-ssh.trace >&2
+if [ "$(open_spares)" -lt 1 ]; then
+    echo 'session pool did not open a spare through the persistent master:' >&2
+    cat "$trace" >&2
     exit 1
 fi
+syq persist status | grep -q 'session pool' || {
+    echo 'persist status does not show the session pool:' >&2
+    syq persist status >&2
+    exit 1
+}
+# Later completions take the ready session: no login of their own.
+complete_remote
+complete_remote
+if [ "$(direct_logins)" -ne 1 ]; then
+    echo 'a later completion opened its own SSH login instead of taking the pooled session:' >&2
+    cat "$trace" >&2
+    exit 1
+fi
+test "$(syq completion cache list)" = source
 syq completion cache clear >/dev/null
 syq persist off >/dev/null
+
+printf 'case: small native push to an ordinary SSH destination takes one turn\n'
+small_source=/tmp/syq-real-ssh-small.bin
+small_debug=/tmp/syq-real-ssh-small.debug
+small_results=/tmp/syq-real-ssh-small.ndjson
+head -c 1024 /dev/urandom >"$small_source"
+ssh source 'rm -rf /tmp/syq-real-ssh/small-destination && install -d /tmp/syq-real-ssh/small-destination'
+SYQ_DEBUG=1 syq cp --no-progress --results "$small_results" \
+    "$small_source" --to source --into /tmp/syq-real-ssh/small-destination \
+    2>"$small_debug"
+small_status=$(tail -n 1 "$small_results")
+case "$small_status" in
+    *'"status":"success"'*'"type":"result"'*) ;;
+    *)
+        echo 'small push did not settle successfully:' >&2
+        cat "$small_results" "$small_debug" >&2
+        exit 1
+        ;;
+esac
+if ! grep -q 'small copy: published' "$small_debug"; then
+    echo 'small push did not use the one-turn path:' >&2
+    cat "$small_debug" >&2
+    exit 1
+fi
+small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
+small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
+test "$small_expected" = "$small_actual"
 
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
-    --from source --src-src /tmp/syq-real-ssh/protected-source \
+    --from source --srcs-in /tmp/syq-real-ssh/protected-source \
     --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
     echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
     exit 1
@@ -165,7 +229,7 @@ ssh destination '
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress -j 2 --preserve=permissions \
-    --from source --src-src /tmp/syq-real-ssh/direct-source \
+    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/direct-source \
@@ -175,8 +239,8 @@ assert_same_tree \
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress -j 2 --preserve=permissions \
-    --agent-broker-only --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
-    --from source --src-src /tmp/syq-real-ssh/firewall-source \
+    --peer-auth broker --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
+    --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/firewall-source \
@@ -186,8 +250,8 @@ assert_same_tree \
 printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --agent-broker-only \
-    --from source --src-src /tmp/syq-real-ssh/ssh-source \
+    --peer-auth broker \
+    --from source --srcs-in /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/ssh-source \
@@ -197,8 +261,8 @@ assert_same_tree \
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --agent-broker-only --coordinate-at dest \
-    --from source --src-src /tmp/syq-real-ssh/pull-source \
+    --peer-auth broker --coordinate-at dst \
+    --from source --srcs-in /tmp/syq-real-ssh/pull-source \
     --to destination --into /tmp/syq-real-ssh/pull-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/pull-source \
@@ -211,7 +275,7 @@ trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
     --coordinate-at local \
-    --from source --src-src /tmp/syq-real-ssh/relay-source \
+    --from source --srcs-in /tmp/syq-real-ssh/relay-source \
     --to destination --into /tmp/syq-real-ssh/relay-destination
 
 if [ "${SYQ_REAL_SSH_PROFILE:-default}" = max-sessions-1 ]; then

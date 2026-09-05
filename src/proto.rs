@@ -111,7 +111,7 @@ pub type ContentDigest = [u8; 32];
 
 /// Stable identifier for one logical copy command. Destination partial names
 /// include this value so unrelated commands never write the same staged inode.
-pub type PartialId = [u8; 16];
+pub type CopyId = [u8; 16];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -279,7 +279,7 @@ pub struct SmallRead {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPut {
     pub path: PathBytes,
-    pub partial_id: PartialId,
+    pub copy_id: CopyId,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub hash: ContentDigest,
@@ -640,7 +640,7 @@ pub enum Request {
         shared_workers: usize,
         /// Maximum concurrent independent-worker claims against the control
         /// process's private descriptor broker.
-        independent_claim_workers: usize,
+        independent_handoff_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
     /// return the selected directory's stable identity.
@@ -669,7 +669,7 @@ pub enum Request {
     /// Compute the exact receiver-side sidecar names for collision preflight.
     PartialPaths {
         paths: Vec<PathBytes>,
-        partial_id: PartialId,
+        copy_id: CopyId,
         guard: Option<ContainerGuard>,
     },
     Apply {
@@ -681,7 +681,7 @@ pub enum Request {
     /// directory, so callers can preserve parent-before-child replacement.
     PlanBatch {
         partial_paths: Vec<PathBytes>,
-        partial_id: PartialId,
+        copy_id: CopyId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
@@ -690,7 +690,7 @@ pub enum Request {
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
@@ -703,7 +703,7 @@ pub enum Request {
         path: PathBytes,
         size: u64,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         mode: u32,
         attempt: u32,
         create_if_missing: bool,
@@ -713,7 +713,7 @@ pub enum Request {
     /// basis until FinishBasis or SeedBasis consumes it.
     HashAndHold {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         block: u64,
         len: u64,
         condition: TargetCondition,
@@ -724,7 +724,7 @@ pub enum Request {
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
@@ -733,7 +733,7 @@ pub enum Request {
     /// Seed this job's sidecar from the retained basis descriptor.
     SeedBasis {
         path: PathBytes,
-        partial_id: PartialId,
+        copy_id: CopyId,
         len: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
@@ -747,7 +747,7 @@ pub enum Request {
         dst: PathBytes,
         inplace: bool,
         allow_sequential_nfs_fallback: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         size: u64,
         mode: u32,
     },
@@ -757,7 +757,7 @@ pub enum Request {
         /// omits it; a confined source session rejects an omission.
         source: Option<RegisteredPath>,
         which: Which,
-        partial_id: PartialId,
+        copy_id: CopyId,
         block: u64,
         len: u64,
         attempt: u32,
@@ -777,7 +777,7 @@ pub enum Request {
     WriteRange {
         path: PathBytes,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         attempt: u32,
         off: u64,
         hash: ContentDigest,
@@ -788,7 +788,7 @@ pub enum Request {
     Finalize {
         path: PathBytes,
         inplace: bool,
-        partial_id: PartialId,
+        copy_id: CopyId,
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
@@ -804,7 +804,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
-    /// existing prefix resolved), for a stable job identity.
+    /// existing prefix resolved), for a stable copy identity.
     Canonicalize {
         path: PathBytes,
         guard: Option<ContainerGuard>,
@@ -817,6 +817,82 @@ pub enum Request {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
+    /// One turn for a push of fresh small regular files on a fresh control
+    /// session: select and retain the destination directory, refuse if any
+    /// target already exists, register the directory as the session's
+    /// destination root, then stage and publish every file through the
+    /// ordinary small-file path. See `SmallCopyRequest`.
+    CopySmallFiles(SmallCopyRequest),
+}
+
+/// Bounds for one-turn small pushes. The receiver enforces them independently
+/// of the coordinator's eligibility check.
+pub const SMALL_COPY_MAX_FILES: usize = 64;
+pub const SMALL_COPY_MAX_FILE_BYTES: u64 = 1 << 20;
+pub const SMALL_COPY_MAX_TOTAL_BYTES: u64 = 4 << 20;
+
+/// The parts of a job identity only the coordinator knows. The receiver adds
+/// the canonical destination it resolves, so the sidecar names it stages
+/// through are the ones the ordinary engine would use for the same copy.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyIdentity {
+    pub src_endpoint: String,
+    pub src_roots: Vec<(String, bool)>,
+    pub dst_endpoint: String,
+    /// Exact placement names a directory entry beneath the selected
+    /// directory; its identity is the canonical parent plus this leaf.
+    pub dst_leaf: Option<PathBytes>,
+    pub semantic_flags: String,
+}
+
+/// One file of a small push. `path` is spelled as the ordinary engine would
+/// send it: beneath the request prefix, one component below the selected
+/// directory.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyFile {
+    pub path: PathBytes,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: ContentDigest,
+    pub meta: Meta,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyRequest {
+    /// The operator directory: the `--into` directory, or the parent of an
+    /// `--as` leaf. It must already exist.
+    pub directory: PathBytes,
+    pub symlink_policy: OperatorSymlinkPolicy,
+    /// What `AnchorDestination` would register as the request prefix.
+    pub request_prefix: PathBytes,
+    pub identity: SmallCopyIdentity,
+    /// Publication metadata flags, as for `SmallPut`.
+    pub flags: u8,
+    pub files: Vec<SmallCopyFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum SmallCopyOutcome {
+    /// Every file was attempted; one result per file in request order.
+    Published(Vec<Option<WireError>>),
+    /// At least one target already exists. Nothing was written and the
+    /// session holds no selection or root, so the ordinary engine can
+    /// continue on this connection.
+    NotFresh,
+    /// The fresh-destination capacity preflight would refuse this copy.
+    /// Nothing was written and the session is untouched; the engine repeats
+    /// the preflight and reports the shortage itself.
+    CapacityShort,
+    /// Staging failed before any final file was published. Sidecars may
+    /// remain for resume, and the session now holds the destination root,
+    /// so the engine needs a fresh control session to continue.
+    StagingFailed(WireError),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallCopyResponse {
+    pub anchor: DirectoryAnchor,
+    pub outcome: SmallCopyOutcome,
 }
 
 impl Request {
@@ -843,6 +919,7 @@ pub enum Response {
     HelloOk {
         identity: String,
         platform: String,
+        supports_confined_socket_nodes: bool,
     },
     /// Each advertised data address with its interface link speed in Mbps
     /// (0 = unknown). The address the client's ssh session arrived on is first.
@@ -857,7 +934,7 @@ pub enum Response {
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     ScanWarn(String),
-    /// Paths (relative to the root) pruned by the ignore patterns.
+    /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
     DirectoryEntries {
@@ -906,16 +983,17 @@ pub enum Response {
     TransportStats(Option<TcpSocketStats>),
     /// One bounded frame of a signed receipt stream. The final frame is marked
     /// inside the canonical frame encoding.
-    ReceiptV2(#[serde(with = "serde_bytes")] Vec<u8>),
+    Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
     Ok,
     /// An endpoint operation failed with a preserved OS error number. Server
     /// and authorization protocol failures continue to use Err(String).
     EndpointError(WireError),
     Err(String),
-    /// `CopyLocal` could not use the receiver-side direct-copy path. This is
+    /// `CopyLocal` could not use the receiver-side kernel-copy path. This is
     /// deliberately distinct from `Err`: filenames and other diagnostics are
     /// untrusted text and must never select a recovery path.
     CopyLocalUnsupported,
+    SmallFilesCopied(SmallCopyResponse),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1098,7 +1176,7 @@ impl SizeHint for Response {
                     + 32
             }
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
-            Response::ReceiptV2(v) => v.len() + 16,
+            Response::Receipt(v) => v.len() + 16,
             _ => 256,
         }
     }
@@ -1116,6 +1194,16 @@ impl<W: Write> FrameWriter<W> {
             w: BufWriter::with_capacity(1 << 20, w),
             compress,
             preamble_written: false,
+        }
+    }
+
+    /// A writer for a stream whose preamble another process already sent:
+    /// a control session taken from the session pool.
+    pub fn with_preamble_written(w: W, compress: bool) -> Self {
+        FrameWriter {
+            w: BufWriter::with_capacity(1 << 20, w),
+            compress,
+            preamble_written: true,
         }
     }
 

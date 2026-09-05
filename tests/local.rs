@@ -1,11 +1,8 @@
 //! Integration tests: local -> local copies through the built binary.
 
 use base64::Engine as _;
-#[cfg(target_os = "linux")]
 use ed25519_dalek::{Signer, SigningKey};
-#[cfg(target_os = "linux")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,7 +12,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -347,7 +343,7 @@ fn source_fd_preflight_accounts_for_independent_ssh_broker_claims() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|fake>local|ssh": 64 }
+            "paths": { "fake>local|ssh": 64 }
         }))
         .unwrap()
         .as_bytes(),
@@ -656,7 +652,7 @@ fn native_copy_fans_out_to_one_tos_group() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -794,7 +790,7 @@ fn fanout_target_preflight_failure_leaves_ready_target_unchanged() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -815,8 +811,8 @@ fn fanout_target_preflight_failure_leaves_ready_target_unchanged() {
     assert_eq!(read(&alpha.join("dst/file")), b"old");
     assert!(!beta.join("dst").exists());
     let content = String::from_utf8(read(&t.path("failed-results.ndjson"))).unwrap();
-    assert_automation_v1_stream(
-        &automation_v1_validator(),
+    assert_automation_stream(
+        &automation_validator(),
         &content,
         "failed fan-out result stream",
     );
@@ -902,7 +898,7 @@ fn fanout_preserves_inplace_and_prune_behavior() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -990,7 +986,7 @@ fn fanout_max_delete_refusal_does_not_abort_peers() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -1046,12 +1042,12 @@ fn fanout_preserves_root_links_filters_and_metadata_behavior() {
             "--root",
             &t.s("base"),
             "--follow-src",
-            "--src-src",
+            "--srcs-in",
             "link",
             "--tos",
             "alpha",
             "beta",
-            "--follow-dest",
+            "--follow-dst",
             "--ignore=*.tmp",
             "--preserve=permissions",
             "--into-existing",
@@ -1205,7 +1201,7 @@ fn fanout_results_are_one_stream_with_target_indexed_operations() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -1224,11 +1220,7 @@ fn fanout_results_are_one_stream_with_target_indexed_operations() {
 
     assert_output_ok(&output);
     let content = String::from_utf8(read(&t.path("results.ndjson"))).unwrap();
-    assert_automation_v1_stream(
-        &automation_v1_validator(),
-        &content,
-        "fan-out result stream",
-    );
+    assert_automation_stream(&automation_validator(), &content, "fan-out result stream");
     let records: Vec<serde_json::Value> = content
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -1475,7 +1467,7 @@ fn fanout_fatal_member_results_preserve_completed_deletions() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--tos",
             "alpha",
@@ -2133,7 +2125,7 @@ fn native_copy_distinguishes_named_contents_and_exact_placement() {
     run_native_ok(&["cp", &many_slashes, "--into", &t.s("named")]);
     assert_eq!(read(&t.path("named/src/sub/file")), b"data");
 
-    run_native_ok(&["cp", "--src-src", &t.s("src"), "--into", &t.s("contents")]);
+    run_native_ok(&["cp", "--srcs-in", &t.s("src"), "--into", &t.s("contents")]);
     assert_eq!(read(&t.path("contents/sub/file")), b"data");
     assert!(!t.path("contents/src").exists());
 
@@ -2214,7 +2206,7 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     let contents_target = t.s("bad-contents-target");
     let not_a_directory = native_syq(&[
         "cp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-new",
         &contents_target,
@@ -2766,7 +2758,7 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
         if prune {
             args.push("--prune");
         }
-        args.extend(["--src-src", &source, "--into-existing", &target]);
+        args.extend(["--srcs-in", &source, "--into-existing", &target]);
         run_native_ok(&args);
         assert_eq!(read(&t.path(&format!("{destination}/file"))), corrupted);
         if prune {
@@ -2793,7 +2785,7 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
         "cp",
         "--ignore",
         "*.tmp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("copied"),
@@ -2810,7 +2802,7 @@ fn native_filters_apply_to_copy_and_protect_pruned_paths() {
         &t.s("patterns"),
         "--ignore",
         "!important.tmp",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("pruned"),
@@ -2834,7 +2826,7 @@ fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
         "2",
         "--max-size",
         "4",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("copied"),
@@ -2850,7 +2842,7 @@ fn native_size_limits_select_regular_files_and_protect_pruned_paths() {
         "--prune",
         "--min-size=2",
         "--max-size=4",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("pruned"),
@@ -2874,7 +2866,7 @@ fn native_size_limits_fail_before_destination_mutation() {
             "cp",
             option,
             value,
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--into",
             &t.s(destination),
@@ -2903,7 +2895,7 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
     run_native_ok(&[
         "cp",
         "--preserve=permissions,specials",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -2921,6 +2913,97 @@ fn native_preserve_policy_controls_permissions_and_special_files() {
 }
 
 #[test]
+fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
+    let t = Tmp::new();
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--preserve=specials",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--no-progress",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/nested/ordinary")), b"ordinary");
+
+    #[cfg(target_os = "linux")]
+    assert!(fs::symlink_metadata(t.path("dst/nested/socket"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(!t.path("dst/nested/socket").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("skipping socket"), "{stderr}");
+        assert!(stderr.contains("confined destination"), "{stderr}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_remote_destination_socket_policy_uses_handshake_capability() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src/nested/ordinary"), b"ordinary");
+    let _source_socket =
+        std::os::unix::net::UnixListener::bind(t.path("src/nested/socket")).unwrap();
+
+    let command = |platform: &str, socket_capability: &str, destination: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args(["--no-tcp", "-j", "1", "--preserve=specials"])
+            .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
+            .arg(t.path(destination))
+            .arg("--no-progress")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_REMOTE_PLATFORM", platform)
+            .env("FAKE_REMOTE_CONFINED_SOCKET_NODES", socket_capability);
+        command
+    };
+
+    // A Linux coordinator must honor a macOS receiver's inability to create
+    // confined socket nodes. The warning is a fidelity diagnostic and remains
+    // visible even when ordinary output is quiet.
+    let mut macos_destination = command("macos-aarch64", "0", "dst-macos");
+    let output = macos_destination.arg("--quiet").run().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst-macos/nested/ordinary")), b"ordinary");
+    assert!(!t.path("dst-macos/nested/socket").exists());
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("skipping socket"), "{stderr}");
+    assert!(stderr.contains("confined destination"), "{stderr}");
+
+    // A macOS coordinator must not suppress a socket headed to a capable
+    // Linux receiver. Dry-run proves the receiver operation is planned without
+    // asking a macOS test host to execute Linux's mknodat behavior.
+    let mut linux_destination = command("linux-x86_64", "1", "dst-linux");
+    let output = linux_destination
+        .args(["--dry-run", "--verbose"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("create socket"), "{stdout}");
+    assert!(!stderr_of(&output).contains("skipping socket"));
+    assert!(!t.path("dst-linux").exists());
+}
+
+#[test]
 fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     let t = Tmp::new();
     let expected = vec![b'n'; 5 * 1024 * 1024];
@@ -2933,7 +3016,7 @@ fn native_inplace_updates_the_existing_inode_without_a_sidecar() {
     run_native_ok(&[
         "cp",
         "--inplace",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -2980,7 +3063,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     write(&t.path("real/file"), b"data");
     symlink("real", t.path("link")).unwrap();
 
-    let refused = native_syq(&["cp", "--src-src", &t.s("link"), "--into", &t.s("refused")]);
+    let refused = native_syq(&["cp", "--srcs-in", &t.s("link"), "--into", &t.s("refused")]);
     assert!(!refused.status.success());
     assert!(stderr_of(&refused).contains("pass --follow"));
     assert!(!t.path("refused").exists());
@@ -2988,7 +3071,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     run_native_ok(&[
         "cp",
         "--follow",
-        "--src-src",
+        "--srcs-in",
         &t.s("link"),
         "--into",
         &t.s("followed"),
@@ -3019,7 +3102,7 @@ fn native_copy_follow_resolves_source_links_but_default_refuses_traversal() {
     let stderr = stderr_of(&refused);
     assert!(stderr.contains("--follow-src for source paths"), "{stderr}");
     assert!(
-        stderr.contains("--follow-dest for destination paths"),
+        stderr.contains("--follow-dst for destination paths"),
         "{stderr}"
     );
     assert!(
@@ -3042,7 +3125,7 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     run_native_ok(&[
         "cp",
         "--follow-src",
-        "--src-src",
+        "--srcs-in",
         &t.s("source-link"),
         "--into",
         &t.s("source-followed"),
@@ -3052,19 +3135,19 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     let destination_refused = native_syq(&[
         "cp",
         "--follow-src",
-        "--src-src",
+        "--srcs-in",
         &t.s("real-source"),
         "--into-existing",
         &t.s("destination-link"),
     ]);
     assert!(!destination_refused.status.success());
-    assert!(stderr_of(&destination_refused).contains("--follow-dest"));
+    assert!(stderr_of(&destination_refused).contains("--follow-dst"));
     assert!(!t.path("real-destination/file").exists());
 
     let source_refused = native_syq(&[
         "cp",
-        "--follow-dest",
-        "--src-src",
+        "--follow-dst",
+        "--srcs-in",
         &t.s("source-link"),
         "--into",
         &t.s("source-refused"),
@@ -3075,8 +3158,8 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
 
     run_native_ok(&[
         "cp",
-        "--follow-dest",
-        "--src-src",
+        "--follow-dst",
+        "--srcs-in",
         &t.s("real-source"),
         "--into-existing",
         &t.s("destination-link"),
@@ -3088,10 +3171,10 @@ fn native_directional_follow_keeps_source_destination_and_control_authority_sepa
     let control_refused = native_syq(&[
         "cp",
         "--follow-src",
-        "--follow-dest",
+        "--follow-dst",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("real-source"),
         "--into",
         &t.s("control-refused"),
@@ -3214,13 +3297,13 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
     assert!(!refused.status.success());
     let stderr = stderr_of(&refused);
     assert!(
-        stderr.contains("--follow-dest for destination paths"),
+        stderr.contains("--follow-dst for destination paths"),
         "{stderr}"
     );
     assert!(!t.path("real-parent/exact-name").exists());
     run_native_ok(&[
         "cp",
-        "--follow-dest",
+        "--follow-dst",
         &t.s("source"),
         "--as",
         &t.s("parent-link/exact-name"),
@@ -3274,7 +3357,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "cp",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("ignored-output"),
@@ -3288,7 +3371,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "--follow",
         "--ignore-from",
         &t.s("rules-link"),
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("followed-output"),
@@ -3351,7 +3434,7 @@ fn native_copy_control_file_paths_use_the_common_follow_policy() {
         "cp",
         "--ignore-from",
         "/dev/null",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into",
         &t.s("device-input-output"),
@@ -3386,7 +3469,7 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
                 command
                     .args(["cp", "--ignore-from"])
                     .arg(&selected)
-                    .arg("--src-src")
+                    .arg("--srcs-in")
                     .arg(t.path("src"))
                     .arg("--into")
                     .arg(&destination)
@@ -3456,7 +3539,7 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
     command
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(&destination)
@@ -3492,7 +3575,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
     command
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(&destination)
@@ -3551,7 +3634,7 @@ fn named_fifo_control_input_fails_before_destination_mutation() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--ignore-from"])
         .arg(&selected)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(t.path("dst"))
@@ -3787,7 +3870,7 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
     run_native_ok(&[
         "cp",
         "--prune",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("dst"),
@@ -3798,30 +3881,30 @@ fn native_cp_with_prune_removes_only_target_extras_after_copy() {
 }
 
 #[test]
-fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
+fn receiver_is_one_subcommand_with_its_verbs_beneath_it() {
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
             .run()
             .unwrap()
     };
-    let help = run(&["enrollment", "--help"]);
+    let help = run(&["receiver", "--help"]);
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for verb in ["add", "list", "revoke"] {
+    for verb in ["enroll", "list", "revoke"] {
         assert!(text.contains(verb), "{text}");
     }
-    let bare = run(&["enrollment"]);
+    let bare = run(&["receiver"]);
     assert_eq!(bare.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq enrollment"));
-    let bogus = run(&["enrollment", "rotate"]);
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("Usage: syq receiver"));
+    let bogus = run(&["receiver", "rotate"]);
     assert!(!bogus.status.success());
-    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown enrollment command"));
-    for verb in ["add", "list", "revoke"] {
-        let verb_help = run(&["enrollment", verb, "--help"]);
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown receiver command"));
+    for verb in ["enroll", "list", "revoke"] {
+        let verb_help = run(&["receiver", verb, "--help"]);
         assert!(verb_help.status.success(), "{verb}");
         assert!(
-            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq enrollment {verb}")),
+            String::from_utf8_lossy(&verb_help.stdout).contains(&format!("syq receiver {verb}")),
             "{verb}"
         );
     }
@@ -3829,6 +3912,7 @@ fn enrollment_is_one_subcommand_with_its_verbs_beneath_it() {
     for old in [
         &["enroll", "host:dst"][..],
         &["enrollments"],
+        &["enrollment", "list"],
         &["revoke", "id"],
     ] {
         let out = run(old);
@@ -3841,16 +3925,15 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"data");
     for option in [
-        "--max-entries=5",
-        "--max-total-bytes=1M",
-        "--max-runtime=30m",
-        "--receipt=sizes",
+        "--receiver-max-entries=5",
+        "--receiver-max-bytes=1M",
+        "--receiver-receipt=sizes",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
                 option,
-                "--src-src",
+                "--srcs-in",
                 &t.s("src"),
                 "--into",
                 &t.s("dst"),
@@ -3866,25 +3949,6 @@ fn native_receiver_ceilings_apply_only_to_direct_remote_copies() {
         );
         assert!(!t.path("dst").exists(), "{option} copied anyway");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--max-runtime=0m",
-            "--src-src",
-            &t.s("src"),
-            "--to",
-            "hostb",
-            "--into",
-            "/dst",
-        ])
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("at least one second"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[test]
@@ -4004,7 +4068,7 @@ fn native_rm_follow_contents_empties_the_referent_directory_and_keeps_the_link()
     write(&t.path("real/file"), b"remove");
     symlink("real", t.path("link")).unwrap();
 
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-src", "link"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--srcs-in", "link"]);
 
     assert!(t.path("link").is_symlink());
     assert!(t.path("real").is_dir());
@@ -4215,7 +4279,7 @@ fn native_rm_cwd_may_escape_while_root_confines_dotdot() {
 
     write(&t.path("base/a"), b"a");
     write(&t.path("base/sub/b"), b"b");
-    run_native_ok(&["rm", "--root", &t.s("base"), "--src-src", "."]);
+    run_native_ok(&["rm", "--root", &t.s("base"), "--srcs-in", "."]);
     assert!(t.path("base").is_dir());
     assert!(listing(&t.path("base")).is_empty());
 }
@@ -4252,7 +4316,7 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
         "--follow",
         "--src",
         "victim",
-        "--src-src",
+        "--srcs-in",
         "escape",
     ]);
     assert!(!excursion.status.success());
@@ -4272,7 +4336,7 @@ fn native_rm_root_allows_following_a_symlink_that_stays_inside() {
         "--root",
         &t.s("root"),
         "--follow",
-        "--src-src",
+        "--srcs-in",
         "link",
     ]);
     assert!(t.path("root/link").is_symlink());
@@ -4500,6 +4564,18 @@ else
     PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin"
 fi
 export HOME PATH
+if [ -n "${FAKE_REMOTE_PLATFORM:-}" ]; then
+    SYQ_TEST_PLATFORM="$FAKE_REMOTE_PLATFORM"
+    export SYQ_TEST_PLATFORM
+else
+    unset SYQ_TEST_PLATFORM
+fi
+if [ -n "${FAKE_REMOTE_CONFINED_SOCKET_NODES:-}" ]; then
+    SYQ_TEST_CONFINED_SOCKET_NODES="$FAKE_REMOTE_CONFINED_SOCKET_NODES"
+    export SYQ_TEST_CONFINED_SOCKET_NODES
+else
+    unset SYQ_TEST_CONFINED_SOCKET_NODES
+fi
 # The remote helper advertises the address ssh arrived on; never leak the
 # developer's own session into the fixture.
 if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
@@ -4563,6 +4639,9 @@ fi
 printf '%s\n' "$*" >> "$FAKE_RSH_LOG"
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        # A control-master query: answer for a live master unless the test
+        # says otherwise, as the session pool asks before every spare.
+        -O) if [ "$2" = check ]; then exit "${FAKE_SSH_CHECK_STATUS:-0}"; fi; shift 2 ;;
         -o|-l|-p|-S) shift 2 ;;
         -a|-A|-x|-k|-T) shift ;;
         --) shift; break ;;
@@ -4711,11 +4790,10 @@ fn cached_remote_helper(t: &Tmp) -> PathBuf {
     let identity = binary_identity("--build-identity");
     let target = helper_target();
     t.path(&format!(
-        "remote-home/.cache/syq/helpers/{identity}-release-v1/{target}/syq"
+        "remote-home/.cache/syq/helpers/{identity}-release/{target}/syq"
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn cached_local_helper(t: &Tmp) -> PathBuf {
     let target = helper_target();
     t.path(&format!(
@@ -4733,7 +4811,6 @@ fn binary_identity(argument: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -4741,7 +4818,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 struct ReleaseBootstrapFixture {
     archive: Vec<u8>,
     manifest: Vec<u8>,
@@ -4749,10 +4825,8 @@ struct ReleaseBootstrapFixture {
     asset: &'static str,
 }
 
-#[cfg(target_os = "linux")]
 static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
 
-#[cfg(target_os = "linux")]
 fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     RELEASE_BOOTSTRAP_FIXTURE.get_or_init(|| {
         let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
@@ -4762,10 +4836,13 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&binary_bytes).unwrap();
         let archive = encoder.finish().unwrap();
-        let (target, asset) = match std::env::consts::ARCH {
-            "x86_64" => ("linux-x86_64", "syq-linux-x86_64"),
-            "aarch64" => ("linux-aarch64", "syq-linux-aarch64"),
-            arch => panic!("unsupported test architecture {arch}"),
+        let target = helper_target();
+        let asset = match target {
+            "linux-x86_64" => "syq-linux-x86_64",
+            "linux-aarch64" => "syq-linux-aarch64",
+            "macos-x86_64" => "syq-macos-x86_64",
+            "macos-arm64" => "syq-macos-arm64",
+            other => panic!("unsupported release target {other}"),
         };
         let manifest = serde_json::json!({
             "schema": 1,
@@ -4806,7 +4883,6 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     })
 }
 
-#[cfg(target_os = "linux")]
 fn setup_release_bootstrap(t: &Tmp) {
     let fixture = release_bootstrap_fixture();
     write(&t.path("release.gz"), &fixture.archive);
@@ -4836,7 +4912,6 @@ esac
     );
 }
 
-#[cfg(target_os = "linux")]
 fn add_remote_tool(t: &Tmp, name: &str) {
     let destination = t.path(&format!("remote-bin/{name}"));
     if destination.exists() {
@@ -4852,7 +4927,6 @@ fn add_remote_tool(t: &Tmp, name: &str) {
     std::os::unix::fs::symlink(source, destination).unwrap();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
@@ -4900,7 +4974,6 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -4950,7 +5023,6 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     assert_eq!(cache_entries, ["syq"]);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_cannot_inject_digest_protocol_framing() {
     let t = Tmp::new();
@@ -5011,7 +5083,6 @@ fn remote_manifest_cannot_inject_digest_protocol_framing() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     let t = Tmp::new();
@@ -5051,7 +5122,6 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn failed_remote_download_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -5081,7 +5151,35 @@ exit 22
     assert_eq!(read(&t.path("curl.log")), b"fetch\n");
 }
 
-#[cfg(target_os = "linux")]
+#[test]
+fn helper_install_and_upload_fallback_survive_broken_stderr() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+    write(
+        &t.path("src"),
+        b"helper installed despite missing diagnostics",
+    );
+    let remote = format!("fake:{}", t.s("dst"));
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let output = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+}
+
 #[test]
 fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     let t = Tmp::new();
@@ -5113,7 +5211,6 @@ fn missing_remote_hasher_skips_download_and_uploads_verified_binary() {
     assert!(!t.path("curl.log").exists());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn broken_remote_hasher_falls_back_to_verified_upload() {
     let t = Tmp::new();
@@ -5144,9 +5241,8 @@ exit 1
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn corrupted_local_helper_cache_is_discarded_and_refetched() {
+fn remote_corrupted_local_helper_cache_is_discarded_and_refetched() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     setup_release_bootstrap(&t);
@@ -5180,7 +5276,6 @@ exit 22
     assert!(stderr.contains("discarding it"), "{stderr}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn remote_download_write_failure_does_not_retry_with_upload() {
     let t = Tmp::new();
@@ -5816,7 +5911,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 1 }
+            "paths": { "local>fake|ssh": 1 }
         }))
         .unwrap()
         .as_bytes(),
@@ -5863,7 +5958,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     let fixed = run("fixed", Some(3));
     assert_output_ok(&fixed);
     let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["v1|local>fake|ssh"], 1);
+    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
 }
 
 #[cfg(debug_assertions)]
@@ -5928,7 +6023,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     write(
         &cache,
         serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "v1|local>fake|ssh": 2 }
+            "paths": { "local>fake|ssh": 2 }
         }))
         .unwrap()
         .as_bytes(),
@@ -6844,7 +6939,7 @@ fn fallocate_quota_error_is_preserved_in_results() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into-existing",
             "dst",
@@ -6893,7 +6988,7 @@ fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into-existing",
             "dst",
@@ -7006,7 +7101,7 @@ fn dry_run_reports_typed_preflight_summary() {
         "{out}"
     );
     assert!(
-        out.contains("exclusions: 1 path/subtree pruned by ignore rules; 1 other entry"),
+        out.contains("exclusions: 1 path/subtree skipped by ignore rules; 1 other entry"),
         "{out}"
     );
     assert!(
@@ -7779,7 +7874,7 @@ fn native_cp_matches_rsync_rlt() {
     std::os::unix::fs::symlink("sub/file", t.path("src/link")).unwrap();
 
     run_ok(&["-rlt", &t.s("src/"), &t.s("rsync/")]);
-    run_native_ok(&["cp", "--src-src", &t.s("src"), "--into", &t.s("native")]);
+    run_native_ok(&["cp", "--srcs-in", &t.s("src"), "--into", &t.s("native")]);
 
     assert_eq!(listing(&t.path("native")), listing(&t.path("rsync")));
     assert_eq!(read(&t.path("native/sub/file")), b"contents");
@@ -7806,7 +7901,7 @@ fn native_cp_with_prune_matches_rsync_delete() {
     run_native_ok(&[
         "cp",
         "--prune",
-        "--src-src",
+        "--srcs-in",
         &t.s("src"),
         "--into-existing",
         &t.s("native"),
@@ -7824,7 +7919,7 @@ fn native_rm_removes_named_tree_and_contents_keeps_root() {
     }
 
     run_native_ok(&["rm", "--cwd", &t.s(""), "--src", "native"]);
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--src-src", "contents"]);
+    run_native_ok(&["rm", "--cwd", &t.s(""), "--srcs-in", "contents"]);
 
     assert!(!t.path("native").exists());
     assert!(t.path("contents").is_dir());
@@ -7876,6 +7971,515 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
     assert!(log.contains("syq --server"), "{log}");
 }
 
+/// A native push of a few small local files into a remote directory travels
+/// as one control-connection request. Its destination state, summary, and
+/// results records must match the ordinary engine's for the same copy, and
+/// anything the one-turn path declines must reach the engine unchanged.
+#[test]
+fn small_pushes_take_one_turn_and_match_the_engine() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    write(&t.path("src/one.txt"), b"one");
+    write(&t.path("src/two.txt"), b"");
+    write(&t.path("src/three.bin"), &[7u8; 4096]);
+    fs::set_permissions(t.path("src/one.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+    set_mtime(&t.path("src/one.txt"), 1_700_000_000);
+    let sources = [t.s("src/one.txt"), t.s("src/two.txt"), t.s("src/three.bin")];
+    let push = |label: &str, engine: bool, sources: &[String], placement: &[&str]| {
+        let results = t.s(&format!("{label}.ndjson"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .current_dir(t.path("remote-home"))
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-progress",
+                "-v",
+                "--results",
+                &results,
+            ])
+            .args(sources)
+            .args(["--to", "fake.example"])
+            .args(placement)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_DEBUG", "1");
+        if engine {
+            command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+        }
+        let output = command.run().unwrap();
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(&results)))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (output, records)
+    };
+    // The comparable part of a results stream: operation records as a set,
+    // because worker order is not deterministic, and the terminal record
+    // without its timing. Periodic progress records are not part of it.
+    let comparable = |records: &[serde_json::Value]| {
+        let mut operations: Vec<String> = records
+            .iter()
+            .filter(|record| record["type"] == "operation_result")
+            .map(|record| {
+                let mut record = record.clone();
+                record.as_object_mut().unwrap().remove("seq");
+                record.to_string()
+            })
+            .collect();
+        operations.sort();
+        let mut terminal = records.last().unwrap().clone();
+        for key in ["seq", "elapsed_ms"] {
+            terminal.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(terminal["type"], "result");
+        (operations, terminal)
+    };
+    // The summary line without its elapsed time and rate.
+    let summary = |output: &Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with("syq: transferred"))
+            .unwrap_or_else(|| panic!("no summary in {stdout}"));
+        let (head, _) = line.rsplit_once(" at ").unwrap();
+        head.rsplit_once(", ").unwrap().0.to_string()
+    };
+
+    fs::create_dir_all(t.path("dest-fast")).unwrap();
+    fs::create_dir_all(t.path("dest-engine")).unwrap();
+    let (fast, fast_records) = push("fast", false, &sources, &["--into", &t.s("dest-fast")]);
+    let (engine, engine_records) = push("engine", true, &sources, &["--into", &t.s("dest-engine")]);
+    assert_output_ok(&fast);
+    assert_output_ok(&engine);
+    assert!(
+        stderr_of(&fast).contains("small copy: published"),
+        "{}",
+        stderr_of(&fast)
+    );
+    assert!(
+        !stderr_of(&engine).contains("small copy"),
+        "{}",
+        stderr_of(&engine)
+    );
+    assert_eq!(
+        summary(&fast),
+        "syq: transferred 3 files (4.00 KiB), 0 B unchanged (0 files), 0 dirs created"
+    );
+    assert_eq!(summary(&fast), summary(&engine));
+    assert_eq!(comparable(&fast_records), comparable(&engine_records));
+    for name in ["one.txt", "two.txt", "three.bin"] {
+        let (a, b) = (
+            t.path("dest-fast").join(name),
+            t.path("dest-engine").join(name),
+        );
+        assert_eq!(read(&a), read(&t.path("src").join(name)));
+        assert_eq!(read(&a), read(&b));
+        let (ma, mb) = (fs::metadata(&a).unwrap(), fs::metadata(&b).unwrap());
+        assert_eq!(ma.mode() & 0o7777, mb.mode() & 0o7777, "{name}");
+        assert_eq!(ma.mtime(), mb.mtime(), "{name}");
+    }
+    assert_eq!(
+        fs::metadata(t.path("dest-fast/one.txt")).unwrap().mtime(),
+        1_700_000_000
+    );
+    let listed: Vec<String> = String::from_utf8_lossy(&fast.stdout)
+        .lines()
+        .filter(|line| !line.starts_with("syq:"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(listed, ["one.txt", "two.txt", "three.bin"]);
+    // One ssh session carried the whole copy: no route probe, no data worker.
+    assert_eq!(
+        fs::read_to_string(t.path("fast.rsh.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    // Exact placement of one file, in both paths.
+    let (exact, exact_records) = push(
+        "exact",
+        false,
+        &sources[..1],
+        &["--as", &t.s("dest-fast/renamed.txt")],
+    );
+    let (exact_engine, exact_engine_records) = push(
+        "exact-engine",
+        true,
+        &sources[..1],
+        &["--as", &t.s("dest-engine/renamed.txt")],
+    );
+    assert_output_ok(&exact);
+    assert_output_ok(&exact_engine);
+    assert!(stderr_of(&exact).contains("small copy: published"));
+    assert_eq!(read(&t.path("dest-fast/renamed.txt")), b"one");
+    assert_eq!(summary(&exact), summary(&exact_engine));
+    assert_eq!(
+        comparable(&exact_records),
+        comparable(&exact_engine_records)
+    );
+
+    // Relative exact placement uses the same request-prefix spelling as the
+    // receiver. A plain leaf must not cost a declined request and fallback.
+    for (label, prefix) in [("relative", ""), ("dot-relative", "./")] {
+        let fast_name = format!("{prefix}{label}-fast.txt");
+        let engine_name = format!("{prefix}{label}-engine.txt");
+        let (fast, fast_records) = push(label, false, &sources[..1], &["--as", &fast_name]);
+        let (engine, engine_records) = push(
+            &format!("{label}-engine"),
+            true,
+            &sources[..1],
+            &["--as", &engine_name],
+        );
+        assert_output_ok(&fast);
+        assert_output_ok(&engine);
+        assert!(
+            stderr_of(&fast).contains("small copy: published"),
+            "{}",
+            stderr_of(&fast)
+        );
+        assert_eq!(read(&t.path("remote-home").join(&fast_name)), b"one");
+        assert_eq!(summary(&fast), summary(&engine));
+        assert_eq!(comparable(&fast_records), comparable(&engine_records));
+        assert_eq!(
+            fs::read_to_string(t.path(&format!("{label}.rsh.log")))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+        );
+    }
+
+    // An existing target is the engine's case: the one-turn path writes
+    // nothing and hands over on the same connection.
+    write(&t.path("dest-fast/one.txt"), b"stale");
+    write(&t.path("dest-engine/one.txt"), b"stale");
+    let (fast_existing, fast_existing_records) = push(
+        "fast-existing",
+        false,
+        &sources,
+        &["--into", &t.s("dest-fast")],
+    );
+    let (engine_existing, engine_existing_records) = push(
+        "engine-existing",
+        true,
+        &sources,
+        &["--into", &t.s("dest-engine")],
+    );
+    assert_output_ok(&fast_existing);
+    assert_output_ok(&engine_existing);
+    let declined = stderr_of(&fast_existing);
+    assert!(declined.contains("using the ordinary engine"), "{declined}");
+    assert!(!declined.contains("small copy: published"), "{declined}");
+    assert_eq!(summary(&fast_existing), summary(&engine_existing));
+    assert_eq!(
+        comparable(&fast_existing_records),
+        comparable(&engine_existing_records)
+    );
+    assert_eq!(read(&t.path("dest-fast/one.txt")), b"one");
+
+    // A missing directory is the engine's to create after the receiver
+    // declines the one-turn request.
+    let (missing, _) = push(
+        "missing",
+        false,
+        &sources[..1],
+        &["--into", &t.s("dest-fast/new")],
+    );
+    assert_output_ok(&missing);
+    assert!(
+        stderr_of(&missing).contains("small copy declined"),
+        "{}",
+        stderr_of(&missing)
+    );
+    assert_eq!(read(&t.path("dest-fast/new/one.txt")), b"one");
+}
+
+/// Human output failures must leave the small-copy result and receipt intact.
+#[test]
+fn small_push_preserves_results_with_closed_human_streams() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let broken_output = || {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        Stdio::from(OwnedFd::from(writer))
+    };
+    for broken_stderr in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        fs::create_dir_all(t.path("remote-home/dest")).unwrap();
+        write(&t.path("source"), b"small copy survives broken output");
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "-vv",
+                "--no-progress",
+            ])
+            .arg(t.path("source"))
+            .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+            .args(["--results", &t.s("results.ndjson")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_DEBUG", "1")
+            .stdin(Stdio::null())
+            .stdout(broken_output())
+            .stderr(if broken_stderr {
+                broken_output()
+            } else {
+                Stdio::piped()
+            })
+            .start()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            read(&t.path("remote-home/dest/source")),
+            read(&t.path("source"))
+        );
+        let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(terminal["type"], "result");
+        assert_eq!(terminal["exit_code"], 0);
+        assert_eq!(terminal["files_transferred"], 1);
+        assert_eq!(
+            fs::read_to_string(t.path("rsh.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        if !broken_stderr {
+            assert!(stderr_of(&output).contains("small copy: published"));
+        }
+    }
+}
+
+/// The one-turn push refuses, fails, warns, and explains itself exactly as
+/// the engine does: the fresh-destination capacity preflight, a staging
+/// failure that publishes nothing, a source named like a sidecar, and the
+/// -vv route report.
+#[test]
+fn small_push_refusals_and_failures_match_the_engine() {
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src/one.txt"), b"one");
+    write(&t.path("src/two.txt"), b"two");
+    write(&t.path("src/three.txt"), b"three");
+    let sources = [t.s("src/one.txt"), t.s("src/two.txt"), t.s("src/three.txt")];
+    let push = |label: &str,
+                engine: bool,
+                env: &[(&str, &str)],
+                extra: &[&str],
+                sources: &[String],
+                placement: &[&str]| {
+        let results = t.s(&format!("{label}.ndjson"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-progress",
+                "--results",
+                &results,
+            ])
+            .args(extra)
+            .args(sources)
+            .args(["--to", "fake.example"])
+            .args(placement)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_DEBUG", "1");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        if engine {
+            command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+        }
+        let output = command.run().unwrap();
+        let records: Vec<serde_json::Value> = String::from_utf8(read(Path::new(results.as_str())))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (output, records)
+    };
+    // Records compare with the destination directory's own name masked,
+    // since a failure message names the path it failed on.
+    let comparable = |records: &[serde_json::Value], dir: &str| {
+        let mut operations: Vec<String> = records
+            .iter()
+            .filter(|record| record["type"] == "operation_result")
+            .map(|record| {
+                let mut record = record.clone();
+                record.as_object_mut().unwrap().remove("seq");
+                record.to_string().replace(&t.s(dir), "<destination>")
+            })
+            .collect();
+        operations.sort();
+        let mut terminal = records.last().unwrap().clone();
+        for key in ["seq", "elapsed_ms"] {
+            terminal.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(terminal["type"], "result");
+        (operations, terminal)
+    };
+
+    // An empty destination directory is fresh, so the capacity preflight
+    // applies; with no space reported, both refuse before writing anything.
+    for dir in ["cap-fast", "cap-engine"] {
+        fs::create_dir_all(t.path(dir)).unwrap();
+    }
+    let no_space = [("SYQ_TEST_AVAILABLE_BYTES", "0")];
+    let (fast, fast_records) = push(
+        "cap-fast",
+        false,
+        &no_space,
+        &[],
+        &sources,
+        &["--into", &t.s("cap-fast")],
+    );
+    let (engine, engine_records) = push(
+        "cap-engine",
+        true,
+        &no_space,
+        &[],
+        &sources,
+        &["--into", &t.s("cap-engine")],
+    );
+    assert_eq!(fast.status.code(), Some(1));
+    assert_eq!(engine.status.code(), Some(1));
+    for output in [&fast, &engine] {
+        assert!(
+            stderr_of(output).contains("fresh destination capacity preflight failed"),
+            "{}",
+            stderr_of(output)
+        );
+    }
+    assert!(
+        stderr_of(&fast).contains("capacity preflight would refuse"),
+        "{}",
+        stderr_of(&fast)
+    );
+    assert_eq!(
+        comparable(&fast_records, "cap-fast"),
+        comparable(&engine_records, "cap-engine")
+    );
+    for dir in ["cap-fast", "cap-engine"] {
+        assert!(fs::read_dir(t.path(dir)).unwrap().next().is_none(), "{dir}");
+    }
+
+    // A staging failure publishes no final files; the engine then reports
+    // the same failure, keeps its partial, and publishes the rest.
+    for dir in ["stage-fast", "stage-engine"] {
+        fs::create_dir_all(t.path(dir)).unwrap();
+    }
+    let injected = [("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/two.txt")];
+    let (fast, fast_records) = push(
+        "stage-fast",
+        false,
+        &injected,
+        &[],
+        &sources,
+        &["--into", &t.s("stage-fast")],
+    );
+    let (engine, engine_records) = push(
+        "stage-engine",
+        true,
+        &injected,
+        &[],
+        &sources,
+        &["--into", &t.s("stage-engine")],
+    );
+    assert!(
+        stderr_of(&fast).contains("staging failed"),
+        "{}",
+        stderr_of(&fast)
+    );
+    assert_eq!(fast.status.code(), Some(23));
+    assert_eq!(engine.status.code(), Some(23));
+    assert_eq!(
+        comparable(&fast_records, "stage-fast"),
+        comparable(&engine_records, "stage-engine")
+    );
+    for dir in ["stage-fast", "stage-engine"] {
+        assert_eq!(read(&t.path(dir).join("one.txt")), b"one", "{dir}");
+        assert_eq!(read(&t.path(dir).join("three.txt")), b"three", "{dir}");
+        assert!(!t.path(dir).join("two.txt").exists(), "{dir}");
+        assert_eq!(partial_files(&t.path(dir)).len(), 1, "{dir}");
+    }
+
+    // A source named like a sidecar reaches the engine, which warns.
+    let sidecar = partial_files(&t.path("stage-engine")).pop().unwrap();
+    fs::create_dir_all(t.path("side")).unwrap();
+    let (side, _) = push(
+        "side",
+        false,
+        &[],
+        &[],
+        &[sidecar.to_string_lossy().into_owned()],
+        &["--into", &t.s("side")],
+    );
+    assert_output_ok(&side);
+    assert!(
+        !stderr_of(&side).contains("small copy: sending"),
+        "{}",
+        stderr_of(&side)
+    );
+    assert!(
+        stderr_of(&side).contains("recognizable SYQ partial path"),
+        "{}",
+        stderr_of(&side)
+    );
+
+    // -vv explains the helper and the route.
+    fs::create_dir_all(t.path("verbose")).unwrap();
+    let (verbose, _) = push(
+        "verbose",
+        false,
+        &[],
+        &["-vv"],
+        &sources,
+        &["--into", &t.s("verbose")],
+    );
+    assert_output_ok(&verbose);
+    let report = stderr_of(&verbose);
+    assert!(report.contains("small copy: published"), "{report}");
+    for line in [
+        "  helper: ",
+        "  transport: control connection",
+        "syq: concurrency: no data connections",
+    ] {
+        assert!(report.contains(line), "{line} missing from:\n{report}");
+    }
+}
+
 #[test]
 fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
     let t = Tmp::new();
@@ -7908,7 +8512,7 @@ fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
 fn native_rm_contents_requires_a_directory() {
     let t = Tmp::new();
     write(&t.path("file"), b"keep");
-    let out = native_syq(&["rm", "--cwd", &t.s(""), "--src-src", "file"]);
+    let out = native_syq(&["rm", "--cwd", &t.s(""), "--srcs-in", "file"]);
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("must resolve to a directory"),
@@ -8070,7 +8674,7 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "a",
         "--srcs",
         "tree",
-        "--src-srcs",
+        "--srcs-in",
         "contents",
         "--src-files",
         "file-a",
@@ -8170,7 +8774,7 @@ fn native_cp_with_prune_keeps_placement_siblings_and_honors_max_delete() {
         "--prune",
         "--max-delete",
         "0",
-        "--src-src",
+        "--srcs-in",
         &t.s("source/tree"),
         "--into-existing",
         &t.s("contents"),
@@ -8366,7 +8970,7 @@ fn control_file_names_preserve_non_utf8_bytes() {
     let native = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--ignore-from"])
         .arg(&rules)
-        .arg("--src-src")
+        .arg("--srcs-in")
         .arg(t.path("src"))
         .arg("--into")
         .arg(t.path("native"))
@@ -9500,7 +10104,7 @@ fn local_copy_does_not_read_the_global_persistence_configuration() {
     write(&t.path("src/f"), b"data");
     // An eligible implicit SSH endpoint would report this malformed policy,
     // but a local copy has no persistence decision to make.
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("XDG_CONFIG_HOME", t.path("config"))
@@ -11799,7 +12403,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
-                "--src-src",
+                "--srcs-in",
                 "/src",
                 "--from",
                 "hosta",
@@ -11826,7 +12430,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         stderr.contains("needs OpenSSH 8.9 or newer on this machine, but ssh is OpenSSH 8.2"),
         "{stderr}"
     );
-    assert!(stderr.contains("--no-forward-agent"), "{stderr}");
+    assert!(stderr.contains("--peer-auth own-credentials"), "{stderr}");
     // The version probe must not have been mistaken for a connection.
     assert!(!t.path("rsh.log").exists(), "{stderr}");
 
@@ -11862,10 +12466,10 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--from",
             "fake",
             "--follow-src",
-            "--follow-dest",
+            "--follow-dst",
             "--root",
             &t.s("src"),
-            "--src-src",
+            "--srcs-in",
             ".",
             "--to",
             "fake",
@@ -11898,7 +12502,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     for option in [
         "--follow-src",
-        "--follow-dest",
+        "--follow-dst",
         "--root",
         "--ignore=*.tmp",
         "--preserve=permissions",
@@ -11914,7 +12518,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
 }
 
 #[test]
-fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
+fn native_coordinate_at_dst_reverses_the_remote_ssh_edge() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     write(&t.path("src/file"), b"pulled");
@@ -11930,12 +12534,12 @@ fn native_coordinate_at_dest_reverses_the_remote_ssh_edge() {
             "1",
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
             "-q",
@@ -11978,12 +12582,12 @@ fn native_target_dry_run_labels_the_real_endpoints_and_ports() {
             "--dry-run",
             "--from",
             "hostA:2200",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB:2222",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
         ])
@@ -12063,7 +12667,7 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
             "1",
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             &t.s("src"),
             "--to",
             "hostB",
@@ -12091,7 +12695,7 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
 }
 
 #[test]
-fn native_coordinate_at_dest_fails_closed_without_read_enrollment_support() {
+fn native_coordinate_at_dst_fails_closed_without_read_enrollment_support() {
     let t = Tmp::new();
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -12103,7 +12707,7 @@ fn native_coordinate_at_dest_fails_closed_without_read_enrollment_support() {
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             &t.s("dst"),
         ])
@@ -12274,6 +12878,60 @@ fn native_detach_does_not_report_an_immediate_setup_failure_as_started() {
     assert!(!t.path("dst").exists());
 }
 
+#[test]
+fn native_detach_broken_stdout_reports_running_job_without_panicking() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"detached");
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args([
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "-j",
+            "1",
+            "--detach",
+            "--from",
+            "hostA",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--as",
+            &t.s("dst"),
+            "-q",
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("job started on hostA, log "), "{stderr}");
+    assert!(
+        stderr.contains("writing its location to stdout failed"),
+        "{stderr}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read(t.path("dst")).ok().as_deref() != Some(b"detached".as_slice())
+        && std::time::Instant::now() < deadline
+    {
+        eprintln!("waiting for detached job after handoff output failure");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(read(&t.path("dst")), b"detached");
+}
+
 // ----------------------------------------------------------- review round 13
 
 #[test]
@@ -12379,7 +13037,7 @@ fn native_map_contents_emits_identity_parent_first() {
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
     std::os::unix::fs::symlink("Notes.TXT", t.path("src/Link.TXT")).unwrap();
-    let lines = map_lines(&syq_map_in(&t.path(""), &["--src-src", "src"]));
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--srcs-in", "src"]));
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["Berlin", "Berlin/IMG.JPG", "Link.TXT", "Notes.TXT"]);
     for v in &lines {
@@ -12403,7 +13061,7 @@ fn native_map_uses_the_common_source_follow_policy() {
     write(&t.path("real/file"), b"data");
     symlink("real", t.path("link")).unwrap();
 
-    let refused = syq_map_in(&t.path(""), &["--src-src", "link"]);
+    let refused = syq_map_in(&t.path(""), &["--srcs-in", "link"]);
     assert!(!refused.status.success());
     assert!(stderr_of(&refused).contains("--follow-src"));
 
@@ -12414,7 +13072,7 @@ fn native_map_uses_the_common_source_follow_policy() {
 
     let lines = map_lines(&syq_map_in(
         &t.path(""),
-        &["--follow-src", "--src-src", "link"],
+        &["--follow-src", "--srcs-in", "link"],
     ));
     assert_eq!(lines.len(), 1);
     assert_eq!(map_path(&lines[0], "src"), "file");
@@ -12467,7 +13125,7 @@ fn native_map_follow_keeps_cwd_unconfined_but_named_sources_base_relative() {
 
     let escaped = map_lines(&syq_map_in(
         &t.path(""),
-        &["-C", &t.s("base"), "--follow-src", "--src-src", "escape"],
+        &["-C", &t.s("base"), "--follow-src", "--srcs-in", "escape"],
     ));
     assert_eq!(map_path(&escaped[0], "src"), "file");
     assert_eq!(map_path(&escaped[0], "dst"), "file");
@@ -12499,7 +13157,7 @@ fn native_map_scans_the_pinned_selection_after_path_replacement() {
     write(&t.path("outside/outside.txt"), b"outside");
     let ready = t.path("map-ready");
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["map", "--src-src", "selected"])
+        .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""))
         .env("SYQ_TEST_MAP_SELECTION_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_MAP_SELECTION_MS", "750")
@@ -12539,7 +13197,7 @@ fn native_map_descriptor_walk_has_bounded_fd_use() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
-        .args(["map", "--src-src", "selected"])
+        .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""));
     unsafe {
         command.pre_exec(|| {
@@ -12593,6 +13251,39 @@ fn native_map_named_cwd_and_as_rename() {
     assert_eq!(dsts, ["album", "album/x", "album/x/a.jpg"]);
     let srcs: Vec<String> = lines.iter().map(|v| map_path(v, "src")).collect();
     assert_eq!(srcs, ["photos", "photos/x", "photos/x/a.jpg"]);
+    // --as PATH may be nested; every component is honored, none is dropped.
+    let lines = map_lines(&syq_map_in(
+        &t.path(""),
+        &["photos", "--as", "2024/07/album"],
+    ));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(
+        dsts,
+        ["2024/07/album", "2024/07/album/x", "2024/07/album/x/a.jpg"]
+    );
+}
+
+#[test]
+fn native_map_as_nested_path_round_trips_through_cp_mapping() {
+    let t = Tmp::new();
+    write(&t.path("src/photos/x/a.jpg"), b"img");
+    let mapped = syq_map_in(&t.path("src"), &["photos", "--as", "2024/07/album"]);
+    assert!(
+        mapped.status.success(),
+        "map failed: {}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+    let copied = syq_cp_in(
+        &t.path(""),
+        &["--mapping", "-", "-C", "src", "--into", "dst", "-q"],
+        Some(&mapped.stdout),
+    );
+    assert!(
+        copied.status.success(),
+        "cp failed: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(read(&t.path("dst/2024/07/album/x/a.jpg")), b"img");
 }
 
 #[test]
@@ -12607,9 +13298,12 @@ fn native_map_refusals() {
         assert!(stderr.contains(needle), "stderr for {args:?}: {stderr}");
     };
     refuse(&["/etc"], "mapping source base");
-    refuse(&["--src-src", "d1", "--src-src", "d2"], "only selector");
-    refuse(&["--src-src", "d1", "d2"], "only selector");
+    refuse(&["--srcs-in", "d1", "--srcs-in", "d2"], "only selector");
+    refuse(&["--srcs-in", "d1", "d2"], "only selector");
     refuse(&["d1/n", "d2/n"], "same destination name");
+    refuse(&["d1", "--as", "/abs"], "is absolute");
+    refuse(&["d1", "--as", "../up"], "`..` component");
+    refuse(&["d1", "--as", "a//b"], "empty, `.`, or `..` component");
     refuse(
         &["d1", "--into-new", "z"],
         "unexpected argument '--into-new'",
@@ -12621,8 +13315,8 @@ fn native_map_refusals() {
     refuse(&["d1", "--to", "remotehost"], "unexpected argument '--to'");
     refuse(&["d1", "--ignore", "n"], "unexpected argument '--ignore'");
     refuse(
-        &["d1", "--receipt", "sizes"],
-        "unexpected argument '--receipt'",
+        &["d1", "--receiver-receipt", "sizes"],
+        "unexpected argument '--receiver-receipt'",
     );
 }
 
@@ -12634,7 +13328,7 @@ fn native_map_exposes_only_manifest_shaping_options() {
         .expect("run syq map --help");
     assert_output_ok(&help);
     let help = String::from_utf8(help.stdout).expect("map help is UTF-8");
-    for option in ["--cwd", "--follow", "--src", "--src-src", "--as"] {
+    for option in ["--cwd", "--follow", "--src", "--srcs-in", "--as"] {
         assert!(help.contains(option), "map help omitted {option}:\n{help}");
     }
     for option in [
@@ -12662,10 +13356,9 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--ignore-from",
         "--preserve",
         "--inplace",
-        "--max-entries",
-        "--max-total-bytes",
-        "--max-runtime",
-        "--receipt",
+        "--receiver-max-entries",
+        "--receiver-max-bytes",
+        "--receiver-receipt",
     ] {
         assert!(
             !help.contains(option),
@@ -12686,7 +13379,7 @@ fn native_map_refuses_non_utf8_names() {
         .path("src")
         .join(std::ffi::OsString::from_vec(b"bad\xff.dat".to_vec()));
     write(&bad, b"x");
-    let out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    let out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(stderr.contains("UTF-8"), "stderr: {stderr}");
@@ -12914,7 +13607,7 @@ fn native_cp_mapping_end_to_end_map_pipeline() {
     write(&t.path("src/Berlin/IMG.JPG"), b"img");
     write(&t.path("src/Notes.TXT"), b"hello");
     // syq map | (lowercase transform) | syq cp --mapping -
-    let map_out = syq_map_in(&t.path(""), &["--src-src", "src"]);
+    let map_out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
     assert!(map_out.status.success());
     let transformed: String = String::from_utf8(map_out.stdout)
         .unwrap()
@@ -13076,7 +13769,7 @@ fn native_cp_results_without_mapping_and_refusals() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "out",
@@ -13106,14 +13799,14 @@ fn native_cp_results_without_mapping_and_refusals() {
     assert_eq!(lines.last().unwrap()["status"], "success");
     // map does not expose --results; pruning copies accept it (schema v1
     // covers deletions) and mark the run record.
-    let out = syq_map_in(&t.path(""), &["--src-src", "src", "--results", "r.ndjson"]);
+    let out = syq_map_in(&t.path(""), &["--srcs-in", "src", "--results", "r.ndjson"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--results'"));
     let out = syq_cp_in(
         &t.path(""),
         &[
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "pruned",
@@ -13151,26 +13844,26 @@ fn native_map_cwd_may_escape_while_root_confines_component_resolution() {
     assert_eq!(dsts, ["photos", "photos/a.jpg"]);
     assert_eq!(map_path(&lines[0], "src"), "photos");
 
-    let lines = map_lines(&syq_map_in(&t.path("base"), &["--src-src", "../outside"]));
+    let lines = map_lines(&syq_map_in(&t.path("base"), &["--srcs-in", "../outside"]));
     assert_eq!(map_path(&lines[0], "src"), "b.jpg");
     assert_eq!(map_path(&lines[0], "dst"), "b.jpg");
 
     let lines = map_lines(&syq_map_in(
         &t.path("base"),
-        &["--cwd", "missing-base", "--src-src", &t.s("outside")],
+        &["--cwd", "missing-base", "--srcs-in", &t.s("outside")],
     ));
     assert_eq!(map_path(&lines[0], "src"), "b.jpg");
 
     let escape = syq_map_in(
         &t.path(""),
-        &["--root", &t.s("base"), "--src-src", "../outside"],
+        &["--root", &t.s("base"), "--srcs-in", "../outside"],
     );
     assert!(!escape.status.success());
     assert!(stderr_of(&escape).contains("outside its confined root"));
 
     let absolute_escape = syq_map_in(
         &t.path(""),
-        &["--root", &t.s("base"), "--src-src", &t.s("outside")],
+        &["--root", &t.s("base"), "--srcs-in", &t.s("outside")],
     );
     assert!(!absolute_escape.status.success());
 
@@ -13195,7 +13888,7 @@ fn native_cp_results_dry_run_emits_traces() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -13334,7 +14027,7 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -13370,7 +14063,7 @@ fn native_cp_results_fatal_failure_emits_terminal_record() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "absent",
             "--into",
             "dst",
@@ -13404,7 +14097,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -13457,7 +14150,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -13493,7 +14186,7 @@ fn native_cp_prune_results_cover_deletions() {
         .args([
             "cp",
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -13757,7 +14450,7 @@ fn jq(program: &str, args: &[&str], input: &[u8]) -> Output {
 
 fn run_doc_pipeline(t: &Tmp, program: &str, jq_args: &[&str], src: &str, dst: &str) {
     assert_documented(jq_args, program);
-    let map_out = syq_map_in(&t.path(""), &["--src-src", src]);
+    let map_out = syq_map_in(&t.path(""), &["--srcs-in", src]);
     assert!(map_out.status.success());
     let jq_out = jq(program, jq_args, &map_out.stdout);
     assert!(
@@ -14496,7 +15189,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
     assert_output_ok(&listed);
     assert_eq!(listed.stdout, b"fake.example\n");
-    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints-v1.json")).unwrap();
+    let metadata = fs::metadata(t.path("cache/syq/completion-endpoints.json")).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
     let suggested = completion_command(
@@ -14549,7 +15242,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
 
     let cleared = completion_command(&t, &["cache", "clear"]).run().unwrap();
     assert_output_ok(&cleared);
-    assert!(!t.path("cache/syq/completion-endpoints-v1.json").exists());
+    assert!(!t.path("cache/syq/completion-endpoints.json").exists());
 }
 
 fn ephemeral_scope(t: &Tmp) -> PathBuf {
@@ -14559,6 +15252,114 @@ fn ephemeral_scope(t: &Tmp) -> PathBuf {
     assert_output_ok(&output);
     let path = output.stdout.strip_suffix(b"\n").unwrap();
     PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
+}
+
+/// Candidates reach the shell as soon as the listing arrives. Closing the
+/// remote connection waits for the helper's exit status, a whole network
+/// round trip on a distant host, so the completion process must print and
+/// exit while that connection is still open.
+#[test]
+fn remote_completion_replies_before_the_remote_connection_closes() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    let ssh = fake_ssh(&t);
+    // A remote helper that serves normally and then stays alive until it is
+    // released, like an ssh session whose exit status has not come back yet.
+    // The wait is bounded so a regression fails instead of hanging.
+    let helper = t.path("lingering-syq");
+    executable(
+        &helper,
+        format!(
+            r#"#!/bin/sh
+'{syq}' "$@"
+status=$?
+n=0
+until [ -e '{release}' ] || [ "$n" -ge 400 ]; do
+    sleep 0.05
+    n=$((n + 1))
+done
+printf 'helper-exit\n' >> "$FAKE_RSH_LOG"
+exit "$status"
+"#,
+            syq = env!("CARGO_BIN_EXE_syq"),
+            release = t.s("release-helper"),
+        )
+        .as_bytes(),
+    );
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "6",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            &t.s("lingering-syq"),
+            "--from",
+            "fake.example",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    // The lingering helper inherits stderr; a captured pipe would keep this
+    // wait open until the helper exits.
+    .stderr(Stdio::null())
+    .start()
+    .unwrap()
+    .wait_with_output()
+    .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![
+            (
+                b'f',
+                t.path("remote-home/data/name")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            (
+                b'p',
+                t.path("remote-home/data/nested/")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+        ]
+    );
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !log.contains("helper-exit"),
+        "completion waited for the remote helper to exit:\n{log}"
+    );
+
+    write(&t.path("release-helper"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        if log.contains("helper-exit") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "released remote helper never exited:\n{log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -14591,7 +15392,7 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     let copy = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--pscope"])
         .arg(&scope)
-        .args(["--src-src", &t.s("src"), "--into", &t.s("out"), "-q"])
+        .args(["--srcs-in", &t.s("src"), "--into", &t.s("out"), "-q"])
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
@@ -14620,6 +15421,335 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
 }
 
+/// Poll a condition with a hard deadline; the message names what never came.
+fn wait_for(what: &str, deadline: std::time::Duration, mut condition: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + deadline;
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The session pool's own ssh invocations, as the fake logs them: a master
+/// check, or a spare opened with every authentication method disabled.
+fn pool_lines(log: &str) -> (Vec<&str>, Vec<&str>) {
+    let checks = log
+        .lines()
+        .filter(|line| line.contains("-O check"))
+        .collect();
+    let spares = log
+        .lines()
+        .filter(|line| line.contains("PubkeyAuthentication=no") && line.contains("--server"))
+        .collect();
+    (checks, spares)
+}
+
+/// With persistence on, the first command starts a session pool for its
+/// endpoint. The pool opens a spare without authenticating, later commands
+/// take it instead of opening an ssh session of their own, and `persist off`
+/// stops the pool with the scope.
+#[test]
+fn session_pool_serves_later_commands_without_new_ssh_sessions() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    write(&t.path("local.txt"), b"hello");
+    fs::create_dir_all(t.path("remote-home/dest")).unwrap();
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    let scope_text = scope.to_str().unwrap().to_string();
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let complete = |t: &Tmp| {
+        completion_command(
+            t,
+            &[
+                "__complete",
+                "bash",
+                "8",
+                "--",
+                "syq",
+                "cp",
+                "--pscope",
+                &scope_text,
+                "--syq-path",
+                executable,
+                "--from",
+                "fake.example",
+                &path,
+            ],
+        )
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("SYQ_COMPLETION_DEBUG", "1")
+        .run()
+        .unwrap()
+    };
+    let log = |t: &Tmp| fs::read_to_string(t.path("rsh.log")).unwrap_or_default();
+
+    let first = complete(&t);
+    assert_output_ok(&first);
+    assert_eq!(completion_values(&first.stdout).len(), 2);
+    assert!(log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+    wait_for(
+        "the pool's first spare",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).1.is_empty(),
+    );
+    let warmed = log(&t);
+    let (checks, spares) = pool_lines(&warmed);
+    assert!(!checks.is_empty(), "{warmed}");
+    for option in [
+        "ControlMaster=no",
+        "ProxyJump=none",
+        "ProxyCommand=false",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "GSSAPIDelegateCredentials=no",
+        "RequestTTY=no",
+        "BatchMode=yes",
+        "PubkeyAuthentication=no",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "GSSAPIAuthentication=no",
+        "HostbasedAuthentication=no",
+    ] {
+        assert!(
+            spares[0].contains(option),
+            "{option} missing: {}",
+            spares[0]
+        );
+    }
+    assert!(!spares[0].contains("ControlPersist"), "{}", spares[0]);
+    let status = persistence_command(&t, &["status", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("session pool"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // The next completion takes the spare: no session of its own.
+    write(&t.path("rsh.log"), b"");
+    let second = complete(&t);
+    assert_output_ok(&second);
+    assert_eq!(
+        completion_values(&second.stdout),
+        completion_values(&first.stdout)
+    );
+    assert!(!log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+    wait_for(
+        "the pool's replacement spare",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).1.is_empty(),
+    );
+
+    // So does a copy, which says so under SYQ_DEBUG.
+    write(&t.path("rsh.log"), b"");
+    let copy = Command::new(executable)
+        .args([
+            "cp",
+            "--pscope",
+            &scope_text,
+            "--syq-path",
+            executable,
+            "-q",
+        ])
+        .arg(t.path("local.txt"))
+        .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&copy);
+    assert!(
+        stderr_of(&copy).contains("control connection from the session pool"),
+        "{}",
+        stderr_of(&copy)
+    );
+    assert_eq!(read(&t.path("remote-home/dest/local.txt")), b"hello");
+    assert!(!log(&t).contains("ControlMaster=auto"), "{}", log(&t));
+
+    // Closing the scope stops the pool and removes its files with the rest.
+    let closed = persistence_command(&t, &["off", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
+    wait_for(
+        "the pool process to exit",
+        std::time::Duration::from_secs(10),
+        || {
+            !Command::new("pgrep")
+                .args(["-f", &scope_text])
+                .run()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        },
+    );
+}
+
+/// An SSH child can start successfully and only then refuse its exec
+/// channel. Such failures need the same delay as a failed master check.
+#[test]
+fn session_pool_backs_off_when_a_live_master_refuses_sessions() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let scope = ephemeral_scope(&t);
+    let ssh = t.path("bin/ssh");
+    executable(
+        &ssh,
+        br#"#!/bin/sh
+case " $* " in
+    *" -O check "*) exit 0 ;;
+esac
+# Wait for the pool's hello so this is an asynchronous session failure.
+dd bs=1 count=1 >/dev/null 2>&1
+sleep 0.05
+printf 'refused\n' >> "$FAKE_RSH_LOG"
+exit 255
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--session-pool")
+        .arg(scope.join("cm-00112233aabbccdd"))
+        .args(["", "fake.example", "", "unused --server"])
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("SYQ_TEST_POOL_IDLE_SECS", "8")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert_eq!(
+        log.lines().count(),
+        2,
+        "a refused spare should retry after five seconds: {log}"
+    );
+    assert!(!scope.join("cm-00112233aabbccdd.pool").exists());
+    assert!(!scope.join("cm-00112233aabbccdd.pool.lock").exists());
+}
+
+/// A pool never opens a session on its own authority: when the master is
+/// gone the check fails, no spare is opened, and commands connect directly.
+#[test]
+fn session_pool_stays_empty_without_a_live_master() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data")).unwrap();
+    write(&t.path("remote-home/data/name"), b"remote");
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    let scope_text = scope.to_str().unwrap().to_string();
+    let executable = env!("CARGO_BIN_EXE_syq");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let complete = |t: &Tmp| {
+        completion_command(
+            t,
+            &[
+                "__complete",
+                "bash",
+                "8",
+                "--",
+                "syq",
+                "cp",
+                "--pscope",
+                &scope_text,
+                "--syq-path",
+                executable,
+                "--from",
+                "fake.example",
+                &path,
+            ],
+        )
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CHECK_STATUS", "255")
+        .env("SYQ_TEST_POOL_IDLE_SECS", "1")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .env("SYQ_COMPLETION_DEBUG", "1")
+        .run()
+        .unwrap()
+    };
+    let log = |t: &Tmp| fs::read_to_string(t.path("rsh.log")).unwrap_or_default();
+
+    let first = complete(&t);
+    assert_output_ok(&first);
+    wait_for(
+        "the pool's master check",
+        std::time::Duration::from_secs(15),
+        || !pool_lines(&log(&t)).0.is_empty(),
+    );
+    let second = complete(&t);
+    assert_output_ok(&second);
+    assert_eq!(completion_values(&second.stdout).len(), 1);
+    let checked = log(&t);
+    let (_, spares) = pool_lines(&checked);
+    assert!(spares.is_empty(), "{checked}");
+    assert_eq!(
+        log(&t)
+            .lines()
+            .filter(|line| line.contains("ControlMaster=auto"))
+            .count(),
+        2,
+        "{}",
+        log(&t)
+    );
+
+    // Idle, the pool leaves on its own; the scope's own files remain.
+    wait_for(
+        "the idle pool to exit",
+        std::time::Duration::from_secs(15),
+        || {
+            !scope.read_dir().unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pool.lock")
+            })
+        },
+    );
+    let status = persistence_command(&t, &["status", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("session pool"));
+    let closed = persistence_command(&t, &["off", "--pscope", &scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
+}
+
 #[test]
 fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
     let t = Tmp::new();
@@ -14643,7 +15773,7 @@ fn absent_user_config_environment_keeps_ordinary_commands_nonpersistent() {
 fn remote_coordinator_does_not_resolve_local_persistence() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
-    write(&t.path("config/syq/persistence-v1.json"), b"not valid JSON");
+    write(&t.path("config/syq/persistence.json"), b"not valid JSON");
     let ssh = t.path("bin/ssh");
     executable(
         &ssh,
@@ -14656,10 +15786,11 @@ exit 23
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
-                "--no-forward-agent",
+                "--peer-auth",
+                "own-credentials",
                 "--from",
                 "hostA",
-                "--src-src",
+                "--srcs-in",
                 "src",
                 "--to",
                 "hostB",
@@ -14945,12 +16076,12 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
             scope,
             "--from",
             "hostA",
-            "--src-src",
+            "--srcs-in",
             "src",
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--into",
             "dst",
             "-q",
@@ -15034,7 +16165,7 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
         let dst = format!("dst-{mode}");
         let results = format!("r-{mode}.ndjson");
         let mut args = vec![
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             &dst,
@@ -15071,7 +16202,7 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
     let out = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst",
@@ -15147,7 +16278,7 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
         &t.path(""),
         &[
             "--prune",
-            "--src-src",
+            "--srcs-in",
             "missing",
             "--into",
             "dst",
@@ -15173,16 +16304,16 @@ fn native_cp_prune_fatal_failure_reports_deletion_aggregates() {
     assert_eq!(terminal["deletions_blocked"], 0);
 }
 
-fn automation_v1_validator() -> jsonschema::Validator {
+fn automation_validator() -> jsonschema::Validator {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schemas/automation-v1.schema.json"))
+        serde_json::from_str(include_str!("../schemas/automation.schema.json"))
             .expect("schema file is JSON");
     jsonschema::validator_for(&schema).expect("schema compiles")
 }
 
 /// Every line validates against the committed schema, seq is contiguous
 /// from 0, the first record is `run`, and the last is `result`.
-fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
+fn assert_automation_stream(validator: &jsonschema::Validator, content: &str, context: &str) {
     let records: Vec<serde_json::Value> = content
         .lines()
         .enumerate()
@@ -15203,9 +16334,9 @@ fn assert_automation_v1_stream(validator: &jsonschema::Validator, content: &str,
 }
 
 #[test]
-fn automation_v1_fixtures_validate_against_schema() {
-    let validator = automation_v1_validator();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation-v1");
+fn automation_fixtures_validate_against_schema() {
+    let validator = automation_validator();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/automation");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("fixture dir")
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -15228,7 +16359,7 @@ fn automation_v1_fixtures_validate_against_schema() {
     );
     for name in names {
         let content = String::from_utf8(read(&dir.join(&name))).unwrap();
-        assert_automation_v1_stream(&validator, &content, &name);
+        assert_automation_stream(&validator, &content, &name);
     }
     // The strictness is the point: a shape change must fail, not slide by.
     let mut record: serde_json::Value = serde_json::from_str(
@@ -15256,8 +16387,8 @@ fn automation_v1_fixtures_validate_against_schema() {
 }
 
 #[test]
-fn automation_v1_live_streams_validate_against_schema() {
-    let validator = automation_v1_validator();
+fn automation_live_streams_validate_against_schema() {
+    let validator = automation_validator();
     let manifest = format!(
         "{}{}",
         entry_line("Berlin/IMG.JPG", "berlin/2024/img.jpg", Some("file")),
@@ -15276,7 +16407,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = syq_cp_in(&t.path(""), &args, Some(manifest.as_bytes()));
         assert!(out.status.success(), "{name}: {}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path(&results))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
     }
 
     // partial: one mapping entry fails. Exit 23.
@@ -15300,7 +16431,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "partial");
+        assert_automation_stream(&validator, &content, "partial");
     }
 
     // refused: --max-delete blocks the deletion pass. Exit 25.
@@ -15316,7 +16447,7 @@ fn automation_v1_live_streams_validate_against_schema() {
                 "--prune",
                 "--max-delete",
                 "1",
-                "--src-src",
+                "--srcs-in",
                 "src",
                 "--into",
                 "dst",
@@ -15328,7 +16459,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(25), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "refused");
+        assert_automation_stream(&validator, &content, "refused");
     }
 
     // failed: fatal setup failure still yields a valid stream. Exit 1.
@@ -15337,7 +16468,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = syq_cp_in(
             &t.path(""),
             &[
-                "--src-src",
+                "--srcs-in",
                 "missing",
                 "--into",
                 "dst",
@@ -15349,7 +16480,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         );
         assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, "failed");
+        assert_automation_stream(&validator, &content, "failed");
     }
 
     // Native removal has command-specific selector, trace, outcome, and
@@ -15367,7 +16498,7 @@ fn automation_v1_live_streams_validate_against_schema() {
         let out = command.run().unwrap();
         assert_output_ok(&out);
         let content = String::from_utf8(read(&t.path("r.ndjson"))).unwrap();
-        assert_automation_v1_stream(&validator, &content, name);
+        assert_automation_stream(&validator, &content, name);
         assert_eq!(t.path("tree").exists(), dry_run);
     }
 }
@@ -15418,7 +16549,7 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
     // outside per-entry accounting, so one directory, matching the record.
     let human = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "-n"],
+        &["--srcs-in", "src", "--into", "dst", "-n"],
         None,
     );
     assert!(human.status.success(), "{}", stderr_of(&human));
@@ -15430,7 +16561,7 @@ fn native_cp_dry_summary_and_terminal_record_count_the_same_directories() {
     let machine = syq_cp_in(
         &t.path(""),
         &[
-            "--src-src",
+            "--srcs-in",
             "src",
             "--into",
             "dst2",
@@ -15457,7 +16588,7 @@ fn native_cp_results_refuses_an_existing_file() {
     write(&t.path("r.ndjson"), b"yesterday's run");
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results", "r.ndjson"],
+        &["--srcs-in", "src", "--into", "dst", "--results", "r.ndjson"],
         None,
     );
     assert!(!out.status.success());
@@ -15476,7 +16607,7 @@ fn native_cp_results_fd_streams_to_a_caller_opened_descriptor() {
     // The caller opens fd 3 (`3>fd.ndjson`); syq only ever writes to it.
     let out = Command::new("/bin/sh")
         .arg("-c")
-        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 -q 3>fd.ndjson")
+        .arg("exec \"$1\" cp --srcs-in src --into dst --results-fd 3 -q 3>fd.ndjson")
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .current_dir(t.path(""))
@@ -15501,7 +16632,7 @@ fn native_cp_results_fd_refusals() {
     // A descriptor nobody connected fails loudly at startup.
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results-fd", "37"],
+        &["--srcs-in", "src", "--into", "dst", "--results-fd", "37"],
         None,
     );
     assert!(!out.status.success());
@@ -15510,7 +16641,7 @@ fn native_cp_results_fd_refusals() {
     // A read-only descriptor would swallow every record silently.
     let out = Command::new("/bin/sh")
         .arg("-c")
-        .arg("exec \"$1\" cp --src-src src --into dst --results-fd 3 3</dev/null")
+        .arg("exec \"$1\" cp --srcs-in src --into dst --results-fd 3 3</dev/null")
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .current_dir(t.path(""))
@@ -15522,7 +16653,7 @@ fn native_cp_results_fd_refusals() {
     // Slots 0-2 belong to stdin/stdout/stderr.
     let out = syq_cp_in(
         &t.path(""),
-        &["--src-src", "src", "--into", "dst", "--results-fd", "1"],
+        &["--srcs-in", "src", "--into", "dst", "--results-fd", "1"],
         None,
     );
     assert!(!out.status.success());
@@ -15554,7 +16685,7 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
             "--to",
             "hostB",
             "--coordinate-at",
-            "dest",
+            "dst",
             "--as",
             &t.s("dst-remote"),
         ])

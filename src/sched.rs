@@ -22,7 +22,7 @@ pub struct FileJob {
     pub target_condition: crate::proto::TargetCondition,
     /// Opened directory identity that anchors descendant target mutations.
     pub container_guard: Option<ContainerGuard>,
-    pub attempts: u32,
+    pub attempt: u32,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).

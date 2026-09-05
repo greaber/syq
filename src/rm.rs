@@ -12,7 +12,7 @@ use crate::proto::{
     NativeRemoveSelection, WireError, WireIoKind,
 };
 use crate::results::{
-    RemovalRecord, RemovalResultRecord, RemovalSelectionRecord, ResultsWriter, RunMode,
+    RemovalRecord, ResultsWriter, RmResultRecord, RunMode, SelectionResultRecord,
 };
 use crate::transfer::{connect_ctl, endpoint};
 use anyhow::{bail, Result};
@@ -124,7 +124,7 @@ fn print_summary(args: &Args, progress: &Progress, summary: &RemovalSummary) {
     if summary.entries_failed > 0 {
         details.push(format!("{} errors", commas(summary.entries_failed)));
     }
-    println!(
+    crate::output::human_stdout!(
         "syq: {} {} entries in {}{}",
         if args.dry_run {
             "would remove"
@@ -219,7 +219,7 @@ fn record_outcome(
                 "missing"
             };
             if let Some(writer) = results {
-                writer.emit_removal_selection(&RemovalSelectionRecord {
+                writer.emit_selection_result(&SelectionResultRecord {
                     selector: outcome.selector,
                     path: &outcome.path,
                     status,
@@ -260,7 +260,7 @@ fn record_outcome(
                 progress.println(&String::from_utf8_lossy(&outcome.path));
             }
             if let Some(writer) = results {
-                writer.emit_removal(&RemovalRecord {
+                writer.emit_removal_result(&RemovalRecord {
                     selector: outcome.selector,
                     path: &outcome.path,
                     kind,
@@ -295,7 +295,7 @@ fn record_outcome(
             };
             let os_kind = failure.error.io_kind.map(wire_os_kind);
             if let Some(writer) = results {
-                writer.emit_removal(&RemovalRecord {
+                writer.emit_removal_result(&RemovalRecord {
                     selector: outcome.selector,
                     path: &outcome.path,
                     kind,
@@ -330,7 +330,7 @@ fn emit_terminal(
     exit_code: i32,
 ) {
     if let Some(writer) = writer.filter(|writer| !writer.is_dead()) {
-        writer.emit_removal_result(&RemovalResultRecord {
+        writer.emit_rm_result(&RmResultRecord {
             status,
             exit_code,
             dry_run,

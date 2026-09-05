@@ -62,7 +62,7 @@ pub enum CoordinateAt {
     /// Run the coordinator at the source endpoint.
     Src,
     /// Run the coordinator at the destination endpoint.
-    Dest,
+    Dst,
     /// Keep the coordinator on the invoking machine and relay the data there.
     Local,
 }
@@ -100,7 +100,7 @@ pub struct Args {
     #[arg(skip)]
     pub fanout_mapping: Option<std::sync::Arc<Vec<u8>>>,
     /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
-    /// not joined into selector strings by the orchestrator.
+    /// not joined into selector strings by the coordinator.
     #[arg(skip)]
     pub native_rm_cwd: Option<Vec<u8>>,
     /// Endpoint-side containment boundary for native removal.
@@ -121,7 +121,7 @@ pub struct Args {
     pub native_follow_src: bool,
     /// Permit symlinks that must be traversed in directly supplied destination paths.
     #[arg(skip)]
-    pub native_follow_dest: bool,
+    pub native_follow_dst: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -157,15 +157,9 @@ pub struct Args {
     /// Native detached remote coordinator.
     #[arg(skip)]
     pub detach: bool,
-    /// Native remote coordinator uses its own peer credential.
+    /// How a native remote coordinator authenticates to the peer.
     #[arg(skip)]
-    pub no_forward_agent: bool,
-    /// Native remote coordinator receives the complete local SSH agent.
-    #[arg(skip)]
-    pub unrestricted_agent_forwarding: bool,
-    /// Native remote coordinator uses authentication-only broker confinement.
-    #[arg(skip)]
-    pub agent_broker_only: bool,
+    pub peer_auth: PeerAuth,
 
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
@@ -266,7 +260,7 @@ pub struct Args {
     /// No-op accepted for rsync compatibility (syq always keeps partial files)
     #[arg(long)]
     pub partial: bool,
-    /// SYQ extension: emit machine-readable progress lines (JSON) on stderr
+    /// Syq extension: emit machine-readable progress lines (JSON) on stderr
     #[arg(long = "syq-progress-json")]
     pub progress_json: bool,
     /// Print transfer statistics at the end
@@ -276,7 +270,7 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// SYQ extension: only compare source and destination contents; transfer nothing
+    /// Syq extension: only compare source and destination contents; transfer nothing
     #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
     /// Update files in place instead of writing a partial and renaming. Use this to modify a
@@ -291,23 +285,23 @@ pub struct Args {
     /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
-    /// SYQ extension: require syq on the remote PATH instead of installing a versioned helper
+    /// Syq extension: require syq on the remote PATH instead of installing a versioned helper
     #[arg(long = "syq-no-bootstrap")]
     pub no_bootstrap: bool,
-    /// SYQ extension: use TCP data connections without encryption (trusted networks only)
+    /// Syq extension: use TCP data connections without encryption (trusted networks only)
     #[arg(long = "syq-tcp-plain")]
     pub tcp_plain: bool,
-    /// SYQ extension: send all data over ssh instead of separate TCP data connections
+    /// Syq extension: send all data over ssh instead of separate TCP data connections
     #[arg(long = "syq-no-tcp")]
     pub no_tcp: bool,
-    /// SYQ extension: port range the remote listens on for TCP data connections
+    /// Syq extension: port range the remote listens on for TCP data connections
     #[arg(
         long = "syq-tcp-ports",
         default_value = "47600-47699",
         value_name = "LO-HI"
     )]
     pub tcp_ports: String,
-    /// SYQ extension: use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    /// Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only)
     #[arg(
         long = "syq-tcp-congestion",
         value_name = "ALGO",
@@ -315,13 +309,13 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// SYQ extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long = "syq-pscope", value_name = "PATH", conflicts_with = "rsh")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
     pub pscope_explicit: bool,
-    /// Signed receiver grant forwarded to a native source-host orchestrator
+    /// Signed receiver grant forwarded to a native source-host coordinator
     #[arg(skip)]
     pub restricted_grant: Option<String>,
     /// Terminal width for a native remote coordinator's progress display
@@ -330,7 +324,7 @@ pub struct Args {
     /// Original source endpoint for a native remote coordinator's dry-run summary
     #[arg(skip)]
     pub plan_source_host: Option<String>,
-    /// SYQ extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
+    /// Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
     /// with --syq-ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
@@ -342,7 +336,7 @@ pub struct Args {
         allow_hyphen_values = true
     )]
     pub ignore: Vec<String>,
-    /// SYQ extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
+    /// Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<OsString>,
     /// All ignore patterns, in command-line order (filled by parse_args)
@@ -374,17 +368,12 @@ pub struct Args {
     pub max_delete: Option<u64>,
     /// Native-only command-restricted receiver ceilings, signed into the grant.
     #[arg(skip)]
-    pub max_entries: Option<u64>,
+    pub receiver_max_entries: Option<u64>,
     #[arg(skip)]
-    pub max_total_bytes: Option<u64>,
+    pub receiver_max_bytes: Option<u64>,
+    /// Native-only: the receipt detail `--receiver-receipt` asked for, if any.
     #[arg(skip)]
-    pub max_runtime_secs: Option<u32>,
-    /// Native-only: `--receipt` was given at all, and whether it asked the
-    /// command-restricted receiver for a hashed receipt.
-    #[arg(skip)]
-    pub receipt_requested: bool,
-    #[arg(skip)]
-    pub receipt_hashed: bool,
+    pub receiver_receipt: Option<ReceiptDetail>,
     /// Skip regular files that are newer on the destination (directories,
     /// symlinks and specials are unaffected)
     #[arg(short = 'u', long)]
@@ -439,7 +428,7 @@ impl Args {
     }
 
     pub(crate) fn follows_native_destination_paths(&self) -> bool {
-        self.native_follow || self.native_follow_dest
+        self.native_follow || self.native_follow_dst
     }
 
     /// Parse the command line and read ignore files, keeping command-line and
@@ -471,7 +460,7 @@ impl Args {
             // helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv, true),
             _ => bail!(
-                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `enrollment`); rsync-shaped syntax now starts with `syq rsync`"
+                "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `receiver`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
@@ -641,7 +630,7 @@ fn ordered_ignore_lines(
 
 fn print_root_help() {
     println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  enrollment   Manage command-restricted receiver enrollments (add, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
+        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  receiver     Manage command-restricted receiver enrollments (enroll, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
     );
 }
 
@@ -677,7 +666,7 @@ struct NativeSourceArgs {
     src: Vec<OsString>,
     /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
-    src_src: Vec<OsString>,
+    srcs_in: Vec<OsString>,
     /// Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
@@ -693,9 +682,6 @@ struct NativeSourceArgs {
     /// Select several named source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
-    /// Select the contents of several directories
-    #[arg(long, value_name = "DIR", num_args = 1..)]
-    src_srcs: Vec<OsString>,
     /// Named source objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
@@ -732,7 +718,7 @@ struct NativeRmSelectionArgs {
     src: Vec<OsString>,
     /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
-    src_src: Vec<OsString>,
+    srcs_in: Vec<OsString>,
     /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
     src_file: Vec<OsString>,
@@ -748,9 +734,6 @@ struct NativeRmSelectionArgs {
     /// Select several objects without constraining their selected types
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
-    /// Select the contents of several directories
-    #[arg(long, value_name = "DIR", num_args = 1..)]
-    src_srcs: Vec<OsString>,
     /// Selected objects (shorthand for --src)
     #[arg(value_name = "PATH")]
     sources: Vec<OsString>,
@@ -784,7 +767,7 @@ struct NativeOperationalArgs {
 #[derive(clap::Args, Debug, Default)]
 struct NativeResultsArgs {
     /// Write the machine-readable NDJSON result stream to FILE (created
-    /// fresh; an existing file is refused). Automation schema version 1
+    /// fresh; an existing file is refused)
     #[arg(long, value_name = "FILE")]
     results: Option<OsString>,
     /// Write the result stream to an inherited file descriptor the caller
@@ -821,29 +804,46 @@ struct NativeCopyOperationalArgs {
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
     inplace: bool,
-    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries (direct remote-to-remote only)
-    #[arg(long, value_name = "N")]
-    max_entries: Option<u64>,
-    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total (direct remote-to-remote only)
-    #[arg(long, value_name = "SIZE")]
-    max_total_bytes: Option<String>,
-    /// Command-restricted receiver ceiling: the signed grant expires DURATION after it is issued, e.g. 30m or 2h (direct remote-to-remote only; at most 23h)
-    #[arg(long, value_name = "DURATION")]
-    max_runtime: Option<String>,
-    /// Receiver receipt detail: final sizes (default) or also final BLAKE3 file digests (direct remote-to-remote only)
-    #[arg(long, value_name = "MODE", value_enum)]
-    receipt: Option<ReceiptMode>,
+    /// Command-restricted receiver ceiling: refuse to touch more than N destination entries
+    #[arg(long, value_name = "N", help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_max_entries: Option<u64>,
+    /// Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total
+    #[arg(long, value_name = "SIZE", help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_max_bytes: Option<String>,
+    /// Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file digests
+    #[arg(long, value_name = "DETAIL", value_enum, help_heading = REMOTE_TO_REMOTE_HEADING)]
+    receiver_receipt: Option<ReceiptDetail>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum ReceiptMode {
-    Sizes,
-    Hashed,
+/// How a remote coordinator authenticates to the peer of a direct
+/// remote-to-remote copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum PeerAuth {
+    /// Constrained agent broker plus the command-restricted receiver on the peer
+    #[default]
+    Restricted,
+    /// Constrained agent broker only; the peer runs no command-restricted receiver
+    Broker,
+    /// Forward nothing; the coordinator must hold its own credentials for the peer
+    OwnCredentials,
+    /// Expose the complete local SSH agent to the coordinator, as `ssh -A` would
+    FullAgent,
 }
+
+/// What the command-restricted receiver records in its signed receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReceiptDetail {
+    /// Final type and size of every path the transfer could have changed
+    Sizes,
+    /// Sizes plus a closure-time BLAKE3 digest of every regular file
+    Digests,
+}
+
+const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteHelperArgs {
-    /// Use this exact syq executable for ordinary remote helpers, including an r2r coordinator
+    /// Use this exact syq executable for ordinary remote helpers, including a remote-to-remote coordinator
     #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
     syq_path: Option<String>,
     /// Require ordinary remote helpers on PATH instead of installing a versioned helper
@@ -854,7 +854,7 @@ struct NativeRemoteHelperArgs {
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
-    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto)]
+    #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
     /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
     #[arg(long = "rsh", value_name = "COMMAND")]
@@ -870,7 +870,7 @@ struct NativeRemoteArgs {
     /// Port range remote listeners use for TCP data connections
     #[arg(long, default_value = "47600-47699", value_name = "LO-HI")]
     tcp_ports: String,
-    /// Use this congestion-control algorithm for direct TCP data sockets (Linux only)
+    /// Use this congestion-control algorithm for TCP data sockets (Linux only)
     #[arg(
         long,
         value_name = "ALGO",
@@ -878,24 +878,18 @@ struct NativeRemoteArgs {
         conflicts_with = "no_tcp"
     )]
     tcp_congestion: Option<String>,
-    /// Run at the remote coordinator and return after launch; requires --no-forward-agent or --rsh
-    #[arg(long)]
+    /// Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh
+    #[arg(long, help_heading = REMOTE_TO_REMOTE_HEADING)]
     detach: bool,
-    /// Give a remote coordinator no forwarded agent; it must own credentials for the peer
-    #[arg(long, conflicts_with = "rsh")]
-    no_forward_agent: bool,
-    /// Expose the complete local SSH agent to a live remote coordinator
+    /// How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely
     #[arg(
         long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "detach"]
+        value_enum,
+        value_name = "MODE",
+        default_value_t = PeerAuth::Restricted,
+        help_heading = REMOTE_TO_REMOTE_HEADING
     )]
-    unrestricted_agent_forwarding: bool,
-    /// Use destination-bound authentication without a command-restricted enrollment
-    #[arg(
-        long,
-        conflicts_with_all = ["rsh", "no_forward_agent", "unrestricted_agent_forwarding", "detach"]
-    )]
-    agent_broker_only: bool,
+    peer_auth: PeerAuth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -926,7 +920,7 @@ struct NativeCopyFields {
     tos: Vec<String>,
     /// Follow symlinks in directly supplied destination paths
     #[arg(long)]
-    follow_dest: bool,
+    follow_dst: bool,
     /// Put selected names inside DIR, creating it if necessary
     #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
     into: Vec<OsString>,
@@ -972,7 +966,7 @@ struct NativeSizeSelectionArgs {
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
     long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to, --tos, or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT\n       syq cp [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]... (--to ENDPOINT | --tos ENDPOINT...) PLACEMENT..."
+    override_usage = "syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT\n       syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... (--to ENDPOINT | --tos ENDPOINT...) PLACEMENT..."
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -981,7 +975,7 @@ struct NativeCopyCommand {
     size_selection: NativeSizeSelectionArgs,
     #[command(flatten)]
     remote: NativeRemoteArgs,
-    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
@@ -1009,13 +1003,12 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
         ("cwd", "--cwd"),
         ("root", "--root"),
         ("src", "--src"),
-        ("src_src", "--src-src"),
+        ("srcs_in", "--srcs-in"),
         ("src_file", "--src-file"),
         ("src_dir", "--src-dir"),
         ("src_files", "--src-files"),
         ("src_dirs", "--src-dirs"),
         ("srcs", "--srcs"),
-        ("src_srcs", "--src-srcs"),
         ("sources", "a positional source"),
         ("mapping", "--mapping"),
     ];
@@ -1052,12 +1045,12 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
     version,
     about = "Print a local source selection as an NDJSON mapping",
     long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    override_usage = "syq map [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeMapCommand {
     #[command(flatten)]
     source: NativeSourceArgs,
-    /// Rename the single selected root in the emitted mapping
+    /// Emit the single selected root at PATH, relative to the future destination container; PATH may be nested
     #[arg(long, value_name = "PATH")]
     r#as: Option<OsString>,
 }
@@ -1068,7 +1061,7 @@ struct NativeMapCommand {
     version,
     about = "Remove endpoint-resolved object trees without following symlinks by default",
     long_about = "Remove endpoint-resolved object trees without following symlinks by default.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq rm [OPTIONS] [--src PATH | --src-src DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    override_usage = "syq rm [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
 )]
 struct NativeRmCommand {
     #[command(flatten)]
@@ -1079,7 +1072,7 @@ struct NativeRmCommand {
     helper: NativeRemoteHelperArgs,
     #[command(flatten)]
     results_output: NativeResultsArgs,
-    /// Use an isolated SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
 }
@@ -1105,11 +1098,10 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--cwd",
         b"--root",
         b"--src",
-        b"--src-src",
+        b"--srcs-in",
         b"--src-file",
         b"--src-dir",
         b"--srcs",
-        b"--src-srcs",
         b"--src-files",
         b"--src-dirs",
         b"--into",
@@ -1124,8 +1116,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--pscope",
         b"--syq-path",
     ];
-    const VARIADIC_VALUE_OPTIONS: &[&[u8]] =
-        &[b"--srcs", b"--src-srcs", b"--src-files", b"--src-dirs"];
+    const VARIADIC_VALUE_OPTIONS: &[&[u8]] = &[b"--srcs", b"--src-files", b"--src-dirs"];
 
     let arguments = argv
         .split(|argument| argument.as_bytes() == b"--")
@@ -1184,13 +1175,12 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
     let source = &mut copy.selection.source;
     for list in [
         &mut source.src,
-        &mut source.src_src,
+        &mut source.srcs_in,
         &mut source.src_file,
         &mut source.src_dir,
         &mut source.src_files,
         &mut source.src_dirs,
         &mut source.srcs,
-        &mut source.src_srcs,
         &mut source.sources,
     ] {
         for value in list.iter_mut() {
@@ -1424,9 +1414,8 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut locations = if mapping.is_some() {
         let source = &copy.selection.source;
         let has_selectors = !(source.src.is_empty()
-            && source.src_src.is_empty()
+            && source.srcs_in.is_empty()
             && source.srcs.is_empty()
-            && source.src_srcs.is_empty()
             && source.src_file.is_empty()
             && source.src_dir.is_empty()
             && source.src_files.is_empty()
@@ -1489,7 +1478,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
-                    "named source {:?} has no target basename; use --src-src to select directory contents",
+                    "named source {:?} has no target basename; use --srcs-in to select directory contents",
                     String::from_utf8_lossy(&source.path)
                 );
             }
@@ -1522,7 +1511,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         .map(OsStringExt::into_vec);
     args.native_follow = copy.selection.source.follow;
     args.native_follow_src = copy.selection.source.follow_src;
-    args.native_follow_dest = copy.follow_dest;
+    args.native_follow_dst = copy.follow_dst;
     if args.native_mapping.is_some() {
         // The manifest is read on this machine and its entries are stat'ed
         // through the source connection; a direct remote-to-remote copy has
@@ -1551,10 +1540,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             bail!("--coordinate-at applies only to copies between two remote endpoints");
         }
     }
-    if args.max_entries.is_some()
-        || args.max_total_bytes.is_some()
-        || args.max_runtime_secs.is_some()
-        || args.receipt_requested
+    if args.receiver_max_entries.is_some()
+        || args.receiver_max_bytes.is_some()
+        || args.receiver_receipt.is_some()
     {
         // These are assertions for hostB's enrolled receiver to enforce; with
         // no such receiver in the topology, nothing would enforce them, so
@@ -1563,7 +1551,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
         if !(src_remote && dst_remote) {
             bail!(
-                "--max-entries, --max-total-bytes, --max-runtime, and --receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
+                "--receiver-max-entries, --receiver-max-bytes, and --receiver-receipt address the command-restricted receiver; they apply only to direct remote-to-remote copies"
             );
         }
     }
@@ -1623,7 +1611,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
         .any(|location| location.selection == SourceSelection::Contents)
         && locations.len() > 1
     {
-        bail!("syq map takes --src-src DIR as the only selector, or any number of named selectors");
+        bail!("syq map takes --srcs-in DIR as the only selector, or any number of named selectors");
     }
 
     let (placement, target) = match parsed.r#as {
@@ -1635,19 +1623,14 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
             if target.is_empty() {
                 bail!("--as target may not be empty");
             }
-            if native_basename(&target).is_none() {
-                bail!(
-                    "--as target {:?} has no basename",
-                    String::from_utf8_lossy(&target)
-                );
-            }
+            crate::transfer::validate_manifest_path(&target, "--as")?;
             (Placement::As, Some(target))
         }
         None => {
             for source in locations.iter().filter(|source| !source.copies_contents()) {
                 if native_basename(&source.path).is_none() {
                     bail!(
-                        "named source {:?} has no target basename; use --src-src to select directory contents",
+                        "named source {:?} has no target basename; use --srcs-in to select directory contents",
                         String::from_utf8_lossy(&source.path)
                     );
                 }
@@ -1692,14 +1675,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             &parsed.selection.srcs,
         ),
         (
-            "src_src",
+            "srcs_in",
             SourceSelection::Contents,
-            &parsed.selection.src_src,
-        ),
-        (
-            "src_srcs",
-            SourceSelection::Contents,
-            &parsed.selection.src_srcs,
+            &parsed.selection.srcs_in,
         ),
         (
             "src_file",
@@ -1790,8 +1768,7 @@ fn lower_native_sources(
         ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
         ("src", SourceSelection::NamedNoFollow, &parsed.src),
         ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
-        ("src_src", SourceSelection::Contents, &parsed.src_src),
-        ("src_srcs", SourceSelection::Contents, &parsed.src_srcs),
+        ("srcs_in", SourceSelection::Contents, &parsed.srcs_in),
         ("src_file", SourceSelection::File, &parsed.src_file),
         ("src_dir", SourceSelection::Directory, &parsed.src_dir),
         ("src_files", SourceSelection::File, &parsed.src_files),
@@ -1932,19 +1909,13 @@ fn apply_native_copy_operational(
         ignore_from,
         preserve,
         inplace,
-        max_entries,
-        max_total_bytes,
-        max_runtime,
-        receipt,
+        receiver_max_entries,
+        receiver_max_bytes,
+        receiver_receipt,
     } = operational;
-    args.receipt_requested = receipt.is_some();
-    args.receipt_hashed = receipt == Some(ReceiptMode::Hashed);
-    args.max_entries = max_entries;
-    args.max_total_bytes = max_total_bytes.as_deref().map(parse_size).transpose()?;
-    args.max_runtime_secs = max_runtime
-        .as_deref()
-        .map(parse_duration_secs)
-        .transpose()?;
+    args.receiver_receipt = receiver_receipt;
+    args.receiver_max_entries = receiver_max_entries;
+    args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
     args.no_compress = no_compress;
     if no_compress {
@@ -1986,6 +1957,14 @@ fn apply_native_copy_operational(
 }
 
 fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> {
+    if remote.rsh.is_some() && remote.peer_auth != PeerAuth::Restricted {
+        bail!("--peer-auth cannot be combined with --rsh; the remote shell command owns SSH and agent policy");
+    }
+    if remote.detach && matches!(remote.peer_auth, PeerAuth::Broker | PeerAuth::FullAgent) {
+        bail!(
+            "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
+        );
+    }
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.helper.syq_path;
@@ -1996,9 +1975,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
     args.tcp_ports = remote.tcp_ports;
     args.tcp_congestion = remote.tcp_congestion;
     args.detach = remote.detach;
-    args.no_forward_agent = remote.no_forward_agent;
-    args.unrestricted_agent_forwarding = remote.unrestricted_agent_forwarding;
-    args.agent_broker_only = remote.agent_broker_only;
+    args.peer_auth = remote.peer_auth;
     Ok(())
 }
 
@@ -2279,7 +2256,7 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
 fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
-    // way on every orchestrator. The kernel otherwise looks up the registered
+    // way on every coordinator. The kernel otherwise looks up the registered
     // name exactly, without imposing a character whitelist.
     if value.is_empty() {
         return Err("congestion-control algorithm cannot be empty".into());
@@ -2309,7 +2286,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The SYQ extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";
@@ -2361,33 +2338,6 @@ fn message_for_short(c: char) -> Option<&'static str> {
 }
 
 /// Parse a whole-number duration with an optional `s`, `m`, or `h` suffix
-/// (seconds when unsuffixed) into seconds. Zero is rejected.
-pub fn parse_duration_secs(s: &str) -> Result<u32> {
-    let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some(c) if c.is_ascii_alphabetic() => {
-            let m: u32 = match c.to_ascii_lowercase() {
-                's' => 1,
-                'm' => 60,
-                'h' => 60 * 60,
-                _ => bail!("bad duration suffix in {s:?}; use s, m, or h"),
-            };
-            (&s[..s.len() - 1], m)
-        }
-        _ => (s, 1),
-    };
-    let n: u32 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad duration {s:?}"))?;
-    let seconds = n
-        .checked_mul(mult)
-        .ok_or_else(|| anyhow::anyhow!("bad duration {s:?}: value is too large"))?;
-    if seconds == 0 {
-        bail!("duration {s:?} must be at least one second");
-    }
-    Ok(seconds)
-}
-
 fn parse_max_delete(value: &str) -> std::result::Result<u64, String> {
     if value == "-1" {
         // Rsync documents -1 as the backward-compatible spelling of its
@@ -2439,9 +2389,9 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_engine_defaults, parse_duration_secs, parse_native_copy, parse_native_endpoint,
-        parse_native_rm, parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args,
-        Existence, Placement, SourceSelection,
+        native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Existence,
+        Placement, SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
@@ -2530,17 +2480,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn durations_take_seconds_minutes_or_hours_and_reject_zero() {
-        assert_eq!(parse_duration_secs("45").unwrap(), 45);
-        assert_eq!(parse_duration_secs("90s").unwrap(), 90);
-        assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
-        assert_eq!(parse_duration_secs("2H").unwrap(), 7200);
-        for bad in ["0", "0m", "", "5d", "1.5h", "-3", "4294967295h"] {
-            assert!(parse_duration_secs(bad).is_err(), "{bad:?}");
         }
     }
 
@@ -2655,7 +2594,7 @@ mod tests {
         let argv = [
             "--follow-src",
             "source",
-            "--follow-dest",
+            "--follow-dst",
             "--into",
             "destination",
         ]
@@ -2663,7 +2602,7 @@ mod tests {
         let args = parse_native_copy(&argv).unwrap();
         assert!(!args.native_follow);
         assert!(args.native_follow_src);
-        assert!(args.native_follow_dest);
+        assert!(args.native_follow_dst);
         assert!(args.follows_native_source_paths());
         assert!(args.follows_native_destination_paths());
 
@@ -2671,7 +2610,7 @@ mod tests {
         let args = parse_native_copy(&argv).unwrap();
         assert!(args.native_follow);
         assert!(!args.native_follow_src);
-        assert!(!args.native_follow_dest);
+        assert!(!args.native_follow_dst);
         assert!(args.follows_native_source_paths());
         assert!(args.follows_native_destination_paths());
     }
@@ -2694,7 +2633,7 @@ mod tests {
     #[test]
     fn native_remote_controls_lower_to_the_shared_engine() {
         let argv = [
-            "--coordinate-at=dest",
+            "--coordinate-at=dst",
             "--rsh=ssh -J jump",
             "--syq-path=/opt/syq",
             "--no-tcp",
@@ -2706,7 +2645,7 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
-        assert_eq!(args.coordinate_at, super::CoordinateAt::Dest);
+        assert_eq!(args.coordinate_at, super::CoordinateAt::Dst);
         assert_eq!(args.rsh.as_deref(), Some("ssh -J jump"));
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
         assert!(!args.no_bootstrap);
@@ -2848,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn native_operational_options_may_follow_destination_arguments() {
+    fn native_operational_options_may_follow_dstination_arguments() {
         let argv = [
             "one",
             "--cwd",

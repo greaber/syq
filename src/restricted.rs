@@ -7,8 +7,8 @@ use crate::delegation::{
     MutationScope, PublicationPolicy, RequestId, RootExistence,
 };
 use crate::enrollment::{
-    self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentRoute, SshEndpoint,
-    TransportPublicKey,
+    self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,
+    EnrollmentRoute, SshEndpoint,
 };
 use crate::proto::{self, ContainerGuard, Op, Request};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
@@ -40,8 +40,10 @@ const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
 const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
-const DEFAULT_RUNTIME_SECONDS: u32 = 23 * 60 * 60;
+/// A grant must be redeemed within this long of being issued.
 const GRANT_VALIDITY_SECONDS: i64 = 24 * 60 * 60;
+/// A transfer must finish within this long of its grant being issued.
+const FINISH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 const CLOCK_SKEW_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,8 +128,8 @@ pub(crate) struct PreparedTransfer {
     /// Verifier for the receipt hostB will issue.
     pub(crate) receipt_public_key: String,
     /// Attached transfers keep this ephemeral HPKE key only until settlement.
-    pub(crate) receipt_recipient_secret: Option<crate::receipt_v2::RecipientSecret>,
-    pub(crate) receipt_policy: crate::receipt_v2::ReceiptPolicyV2,
+    pub(crate) receipt_recipient_secret: Option<crate::receipt::RecipientSecret>,
+    pub(crate) receipt_policy: crate::receipt::ReceiptPolicy,
     pub(crate) grant_digest: [u8; 32],
 }
 
@@ -147,21 +149,21 @@ struct AuthorityState {
     /// preallocation and basis seeding are charged against the aggregate
     /// ceiling here, once per file at its largest declared size, and every
     /// write or publication must name a declared partial. Observation-only
-    /// preparations own separate provisional claims so an older absent
+    /// preparations own separate provisional holds so an older absent
     /// observation cannot roll back a newer preparation for the same key.
-    reserved: HashMap<(Vec<u8>, proto::PartialId), ByteReservation>,
+    reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     reserved_bytes: u64,
-    next_reservation_claim: u64,
+    next_reservation_hold: u64,
     transferred_bytes: u64,
     deletions: u64,
     live_connections: u16,
     tcp_listener_started: bool,
     /// What hostB will attest to in its receipt.
     /// Receipt records live in an anonymous spool; only mutation-relevant paths
-    /// enter `touched_v2`, never paths merely returned by a destination scan.
-    ledger_v2: Option<crate::receipt_v2::StreamWriterV2>,
-    touched_v2: BTreeSet<Vec<u8>>,
-    file_lifecycles_v2: HashMap<(Vec<u8>, proto::PartialId), FileLifecycleV2>,
+    /// enter `touched`, never paths merely returned by a destination scan.
+    receipt_stream: Option<crate::receipt::ReceiptStreamWriter>,
+    touched: BTreeSet<Vec<u8>>,
+    file_lifecycles: HashMap<(Vec<u8>, proto::CopyId), FileLifecycle>,
     /// Requests authorized for execution whose outcome has not been settled
     /// yet, across every connection. The receipt waits for zero.
     in_flight: u64,
@@ -192,16 +194,16 @@ enum ReceiverModeState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ReservationClaimId(u64);
+struct ReservationHoldId(u64);
 
 #[derive(Debug, Default)]
 struct ByteReservation {
     /// Capacity retained by a preparation that may have created, resized, or
     /// reused the write target.
     retained: Option<u64>,
-    /// Capacity provisionally claimed by observation-only preparations until
+    /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
-    observations: HashMap<ReservationClaimId, u64>,
+    observations: HashMap<ReservationHoldId, u64>,
 }
 
 impl ByteReservation {
@@ -354,7 +356,7 @@ pub(crate) struct RestrictedAuthority {
     root_existence: RootExistence,
     enrollment_id: EnrollmentId,
     request_id: RequestId,
-    receipt_policy_v2: crate::receipt_v2::ReceiptPolicyV2,
+    receipt_policy: crate::receipt::ReceiptPolicy,
     grant_digest: [u8; 32],
     receipt_key: PrivateKey,
     file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
@@ -380,7 +382,7 @@ impl RestrictedAuthority {
             max_file_data_bytes_per_second,
             filters,
             root_existence,
-            receipt_v2: receipt_policy_v2,
+            receipt_policy,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -426,7 +428,7 @@ impl RestrictedAuthority {
         let receiver_umask = read_process_umask();
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
-        let ledger_v2 = Some(crate::receipt_v2::StreamWriterV2::new(&receipt_policy_v2)?);
+        let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
@@ -441,7 +443,7 @@ impl RestrictedAuthority {
             root_existence,
             enrollment_id,
             request_id,
-            receipt_policy_v2,
+            receipt_policy,
             grant_digest,
             receipt_key,
             file_data_limit,
@@ -456,14 +458,14 @@ impl RestrictedAuthority {
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
-                next_reservation_claim: 0,
+                next_reservation_hold: 0,
                 transferred_bytes: 0,
                 deletions: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
-                ledger_v2,
-                touched_v2: BTreeSet::new(),
-                file_lifecycles_v2: HashMap::new(),
+                receipt_stream,
+                touched: BTreeSet::new(),
+                file_lifecycles: HashMap::new(),
                 in_flight: 0,
                 receipt_closing: false,
                 receipt_issued: false,
@@ -474,9 +476,9 @@ impl RestrictedAuthority {
     }
 
     /// Sign hostB's account of this grant and close it to further mutation.
-    pub(crate) fn issue_receipt(&self) -> Result<crate::receipt_v2::IssuedReceiptV2> {
+    pub(crate) fn issue_receipt(&self) -> Result<crate::receipt::IssuedReceipt> {
         let key = &self.receipt_key;
-        let policy = self.receipt_policy_v2.clone();
+        let policy = self.receipt_policy.clone();
         // Close the grant first, then wait for every request already
         // authorized on any connection to execute and settle, so the receipt
         // describes a final state rather than a snapshot with work in flight.
@@ -500,11 +502,11 @@ impl RestrictedAuthority {
         }
         state.receipt_issued = true;
         let mut stream = state
-            .ledger_v2
+            .receipt_stream
             .take()
             .context("receiver receipt spool is unavailable")?;
-        let lifecycles = std::mem::take(&mut state.file_lifecycles_v2);
-        let touched = std::mem::take(&mut state.touched_v2);
+        let lifecycles = std::mem::take(&mut state.file_lifecycles);
+        let touched = std::mem::take(&mut state.touched);
         let entries_touched = touched.len() as u64;
         let transferred_bytes = state.transferred_bytes;
         drop(state);
@@ -513,17 +515,17 @@ impl RestrictedAuthority {
             if lifecycle.recorded {
                 continue;
             }
-            self.append_operation_to_stream_v2(
+            self.append_operation_to_stream(
                 &mut stream,
                 &path,
-                crate::receipt_v2::OperationActionV2::PublishFile {
+                crate::receipt::OperationAction::PublishFile {
                     size: lifecycle.size,
                     inplace: lifecycle.inplace,
                 },
                 if lifecycle.last_error.is_some() {
-                    crate::receipt_v2::OperationDispositionV2::Failed
+                    crate::receipt::OperationDisposition::Failed
                 } else {
-                    crate::receipt_v2::OperationDispositionV2::Incomplete
+                    crate::receipt::OperationDisposition::Incomplete
                 },
                 lifecycle.last_error.as_deref().or(Some(
                     "file lifecycle ended without a successful finalization",
@@ -533,7 +535,7 @@ impl RestrictedAuthority {
 
         for path in touched {
             let object = match self.observe_final(&path) {
-                Ok(None) => crate::receipt_v2::FinalObjectV2::Absent,
+                Ok(None) => crate::receipt::FinalObject::Absent,
                 Ok(Some(metadata)) => {
                     let kind = kind_from_mode(metadata.mode);
                     let mut observation_error = None;
@@ -541,9 +543,9 @@ impl RestrictedAuthority {
                         match self.digest_published(&path) {
                             Ok(digest) => Some(digest),
                             Err(error) => {
-                                observation_error = crate::receipt_v2::bounded_format(
-                                    format_args!("hash final file: {error:#}"),
-                                );
+                                observation_error = crate::receipt::bounded_format(format_args!(
+                                    "hash final file: {error:#}"
+                                ));
                                 None
                             }
                         }
@@ -554,21 +556,21 @@ impl RestrictedAuthority {
                         match self.read_published_link(&path) {
                             Ok(target) => Some(target),
                             Err(error) => {
-                                observation_error = crate::receipt_v2::bounded_format(
-                                    format_args!("read final symlink: {error:#}"),
-                                );
+                                observation_error = crate::receipt::bounded_format(format_args!(
+                                    "read final symlink: {error:#}"
+                                ));
                                 None
                             }
                         }
                     } else {
                         None
                     };
-                    crate::receipt_v2::FinalObjectV2::Present {
+                    crate::receipt::FinalObject::Present {
                         kind,
                         size: metadata.len,
                         digest,
                         symlink_target,
-                        metadata: crate::receipt_v2::ObjectMetadataV2 {
+                        metadata: crate::receipt::ObjectMetadata {
                             mode: metadata.mode,
                             uid: metadata.uid,
                             gid: metadata.gid,
@@ -579,9 +581,9 @@ impl RestrictedAuthority {
                         observation_error,
                     }
                 }
-                Err(error) => crate::receipt_v2::FinalObjectV2::ObservationFailed {
-                    code: crate::receipt_v2::OutcomeCodeV2::ObservationFailed,
-                    diagnostic: crate::receipt_v2::bounded_format(format_args!("{error:#}")),
+                Err(error) => crate::receipt::FinalObject::ObservationFailed {
+                    code: crate::receipt::OutcomeCode::ObservationFailed,
+                    diagnostic: crate::receipt::bounded_format(format_args!("{error:#}")),
                 },
             };
             let Some((scope, relative)) = self.receipt_location(&path) else {
@@ -589,8 +591,8 @@ impl RestrictedAuthority {
                 continue;
             };
             let sequence = stream.next_sequence();
-            stream.append(&crate::receipt_v2::RecordV2::FinalState(
-                crate::receipt_v2::FinalStateRecordV2 {
+            stream.append(&crate::receipt::ReceiptRecord::FinalState(
+                crate::receipt::FinalStateReceiptRecord {
                     sequence,
                     scope,
                     path: relative,
@@ -598,7 +600,7 @@ impl RestrictedAuthority {
                 },
             ));
         }
-        stream.finish(crate::receipt_v2::ReceiptClosureV2 {
+        stream.finish(crate::receipt::ReceiptClosure {
             enrollment_id: self.enrollment_id,
             request_id: self.request_id,
             grant_digest: self.grant_digest,
@@ -790,12 +792,12 @@ impl RestrictedAuthority {
     fn reserve_bytes(
         &self,
         path: &[u8],
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         size: u64,
         observation_only: bool,
-    ) -> Result<Option<ReservationClaimId>> {
+    ) -> Result<Option<ReservationHoldId>> {
         let mut state = self.state.lock().unwrap();
-        let key = (path.to_vec(), partial_id);
+        let key = (path.to_vec(), copy_id);
         let previous = state
             .reserved
             .get(&key)
@@ -810,19 +812,19 @@ impl RestrictedAuthority {
         if total > self.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
-        let claim = if observation_only {
-            let claim = ReservationClaimId(state.next_reservation_claim);
-            state.next_reservation_claim = state
-                .next_reservation_claim
+        let hold = if observation_only {
+            let hold = ReservationHoldId(state.next_reservation_hold);
+            state.next_reservation_hold = state
+                .next_reservation_hold
                 .checked_add(1)
-                .context("reservation claim counter overflow")?;
-            Some(claim)
+                .context("reservation hold counter overflow")?;
+            Some(hold)
         } else {
             None
         };
         let reservation = state.reserved.entry(key).or_default();
-        if let Some(claim) = claim {
-            reservation.observations.insert(claim, size);
+        if let Some(hold) = hold {
+            reservation.observations.insert(hold, size);
         } else {
             reservation.retained = Some(
                 reservation
@@ -831,15 +833,15 @@ impl RestrictedAuthority {
             );
         }
         state.reserved_bytes = total;
-        Ok(claim)
+        Ok(hold)
     }
 
     /// Settle one observation's provisional reservation without disturbing
-    /// claims installed by requests that ran before or after it.
+    /// holds installed by requests that ran before or after it.
     fn settle_observation_reservation(
         state: &mut AuthorityState,
-        key: &(Vec<u8>, proto::PartialId),
-        claim: ReservationClaimId,
+        key: &(Vec<u8>, proto::CopyId),
+        hold: ReservationHoldId,
         retain: bool,
     ) {
         let Some(reservation) = state.reserved.get_mut(key) else {
@@ -847,8 +849,8 @@ impl RestrictedAuthority {
         };
         let before = reservation
             .effective_size()
-            .expect("a stored reservation has at least one claim");
-        let Some(size) = reservation.observations.remove(&claim) else {
+            .expect("a stored reservation has at least one hold");
+        let Some(size) = reservation.observations.remove(&hold) else {
             return;
         };
         if retain {
@@ -872,12 +874,12 @@ impl RestrictedAuthority {
     /// The size this grant declared for a partial, which bounds what may be
     /// written into it and what may be published from it. A partial left by
     /// an earlier grant has no declaration here and cannot be used.
-    fn declared_size(&self, path: &[u8], partial_id: proto::PartialId) -> Result<u64> {
+    fn declared_size(&self, path: &[u8], copy_id: proto::CopyId) -> Result<u64> {
         self.state
             .lock()
             .unwrap()
             .reserved
-            .get(&(path.to_vec(), partial_id))
+            .get(&(path.to_vec(), copy_id))
             .and_then(ByteReservation::effective_size)
             .with_context(|| {
                 format!(
@@ -892,14 +894,14 @@ impl RestrictedAuthority {
     fn check_published_length(
         &self,
         path: &[u8],
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         inplace: bool,
     ) -> Result<()> {
-        let declared = self.declared_size(path, partial_id)?;
+        let declared = self.declared_size(path, copy_id)?;
         let staged = if inplace {
             path.to_vec()
         } else {
-            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &partial_id)?
+            crate::fsops::partial_path(Path::new(OsStr::from_bytes(path)), &copy_id)?
                 .into_os_string()
                 .into_vec()
         };
@@ -967,9 +969,9 @@ impl RestrictedAuthority {
             bail!("the signed grant is closed: its receipt has been issued");
         }
         if state
-            .ledger_v2
+            .receipt_stream
             .as_ref()
-            .is_some_and(crate::receipt_v2::StreamWriterV2::is_failed)
+            .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
         {
             bail!("the signed grant is closed because receipt recording failed");
         }
@@ -1015,26 +1017,26 @@ impl RestrictedAuthority {
             })
     }
 
-    fn append_operation_v2(
+    fn append_operation(
         &self,
         state: &mut AuthorityState,
         path: &[u8],
-        action: crate::receipt_v2::OperationActionV2,
-        disposition: crate::receipt_v2::OperationDispositionV2,
+        action: crate::receipt::OperationAction,
+        disposition: crate::receipt::OperationDisposition,
         error: Option<&str>,
     ) {
-        let Some(stream) = state.ledger_v2.as_mut() else {
+        let Some(stream) = state.receipt_stream.as_mut() else {
             return;
         };
-        self.append_operation_to_stream_v2(stream, path, action, disposition, error);
+        self.append_operation_to_stream(stream, path, action, disposition, error);
     }
 
-    fn append_operation_to_stream_v2(
+    fn append_operation_to_stream(
         &self,
-        stream: &mut crate::receipt_v2::StreamWriterV2,
+        stream: &mut crate::receipt::ReceiptStreamWriter,
         path: &[u8],
-        action: crate::receipt_v2::OperationActionV2,
-        disposition: crate::receipt_v2::OperationDispositionV2,
+        action: crate::receipt::OperationAction,
+        disposition: crate::receipt::OperationDisposition,
         error: Option<&str>,
     ) {
         let Some((scope, relative)) = self.receipt_location(path) else {
@@ -1043,26 +1045,24 @@ impl RestrictedAuthority {
         };
         let sequence = stream.next_sequence();
         let code = match disposition {
-            crate::receipt_v2::OperationDispositionV2::Failed => {
-                crate::receipt_v2::OutcomeCodeV2::ExecutionFailed
+            crate::receipt::OperationDisposition::Failed => {
+                crate::receipt::OutcomeCode::ExecutionFailed
             }
-            crate::receipt_v2::OperationDispositionV2::Incomplete => {
-                crate::receipt_v2::OutcomeCodeV2::FileLifecycleIncomplete
+            crate::receipt::OperationDisposition::Incomplete => {
+                crate::receipt::OutcomeCode::FileLifecycleIncomplete
             }
-            crate::receipt_v2::OperationDispositionV2::Applied
-            | crate::receipt_v2::OperationDispositionV2::Observed => {
-                crate::receipt_v2::OutcomeCodeV2::None
-            }
+            crate::receipt::OperationDisposition::Succeeded
+            | crate::receipt::OperationDisposition::Observed => crate::receipt::OutcomeCode::None,
         };
-        stream.append(&crate::receipt_v2::RecordV2::Operation(
-            crate::receipt_v2::OperationRecordV2 {
+        stream.append(&crate::receipt::ReceiptRecord::Operation(
+            crate::receipt::ReceiptOperationRecord {
                 sequence,
                 scope,
                 path: relative,
                 action,
                 disposition,
                 code,
-                diagnostic: error.and_then(crate::receipt_v2::bounded_diagnostic),
+                diagnostic: error.and_then(crate::receipt::bounded_diagnostic),
             },
         ));
     }
@@ -1075,10 +1075,10 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
-            touched_v2,
+            touched,
             tracked,
         } = settlement;
-        if creations.is_empty() && outcomes.is_empty() && touched_v2.is_empty() && !tracked {
+        if creations.is_empty() && outcomes.is_empty() && touched.is_empty() && !tracked {
             return;
         }
         let outcome_error = |index: usize| -> Option<&str> {
@@ -1103,65 +1103,65 @@ impl RestrictedAuthority {
                 state.created.insert(creation.path);
             }
         }
-        state.touched_v2.extend(touched_v2);
+        state.touched.extend(touched);
         for outcome in outcomes {
             match outcome {
                 PendingOutcome::Observe { path } => {
                     if let proto::Response::FileHash { .. } = response {
-                        self.append_operation_v2(
+                        self.append_operation(
                             &mut state,
                             &path,
-                            crate::receipt_v2::OperationActionV2::ObserveFileHash,
-                            crate::receipt_v2::OperationDispositionV2::Observed,
+                            crate::receipt::OperationAction::ObserveFileHash,
+                            crate::receipt::OperationDisposition::Observed,
                             None,
                         );
                     } else {
-                        self.append_operation_v2(
+                        self.append_operation(
                             &mut state,
                             &path,
-                            crate::receipt_v2::OperationActionV2::ObserveFileHash,
-                            crate::receipt_v2::OperationDispositionV2::Failed,
+                            crate::receipt::OperationAction::ObserveFileHash,
+                            crate::receipt::OperationDisposition::Failed,
                             outcome_error(0).or(Some("receiver returned no file hash")),
                         );
                     }
                 }
-                PendingOutcome::LogicalV2 {
+                PendingOutcome::Logical {
                     index,
                     path,
                     action,
                 } => {
                     let error = outcome_error(index);
-                    self.append_operation_v2(
+                    self.append_operation(
                         &mut state,
                         &path,
                         action,
                         if error.is_some() {
-                            crate::receipt_v2::OperationDispositionV2::Failed
+                            crate::receipt::OperationDisposition::Failed
                         } else {
-                            crate::receipt_v2::OperationDispositionV2::Applied
+                            crate::receipt::OperationDisposition::Succeeded
                         },
                         error,
                     );
                 }
-                PendingOutcome::FileStageV2 {
+                PendingOutcome::FileStage {
                     index,
                     path,
-                    partial_id,
+                    copy_id,
                     size,
                     inplace,
                     stage,
                     skip_if_absent,
-                    observation_claim,
+                    observation_hold,
                 } => {
                     // Observation-only Prepare replaces the old partial probe.
-                    // Settle only this request's provisional claim: concurrent
+                    // Settle only this request's provisional hold: concurrent
                     // preparations for the same partial retain their own
                     // capacity regardless of response ordering.
                     let absent =
                         skip_if_absent && matches!(response, proto::Response::PartialSize(None));
-                    if let Some(claim) = observation_claim {
-                        let key = (path.clone(), partial_id);
-                        Self::settle_observation_reservation(&mut state, &key, claim, !absent);
+                    if let Some(hold) = observation_hold {
+                        let key = (path.clone(), copy_id);
+                        Self::settle_observation_reservation(&mut state, &key, hold, !absent);
                     }
                     // If no sidecar existed, the observation performed no
                     // file-lifecycle mutation and must not create an
@@ -1169,16 +1169,16 @@ impl RestrictedAuthority {
                     if absent {
                         continue;
                     }
-                    if state.ledger_v2.is_none() {
+                    if state.receipt_stream.is_none() {
                         continue;
                     }
                     let error = outcome_error(index);
                     let mut inconsistent = false;
                     let emit_complete = {
                         let lifecycle = state
-                            .file_lifecycles_v2
-                            .entry((path.clone(), partial_id))
-                            .or_insert(FileLifecycleV2 {
+                            .file_lifecycles
+                            .entry((path.clone(), copy_id))
+                            .or_insert(FileLifecycle {
                                 size,
                                 inplace,
                                 recorded: false,
@@ -1187,19 +1187,19 @@ impl RestrictedAuthority {
                         if lifecycle.size != size || lifecycle.inplace != inplace {
                             inconsistent = true;
                         }
-                        if matches!(stage, FileStageV2::Prepare | FileStageV2::Write)
+                        if matches!(stage, FileStage::Prepare | FileStage::Write)
                             && lifecycle.recorded
                         {
                             lifecycle.recorded = false;
                             lifecycle.last_error = None;
                         }
                         if let Some(error) = error {
-                            lifecycle.last_error = crate::receipt_v2::bounded_diagnostic(error);
-                            if stage == FileStageV2::Finalize {
+                            lifecycle.last_error = crate::receipt::bounded_diagnostic(error);
+                            if stage == FileStage::Finalize {
                                 lifecycle.recorded = false;
                             }
                             false
-                        } else if stage == FileStageV2::Finalize && !lifecycle.recorded {
+                        } else if stage == FileStage::Finalize && !lifecycle.recorded {
                             lifecycle.recorded = true;
                             lifecycle.last_error = None;
                             true
@@ -1208,16 +1208,16 @@ impl RestrictedAuthority {
                         }
                     };
                     if inconsistent {
-                        if let Some(stream) = state.ledger_v2.as_mut() {
+                        if let Some(stream) = state.receipt_stream.as_mut() {
                             stream.mark_recording_failure();
                         }
                     }
                     if emit_complete {
-                        self.append_operation_v2(
+                        self.append_operation(
                             &mut state,
                             &path,
-                            crate::receipt_v2::OperationActionV2::PublishFile { size, inplace },
-                            crate::receipt_v2::OperationDispositionV2::Applied,
+                            crate::receipt::OperationAction::PublishFile { size, inplace },
+                            crate::receipt::OperationDisposition::Succeeded,
                             None,
                         );
                     }
@@ -1812,7 +1812,7 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched_v2: &mut Vec<Vec<u8>>,
+        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         let path = match &*operation {
             Op::Mkdir { path, .. }
@@ -1836,23 +1836,23 @@ impl RestrictedAuthority {
             Op::Rmdir { path } => {
                 self.charge_deletion(path, true)?;
                 self.state.lock().unwrap().receiver_modes.remove(path);
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::DeleteDirectory,
+                    action: crate::receipt::OperationAction::DeleteDirectory,
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 return Ok(());
             }
             Op::Unlink { path } => {
                 self.charge_deletion(path, false)?;
                 self.state.lock().unwrap().receiver_modes.remove(path);
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::DeleteFile,
+                    action: crate::receipt::OperationAction::DeleteFile,
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 return Ok(());
             }
         };
@@ -1875,24 +1875,24 @@ impl RestrictedAuthority {
                     self.remember_receiver_creation(path, true)?;
                     *mode = 0o700;
                 }
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::EnsureDirectory,
+                    action: crate::receipt::OperationAction::EnsureDirectory,
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 Ok(())
             }
             Op::Symlink {
                 path, condition, ..
             } => {
                 self.constrain_creation(path, condition, false, index, pending)?;
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::CreateSymlink,
+                    action: crate::receipt::OperationAction::CreateSymlink,
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 Ok(())
             }
             Op::Mknod {
@@ -1911,12 +1911,12 @@ impl RestrictedAuthority {
                     let file_type = *mode & libc::S_IFMT as u32;
                     *mode = file_type | 0o600;
                 }
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::CreateSpecial { kind },
+                    action: crate::receipt::OperationAction::CreateSpecial { kind },
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 Ok(())
             }
             Op::SetMeta {
@@ -1933,12 +1933,12 @@ impl RestrictedAuthority {
                     condition,
                     ReceiverModeTarget::AnyExisting,
                 )?;
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::SetMetadata { flags: *flags },
+                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 Ok(())
             }
             Op::SetFileMetaIfSame {
@@ -1955,12 +1955,12 @@ impl RestrictedAuthority {
                     condition,
                     ReceiverModeTarget::RegularFile,
                 )?;
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::SetMetadata { flags: *flags },
+                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 Ok(())
             }
             Op::Remove { .. } | Op::Rmdir { .. } | Op::Unlink { .. } => Ok(()),
@@ -1973,7 +1973,7 @@ impl RestrictedAuthority {
     pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
-        let mut touched_v2 = Vec::new();
+        let mut touched = Vec::new();
         // Requests the server executes and then settles; the receipt waits
         // for all of them. The others are answered inline without settling.
         let tracked = !matches!(
@@ -1996,25 +1996,19 @@ impl RestrictedAuthority {
                 bail!("the signed grant is closed: its receipt has been issued");
             }
             if state
-                .ledger_v2
+                .receipt_stream
                 .as_ref()
-                .is_some_and(crate::receipt_v2::StreamWriterV2::is_failed)
+                .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
             {
                 bail!("the signed grant is closed because receipt recording failed");
             }
             state.in_flight += 1;
         }
-        match self.authorize_inner(
-            request,
-            over_ssh,
-            &mut pending,
-            &mut outcomes,
-            &mut touched_v2,
-        ) {
+        match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes, &mut touched) {
             Ok(()) => Ok(Settlement {
                 creations: pending,
                 outcomes,
-                touched_v2,
+                touched,
                 tracked,
             }),
             Err(error) => {
@@ -2026,15 +2020,13 @@ impl RestrictedAuthority {
                     state.in_flight = state.in_flight.saturating_sub(1);
                     self.settled.notify_all();
                 }
-                if let Some(stream) = state.ledger_v2.as_mut() {
+                if let Some(stream) = state.receipt_stream.as_mut() {
                     let sequence = stream.next_sequence();
-                    stream.append(&crate::receipt_v2::RecordV2::Refusal(
-                        crate::receipt_v2::RefusalRecordV2 {
+                    stream.append(&crate::receipt::ReceiptRecord::Refusal(
+                        crate::receipt::RefusalReceiptRecord {
                             sequence,
-                            code: crate::receipt_v2::OutcomeCodeV2::AuthorizationRefused,
-                            diagnostic: crate::receipt_v2::bounded_format(format_args!(
-                                "{error:#}"
-                            )),
+                            code: crate::receipt::OutcomeCode::AuthorizationRefused,
+                            diagnostic: crate::receipt::bounded_format(format_args!("{error:#}")),
                         },
                     ));
                 }
@@ -2049,7 +2041,7 @@ impl RestrictedAuthority {
         over_ssh: bool,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
-        touched_v2: &mut Vec<Vec<u8>>,
+        touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         self.check_deadline()?;
         match request {
@@ -2065,7 +2057,7 @@ impl RestrictedAuthority {
                 }
                 if key
                     .as_ref()
-                    .is_none_or(|key| key.len() != crate::crypto::KEY_LEN)
+                    .is_none_or(|key| key.len() != crate::tcp_records::KEY_LEN)
                     || token.len() != 16
                 {
                     bail!("signed transfers require encrypted TCP data connections");
@@ -2156,7 +2148,7 @@ impl RestrictedAuthority {
             }
             Request::Apply { ops, guard } => {
                 for (index, operation) in ops.iter_mut().enumerate() {
-                    self.authorize_op(operation, index, pending, outcomes, touched_v2)?;
+                    self.authorize_op(operation, index, pending, outcomes, touched)?;
                 }
                 *guard = Some(self.guard.clone());
             }
@@ -2204,7 +2196,7 @@ impl RestrictedAuthority {
             }
             Request::SeedBasis {
                 path,
-                partial_id,
+                copy_id,
                 len,
                 guard,
                 ..
@@ -2217,16 +2209,16 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, false, None, pending)?;
-                self.reserve_bytes(path, *partial_id, *len, false)?;
-                outcomes.push(PendingOutcome::FileStageV2 {
+                self.reserve_bytes(path, *copy_id, *len, false)?;
+                outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: *len,
                     inplace: false,
-                    stage: FileStageV2::Prepare,
+                    stage: FileStage::Prepare,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
                 *guard = Some(self.guard.clone());
             }
@@ -2247,19 +2239,19 @@ impl RestrictedAuthority {
                     condition,
                     ReceiverModeTarget::RegularFile,
                 )?;
-                outcomes.push(PendingOutcome::LogicalV2 {
+                outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
-                    action: crate::receipt_v2::OperationActionV2::SetMetadata { flags: *flags },
+                    action: crate::receipt::OperationAction::SetMetadata { flags: *flags },
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 *guard = Some(self.guard.clone());
             }
             Request::Prepare {
                 path,
                 size,
                 inplace,
-                partial_id,
+                copy_id,
                 create_if_missing,
                 guard,
                 ..
@@ -2272,29 +2264,29 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 self.constrain_prepare(path)?;
-                let observation_claim =
-                    self.reserve_bytes(path, *partial_id, *size, !*create_if_missing)?;
-                outcomes.push(PendingOutcome::FileStageV2 {
+                let observation_hold =
+                    self.reserve_bytes(path, *copy_id, *size, !*create_if_missing)?;
+                outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: *size,
                     inplace: *inplace,
-                    stage: FileStageV2::Prepare,
+                    stage: FileStage::Prepare,
                     skip_if_absent: !*create_if_missing,
-                    observation_claim,
+                    observation_hold,
                 });
                 if *inplace {
                     // In-place preparation resizes the final file itself:
                     // the receipt must know even if no final step follows.
-                    touched_v2.push(path.clone());
+                    touched.push(path.clone());
                 }
                 *guard = Some(self.guard.clone());
             }
             Request::WriteRange {
                 path,
                 inplace,
-                partial_id,
+                copy_id,
                 off,
                 data,
                 guard,
@@ -2303,7 +2295,7 @@ impl RestrictedAuthority {
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file write does not match the signed publication policy");
                 }
-                let declared = self.declared_size(path, *partial_id)?;
+                let declared = self.declared_size(path, *copy_id)?;
                 if off
                     .checked_add(data.len() as u64)
                     .is_none_or(|end| end > declared)
@@ -2311,17 +2303,17 @@ impl RestrictedAuthority {
                     bail!("file write extends past the size declared for it");
                 }
                 if *inplace {
-                    touched_v2.push(path.clone());
+                    touched.push(path.clone());
                 }
-                outcomes.push(PendingOutcome::FileStageV2 {
+                outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
+                    copy_id: *copy_id,
                     size: declared,
                     inplace: *inplace,
-                    stage: FileStageV2::Write,
+                    stage: FileStage::Write,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
                 self.charge_bytes(path, *off, data.len())?;
                 *guard = Some(self.guard.clone());
@@ -2329,7 +2321,7 @@ impl RestrictedAuthority {
             Request::Finalize {
                 path,
                 inplace,
-                partial_id,
+                copy_id,
                 meta,
                 flags,
                 condition,
@@ -2340,19 +2332,19 @@ impl RestrictedAuthority {
                     bail!("file finalization does not match the signed publication policy");
                 }
                 self.check_mutation_path(path, false)?;
-                self.check_published_length(path, *partial_id, *inplace)?;
+                self.check_published_length(path, *copy_id, *inplace)?;
                 self.constrain_creation(path, condition, false, 0, pending)?;
-                outcomes.push(PendingOutcome::FileStageV2 {
+                outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
-                    partial_id: *partial_id,
-                    size: self.declared_size(path, *partial_id)?,
+                    copy_id: *copy_id,
+                    size: self.declared_size(path, *copy_id)?,
                     inplace: *inplace,
-                    stage: FileStageV2::Finalize,
+                    stage: FileStage::Finalize,
                     skip_if_absent: false,
-                    observation_claim: None,
+                    observation_hold: None,
                 });
-                touched_v2.push(path.clone());
+                touched.push(path.clone());
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -2381,15 +2373,15 @@ impl RestrictedAuthority {
                 for (index, put) in puts.iter_mut().enumerate() {
                     self.charge_bytes(&put.path, 0, put.data.len())?;
                     self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
-                    outcomes.push(PendingOutcome::LogicalV2 {
+                    outcomes.push(PendingOutcome::Logical {
                         index,
                         path: put.path.clone(),
-                        action: crate::receipt_v2::OperationActionV2::PublishFile {
+                        action: crate::receipt::OperationAction::PublishFile {
                             size: put.data.len() as u64,
                             inplace: false,
                         },
                     });
-                    touched_v2.push(put.path.clone());
+                    touched.push(put.path.clone());
                     self.constrain_receiver_mode(
                         &put.path,
                         &mut put.meta,
@@ -2400,7 +2392,10 @@ impl RestrictedAuthority {
                     put.guard = Some(self.guard.clone());
                 }
             }
-            Request::CopyLocal { .. } | Request::ReadRange { .. } | Request::ReadSmallBatch(_) => {
+            Request::CopyLocal { .. }
+            | Request::ReadRange { .. }
+            | Request::ReadSmallBatch(_)
+            | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::ListDir { .. } => {
@@ -2436,13 +2431,13 @@ pub(crate) struct Settlement {
     creations: Vec<PendingCreation>,
     outcomes: Vec<PendingOutcome>,
     /// Final destination paths this admitted request could have changed.
-    touched_v2: Vec<Vec<u8>>,
+    touched: Vec<Vec<u8>>,
     /// The request counts as in flight until settled.
     tracked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileStageV2 {
+enum FileStage {
     Prepare,
     Write,
     Finalize,
@@ -2470,7 +2465,7 @@ fn kind_from_mode(mode: u32) -> proto::Kind {
 }
 
 #[derive(Debug)]
-struct FileLifecycleV2 {
+struct FileLifecycle {
     size: u64,
     inplace: bool,
     recorded: bool,
@@ -2483,25 +2478,25 @@ enum PendingOutcome {
     Observe {
         path: Vec<u8>,
     },
-    LogicalV2 {
+    Logical {
         index: usize,
         path: Vec<u8>,
-        action: crate::receipt_v2::OperationActionV2,
+        action: crate::receipt::OperationAction,
     },
-    FileStageV2 {
+    FileStage {
         index: usize,
         path: Vec<u8>,
-        partial_id: proto::PartialId,
+        copy_id: proto::CopyId,
         size: u64,
         inplace: bool,
-        stage: FileStageV2,
+        stage: FileStage,
         /// Ignore a successful observation-only Prepare when it found no
         /// resumable sidecar and therefore performed no lifecycle mutation.
         skip_if_absent: bool,
         /// This observation-only Prepare's provisional reservation. Settlement
-        /// releases or retains precisely this claim without affecting a
+        /// releases or retains precisely this hold without affecting a
         /// concurrent preparation for the same partial.
-        observation_claim: Option<ReservationClaimId>,
+        observation_hold: Option<ReservationHoldId>,
     },
 }
 
@@ -2821,13 +2816,13 @@ fn remove_leaf_locked(directory: &File, name: &str) -> Result<()> {
     }
 }
 
-fn generate_transport_key(id: EnrollmentId) -> Result<PrivateKey> {
+fn generate_enrollment_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).context("generate restricted transport key")?;
+    getrandom::fill(&mut seed).context("generate enrollment key")?;
     let keypair = Ed25519Keypair::from_seed(&seed);
     seed.fill(0);
     PrivateKey::new(keypair.into(), format!("syq-enrollment:{id}"))
-        .context("construct restricted transport key")
+        .context("construct enrollment key")
 }
 
 /// The receiver's own signing key for receipts. It lives only on hostB, in
@@ -3084,11 +3079,11 @@ pub(crate) fn remote_install() -> Result<()> {
     reject_control_plane_path(canonical_destination.as_os_str().as_bytes(), &protected)?;
     let root = crate::rooted::Root::open(&canonical_root)?;
     let root_identity = root.identity();
-    let transport = TransportPublicKey::parse(&request.public_key)?;
+    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
     let signer = signer_name(request.id);
     let public_words: Vec<&str> = request.public_key.split_ascii_whitespace().collect();
     if public_words.len() < 2 {
-        bail!("transport public key is malformed");
+        bail!("enrollment public key is malformed");
     }
     let running_receiver = std::env::current_exe().context("resolve restricted receiver path")?;
     delegation::validate_regular_executable(&running_receiver, "restricted receiver")?;
@@ -3102,7 +3097,7 @@ pub(crate) fn remote_install() -> Result<()> {
     // installer that already started has its bytes and recreates it before
     // publishing the new forced authorization.
     let receiver_path = materialize_receiver(&home, &receiver_contents)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
@@ -3222,8 +3217,8 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
         }
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
-    let transport = TransportPublicKey::parse(&request.public_key)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &transport)?;
+    let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
+    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;
@@ -3325,8 +3320,8 @@ fn store_pending_files(
 ) -> Result<()> {
     let private = private_key
         .to_openssh(LineEnding::LF)
-        .context("encode restricted transport private key")?;
-    atomic_write(directory, "transport", private.as_bytes(), 0o600)?;
+        .context("encode enrollment private key")?;
+    atomic_write(directory, "enrollment-key", private.as_bytes(), 0o600)?;
     atomic_write(
         directory,
         "pending.json",
@@ -3414,11 +3409,11 @@ fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
 
 fn load_private_key(directory: &Path) -> Result<PrivateKey> {
     let encoded = delegation::read_private_regular(
-        &directory.join("transport"),
-        "restricted transport private key",
+        &directory.join("enrollment-key"),
+        "enrollment private key",
         128 * 1024,
     )?;
-    PrivateKey::from_openssh(&encoded).context("parse restricted transport private key")
+    PrivateKey::from_openssh(&encoded).context("parse enrollment private key")
 }
 
 #[derive(Debug)]
@@ -3668,7 +3663,7 @@ fn enroll(
         }
         (None, None) => {
             let id = EnrollmentId::random();
-            let private_key = generate_transport_key(id)?;
+            let private_key = generate_enrollment_key(id)?;
             let pending = PendingEnrollment {
                 version: CONFIG_VERSION,
                 id,
@@ -3793,28 +3788,20 @@ fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
-    if let Some(runtime) = args.max_runtime_secs {
-        if runtime > DEFAULT_RUNTIME_SECONDS {
-            bail!(
-                "--max-runtime exceeds the {}-hour signed grant ceiling",
-                DEFAULT_RUNTIME_SECONDS / 3600
-            );
-        }
-    }
     if args
-        .max_entries
+        .receiver_max_entries
         .is_some_and(|entries| entries == 0 || entries > delegation::MAX_ENTRIES)
     {
         bail!(
-            "--max-entries must be between 1 and {}",
+            "--receiver-max-entries must be between 1 and {}",
             delegation::MAX_ENTRIES
         );
     }
     if args
-        .max_total_bytes
+        .receiver_max_bytes
         .is_some_and(|bytes| bytes == 0 || bytes > delegation::MAX_COPY_BYTES)
     {
-        bail!("--max-total-bytes must be at least 1 byte");
+        bail!("--receiver-max-bytes must be at least 1 byte");
     }
     if let Some(maximum) = args.max_size.as_deref() {
         if crate::cli::parse_size(maximum)? == 0 {
@@ -3870,8 +3857,8 @@ fn grant_for(
     } else {
         DeletionPolicy::Forbid
     };
-    let max_entries = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
-    let max_total_bytes = args.max_total_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let max_entries = args.receiver_max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+    let max_total_bytes = args.receiver_max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let max_file_bytes = args
         .max_size
         .as_deref()
@@ -3886,20 +3873,12 @@ fn grant_for(
             .context("deletion through the command-restricted receiver needs --max-delete")?
             .min(max_entries),
     };
-    let (not_after, max_runtime_seconds) = match args.max_runtime_secs {
-        None => (
-            issued_at
-                .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
-                .context("signed grant expiration overflow")?,
-            DEFAULT_RUNTIME_SECONDS,
-        ),
-        Some(runtime) => (
-            issued_at
-                .checked_add(i64::from(runtime))
-                .context("signed grant expiration overflow")?,
-            runtime,
-        ),
-    };
+    let start_by = issued_at
+        .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
+        .context("signed grant start-by overflow")?;
+    let finish_by = issued_at
+        .checked_add(FINISH_WINDOW_SECONDS)
+        .context("signed grant finish-by overflow")?;
     let copies_contents = sources.iter().any(Location::copies_contents);
     let placement = match args.placement {
         Placement::As => DestinationPlacement::ExactPath,
@@ -3957,7 +3936,8 @@ fn grant_for(
         request_id: RequestId::fresh(issued_at)?,
         issued_at,
         not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
-        not_after,
+        start_by,
+        finish_by,
         operation: GrantOperation::Copy(CopyOperation {
             destination: destination_bytes,
             mutation_scopes,
@@ -4000,7 +3980,6 @@ fn grant_for(
                 })
                 .context("connection maximum exceeds grant representation")?,
                 max_deletions,
-                max_runtime_seconds,
             },
         }),
     };
@@ -4060,7 +4039,7 @@ pub(crate) fn prepare_transfer(
         None => {
             if !allow_enrollment {
                 bail!(
-                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq enrollment add` or explicitly use --agent-broker-only"
+                    "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq receiver enroll` or explicitly use --peer-auth broker"
                 );
             }
             let jump = endpoint(
@@ -4076,7 +4055,7 @@ pub(crate) fn prepare_transfer(
                 // which stays UTF-8; transfers against an existing
                 // enrollment accept any destination bytes above.
                 std::str::from_utf8(requested).context(
-                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq enrollment add` to copy to this path",
+                    "automatic enrollment requires a UTF-8 destination; pre-enroll a scope with `syq receiver enroll` to copy to this path",
                 )?,
                 Some(&jump),
                 false,
@@ -4103,23 +4082,23 @@ pub(crate) fn prepare_transfer(
     let (receipt_recipient_secret, receipt_delivery) = if args.detach {
         (
             None,
-            crate::receipt_v2::ReceiptDeliveryV2::DetachedSignedPlaintext,
+            crate::receipt::ReceiptDelivery::DetachedSignedPlaintext,
         )
     } else {
-        let (secret, public) = crate::receipt_v2::generate_recipient()?;
+        let (secret, public) = crate::receipt::generate_recipient()?;
         (
             Some(secret),
-            crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted {
-                suite: crate::receipt_v2::HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+            crate::receipt::ReceiptDelivery::AttachedEncrypted {
+                suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
                 recipient_public_key: public,
             },
         )
     };
-    let receipt_policy = crate::receipt_v2::ReceiptPolicyV2 {
+    let receipt_policy = crate::receipt::ReceiptPolicy {
         required: true,
-        hashed: args.receipt_hashed,
-        max_records: crate::receipt_v2::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::receipt_v2::DEFAULT_MAX_PLAINTEXT_BYTES,
+        hashed: args.receiver_receipt == Some(crate::cli::ReceiptDetail::Digests),
+        max_records: crate::receipt::DEFAULT_MAX_RECORDS,
+        max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
         delivery: receipt_delivery,
     };
     let grant = delegation::sign_grant(
@@ -4132,7 +4111,7 @@ pub(crate) fn prepare_transfer(
                 delete_excluded: args.delete_excluded,
             },
             root_existence: root_existence_for(args.target_existence),
-            receipt_v2: receipt_policy.clone(),
+            receipt_policy: receipt_policy.clone(),
         },
         &private_key,
     )?;
@@ -4210,7 +4189,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         allowed_signers,
         revocation_file: None,
     };
-    let verified = delegation::verify_and_claim(&envelope, &context, &policy, &replay)?;
+    let verified = delegation::verify_and_redeem(&envelope, &context, &policy, &replay)?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
     let receipt_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
     let authority = std::sync::Arc::new(RestrictedAuthority::new(
@@ -4231,7 +4210,7 @@ fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     }
     let words = shell_words::split(original).context("parse restricted receiver command")?;
     if words.len() != 3 || words[0] != "syq" || words[1] != "--server" {
-        bail!("restricted credential accepts only a syq server request with one signed grant");
+        bail!("the enrollment key accepts only a syq server request with one signed grant");
     }
     let encoded = words[2]
         .strip_prefix("--restricted-grant=")
@@ -4256,30 +4235,30 @@ fn management_via(arguments: &[OsString]) -> Result<Option<SshEndpoint>> {
     )?))
 }
 
-const ENROLLMENT_USAGE: &str = "Usage: syq enrollment <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  add     Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq enrollment <COMMAND> --help` for command-specific help.";
+const RECEIVER_USAGE: &str = "Usage: syq receiver <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  enroll  Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq receiver <COMMAND> --help` for command-specific help.";
 
-/// `syq enrollment add|list|revoke`: the receiver enrollment system is one
+/// `syq receiver enroll|list|revoke`: the receiver enrollment system is one
 /// subcommand with its verbs beneath it. `argv[1]` is `enrollment`.
-pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
-    if argv.get(1)?.to_str()? != "enrollment" {
+pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>> {
+    if argv.get(1)?.to_str()? != "receiver" {
         return None;
     }
     let Some(command) = argv.get(2).and_then(|argument| argument.to_str()) else {
-        eprintln!("{ENROLLMENT_USAGE}");
+        crate::output::diagnostic!("{RECEIVER_USAGE}");
         return Some(Ok(2));
     };
     match command {
         "--help" | "-h" => {
-            println!("{ENROLLMENT_USAGE}");
+            println!("{RECEIVER_USAGE}");
             Some(Ok(0))
         }
         "list" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
-                println!("Usage: syq enrollment list\n\nList local command-restricted receiver enrollments.");
+                println!("Usage: syq receiver list\n\nList local command-restricted receiver enrollments.");
                 return Ok(0);
             }
             if argv.len() != 3 {
-                bail!("usage: syq enrollment list");
+                bail!("usage: syq receiver list");
             }
             let active = load_local_enrollments()?;
             let active_ids = active
@@ -4308,15 +4287,15 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             }
             Ok(0)
         })()),
-        "add" => Some((|| {
+        "enroll" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
+                    "Usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
                 );
                 return Ok(0);
             }
             if argv.len() < 4 {
-                bail!("usage: syq enrollment add [USER@]HOST:DESTINATION [--via [USER@]HOST]");
+                bail!("usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]");
             }
             let target = argv[3].to_str().context("enrollment target is not UTF-8")?;
             let location = Location::parse(target)?;
@@ -4348,12 +4327,12 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
         "revoke" => Some((|| {
             if argv.get(3).is_some_and(|argument| argument == "--help") {
                 println!(
-                    "Usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
+                    "Usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
                 );
                 return Ok(0);
             }
             if argv.len() < 4 {
-                bail!("usage: syq enrollment revoke ENROLLMENT-ID [--via [USER@]HOST]");
+                bail!("usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]");
             }
             let id = EnrollmentId::parse(argv[3].to_str().context("enrollment ID is not UTF-8")?)?;
             let via = management_via(&argv[4..])?;
@@ -4414,7 +4393,7 @@ pub(crate) fn dispatch_management(argv: &[OsString]) -> Option<Result<i32>> {
             Ok(0)
         })()),
         other => Some(Err(anyhow::anyhow!(
-            "unknown enrollment command {other:?}\n{ENROLLMENT_USAGE}"
+            "unknown receiver command {other:?}\n{RECEIVER_USAGE}"
         ))),
     }
 }
@@ -4442,11 +4421,12 @@ pub(crate) mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let directory = open_directory(temporary.path()).unwrap();
-        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v1").unwrap();
-        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-v2").unwrap();
+        atomic_replace_executable_locked(&directory, "syq-receiver", b"receiver-binary").unwrap();
+        atomic_replace_executable_locked(&directory, "syq-receiver", b"replacement-receiver")
+            .unwrap();
 
         let path = temporary.path().join("syq-receiver");
-        assert_eq!(fs::read(&path).unwrap(), b"receiver-v2");
+        assert_eq!(fs::read(&path).unwrap(), b"replacement-receiver");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
     }
@@ -4490,9 +4470,9 @@ pub(crate) mod tests {
             fs::create_dir(&ssh).unwrap();
             fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 
-            let key = generate_transport_key(id).unwrap();
+            let key = generate_enrollment_key(id).unwrap();
             let public_key = key.public_key().to_openssh().unwrap();
-            let transport = TransportPublicKey::parse(&public_key).unwrap();
+            let transport = EnrollmentPublicKey::parse(&public_key).unwrap();
             let entry =
                 AuthorizedKeyEntry::new(id, &receiver_install_path(home), &transport).unwrap();
             let original = format!("{}\n", entry.line()).into_bytes();
@@ -4664,13 +4644,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn test_receipt_policy() -> crate::receipt_v2::ReceiptPolicyV2 {
-        crate::receipt_v2::ReceiptPolicyV2 {
+    fn test_receipt_policy() -> crate::receipt::ReceiptPolicy {
+        crate::receipt::ReceiptPolicy {
             required: true,
             hashed: false,
-            max_records: crate::receipt_v2::DEFAULT_MAX_RECORDS,
-            max_plaintext_bytes: crate::receipt_v2::DEFAULT_MAX_PLAINTEXT_BYTES,
-            delivery: crate::receipt_v2::ReceiptDeliveryV2::DetachedSignedPlaintext,
+            max_records: crate::receipt::DEFAULT_MAX_RECORDS,
+            max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
+            delivery: crate::receipt::ReceiptDelivery::DetachedSignedPlaintext,
         }
     }
 
@@ -4711,7 +4691,7 @@ pub(crate) mod tests {
         existing: ExistingDestinationPolicy,
         placement: DestinationPlacement,
         root_existence: RootExistence,
-        receipt_v2: Option<(PrivateKey, crate::receipt_v2::ReceiptPolicyV2)>,
+        receipt_policy: Option<(PrivateKey, crate::receipt::ReceiptPolicy)>,
     ) -> Result<RestrictedAuthority> {
         let opened = Root::open(root).unwrap();
         let identity = opened.identity();
@@ -4738,7 +4718,8 @@ pub(crate) mod tests {
             request_id: RequestId::fresh(1_900_000_000).unwrap(),
             issued_at: 1,
             not_before: 1,
-            not_after: 100,
+            start_by: 100,
+            finish_by: 100,
             operation: GrantOperation::Copy(CopyOperation {
                 destination: destination.as_os_str().as_bytes().to_vec(),
                 mutation_scopes: vec![MutationScope {
@@ -4774,11 +4755,10 @@ pub(crate) mod tests {
                     hash_block_bytes: 4 << 20,
                     max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
                     max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
-                    max_runtime_seconds: 60,
                 },
             }),
         };
-        let (receipt_key, receipt_policy_v2) = match receipt_v2 {
+        let (receipt_key, receipt_policy) = match receipt_policy {
             Some((key, policy)) => (key, policy),
             None => (generate_receipt_key(id)?, test_receipt_policy()),
         };
@@ -4789,7 +4769,7 @@ pub(crate) mod tests {
                 max_file_data_bytes_per_second,
                 filters,
                 root_existence,
-                receipt_v2: receipt_policy_v2,
+                receipt_policy,
             },
             [0; 32],
             receipt_key,
@@ -4964,11 +4944,14 @@ pub(crate) mod tests {
             target_login: "backup".into(),
             requested_destination: "/archive/item".into(),
         };
-        let private_key = generate_transport_key(id).unwrap();
+        let private_key = generate_enrollment_key(id).unwrap();
         store_pending_files(&directory, &pending, &private_key).unwrap();
         assert!(directory.join("pending.json").is_file());
         assert_eq!(
-            fs::metadata(directory.join("transport")).unwrap().mode() & 0o777,
+            fs::metadata(directory.join("enrollment-key"))
+                .unwrap()
+                .mode()
+                & 0o777,
             0o600
         );
         assert_eq!(
@@ -4999,7 +4982,7 @@ pub(crate) mod tests {
         complete_local_enrollment(&directory, &metadata).unwrap();
         assert!(!directory.join("pending.json").exists());
         assert!(directory.join("metadata.json").is_file());
-        assert!(directory.join("transport").is_file());
+        assert!(directory.join("enrollment-key").is_file());
     }
 
     #[test]
@@ -5037,7 +5020,7 @@ pub(crate) mod tests {
 
         let mut plan = Request::PlanBatch {
             partial_paths: vec![target.clone()],
-            partial_id: [3; 16],
+            copy_id: [3; 16],
             directories: vec![target.clone()],
             others: vec![target.clone()],
             guard: None,
@@ -5075,7 +5058,7 @@ pub(crate) mod tests {
 
         let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
             path: target.clone(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: vec![0; 4],
             hash: [0; 32],
             meta: proto::Meta {
@@ -5106,7 +5089,7 @@ pub(crate) mod tests {
         let mut write = Request::WriteRange {
             path: target,
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             attempt: 0,
             off: 0,
             hash: [0; 32],
@@ -5186,7 +5169,7 @@ pub(crate) mod tests {
             path,
             size: 4,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5265,7 +5248,7 @@ pub(crate) mod tests {
             path,
             size: 4,
             inplace: false,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5295,7 +5278,7 @@ pub(crate) mod tests {
             path: target.clone(),
             size: 4,
             inplace,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5345,7 +5328,7 @@ pub(crate) mod tests {
             path: path_bytes(path),
             size: 4,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -5357,7 +5340,7 @@ pub(crate) mod tests {
         Request::Finalize {
             path: path_bytes(path),
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition,
@@ -5375,7 +5358,7 @@ pub(crate) mod tests {
     fn small_put(path: &Path) -> Request {
         Request::PutSmallBatch(vec![proto::SmallPut {
             path: path_bytes(path),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
@@ -5524,7 +5507,7 @@ pub(crate) mod tests {
         // governed by the separately signed deletion policy.
         let mut finish = Request::FinishBasis {
             path: path_bytes(&kept),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -5533,7 +5516,7 @@ pub(crate) mod tests {
         assert!(authority.authorize(&mut finish, false).is_err());
         let mut seed = Request::SeedBasis {
             path: path_bytes(&kept),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             len: 3,
             attempt: 0,
             guard: None,
@@ -5610,7 +5593,7 @@ pub(crate) mod tests {
 
         let mut finish = Request::FinishBasis {
             path: path_bytes(&present),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -5806,7 +5789,7 @@ pub(crate) mod tests {
         assert_eq!(op_condition(&same), expected);
         let mut finish = Request::FinishBasis {
             path: path_bytes(&present),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: plain_meta(),
             flags: 0,
             condition: Any,
@@ -5908,7 +5891,7 @@ pub(crate) mod tests {
 
     fn existence_authority_with_receipt(
         root: &Path,
-        policy: &crate::receipt_v2::ReceiptPolicyV2,
+        policy: &crate::receipt::ReceiptPolicy,
         deadline_ms: u64,
     ) -> RestrictedAuthority {
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
@@ -5943,7 +5926,7 @@ pub(crate) mod tests {
         fs::write(&kept, b"old").unwrap();
         fs::write(&gone, b"bye").unwrap();
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(true);
+        let (secret, policy) = encrypted_policy(true);
         let authority = test_authority_with_receipt(
             &root,
             DeletionPolicy::DeleteDestinationOnly,
@@ -5958,7 +5941,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // An observation the orchestrator asked for is hostB's own view.
+        // An observation the coordinator asked for is hostB's own view.
         let mut hash = Request::FileHash {
             path: path_bytes(&kept),
             source: None,
@@ -6005,18 +5988,18 @@ pub(crate) mod tests {
             .unwrap();
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::Operation(operation)
+            crate::receipt::ReceiptRecord::Operation(operation)
                 if operation.path == b"kept"
                     && operation.disposition
-                        == crate::receipt_v2::OperationDispositionV2::Observed
+                        == crate::receipt::OperationDisposition::Observed
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"fresh"
                     && matches!(
                         state.object,
-                        crate::receipt_v2::FinalObjectV2::Present {
+                        crate::receipt::FinalObject::Present {
                             digest: Some(digest),
                             ..
                         } if digest == *blake3::hash(b"data").as_bytes()
@@ -6024,9 +6007,9 @@ pub(crate) mod tests {
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"gone"
-                    && state.object == crate::receipt_v2::FinalObjectV2::Absent
+                    && state.object == crate::receipt::FinalObject::Absent
         )));
 
         // Issuing the receipt closes the grant: no mutation, no second copy,
@@ -6054,7 +6037,7 @@ pub(crate) mod tests {
         // A published file that cannot be read back at closure is attested
         // present with the hash failure recorded rather than silently
         // unhashed.
-        let (hashing_secret, hashing_policy) = encrypted_v2_policy(true);
+        let (hashing_secret, hashing_policy) = encrypted_policy(true);
         let hashing = existence_authority_with_receipt(&root, &hashing_policy, 5_000);
         let unreadable = target.join("unreadable");
         let settlement = hashing
@@ -6077,11 +6060,11 @@ pub(crate) mod tests {
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"unreadable"
                     && matches!(
                         &state.object,
-                        crate::receipt_v2::FinalObjectV2::Present {
+                        crate::receipt::FinalObject::Present {
                             digest: None,
                             observation_error: Some(_),
                             ..
@@ -6092,7 +6075,7 @@ pub(crate) mod tests {
         // The receipt states the final tree, not settlement order: a file
         // republished then deleted is absent, and one deleted then
         // republished is present.
-        let (racing_secret, racing_policy) = encrypted_v2_policy(false);
+        let (racing_secret, racing_policy) = encrypted_policy(false);
         let racing = existence_authority_with_receipt(&root, &racing_policy, 5_000);
         let vanished = target.join("vanished");
         let returned = target.join("returned");
@@ -6119,17 +6102,17 @@ pub(crate) mod tests {
             .unwrap();
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"vanished"
-                    && state.object == crate::receipt_v2::FinalObjectV2::Absent
+                    && state.object == crate::receipt::FinalObject::Absent
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"returned"
                     && matches!(
                         state.object,
-                        crate::receipt_v2::FinalObjectV2::Present { size: 4, .. }
+                        crate::receipt::FinalObject::Present { size: 4, .. }
                     )
         )));
     }
@@ -6177,7 +6160,7 @@ pub(crate) mod tests {
         authority.settle(second, &proto::Response::PartialSize(None));
         {
             let state = authority.state.lock().unwrap();
-            assert!(state.file_lifecycles_v2.is_empty());
+            assert!(state.file_lifecycles.is_empty());
             assert!(state.reserved.is_empty());
             assert_eq!(state.reserved_bytes, 0);
         }
@@ -6188,7 +6171,7 @@ pub(crate) mod tests {
         authority.settle(settlement, &proto::Response::PartialSize(Some(0)));
         let state = authority.state.lock().unwrap();
         assert!(state
-            .file_lifecycles_v2
+            .file_lifecycles
             .contains_key(&(path_bytes(&present_path), [1; 16])));
         assert_eq!(state.reserved_bytes, 4);
     }
@@ -6246,7 +6229,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn receipt_v2_records_each_outcome_and_closure_state_then_encrypts_it() {
+    fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
@@ -6265,14 +6248,14 @@ pub(crate) mod tests {
         let receipt_key = generate_receipt_key(EnrollmentId::random()).unwrap();
         let receipt_public = receipt_key.public_key().to_openssh().unwrap();
         let (recipient_secret, recipient_public_key) =
-            crate::receipt_v2::generate_recipient().unwrap();
-        let policy = crate::receipt_v2::ReceiptPolicyV2 {
+            crate::receipt::generate_recipient().unwrap();
+        let policy = crate::receipt::ReceiptPolicy {
             required: true,
             hashed: true,
             max_records: 64,
             max_plaintext_bytes: 1 << 20,
-            delivery: crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted {
-                suite: crate::receipt_v2::HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+            delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
+                suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
                 recipient_public_key,
             },
         };
@@ -6291,7 +6274,7 @@ pub(crate) mod tests {
         .unwrap();
         let put = |path: &Path| proto::SmallPut {
             path: path_bytes(path),
-            partial_id: [7; 16],
+            copy_id: [7; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: plain_meta(),
@@ -6322,12 +6305,12 @@ pub(crate) mod tests {
         assert!(authority.authorize(&mut late, false).is_err());
         assert!(authority.issue_receipt().is_err());
         let mut frames = Vec::new();
-        crate::receipt_v2::emit_transport_frames(issued, |frame| {
+        crate::receipt::emit_receipt_frames(issued, |frame| {
             frames.push(Ok(frame));
             Ok(())
         })
         .unwrap();
-        let mut verified = crate::receipt_v2::open_attached_frames(
+        let mut verified = crate::receipt::open_attached_frames(
             frames,
             &recipient_secret,
             &receipt_public,
@@ -6339,7 +6322,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             verified.terminal.status,
-            crate::receipt_v2::ReceiptStatusV2::Failed
+            crate::receipt::ReceiptStatus::Failed
         );
         assert_eq!(verified.terminal.summary.operations, 3);
         assert_eq!(verified.terminal.summary.refusals, 1);
@@ -6356,23 +6339,23 @@ pub(crate) mod tests {
             .unwrap();
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::Operation(operation)
+            crate::receipt::ReceiptRecord::Operation(operation)
                 if operation.path == copied_name
-                    && operation.disposition == crate::receipt_v2::OperationDispositionV2::Applied
+                    && operation.disposition == crate::receipt::OperationDisposition::Succeeded
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::Operation(operation)
+            crate::receipt::ReceiptRecord::Operation(operation)
                 if operation.path == b"failed"
-                    && operation.disposition == crate::receipt_v2::OperationDispositionV2::Failed
+                    && operation.disposition == crate::receipt::OperationDisposition::Failed
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == copied_name
                     && matches!(
                         state.object,
-                        crate::receipt_v2::FinalObjectV2::Present {
+                        crate::receipt::FinalObject::Present {
                             digest: Some(digest),
                             ..
                         } if digest == *blake3::hash(b"new").as_bytes()
@@ -6380,9 +6363,9 @@ pub(crate) mod tests {
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            crate::receipt_v2::RecordV2::FinalState(state)
+            crate::receipt::ReceiptRecord::FinalState(state)
                 if state.path == b"removed"
-                    && state.object == crate::receipt_v2::FinalObjectV2::Absent
+                    && state.object == crate::receipt::FinalObject::Absent
         )));
     }
 
@@ -6394,7 +6377,7 @@ pub(crate) mod tests {
         let image = target.join("image");
         fs::create_dir_all(&target).unwrap();
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(false);
+        let (secret, policy) = encrypted_policy(false);
         let authority = test_authority_with_receipt(
             &root,
             DeletionPolicy::Forbid,
@@ -6412,7 +6395,7 @@ pub(crate) mod tests {
             path: path_bytes(&image),
             size: 4,
             inplace: true,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -6424,7 +6407,7 @@ pub(crate) mod tests {
         let mut write = Request::WriteRange {
             path: path_bytes(&image),
             inplace: true,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             attempt: 0,
             off: 0,
             hash: crate::fsops::content_digest(b"ha"),
@@ -6439,13 +6422,13 @@ pub(crate) mod tests {
         let verified = open_issued(&authority, &secret, &policy);
         assert_eq!(
             verified.terminal.status,
-            crate::receipt_v2::ReceiptStatusV2::Failed
+            crate::receipt::ReceiptStatus::Failed
         );
         assert!(verified.terminal.summary.incomplete > 0);
 
         // With it, the same file is complete and the receipt is clean.
         let key = generate_receipt_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = encrypted_v2_policy(false);
+        let (secret, policy) = encrypted_policy(false);
         let finished = test_authority_with_receipt(
             &root,
             DeletionPolicy::Forbid,
@@ -6463,7 +6446,7 @@ pub(crate) mod tests {
             path: path_bytes(&image),
             size: 4,
             inplace: true,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -6474,7 +6457,7 @@ pub(crate) mod tests {
         let mut finalize = Request::Finalize {
             path: path_bytes(&image),
             inplace: true,
-            partial_id: [2; 16],
+            copy_id: [2; 16],
             meta: plain_meta(),
             flags: 0,
             condition: proto::TargetCondition::Any,
@@ -6485,7 +6468,7 @@ pub(crate) mod tests {
         let verified = open_issued(&finished, &secret, &policy);
         assert_eq!(
             verified.terminal.status,
-            crate::receipt_v2::ReceiptStatusV2::Clean
+            crate::receipt::ReceiptStatus::Clean
         );
         assert_eq!(verified.terminal.summary.incomplete, 0);
     }
@@ -6494,23 +6477,22 @@ pub(crate) mod tests {
         authority.receipt_key.public_key().to_openssh().unwrap()
     }
 
-    fn encrypted_v2_policy(
+    fn encrypted_policy(
         hashed: bool,
     ) -> (
-        crate::receipt_v2::RecipientSecret,
-        crate::receipt_v2::ReceiptPolicyV2,
+        crate::receipt::RecipientSecret,
+        crate::receipt::ReceiptPolicy,
     ) {
-        let (secret, recipient_public_key) = crate::receipt_v2::generate_recipient().unwrap();
+        let (secret, recipient_public_key) = crate::receipt::generate_recipient().unwrap();
         (
             secret,
-            crate::receipt_v2::ReceiptPolicyV2 {
+            crate::receipt::ReceiptPolicy {
                 required: true,
                 hashed,
                 max_records: 64,
                 max_plaintext_bytes: 1 << 20,
-                delivery: crate::receipt_v2::ReceiptDeliveryV2::AttachedEncrypted {
-                    suite:
-                        crate::receipt_v2::HpkeSuiteV1::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
+                delivery: crate::receipt::ReceiptDelivery::AttachedEncrypted {
+                    suite: crate::receipt::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
                     recipient_public_key,
                 },
             },
@@ -6519,17 +6501,17 @@ pub(crate) mod tests {
 
     fn open_issued(
         authority: &RestrictedAuthority,
-        secret: &crate::receipt_v2::RecipientSecret,
-        policy: &crate::receipt_v2::ReceiptPolicyV2,
-    ) -> crate::receipt_v2::VerifiedReceiptV2 {
+        secret: &crate::receipt::RecipientSecret,
+        policy: &crate::receipt::ReceiptPolicy,
+    ) -> crate::receipt::VerifiedReceipt {
         let issued = authority.issue_receipt().unwrap();
         let mut frames = Vec::new();
-        crate::receipt_v2::emit_transport_frames(issued, |frame| {
+        crate::receipt::emit_receipt_frames(issued, |frame| {
             frames.push(Ok(frame));
             Ok(())
         })
         .unwrap();
-        crate::receipt_v2::open_attached_frames(
+        crate::receipt::open_attached_frames(
             frames,
             secret,
             &racing_public(authority),
@@ -6674,7 +6656,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // The orchestrator refuses the same combination before signing. The
+        // The coordinator refuses the same combination before signing. The
         // rsync-shaped parser already makes --inplace and --ignore-existing
         // conflict, so the reachable case is the native --as-new placement.
         let mut args = Args::try_parse_from([
@@ -6695,7 +6677,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn signed_root_existence_is_checked_at_claim_and_forced_on_creation() {
+    fn signed_root_existence_is_checked_at_redemption_and_forced_on_creation() {
         use proto::TargetCondition::{Absent, Any};
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -6772,7 +6754,7 @@ pub(crate) mod tests {
         .unwrap();
 
         // The one existing-object policy the receiver cannot enforce is
-        // refused when the grant is claimed rather than trusted.
+        // refused when the grant is redeemed rather than trusted.
         assert!(existence_authority(
             &root,
             ExistingDestinationPolicy::UpdateIfOlder,
@@ -6991,7 +6973,7 @@ pub(crate) mod tests {
         fs::set_permissions(&existing_file, fs::Permissions::from_mode(0o600)).unwrap();
         let put = |path: &Path, mode| proto::SmallPut {
             path: path.as_os_str().as_bytes().to_vec(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: b"new".to_vec(),
             hash: crate::fsops::content_digest(b"new"),
             meta: proto::Meta {
@@ -7165,7 +7147,7 @@ pub(crate) mod tests {
             path: target.clone(),
             source: None,
             which: proto::Which::Final,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             block,
             len,
             attempt: 0,
@@ -7204,7 +7186,7 @@ pub(crate) mod tests {
         let request = |off| Request::WriteRange {
             path: target.clone(),
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             attempt: 0,
             off,
             hash: [0; 32],
@@ -7218,7 +7200,7 @@ pub(crate) mod tests {
             path: target.clone(),
             size: 1024,
             inplace: false,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -7273,7 +7255,7 @@ pub(crate) mod tests {
         fs::create_dir(&root).unwrap();
         let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 47_600,
             port_hi: 47_699,
@@ -7287,7 +7269,7 @@ pub(crate) mod tests {
 
         let wrong_range = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 1,
             port_hi: 2,
@@ -7297,7 +7279,7 @@ pub(crate) mod tests {
 
         let congestion_override = test_authority(&root, DeletionPolicy::Forbid, 1024);
         let mut listener = Request::TcpListen {
-            key: Some(vec![7; crate::crypto::KEY_LEN]),
+            key: Some(vec![7; crate::tcp_records::KEY_LEN]),
             token: vec![8; 16],
             port_lo: 47_600,
             port_hi: 47_699,
@@ -7344,7 +7326,7 @@ pub(crate) mod tests {
 
         let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
             path: target.clone(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             data: vec![0],
             hash: [0; 32],
             meta: proto::Meta {
@@ -7502,7 +7484,7 @@ pub(crate) mod tests {
                 .to_vec(),
             size,
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             mode: 0o600,
             attempt: 0,
             create_if_missing: true,
@@ -7519,7 +7501,7 @@ pub(crate) mod tests {
         authority.authorize(&mut prepare("b", 2), false).unwrap();
         let mut seed = Request::SeedBasis {
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             len: 3,
             attempt: 0,
             guard: None,
@@ -7533,7 +7515,7 @@ pub(crate) mod tests {
         let mut publish_empty = Request::Finalize {
             path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
             inplace: false,
-            partial_id: [1; 16],
+            copy_id: [1; 16],
             meta: proto::Meta {
                 mode: 0o644,
                 uid: 0,
@@ -7550,7 +7532,7 @@ pub(crate) mod tests {
         let mut publish_foreign = Request::Finalize {
             path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
             inplace: false,
-            partial_id: [9; 16],
+            copy_id: [9; 16],
             meta: proto::Meta {
                 mode: 0o644,
                 uid: 0,
@@ -7612,15 +7594,12 @@ pub(crate) mod tests {
         // the enrollment lookup or installation.
         let mut args = parse(&[]);
         validate_restricted_args(&args).unwrap();
-        args.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
+        args.receiver_max_entries = Some(0);
+        assert!(validate_restricted_args(&args).is_err());
+        args.receiver_max_entries = Some(delegation::MAX_ENTRIES + 1);
         assert!(validate_restricted_args(&args).is_err());
         let mut args = parse(&[]);
-        args.max_entries = Some(0);
-        assert!(validate_restricted_args(&args).is_err());
-        args.max_entries = Some(delegation::MAX_ENTRIES + 1);
-        assert!(validate_restricted_args(&args).is_err());
-        let mut args = parse(&[]);
-        args.max_total_bytes = Some(0);
+        args.receiver_max_bytes = Some(0);
         assert!(validate_restricted_args(&args).is_err());
         assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
         assert!(validate_restricted_args(&parse(&["--delete"])).is_err());
@@ -7670,20 +7649,19 @@ pub(crate) mod tests {
         assert_eq!(default_copy.limits.max_total_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(default_copy.limits.max_file_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(
-            default_copy.limits.max_runtime_seconds,
-            DEFAULT_RUNTIME_SECONDS
+            default_grant.start_by - default_grant.not_before,
+            GRANT_VALIDITY_SECONDS
         );
         assert_eq!(
-            default_grant.not_after - default_grant.not_before,
-            GRANT_VALIDITY_SECONDS
+            default_grant.finish_by - default_grant.issued_at,
+            FINISH_WINDOW_SECONDS
         );
 
         // Explicit ceilings land in the signed limits; the per-file bound
         // never exceeds the total, and the validity shrinks to the runtime.
         let mut ceilings = parse(&["--max-size", "3M"]);
-        ceilings.max_entries = Some(12);
-        ceilings.max_total_bytes = Some(2 << 20);
-        ceilings.max_runtime_secs = Some(1800);
+        ceilings.receiver_max_entries = Some(12);
+        ceilings.receiver_max_bytes = Some(2 << 20);
         let grant = grant_for(
             &ceilings,
             std::slice::from_ref(&source),
@@ -7696,20 +7674,7 @@ pub(crate) mod tests {
         assert_eq!(copy.limits.max_entries, 12);
         assert_eq!(copy.limits.max_total_bytes, 2 << 20);
         assert_eq!(copy.limits.max_file_bytes, 2 << 20);
-        assert_eq!(copy.limits.max_runtime_seconds, 1800);
-        assert_eq!(grant.not_after - grant.issued_at, 1800);
         assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
-
-        let mut too_long = parse(&[]);
-        too_long.max_runtime_secs = Some(DEFAULT_RUNTIME_SECONDS + 1);
-        assert!(grant_for(
-            &too_long,
-            std::slice::from_ref(&source),
-            id,
-            "backup",
-            b"/backup"
-        )
-        .is_err());
 
         // Deletion authority must be stated; it is then capped by the entry
         // ceiling so the grant stays self-consistent.
@@ -7723,7 +7688,7 @@ pub(crate) mod tests {
         )
         .is_err());
         let mut bounded = parse(&["--delete", "--max-delete", "40"]);
-        bounded.max_entries = Some(30);
+        bounded.receiver_max_entries = Some(30);
         let grant = grant_for(
             &bounded,
             std::slice::from_ref(&source),
@@ -7851,7 +7816,7 @@ pub(crate) mod tests {
             path: target.join("escape").as_os_str().as_bytes().to_vec(),
             source: None,
             which: proto::Which::Final,
-            partial_id: [0; 16],
+            copy_id: [0; 16],
             block: 4096,
             len: 1,
             attempt: 0,
@@ -7876,7 +7841,7 @@ pub(crate) mod tests {
             symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
             allow_unconfined_paths: false,
             shared_workers: 0,
-            independent_claim_workers: 0,
+            independent_handoff_workers: 0,
         };
         let error = authority.authorize(&mut request, true).unwrap_err();
         assert!(error
@@ -7909,7 +7874,7 @@ pub(crate) mod tests {
                 path: root.join("file").as_os_str().as_bytes().to_vec(),
                 source: Some(source),
                 which: proto::Which::Final,
-                partial_id: [0; 16],
+                copy_id: [0; 16],
                 block: proto::MIN_HASH_BLOCK_BYTES,
                 len: 1,
                 attempt: 0,

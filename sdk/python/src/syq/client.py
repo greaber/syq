@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from .bootstrap import managed_executable
+from .managed import managed_executable
 from .errors import (
     SyqInvocationError,
     SyqOperationError,
@@ -526,14 +526,12 @@ def _append_remote_arguments(
     no_tcp: bool,
     tcp_ports: str | None,
     tcp_congestion: str | None,
-    no_forward_agent: bool,
-    unrestricted_agent_forwarding: bool,
-    agent_broker_only: bool,
+    peer_auth: str | None,
 ) -> None:
     if coordinate_at is not None:
-        if coordinate_at not in {"auto", "local", "src", "dest"}:
+        if coordinate_at not in {"auto", "local", "src", "dst"}:
             raise SyqInvocationError(
-                "--coordinate-at must be auto, local, src, or dest"
+                "--coordinate-at must be auto, local, src, or dst"
             )
         argv.extend(("--coordinate-at", coordinate_at))
     if pscope is not None and rsh is not None:
@@ -564,13 +562,12 @@ def _append_remote_arguments(
                 _text_arg(tcp_congestion, label="tcp_congestion"),
             )
         )
-    for enabled, option in (
-        (no_forward_agent, "--no-forward-agent"),
-        (unrestricted_agent_forwarding, "--unrestricted-agent-forwarding"),
-        (agent_broker_only, "--agent-broker-only"),
-    ):
-        if enabled:
-            argv.append(option)
+    if peer_auth is not None:
+        if peer_auth not in {"restricted", "broker", "own-credentials", "full-agent"}:
+            raise SyqInvocationError(
+                "--peer-auth must be restricted, broker, own-credentials, or full-agent"
+            )
+        argv.extend(("--peer-auth", peer_auth))
 
 
 def _nonnegative_integer(value: int | None, *, option: str) -> int | None:
@@ -593,7 +590,7 @@ def _copy_arguments(
     sources: tuple[PathArgument, ...],
     *,
     src: Selector | None,
-    src_src: Selector | None,
+    srcs_in: Selector | None,
     src_file: Selector | None,
     src_dir: Selector | None,
     from_: str | None,
@@ -601,7 +598,7 @@ def _copy_arguments(
     root: PathArgument | None,
     follow: bool,
     follow_src: bool,
-    follow_dest: bool,
+    follow_dst: bool,
     to: str | None,
     tos: Iterable[str] | None,
     into: PathArgument | None,
@@ -616,10 +613,9 @@ def _copy_arguments(
     no_compress: bool,
     bwlimit: str | int | None,
     connections: int | None,
-    max_entries: int | None,
-    max_total_bytes: str | int | None,
-    max_runtime: str | int | None,
-    receipt: str | None,
+    receiver_max_entries: int | None,
+    receiver_max_bytes: str | int | None,
+    receiver_receipt: str | None,
     ignore: IgnoreSelector | None,
     ignore_from: Selector | None,
     preserve: str | Iterable[str] | None,
@@ -636,13 +632,13 @@ def _copy_arguments(
         source_count += 1
     for option, value in (
         ("--src", src),
-        ("--src-src", src_src),
+        ("--srcs-in", srcs_in),
         ("--src-file", src_file),
         ("--src-dir", src_dir),
     ):
         appended = _append_paths(argv, option, value)
         source_count += appended
-        if option == "--src-src":
+        if option == "--srcs-in":
             contents_count += appended
     if from_ is not None:
         argv.extend(("--from", _text_arg(from_, label="from_")))
@@ -657,8 +653,8 @@ def _copy_arguments(
     if follow_src:
         argv.append("--follow-src")
     source_end = len(argv)
-    if follow_dest:
-        argv.append("--follow-dest")
+    if follow_dst:
+        argv.append("--follow-dst")
     to_endpoint = _text_arg(to, label="to") if to is not None else None
     tos_endpoints: tuple[str, ...] = ()
     if tos is not None:
@@ -715,16 +711,17 @@ def _copy_arguments(
     connections = _positive_integer(connections, option="--connections")
     if connections is not None:
         argv.extend(("--connections", str(connections)))
-    max_entries = _nonnegative_integer(max_entries, option="--max-entries")
-    if max_entries is not None:
-        argv.extend(("--max-entries", str(max_entries)))
-    _append_text(argv, "--max-total-bytes", max_total_bytes)
-    _append_text(argv, "--max-runtime", max_runtime)
-    if receipt is not None:
-        receipt_value = _text_arg(receipt, label="receipt")
-        if receipt_value not in {"sizes", "hashed"}:
-            raise SyqInvocationError("--receipt must be sizes or hashed")
-        argv.extend(("--receipt", receipt_value))
+    receiver_max_entries = _nonnegative_integer(
+        receiver_max_entries, option="--receiver-max-entries"
+    )
+    if receiver_max_entries is not None:
+        argv.extend(("--receiver-max-entries", str(receiver_max_entries)))
+    _append_text(argv, "--receiver-max-bytes", receiver_max_bytes)
+    if receiver_receipt is not None:
+        receipt_value = _text_arg(receiver_receipt, label="receiver_receipt")
+        if receipt_value not in {"sizes", "digests"}:
+            raise SyqInvocationError("--receiver-receipt must be sizes or digests")
+        argv.extend(("--receiver-receipt", receipt_value))
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
         for rule in rules:
@@ -765,7 +762,7 @@ def _rm_arguments(
     sources: tuple[PathArgument, ...],
     *,
     src: Selector | None,
-    src_src: Selector | None,
+    srcs_in: Selector | None,
     src_file: Selector | None,
     src_dir: Selector | None,
     from_: str | None,
@@ -786,7 +783,7 @@ def _rm_arguments(
         source_count += 1
     for option, value in (
         ("--src", src),
-        ("--src-src", src_src),
+        ("--srcs-in", srcs_in),
         ("--src-file", src_file),
         ("--src-dir", src_dir),
     ):
@@ -1017,7 +1014,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -1025,7 +1022,7 @@ class Client:
         root: PathArgument | None = None,
         follow: bool = False,
         follow_src: bool = False,
-        follow_dest: bool = False,
+        follow_dst: bool = False,
         to: str | None = None,
         tos: Iterable[str] | None = None,
         into: PathArgument | None = None,
@@ -1051,13 +1048,10 @@ class Client:
         no_tcp: bool = False,
         tcp_ports: str | None = None,
         tcp_congestion: str | None = None,
-        no_forward_agent: bool = False,
-        unrestricted_agent_forwarding: bool = False,
-        agent_broker_only: bool = False,
-        max_entries: int | None = None,
-        max_total_bytes: str | int | None = None,
-        max_runtime: str | int | None = None,
-        receipt: str | None = None,
+        peer_auth: str | None = None,
+        receiver_max_entries: int | None = None,
+        receiver_max_bytes: str | int | None = None,
+        receiver_receipt: str | None = None,
         ignore: IgnoreSelector | None = None,
         ignore_from: Selector | None = None,
         preserve: str | Iterable[str] | None = None,
@@ -1086,7 +1080,7 @@ class Client:
             "cp",
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -1094,7 +1088,7 @@ class Client:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=follow_dest,
+            follow_dst=follow_dst,
             to=to,
             tos=tos,
             into=into,
@@ -1109,10 +1103,9 @@ class Client:
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
-            max_entries=max_entries,
-            max_total_bytes=max_total_bytes,
-            max_runtime=max_runtime,
-            receipt=receipt,
+            receiver_max_entries=receiver_max_entries,
+            receiver_max_bytes=receiver_max_bytes,
+            receiver_receipt=receiver_receipt,
             ignore=ignore,
             ignore_from=ignore_from,
             preserve=preserve,
@@ -1132,9 +1125,7 @@ class Client:
             no_tcp=no_tcp,
             tcp_ports=tcp_ports,
             tcp_congestion=tcp_congestion,
-            no_forward_agent=no_forward_agent,
-            unrestricted_agent_forwarding=unrestricted_agent_forwarding,
-            agent_broker_only=agent_broker_only,
+            peer_auth=peer_auth,
         )
         if mapping is not None and prune:
             raise SyqInvocationError("--mapping conflicts with --prune")
@@ -1197,7 +1188,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
@@ -1219,7 +1210,7 @@ class Client:
         argv, selectors_total = _rm_arguments(
             sources,
             src=src,
-            src_src=src_src,
+            srcs_in=srcs_in,
             src_file=src_file,
             src_dir=src_dir,
             from_=from_,
@@ -1252,7 +1243,7 @@ class Client:
         self,
         *sources: PathArgument,
         src: Selector | None = None,
-        src_src: Selector | None = None,
+        srcs_in: Selector | None = None,
         src_file: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
@@ -1265,14 +1256,14 @@ class Client:
         # Materialize selectors once so generators are not consumed separately
         # while deriving the source base carried by MapStream.cwd.
         src_values = _values(src, label="--src")
-        src_src_values = _values(src_src, label="--src-src")
+        srcs_in_values = _values(srcs_in, label="--srcs-in")
         src_file_values = _values(src_file, label="--src-file")
         src_dir_values = _values(src_dir, label="--src-dir")
         argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,
-            src_src=src_src_values,
+            srcs_in=srcs_in_values,
             src_file=src_file_values,
             src_dir=src_dir_values,
             from_=None,
@@ -1280,7 +1271,7 @@ class Client:
             root=root,
             follow=follow,
             follow_src=follow_src,
-            follow_dest=False,
+            follow_dst=False,
             to=None,
             tos=None,
             into=None,
@@ -1295,10 +1286,9 @@ class Client:
             no_compress=False,
             bwlimit=None,
             connections=None,
-            max_entries=None,
-            max_total_bytes=None,
-            max_runtime=None,
-            receipt=None,
+            receiver_max_entries=None,
+            receiver_max_bytes=None,
+            receiver_receipt=None,
             ignore=None,
             ignore_from=None,
             preserve=None,
@@ -1312,12 +1302,12 @@ class Client:
         command = (self._executable_value(), *argv)
         selected_base = root if root is not None else cwd
         contents_selector = None
-        if src_src_values:
-            if len(src_src_values) != 1 or source_count != 1:
+        if srcs_in_values:
+            if len(srcs_in_values) != 1 or source_count != 1:
                 raise SyqInvocationError(
-                    "syq map takes --src-src as its only selector"
+                    "syq map takes --srcs-in as its only selector"
                 )
-            contents_selector = src_src_values[0]
+            contents_selector = srcs_in_values[0]
         effective_cwd = _map_stream_cwd(
             self.process_cwd,
             self.env,

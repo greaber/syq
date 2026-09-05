@@ -1,10 +1,10 @@
 //! A fail-closed SSH-agent proxy for native remote-to-remote transfers.
 //!
-//! The default mode exposes only the transfer's enrolled transport key. Native
-//! `--agent-broker-only` instead advertises supported ambient-agent identities,
+//! The default mode exposes only the transfer's enrollment key. Native
+//! `--peer-auth broker` instead advertises supported ambient-agent identities,
 //! while applying the same signature restrictions. OpenSSH's session-bind
-//! messages prove the delegate and destination sessions, and the host-bound
-//! userauth request binds each signature to the destination host key and login
+//! messages prove the coordinator and peer sessions, and the host-bound
+//! userauth request binds each signature to the peer host key and login
 //! user.
 
 use crate::private_broker::{
@@ -89,16 +89,13 @@ impl HostPolicy {
 
 #[derive(Clone, Debug)]
 pub struct BrokerPolicy {
-    delegate: HostPolicy,
-    destination: HostPolicy,
+    coordinator: HostPolicy,
+    peer: HostPolicy,
 }
 
 impl BrokerPolicy {
-    pub fn new(delegate: HostPolicy, destination: HostPolicy) -> Self {
-        Self {
-            delegate,
-            destination,
-        }
+    pub fn new(coordinator: HostPolicy, peer: HostPolicy) -> Self {
+        Self { coordinator, peer }
     }
 }
 
@@ -758,9 +755,9 @@ impl std::fmt::Debug for ConstrainedAgentBroker {
 }
 
 impl ConstrainedAgentBroker {
-    /// Start a destination-bound broker backed by the current SSH agent. This
-    /// is the native `--agent-broker-only` mode: signatures remain limited to
-    /// the validated delegate-to-destination session and login user.
+    /// Start a peer-bound broker backed by the current SSH agent. This
+    /// is the native `--peer-auth broker` mode: signatures remain limited to
+    /// the validated coordinator-to-peer session and login user.
     pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
         let ambient = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
@@ -790,16 +787,16 @@ impl ConstrainedAgentBroker {
         )
     }
 
-    /// Start a destination-bound broker which advertises and signs only with
+    /// Start a peer-bound broker which advertises and signs only with
     /// one local private key. The ambient agent remains available solely for
-    /// authenticating the outer local-to-delegate SSH connection.
+    /// authenticating the outer local-to-coordinator SSH connection.
     pub fn start_with_private_key(
         policy: BrokerPolicy,
         max_connections: usize,
         private_key: PrivateKey,
     ) -> Result<Self> {
         if private_key.is_encrypted() || private_key.algorithm() != Algorithm::Ed25519 {
-            bail!("restricted transport credential must be an unencrypted Ed25519 key");
+            bail!("enrollment key must be an unencrypted Ed25519 key");
         }
         let ambient = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
@@ -919,15 +916,15 @@ impl BindState {
             .verify_signature()
             .context("invalid session-bind host-key signature")?;
         match self.bindings.len() {
-            0 if binding.is_forwarding && policy.delegate.authorizes_binding(&binding) => {}
-            1 if !binding.is_forwarding && policy.destination.authorizes_binding(&binding) => {}
+            0 if binding.is_forwarding && policy.coordinator.authorizes_binding(&binding) => {}
+            1 if !binding.is_forwarding && policy.peer.authorizes_binding(&binding) => {}
             0 => bail!(
-                "first session-bind did not identify trusted delegate {}",
-                policy.delegate.known_hosts_name
+                "first session-bind did not identify trusted coordinator {}",
+                policy.coordinator.known_hosts_name
             ),
             1 => bail!(
-                "final session-bind did not identify trusted destination {}",
-                policy.destination.known_hosts_name
+                "final session-bind did not identify trusted peer {}",
+                policy.peer.known_hosts_name
             ),
             _ => bail!("unexpected extra SSH forwarding hop"),
         }
@@ -943,14 +940,14 @@ impl BindState {
     }
 
     fn authorize(&self, policy: &BrokerPolicy, request: &SignRequest) -> Result<()> {
-        let [_, destination] = self.bindings.as_slice() else {
+        let [_, peer] = self.bindings.as_slice() else {
             bail!("signature requested before the exact two-hop path was bound");
         };
         let parsed = HostboundUserauth::parse(&request.data)?;
-        if parsed.session_id != destination.session_id {
+        if parsed.session_id != peer.session_id {
             bail!("userauth session did not match session-bind");
         }
-        if parsed.user != policy.destination.login_user.as_bytes() {
+        if parsed.user != policy.peer.login_user.as_bytes() {
             bail!("userauth login user was not authorized");
         }
         if parsed.service != b"ssh-connection" {
@@ -968,8 +965,7 @@ impl BindState {
             bail!("embedded userauth credential did not match sign request");
         }
         let mut host_key = Vec::new();
-        destination
-            .host_key
+        peer.host_key
             .encode(&mut host_key)
             .context("encode bound host key")?;
         if parsed.host_key != host_key {
@@ -1333,11 +1329,11 @@ impl SigningBackend {
                 let expected = PublicCredential::Key(private.public_key().key_data().clone());
                 if request.flags != 0 || !credentials_equal_on_wire(&request.credential, &expected)
                 {
-                    bail!("sign request did not select the enrolled transport credential");
+                    bail!("sign request did not select the enrollment key");
                 }
                 let signature = private
                     .try_sign(&request.data)
-                    .context("sign destination authentication with transport credential")?;
+                    .context("sign destination authentication with the enrollment key")?;
                 let mut response = Vec::new();
                 Response::SignResponse(signature).encode(&mut response)?;
                 Ok(response)
@@ -1618,10 +1614,10 @@ mod tests {
         }
     }
 
-    fn policy(delegate: KeyData, destination: KeyData) -> BrokerPolicy {
+    fn policy(coordinator: KeyData, peer: KeyData) -> BrokerPolicy {
         BrokerPolicy::new(
-            host_policy("source-user", "source", delegate),
-            host_policy("backup", "destination", destination),
+            host_policy("source-user", "source", coordinator),
+            host_policy("backup", "destination", peer),
         )
     }
 
@@ -2118,7 +2114,7 @@ mod tests {
         let policy = policy(source.clone(), destination.clone());
 
         let mut disallowed_algorithm = policy.clone();
-        disallowed_algorithm.delegate.host_key_algorithms = vec!["rsa-sha2-512".into()];
+        disallowed_algorithm.coordinator.host_key_algorithms = vec!["rsa-sha2-512".into()];
         assert!(BindState::default()
             .add(
                 &disallowed_algorithm,
@@ -2150,12 +2146,13 @@ mod tests {
                 binding(&source_private, source, b"source-session", true),
             )
             .unwrap();
-        assert!(state
+        let error = state
             .add(
                 &policy,
-                binding(&other_private, other.clone(), b"wrong-destination", false)
+                binding(&other_private, other.clone(), b"wrong-destination", false),
             )
-            .is_err());
+            .unwrap_err();
+        assert!(error.to_string().contains("trusted peer"), "{error:#}");
         state
             .add(
                 &policy,
@@ -2461,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_advertises_and_signs_only_the_transport_key() {
+    fn broker_advertises_and_signs_only_the_enrollment_key() {
         let temp = crate::test_support::tempdir().unwrap();
         let ambient_socket = temp.path().join("ambient.sock");
         let _ambient = UnixListener::bind(&ambient_socket).unwrap();

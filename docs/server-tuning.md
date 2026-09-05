@@ -1,10 +1,15 @@
-# Server performance tuning
+# Server setup
 
-syq does not require a specially configured server. It installs its versioned
-remote helper automatically, encrypts its TCP data connections by default,
-falls back to ssh when a TCP listener cannot be reached, and tunes its worker
-count while a copy runs. Start with the defaults and change the host only when
-a representative transfer shows a specific bottleneck.
+This page is about setting up a server (its firewall, sshd, and sysctl
+settings) so syq can run fast on it. That is separate from syq's own
+auto-tuner, which adjusts the connection count during a copy without any
+change to the host. syq does not require a specially configured server. It
+installs a matching remote helper automatically when using an official
+release build, encrypts its TCP data connections by default, and adjusts its
+connection count while a copy runs. If TCP cannot be reached, syq falls back
+to ssh, except with the restricted receiver, which requires encrypted TCP
+and fails instead. Start with the defaults and change the host only when a
+representative transfer shows a specific bottleneck.
 
 This is deliberately a guide, not an installer. Firewall policy, ssh capacity,
 kernel versions, network paths, and storage differ too much for one script to
@@ -24,10 +29,10 @@ SYQ_DEBUG=1 syq rsync -a --stats SOURCE HOST:DESTINATION
 
 `-vv` reports the remote helper and platform, candidate TCP addresses, the
 planned data transport, and the initial connection count; `--stats` reports
-where automatic connection tuning settled. `SYQ_DEBUG=1` adds engineering
+the connection count the auto-tuner finished on. `SYQ_DEBUG=1` adds engineering
 timings showing connection setup and where workers spent their time. Check CPU,
 disk, and network utilization on both endpoints at the same time. More network
-tuning cannot fix a saturated disk, one busy CPU core, or a slow destination
+changes cannot fix a saturated disk, one busy CPU core, or a slow destination
 filesystem.
 
 Change one thing at a time and repeat the same transfer. Record the original
@@ -43,7 +48,8 @@ transfer. The default TCP records are encrypted with a key exchanged through
 ssh. The helper listens on that port over both IPv4 and IPv6, so a firewall
 rule must allow whichever family the client will use. If no advertised
 address and port is reachable, syq reports the fallback once and carries data
-over separate ssh sessions instead.
+over ssh instead. A restricted remote-to-remote copy requires encrypted TCP
+and fails instead of falling back.
 
 Allow the chosen port range only from clients or trusted networks that need it.
 For example, an administrator using ufw could adapt one of these rules:
@@ -62,8 +68,9 @@ per-transfer token and is encrypted unless `--syq-tcp-plain` was requested.
 Trade-offs:
 
 - A reachable TCP path avoids ssh's per-channel flow-control and cipher-process
-  limits. Fresh-small-file workers using default ssh reuse the authenticated
-  control connection; larger and mixed SSH workloads start independent data
+  limits. A job made only of new small files, using default ssh with no
+  bandwidth limit, reuses the authenticated control connection. Larger or
+  mixed workloads and bandwidth-limited copies use independent SSH data
   processes so they can use multiple flows and cipher processes.
 - A firewall exception increases reachable attack surface. A private LAN, VPN,
   or narrowly scoped source rule is preferable to a public allow rule.
@@ -76,9 +83,10 @@ Trade-offs:
 
 This setting matters when data falls back to independent ssh connections. It
 limits concurrent *unauthenticated* ssh connections; it does not limit
-established sessions, fresh-small-file workers multiplexed over default ssh, or
-workers using the TCP data path. syq already retries shed connections and
-reduces the number of simultaneous handshakes, so the default is functional but
+established sessions, small-file workers sharing the control connection
+(which a nonzero `--bwlimit` disables), or workers using the TCP data path.
+Syq already retries shed connections and reduces the number of simultaneous
+handshakes, so the default is functional but
 can make connection setup slower.
 
 Inspect the effective value rather than assuming the distribution default:
@@ -119,7 +127,7 @@ and interaction with per-source limits.
 
 ## 3. Change TCP buffer ceilings only when the window is limiting throughput
 
-Linux already auto-tunes TCP buffers. syq also uses several flows, so a single
+Linux already adjusts TCP buffer sizes on its own. syq also uses several flows, so a single
 flow's window often is not the transfer limit. Raising global ceilings consumes
 no full buffer up front, but it permits each busy connection to consume more
 kernel memory; multiplied across many connections and services, that can be
@@ -191,14 +199,14 @@ tc qdisc show
 ```
 
 For a scoped comparison on Linux, `syq rsync --syq-tcp-congestion ALGO` selects an
-algorithm only for syq's direct TCP data sockets, on both the connecting and
+algorithm only for syq's TCP data sockets, on both the connecting and
 listening hosts. It does not change the host default. Both kernels must have
 the algorithm registered, and an unprivileged syq process may choose only an
 entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
 stops the transfer rather than silently changing the experiment. Without the
 option, each socket inherits its host's default.
 
-Compare algorithms with a fixed connection count so syq's worker tuning does
+Compare algorithms with a fixed connection count so syq's auto-tuner does
 not hide their effect. Use only a disposable test destination, and restore it
 to the same absent or empty state before every invocation. Otherwise the first
 command copies the data and the second measures an up-to-date no-op. Reset the
@@ -217,7 +225,7 @@ congestion control is sender-side, so a path can behave very differently in
 reverse. `--stats` reports the effective algorithm, retransmitted packets and
 bytes, round-trip time, congestion window, and delivery rate. If BBR wins
 repeatedly, pass `--syq-tcp-congestion bbr` for that workload and rerun once without
-`--syq-connections 1` to measure normal automatic worker tuning. Prefer this per-transfer
+`--syq-connections 1` to measure it with the auto-tuner active. Prefer this per-transfer
 choice to a global sysctl change.
 
 The server setting governs bulk downloads, while the uploading client setting
@@ -228,7 +236,7 @@ Changing
 interfaces, and virtual or multiqueue devices can have different behavior.
 Changing `net.ipv4.tcp_congestion_control` affects new connections from every
 application. If both endpoints already default to the wanted algorithm, syq's
-new direct TCP sockets inherit it and no application option is needed.
+new TCP data sockets inherit it and no application option is needed.
 
 Only test these settings when network measurements point to congestion, loss,
 or queueing rather than CPU or storage. Confirm kernel support, follow the
@@ -255,18 +263,18 @@ drops with `ip -s link` and the vendor's tools.
 
 - A single spinning disk often performs better with one fixed connection;
   use native `--connections 1` or compatibility `--syq-connections 1`. Syq's
-  automatic tuner can reduce active workers during longer runs, but short jobs
+  auto-tuner can reduce active workers during longer runs, but short jobs
   may finish before it measures the slowdown.
 - NVMe, RAID, NFS, and other high-latency filesystems often benefit from
   parallelism across files. A same-machine copy from a recognized local disk
   filesystem into one asynchronous NFS file is the exception: when kernel
-  offload is unavailable, syq automatically uses one sequential receiver-side
-  writer to avoid per-inode contention. Other source types and synchronous NFS
+  offload is unavailable, syq automatically uses one sequential writer on the
+  destination side to avoid per-inode contention. Other source types and synchronous NFS
   destinations keep the adaptive parallel path. NFS mount choices such as
   `nconnect` are client and server policy; see the
   [NFS notes](speed.md#nfs) and test with disposable data.
-- Compression trades network bytes for CPU. Compare with and without `-z` when
-  either the link or CPU is near saturation.
+- Compression trades network bytes for CPU and is on by default. Compare the
+  default with `--no-compress` when either the link or CPU is near saturation.
 - `--bwlimit` is the appropriate control when the goal is coexistence with
   other traffic, not maximum benchmark throughput.
 

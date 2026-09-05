@@ -1,11 +1,11 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
-use crate::crypto::{Cipher, RecordReader, RecordWriter};
 use crate::fsops::{self, FsOps};
 #[allow(unused_imports)]
 use crate::proto::SizeHint;
 use crate::proto::*;
 use crate::remote_helper::{self, Target};
+use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -32,12 +32,12 @@ pub trait Conn: Send {
     fn supports_request_pipelining(&self) -> bool {
         true
     }
-    /// Current kernel RTT estimate for a direct TCP connection. This is a
+    /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
         None
     }
-    /// Best-effort counters for a direct TCP data connection. Collection is
+    /// Best-effort counters for a TCP data connection. Collection is
     /// deliberately observational: unavailable kernels and SSH return None.
     fn transport_stats(&mut self) -> Option<TcpPairStats> {
         None
@@ -74,6 +74,7 @@ pub trait Conn: Send {
 pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
+    pub supports_confined_socket_nodes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -482,6 +483,7 @@ impl Conn for LocalConn {
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
+                    | Request::CopySmallFiles(_)
                     | Request::Receipt
             )
         {
@@ -598,6 +600,9 @@ pub struct RemoteConn {
     peer: Option<PeerInfo>,
     tcp_socket: Option<TcpStream>,
     multiplexed_ssh: bool,
+    /// A session taken from the session pool: no child of ours to wait for,
+    /// and a reader that ends when the remote closes the pipe.
+    detached: bool,
 }
 
 const READ_AHEAD: usize = 4;
@@ -661,7 +666,45 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
     Ok(())
 }
 
+impl std::fmt::Debug for RemoteConn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteConn")
+            .field("label", &self.label)
+            .field("detached", &self.detached)
+            .finish()
+    }
+}
+
 impl RemoteConn {
+    /// A control session taken from the session pool: the ssh client's
+    /// pipes, with the preamble and hello already sent by the pool and their
+    /// replies unread. The pool reaps the ssh client once this process has
+    /// closed the pipes.
+    pub(crate) fn from_pooled(
+        session: crate::session_pool::PooledSession,
+        compress: bool,
+        label: String,
+    ) -> Self {
+        let (rx, reader) = spawn_reader(Box::new(session.stdout));
+        let mut stderr = session.stderr;
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+        });
+        RemoteConn {
+            child: None,
+            w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
+            rx: Some(rx),
+            reader: Some(reader),
+            label,
+            dead: false,
+            peer: None,
+            tcp_socket: None,
+            multiplexed_ssh: false,
+            detached: true,
+        }
+    }
+
     fn transport_stats_with_timeout(
         &mut self,
         timeout: std::time::Duration,
@@ -836,6 +879,13 @@ impl Drop for RemoteConn {
     fn drop(&mut self) {
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
+        }
+        if self.detached {
+            // Closing the pipes is the whole teardown: the remote exits on
+            // Shutdown or EOF, and waiting for its exit status would cost
+            // the round trip the pool exists to save.
+            self.rx.take();
+            return;
         }
         // Sending Shutdown asks for an orderly peer exit; shutting down the
         // retained TCP descriptor also wakes our reader clone and the peer's
@@ -1077,7 +1127,7 @@ pub(crate) fn require_constrained_openssh(program: &str, location: &str) -> Resu
     match openssh_version(program) {
         Some(version) if version < CONSTRAINED_OPENSSH_MINIMUM => {
             Err(OpenSshVersionError(format!(
-                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --no-forward-agent with credentials on the coordinator host, --unrestricted-agent-forwarding, or an explicit --rsh policy"
+                "constrained agent forwarding needs {CONSTRAINED_OPENSSH_MINIMUM} or newer {location}, but {program} is {version}; use --peer-auth own-credentials with credentials on the coordinator host, --peer-auth full-agent, or an explicit --rsh policy"
             ))
             .into())
         }
@@ -1149,7 +1199,7 @@ pub struct RemoteSpec {
     pub rsh: Vec<String>,
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
-    pub auto_helper: bool,
+    pub bootstrap_helper: bool,
     /// One-time signed authorization for a command-restricted receiver. It is
     /// sent only on the SSH control connection; authenticated TCP workers are
     /// children of that already-authorized receiver.
@@ -1166,6 +1216,17 @@ pub struct RemoteSpec {
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
     /// User-facing facts gathered by the same connection path the transfer uses.
     pub diagnostics: std::sync::Arc<std::sync::Mutex<RemoteDiagnostics>>,
+    /// A pooled control session taken ahead of time on the main thread, for
+    /// the control connection to consume. An empty result also prevents
+    /// descriptor receipt during the later parallel connect.
+    pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<PrimedControl>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum PrimedControl {
+    #[default]
+    Unchecked,
+    Checked(Option<Box<RemoteConn>>),
 }
 
 impl RemoteSpec {
@@ -1177,13 +1238,14 @@ impl RemoteSpec {
             port: None,
             rsh: vec!["local".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
             quiet,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         }
     }
 
@@ -1314,6 +1376,75 @@ impl RemoteSpec {
         }
     }
 
+    fn pool_endpoint(&self) -> crate::session_pool::PoolEndpoint {
+        crate::session_pool::PoolEndpoint {
+            user: self.user.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            program: self.program_command(&["--server".into()]),
+        }
+    }
+
+    /// A ready control session from the persistence scope's pool, if the
+    /// pool has one for exactly the remote command this connection would
+    /// run. The pool sent the hello with a default command's flags; this
+    /// process reads the reply. Anything short of a usable session is a
+    /// reason to connect directly, never an error.
+    fn take_pooled_control(&self, compress: bool) -> Option<RemoteConn> {
+        if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
+            return conn.take().map(|conn| *conn);
+        }
+        let multiplexer = self.ssh_multiplexer.as_ref()?;
+        if !multiplexer.persistent
+            || self.local_process
+            || self.restricted_grant.is_some()
+            || !self
+                .rsh
+                .first()
+                .is_some_and(|program| program.ends_with("ssh"))
+        {
+            return None;
+        }
+        let program = self.program_command(&["--server".into()]);
+        let session = crate::session_pool::take(&multiplexer.path, &program)?;
+        let conn = RemoteConn::from_pooled(session, compress, self.label());
+        match receive_hello(conn, false) {
+            Ok(conn) => {
+                if crate::transfer::debug() {
+                    crate::output::diagnostic!(
+                        "syq: {}: control connection from the session pool",
+                        self.label()
+                    );
+                }
+                self.record_peer(&conn);
+                Some(conn)
+            }
+            Err(error) => {
+                if crate::transfer::debug() {
+                    crate::output::diagnostic!(
+                        "syq: {}: pooled session unusable ({error:#}); connecting directly",
+                        self.label()
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Take a pooled control session now, on the calling thread, for the
+    /// control connection to use later. Pooled sessions arrive as
+    /// descriptors, and Darwin cannot receive those close-on-exec
+    /// atomically, so this runs before any child is spawned alongside.
+    pub(crate) fn prime_pooled_control(&self, compress: bool) {
+        // The same gate as the control connection's: a --no-compress command
+        // connects directly and must not hold a session it will not use.
+        if !compress {
+            return;
+        }
+        let conn = self.take_pooled_control(compress);
+        *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
+    }
+
     /// A shell command that runs syq with `args` on this host.  Automatic mode
     /// addresses the exact release/build-identified helper; explicit mode preserves the
     /// administrator-provided path; disabling bootstrap uses normal PATH lookup.
@@ -1321,7 +1452,7 @@ impl RemoteSpec {
         if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
-        if self.auto_helper {
+        if self.bootstrap_helper {
             return remote_helper::launcher(args);
         }
         format!("syq {}", shell_words::join(args))
@@ -1345,12 +1476,15 @@ impl RemoteSpec {
     /// transfer engine's exponential retries while retaining the exact same
     /// managed-helper bootstrap and persistent control socket behavior.
     pub(crate) fn connect_completion(&self) -> Result<RemoteConn> {
+        if let Some(conn) = self.take_pooled_control(false) {
+            return Ok(conn);
+        }
         let role = ConnectionRole::Control;
         let first = self.connect_once(false, SshConnection::Control, role.clone());
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
         self.install_helper()?;
@@ -1370,11 +1504,16 @@ impl RemoteSpec {
         limited: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        if matches!(role, ConnectionRole::Control) && compress {
+            if let Some(conn) = self.take_pooled_control(compress) {
+                return Ok(conn);
+            }
+        }
         let first = self.connect_retried(compress, limited, role.clone());
         let Err(first_error) = first else {
             return first;
         };
-        if !self.auto_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
 
@@ -1412,7 +1551,7 @@ impl RemoteSpec {
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
                     if crate::transfer::debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
                             self.label()
                         );
@@ -1430,7 +1569,7 @@ impl RemoteSpec {
                         None
                     };
                     if crate::transfer::debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: connect to {} failed (attempt {}): {e:#}{}",
                             self.label(),
                             attempt + 1,
@@ -1504,6 +1643,7 @@ impl RemoteSpec {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
+            detached: false,
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
         self.record_peer(&conn);
@@ -1520,6 +1660,14 @@ impl RemoteSpec {
                 &self.host,
                 self.port,
             );
+            // With persistence on, the next command should find a session
+            // ready. The pool is started here, after this connection is up,
+            // so it never sits on the critical path.
+            if let Some(multiplexer) = &self.ssh_multiplexer {
+                if multiplexer.persistent {
+                    crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
+                }
+            }
         }
         Ok(conn)
     }
@@ -1566,9 +1714,11 @@ impl RemoteSpec {
         let key = if plain {
             None
         } else {
-            Some(crate::crypto::random_bytes(crate::crypto::KEY_LEN))
+            Some(crate::tcp_records::random_bytes(
+                crate::tcp_records::KEY_LEN,
+            ))
         };
-        let token = crate::crypto::random_bytes(16);
+        let token = crate::tcp_records::random_bytes(16);
         let resp = ctl.call(Request::TcpListen {
             key: key.clone(),
             token: token.clone(),
@@ -1686,7 +1836,7 @@ impl RemoteSpec {
             bail!("no advertised data address is reachable");
         }
         if crate::transfer::debug() {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: data paths {:?} (advertised {:?})",
                 self.label(),
                 addrs,
@@ -1787,7 +1937,10 @@ impl RemoteSpec {
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             if crate::transfer::debug() {
-                eprintln!("syq: {}: data connection via tcp {addr_s}", self.label());
+                crate::output::diagnostic!(
+                    "syq: {}: data connection via tcp {addr_s}",
+                    self.label()
+                );
             }
             stream.set_nodelay(true)?;
             let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1813,6 +1966,7 @@ impl RemoteSpec {
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
+                detached: false,
             };
             let conn = hello(conn, compress, info.token.clone(), role.clone())?;
             self.record_peer(&conn);
@@ -1949,6 +2103,23 @@ impl std::fmt::Debug for TcpInfo {
     }
 }
 
+/// The first request on every connection. The session pool sends it on a
+/// command's behalf with a default command's flags.
+pub(crate) fn hello_request(
+    compress: bool,
+    debug: bool,
+    token: Vec<u8>,
+    role: ConnectionRole,
+) -> Request {
+    Request::Hello {
+        identity: crate::identity::build().to_string(),
+        compress,
+        debug,
+        token,
+        role,
+    }
+}
+
 fn hello(
     mut conn: RemoteConn,
     compress: bool,
@@ -1956,16 +2127,27 @@ fn hello(
     role: ConnectionRole,
 ) -> Result<RemoteConn> {
     let worker = !matches!(role, ConnectionRole::Control);
-    conn.send(Request::Hello {
-        identity: crate::identity::build().to_string(),
+    conn.send(hello_request(
         compress,
-        debug: crate::transfer::debug(),
+        crate::transfer::debug(),
         token,
         role,
-    })?;
+    ))?;
+    receive_hello(conn, worker)
+}
+
+fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     match conn.recv() {
-        Ok(Response::HelloOk { identity, platform }) if identity == crate::identity::build() => {
-            conn.peer = Some(PeerInfo { identity, platform });
+        Ok(Response::HelloOk {
+            identity,
+            platform,
+            supports_confined_socket_nodes,
+        }) if identity == crate::identity::build() => {
+            conn.peer = Some(PeerInfo {
+                identity,
+                platform,
+                supports_confined_socket_nodes,
+            });
         }
         Ok(Response::HelloOk { identity, .. }) => {
             bail!(
@@ -2010,7 +2192,7 @@ impl RemoteSpec {
         let bootstrap = self.remote_bootstrap()?;
         let target = bootstrap.target;
         if !self.quiet {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: installing {} helper for {}",
                 self.label(),
                 remote_helper::helper_identity(),
@@ -2060,7 +2242,7 @@ impl RemoteSpec {
                 self.label()
             )
         })?;
-        let direct_download = text
+        let remote_download = text
             .lines()
             .find_map(|line| line.strip_prefix("syq-helper-tools:"))
             .is_some_and(|tools| {
@@ -2072,28 +2254,28 @@ impl RemoteSpec {
             });
         Ok(RemoteBootstrap {
             target,
-            direct_download,
+            remote_download,
         })
     }
 
     fn bootstrap_helper(&self, bootstrap: RemoteBootstrap) -> Result<()> {
         let mut trusted = None;
-        if bootstrap.direct_download {
-            match self.try_direct_helper(bootstrap.target)? {
-                DirectHelper::Installed => return Ok(()),
-                DirectHelper::Fallback { detail, helper } => {
+        if bootstrap.remote_download {
+            match self.try_remote_download(bootstrap.target)? {
+                RemoteDownloadOutcome::Installed => return Ok(()),
+                RemoteDownloadOutcome::Fallback { detail, helper } => {
                     trusted = helper;
                     if !self.quiet {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: {}: remote download unavailable{}; uploading the verified helper over SSH",
                             self.label(),
                             parenthesized_detail(&detail)
                         );
                     }
                 }
-                DirectHelper::Integrity { warning, helper } => {
+                RemoteDownloadOutcome::Integrity { warning, helper } => {
                     trusted = helper;
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: warning: {}: {}; the remote download was discarded; uploading the verified helper over SSH",
                         self.label(),
                         warning
@@ -2101,7 +2283,7 @@ impl RemoteSpec {
                 }
             }
         } else if !self.quiet {
-            eprintln!(
+            crate::output::diagnostic!(
                 "syq: {}: remote download prerequisites unavailable; uploading the verified helper over SSH",
                 self.label()
             );
@@ -2117,7 +2299,7 @@ impl RemoteSpec {
         self.upload_helper(bootstrap.target, &binary)
     }
 
-    fn try_direct_helper(&self, target: Target) -> Result<DirectHelper> {
+    fn try_remote_download(&self, target: Target) -> Result<RemoteDownloadOutcome> {
         let script = remote_helper::download_script(target);
         let mut cmd = self.ssh_command(SshConnection::Independent);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
@@ -2145,7 +2327,7 @@ impl RemoteSpec {
             bytes
         });
 
-        let report = read_direct_report(&mut BufReader::new(stdout));
+        let report = read_remote_download_report(&mut BufReader::new(stdout));
         let mut helper = None;
         let mut integrity_warning = None;
         let mut protocol_detail = None;
@@ -2204,9 +2386,9 @@ impl RemoteSpec {
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
             return if authorized {
-                Ok(DirectHelper::Installed)
+                Ok(RemoteDownloadOutcome::Installed)
             } else {
-                Ok(DirectHelper::Fallback {
+                Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail
                         .unwrap_or_else(|| "the remote ignored a discard decision".into()),
                     helper,
@@ -2214,17 +2396,19 @@ impl RemoteSpec {
             };
         }
         match status.code() {
-            Some(remote_helper::DIRECT_FALLBACK_EXIT) => Ok(DirectHelper::Fallback {
-                detail: if detail.is_empty() {
-                    protocol_detail.unwrap_or_default()
-                } else {
-                    detail
-                },
-                helper,
-            }),
-            Some(remote_helper::DIRECT_INTEGRITY_EXIT) => match integrity_warning {
-                Some(warning) => Ok(DirectHelper::Integrity { warning, helper }),
-                None => Ok(DirectHelper::Fallback {
+            Some(remote_helper::REMOTE_DOWNLOAD_FALLBACK_EXIT) => {
+                Ok(RemoteDownloadOutcome::Fallback {
+                    detail: if detail.is_empty() {
+                        protocol_detail.unwrap_or_default()
+                    } else {
+                        detail
+                    },
+                    helper,
+                })
+            }
+            Some(remote_helper::REMOTE_DOWNLOAD_INTEGRITY_EXIT) => match integrity_warning {
+                Some(warning) => Ok(RemoteDownloadOutcome::Integrity { warning, helper }),
+                None => Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail.unwrap_or(detail),
                     helper,
                 }),
@@ -2272,10 +2456,10 @@ impl RemoteSpec {
 #[derive(Clone, Copy)]
 struct RemoteBootstrap {
     target: Target,
-    direct_download: bool,
+    remote_download: bool,
 }
 
-enum DirectHelper {
+enum RemoteDownloadOutcome {
     Installed,
     Fallback {
         detail: String,
@@ -2288,12 +2472,14 @@ enum DirectHelper {
 }
 
 #[derive(Debug)]
-struct DirectReport {
+struct RemoteDownloadReport {
     manifest: Vec<u8>,
     sha256: String,
 }
 
-fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<DirectReport>> {
+fn read_remote_download_report(
+    reader: &mut impl BufRead,
+) -> std::io::Result<Option<RemoteDownloadReport>> {
     const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
     let mut line = Vec::new();
     if reader.read_until(b'\n', &mut line)? == 0 {
@@ -2363,7 +2549,7 @@ fn read_direct_report(reader: &mut impl BufRead) -> std::io::Result<Option<Direc
             "remote helper report contained trailing or malformed protocol data",
         ));
     }
-    Ok(Some(DirectReport { manifest, sha256 }))
+    Ok(Some(RemoteDownloadReport { manifest, sha256 }))
 }
 
 fn protocol_line(mut line: &[u8]) -> &[u8] {
@@ -2541,6 +2727,7 @@ impl Endpoint {
                                 return Err(e).context("TCP data transport required by test");
                             }
                             let mut g = spec.tcp.lock().unwrap();
+                            let mut warning = None;
                             if let Some(i) = g.as_mut() {
                                 if !i.failed {
                                     i.failed = true;
@@ -2549,9 +2736,13 @@ impl Endpoint {
                                         let congestion_note = tcp_congestion_fallback_note(
                                             info.congestion_control.as_deref(),
                                         );
-                                        eprintln!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port);
+                                        warning = Some(format!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port));
                                     }
                                 }
+                            }
+                            drop(g);
+                            if let Some(warning) = warning {
+                                crate::output::diagnostic!("{warning}");
                             }
                         }
                     }
@@ -2596,7 +2787,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 1,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             })
             .unwrap();
         let Response::SourceRootsRegistered(roots) = response else {
@@ -2634,7 +2825,7 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 allow_unconfined_paths: false,
                 shared_workers: 1,
-                independent_claim_workers: 0,
+                independent_handoff_workers: 0,
             })
             .unwrap();
         let Response::SourceRootsRegistered(roots) = response else {
@@ -2859,13 +3050,14 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let info = TcpInfo {
             addrs: vec!["127.0.0.1".into()],
@@ -2884,8 +3076,7 @@ mod tests {
                 false,
                 ConnectionRole::SourceWorker { roots: Vec::new() },
             )
-            .err()
-            .expect("unregistered congestion control should fail locally");
+            .expect_err("unregistered congestion control should fail locally");
         let message = format!("{error:#}");
         assert!(is_tcp_congestion_error(&error));
         assert!(message.contains(
@@ -2948,6 +3139,8 @@ mod tests {
                 .write_msg(&Response::HelloOk {
                     identity: crate::identity::build().to_string(),
                     platform: crate::identity::platform(),
+                    supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(
+                    ),
                 })
                 .unwrap();
         });
@@ -2964,6 +3157,7 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let conn = hello(
             conn,
@@ -3009,10 +3203,10 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let error = hello(conn, false, Vec::new(), ConnectionRole::Control)
-            .err()
-            .expect("an operation response is not a valid handshake");
+            .expect_err("an operation response is not a valid handshake");
         let message = format!("{error:#}");
         assert!(
             message.contains("unexpected handshake response"),
@@ -3050,6 +3244,7 @@ mod tests {
             peer: None,
             tcp_socket: None,
             multiplexed_ssh: false,
+            detached: false,
         };
         let error = conn.io_err(
             std::io::Error::new(
@@ -3109,6 +3304,7 @@ mod tests {
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 multiplexed_ssh: false,
+                detached: false,
             };
             let timeout = std::time::Duration::from_millis(5);
             let start = std::time::Instant::now();
@@ -3170,19 +3366,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_frames_manifest_and_digest() {
+    fn remote_download_report_frames_manifest_and_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
         );
-        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        let report = read_remote_download_report(&mut bytes.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(report.manifest, b"{\n  \"schema\": 1\n}\n");
         assert_eq!(report.sha256, digest);
     }
 
     #[test]
-    fn direct_download_report_rejects_unterminated_manifest() {
-        let error = read_direct_report(
+    fn remote_download_report_rejects_unterminated_manifest() {
+        let error = read_remote_download_report(
             &mut b"syq-helper-manifest-begin\nsyq-helper-manifest-data:{\"schema\":1}\n".as_slice(),
         )
         .unwrap_err();
@@ -3190,13 +3388,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_keeps_injected_markers_inside_the_manifest() {
+    fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
         let spoofed = "a".repeat(64);
         let actual = "b".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
         );
-        let report = read_direct_report(&mut bytes.as_bytes()).unwrap().unwrap();
+        let report = read_remote_download_report(&mut bytes.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(report.sha256, actual);
         assert!(report
             .manifest
@@ -3209,12 +3409,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_download_report_rejects_data_after_the_digest() {
+    fn remote_download_report_rejects_data_after_the_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
             "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
         );
-        let error = read_direct_report(&mut bytes.as_bytes()).unwrap_err();
+        let error = read_remote_download_report(&mut bytes.as_bytes()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -3227,13 +3427,14 @@ mod tests {
             port: None,
             rsh: vec!["ssh".to_string()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let command = spec.ssh_command(SshConnection::Independent);
         assert!(!command
@@ -3253,6 +3454,57 @@ mod tests {
     }
 
     #[test]
+    fn worker_tcp_fallback_survives_broken_stderr() {
+        if !crate::test_support::with_broken_stderr(
+            "conn::tests::worker_tcp_fallback_survives_broken_stderr",
+        ) {
+            return;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let marker = temporary.path().join("ssh-attempted");
+        let spec = RemoteSpec {
+            local_process: false,
+            user: None,
+            host: "unused".into(),
+            port: None,
+            // The shell records that fallback was reached, then reports a
+            // missing helper so no retry or real SSH connection is needed.
+            rsh: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "touch {}; exit 127",
+                    shell_words::quote(marker.to_str().unwrap())
+                ),
+            ],
+            syq_path: None,
+            bootstrap_helper: false,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: None,
+            quiet: false,
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(Some(TcpInfo {
+                addrs: vec!["invalid address".into()], // Fail resolution without DNS or a socket.
+                port: 0,
+                key: None,
+                token: Vec::new(),
+                congestion_control: None,
+                failed: false,
+                failure: None,
+                next: Default::default(),
+            }))),
+            diagnostics: Default::default(),
+            primed_control: Default::default(),
+        };
+        let endpoint = Endpoint::Remote(spec.clone());
+        assert!(endpoint
+            .connect_with_role(false, ConnectionRole::SourceWorker { roots: Vec::new() })
+            .is_err());
+        assert!(marker.exists(), "worker never attempted SSH fallback");
+        assert!(spec.tcp.lock().unwrap().as_ref().unwrap().failed);
+    }
+
+    #[test]
     fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
         let multiplexer = std::sync::Arc::new(SshMultiplexer::new().unwrap());
         let control_path = multiplexer.path.to_string_lossy().into_owned();
@@ -3263,13 +3515,14 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(multiplexer),
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3302,6 +3555,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
+        use std::os::unix::net::UnixListener;
+        let directory = crate::test_support::tempdir().unwrap();
+        let scope = directory.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None).unwrap();
+        let socket = crate::session_pool::socket_path(&multiplexer.path);
+        let mut spec = RemoteSpec::local_receiver(true);
+        spec.local_process = false;
+        spec.rsh = vec!["ssh".into()];
+        spec.ssh_multiplexer = Some(std::sync::Arc::new(multiplexer));
+
+        // The pool is absent during the main-thread prime, then starts
+        // before the parallel connect. The cloned spec must keep that miss.
+        spec.prime_pooled_control(true);
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(spec.clone().take_pooled_control(true).is_none());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         use std::os::unix::fs::PermissionsExt;
         let directory = crate::test_support::tempdir().unwrap();
@@ -3329,13 +3607,14 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
         let args = |connection| {
             spec.ssh_command(connection)
@@ -3379,13 +3658,14 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
             quiet: false,
             tcp: Default::default(),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         };
 
         let command = spec.ssh_command(SshConnection::Control);

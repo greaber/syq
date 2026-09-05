@@ -66,7 +66,7 @@ if command == "rm":
     status = os.environ.get("SYQ_FAKE_STATUS", "success")
     exit_code = 0 if status == "success" else 23
     selector_total = sum(
-        arg in {"--src", "--src-src", "--src-file", "--src-dir"}
+        arg in {"--src", "--srcs-in", "--src-file", "--src-dir"}
         for arg in args
     ) or 1
     records = [{
@@ -276,7 +276,7 @@ class NativeClientTests(unittest.TestCase):
             from_="source",
             root="source-root",
             follow_src=True,
-            follow_dest=True,
+            follow_dst=True,
             to="target",
             coordinate_at="local",
             into_existing="out",
@@ -287,10 +287,9 @@ class NativeClientTests(unittest.TestCase):
             no_compress=True,
             bwlimit="10M",
             connections=4,
-            max_entries=100,
-            max_total_bytes="2G",
-            max_runtime="30m",
-            receipt="hashed",
+            receiver_max_entries=100,
+            receiver_max_bytes="2G",
+            receiver_receipt="digests",
             pscope="-scope",
             ignore=["*.tmp", "cache/"],
             ignore_from="ignore.txt",
@@ -320,11 +319,11 @@ class NativeClientTests(unittest.TestCase):
         argv = self.argv()
         for expected in (
             "cp", "--src", "--src-dir", "--from", "--root", "--follow-src",
-            "--follow-dest", "--to",
+            "--follow-dst", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
             "--hash", "--no-compress", "--bwlimit", "--connections",
-            "--max-entries", "--max-total-bytes",
-            "--max-runtime", "--receipt", "--ignore", "--ignore-from",
+            "--receiver-max-entries", "--receiver-max-bytes",
+            "--receiver-receipt", "--ignore", "--ignore-from",
             "--preserve",
             "--inplace", "--max-size", "--min-size",
         ):
@@ -336,7 +335,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("--results", argv)
         self.assertNotIn("--quiet", argv)
         self.assertIn("--pscope=-scope", argv)
-        self.assertEqual(argv[argv.index("--receipt") + 1], "hashed")
+        self.assertEqual(argv[argv.index("--receiver-receipt") + 1], "digests")
         self.assertEqual(argv.count("--src"), 2)
 
     def test_hyphen_prefixed_paths_use_attached_option_values(self) -> None:
@@ -369,7 +368,7 @@ class NativeClientTests(unittest.TestCase):
 
         result = self.client.rm(
             src="victim",
-            src_src="contents",
+            srcs_in="contents",
             src_file="leaf",
             src_dir="tree",
             from_="source",
@@ -403,7 +402,7 @@ class NativeClientTests(unittest.TestCase):
         for expected in (
             "rm",
             "--src",
-            "--src-src",
+            "--srcs-in",
             "--src-file",
             "--src-dir",
             "--from",
@@ -574,12 +573,7 @@ class NativeClientTests(unittest.TestCase):
 
         for parameter, option in (
             ({"no_tcp": True}, "--no-tcp"),
-            ({"no_forward_agent": True}, "--no-forward-agent"),
-            (
-                {"unrestricted_agent_forwarding": True},
-                "--unrestricted-agent-forwarding",
-            ),
-            ({"agent_broker_only": True}, "--agent-broker-only"),
+            ({"peer_auth": "own-credentials"}, "--peer-auth"),
         ):
             with self.subTest(option=option):
                 self.client.cp(
@@ -736,7 +730,7 @@ class NativeClientTests(unittest.TestCase):
 
     def test_map_is_streaming_typed_and_context_managed(self) -> None:
         with self.client.map(
-            src_src="source", root="source-root", follow_src=True
+            srcs_in="source", root="source-root", follow_src=True
         ) as stream:
             entries = list(stream)
         self.assertEqual(len(entries), 1)
@@ -759,7 +753,7 @@ class NativeClientTests(unittest.TestCase):
             process_cwd=self.root,
         )
         with client.map(
-            src_src="link/../selected", cwd="base", follow_src=True
+            srcs_in="link/../selected", cwd="base", follow_src=True
         ) as stream:
             list(stream)
         self.assertEqual(
@@ -774,7 +768,7 @@ class NativeClientTests(unittest.TestCase):
             env={**self.env, "HOME": os.fspath(home)},
             process_cwd=self.root,
         )
-        with client.map(src_src="~/selected", cwd="ignored") as stream:
+        with client.map(srcs_in="~/selected", cwd="ignored") as stream:
             list(stream)
         self.assertEqual(stream.cwd, home / "selected")
 
@@ -788,7 +782,7 @@ class NativeClientTests(unittest.TestCase):
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
             self.client.cp("a", "b", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "ordinary source"):
-            self.client.map(src_src="source", as_="target")
+            self.client.map(srcs_in="source", as_="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
             self.client.cp("source", cwd="a", root="b", into="target")
         with self.assertRaisesRegex(syq.SyqInvocationError, "mutually exclusive"):
@@ -797,8 +791,10 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", coordinate_at="elsewhere")
         with self.assertRaisesRegex(syq.SyqInvocationError, "dry run"):
             self.client.cp(from_="alpha:src", to="beta:dst", dry_run=True)
-        with self.assertRaisesRegex(syq.SyqInvocationError, "--receipt"):
-            self.client.cp("source", into="target", receipt="full")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--receiver-receipt"):
+            self.client.cp("source", into="target", receiver_receipt="full")
+        with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
+            self.client.cp("source", into="target", peer_auth="agent")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--pscope"):
             self.client.cp(
                 "source", into="target", pscope="scope", rsh="ssh"

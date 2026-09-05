@@ -20,7 +20,7 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
    and restrict deployments to release tags. Keep the default workflow token
    read-only; the workflow grants write permissions only to its release job.
 3. Enable immutable releases, artifact attestations, branch protection for
-   `master`, required `ci` checks, dependency review/Dependabot, secret
+   `master` without required status checks, dependency review/Dependabot, secret
    scanning, and a ruleset that restricts creation, update, and deletion of
    `v*` tags to release maintainers. GitHub's ruleset signature rule applies to
    commits, not annotated tag-object signatures; the release workflow checks
@@ -136,8 +136,11 @@ connection, so enable it only for a trusted release host rather than globally.
 ## Cutting a release
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
-   `Cargo.lock`, then run the normal locked checks to validate it. Update
-   release notes and merge through the protected branch. Peer compatibility is
+   `Cargo.lock`, then run the normal locked checks to validate it. Write the
+   curated introduction and breaking-change notes in
+   `.github/release-notes/v<version>.md`; the release workflow prepends that
+   file to GitHub's generated contributor and change list. Merge the version
+   and release notes through the protected branch. Peer compatibility is
    the immutable release identity, so there is no separate protocol number to
    maintain. Native command changes must also be classified in
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
@@ -259,32 +262,28 @@ as their sole release identity.
 
 ## CI scope
 
-The required `rust`, `sdks`, `linux-arm64`, `macos`, and `conformance` check
-names are stable, but the work behind them differs before and after merge.
-Pull requests run a fast affected-surface gate: Rust changes get formatting,
-clippy, and native unit tests; SDK and rsync-owned changes get their respective
-suites; executable examples in `MAPPINGS.md` get their focused integration
-tests; and repository-tooling changes get the packaging, release, workflow, and
-shell checks. Ordinary native pull requests defer the complete filesystem,
-SDK, conformance, ARM, and macOS suites to `master`. The working agent chooses
-and reports any additional integration tests justified by the change.
+Pull requests do not start automated test or documentation workflows, and
+branch protection does not require test status contexts. The working agent runs
+the proportionate local checks described in `AGENTS.md` and reports exactly
+what was verified. A merge does not wait for GitHub to repeat those checks.
 
-Every native push to `master` runs the complete native, SDK, conformance, ARM,
-and macOS suites. Workflow concurrency cancels an older run when a newer commit
-arrives on the same pull request. Each non-PR run has a unique concurrency
-group, including while it is pending, because a later push may affect a
-different subsystem and therefore cannot safely replace the earlier push's
-selected suites. A release candidate must additionally have successful,
-exact-SHA manual runs of both workflows; release preflight and tag verification
-reject selective stubs as release evidence.
+Every native push to `master` runs the complete native and SDK suites, Linux
+and macOS conformance, Linux ARM64 validation, focused Apple Silicon macOS
+tests, and an Intel macOS compile-and-updater check. The separate macOS workflow
+also runs the complete native and SDK suites on Apple Silicon. Each run has a
+unique concurrency group, including while it is pending, because a later push
+may affect a different subsystem and therefore cannot safely replace the
+earlier push's selected suites. Failures are repaired in follow-up changes; they
+do not retroactively gate unrelated merges. A release candidate must still have
+successful, exact-SHA manual runs of both workflows. Release preflight and tag
+verification require the stable `rust`, `sdks`, `linux-arm64`, `macos`, and
+`conformance` evidence names and reject selective stubs.
 
-The checked-in classifier uses a pull request's merge-base diff rather than
-including unrelated base-branch changes. Documentation-only changes finish
-with small successful required jobs, except for documentation consumed by a
-test or generator. Unknown paths fail safe by selecting every suite. Manual
-workflow runs also select everything. This keeps branch protection and
-release-tag verification attached to stable check names while avoiding the
-same expensive validation on both sides of a merge.
+The checked-in classifier uses each push's exact diff. Documentation-only
+changes select no test jobs unless a document is consumed by a test or
+generator. Unknown paths fail safe by selecting every affected suite. Manual
+workflow runs select everything. Documentation site checks and deployment also
+happen only after a relevant change reaches `master`, or on manual dispatch.
 
 ## macOS signing
 

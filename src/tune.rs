@@ -143,7 +143,7 @@ fn endpoint_key(endpoint: &Endpoint) -> String {
     }
 }
 
-fn transport_key(endpoint: &Endpoint) -> Option<&'static str> {
+fn transport_label(endpoint: &Endpoint) -> Option<&'static str> {
     match endpoint {
         Endpoint::Local { .. } => None,
         Endpoint::Remote(spec) if spec.local_process => None,
@@ -161,13 +161,13 @@ pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
     if !src.is_remote() && !dst.is_remote() {
         return None;
     }
-    let transport = [transport_key(src), transport_key(dst)]
+    let transport = [transport_label(src), transport_label(dst)]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join("+");
     Some(format!(
-        "v1|{}>{}|{transport}",
+        "{}>{}|{transport}",
         endpoint_key(src),
         endpoint_key(dst)
     ))
@@ -185,7 +185,7 @@ fn cache_path() -> Option<PathBuf> {
                 .filter(|path| !path.is_empty())
                 .map(|home| PathBuf::from(home).join(".cache"))
         })
-        .map(|root| root.join("syq/tuning-v1.json"))
+        .map(|root| root.join("syq/tuning.json"))
 }
 
 fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
@@ -261,7 +261,7 @@ pub fn remember(key: &str, connections: usize) {
     };
     if let Err(error) = remember_at(&path, key, connections) {
         if crate::transfer::debug() {
-            eprintln!("syq: tuning cache {}: {error}", path.display());
+            crate::output::diagnostic!("syq: tuning cache {}: {error}", path.display());
         }
     }
 }
@@ -881,7 +881,7 @@ pub fn run(
             break;
         }
 
-        // A same-machine single-file copy starts with one cheap direct-copy
+        // A same-machine single-file copy starts with one cheap kernel copy
         // probe. If the receiver reports a partial or unsupported kernel
         // offload, skip the measurement ramp and restore the ordinary local
         // starting count before userspace ranges become the bottleneck.
@@ -900,7 +900,7 @@ pub fn run(
             last = (meter.bytes(), meter.files());
             sample_start = std::time::Instant::now();
             if crate::transfer::debug() {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: tune: {before} -> {requested} workers (direct copy needs userspace transfer)"
                 );
             }
@@ -921,7 +921,7 @@ pub fn run(
             last = (meter.bytes(), meter.files());
             sample_start = std::time::Instant::now();
             if crate::transfer::debug() {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: tune: {before} -> {active} workers (state {:?})",
                     policy.state
                 );
@@ -961,7 +961,7 @@ pub fn run(
                 last = (meter.bytes(), meter.files());
                 sample_start = std::time::Instant::now();
                 if crate::transfer::debug() {
-                    eprintln!(
+                    crate::output::diagnostic!(
                         "syq: tune: {before} -> {active} workers (candidate ready, state {:?})",
                         policy.state
                     );
@@ -997,7 +997,7 @@ pub fn run(
                 if let Some(score) = sampler.push(rate) {
                     policy.refresh_warming_baseline(score);
                     if crate::transfer::debug() {
-                        eprintln!(
+                        crate::output::diagnostic!(
                             "syq: tune: refreshed {active}-worker baseline to {:.1} MB/s while {} workers warm",
                             score / 1e6,
                             policy.n
@@ -1081,7 +1081,7 @@ pub fn run(
         if policy.n != before {
             sampler.reset();
             if crate::transfer::debug() {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: tune: candidate {before} -> {} workers (measured {:.1} MB/s at {before}, state {:?})",
                     policy.n,
                     score / 1e6,
@@ -1113,7 +1113,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            auto_helper: false,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -1129,6 +1129,7 @@ mod tests {
                 next: Default::default(),
             }))),
             diagnostics: Default::default(),
+            primed_control: Default::default(),
         })
     }
 

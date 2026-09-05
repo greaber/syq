@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the golden automation-v1 fixture streams from real syq runs.
+# Regenerate the golden automation fixture streams from real syq runs.
 #
 # Normalization keeps regeneration deterministic so a diff shows only real
 # API changes — fixture review is API review. Volatile identity fields
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-out="$repo/tests/fixtures/automation-v1"
+out="$repo/tests/fixtures/automation"
 cargo build --quiet --manifest-path "$repo/Cargo.toml"
 syq="$repo/target/debug/syq"
 work="$(mktemp -d)"
@@ -83,7 +83,7 @@ printf 'k' >"$dir/dst/keep.txt"
 printf 'x' >"$dir/dst/extra-1.txt"
 printf 'x' >"$dir/dst/extra-2.txt"
 (cd "$dir" &&
-    "$syq" cp -j1 --prune --max-delete 1 --src-src src --into dst \
+    "$syq" cp -j1 --prune --max-delete 1 --srcs-in src --into dst \
         --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 
@@ -92,7 +92,7 @@ normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 dir="$work/failed"
 mkdir -p "$dir"
 (cd "$dir" &&
-    "$syq" cp -j1 --src-src missing --into dst --results raw.ndjson -q) || true
+    "$syq" cp -j1 --srcs-in missing --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/failed.ndjson"
 
 # rm-success: one directory tree is removed and one explicit selector is
@@ -120,7 +120,7 @@ dir="$work/rm-dry-partial"
 mkdir -p "$dir/tree/blocked"
 chmod 000 "$dir/tree/blocked"
 (cd "$dir" &&
-    "$syq" rm -j1 -n --src-src tree --results raw.ndjson -q) || true
+    "$syq" rm -j1 -n --srcs-in tree --results raw.ndjson -q) || true
 chmod 700 "$dir/tree/blocked"
 normalize <"$dir/raw.ndjson" >"$out/rm-dry-partial.ndjson"
 
@@ -142,4 +142,9 @@ mkdir -p "$dir"
     "$syq" rm -j1 --cwd missing --src victim --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/rm-failed.ndjson"
 
-echo "regenerated $(ls "$out" | wc -l) fixtures in $out"
+fixture_count=0
+for fixture in "$out"/*; do
+    [ -e "$fixture" ] || continue
+    fixture_count=$((fixture_count + 1))
+done
+echo "regenerated $fixture_count fixtures in $out"

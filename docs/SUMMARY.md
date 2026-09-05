@@ -7,13 +7,13 @@
 - [Installing](install.md)
 - [Command reference](reference.md)
 - [Mappings](mappings.md)
-- [Automation results](automation-v1.md)
+- [Automation results](automation.md)
 - [Composability](composability.md)
 
 # Performance
 
 - [Speed](speed.md)
-- [Server tuning](server-tuning.md)
+- [Server setup](server-tuning.md)
 
 # Trust
 
@@ -22,4 +22,4 @@
 
 # Compatibility
 
-- [Rsync compatibility record](rsync-compat.md)
+- [Rsync compatibility](rsync-compat.md)

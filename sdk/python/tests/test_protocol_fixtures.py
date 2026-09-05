@@ -8,7 +8,7 @@ import syq
 from syq.protocol import AutomationDecoder
 
 
-FIXTURES = Path(__file__).resolve().parents[3] / "tests/fixtures/automation-v1"
+FIXTURES = Path(__file__).resolve().parents[3] / "tests/fixtures/automation"
 
 
 @unittest.skipUnless(FIXTURES.is_dir(), "repository automation fixtures unavailable")
@@ -29,7 +29,7 @@ class AutomationFixtureTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in FIXTURES.glob("*.ndjson")},
             set(cases),
-            "classify every committed automation-v1 fixture",
+            "classify every committed automation fixture",
         )
 
         for name, (

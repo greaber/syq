@@ -1,6 +1,6 @@
 //! `--results`: an NDJSON stream of machine-readable operation outcomes for
-//! native cp and rm. Automation schema version 1: every record carries `schema`
-//! (`syq.automation`), `schema_version`, and a monotonic `seq`. The stream
+//! native cp and rm. Every record carries `schema` (`syq.automation`),
+//! `schema_version`, and a monotonic `seq`. The stream
 //! target is a freshly created file (`--results FILE`) or a descriptor the
 //! caller opened (`--results-fd N`); human output is untouched.
 //!
@@ -18,7 +18,7 @@
 //! not reported per operation (dry runs do trace them as `metadata_differs`).
 //!
 //! Attached direct copies through a command-restricted receiver are the one
-//! exception: receipt_v2 emits their stream locally after verification, marks
+//! exception: receipt emits their stream locally after verification, marks
 //! its provenance, omits source-side claims hostB cannot authenticate, and
 //! includes closure-time final-state records.
 
@@ -107,7 +107,7 @@ pub struct TraceRecord<'a> {
     pub reason: &'static str,
 }
 
-pub struct RemovalSelectionRecord<'a> {
+pub struct SelectionResultRecord<'a> {
     pub selector: u64,
     pub path: &'a [u8],
     pub status: &'static str,
@@ -147,7 +147,7 @@ pub struct ResultRecord {
     pub deletions_blocked: Option<u64>,
 }
 
-pub struct RemovalResultRecord {
+pub struct RmResultRecord {
     pub status: &'static str,
     pub exit_code: i32,
     pub dry_run: bool,
@@ -379,7 +379,7 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    pub fn emit_removal_selection(&self, selection: &RemovalSelectionRecord) {
+    pub fn emit_selection_result(&self, selection: &SelectionResultRecord) {
         let mut record = serde_json::json!({
             "type": "selection_result",
             "selector": selection.selector,
@@ -408,7 +408,7 @@ impl ResultsWriter {
         }));
     }
 
-    pub fn emit_removal(&self, removal: &RemovalRecord) {
+    pub fn emit_removal_result(&self, removal: &RemovalRecord) {
         let mut record = serde_json::json!({
             "type": "removal_result",
             "selector": removal.selector,
@@ -562,7 +562,7 @@ impl ResultsWriter {
         self.write_and_seal(Self::copy_result_record("result", result), true);
     }
 
-    pub fn emit_removal_result(&self, result: &RemovalResultRecord) {
+    pub fn emit_rm_result(&self, result: &RmResultRecord) {
         self.write_and_seal(
             serde_json::json!({
                 "type": "result",
@@ -644,7 +644,9 @@ impl ResultsWriter {
 
     fn mark_dead(&self, error: &std::io::Error) {
         if !self.dead.swap(true, Relaxed) {
-            eprintln!("syq: warning: --results stream failed ({error}); further records are lost");
+            crate::output::diagnostic!(
+                "syq: warning: --results stream failed ({error}); further records are lost"
+            );
         }
     }
 }
@@ -664,6 +666,22 @@ fn tagged(path: &[u8]) -> serde_json::Value {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn failed_results_and_stderr_do_not_panic() {
+        if !crate::test_support::with_broken_stderr(
+            "results::tests::failed_results_and_stderr_do_not_panic",
+        ) {
+            return;
+        }
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(reader);
+        let writer = ResultsWriter::new(Box::new(writer));
+        writer.emit_error_classified("first failure", None, None);
+        assert!(writer.is_dead());
+        writer.emit_error_classified("later failure", None, None);
+        assert!(!writer.out.is_poisoned());
+    }
 
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);

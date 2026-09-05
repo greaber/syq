@@ -7,7 +7,7 @@
 //! endpoint selection, and local/remote directory discovery remains in Rust.
 
 use crate::cli::{parse_native_endpoint, NativeEndpoint};
-use crate::conn::{Conn, RemoteSpec, SshMultiplexer};
+use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
 use crate::proto::{CompletionEntry, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CACHE_VERSION: u8 = 1;
-const CACHE_FILE: &str = "completion-endpoints-v1.json";
+const CACHE_FILE: &str = "completion-endpoints.json";
 const CACHE_LOCK: &str = ".completion-endpoints.lock";
 const MAX_CACHED_ENDPOINTS: usize = 100;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024;
@@ -129,20 +128,10 @@ impl CachedEndpoint {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionCache {
-    version: u8,
     endpoints: Vec<CachedEndpoint>,
-}
-
-impl Default for CompletionCache {
-    fn default() -> Self {
-        Self {
-            version: CACHE_VERSION,
-            endpoints: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,7 +181,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-                        eprintln!("syq completion: {error:#}");
+                        crate::output::diagnostic!("syq completion: {error:#}");
                     }
                     Vec::new()
                 }
@@ -212,7 +201,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 }
                 Err(error) => {
                     if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-                        eprintln!("syq completion: {error:#}");
+                        crate::output::diagnostic!("syq completion: {error:#}");
                     }
                     Vec::new()
                 }
@@ -285,7 +274,7 @@ fn run_cache(action: CacheAction) -> Result<()> {
 pub(crate) fn remember_endpoint_best_effort(user: Option<&str>, host: &str, port: Option<u16>) {
     if let Err(error) = remember_endpoint(user, host, port) {
         if std::env::var_os("SYQ_COMPLETION_DEBUG").is_some() {
-            eprintln!("syq completion cache: {error:#}");
+            crate::output::diagnostic!("syq completion cache: {error:#}");
         }
     }
 }
@@ -444,13 +433,6 @@ fn read_cache() -> Result<CompletionCache> {
     file.read_to_end(&mut bytes)?;
     let mut cache: CompletionCache = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse completion cache {}", path.display()))?;
-    if cache.version != CACHE_VERSION {
-        bail!(
-            "unsupported completion cache version {} in {}",
-            cache.version,
-            path.display()
-        );
-    }
     cache.endpoints.truncate(MAX_CACHED_ENDPOINTS);
     Ok(cache)
 }
@@ -666,7 +648,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "rsync",
         "persist",
         "completion",
-        "enrollment",
+        "receiver",
         "--help",
         "--version",
         "--self-update",
@@ -829,11 +811,10 @@ fn native_copy_source_option(option: &[u8]) -> bool {
             | b"--cwd"
             | b"--root"
             | b"--src"
-            | b"--src-src"
+            | b"--srcs-in"
             | b"--src-file"
             | b"--src-dir"
             | b"--srcs"
-            | b"--src-srcs"
             | b"--src-files"
             | b"--src-dirs"
             | b"--mapping"
@@ -858,10 +839,8 @@ fn value_completion(
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" | b"--tos" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
             | b"--as-existing" => Some(ValueCompletion::DestinationPath),
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
@@ -870,22 +849,26 @@ fn value_completion(
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
-            b"--coordinate-at" => Some(ValueCompletion::Enum(&["auto", "src", "dest", "local"])),
+            b"--coordinate-at" => Some(ValueCompletion::Enum(&["auto", "src", "dst", "local"])),
             b"--preserve" => Some(ValueCompletion::Enum(&[
                 "permissions",
                 "ownership",
                 "specials",
             ])),
-            b"--receipt" => Some(ValueCompletion::Enum(&["sizes", "hashed"])),
+            b"--receiver-receipt" => Some(ValueCompletion::Enum(&["sizes", "digests"])),
+            b"--peer-auth" => Some(ValueCompletion::Enum(&[
+                "restricted",
+                "broker",
+                "own-credentials",
+                "full-agent",
+            ])),
             _ => None,
         },
         "rm" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
@@ -893,10 +876,8 @@ fn value_completion(
         },
         "map" => match option {
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--src-src" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-srcs"
-            | b"--src-files" | b"--src-dirs" => {
-                Some(ValueCompletion::SourcePath { apply_base: true })
-            }
+            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
+            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
             b"--as" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1153,16 +1134,31 @@ fn remote_path_candidates(
     let prefix_for_thread = prefix.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = fetch_remote_entries(
+        let connection = connect_completion_endpoint(
             endpoint_for_thread,
             pscope.as_deref(),
             syq_path,
             no_bootstrap,
-            directory_for_thread,
-            root_for_thread,
-            prefix_for_thread,
         );
+        let (result, connection) = match connection {
+            Ok(mut connection) => {
+                let result = list_remote_entries(
+                    &mut connection,
+                    directory_for_thread,
+                    root_for_thread,
+                    prefix_for_thread,
+                );
+                (result, Some(connection))
+            }
+            Err(error) => (Err(error), None),
+        };
+        // Hand the entries back before closing the connection. Closing it
+        // sends Shutdown and then waits for the remote helper's exit status,
+        // a whole network round trip that must not delay the candidates. The
+        // process exits once they are printed; the ssh child finishes on its
+        // own.
         let _ = sender.send(result);
+        drop(connection);
     });
     let entries = receiver
         .recv_timeout(REMOTE_COMPLETION_DEADLINE)
@@ -1175,15 +1171,12 @@ fn remote_path_candidates(
     ))
 }
 
-fn fetch_remote_entries(
+fn connect_completion_endpoint(
     endpoint: NativeEndpoint,
     pscope: Option<&Path>,
     syq_path: Option<String>,
     no_bootstrap: bool,
-    directory: Vec<u8>,
-    confined_root: Option<Vec<u8>>,
-    prefix: Vec<u8>,
-) -> Result<Vec<CompletionEntry>> {
+) -> Result<RemoteConn> {
     let multiplexer = match crate::persistence::scope_for_implicit_ssh(pscope)? {
         Some(scope) => Arc::new(SshMultiplexer::persistent(
             &scope,
@@ -1212,15 +1205,24 @@ fn fetch_remote_entries(
             "ServerAliveCountMax=1".into(),
         ],
         syq_path: syq_path.clone(),
-        auto_helper: syq_path.is_none() && !no_bootstrap,
+        bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer),
         quiet: true,
         tcp: Default::default(),
         diagnostics: Default::default(),
+        primed_control: Default::default(),
     };
-    let mut connection = spec.connect_completion()?;
+    spec.connect_completion()
+}
+
+fn list_remote_entries(
+    connection: &mut RemoteConn,
+    directory: Vec<u8>,
+    confined_root: Option<Vec<u8>>,
+    prefix: Vec<u8>,
+) -> Result<Vec<CompletionEntry>> {
     match connection.call(Request::ListDir {
         directory,
         confined_root,

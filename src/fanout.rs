@@ -561,10 +561,10 @@ fn run_group(
         let _ = ticker.join();
     }
     for notice in notices {
-        eprintln!("syq: fan-out: {notice}");
+        crate::output::diagnostic!("syq: fan-out: {notice}");
     }
     for failure in failures {
-        eprintln!("syq: fan-out: {failure}");
+        crate::output::diagnostic!("syq: fan-out: {failure}");
     }
     let terminals = group.terminal_records();
     if let Some(results) = group.results() {

@@ -2,7 +2,11 @@
 
 This directory tracks what selected upstream rsync tests tell us about SYQ's
 rsync-compatible command surface. It is both a regression suite and a reviewable
-map of compatibility work. It is not an overall compatibility score.
+map of compatibility work. It is not an overall compatibility score: many
+upstream tests exercise unsupported options, rsync's wire protocol, daemon,
+or internal helpers. The [public compatibility guide](../../docs/rsync-compat.md)
+describes user-visible behavior; [LOCAL-TESTS.md](LOCAL-TESTS.md) links its
+claims to local integration tests and records unresolved review questions.
 
 Run it from the repository root:
 
@@ -41,10 +45,14 @@ Markdown, static HTML, and a raw log under `target/rsync-compat/reports/`.
 
 Only the classified runnable subset is executed, not all 351 inventoried
 tests. The 38 runnable upstream test sources currently produce 40 independently
-reported scenarios. A warm non-root Linux run selects 36 scenarios and takes
-about 22 seconds on the development machine; four more apply when run as root. A
-first run also downloads and prepares the pinned rsync checkout and may do a
-cold Rust build. The exact cold time depends mostly on network and Cargo state.
+reported scenarios. A non-root Linux run selects 36 scenarios and a root run
+adds four. A non-root macOS run selects 33 scenarios and a root run adds three;
+the four Linux-only cases depend on setgid-directory inheritance, Linux
+search-only-directory behavior, `/proc` interposition, or
+`fs.protected_regular`. Warm non-root runs take about 22 seconds on Linux and
+27 seconds on macOS on the development machines. A first run also downloads
+and prepares the pinned rsync checkout and may do a cold Rust build. The exact
+cold time depends mostly on network and Cargo state.
 
 ## What upstream's security testing means here
 
@@ -100,17 +108,22 @@ rsync's build prerequisites only on a suite-cache miss. To manage the SYQ build
 separately, use `--no-build-syq --syq-bin PATH`.
 
 The upstream runner gives each test a 300-second deadline by default; override
-it with `--test-timeout SECONDS`. CI uses 120 seconds per test, caps the entire
-job at 30 minutes, and passes `--require-tests` so an accidentally empty Linux
-selection cannot look successful. A local run with no applicable tests still
-writes a valid N/A report.
+it with `--test-timeout SECONDS`. CI uses 120 seconds per test, caps each
+platform job at 30 minutes, and passes `--require-tests` so an accidentally
+empty platform selection cannot look successful. A local run with no applicable
+tests still writes a valid N/A report.
 
 The harness requires Python 3.11 or newer. Preparing a fresh checkout also
-requires Git, a C toolchain, Make, Autoconf, and Automake.
+requires Git, a C toolchain, Make, Autoconf, and Automake. The pinned helper
+build disables rsync's optional OpenSSL integration so a locally installed,
+keg-only OpenSSL cannot make macOS configuration depend on undeclared flags.
 
 ## Inventory, observations, and product positions
 
-`inventory.tsv` names every test at the pinned commit. Updating the pin without
+`inventory.tsv` names every test at the pinned commit. At the current pin,
+all 351 are classified: 38 runnable sources, 130 unsupported user features,
+and 183 tests of rsync internals, protocol, daemon, or restricted wrappers.
+None are unassessed. Updating the pin without
 classifying every added or removed test is an error. Its classifications are:
 
 - `conformance`: a relevant upstream test used without modification.

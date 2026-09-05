@@ -3,7 +3,7 @@
 from importlib.metadata import version as distribution_version
 
 from .async_client import AsyncClient, AsyncMapStream
-from .bootstrap import PINNED_SYQ_VERSION, SyqInstallError, managed_executable
+from .managed import PINNED_SYQ_VERSION, SyqInstallError, managed_executable
 from .client import Client, MapStream, Result, run, version
 from .errors import (
     SyqInvocationError,

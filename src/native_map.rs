@@ -4,7 +4,8 @@
 //! Emission is local and read-only, and destination-independent by design:
 //! `dst` values are relative to the target container, so the same manifest
 //! can be executed against any target with `syq cp --mapping`. Only `--as`
-//! changes emitted values, by renaming the single selected root. Names must
+//! changes emitted values, by placing the single selected root at a chosen
+//! container-relative path. Names must
 //! be valid UTF-8; a non-UTF-8 name aborts emission with an error so that
 //! text transforms downstream cannot silently corrupt a base64 value.
 
@@ -79,9 +80,7 @@ pub fn run(args: &Args) -> Result<i32> {
                 return Ok(Vec::new());
             }
             let destination = match (args.placement, &args.native_map_target) {
-                (Placement::As, Some(target)) => native_basename(target)
-                    .ok_or_else(|| anyhow!("--as destination has no basename"))?
-                    .to_vec(),
+                (Placement::As, Some(target)) => target.clone(),
                 _ => native_basename(&location.path)
                     .expect("parse validated that named selectors have a basename")
                     .to_vec(),
@@ -217,7 +216,7 @@ fn pin_selection(
         PinnedPath::Leaf(leaf) => {
             if location.selection == SourceSelection::Contents && leaf.metadata().is_symlink() {
                 bail!(
-                    "--src-src {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+                    "--srcs-in {} encounters a last-component symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
                     display(&location.path)
                 );
             }
@@ -298,7 +297,7 @@ fn emit_selection(
     }
     if contents {
         if root_entry.kind != Kind::Dir {
-            bail!("--src-src {} is not a directory", display(&location.path));
+            bail!("--srcs-in {} is not a directory", display(&location.path));
         }
     } else {
         crate::transfer::validate_native_source_type(

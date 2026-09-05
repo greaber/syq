@@ -176,7 +176,7 @@ pub fn after_success(quiet: bool) {
     if release.version <= current {
         return;
     }
-    eprintln!(
+    crate::output::diagnostic!(
         "syq: update {} is available; run `syq --self-update`",
         release.version
     );
@@ -249,7 +249,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
                 });
             }
             Err(error) => {
-                eprintln!(
+                crate::output::diagnostic!(
                     "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
                 );
                 fs::remove_file(&cache_path).with_context(|| {

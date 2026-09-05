@@ -1,7 +1,7 @@
 //! User-managed OpenSSH control-connection persistence.
 //!
 //! A durable preference selects a well-known per-user runtime scope. Scripts
-//! can instead create an isolated scope and pass its path back with
+//! can instead create an ephemeral scope and pass its path back with
 //! `--pscope`, avoiding shared configuration state.
 
 use crate::cli::Args;
@@ -17,10 +17,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CONFIG_VERSION: u8 = 1;
-const CONFIG_FILE: &str = "persistence-v1.json";
-const SCOPE_MARKER: &str = ".syq-persistence-v1";
-const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope v1\n";
+const CONFIG_FILE: &str = "persistence.json";
+const SCOPE_MARKER: &str = ".syq-persistence";
+const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,19 +36,19 @@ struct PersistCommand {
 enum PersistAction {
     /// Enable reusable SSH control connections
     On {
-        /// Create an isolated scope and print its path instead of changing the user setting
+        /// Create an ephemeral scope and print its path instead of changing the user setting
         #[arg(long)]
         ephemeral: bool,
     },
     /// Disable persistence and close its live SSH control connections
     Off {
-        /// Operate on this isolated persistence scope instead of the user setting
+        /// Operate on this ephemeral persistence scope instead of the user setting
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
     },
     /// Show the configured policy and live SSH control connections
     Status {
-        /// Inspect this isolated persistence scope instead of the user setting
+        /// Inspect this ephemeral persistence scope instead of the user setting
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
     },
@@ -58,14 +57,12 @@ enum PersistAction {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistenceConfig {
-    version: u8,
     enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EndpointRecord {
-    version: u8,
     pub(crate) user: Option<String>,
     pub(crate) host: String,
     pub(crate) port: Option<u16>,
@@ -74,7 +71,6 @@ pub(crate) struct EndpointRecord {
 impl EndpointRecord {
     fn new(user: Option<&str>, host: &str, port: Option<u16>) -> Self {
         Self {
-            version: CONFIG_VERSION,
             user: user.map(str::to_owned),
             host: host.to_owned(),
             port,
@@ -348,13 +344,6 @@ fn read_global_config() -> Result<Option<PersistenceConfig>> {
     file.read_to_end(&mut bytes)?;
     let config: PersistenceConfig = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse persistence configuration {}", path.display()))?;
-    if config.version != CONFIG_VERSION {
-        bail!(
-            "unsupported persistence configuration version {} in {}",
-            config.version,
-            path.display()
-        );
-    }
     Ok(Some(config))
 }
 
@@ -370,13 +359,7 @@ fn write_global_config(enabled: bool) -> Result<()> {
         .with_context(|| format!("create configuration directory {}", parent.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary configuration in {}", parent.display()))?;
-    serde_json::to_writer_pretty(
-        &mut temporary,
-        &PersistenceConfig {
-            version: CONFIG_VERSION,
-            enabled,
-        },
-    )?;
+    serde_json::to_writer_pretty(&mut temporary, &PersistenceConfig { enabled })?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary
@@ -469,7 +452,7 @@ fn create_marker(scope: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_scope(scope: &Path) -> Result<()> {
+pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
     validate_openssh_control_path(scope)?;
     secure_directory(scope, false, false)?;
     let marker_path = scope.join(SCOPE_MARKER);
@@ -580,13 +563,6 @@ fn read_endpoint_record(path: &Path) -> Result<EndpointRecord> {
     }
     let record: EndpointRecord = serde_json::from_reader(file)
         .with_context(|| format!("parse endpoint record {}", path.display()))?;
-    if record.version != CONFIG_VERSION {
-        bail!(
-            "unsupported endpoint record version {} in {}",
-            record.version,
-            path.display()
-        );
-    }
     Ok(record)
 }
 
@@ -639,12 +615,18 @@ fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
     }
     println!("connections: {}", records.len());
     for (key, record) in records {
-        let state = if socket_is_live(&scope.join(key)) {
+        let control = scope.join(&key);
+        let state = if socket_is_live(&control) {
             "live"
         } else {
             "inactive"
         };
-        println!("  {}  {state}", record.label());
+        let pool = if crate::session_pool::is_running(&control) {
+            ", session pool"
+        } else {
+            ""
+        };
+        println!("  {}  {state}{pool}", record.label());
     }
     Ok(())
 }
@@ -664,6 +646,13 @@ fn close_scope(scope: &Path) -> Result<()> {
                 continue;
             }
         }
+        if let Some(owner) = crate::session_pool::owned_name(name.as_bytes())
+            .and_then(|owner| std::str::from_utf8(owner).ok())
+        {
+            if valid_endpoint_key(owner) && record_keys.contains(owner) {
+                continue;
+            }
+        }
         bail!(
             "refusing to remove persistence scope {} because it contains unrecognized entry {:?}",
             scope.display(),
@@ -673,6 +662,8 @@ fn close_scope(scope: &Path) -> Result<()> {
 
     for (key, record) in records {
         let socket = scope.join(&key);
+        // The pool holds live sessions on the master, so it goes first.
+        crate::session_pool::stop(&socket)?;
         if socket_is_live(&socket) {
             close_master(&socket, &record)?;
         }

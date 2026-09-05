@@ -11,7 +11,7 @@ seed_helper() {
             exit 1
             ;;
     esac
-    helper="/home/syq/.cache/syq/helpers/${identity}-release-v1/${target}/syq"
+    helper="/home/syq/.cache/syq/helpers/${identity}-release/${target}/syq"
     install -D -m 0755 -o syq -g syq /usr/local/bin/syq "$helper"
 }
 

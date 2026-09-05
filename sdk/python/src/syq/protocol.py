@@ -220,7 +220,7 @@ def _destination_index(record: dict[str, Any], run: RunEvent) -> int | None:
 
 
 class AutomationDecoder:
-    """Validate one complete automation-v1 typed-operation stream incrementally."""
+    """Validate one complete automation typed-operation stream incrementally."""
 
     def __init__(
         self,
@@ -624,7 +624,7 @@ class AutomationDecoder:
             if not isinstance(state, dict):
                 raise SyqProtocolError("final_state record has no object")
             variant = _enum(state, "state", FinalObjectState)
-            # Each state admits exactly its own fields (spec: automation v1).
+            # Each state admits exactly its own fields (spec: automation results).
             allowed, required = {
                 FinalObjectState.PRESENT: (
                     {

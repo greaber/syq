@@ -1,8 +1,8 @@
 name: macOS suite
 
-# The complete native test suite, clippy, and the release shell suites on
-# macOS. Pull-request CI runs a narrow macOS job in ci.yml; this cumulative
-# run happens after every merge to master and on demand.
+# The complete native and SDK test suites, clippy, and release shell suites on
+# macOS. Automated validation runs after merges to master and on demand, not
+# on pull requests.
 on:
   push:
     branches: [master]
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   suite:
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,7 +39,9 @@ jobs:
           python-version: "3.10"
       - name: Install pinned Python tooling
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
-      - name: Test Python SDK against the candidate executable
+      - name: Use Homebrew OpenSSL for Ed25519 signing
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+      - name: Test and reproducibly package Python SDK
         env:
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
@@ -48,9 +50,45 @@ jobs:
         run: |
           SYQ_CANDIDATE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           export SYQ_CANDIDATE_VERSION
+          scripts/test-python-sdk-release-tools.sh
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
-      - name: Use Homebrew OpenSSL for Ed25519 signing
-        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
+            uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
+            python scripts/normalize-python-sdist.py \
+              --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
+            sleep 2
+          done
+          for artifact in target/sdk-python-dist-a/*; do
+            name=${artifact##*/}
+            cmp "$artifact" "target/sdk-python-dist-b/$name"
+          done
+          set -- target/sdk-python-dist-a/syq-*-py3-none-any.whl
+          test "$#" -eq 1 && test -f "$1"
+          env -u PYTHONPATH uv run --isolated --python 3.10 \
+            --with "$1" \
+            python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.x"
+          package-manager-cache: false
+      - name: Test and package JavaScript SDK
+        working-directory: sdk/js
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          npm pack --dry-run
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Format, vet, and test Go SDK
+        working-directory: sdk/go
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
       - name: Release shell suites
         run: |
           status=0
@@ -58,7 +96,6 @@ jobs:
             scripts/test-release-tools.sh \
             scripts/test-release-orchestration.sh \
             scripts/test-secret-tools.sh \
-            scripts/test-python-sdk-release-tools.sh \
             scripts/test-installer.sh \
             scripts/test-homebrew-formula.sh
           do

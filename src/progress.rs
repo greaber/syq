@@ -25,10 +25,10 @@ pub struct Progress {
     /// `bytes_done` back, but retransmitting the same range is not fresh useful
     /// throughput and cannot advance this meter until progress passes the mark.
     tuning_high_water: AtomicU64,
-    pub bytes_skipped: AtomicU64,
+    pub bytes_unchanged: AtomicU64,
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
-    pub files_skipped: AtomicU64,
+    pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
     /// symlinks without -l, ...); neither "transferred" nor "unchanged".
     pub files_excluded: AtomicU64,
@@ -46,8 +46,8 @@ pub struct Progress {
     pub deletions_blocked: AtomicU64,
     /// Settled creations, mirrored here (like the deletion counters) so a
     /// fatal-error terminal record reports what the run actually did.
-    pub dirs_created: AtomicU64,
-    pub links_created: AtomicU64,
+    pub directories_created: AtomicU64,
+    pub symlinks_created: AtomicU64,
     pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
@@ -72,10 +72,10 @@ struct TermState {
 pub(crate) struct ProgressSnapshot {
     bytes_done: u64,
     bytes_total: u64,
-    bytes_skipped: u64,
+    bytes_unchanged: u64,
     files_done: u64,
     files_total: u64,
-    files_skipped: u64,
+    files_unchanged: u64,
     files_excluded: u64,
     scanned: u64,
     scan_done: bool,
@@ -95,10 +95,10 @@ impl ProgressSnapshot {
             destination_index,
             bytes_done: self.bytes_done,
             bytes_total: self.bytes_total,
-            bytes_unchanged: self.bytes_skipped,
+            bytes_unchanged: self.bytes_unchanged,
             files_done: self.files_done,
             files_total: self.files_total,
-            files_unchanged: self.files_skipped,
+            files_unchanged: self.files_unchanged,
             files_excluded: self.files_excluded,
             scanned: self.scanned,
             scan_done: self.scan_done,
@@ -123,10 +123,10 @@ impl Progress {
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             tuning_high_water: AtomicU64::new(0),
-            bytes_skipped: AtomicU64::new(0),
+            bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
-            files_skipped: AtomicU64::new(0),
+            files_unchanged: AtomicU64::new(0),
             files_excluded: AtomicU64::new(0),
             paths_ignored: AtomicU64::new(0),
             scanned: AtomicU64::new(0),
@@ -135,8 +135,8 @@ impl Progress {
             deletions_planned: AtomicU64::new(0),
             deletions_completed: AtomicU64::new(0),
             deletions_blocked: AtomicU64::new(0),
-            dirs_created: AtomicU64::new(0),
-            links_created: AtomicU64::new(0),
+            directories_created: AtomicU64::new(0),
+            symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
@@ -185,14 +185,14 @@ impl Progress {
             exit_code: 1,
             dry_run,
             files_transferred: self.files_done.load(Relaxed),
-            files_unchanged: self.files_skipped.load(Relaxed),
+            files_unchanged: self.files_unchanged.load(Relaxed),
             files_excluded: self.files_excluded.load(Relaxed),
-            directories_created: self.dirs_created.load(Relaxed),
-            symlinks_created: self.links_created.load(Relaxed),
+            directories_created: self.directories_created.load(Relaxed),
+            symlinks_created: self.symlinks_created.load(Relaxed),
             specials_created: self.specials_created.load(Relaxed),
             errors: self.errors.load(Relaxed).saturating_add(extra_errors),
             bytes_transferred: self.bytes_done.load(Relaxed),
-            bytes_unchanged: self.bytes_skipped.load(Relaxed),
+            bytes_unchanged: self.bytes_unchanged.load(Relaxed),
             elapsed_ms: self.start.elapsed().as_millis() as u64,
             deletions_planned: prune.then(|| self.deletions_planned.load(Relaxed)),
             deletions_completed: prune.then(|| self.deletions_completed.load(Relaxed)),
@@ -216,12 +216,23 @@ impl Progress {
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
         let group = self.fanout_group.get().and_then(std::sync::Weak::upgrade);
-        let _group_output = group.as_ref().map(|group| group.lock_human_output());
-        let mut term = self.term.lock().unwrap();
-        self.erase(&mut term);
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+        let mut group_output = group.as_ref().map(|group| group.lock_human_output());
+        let mut term = Some(self.term.lock().unwrap());
+        self.erase(term.as_mut().unwrap());
+        // A redirected stdout cannot disturb the terminal display. Let the
+        // ticker keep running while a slow pipe blocks this printing worker.
+        if !std::io::stdout().is_terminal() {
+            drop(term.take());
+            drop(group_output.take());
+        }
+        let result = {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{line}").and_then(|()| out.flush())
+        };
+        drop(term);
+        if let Err(error) = result {
+            crate::output::warn_stdout(&error);
+        }
     }
 
     /// Print a line to stderr (errors and warnings), keeping the progress area intact.
@@ -230,9 +241,7 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut t = self.term.lock().unwrap();
         self.erase(&mut t);
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{line}");
-        let _ = err.flush();
+        crate::output::diagnostic!("{line}");
     }
 
     pub fn error(&self, line: &str) {
@@ -257,10 +266,8 @@ impl Progress {
         let _group_output = group.as_ref().map(|group| group.lock_human_output());
         let mut term = self.term.lock().unwrap();
         self.erase(&mut term);
-        let mut err = std::io::stderr().lock();
         if self.json {
-            let _ = writeln!(
-                err,
+            crate::output::diagnostic!(
                 "{}",
                 serde_json::json!({
                     "type": "warning",
@@ -270,14 +277,13 @@ impl Progress {
                 })
             );
         } else {
-            let _ = writeln!(err, "syq: warning: {message}");
+            crate::output::diagnostic!("syq: warning: {message}");
         }
-        let _ = err.flush();
     }
 
     fn erase(&self, t: &mut TermState) {
         if t.lines_drawn > 0 {
-            eprint!("\r\x1b[{}A\x1b[J", t.lines_drawn);
+            let _ = write!(std::io::stderr().lock(), "\r\x1b[{}A\x1b[J", t.lines_drawn);
             t.lines_drawn = 0;
         }
     }
@@ -311,7 +317,7 @@ impl Progress {
         let total = self.bytes_total.load(Relaxed);
         let fdone = self.files_done.load(Relaxed);
         let ftotal = self.files_total.load(Relaxed);
-        let skipped = self.bytes_skipped.load(Relaxed);
+        let skipped = self.bytes_unchanged.load(Relaxed);
         let scan_done = self.scan_done.load(Relaxed);
         let remaining = total.saturating_sub(done);
         let eta = if rate > 0.0 && scan_done {
@@ -322,10 +328,10 @@ impl Progress {
         ProgressSnapshot {
             bytes_done: done,
             bytes_total: total,
-            bytes_skipped: skipped,
+            bytes_unchanged: skipped,
             files_done: fdone,
             files_total: ftotal,
-            files_skipped: self.files_skipped.load(Relaxed),
+            files_unchanged: self.files_unchanged.load(Relaxed),
             files_excluded: self.files_excluded.load(Relaxed),
             scanned: self.scanned.load(Relaxed),
             scan_done,
@@ -442,10 +448,10 @@ pub(crate) fn progress_json(
     struct Record<'a> {
         bytes_done: u64,
         bytes_total: u64,
-        bytes_skipped: u64,
+        bytes_unchanged: u64,
         files_done: u64,
         files_total: u64,
-        files_skipped: u64,
+        files_unchanged: u64,
         files_excluded: u64,
         scanned: u64,
         scan_done: bool,
@@ -461,10 +467,10 @@ pub(crate) fn progress_json(
     serde_json::to_string(&Record {
         bytes_done: snapshot.bytes_done,
         bytes_total: snapshot.bytes_total,
-        bytes_skipped: snapshot.bytes_skipped,
+        bytes_unchanged: snapshot.bytes_unchanged,
         files_done: snapshot.files_done,
         files_total: snapshot.files_total,
-        files_skipped: snapshot.files_skipped,
+        files_unchanged: snapshot.files_unchanged,
         files_excluded: snapshot.files_excluded,
         scanned: snapshot.scanned,
         scan_done: snapshot.scan_done,
@@ -506,8 +512,11 @@ pub(crate) fn progress_line(snapshot: &ProgressSnapshot) -> String {
     if snapshot.active_workers > 0 {
         line.push_str(&format!("  {} conn", snapshot.active_workers));
     }
-    if snapshot.bytes_skipped > 0 {
-        line.push_str(&format!("  (unchanged {})", human(snapshot.bytes_skipped)));
+    if snapshot.bytes_unchanged > 0 {
+        line.push_str(&format!(
+            "  (unchanged {})",
+            human(snapshot.bytes_unchanged)
+        ));
     }
     if !snapshot.scan_done {
         line.push_str(&format!("  scanning: {} entries", snapshot.scanned));
@@ -626,10 +635,10 @@ mod tests {
         let snapshot = ProgressSnapshot {
             bytes_done: 1,
             bytes_total: 2,
-            bytes_skipped: 3,
+            bytes_unchanged: 3,
             files_done: 4,
             files_total: 5,
-            files_skipped: 6,
+            files_unchanged: 6,
             files_excluded: 7,
             scanned: 8,
             scan_done: true,
@@ -642,7 +651,7 @@ mod tests {
 
         assert_eq!(
             progress_json(&snapshot, None, None),
-            r#"{"bytes_done":1,"bytes_total":2,"bytes_skipped":3,"files_done":4,"files_total":5,"files_skipped":6,"files_excluded":7,"scanned":8,"scan_done":true,"rate":10,"eta":12,"elapsed":1.2}"#
+            r#"{"bytes_done":1,"bytes_total":2,"bytes_unchanged":3,"files_done":4,"files_total":5,"files_unchanged":6,"files_excluded":7,"scanned":8,"scan_done":true,"rate":10,"eta":12,"elapsed":1.2}"#
         );
     }
 }

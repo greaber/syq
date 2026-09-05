@@ -79,7 +79,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
             (mapping_source / "mapped.txt").write_bytes(b"mapped")
             mapping_alias = root / "mapping-source-link"
             mapping_alias.symlink_to(mapping_source, target_is_directory=True)
-            with client.map(src_src=mapping_alias.name, follow_src=True) as mapping:
+            with client.map(srcs_in=mapping_alias.name, follow_src=True) as mapping:
                 entries = list(mapping)
             self.assertEqual(entries[0].src, syq.RelativePath("mapped.txt"))
             physical_temp = root / "physical-temp"
@@ -118,7 +118,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
             wrong_selected.mkdir()
             (wrong_selected / "chosen.txt").write_bytes(b"wrong")
             with client.map(
-                src_src="link/../component-selected",
+                srcs_in="link/../component-selected",
                 cwd=component_base.name,
                 follow_src=True,
             ) as component_mapping:
@@ -158,7 +158,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
             ignore_rules = root / "ignore.rules"
             ignore_rules.write_text("*.tmp\n", encoding="utf-8")
             ordered = client.cp(
-                src_src=ignore_source.name,
+                srcs_in=ignore_source.name,
                 into="ignore-target",
                 ignore=[syq.IgnoreFrom(ignore_rules.name), "!keep.tmp"],
             )
@@ -174,7 +174,7 @@ class CandidateCompatibilityTests(unittest.TestCase):
             (prune_source / "keep").write_bytes(b"keep")
             (prune_target / "extra").write_bytes(b"extra")
             pruned = client.cp(
-                src_src=prune_source.name,
+                srcs_in=prune_source.name,
                 into_existing=prune_target.name,
                 prune=True,
                 max_delete=1,
@@ -322,7 +322,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.version(), EXPECTED_VERSION)
             saved_results = io.BytesIO()
             preview = await client.cp(
-                src_src="source",
+                srcs_in="source",
                 into="destination",
                 dry_run=True,
                 results=saved_results,
@@ -343,7 +343,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             def create_through_alias(**kwargs):
                 return named_temporary_file(dir=temporary_alias, **kwargs)
 
-            async with client.map(src_src="source") as mapping:
+            async with client.map(srcs_in="source") as mapping:
                 with mock.patch(
                     "syq.async_client.tempfile.NamedTemporaryFile",
                     side_effect=create_through_alias,
@@ -356,7 +356,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
             (root / "destination" / "extra").write_bytes(b"remove")
             pruned = await client.cp(
-                src_src="source",
+                srcs_in="source",
                 into_existing="destination",
                 prune=True,
                 max_delete=1,

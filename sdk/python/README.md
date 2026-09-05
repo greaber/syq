@@ -13,8 +13,8 @@ Installing the package does not install syq itself. The first default call that
 needs syq downloads the matching syq release if it is not
 already cached, checks it against the signed release manifest, and uses that
 managed binary for subsequent default calls.
-The Python package and its managed syq executable share one version: package `0.1.8`
-manages syq `0.1.8`.
+The Python package and its managed syq executable share one version: package `0.2.0`
+manages syq `0.2.0`.
 syq always runs as a subprocess with an argument list, never through a shell.
 
 ```python
@@ -30,7 +30,7 @@ print(plan.files_transferred, plan.bytes_transferred)
 replicated = syq.cp("project", tos=["server-a", "server-b"], into="/backup")
 ```
 
-The typed API validates syq's complete automation-v1 stream and its agreement
+The typed API validates syq's complete automation results stream and its agreement
 with the process status. Dry and live calls return the same `CpResult` type;
 dry runs report planned mutation totals and emit `TraceEvent` records:
 
@@ -38,7 +38,7 @@ dry runs report planned mutation totals and emit `TraceEvent` records:
 client = syq.Client(process_cwd="/srv/jobs")
 
 preview = client.cp(
-    src_src="build",
+    srcs_in="build",
     to="server",
     into_existing="/srv/app",
     prune=True,
@@ -60,11 +60,12 @@ copy mutations only.
 
 Remote-copy controls use the same names with underscores, including `coordinate_at`,
 `rsh`, `pscope`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, and the native agent-forwarding policy flags. `detach` stays
+`tcp_congestion`, and `peer_auth`. `detach` stays
 on raw `run()` because a detached command cannot return typed attached results.
 `pscope` is also available on typed `rm`. Direct remote-to-remote copies can
-request native receiver receipt detail with `receipt="sizes"` or
-`receipt="hashed"`.
+lower the enrolled receiver's entry and byte ceilings with
+`receiver_max_entries=` and `receiver_max_bytes=`, and can request receipt
+detail with `receiver_receipt="sizes"` or `receiver_receipt="digests"`.
 Ignore rules retain native ordering when interleaved by using
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`; `ignore_from=` remains the
 simple form when every file follows the inline patterns.
@@ -130,7 +131,7 @@ transform cannot launch a copy with only a valid prefix:
 ```python
 from dataclasses import replace
 
-with syq.map(src_src="photos") as mapping:
+with syq.map(srcs_in="photos") as mapping:
     entries = (
         replace(entry, dst=syq.RelativePath("archive") / entry.dst)
         for entry in mapping
@@ -141,7 +142,7 @@ with syq.map(src_src="photos") as mapping:
 The async mapping stream is lazy and uses an async context manager:
 
 ```python
-async with client.map(src_src="photos") as mapping:
+async with client.map(srcs_in="photos") as mapping:
     result = await client.cp(
         mapping=mapping,
         cwd=mapping.cwd,
@@ -160,8 +161,8 @@ pin. During that development interval, use `Client(executable=...)` or
 updates the immutable pin only after candidate conformance tests pass.
 
 The managed executable is stored below
-`$XDG_CACHE_HOME/syq/sdk/python/v0.1.8/` or, when `XDG_CACHE_HOME` is not an
-absolute path, `~/.cache/syq/sdk/python/v0.1.8/`. The SDK checks the complete
+`$XDG_CACHE_HOME/syq/sdk/python/v0.2.0/` or, when `XDG_CACHE_HOME` is not an
+absolute path, `~/.cache/syq/sdk/python/v0.2.0/`. The SDK checks the complete
 cached binary against its embedded release manifest before every use. A corrupt
 or missing cache entry is replaced atomically with a freshly downloaded,
 verified binary.

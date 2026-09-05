@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/greaber/syq/blob/master/schemas/automation-v1.schema.json",
-  "title": "syq automation results stream, schema version 1",
-  "description": "One record per NDJSON line of a native `syq cp --results` or `syq rm --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation-v1.md.",
+  "$id": "https://github.com/greaber/syq/blob/master/schemas/automation.schema.json",
+  "title": "syq automation results stream",
+  "description": "One record per NDJSON line of a native `syq cp --results` or `syq rm --results` stream. This schema is strict (additionalProperties: false) so that any change to syq's output shape fails the repository's validation tests and gets reviewed as an API change; consumers should instead ignore unknown record types and unknown optional fields, per docs/automation.md.",
   "oneOf": [
     {
       "$ref": "#/$defs/run"
