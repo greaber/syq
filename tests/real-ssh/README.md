@@ -77,3 +77,8 @@ successful default-profile validation for the complete clean tree, reusable
 across an identical-tree merge. See `RELEASING.md` for the evidence rules.
 A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
+
+The suite also runs the standalone interactive benchmark in noninteractive
+push and pull modes, with both synthetic workloads and scratch paths containing
+spaces and quotes. These are correctness and cleanup checks using the lab's
+debug binary, not performance measurements.

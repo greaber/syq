@@ -431,3 +431,19 @@ if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/n
 fi
 
 printf 'real-SSH smoke suite passed\n'
+
+# Exercise the user-facing script against real remote rsync and syq helpers.
+# Quoted scratch names must survive both SSH and rsync's remote argument parsing.
+benchmark_parent="$home/benchmark scratch's"
+mkdir "$benchmark_parent"
+ssh destination "mkdir -p \"/tmp/benchmark scratch's\""
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload both --size quick \
+        --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
+done
+test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
+ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
+rmdir "$benchmark_parent"
+ssh destination "rmdir \"/tmp/benchmark scratch's\""
+echo 'interactive benchmark push/pull passed'

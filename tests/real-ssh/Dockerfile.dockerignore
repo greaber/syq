@@ -12,3 +12,6 @@
 !tests/real-ssh/scenarios.sh
 !tests/real-ssh/ssh-wrapper.sh
 !tests/real-ssh/sshd_config
+
+!scripts/
+!scripts/try-benchmark.sh
