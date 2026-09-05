@@ -40,8 +40,10 @@ An approved copy may create files and overwrite matching files within its
 approved scopes. Standard directory recursion, symlinks, modification times,
 filters, hashing, and staged publication use the same copy engine as other
 syq copies. `--preserve=permissions` requests permission preservation as well.
-Ownership, special-file preservation, `--inplace`, mappings, and `--min-size`
-are not accepted by named destinations.
+`--verify-only`, `--ignore-existing`, and `--existing` keep their usual meanings.
+Ownership, special-file preservation, `--inplace`, `--update`, mappings, and
+`--min-size` are not accepted by named destinations. The receiver cannot
+independently enforce `--update`, which relies on source-reported timestamps.
 
 To permit copies automatically, including overwrites:
 

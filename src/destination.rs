@@ -564,6 +564,7 @@ struct Prompt {
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
+    requester: String,
     root: PathBuf,
     secret: String,
     max_bytes: u64,
@@ -611,9 +612,29 @@ impl Receiver {
                 let (authority, mut approved) =
                     crate::restricted::named_authority(&self.root, request.clone())?;
                 if matches!(self.approval, Approval::Ask) {
+                    let permission = if request.copy.options.dry_run {
+                        "preview only; no changes"
+                    } else if request.copy.options.verify_only {
+                        "compare contents only; no changes"
+                    } else {
+                        match request.copy.policy.existing {
+                            crate::delegation::ExistingDestinationPolicy::Replace => {
+                                "may create and overwrite matching entries"
+                            }
+                            crate::delegation::ExistingDestinationPolicy::Skip => {
+                                "keep existing entries; may create new entries"
+                            }
+                            crate::delegation::ExistingDestinationPolicy::MustExist => {
+                                "may update existing entries only"
+                            }
+                            crate::delegation::ExistingDestinationPolicy::UpdateIfOlder => {
+                                unreachable!("validated receiver policy")
+                            }
+                        }
+                    };
                     let description = format!(
-                        "Copy request to {:?}\nAuthority: create/overwrite within {} checked scope(s); deletion ceiling {} entries.\nLimits: {} bytes, {} entries. Preserve permissions: {}.\nSource contents and file sizes have not been inspected by this laptop.",
-                        String::from_utf8_lossy(&request.copy.destination), request.copy.mutation_scopes.len(), request.copy.limits.max_deletions, request.copy.limits.max_total_bytes, request.copy.limits.max_entries, request.copy.options.preserve_permissions,
+                        "Copy request from {:?}\nDestination: {:?}\nPermission: {permission}. Deletion ceiling: {} entries.\nLimits: {} bytes, {} entries. Preserve permissions: {}.\nSource contents and file sizes have not been inspected by this laptop.",
+                        self.requester, String::from_utf8_lossy(&request.copy.destination), request.copy.limits.max_deletions, request.copy.limits.max_total_bytes, request.copy.limits.max_entries, request.copy.options.preserve_permissions,
                     );
                     let (decision, reply) = mpsc::sync_channel(1);
                     let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -769,6 +790,7 @@ fn receive(config: Receive) -> Result<i32> {
     let (prompts, requests) = mpsc::sync_channel(1);
     let secret = receiving_identity(&config, &root)?;
     let receiver = Arc::new(Receiver {
+        requester: config.via.clone(),
         root,
         secret,
         max_bytes,
@@ -1177,6 +1199,7 @@ mod tests {
     ) {
         let (prompts, requests) = mpsc::sync_channel(1);
         let receiver = Arc::new(Receiver {
+            requester: "test-server".into(),
             root: root.into(),
             secret: random_token().unwrap(),
             max_bytes: 10_000_000,

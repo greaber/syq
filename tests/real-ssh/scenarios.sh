@@ -143,6 +143,8 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
     } | LC_ALL=C sort
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
+ssh source 'syq cp --verify-only --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'syq cp --ignore-existing /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
@@ -167,14 +169,19 @@ fi
 ssh source 'syq destination wait laptop --timeout 5'
 
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
-ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=6 status=none'
-timeout 30 ssh source 'syq cp --bwlimit 512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
+source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=4 status=none | sha256sum')
+timeout 45 ssh source 'syq cp --bwlimit 512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
-deadline=$(($(date +%s) + 15))
+deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
 while :; do
     partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)
-    if [ "$partial_count" -eq 1 ]; then break; fi
+    if [ "$partial_count" -eq 1 ]; then
+        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*')
+        partial_prefix=$(dd if="$partial" bs=1M count=4 status=none | sha256sum)
+        if [ "$partial_prefix" = "$source_prefix" ]; then break; fi
+    fi
     now=$(date +%s)
     if [ "$now" -ge "$deadline" ]; then
         echo "named partial readiness timed out: partial_count=$partial_count" >&2
@@ -186,8 +193,7 @@ while :; do
     fi
     sleep 0.1
 done
-# Let the rate-limited transfer write data before severing its transport.
-sleep 2
+# One complete 4 MiB prefix is now present and eligible for resume checks.
 # Only kill the receiver's owned SSH child; the tracing wrapper is its parent.
 receive_wrapper=$(pgrep -P "$receive_pid")
 pkill -KILL -P "$receive_wrapper" -x ssh
