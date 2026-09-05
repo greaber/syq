@@ -8705,6 +8705,29 @@ fn small_push_refusals_and_failures_match_the_engine() {
         stderr_of(&side)
     );
 
+    // Retry without the staging fault: the fallback engine must complete
+    // the remaining file and consume its sidecar, preserving prior successes.
+    for dir in ["stage-fast", "stage-engine"] {
+        let (retried, records) = push(
+            &format!("{dir}-retry"),
+            false,
+            &[],
+            &[],
+            &sources,
+            &["--into", &t.s(dir)],
+        );
+        assert_output_ok(&retried);
+        assert_eq!(records.last().unwrap()["status"], "success");
+        for (name, data) in [
+            ("one.txt", b"one".as_slice()),
+            ("two.txt", b"two"),
+            ("three.txt", b"three"),
+        ] {
+            assert_eq!(read(&t.path(dir).join(name)), data, "{dir}/{name}");
+        }
+        assert!(partial_files(&t.path(dir)).is_empty(), "{dir}");
+    }
+
     // -vv explains the helper and the route.
     fs::create_dir_all(t.path("verbose")).unwrap();
     let (verbose, _) = push(

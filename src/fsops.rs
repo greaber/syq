@@ -1796,7 +1796,7 @@ impl FsOps {
         self.install_destination(directory, &request.request_prefix)?;
 
         // Stage everything before publishing any final files. A staging
-        // failure can leave sidecars for the fallback engine to resume.
+        // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
         for file in &request.files {
             match self.stage_small_file(
@@ -1809,9 +1809,6 @@ impl FsOps {
             ) {
                 Ok(item) => staged.push(item),
                 Err(error) => {
-                    for item in &staged {
-                        let _ = item.root.unlink(&item.partial);
-                    }
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
                         outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
@@ -7421,6 +7418,81 @@ mod tests {
                 "{prefix:?}: {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn small_copy_staging_failure_keeps_all_partials_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().as_os_str().as_bytes().to_vec();
+        let mut request = SmallCopyRequest {
+            directory: prefix.clone(),
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+            request_prefix: prefix.clone(),
+            identity: SmallCopyIdentity {
+                src_endpoint: "local".into(),
+                src_roots: vec![("source".into(), false)],
+                dst_endpoint: "example".into(),
+                dst_leaf: None,
+                semantic_flags: "{}".into(),
+            },
+            flags: flags::TIMES,
+            files: ["one", "two"]
+                .into_iter()
+                .map(|name| SmallCopyFile {
+                    path: join(&prefix, name.as_bytes()),
+                    data: name.as_bytes().to_vec(),
+                    hash: content_digest(name.as_bytes()),
+                    meta: Meta {
+                        mode: 0o600,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 1_700_000_000,
+                        mtime_nsec: 0,
+                    },
+                })
+                .collect(),
+        };
+        // Invalid nanoseconds fail metadata application after the second
+        // sidecar has been written, without process-wide fault injection.
+        request.files[1].meta.mtime_nsec = 1_000_000_000;
+        let response = FsOps::new().handle(&Request::CopySmallFiles(request.clone()));
+        assert!(
+            matches!(
+                response,
+                Response::SmallFilesCopied(SmallCopyResponse {
+                    outcome: SmallCopyOutcome::StagingFailed(_),
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+        let mut contents: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(is_partial_name(&entry.file_name()));
+                fs::read(entry.path()).unwrap()
+            })
+            .collect();
+        contents.sort();
+        assert_eq!(contents, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert!(!dir.path().join("one").exists());
+        assert!(!dir.path().join("two").exists());
+
+        // A fresh control session can finish the same copy with the partials
+        // present, without publishing duplicates or leaving temporary files.
+        request.files[1].meta.mtime_nsec = 0;
+        let response = FsOps::new().handle(&Request::CopySmallFiles(request));
+        match response {
+            Response::SmallFilesCopied(SmallCopyResponse {
+                outcome: SmallCopyOutcome::Published(results),
+                ..
+            }) => assert_eq!(results, vec![None, None]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(dir.path().join("one")).unwrap(), b"one");
+        assert_eq!(fs::read(dir.path().join("two")).unwrap(), b"two");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     /// The one-turn small copy publishes fresh files through the ordinary
