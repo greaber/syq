@@ -14,7 +14,8 @@ package="$target_dir/package/syq-$version.crate"
 # shorter one. Remove only this generated package so extraction verifies the
 # newly written archive rather than stale local target state.
 rm -f -- "$package"
-cargo package --locked --manifest-path "$repo_dir/Cargo.toml"
+# The extracted build below verifies the package and its identity in one build.
+cargo package --locked --no-verify --manifest-path "$repo_dir/Cargo.toml"
 if [ ! -f "$package" ] || [ -L "$package" ]; then
   echo "cargo did not create $package" >&2
   exit 1
@@ -29,9 +30,14 @@ revision=$(jq -er '.git.sha1 | select(test("^[0-9a-fA-F]{40}$"))' \
   "$source_dir/.cargo_vcs_info.json")
 expected="v$version+dev.${revision:0:12}"
 
-CARGO_TARGET_DIR="$work/target" cargo build --locked \
+# Cargo archives normalize mtimes. A restored build cache can otherwise mistake
+# a different commit's extracted sources/VCS metadata for the previous package.
+# Rebuild syq itself while keeping compiled dependencies across package checks.
+cargo clean --manifest-path "$source_dir/Cargo.toml" --package syq \
+  --target-dir "$target_dir/package-identity"
+CARGO_TARGET_DIR="$target_dir/package-identity" cargo build --locked \
   --manifest-path "$source_dir/Cargo.toml" --bin syq
-actual=$("$work/target/debug/syq" --build-identity)
+actual=$("$target_dir/package-identity/debug/syq" --build-identity)
 [ "$actual" = "$expected" ] || {
   echo "packaged source identity is $actual, expected $expected" >&2
   exit 1

@@ -145,6 +145,17 @@ activate publication. Validation and repository protections still apply.
 
 ## Cutting a release
 
+Start with `scripts/release-readiness.py v<version>` (add `--json` for automation).
+Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
+2 means inspection failed. The report includes the candidate SHA, remote master,
+local real-SSH evidence, all three CI certifications, and next actions. It is
+read-only unless `--check-ssh` is supplied. It never tags, publishes, dispatches
+CI, or merges a PR. If the requested tag exists, inspect `release-status.sh`
+and resume or verify that release rather than preparing another version.
+
+For an already-prepared version with matching evidence, start at step 2. A new
+release request does not require another preparation PR or another test run.
+
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
    `Cargo.lock`, then run the normal locked checks to validate it. Write the
    curated introduction and breaking-change notes in
@@ -156,15 +167,25 @@ activate publication. Validation and repository protections still apply.
    `sdk/python/native-api.json`. A feature may use the `follow_up` disposition
    so its merge is not blocked on SDK work, but `scripts/check-python-api-sync.py`
    and the tag workflow refuse a release until every follow-up is resolved.
-   Run `scripts/test-real-ssh.sh` as the local live-OpenSSH release check. It
-   exercises all three coordinator placements across isolated source and
-   destination containers and does not contact real remote hosts.
+   Run proportionate local checks for the preparation changes, then commit.
+   Run `scripts/release-readiness.py v<version> --check-ssh` for the local
+   live-OpenSSH release check. It exercises all three coordinator placements
+   in isolated containers and records success only for a clean, unchanged
+   checkout. Evidence records the commit, complete Git tree, default profile,
+   host, Docker/Compose versions, and completion time under the shared Git
+   directory's `syq-release/real-ssh/`. A merge with an identical tree reuses
+   it across task worktrees. Any committed-tree change requires fresh evidence;
+   dirty runs cannot certify a release. A deliberately rerun check invalidates
+   its earlier receipt before execution, so failure cannot leave stale success.
+   These are local maintainer records, not portable CI certificates. An
+   independent clone needs its own check. `scripts/test-real-ssh.sh` remains
+   available for development checks without release recording.
 
 2. Once the release commit is the exact `master` tip, check for existing full
    validation on that commit before starting any more tests:
 
    ```sh
-   candidate=$(git rev-parse master)
+   candidate=$(git rev-parse HEAD)
    scripts/verify-release-ci.sh greaber/syq "$candidate"
    ```
 
@@ -176,12 +197,13 @@ activate publication. Validation and repository protections still apply.
    certificate in its current attempt. Runs made before certificates were
    introduced need a fresh manual run.
 
-   If evidence is missing, dispatch only the workflow that needs it (both
+   If evidence is missing, dispatch only the workflow that needs it (all three
    commands are shown here):
 
    ```sh
    gh workflow run ci.yml --ref master
    gh workflow run rsync-compat.yml --ref master
+   gh workflow run macos.yml --ref master
    ```
 
    If the latest run is still running, wait for it instead of starting a copy.
@@ -194,9 +216,12 @@ activate publication. Validation and repository protections still apply.
    scripts/release-preflight.sh v0.1.9
    ```
 
-   It requires the exact clean, synchronized `master` tip; no pending Python
+   It accepts a clean task branch or detached checkout whose HEAD matches both
+   freshly fetched `origin/master` and the live remote `master` tip. The local
+   coordination branch may remain stale. It also requires matching local
+   real-SSH evidence; curated release notes; no pending Python
    API follow-ups; matching Cargo metadata; successful `rust`, `sdks`,
-   `macos`, `linux-arm64`, and `conformance` checks on that SHA; the two full-suite
+   `macos`, `linux-arm64`, and `conformance` checks on that SHA; all three full-suite
    workflow certifications; an SSH tag-signing key registered with
    GitHub; the selected-Actions allowlist; the protected `release` environment,
    tag policy, variables, and secret names; and absence of the tag or version
@@ -217,12 +242,19 @@ activate publication. Validation and repository protections still apply.
    first verifies that the annotated tag's signature is valid and that it
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
-   and `conformance` checks all succeeded on that exact commit, and that both
+   and `conformance` checks all succeeded on that exact commit, and that all three
    full-suite workflow certifications succeeded. It then builds
    static GNU Linux x86-64/ARM64
-   binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
-   signature over the manifest's RFC 8785 canonical JSON, verifies the exact
-   asset inventory, creates provenance attestations, uploads a draft, checks
+   binaries and native macOS Apple Silicon/Intel binaries. In parallel it
+   compiles the source crate once. The protected publishing job repackages it
+   without compiling and requires byte-for-byte equality with that validated
+   artifact before any permanent publication. `cargo publish --no-verify`
+   later uploads from those same locked inputs without repeating compilation.
+   The job installs the actual generated installer and Linux x86-64 artifact
+   over loopback HTTPS into a temporary directory and exercises a native copy.
+   The installer fixture suite remains in CI. Manifest signing (Ed25519 over
+   RFC 8785 canonical JSON) and exact asset-inventory checks also finish before
+   publication. The job creates provenance attestations, uploads a draft, checks
    every uploaded byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
    Once the entire release workflow succeeds, the Python SDK preparation
@@ -254,7 +286,7 @@ If a job stops after creating a draft, inspect that draft rather than
 overwriting it. The workflow refuses to reuse drafts. It may safely be rerun
 after a fully published release: it downloads every published asset and
 requires byte-for-byte equality with the rebuilt release before forwarding the
-formula to the tap job. The same rerun packages the source crate again and
+formula to the tap job. The same rerun validates and compares the source crate again and
 requires its SHA-256 to match the immutable crates.io version; a missing
 version is published, while a divergent version fails closed.
 
@@ -291,16 +323,29 @@ the proportionate local checks described in `AGENTS.md` and reports exactly
 what was verified. A merge does not wait for GitHub to repeat those checks.
 
 Every native push to `master` runs the complete native and SDK suites, Linux
-and macOS conformance, Linux ARM64 validation, focused Apple Silicon macOS
-tests, and an Intel macOS compile-and-updater check. The separate macOS workflow
-also runs the complete native and SDK suites on Apple Silicon. Each run has a
-unique concurrency group, including while it is pending, because a later push
-may affect a different subsystem and therefore cannot safely replace the
-earlier push's selected suites. Failures are repaired in follow-up changes; they
-do not retroactively gate unrelated merges. A release candidate must still have
-successful, exact-SHA full-suite certificates from both workflows. Release
-preflight and tag verification require the stable `rust`, `sdks`, `linux-arm64`, `macos`, and
-`conformance` evidence names and reject selective stubs.
+and macOS conformance, Linux ARM64 validation, and an Intel macOS
+compile-and-updater check. The `macos.yml` workflow owns the complete Apple
+Silicon native, SDK, and release-tool coverage; CI does not repeat a focused
+subset on another Apple Silicon runner. It skips its suite for documentation
+changes that do not affect executable documentation or tooling. Each run has
+a unique concurrency group; later pushes do not cancel earlier evidence.
+
+A release requires successful exact-SHA full-suite certificates from `ci.yml`,
+`rsync-compat.yml`, and `macos.yml`. The stable `macos` check in `ci.yml` now
+represents Intel validation; the separate macOS certificate establishes full
+Apple Silicon coverage. Old runs without the required certificates need one
+manual certification. Failed latest runs must be investigated, not replaced by
+older success.
+
+Cargo caches in CI and release builds separate platform/architecture,
+toolchain, lockfile, and job/build mode. Release builds can restore trusted
+master dependency/build caches, but still build and check the shipping identity
+with release flags and the configured public key. A cache hit never substitutes
+for a test or certificate. GitHub scopes tag caches to that tag; later tags can
+reuse master caches, not earlier tag caches. Source-package identity testing
+extracts and compiles the crate once, using a separate reusable target directory.
+It clears only syq's own build outputs before compiling: normalized archive
+mtimes cannot prove unchanged source or VCS identity across cached packages.
 
 The checked-in classifier uses each push's exact diff. Documentation-only
 changes select no test jobs unless a document is consumed by a test or

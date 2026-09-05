@@ -15,13 +15,46 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.changes.outputs.needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        shell: bash
+        run: |
+          scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
+          # ci-scope output is a machine-readable boolean contract.
+          needed=false
+          for key in native sdks tooling shellcheck mapping_docs; do
+            if [[ $'\n'"$scope"$'\n' == *$'\n'"$key=true"$'\n'* ]]; then
+              needed=true
+            fi
+          done
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
   suite:
+    needs: scope
+    if: needs.scope.outputs.needed == 'true'
     runs-on: macos-26
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Cache Cargo dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
       - name: Show toolchain and environment
         run: |
           rustc --version
@@ -55,6 +88,8 @@ jobs:
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
+            # Restored Cargo caches can contain distributions from an older SDK.
+            rm -rf -- "$output"
             uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
@@ -106,3 +141,10 @@ jobs:
             fi
           done
           exit "$status"
+
+  release-certification:
+    needs: [scope, suite]
+    if: needs.scope.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'The complete Apple Silicon native, SDK, and release-tool suites passed.'

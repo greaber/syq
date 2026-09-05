@@ -190,6 +190,7 @@ case "$1:$2" in
   api:*/compare/*) printf '%s\n' "$SYQ_TEST_COMPARE_JSON" ;;
   api:*/check-runs*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
   api:*/attempts/1/jobs?*) printf '%s\n' "${SYQ_TEST_CI_JOBS_JSON:-}" ;;
+  api:*/actions/workflows/macos.yml/runs?*) printf '[%s]\n' "${SYQ_TEST_MACOS_RUNS_JSON:-$SYQ_TEST_WORKFLOW_RUNS_JSON}" ;;
   api:*/actions/workflows/*/runs?*) printf '[%s]\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
   release:download)
     shift 2
@@ -273,6 +274,26 @@ retry_runs=$(jq '.workflow_runs[0].run_attempt = 2' <<<"$push_runs")
 expect_failure '/attempts/2/jobs' env \
   SYQ_TEST_WORKFLOW_RUNS_JSON="$retry_runs" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+
+# Structured readiness distinguishes waiting, missing evidence, and failures.
+for pair in 'pending:wait' 'failed:repair' 'missing:dispatch' 'passed:ready'; do
+  scenario=${pair%:*}
+  expected=${pair#*:}
+  case "$scenario" in
+    pending) runs=$pending_runs ;;
+    failed) runs=$failed_workflow_runs ;;
+    missing) runs='{"workflow_runs":[]}' ;;
+    passed) runs=$push_runs ;;
+  esac
+  status=0
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$runs" PATH="$fakebin:$PATH" \
+    "$script_dir/verify-release-ci.sh" --json greaber/syq "$commit" >"$work/ci.json" || status=$?
+  if [ "$expected" = ready ]; then test "$status" -eq 0; else test "$status" -eq 1; fi
+  jq -e --arg expected "$expected" '.workflows | length == 3 and all(.[]; .state == $expected)' "$work/ci.json" >/dev/null
+done
+expect_failure 'macos.yml has no push or workflow_dispatch run' env \
+  SYQ_TEST_MACOS_RUNS_JSON='{"workflow_runs":[]}' SYQ_TEST_WORKFLOW_RUNS_JSON="$push_runs" \
+  PATH="$fakebin:$PATH" "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 
 lightweight=$(jq -cn --arg sha "$commit" '{object:{type:"commit",sha:$sha}}')
 expect_failure 'is lightweight' env \
