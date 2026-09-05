@@ -180,12 +180,17 @@ fakebin="$work/fakebin"
 mkdir "$fakebin"
 cat > "$fakebin/gh" <<'EOF'
 #!/bin/sh
+if [ "$1" = api ] && [ "${2:-}" = --paginate ]; then
+  shift 3
+  set -- api "$@"
+fi
 case "$1:$2" in
   api:*/git/ref/tags/*) printf '%s\n' "$SYQ_TEST_REF_JSON" ;;
   api:*/git/tags/*) printf '%s\n' "$SYQ_TEST_TAG_JSON" ;;
   api:*/compare/*) printf '%s\n' "$SYQ_TEST_COMPARE_JSON" ;;
   api:*/check-runs*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
-  api:*/actions/workflows/*/runs?*) printf '%s\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
+  api:*/attempts/1/jobs?*) printf '%s\n' "${SYQ_TEST_CI_JOBS_JSON:-}" ;;
+  api:*/actions/workflows/*/runs?*) printf '[%s]\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
   release:download)
     shift 2
     destination=
@@ -214,8 +219,9 @@ checks_json=$(jq -cn '{check_runs:[
   {id:2,name:"rust",started_at:"2026-01-01T00:01:00Z",status:"completed",conclusion:"success"},
   {name:"macos",status:"completed",conclusion:"success"},
   {name:"verify signed release tag",status:"in_progress",conclusion:null}]}')
+export SYQ_TEST_CI_JOBS_JSON='[{"jobs":[{"name":"release-certification","status":"completed","conclusion":"success"}]}]'
 workflow_runs_json=$(jq -cn --arg commit "$commit" '{workflow_runs:[{
-  id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+  head_branch:"master",head_repository:{full_name:"greaber/syq"},id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
   conclusion:"success",run_number:1,run_attempt:1}]}')
 SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
@@ -224,16 +230,48 @@ SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
 
 SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit" >/dev/null
-expect_failure 'has no workflow_dispatch run' env \
+expect_failure 'has no push or workflow_dispatch run on master' env \
   SYQ_TEST_WORKFLOW_RUNS_JSON='{"workflow_runs":[]}' PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 failed_workflow_runs=$(jq -cn --arg commit "$commit" '{workflow_runs:[
-  {id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+  {head_branch:"master",head_repository:{full_name:"greaber/syq"},id:701,event:"workflow_dispatch",head_sha:$commit,status:"completed",
    conclusion:"success",run_number:1,run_attempt:1},
-  {id:702,event:"workflow_dispatch",head_sha:$commit,status:"completed",
+  {head_branch:"master",head_repository:{full_name:"greaber/syq"},id:702,event:"workflow_dispatch",head_sha:$commit,status:"completed",
    conclusion:"failure",run_number:2,run_attempt:1}]}')
 expect_failure 'is completed/failure' env \
   SYQ_TEST_WORKFLOW_RUNS_JSON="$failed_workflow_runs" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+
+# Reuse only exact-commit, own-repository master runs with full evidence.
+push_runs=$(jq '.workflow_runs[].event = "push"' <<<"$workflow_runs_json")
+SYQ_TEST_WORKFLOW_RUNS_JSON="$push_runs" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit" >/dev/null
+for conclusion in skipped failure cancelled null; do
+  jobs=$(jq -cn --arg conclusion "$conclusion" \
+    '[{jobs:[{name:"release-certification",status:"completed",conclusion:$conclusion}]}]')
+  expect_failure 'lacks successful full-suite' env \
+    SYQ_TEST_CI_JOBS_JSON="$jobs" SYQ_TEST_WORKFLOW_RUNS_JSON="$push_runs" \
+    PATH="$fakebin:$PATH" "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+done
+expect_failure 'lacks successful full-suite' env \
+  SYQ_TEST_CI_JOBS_JSON='[{"jobs":[]}]' SYQ_TEST_WORKFLOW_RUNS_JSON="$push_runs" \
+  PATH="$fakebin:$PATH" "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+for mutation in '.head_sha = "wrong"' '.head_branch = "feature"' \
+  '.head_repository.full_name = "someone/syq"' '.event = "pull_request"'; do
+  untrusted=$(jq ".workflow_runs[] |= ($mutation)" <<<"$push_runs")
+  expect_failure 'has no push or workflow_dispatch run on master' env \
+    SYQ_TEST_WORKFLOW_RUNS_JSON="$untrusted" PATH="$fakebin:$PATH" \
+    "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+done
+
+pending_runs=$(jq '.workflow_runs[0].status = "in_progress" | .workflow_runs[0].conclusion = null' <<<"$push_runs")
+expect_failure 'is in_progress/pending' env \
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$pending_runs" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
+# A retry cannot borrow the first attempt's successful certificate.
+retry_runs=$(jq '.workflow_runs[0].run_attempt = 2' <<<"$push_runs")
+expect_failure '/attempts/2/jobs' env \
+  SYQ_TEST_WORKFLOW_RUNS_JSON="$retry_runs" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit"
 
 lightweight=$(jq -cn --arg sha "$commit" '{object:{type:"commit",sha:$sha}}')

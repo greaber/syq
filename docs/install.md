@@ -45,20 +45,98 @@ Rust users can instead compile and install the published source package:
 cargo install --locked syq
 ```
 
-Or build a checkout with the Rust toolchain version the checkout specifies:
+Cargo installs binaries in `~/.cargo/bin` by default; make sure that directory
+is on your `PATH`. Cargo builds, including the published source package, use
+the [source-build remote setup](#remote-hosts-with-source-builds) below.
+
+## Installing from master or another branch
+
+To install the latest code on `master`, with Git, Rust, Cargo, and a C compiler
+installed:
 
 ```sh
-cargo build --release          # binary at target/release/syq
-cargo install --locked --path . # or: put it on your PATH
+cargo install --locked --force --git https://github.com/greaber/syq.git --branch master syq
 ```
 
-Automatic installation of the remote helper is available only from official
-release builds.
-For Cargo and checkout builds, install a compatible `syq` on the remote and
-select it explicitly. Native `syq cp` and remote `syq rm` use `--syq-path
-PATH`, or `--no-bootstrap` when the binary is on the remote `PATH`; `syq
-rsync` uses the rsync-compatible `--rsync-path PATH`, or
-`--syq-no-bootstrap` for the same `PATH` lookup.
+Replace `master` with another branch name to try that branch. To install a
+specific commit, replace `--branch master` with `--rev COMMIT_SHA`. Rerun the
+branch command to update; `--force` reinstalls even when the package version
+number has not changed. These are optimized builds, just like
+`cargo build --release`; the word “release” in Cargo's build profile does not
+make them official syq releases.
+
+The active Rust toolchain must satisfy the selected revision's `rust-version`
+in `Cargo.toml`. For the exact toolchain pinned by that revision, build from a
+checkout with [rustup](https://rustup.rs/) installed:
+
+```sh
+git clone --branch master https://github.com/greaber/syq.git
+cd syq
+cargo install --locked --force --path .
+```
+
+Rustup selects the version in `rust-toolchain.toml`. You can replace `master`
+in the clone command with another branch, or run `git checkout COMMIT_SHA`
+before installing to select a specific commit. To update a clean branch
+checkout, run `git pull --ff-only` and repeat the install command. To build
+without installing, use `cargo build --locked --release`; the binary is at
+`target/release/syq`. See [Platform notes](#platform-notes) for macOS build
+prerequisites.
+
+Check which executable your shell selects and record its build identity:
+
+```sh
+command -v syq
+syq --build-identity
+```
+
+Cargo normally installs into `~/.cargo/bin`. An older standalone or Homebrew
+binary earlier on `PATH` can still be the one you run; adjust `PATH` or invoke
+`~/.cargo/bin/syq` explicitly.
+
+### What changes with an unreleased build
+
+Branch builds can include changes that have not shipped in a release. Use the
+documentation in that checkout when trying another branch; the documentation
+site describes `master`.
+
+`syq --version` reports the package version, which can stay the same across
+many commits. `syq --build-identity` distinguishes them: a clean Git build has
+an identity such as `v0.2.0+dev.0123456789ab`. Local changes add a
+`.dirty.HASH` suffix. Include the full build identity when reporting a problem.
+A source build from a release tag still has a development identity and does
+not match the official release binary. Source archives without Git revision
+metadata get a build-specific identity, so use a Git checkout when building
+matching binaries on different machines.
+
+Source builds do not automatically install remote helpers, check for release
+updates, or support `syq --self-update`. Update them with Cargo or rebuild the
+checkout. To return to an official binary, use the standalone installer or
+Homebrew and check `command -v syq` again so a Cargo binary does not shadow it.
+
+### Remote hosts with source builds
+
+Local copies need no extra setup. For remote operations, install a source-built
+`syq` on every participating host. All binaries must report exactly the same
+`syq --build-identity`; matching package versions or branch names are not
+enough. Build the same pinned commit from clean checkouts for each host's
+platform, or copy your binary when it is compatible with the remote platform.
+Local changes affect the identity too, so independently edited checkouts may
+fail the connection handshake.
+
+Select the remote binary explicitly. For example, after installing it at
+`/home/alice/.cargo/bin/syq` on `server`:
+
+```sh
+ssh server /home/alice/.cargo/bin/syq --build-identity
+syq cp --syq-path /home/alice/.cargo/bin/syq ./data server:/home/alice/data-copy
+```
+
+Native `syq cp` and remote `syq rm` use `--syq-path PATH`, or `--no-bootstrap`
+when the matching binary is on the non-interactive remote `PATH`. `syq rsync`
+uses `--rsync-path PATH`, or `--syq-no-bootstrap` for the same `PATH` lookup.
+Without these options, source builds cannot use the default managed helper
+installation, even if a matching binary is already installed on the remote.
 
 ## Shell completion
 

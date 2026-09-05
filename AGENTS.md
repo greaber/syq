@@ -120,14 +120,16 @@ outlive its premise and steer later work in the wrong direction.
 
 ## Release tag lifecycle
 
-- Before pushing a syq release tag, run
-  explicit `workflow_dispatch` runs of both `ci.yml` and `rsync-compat.yml` on
-  the exact clean, synchronized `master` commit, wait for both to succeed, and
-  then run `scripts/release-preflight.sh v<version>` from that same commit.
-  Treat any failure as a blocker rather than pushing the tag to discover
-  whether the release workflow starts. Use
-  `scripts/release-status.sh v<version>` after the push to correlate the exact
-  tag, workflow, approvals, and publication destinations.
+- Before pushing a syq release tag, require successful full-suite runs of both
+  `ci.yml` and `rsync-compat.yml` on the exact clean, synchronized `master`
+  commit. Reuse post-merge or manual runs when `scripts/verify-release-ci.sh`
+  accepts their full-suite certificates; dispatch only workflows missing that
+  evidence and wait for them to succeed. Then run
+  `scripts/release-preflight.sh v<version>` from that same commit. Treat any
+  failure as a blocker rather than pushing the tag to discover whether the
+  release workflow starts. Use `scripts/release-status.sh v<version>` after
+  the push to correlate the exact tag, workflow, approvals, and publication
+  destinations.
 - Except for Go module tags, treat a release tag as provisional until its
   release workflow connects it to permanent published state. If an attempt is
   abandoned before that boundary, remove the failed tag locally and remotely

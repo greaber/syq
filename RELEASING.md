@@ -150,21 +150,34 @@ connection, so enable it only for a trusted release host rather than globally.
    exercises all three coordinator placements across isolated source and
    destination containers and does not contact real remote hosts.
 
-2. Once the release commit is the exact `master` tip, explicitly dispatch both
-   full validation workflows on it. Selective push checks are insufficient for
-   a release candidate because an unaffected job may have completed with a
-   successful stub. A manual run selects every native, SDK, conformance, ARM,
-   and macOS suite; the release gates require the latest manual run of each
-   workflow on the exact candidate SHA to succeed:
+2. Once the release commit is the exact `master` tip, check for existing full
+   validation on that commit before starting any more tests:
 
    ```sh
    candidate=$(git rev-parse master)
+   scripts/verify-release-ci.sh greaber/syq "$candidate"
+   ```
+
+   A successful post-merge run is reusable. Each workflow records a
+   `release-certification` job only when all its release suites were selected
+   and passed. Green selective runs with skipped suites do not qualify. The
+   verifier requires the latest push or manual run of each workflow on the
+   exact SHA, from this repository's `master`, to succeed and carry that
+   certificate in its current attempt. Runs made before certificates were
+   introduced need a fresh manual run.
+
+   If evidence is missing, dispatch only the workflow that needs it (both
+   commands are shown here):
+
+   ```sh
    gh workflow run ci.yml --ref master
    gh workflow run rsync-compat.yml --ref master
    ```
 
-   After both runs complete, verify their exact-SHA certification and run the
-   read-only preflight before creating the tag:
+   If the latest run is still running, wait for it instead of starting a copy.
+   A failed latest run must be investigated and repaired or rerun; an older
+   success does not override it. Manual runs select every suite. After the
+   needed runs succeed, repeat verification and run the read-only preflight:
 
    ```sh
    scripts/verify-release-ci.sh greaber/syq "$candidate"
@@ -173,8 +186,8 @@ connection, so enable it only for a trusted release host rather than globally.
 
    It requires the exact clean, synchronized `master` tip; no pending Python
    API follow-ups; matching Cargo metadata; successful `rust`, `sdks`,
-   `macos`, `linux-arm64`, and `conformance` checks on that SHA; the two full
-   manual workflow certifications; an SSH tag-signing key registered with
+   `macos`, `linux-arm64`, and `conformance` checks on that SHA; the two full-suite
+   workflow certifications; an SSH tag-signing key registered with
    GitHub; the selected-Actions allowlist; the protected `release` environment,
    tag policy, variables, and secret names; and absence of the tag or version
    from GitHub, crates.io, and the Homebrew tap. It makes no local or remote
@@ -195,7 +208,7 @@ connection, so enable it only for a trusted release host rather than globally.
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
    and `conformance` checks all succeeded on that exact commit, and that both
-   full manual workflow certifications succeeded. It then builds
+   full-suite workflow certifications succeeded. It then builds
    static GNU Linux x86-64/ARM64
    binaries and native macOS Apple Silicon/Intel binaries, embeds an Ed25519
    signature over the manifest's RFC 8785 canonical JSON, verifies the exact
@@ -275,8 +288,8 @@ unique concurrency group, including while it is pending, because a later push
 may affect a different subsystem and therefore cannot safely replace the
 earlier push's selected suites. Failures are repaired in follow-up changes; they
 do not retroactively gate unrelated merges. A release candidate must still have
-successful, exact-SHA manual runs of both workflows. Release preflight and tag
-verification require the stable `rust`, `sdks`, `linux-arm64`, `macos`, and
+successful, exact-SHA full-suite certificates from both workflows. Release
+preflight and tag verification require the stable `rust`, `sdks`, `linux-arm64`, `macos`, and
 `conformance` evidence names and reject selective stubs.
 
 The checked-in classifier uses each push's exact diff. Documentation-only
