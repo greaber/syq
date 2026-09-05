@@ -7416,12 +7416,33 @@ mod tests {
 
     #[test]
     fn small_copy_staging_failure_keeps_all_partials_for_retry() {
+        const CHILD_ENV: &str = "SYQ_TEST_SMALL_COPY_STAGING_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fsops::tests::small_copy_staging_failure_keeps_all_partials_for_retry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/two")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "staging test child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         // macOS temp paths can traverse /var, a symlink to /private/var.
         // Exercise staging failure with a path the refusal policy accepts.
         let canonical = dir.path().canonicalize().unwrap();
         let prefix = canonical.as_os_str().as_bytes().to_vec();
-        let mut request = SmallCopyRequest {
+        let request = SmallCopyRequest {
             directory: prefix.clone(),
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             request_prefix: prefix.clone(),
@@ -7449,9 +7470,8 @@ mod tests {
                 })
                 .collect(),
         };
-        // Invalid nanoseconds fail metadata application after the second
-        // sidecar has been written, without process-wide fault injection.
-        request.files[1].meta.mtime_nsec = 1_000_000_000;
+        // The child alone injects failure after the second sidecar is
+        // complete. Timestamp rejection differs between Linux and macOS.
         let response = FsOps::new().handle(&Request::CopySmallFiles(request.clone()));
         assert!(
             matches!(
@@ -7478,7 +7498,7 @@ mod tests {
 
         // A fresh control session can finish the same copy with the partials
         // present, without publishing duplicates or leaving temporary files.
-        request.files[1].meta.mtime_nsec = 0;
+        std::env::remove_var("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME");
         let response = FsOps::new().handle(&Request::CopySmallFiles(request));
         match response {
             Response::SmallFilesCopied(SmallCopyResponse {
