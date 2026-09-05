@@ -2,8 +2,7 @@
 
 `syq rsync` accepts common rsync commands for local copies, pushes, and pulls.
 It uses its own protocol: the remote program must be syq, not rsync.
-For all accepted flags, see the [option table](reference.md#compatibility-options)
-or `syq rsync --help-all`.
+Run `syq rsync --help-all` for all accepted flags.
 
 ```sh
 syq rsync -av project/ server:backup/project/
@@ -27,7 +26,7 @@ syq rsync -av project/ server:backup/project/
 A failed source or destination scan prevents deletion. A per-file read failure
 during transfer does not by itself prevent deletion: that source entry remains
 present, so its destination counterpart is not an extra. Preview deletion
-scope with `--dry-run -v`; see [deletion rules](reference.md#deleting-extras---delete).
+scope with `--dry-run -v`; see [deletion rules](reference.md#mirror-a-directory).
 
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
@@ -68,8 +67,8 @@ Other parsing differences:
 - Use `--from0` for NUL separators; `-0` is unsupported.
 
 Blank entries and comment-looking names starting with `#` or `;` are ignored
-in both separator modes. Use `./#name` for a literal name. See
-[copying a list](reference.md#copying-a-list---files-from).
+in both separator modes. Use `./#name` for a literal name. The paths are relative to one source directory; destination parents are
+created as needed.
 
 `-h` alone does not show help; use `--help` or `--help-all`.
 
@@ -86,3 +85,12 @@ converting a filtered command.
 
 The [compatibility tests](https://github.com/greaber/syq/tree/master/tests/rsync-compat)
 record comparison evidence and version-specific details.
+
+## Compare without copying
+
+```sh
+syq rsync -a --syq-verify-only project/ backup/
+```
+
+Hashes selected contents on both sides, writes nothing, and reports `DIFFERS`
+or `MISSING`. Differences or inspection failures produce a nonzero exit status.

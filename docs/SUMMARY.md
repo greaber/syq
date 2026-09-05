@@ -4,16 +4,20 @@
 
 # Using syq
 
-- [Install](install.md)
-- [Commands](reference.md)
+- [Install and setup](install.md)
+- [Copy files](reference.md)
+- [Remove files](remove.md)
 - [Copy between servers](remote-to-remote.md)
 - [Rename and reorganize](mappings.md)
 
-# Troubleshooting
+# Performance
 
 - [Speed](speed.md)
-- [Server setup](server-tuning.md)
-- [Security](security.md)
+  - [Server setup](server-tuning.md)
+
+# Security
+
+- [Threat model and protections](security.md)
 
 # Reference
 

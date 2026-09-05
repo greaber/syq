@@ -15,9 +15,7 @@ Your machine ── starts the copy and displays results
 
 The default uses a restricted receiver on hostB. HostA receives permission
 for this copy, without your SSH agent or a reusable credential for hostB.
-Official releases set up matching helpers automatically; source builds upload
-their executable to compatible hosts. Two endpoints
-with the same host and user run a local copy on that host.
+Two endpoints with the same host and user run a local copy on that host.
 
 `syq rsync` does not accept two remote endpoints; use native `cp`.
 
@@ -70,9 +68,6 @@ configuration, installed programs, or enrollment state are refused.
 Manage enrollment through these commands. Its state is not a disposable
 helper cache. Revocation prevents new sessions; work already in progress may
 finish. `revoke` also accepts `--via`.
-
-For source builds, `--syq-path` or `--no-bootstrap` selects the coordinator
-on hostA, not hostB's receiver. Refresh the receiver with `enroll`.
 
 ## Preview and mirror
 
@@ -152,7 +147,7 @@ syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to ho
 Other choices are `--peer-auth broker` (your destination account's authority,
 limited to that host and user), `--peer-auth full-agent` (ordinary agent
 forwarding), or `--rsh COMMAND` (your complete policy). Their
-[security tradeoffs](security.md#what-a-compromised-source-can-do) differ.
+[security tradeoffs](security.md#a-compromised-source-server) differ.
 
 ## Detached copies
 

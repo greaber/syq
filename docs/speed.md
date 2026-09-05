@@ -24,8 +24,8 @@ Methods, additional measurements, and the measured cost of path safety are in
 
 ## When rsync or cp is faster
 
-- **Tiny jobs:** setup can cost more than the copy. `syq persist on` reduces
-  repeated remote login and helper-startup costs.
+- **Tiny jobs:** setup can cost more than the copy. [`syq persist on`](install.md#keep-connections-open) avoids
+  repeated logins.
 - **One spinning disk:** parallel reads can cause extra seeks. Try
   `--connections 1`.
 - **Shifted file contents:** rsync can reuse data after an insertion changes
@@ -110,4 +110,4 @@ bytes; it does not affect file contents or integrity checks.
 
 Examples use native options. In rsync mode, syq-specific options have a
 `--syq-` prefix, such as `--syq-connections` and `--syq-no-tcp`.
-See the [option table](reference.md#compatibility-options).
+See [rsync extensions](rsync-compat.md#syq-extensions).

@@ -9,6 +9,8 @@ build-dir = "target/book"
 create-missing = false
 
 [output.html]
+additional-css = ["theme/copy-demo.css"]
+additional-js = ["theme/copy-demo.js"]
 site-url = "/syq/"
 git-repository-url = "https://github.com/greaber/syq"
 edit-url-template = "https://github.com/greaber/syq/edit/master/{path}"

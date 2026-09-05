@@ -39,23 +39,12 @@ substituting it in an existing script.
 
 | I want to… | Start here |
 |---|---|
-| Choose exactly where files land | [Copy and placement](reference.md#native-commands) |
-| Preview changes | [Dry runs](reference.md#previewing-a-copy) |
+| Choose exactly where files land | [Copy and placement](reference.md) |
+| Preview changes | [Dry runs](reference.md#preview-changes) |
 | Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |
-| Mirror a directory | [Deleting extras](reference.md#deleting-extras---delete) |
-| Remove files in parallel | [Removal](reference.md#removing-files) |
+| Mirror a directory | [Deleting extras](reference.md#mirror-a-directory) |
+| Remove files in parallel | [Removal](remove.md) |
 | Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
 | Rename or reorganize files during a copy | [Mappings](mappings.md) |
 | Read results from a script | [Automation results](automation.md) |
-| Diagnose a slow copy | [Speed](speed.md) |
-
-## Before you rely on it
-
-Rsync mode is the most stable interface; native `cp`, `rm`, and `map` are
-experimental and their command lines may change between releases. Syq runs on
-Linux and macOS.
-
-Interrupted copies can be resumed by rerunning the same command. A copy is
-not a transaction or a filesystem snapshot; use snapshots for files that
-other programs are actively changing. Read the short [security guide](security.md)
-for the trust boundaries.
+| Make copies faster | [Speed](speed.md) |
