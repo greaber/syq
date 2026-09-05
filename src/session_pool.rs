@@ -222,28 +222,31 @@ pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
 /// Ask a running pool to exit, wait for it, and remove its files. A pool
 /// that is not running leaves only stale files, which are removed too.
 pub(crate) fn stop(control: &Path) -> Result<()> {
-    if is_running(control) {
-        if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
-            let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
-            let request = ClientRequest {
-                identity: crate::identity::build().to_string(),
-                program: None,
-                exit: true,
-            };
-            let mut line = serde_json::to_vec(&request)?;
-            line.push(b'\n');
-            let _ = stream.write_all(&line);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    let mut requested = false;
+    while is_running(control) {
+        if Instant::now() >= deadline {
+            bail!(
+                "session pool for {} did not exit",
+                control.file_name().unwrap_or_default().to_string_lossy()
+            );
         }
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while is_running(control) {
-            if Instant::now() >= deadline {
-                bail!(
-                    "session pool for {} did not exit",
-                    control.file_name().unwrap_or_default().to_string_lossy()
-                );
+        // Startup holds the lock before binding the socket. Retry delivery
+        // within the stop deadline instead of waiting on an unsent request.
+        if !requested {
+            if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
+                let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+                let request = ClientRequest {
+                    identity: crate::identity::build().to_string(),
+                    program: None,
+                    exit: true,
+                };
+                let mut line = serde_json::to_vec(&request)?;
+                line.push(b'\n');
+                requested = stream.write_all(&line).is_ok();
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
     for path in [socket_path(control), lock_path(control)] {
         match fs::symlink_metadata(&path) {
@@ -751,6 +754,39 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         stop(&control).unwrap();
+        assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn stop_waits_for_a_starting_pool_to_bind_its_socket() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        let held = try_lock(&control, true).unwrap().unwrap();
+        let socket = socket_path(&control);
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        assert!(read_request(&mut stream).unwrap().exit);
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no stop request arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept stop request: {error}"),
+                }
+            }
+            drop(held);
+        });
+        let stopped = stop(&control);
+        starter.join().unwrap();
+        stopped.unwrap();
+        assert!(!socket_path(&control).exists());
         assert!(!lock_path(&control).exists());
     }
 
