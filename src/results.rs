@@ -66,6 +66,7 @@ pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
+    pub verify_only: bool,
     /// Copy-only fields. Omitting them gives rm a distinct shape instead of
     /// assigning copy semantics to false values.
     pub prune: Option<bool>,
@@ -238,6 +239,7 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         run_id: &run_id,
         started_at,
         mode: name,
+        verify_only: args.verify_only,
         prune,
         mapping,
         dry_run: args.dry_run,
@@ -309,6 +311,9 @@ impl ResultsWriter {
             "endpoints": endpoints,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if run.verify_only {
+            object.insert("verify_only".into(), true.into());
+        }
         if let Some(prune) = run.prune {
             object.insert("prune".into(), prune.into());
         }

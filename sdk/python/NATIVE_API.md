@@ -43,6 +43,10 @@ learn a second set of names for concepts that syq already names.
 | Native spelling | Python spelling |
 |---|---|
 | `syq cp` | `syq.cp()` or `Client.cp()` |
+| `syq cp --verify-only` | `syq.cp(verify_only=True)` |
+| `--ignore-existing` | `ignore_existing=True` |
+| `--existing` | `existing=True` |
+| `--update` | `update=True` |
 | `syq cp --prune` | `syq.cp(prune=True)` or `Client.cp(prune=True)` |
 | `syq rm` | `syq.rm()` or `Client.rm()` |
 | `syq map` | `syq.map()` or `Client.map()` |

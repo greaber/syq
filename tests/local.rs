@@ -16760,3 +16760,290 @@ fn native_remote_dry_run_results_need_a_local_coordinator() {
     assert!(stderr.contains("--coordinate-at local"), "{stderr}");
     assert!(!t.path("r.ndjson").exists());
 }
+
+#[test]
+fn native_verify_only_compares_contents_without_mutations() {
+    let t = Tmp::new();
+    write(&t.path("src/same"), b"same");
+    write(&t.path("src/different"), b"AAAA");
+    write(&t.path("src/missing"), b"missing");
+    fs::create_dir_all(t.path("src/empty")).unwrap();
+    std::os::unix::fs::symlink("same", t.path("src/link")).unwrap();
+    write(&t.path("dst/same"), b"same");
+    write(&t.path("dst/different"), b"BBBB");
+    write(&t.path("dst/extra"), b"extra");
+    std::os::unix::fs::symlink("different", t.path("dst/link")).unwrap();
+    for path in ["src/same", "src/different", "dst/same", "dst/different"] {
+        set_mtime(&t.path(path), 1_600_000_000);
+    }
+    let before = fs::metadata(t.path("dst/different")).unwrap();
+    let out = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--stats",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+        "--results",
+        &t.s("results"),
+    ]);
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("DIFFERS"));
+    assert!(stderr_of(&out).contains("MISSING"));
+    assert_eq!(read(&t.path("dst/different")), b"BBBB");
+    assert_eq!(read(&t.path("dst/extra")), b"extra");
+    assert!(!t.path("dst/missing").exists());
+    assert!(!t.path("dst/empty").exists());
+    assert_eq!(
+        fs::read_link(t.path("dst/link")).unwrap(),
+        Path::new("different")
+    );
+    let after = fs::metadata(t.path("dst/different")).unwrap();
+    assert_eq!(
+        (before.ino(), before.mtime(), before.mode()),
+        (after.ino(), after.mtime(), after.mode())
+    );
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for record in &records {
+        assert!(
+            validator.is_valid(record),
+            "invalid verification record: {record}"
+        );
+    }
+    assert_eq!(records[0]["verify_only"], true);
+    let result = records.last().unwrap();
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["files_transferred"], 0);
+    assert_eq!(result["bytes_transferred"], 0);
+    assert_eq!(result["files_unchanged"], 1);
+    assert_eq!(result["bytes_unchanged"], 4);
+    assert_eq!(result["directories_created"], 0);
+    assert_eq!(result["symlinks_created"], 0);
+    assert!(!records.iter().any(|r| r["type"] == "operation_result"));
+
+    // Filtering is selection, not verification of the entire destination tree.
+    let filtered = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--ignore",
+        "different",
+        "--ignore",
+        "missing",
+        "--ignore",
+        "empty",
+        "--ignore",
+        "link",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_output_ok(&filtered);
+
+    // A missing destination container must not be created, even for an exact placement.
+    for placement in ["--into", "--as"] {
+        let out = native_syq(&[
+            "cp",
+            "--verify-only",
+            &t.s("src"),
+            placement,
+            &t.s("absent"),
+        ]);
+        assert!(!out.status.success());
+        assert!(!t.path("absent").exists());
+    }
+}
+
+#[test]
+fn native_overwrite_policies_apply_per_entry() {
+    for policy in ["--ignore-existing", "--existing", "--update"] {
+        let t = Tmp::new();
+        write(&t.path("src/present"), b"source");
+        write(&t.path("src/new"), b"new");
+        write(&t.path("src/dir/child"), b"child");
+        write(&t.path("src/nested/new"), b"nested");
+        write(&t.path("dst/present"), b"destination");
+        write(&t.path("dst/dir"), b"keep non-directory");
+        fs::create_dir_all(t.path("dst/nested")).unwrap();
+        set_mtime(&t.path("src/present"), 1_600_000_000);
+        set_mtime(&t.path("dst/present"), 1_700_000_000);
+        run_native_ok(&[
+            "cp",
+            policy,
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        let updates = policy == "--existing";
+        assert_eq!(
+            read(&t.path("dst/present")),
+            if updates {
+                b"source" as &[u8]
+            } else {
+                b"destination"
+            }
+        );
+        assert_eq!(t.path("dst/new").exists(), policy != "--existing");
+        assert_eq!(t.path("dst/nested/new").exists(), policy != "--existing");
+        if policy == "--update" {
+            assert_eq!(read(&t.path("dst/dir/child")), b"child");
+        } else {
+            assert_eq!(read(&t.path("dst/dir")), b"keep non-directory");
+        }
+    }
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    run_native_ok(&[
+        "cp",
+        "--existing",
+        &t.s("source"),
+        "--into",
+        &t.s("missing"),
+    ]);
+    assert!(!t.path("missing").exists());
+}
+
+#[test]
+fn native_copy_policy_conflicts_refuse_before_writing() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    for pair in [
+        ["--verify-only", "--prune"],
+        ["--verify-only", "--dry-run"],
+        ["--verify-only", "--inplace"],
+        ["--verify-only", "--ignore-existing"],
+        ["--verify-only", "--existing"],
+        ["--verify-only", "--update"],
+        ["--ignore-existing", "--existing"],
+        ["--ignore-existing", "--update"],
+        ["--ignore-existing", "--inplace"],
+        ["--update", "--inplace"],
+    ] {
+        let out = native_syq(&[
+            "cp",
+            pair[0],
+            pair[1],
+            &t.s("source"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{pair:?}: {}", stderr_of(&out));
+        assert!(!t.path("dst").exists());
+    }
+}
+
+#[test]
+fn native_direct_remote_forwards_verification_and_overwrite_policies() {
+    for policy in [
+        "--verify-only",
+        "--ignore-existing",
+        "--existing",
+        "--update",
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let helper = cached_remote_helper(&t);
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
+        write(&t.path("src/file"), b"source");
+        write(&t.path("dst/file"), b"destination");
+        write(&t.path("src/new"), b"new");
+        set_mtime(&t.path("src/file"), 1_600_000_000);
+        set_mtime(&t.path("dst/file"), 1_700_000_000);
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args([
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--from",
+                "fake",
+                "--srcs-in",
+                &t.s("src"),
+                "--to",
+                "fake",
+                "--into",
+                &t.s("dst"),
+                policy,
+                "-q",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(if policy == "--verify-only" { 23 } else { 0 }),
+            "{policy}: {}",
+            stderr_of(&out)
+        );
+        assert_eq!(
+            read(&t.path("dst/file")),
+            if policy == "--existing" {
+                b"source" as &[u8]
+            } else {
+                b"destination"
+            }
+        );
+        assert_eq!(
+            t.path("dst/new").exists(),
+            matches!(policy, "--ignore-existing" | "--update")
+        );
+        assert!(fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .contains(policy));
+    }
+}
+
+#[test]
+fn native_verify_only_mapping_keeps_missing_parents_absent() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"source");
+    write(&t.path("mapping"), br#"{"src":{"encoding":"utf-8","value":"file"},"dst":{"encoding":"utf-8","value":"missing/parent/file"}}"#);
+    let out = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--mapping",
+        &t.s("mapping"),
+        "-C",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+        "--results",
+        &t.s("results"),
+    ]);
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn native_verify_only_remote_results_require_local_coordination() {
+    let t = Tmp::new();
+    let out = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--from",
+        "source.invalid",
+        "--srcs-in",
+        "data",
+        "--to",
+        "destination.invalid",
+        "--into",
+        "data",
+        "--results",
+        &t.s("results"),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("--coordinate-at local"));
+    assert!(!t.path("results").exists());
+}

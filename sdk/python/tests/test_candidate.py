@@ -371,5 +371,52 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "async-remove").exists())
 
 
+@unittest.skipUnless(EXECUTABLE and EXPECTED_VERSION, "candidate binary required")
+class CopyPolicyCandidateTests(unittest.TestCase):
+    def test_sync_and_async_copy_policies_and_comparison_results(self) -> None:
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:
+                root = Path(temporary)
+                (root / "src").mkdir()
+                (root / "dst").mkdir()
+                (root / "src/file").write_bytes(b"source")
+                (root / "dst/file").write_bytes(b"target")
+                (root / "src/new").write_bytes(b"new")
+                os.utime(root / "src/file", (1600000000, 1600000000))
+                os.utime(root / "dst/file", (1700000000, 1700000000))
+                events: list[syq.AutomationEvent] = []
+                client = (syq.AsyncClient if asynchronous else syq.Client)(
+                    executable=Path(EXECUTABLE), process_cwd=root
+                )
+
+                def copy(**options: object) -> syq.CpResult:
+                    result = client.cp(srcs_in="src", into="dst", **options)
+                    return asyncio.run(result) if asynchronous else result
+
+                different = copy(verify_only=True, check=False, on_event=events.append)
+                self.assertEqual(different.exit_code, 23)
+                self.assertEqual(different.files_transferred, 0)
+                self.assertEqual(different.bytes_transferred, 0)
+                self.assertTrue(events[0].verify_only)
+                self.assertFalse((root / "dst/new").exists())
+                self.assertEqual((root / "dst/file").read_bytes(), b"target")
+                kept = copy(ignore_existing=True)
+                self.assertEqual(kept.files_excluded, 1)
+                self.assertEqual((root / "dst/file").read_bytes(), b"target")
+                (root / "dst/new").unlink()
+                copy(existing=True, update=True)
+                self.assertEqual((root / "dst/file").read_bytes(), b"target")
+                self.assertFalse((root / "dst/new").exists())
+                copy(existing=True)
+                self.assertEqual((root / "dst/file").read_bytes(), b"source")
+                self.assertFalse((root / "dst/new").exists())
+                matched = copy(verify_only=True, ignore="new")
+                self.assertEqual(matched.files_unchanged, 1)
+                self.assertEqual(matched.bytes_unchanged, 6)
+                self.assertEqual(matched.files_transferred, 0)
+                with self.assertRaises(syq.SyqInvocationError):
+                    copy(verify_only=True, prune=True)
+
+
 if __name__ == "__main__":
     unittest.main()

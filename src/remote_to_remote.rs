@@ -922,6 +922,16 @@ fn run_remote(
     if args.checksum {
         remote.push("--hash".into());
     }
+    for (enabled, option) in [
+        (args.verify_only, "--verify-only"),
+        (args.ignore_existing, "--ignore-existing"),
+        (args.existing, "--existing"),
+        (args.update, "--update"),
+    ] {
+        if enabled {
+            remote.push(option.into());
+        }
+    }
     if args.native_follow {
         remote.push("--follow".into());
     } else {

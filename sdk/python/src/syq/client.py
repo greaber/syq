@@ -609,6 +609,10 @@ def _copy_arguments(
     prune: bool,
     dry_run: bool,
     hash: bool,
+    verify_only: bool,
+    ignore_existing: bool,
+    existing: bool,
+    update: bool,
     no_compress: bool,
     bwlimit: str | int | None,
     connections: int | None,
@@ -690,6 +694,22 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
+    if verify_only and (dry_run or prune or inplace or ignore_existing or existing or update):
+        raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
+    if ignore_existing and (existing or update or inplace):
+        raise SyqInvocationError("ignore_existing conflicts with existing, update, and inplace")
+    if existing and (into_new is not None or as_new is not None):
+        raise SyqInvocationError("existing conflicts with into_new and as_new")
+    if update and inplace:
+        raise SyqInvocationError("update conflicts with inplace")
+    for enabled, option in (
+        (verify_only, "--verify-only"),
+        (ignore_existing, "--ignore-existing"),
+        (existing, "--existing"),
+        (update, "--update"),
+    ):
+        if enabled:
+            argv.append(option)
     if no_compress:
         argv.append("--no-compress")
     _append_text(argv, "--bwlimit", bwlimit)
@@ -1020,6 +1040,10 @@ class Client:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        verify_only: bool = False,
+        ignore_existing: bool = False,
+        existing: bool = False,
+        update: bool = False,
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
@@ -1050,13 +1074,13 @@ class Client:
         if (
             from_ is not None
             and to is not None
-            and dry_run
+            and (dry_run or verify_only)
             and coordinate_at != "local"
         ):
             # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
             # only on the coordinator, which these placements move remote.
             raise SyqInvocationError(
-                "a remote-to-remote dry run cannot produce the results "
+                f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
         results = _prepare_results_file(results)
@@ -1083,6 +1107,10 @@ class Client:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            verify_only=verify_only,
+            ignore_existing=ignore_existing,
+            existing=existing,
+            update=update,
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
@@ -1265,6 +1293,10 @@ class Client:
             prune=False,
             dry_run=False,
             hash=False,
+            verify_only=False,
+            ignore_existing=False,
+            existing=False,
+            update=False,
             no_compress=False,
             bwlimit=None,
             connections=None,

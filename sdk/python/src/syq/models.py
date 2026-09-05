@@ -264,6 +264,7 @@ class RunEvent:
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
     type: str = "run"
+    verify_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -619,6 +619,10 @@ class AsyncClient:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        verify_only: bool = False,
+        ignore_existing: bool = False,
+        existing: bool = False,
+        update: bool = False,
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
@@ -649,13 +653,13 @@ class AsyncClient:
         if (
             from_ is not None
             and to is not None
-            and dry_run
+            and (dry_run or verify_only)
             and coordinate_at != "local"
         ):
             # Mirrors the CLI's usage-lane refusal: a dry run's traces exist
             # only on the coordinator, which these placements move remote.
             raise SyqInvocationError(
-                "a remote-to-remote dry run cannot produce the results "
+                f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
         results = await _complete_task(
@@ -684,6 +688,10 @@ class AsyncClient:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            verify_only=verify_only,
+            ignore_existing=ignore_existing,
+            existing=existing,
+            update=update,
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
@@ -884,6 +892,10 @@ class AsyncClient:
             prune=False,
             dry_run=False,
             hash=False,
+            verify_only=False,
+            ignore_existing=False,
+            existing=False,
+            update=False,
             no_compress=False,
             bwlimit=None,
             connections=None,

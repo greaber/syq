@@ -95,6 +95,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "quiet"
                     | "ignore"
                     | "preserve"
+                    | "verify_only"
                     | "hash"
                     | "prune"
                     | "help"
