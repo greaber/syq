@@ -235,7 +235,13 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
         // within the stop deadline instead of waiting on an unsent request.
         if !requested {
             if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
-                let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+                let timeout =
+                    CLIENT_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+                if timeout.is_zero() {
+                    continue;
+                }
+                stream.set_write_timeout(Some(timeout))?;
+                stream.set_read_timeout(Some(timeout))?;
                 let request = ClientRequest {
                     identity: crate::identity::build().to_string(),
                     program: None,
@@ -243,7 +249,20 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
                 };
                 let mut line = serde_json::to_vec(&request)?;
                 line.push(b'\n');
-                requested = stream.write_all(&line).is_ok();
+                if stream.write_all(&line).is_ok() {
+                    // Keep the connection open until the pool consumes the
+                    // request. Closing a queued Unix connection can discard
+                    // its unread data on macOS.
+                    requested = receive_message(stream.as_raw_fd(), MAX_MESSAGE)
+                        .ok()
+                        .and_then(|(payload, descriptors)| {
+                            if !descriptors.is_empty() {
+                                return None;
+                            }
+                            serde_json::from_slice::<PoolReply>(&payload).ok()
+                        })
+                        .is_some_and(|reply| reply.status == "exiting");
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -772,6 +791,12 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         assert!(read_request(&mut stream).unwrap().exit);
+                        let reply = serde_json::to_vec(&PoolReply {
+                            status: "exiting".into(),
+                            identity: crate::identity::build().to_string(),
+                        })
+                        .unwrap();
+                        send_message(stream.as_raw_fd(), &reply, &[]).unwrap();
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
