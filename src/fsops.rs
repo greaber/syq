@@ -7417,7 +7417,10 @@ mod tests {
     #[test]
     fn small_copy_staging_failure_keeps_all_partials_for_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().as_os_str().as_bytes().to_vec();
+        // macOS temp paths can traverse /var, a symlink to /private/var.
+        // Exercise staging failure with a path the refusal policy accepts.
+        let canonical = dir.path().canonicalize().unwrap();
+        let prefix = canonical.as_os_str().as_bytes().to_vec();
         let mut request = SmallCopyRequest {
             directory: prefix.clone(),
             symlink_policy: OperatorSymlinkPolicy::Refuse,
