@@ -32,7 +32,7 @@ def smoke(dist):
         thread.start()
         environment = {**os.environ, "XDG_CONFIG_HOME": str(work / "config"),
                        "SYQ_INSTALL_BASE_URL": f"https://127.0.0.1:{server.server_port}",
-                       "CURL_CA_BUNDLE": str(cert), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
+                       "SYQ_NO_UPDATE_CHECK": "1", "CURL_CA_BUNDLE": str(cert), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
         try:
             subprocess.run(["sh", str(dist / "install.sh"), "--bin-dir", str(work / "bin")],
                            env=environment, check=True, timeout=60)
@@ -42,6 +42,10 @@ def smoke(dist):
                 actual = subprocess.check_output([binary, option], env=environment, text=True, timeout=10).strip()
                 if actual != expected:
                     raise ValueError(f"installed {option}: {actual!r}, expected {expected!r}")
+            receipt = json.loads((work / "config" / "syq" / "install.json").read_text())
+            if (receipt.get("provider") != "standalone" or receipt.get("version") != manifest["version"]
+                    or receipt.get("binary") != str(Path(binary).resolve())):
+                raise ValueError("installer did not register the expected standalone receipt")
             source = work / "source"
             source.write_bytes(b"release installer smoke test\n")
             subprocess.run([binary, "cp", str(source), "--into", str(work / "destination")],
