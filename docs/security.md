@@ -32,6 +32,13 @@ These protections bound where the operation can go. They do not prevent an
 authorized writer from changing the contents of that tree. In a removal race,
 a single replacement entry can still be unlinked.
 
+Two attackers are outside the design because no file tool can address them:
+someone who already controls the account syq runs as, on either end, and
+someone legitimately allowed to modify the result. A local user with write
+access to a destination tree is the second kind. New protections are judged
+against this list: a check has to stop one of the attackers above, and not
+one of these two.
+
 ## Relationship to rsync 3.5.0
 
 Syq's path protection is inspired by
@@ -63,6 +70,17 @@ For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The
 restricted receiver enforces the destination, options, and limits independently.
 The source cannot enlarge or replay that permission.
+
+The receiver can enforce only what it can decide from its own disk and the
+messages it receives. That rule sorts every option. Anything about the
+destination's own state is enforced there: staying inside the enrolled
+directory, whether that directory must already exist or must be new, ignore
+rules, preservation, limits, deadlines, and single use of the permission.
+Anything that depends on the source's account of itself, such as `--update`
+comparing source times or `--mapping` supplying a manifest, is refused rather
+than trusted. And because nothing from the destination reaches you except
+through the source, enforcement alone cannot make the source's report
+trustworthy; that is what the receipt is for.
 
 The receiver signs what it did, and your machine verifies the receipt. A
 source cannot forge a clean account of destination changes. It can still omit

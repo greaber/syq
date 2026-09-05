@@ -18,7 +18,7 @@ topic. The normal setup from the primary checkout is:
 
 ```bash
 git worktree add .worktrees/<task> -b <task> master
-ln -s ../../current-plans .worktrees/<task>/current-plans
+ln -sn ../../current-plans .worktrees/<task>/current-plans
 cd .worktrees/<task>
 ```
 
@@ -68,10 +68,10 @@ command with this restoration when necessary.
 Prefer durable, committed documentation over private memory. Facts worth
 keeping (behavior, measured performance, design rationale, and invariants) go
 in the appropriate committed documentation; guidance every session needs goes
-here in `AGENTS.md`. Plans and handoff notes that change too fast for git or do
-not belong to a branch go in `current-plans/` (gitignored by design; check it
-before starting work on a topic it covers). Use memory only for what fits none
-of those.
+here in `AGENTS.md`. Handoff notes for work in flight go in `current-plans/`
+(gitignored by design; check it before starting work on a topic it covers). A
+note there is not an approved plan or a product decision, and it is deleted
+when its pull request closes. Use memory only for what fits none of those.
 
 When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
@@ -235,7 +235,7 @@ report actual access or decision blockers instead of bypassing them.
 - `README.md` and `docs/` are written for users. They describe what the code
   on `master` does. Plans, roadmap items, design directions, internal status,
   unreleased or unvetted components, and notes to future maintainers do not
-  belong there; they go in `current-plans/` or a design note. State a
+  belong there; they go in `current-plans/` while the work is in flight. State a
   limitation as a fact about today's behavior, not as an intention.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.

@@ -109,8 +109,13 @@ Copy options and filters belong to the later `cp` command or your transform.
 ## Semantics and limits
 
 - `--mapping` replaces `cp` source selectors. Use `--into`, `--into-new`, or
-  `--into-existing` for the destination. It cannot combine with `--as` or
-  `--prune`, and a mapping copy requires at least one local endpoint.
+  `--into-existing` for the destination. It cannot combine with `--as`, and a
+  mapping copy requires at least one local endpoint.
+- `--mapping` cannot combine with `--prune`. A mapping says what should exist
+  at each path, never that nothing else should exist nearby, so pruning would
+  have to guess which paths are destination-only, and a truncated manifest
+  would then be a mass-deletion hazard. A converge-to-manifest mode, if one is
+  ever added, would treat only explicitly declared directories as complete.
 - A contents selection emits paths relative to the selected directory. Use
   that same directory as the consuming copy's `-C` base. Named `map`
   selectors must be relative and resolve inside their base; a contents
