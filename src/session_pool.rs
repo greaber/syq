@@ -548,7 +548,6 @@ impl Pool {
     }
 
     fn handle_client(&mut self, mut stream: UnixStream) -> Verdict {
-        let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
         if peer_uid(&stream).ok() != Some(unsafe { libc::geteuid() }) {
             return Verdict::Continue;
@@ -666,6 +665,10 @@ fn greet_spare(child: &mut Child) -> Result<(File, File, File)> {
 
 /// One request line, read a byte at a time so nothing beyond it is consumed.
 fn read_request(stream: &mut UnixStream) -> Option<ClientRequest> {
+    // BSD accepts inherit the listener's nonblocking mode. The request can
+    // arrive after accept, so use bounded blocking I/O on the client stream.
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok()?;
     let mut line = Vec::new();
     let mut byte = [0u8];
     loop {
@@ -766,6 +769,21 @@ mod tests {
         }
         stop(&control).unwrap();
         assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn a_nonblocking_client_waits_for_the_rest_of_its_request() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"{\"identity\":\"test\",").unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"\"exit\":true}\n").unwrap();
+        });
+        let request = read_request(&mut server).expect("complete delayed request");
+        assert!(request.exit);
+        assert_eq!(request.identity, "test");
+        sender.join().unwrap();
     }
 
     #[test]
