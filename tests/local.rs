@@ -1179,7 +1179,9 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn janky_cat_concatenates_files_and_stdin() {
     let t = Tmp::new();
-    write(&t.path("first"), b"first\0");
+    // Cross several bursts, including a short final one, without changing bytes.
+    let first: Vec<u8> = (0..=255).cycle().take(1300).collect();
+    write(&t.path("first"), &first);
     write(&t.path("last"), b"\nlast");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -1192,7 +1194,7 @@ fn janky_cat_concatenates_files_and_stdin() {
     let output = child.wait_with_output().unwrap();
 
     assert_output_ok(&output);
-    assert_eq!(output.stdout, b"first\0middle\nlast");
+    assert_eq!(output.stdout, [first.as_slice(), b"middle\nlast"].concat());
 }
 
 #[test]
