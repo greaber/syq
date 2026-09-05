@@ -117,9 +117,10 @@ Identifies the run: `run_id` (opaque string, unique per invocation),
 (`source`|`destination`), `kind` (`local`|`ssh`), and for ssh
 endpoints `host` and, when given, `user`. Never credentials, ports,
 or raw shell arguments. A copy run also has `prune` and `mapping` booleans and
-source and destination endpoints. A removal run omits those copy-only fields
-and has exactly one source endpoint, regardless of how many selectors it
-contains.
+source and destination endpoints. A coordinated multi-target copy lists its
+source once and then every destination in command-line order. A removal run
+omits those copy-only fields and has exactly one source endpoint, regardless of
+how many selectors it contains.
 
 ### `progress` — sampled telemetry
 
@@ -130,6 +131,18 @@ lossy by design: drive spinners and dashboards from it, never final
 accounting; the terminal record is the only authority on totals.
 Removal has no byte accounting, so its byte and unchanged/excluded fields are
 zero; its file counts reflect endpoint outcomes delivered so far.
+For a multi-target copy there is one progress record per destination, carrying
+the same `destination_index` used by that destination's traces, operations,
+errors, and result. Ordinary one-target progress records omit the index.
+
+### `destination_result` — one per destination in a multi-target copy
+
+Before the final result, a coordinated multi-target copy emits one
+`destination_result` for every destination, in the destination order from the
+run record. It has `destination_index` and the same status, exit code, copy
+counters, elapsed time, and optional deletion counters as a copy `result`, but
+describes only that destination. It is not terminal: the stream remains open
+until the final aggregate `result` arrives.
 
 ### `trace` — dry-run only, one per intended mutation
 
@@ -141,6 +154,10 @@ would print under `-v`:
 
 `destination_missing` | `type_differs` | `content_differs` |
 `metadata_differs` | `destination_only` (`--prune` deletions).
+
+On a multi-target run, `destination_index` is the zero-based index among the
+run record's destination endpoints. It is absent on an ordinary one-target
+run.
 
 There is no identity linking a trace to an operation in a later real
 run: the filesystem can change between the two, and the stream does
@@ -170,6 +187,8 @@ ownership, or times reconciled on an otherwise unchanged object, that is,
 an unchanged file, directory, symlink, or special file) are not reported
 per operation in v1: a live run emits no record for them, while a dry run
 does emit a `metadata_differs` trace for the same situation.
+On a multi-target run, `destination_index` identifies which ordered
+destination the operation belongs to; it is absent on a one-target run.
 
 Copy streams use `trace` and `operation_result`; removal streams use the next
 three record types instead.
@@ -212,7 +231,8 @@ are the tally the terminal `errors` count refers to.
 ### `error` — one per counted error
 
 `message` is display text, never a parsing contract. Optional `class`
-and `os_kind` where syq knows them at the point of reporting; a receiver refusal
+and `os_kind` where syq knows them at the point of reporting. A multi-target
+error also has `destination_index` when it belongs to one destination; a receiver refusal
 arrives as an `error` with `class: "safety_limit"`, `provenance`, and
 the receiver's `code`.
 
@@ -269,6 +289,12 @@ receiver-attested `error` records emitted on the stream: one per
 failed or incomplete operation, per refusal, and per failed or
 partial final-state observation (a present object whose hash or link
 target could not be read).
+
+For a multi-target copy, the final counters are sums of the destination
+results. A failure before any destination starts, such as an unreadable mapping
+input, can add a run-level error that is not charged to an individual
+destination. The final `elapsed_ms` is wall-clock time for the whole command,
+not the sum of the destinations' overlapping elapsed times.
 
 A removal result is distinguished by `mode: "rm"`, has `status`: `success` |
 `partial` | `failed`, and carries `selectors_total`, `selectors_resolved`,

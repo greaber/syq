@@ -1,5 +1,6 @@
 mod agent_broker;
 mod bwlimit;
+mod cancellation;
 mod cli;
 mod completion;
 mod conn;
@@ -7,6 +8,7 @@ mod delegation;
 #[allow(dead_code)]
 mod descriptor_broker;
 pub mod enrollment;
+mod fanout;
 mod fsops;
 mod identity;
 mod janky_cat;
@@ -255,6 +257,8 @@ fn main() {
         native_map::run(&args)
     } else if args.rm {
         rm::run(args)
+    } else if !args.fanout_targets.is_empty() {
+        fanout::run(args)
     } else {
         transfer::run(args)
     };

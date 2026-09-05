@@ -1130,6 +1130,7 @@ mod tests {
             }))),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            cancellation: None,
         })
     }
 

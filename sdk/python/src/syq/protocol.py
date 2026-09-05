@@ -11,6 +11,7 @@ from .errors import SyqProtocolError
 from .models import (
     AutomationEvent,
     CpResult,
+    DestinationResult,
     Disposition,
     Endpoint,
     EndpointKind,
@@ -204,6 +205,20 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
     return tuple(endpoints)
 
 
+def _destination_index(record: dict[str, Any], run: RunEvent) -> int | None:
+    index = _optional_integer(record, "destination_index")
+    if index is None:
+        return None
+    destinations = sum(
+        endpoint.role is EndpointRole.DESTINATION for endpoint in run.endpoints
+    )
+    if index < 0 or index >= destinations:
+        raise SyqProtocolError(
+            "automation destination_index does not name a run destination"
+        )
+    return index
+
+
 class AutomationDecoder:
     """Validate one complete automation typed-operation stream incrementally."""
 
@@ -226,6 +241,7 @@ class AutomationDecoder:
         self.run: RunEvent | None = None
         self.result: OperationSummary | None = None
         self._next_seq = 0
+        self._destination_results: set[int] = set()
         self._rm_selections: dict[int, SelectionStatus] = {}
         self._rm_removal_started = False
         self._rm_entries = {
@@ -325,6 +341,7 @@ class AutomationDecoder:
         if record_type == "progress":
             return ProgressEvent(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 bytes_done=_integer(record, "bytes_done"),
                 bytes_total=_integer(record, "bytes_total"),
                 bytes_unchanged=_integer(record, "bytes_unchanged"),
@@ -336,6 +353,90 @@ class AutomationDecoder:
                 scan_done=_boolean(record, "scan_done"),
                 elapsed_ms=_integer(record, "elapsed_ms"),
             )
+        if record_type == "destination_result":
+            if self.run.mode != "cp":
+                raise SyqProtocolError(
+                    "an rm automation stream contains a destination result"
+                )
+            destination_count = sum(
+                endpoint.role is EndpointRole.DESTINATION
+                for endpoint in self.run.endpoints
+            )
+            if destination_count <= 1:
+                raise SyqProtocolError(
+                    "a one-target copy contains a destination result"
+                )
+            destination_index = _destination_index(record, self.run)
+            if destination_index is None:
+                raise SyqProtocolError(
+                    "a destination result has no destination_index"
+                )
+            if destination_index in self._destination_results:
+                raise SyqProtocolError(
+                    f"destination {destination_index} has more than one result"
+                )
+            expected_index = len(self._destination_results)
+            if destination_index != expected_index:
+                raise SyqProtocolError(
+                    "destination results are not in run destination order"
+                )
+            status = _enum(record, "status", OperationStatus)
+            exit_code = _integer(record, "exit_code")
+            allowed_exit_codes = {
+                OperationStatus.SUCCESS: {0},
+                OperationStatus.PARTIAL: {23},
+                OperationStatus.REFUSED: {25},
+                OperationStatus.ABORTED: {1},
+                OperationStatus.FAILED: {1},
+            }
+            if exit_code not in allowed_exit_codes[status]:
+                raise SyqProtocolError(
+                    "destination status disagrees with its exit_code"
+                )
+            dry_run = _boolean(record, "dry_run")
+            if dry_run != self.run.dry_run:
+                raise SyqProtocolError(
+                    "destination result dry_run disagrees with the run record"
+                )
+            deletion_values = tuple(
+                _optional_integer(record, field)
+                for field in (
+                    "deletions_planned",
+                    "deletions_completed",
+                    "deletions_blocked",
+                )
+            )
+            if self.run.prune and any(value is None for value in deletion_values):
+                raise SyqProtocolError(
+                    "a prune destination result must contain every deletion total"
+                )
+            if not self.run.prune and any(
+                value is not None for value in deletion_values
+            ):
+                raise SyqProtocolError(
+                    "a non-prune destination result may not contain deletion totals"
+                )
+            self._destination_results.add(destination_index)
+            return DestinationResult(
+                **common,
+                destination_index=destination_index,
+                status=status,
+                exit_code=exit_code,
+                dry_run=dry_run,
+                files_transferred=_integer(record, "files_transferred"),
+                files_unchanged=_integer(record, "files_unchanged"),
+                files_excluded=_integer(record, "files_excluded"),
+                directories_created=_integer(record, "directories_created"),
+                symlinks_created=_integer(record, "symlinks_created"),
+                specials_created=_integer(record, "specials_created"),
+                errors=_integer(record, "errors"),
+                bytes_transferred=_integer(record, "bytes_transferred"),
+                bytes_unchanged=_integer(record, "bytes_unchanged"),
+                elapsed_ms=_integer(record, "elapsed_ms"),
+                deletions_planned=deletion_values[0],
+                deletions_completed=deletion_values[1],
+                deletions_blocked=deletion_values[2],
+            )
         if record_type == "trace":
             if self.run.mode != "cp":
                 raise SyqProtocolError("an rm automation stream contains a cp trace")
@@ -343,6 +444,7 @@ class AutomationDecoder:
                 raise SyqProtocolError("a live automation stream contains a trace")
             return TraceEvent(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 action=_enum(record, "action", OperationAction),
                 dst=_tagged(record.get("dst"), label="dst"),
                 src=_tagged(record["src"], label="src") if "src" in record else None,
@@ -373,6 +475,7 @@ class AutomationDecoder:
                 )
             return OperationResult(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 action=_enum(record, "action", OperationAction),
                 dst=_tagged(record.get("dst"), label="dst"),
                 src=_tagged(record["src"], label="src") if "src" in record else None,
@@ -502,6 +605,7 @@ class AutomationDecoder:
                 )
             event = ErrorEvent(
                 **common,
+                destination_index=_destination_index(record, self.run),
                 message=_string(record, "message"),
                 class_=_optional_enum(record, "class", ErrorClass),
                 os_kind=_optional_enum(record, "os_kind", OsKind),
@@ -784,6 +888,16 @@ class AutomationDecoder:
             )
             provenance = _attested_provenance(record, "result")
             attested = provenance is not None
+            destination_count = sum(
+                endpoint.role is EndpointRole.DESTINATION
+                for endpoint in self.run.endpoints
+            )
+            if destination_count > 1 and self._destination_results != set(
+                range(destination_count)
+            ):
+                raise SyqProtocolError(
+                    "a multi-target result does not have one result per destination"
+                )
             if attested:
                 # A receipt attests settled deletions (deletions_completed);
                 # it cannot vouch for planning or --max-delete blocking, so

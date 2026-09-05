@@ -14,6 +14,9 @@
       "$ref": "#/$defs/progress"
     },
     {
+      "$ref": "#/$defs/destination_result"
+    },
+    {
       "$ref": "#/$defs/trace"
     },
     {
@@ -301,6 +304,9 @@
         "type": {
           "const": "progress"
         },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
+        },
         "bytes_done": {
           "$ref": "#/$defs/u64"
         },
@@ -346,6 +352,96 @@
       ],
       "additionalProperties": false
     },
+    "destination_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "type": "object",
+      "properties": {
+        "schema": true,
+        "schema_version": true,
+        "seq": true,
+        "type": {
+          "const": "destination_result"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
+        },
+        "status": {
+          "enum": [
+            "success",
+            "partial",
+            "refused",
+            "aborted",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "files_transferred": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "files_excluded": {
+          "$ref": "#/$defs/u64"
+        },
+        "directories_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "symlinks_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "specials_created": {
+          "$ref": "#/$defs/u64"
+        },
+        "errors": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_transferred": {
+          "$ref": "#/$defs/u64"
+        },
+        "bytes_unchanged": {
+          "$ref": "#/$defs/u64"
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_planned": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_completed": {
+          "$ref": "#/$defs/u64"
+        },
+        "deletions_blocked": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "destination_index",
+        "status",
+        "exit_code",
+        "dry_run",
+        "files_transferred",
+        "files_unchanged",
+        "files_excluded",
+        "directories_created",
+        "symlinks_created",
+        "specials_created",
+        "errors",
+        "bytes_transferred",
+        "bytes_unchanged",
+        "elapsed_ms"
+      ],
+      "additionalProperties": false
+    },
     "trace": {
       "allOf": [
         {
@@ -359,6 +455,9 @@
         "seq": true,
         "type": {
           "const": "trace"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
         },
         "action": {
           "$ref": "#/$defs/action"
@@ -428,6 +527,9 @@
         "seq": true,
         "type": {
           "const": "operation_result"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
         },
         "action": {
           "$ref": "#/$defs/action"
@@ -714,6 +816,9 @@
         "seq": true,
         "type": {
           "const": "error"
+        },
+        "destination_index": {
+          "$ref": "#/$defs/u64"
         },
         "message": {
           "type": "string"

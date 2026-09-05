@@ -15,6 +15,7 @@
         "src-file",
         "src-dir",
         "to",
+        "tos",
         "into",
         "into-new",
         "into-existing",

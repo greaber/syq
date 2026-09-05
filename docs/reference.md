@@ -16,6 +16,7 @@ and destination placement in separate arguments:
 
 ```sh
 syq cp project --to server --into /backup       # named object → /backup/project
+syq cp project --tos server-a server-b --into /backup # one copy → both targets
 syq cp --srcs-in project --to server --into /app # project contents → /app
 syq cp --from server --cwd /data --src a --src b --into ./data
 syq cp --from server:2222 data --to backup:2200 --into /archive
@@ -53,7 +54,8 @@ guesses endpoints from path text.
 
 In `cp`, finish the source specification before starting the destination. The
 source endpoint, `--cwd` or `--root`, every positional or `--src*` selector,
-and `--mapping` must all appear before the first `--to` or placement option.
+and `--mapping` must all appear before the first `--to`, `--tos`, or placement
+option.
 Other options remain order-independent, so flags such as `--dry-run` may still
 follow the placement. This rule makes every bare path's role clear and applies
 equally to local and remote copies.
@@ -67,6 +69,69 @@ A contents selector (`--srcs-in DIR`) may point outside the base instead.
 With `--root DIR` in place of `--cwd`, all three commands require relative
 selectors that stay beneath `DIR`; absolute paths, `~` paths, and `..` that
 would leave it are refused before anything changes.
+
+`cp` can coordinate several remote targets from one local source. Each `--to`
+or `--tos` starts a target group, followed by that group's placement:
+
+```sh
+syq cp --srcs-in build --tos edge-a edge-b edge-c --into /srv/app
+syq cp --srcs-in build \
+  --to edge-a --into-new /srv/app-a \
+  --tos edge-b edge-c --into-existing /opt/app
+```
+
+The placement is exactly one of `--into`, `--into-new`, `--into-existing`,
+`--as`, `--as-new`, or `--as-existing`. It must follow its `--to` or `--tos`
+group and come before the next group. `--tos` takes one or more endpoints and
+stops at the next option; every endpoint in the group shares its eventual
+placement. Target groups may use different paths and placement preconditions.
+Targets keep their command-line order, and naming the same parsed user, host,
+and port twice is an error. A local copy has no target group and keeps its
+single placement form.
+
+The target connections are opened concurrently. Each target opens the selected
+local source before scanning, so replacing a source path afterward cannot
+redirect the copy. One target walks the source and shares that list with the
+others. Before making any destination changes, SYQ waits for every target to
+connect, check its placement, plan the complete copy, and check the capacity of
+a new target. A failure before this point leaves every target unchanged. This
+is not a distributed transaction: a connection or filesystem failure later can
+leave some targets complete and others partial, and `--prune` planning and
+removal run after each target's file transfers. Rerunning the same command
+safely converges the targets unless its placement is new-only. After a partial
+`--into-new` or `--as-new` run, inspect the targets and retry with `--into` or
+`--as`, respectively: the successful targets now exist, so the original
+new-only precondition cannot be reused.
+
+A target that finishes with some file errors (exit 23), or refuses its deletion
+phase because of `--max-delete` (exit 25), does not stop the other targets. A
+fatal setup, connection, or filesystem failure (exit 1) cancels unfinished
+targets, interrupting their active SSH sessions and TCP connections as well
+as pending transfer work. Copies they have already completed remain in place; syq does not roll
+them back. The command returns the most severe target outcome: 1 takes
+precedence over 23, which takes precedence over 25, which takes precedence over
+success (0).
+
+Multi-target copies support the ordinary local-source `cp` options, including
+`--root`, directional link following, `--mapping` (stdin is acquired once),
+`--inplace`, `--prune`, dry runs, filtering and preservation, progress, stats,
+and automation results. Without `--connections`, each destination tunes its
+own connection count for its path. An explicit `--connections` value is one
+budget divided among targets, and a value smaller than the number of targets
+is refused. `--bwlimit` is likewise one aggregate file-data limit. Human
+progress has one labelled row per destination; progress JSON has one record
+per destination with its label and zero-based index. Human summaries are also
+labelled by destination. Multi-target commands reuse persistent SSH masters,
+but open their own helper sessions so cancellation can close them. `--results` and `--results-fd` produce one stream; its
+run record lists all destinations and each target-specific progress, trace,
+operation, or error carries a zero-based `destination_index` into that ordered
+destination list. A `destination_result` records each target's outcome before
+the final aggregate `result` seals the stream.
+
+Multi-target copies require a local source. A command with both a remote source
+and multiple targets is rejected. Options that apply only to a direct copy
+between two remote hosts, including receiver ceilings, receipts, detached mode,
+and agent-forwarding controls, therefore remain single-target options.
 
 Bare paths and repeatable `--src PATH` select named objects (an object is a
 file, directory, symlink, or special file). A named directory keeps its

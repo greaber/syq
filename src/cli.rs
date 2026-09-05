@@ -30,6 +30,16 @@ pub enum Existence {
     Existing,
 }
 
+/// One additional destination in a coordinated native copy. The first
+/// destination retains the ordinary `Args` fields so single-target execution
+/// does not pay for a separate representation.
+#[derive(Debug, Clone)]
+pub struct FanoutTarget {
+    pub location: Location,
+    pub placement: Placement,
+    pub target_existence: Existence,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SourceSelection {
     #[default]
@@ -78,6 +88,17 @@ pub struct Args {
     /// Native parsing keeps endpoints separate from raw Unix path bytes.
     #[arg(skip)]
     pub locations: Vec<Location>,
+    /// Additional destinations for a coordinated native copy. `locations`
+    /// retains the first destination for the ordinary single-target engine.
+    #[arg(skip)]
+    pub fanout_targets: Vec<FanoutTarget>,
+    /// Runtime-only coordination shared by the single-target engines in a
+    /// fan-out operation.
+    #[arg(skip)]
+    pub fanout_run: Option<crate::fanout::RunContext>,
+    /// Mapping bytes acquired once before fan-out members start.
+    #[arg(skip)]
+    pub fanout_mapping: Option<std::sync::Arc<Vec<u8>>>,
     /// Endpoint-side base for native removal. Unlike copy's `--cwd`, this is
     /// not joined into selector strings by the coordinator.
     #[arg(skip)]
@@ -891,30 +912,33 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Target endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Target endpoint ([USER@]HOST[:PORT]); starts a destination group
     #[arg(long, value_name = "ENDPOINT")]
-    to: Option<String>,
+    to: Vec<String>,
+    /// Target endpoints ([USER@]HOST[:PORT]...) that share one following placement
+    #[arg(long, value_name = "ENDPOINT", num_args = 1..)]
+    tos: Vec<String>,
     /// Follow symlinks in directly supplied destination paths
     #[arg(long)]
     follow_dst: bool,
     /// Put selected names inside DIR, creating it if necessary
-    #[arg(long, value_name = "DIR", group = "placement")]
-    into: Option<OsString>,
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    into: Vec<OsString>,
     /// Put selected names inside DIR, which must not exist
-    #[arg(long, value_name = "DIR", group = "placement")]
-    into_new: Option<OsString>,
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    into_new: Vec<OsString>,
     /// Put selected names inside an existing directory
-    #[arg(long, value_name = "DIR", group = "placement")]
-    into_existing: Option<OsString>,
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    into_existing: Vec<OsString>,
     /// Map one named source exactly to PATH; never follow its final entry
-    #[arg(long, value_name = "PATH", group = "placement")]
-    r#as: Option<OsString>,
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    r#as: Vec<OsString>,
     /// Map one named source exactly to PATH; its final entry must not exist and is never followed
-    #[arg(long, value_name = "PATH", group = "placement")]
-    as_new: Option<OsString>,
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    as_new: Vec<OsString>,
     /// Map one named source exactly to PATH; its final entry must exist and is never followed
-    #[arg(long, value_name = "PATH", group = "placement")]
-    as_existing: Option<OsString>,
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    as_existing: Vec<OsString>,
     /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin), acquired before
     /// destination changes, instead of selecting sources; entry src paths are relative to
     /// -C and dst paths are relative to the --into container
@@ -941,8 +965,8 @@ struct NativeSizeSelectionArgs {
     name = "syq cp",
     version,
     about = "Copy selected objects with explicit endpoint and placement syntax",
-    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
+    long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to, --tos, or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    override_usage = "syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT\n       syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... (--to ENDPOINT | --tos ENDPOINT...) PLACEMENT..."
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -966,6 +990,7 @@ struct NativeCopyCommand {
 fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()> {
     const DESTINATION_ARGUMENTS: &[(&str, &str)] = &[
         ("to", "--to"),
+        ("tos", "--tos"),
         ("into", "--into"),
         ("into_new", "--into-new"),
         ("into_existing", "--into-existing"),
@@ -1162,22 +1187,201 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
             decode_one(value)?;
         }
     }
-    for value in [
-        source.cwd.as_mut(),
-        source.root.as_mut(),
-        copy.into.as_mut(),
-        copy.into_new.as_mut(),
-        copy.into_existing.as_mut(),
-        copy.r#as.as_mut(),
-        copy.as_new.as_mut(),
-        copy.as_existing.as_mut(),
-    ]
-    .into_iter()
-    .flatten()
+    for value in [source.cwd.as_mut(), source.root.as_mut()]
+        .into_iter()
+        .flatten()
     {
         decode_one(value)?;
     }
+    for list in [
+        &mut copy.into,
+        &mut copy.into_new,
+        &mut copy.into_existing,
+        &mut copy.r#as,
+        &mut copy.as_new,
+        &mut copy.as_existing,
+    ] {
+        for value in list {
+            decode_one(value)?;
+        }
+    }
     Ok(())
+}
+
+#[derive(Debug)]
+struct NativeTargetGroup {
+    index: usize,
+    option: &'static str,
+    endpoints: Vec<(String, Option<NativeEndpoint>)>,
+}
+
+#[derive(Debug, Clone)]
+struct NativePlacementSpec {
+    index: usize,
+    option: &'static str,
+    path: Vec<u8>,
+    placement: Placement,
+    target_existence: Existence,
+}
+
+#[derive(Debug)]
+enum NativeDestinationEvent {
+    Targets(NativeTargetGroup),
+    Placement(NativePlacementSpec),
+}
+
+impl NativeDestinationEvent {
+    fn index(&self) -> usize {
+        match self {
+            Self::Targets(group) => group.index,
+            Self::Placement(spec) => spec.index,
+        }
+    }
+}
+
+fn native_target_groups(matches: &clap::ArgMatches) -> Result<Vec<NativeTargetGroup>> {
+    let mut groups = Vec::new();
+    for (id, option) in [("to", "--to"), ("tos", "--tos")] {
+        let Some(occurrences) = matches.get_occurrences::<String>(id) else {
+            continue;
+        };
+        let mut indices = matches
+            .indices_of(id)
+            .expect("an endpoint occurrence has value indices");
+        for occurrence in occurrences {
+            let mut index = None;
+            let mut endpoints = Vec::new();
+            for endpoint in occurrence {
+                let value_index = indices.next().expect("each endpoint value has an index");
+                index.get_or_insert(value_index);
+                endpoints.push((
+                    endpoint.clone(),
+                    parse_native_endpoint(Some(endpoint.as_str()))?,
+                ));
+            }
+            groups.push(NativeTargetGroup {
+                index: index.expect("an endpoint occurrence has at least one value"),
+                option,
+                endpoints,
+            });
+        }
+        debug_assert!(indices.next().is_none());
+    }
+    groups.sort_by_key(|group| group.index);
+    Ok(groups)
+}
+
+fn native_placement_specs(
+    matches: &clap::ArgMatches,
+    placements: [(&'static str, Vec<OsString>, Placement, Existence); 6],
+) -> Result<Vec<NativePlacementSpec>> {
+    let mut specs = Vec::new();
+    for (id, paths, placement, target_existence) in placements {
+        let option = match id {
+            "into" => "--into",
+            "into_new" => "--into-new",
+            "into_existing" => "--into-existing",
+            "as" => "--as",
+            "as_new" => "--as-new",
+            "as_existing" => "--as-existing",
+            _ => unreachable!("all placement argument IDs are known"),
+        };
+        let indices = matches.indices_of(id).into_iter().flatten();
+        for (index, path) in indices.zip(paths) {
+            let path = trim_native_trailing_slashes(path.into_vec());
+            if path.is_empty() {
+                bail!("target paths may not be empty");
+            }
+            specs.push(NativePlacementSpec {
+                index,
+                option,
+                path,
+                placement,
+                target_existence,
+            });
+        }
+    }
+    specs.sort_by_key(|spec| spec.index);
+    Ok(specs)
+}
+
+fn lower_native_destinations(
+    target_groups: Vec<NativeTargetGroup>,
+    placement_specs: Vec<NativePlacementSpec>,
+) -> Result<Vec<FanoutTarget>> {
+    if target_groups.is_empty() {
+        return match placement_specs.as_slice() {
+            [] => bail!(
+                "syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
+            ),
+            [spec] => Ok(vec![FanoutTarget {
+                location: Location::native(None, spec.path.clone(), SourceSelection::Named),
+                placement: spec.placement,
+                target_existence: spec.target_existence,
+            }]),
+            _ => bail!("a local copy takes exactly one placement"),
+        };
+    }
+
+    let mut events = Vec::with_capacity(target_groups.len() + placement_specs.len());
+    events.extend(
+        target_groups
+            .into_iter()
+            .map(NativeDestinationEvent::Targets),
+    );
+    events.extend(
+        placement_specs
+            .into_iter()
+            .map(NativeDestinationEvent::Placement),
+    );
+    events.sort_by_key(NativeDestinationEvent::index);
+
+    let mut pending: Option<NativeTargetGroup> = None;
+    let mut seen_endpoints: Vec<Option<NativeEndpoint>> = Vec::new();
+    let mut destinations = Vec::new();
+    for event in events {
+        match event {
+            NativeDestinationEvent::Targets(group) => {
+                if let Some(previous) = &pending {
+                    bail!(
+                        "{} target group requires a placement before the next --to or --tos",
+                        previous.option
+                    );
+                }
+                pending = Some(group);
+            }
+            NativeDestinationEvent::Placement(spec) => {
+                let Some(group) = pending.take() else {
+                    bail!(
+                        "{} must follow the --to or --tos target group it describes",
+                        spec.option
+                    );
+                };
+                for (spelling, endpoint) in group.endpoints {
+                    if seen_endpoints.contains(&endpoint) {
+                        bail!("duplicate target endpoint {spelling:?}");
+                    }
+                    seen_endpoints.push(endpoint.clone());
+                    destinations.push(FanoutTarget {
+                        location: Location::native(
+                            endpoint,
+                            spec.path.clone(),
+                            SourceSelection::Named,
+                        ),
+                        placement: spec.placement,
+                        target_existence: spec.target_existence,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(group) = pending {
+        bail!(
+            "{} target group requires a following placement (--into, --into-new, --into-existing, --as, --as-new, or --as-existing)",
+            group.option
+        );
+    }
+    Ok(destinations)
 }
 
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
@@ -1202,6 +1406,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     if copy.delegated_operands_b64 {
         decode_delegated_operands(&mut copy)?;
     }
+    let target_groups = native_target_groups(&matches)?;
     let mapping = copy.mapping.take();
     let results = copy.results_output.results.take();
     let results_fd = copy.results_output.results_fd.take();
@@ -1230,30 +1435,46 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         lower_native_selection(&copy.selection, &matches)?
     };
 
-    let placements = [
-        (copy.into, Placement::Into, Existence::Any),
-        (copy.into_new, Placement::Into, Existence::New),
-        (copy.into_existing, Placement::Into, Existence::Existing),
-        (copy.r#as, Placement::As, Existence::Any),
-        (copy.as_new, Placement::As, Existence::New),
-        (copy.as_existing, Placement::As, Existence::Existing),
-    ];
-    let (target, placement, existence) = match placements
-        .into_iter()
-        .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
+    let placement_specs = native_placement_specs(
+        &matches,
+        [
+            ("into", copy.into, Placement::Into, Existence::Any),
+            ("into_new", copy.into_new, Placement::Into, Existence::New),
+            (
+                "into_existing",
+                copy.into_existing,
+                Placement::Into,
+                Existence::Existing,
+            ),
+            ("as", copy.r#as, Placement::As, Existence::Any),
+            ("as_new", copy.as_new, Placement::As, Existence::New),
+            (
+                "as_existing",
+                copy.as_existing,
+                Placement::As,
+                Existence::Existing,
+            ),
+        ],
+    )?;
+    let mut destinations = lower_native_destinations(target_groups, placement_specs)?;
+    if destinations
+        .iter()
+        .any(|destination| destination.placement == Placement::As)
+        && mapping.is_some()
     {
-        Some((path, placement, existence)) => (Some(path), placement, existence),
-        None => bail!(
-            "syq cp requires one of --into, --into-new, --into-existing, --as, --as-new, or --as-existing"
-        ),
-    };
-    if placement == Placement::As && mapping.is_some() {
         bail!("--as conflicts with --mapping: each entry's dst is its own --as");
     }
-    if placement == Placement::As && (locations.len() != 1 || locations[0].copies_contents()) {
+    if destinations
+        .iter()
+        .any(|destination| destination.placement == Placement::As)
+        && (locations.len() != 1 || locations[0].copies_contents())
+    {
         bail!("--as, --as-new, and --as-existing require exactly one ordinary source object");
     }
-    if placement == Placement::Into {
+    if destinations
+        .iter()
+        .any(|destination| destination.placement == Placement::Into)
+    {
         for source in locations.iter().filter(|source| !source.copies_contents()) {
             if native_basename(&source.path).is_none() {
                 bail!(
@@ -1263,29 +1484,15 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             }
         }
     }
-    let target = match target {
-        Some(target) => {
-            let target = trim_native_trailing_slashes(target.into_vec());
-            if target.is_empty() {
-                bail!("target paths may not be empty");
-            }
-            Some(target)
-        }
-        None => None,
-    };
-    let target = target.expect("copy placement parsed with a target");
-    let target_endpoint = parse_native_endpoint(copy.to.as_deref())?;
-    locations.push(Location::native(
-        target_endpoint,
-        target,
-        SourceSelection::Named,
-    ));
+    let first_destination = destinations.remove(0);
+    locations.push(first_destination.location);
 
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeCp;
-    args.placement = placement;
-    args.target_existence = existence;
+    args.placement = first_destination.placement;
+    args.target_existence = first_destination.target_existence;
     args.locations = locations;
+    args.fanout_targets = destinations;
     args.delete = prune;
     args.max_delete = max_delete;
     args.max_size = size_selection.max_size;
@@ -1317,6 +1524,22 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
+    if !args.fanout_targets.is_empty() {
+        let target_count = args.fanout_targets.len() + 1;
+        if let Some(connections) = args.connections_opt.filter(|value| *value < target_count) {
+            bail!(
+                "--connections {connections} is smaller than the {target_count} target endpoints; allow at least one worker per target"
+            );
+        }
+        if args.locations.first().is_some_and(Location::is_remote) {
+            bail!(
+                "multiple target endpoints require a local source; remote-source fan-out needs multi-destination credential confinement"
+            );
+        }
+        if args.coordinate_at != CoordinateAt::Auto {
+            bail!("--coordinate-at applies only to copies between two remote endpoints");
+        }
+    }
     if args.receiver_max_entries.is_some()
         || args.receiver_max_bytes.is_some()
         || args.receiver_receipt.is_some()
@@ -2167,8 +2390,8 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
-        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Placement,
-        SourceSelection,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Existence,
+        Placement, SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
@@ -2534,6 +2757,10 @@ mod tests {
                 "a positional source",
             ),
             (
+                vec!["source", "--tos=target.test", "extra", "--into", "dest"],
+                "a positional source",
+            ),
+            (
                 vec![
                     "source",
                     "--to",
@@ -2560,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn native_operational_options_may_follow_destination_arguments() {
+    fn native_operational_options_may_follow_dstination_arguments() {
         let argv = [
             "one",
             "--cwd",
@@ -2587,6 +2814,114 @@ mod tests {
         assert_eq!(args.locations[1].path, b"dest");
         assert!(args.dry_run);
         assert!(args.native_follow_src);
+    }
+
+    #[test]
+    fn native_target_groups_keep_command_line_order_and_placement() {
+        let argv = [
+            "source",
+            "--tos",
+            "alpha",
+            "beta",
+            "--into",
+            "shared",
+            "--to",
+            "gamma:2222",
+            "--into-new",
+            "new",
+            "--to",
+            "delta",
+            "--as-existing",
+            "exact",
+        ]
+        .map(std::ffi::OsString::from);
+        let args = parse_native_copy(&argv).unwrap();
+        assert_eq!(
+            args.locations.last().unwrap().host.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(args.locations.last().unwrap().path, b"shared");
+        assert_eq!(args.placement, Placement::Into);
+        assert_eq!(args.target_existence, Existence::Any);
+        assert_eq!(args.fanout_targets.len(), 3);
+        let beta = &args.fanout_targets[0];
+        assert_eq!(beta.location.host.as_deref(), Some("beta"));
+        assert_eq!(beta.location.path, b"shared");
+        assert_eq!(beta.placement, Placement::Into);
+        assert_eq!(beta.target_existence, Existence::Any);
+        let gamma = &args.fanout_targets[1];
+        assert_eq!(gamma.location.host.as_deref(), Some("gamma"));
+        assert_eq!(gamma.location.port, Some(2222));
+        assert_eq!(gamma.location.path, b"new");
+        assert_eq!(gamma.placement, Placement::Into);
+        assert_eq!(gamma.target_existence, Existence::New);
+        let delta = &args.fanout_targets[2];
+        assert_eq!(delta.location.host.as_deref(), Some("delta"));
+        assert_eq!(delta.location.path, b"exact");
+        assert_eq!(delta.placement, Placement::As);
+        assert_eq!(delta.target_existence, Existence::Existing);
+    }
+
+    #[test]
+    fn native_target_endpoints_reject_duplicates_across_forms() {
+        let argv = [
+            "source", "--to", "alpha", "--into", "one", "--tos", "beta", "alpha", "--into", "two",
+        ]
+        .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv).unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate target endpoint \"alpha\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_remote_placement_must_follow_its_target_group() {
+        let argv = ["source", "--into", "dest", "--to", "alpha"].map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv).unwrap_err().to_string();
+        assert!(
+            error.contains("--into must follow the --to or --tos target group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_target_groups_each_need_exactly_one_placement() {
+        let argv = ["source", "--to", "alpha", "--to", "beta", "--into", "dest"]
+            .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv).unwrap_err().to_string();
+        assert!(
+            error.contains("--to target group requires a placement before the next"),
+            "{error}"
+        );
+
+        let argv = ["source", "--to", "alpha", "--into", "one", "--into", "two"]
+            .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv).unwrap_err().to_string();
+        assert!(
+            error.contains("--into must follow the --to or --tos target group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_target_endpoints_need_one_connection_each() {
+        let argv = [
+            "source",
+            "--tos",
+            "alpha",
+            "beta",
+            "--connections",
+            "1",
+            "--into",
+            "dest",
+        ]
+        .map(std::ffi::OsString::from);
+        let error = parse_native_copy(&argv).unwrap_err().to_string();
+        assert!(
+            error.contains("smaller than the 2 target endpoints"),
+            "{error}"
+        );
     }
 }
 

@@ -600,6 +600,7 @@ def _copy_arguments(
     follow_src: bool,
     follow_dst: bool,
     to: str | None,
+    tos: Iterable[str] | None,
     into: PathArgument | None,
     into_new: PathArgument | None,
     into_existing: PathArgument | None,
@@ -654,8 +655,22 @@ def _copy_arguments(
     source_end = len(argv)
     if follow_dst:
         argv.append("--follow-dst")
-    if to is not None:
-        argv.extend(("--to", _text_arg(to, label="to")))
+    to_endpoint = _text_arg(to, label="to") if to is not None else None
+    tos_endpoints: tuple[str, ...] = ()
+    if tos is not None:
+        if isinstance(tos, str):
+            raise TypeError("tos must be an iterable of endpoint strings, not one string")
+        endpoints = tuple(tos)
+        tos_endpoints = tuple(
+            _text_arg(endpoint, label=f"tos[{index}]")
+            for index, endpoint in enumerate(endpoints)
+        )
+    if to_endpoint is not None and tos_endpoints:
+        argv.extend(("--tos", to_endpoint, *tos_endpoints))
+    elif to_endpoint is not None:
+        argv.extend(("--to", to_endpoint))
+    elif tos_endpoints:
+        argv.extend(("--tos", *tos_endpoints))
     placements = [
         ("--into", into),
         ("--into-new", into_new),
@@ -1009,6 +1024,7 @@ class Client:
         follow_src: bool = False,
         follow_dst: bool = False,
         to: str | None = None,
+        tos: Iterable[str] | None = None,
         into: PathArgument | None = None,
         into_new: PathArgument | None = None,
         into_existing: PathArgument | None = None,
@@ -1074,6 +1090,7 @@ class Client:
             follow_src=follow_src,
             follow_dst=follow_dst,
             to=to,
+            tos=tos,
             into=into,
             into_new=into_new,
             into_existing=into_existing,
@@ -1256,6 +1273,7 @@ class Client:
             follow_src=follow_src,
             follow_dst=False,
             to=None,
+            tos=None,
             into=None,
             into_new=None,
             into_existing=None,

@@ -86,6 +86,7 @@ pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
     tune_cv: Condvar,
+    fanout: Mutex<Option<std::sync::Weak<crate::fanout::Group>>>,
     direct_fallback_workers: AtomicUsize,
     tune_request: AtomicUsize,
     pub jobs: Mutex<Vec<FileJob>>,
@@ -112,6 +113,7 @@ impl Sched {
             }),
             cv: Condvar::new(),
             tune_cv: Condvar::new(),
+            fanout: Mutex::new(None),
             direct_fallback_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
             jobs: Mutex::new(Vec::new()),
@@ -219,9 +221,30 @@ impl Sched {
     }
 
     pub fn abort(&self) {
+        self.abort_from_fanout();
+        let fanout = self.fanout.lock().unwrap().clone();
+        if let Some(group) = fanout.and_then(|group| group.upgrade()) {
+            group.cancel();
+        }
+    }
+
+    pub(crate) fn attach_fanout(&self, group: std::sync::Weak<crate::fanout::Group>) {
+        *self.fanout.lock().unwrap() = Some(group);
+    }
+
+    pub(crate) fn abort_from_fanout(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
         self.tune_cv.notify_one();
+    }
+
+    /// Backoff and bandwidth waits must release promptly on peer failure.
+    pub fn wait_for_abort(&self, duration: Duration) -> bool {
+        self.cv
+            .wait_timeout_while(self.inner.lock().unwrap(), duration, |inner| !inner.abort)
+            .unwrap()
+            .0
+            .abort
     }
 
     pub fn is_aborted(&self) -> bool {

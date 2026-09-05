@@ -54,6 +54,7 @@ learn a second set of names for concepts that syq already names.
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
 | `--from` | `from_=` |
+| `--tos` | `tos=` |
 | `--as` | `as_=` |
 | `class` event field | `class_` attribute |
 
@@ -143,6 +144,21 @@ syq.cp(
 )
 ```
 
+Pass `tos=` an iterable for a coordinated local-source copy to several
+destinations. When both are present, the client combines `to=` and `tos=` into
+one native `--tos` group sharing the requested placement. Progress, operation,
+trace, and error events expose their optional `destination_index`, and each
+target finishes with a `DestinationResult` before the aggregate `CpResult`:
+
+```python
+syq.cp(
+    "project",
+    to="edge-a",
+    tos=["edge-b", "edge-c"],
+    into="/backup",
+)
+```
+
 `cp` returns only after it has received and validated the terminal result and
 reaped the process. By default, a non-successful terminal result raises
 `SyqOperationError`; the exception retains the same typed result. Pass
@@ -204,6 +220,7 @@ syq.cp(
     follow_src=False,
     follow_dst=False,
     to=None,
+    tos=None,
     into=None,
     into_new=None,
     into_existing=None,
@@ -563,7 +580,8 @@ supplies the shared execution trace and terminal result.
 
 Typed operations consume the stable automation stream. `on_event` receives
 frozen dataclasses corresponding to its known records: `RunEvent`, sampled
-`ProgressEvent`, copy `TraceEvent` or `OperationResult`, removal
+`ProgressEvent`, copy `TraceEvent`, `OperationResult`, or
+`DestinationResult`, removal
 `SelectionResult`, `RemovalTrace`, or `RemovalResult` (including inspection
 failures during a preview), `ErrorEvent`,
 receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.

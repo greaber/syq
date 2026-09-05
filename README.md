@@ -37,7 +37,8 @@ fast with `syq persist on`; see the [installation guide](https://greaber.github.
 syq rsync -av project/ server:backup/project/      # rsync syntax: push
 syq rsync -av server:data/ ./data/                 # pull
 syq rsync -a --dry-run -v src/ host:dst/           # preview; change nothing
-syq cp project --to server --into /backup          # native mode → /backup/project
+syq cp project --to server --into /backup          # native syntax → /backup/project
+syq cp project --tos server-a server-b --into /backup  # one coordinated copy → both
 syq cp --from hostA --srcs-in big --to hostB --into big   # direct server-to-server
 syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
 syq rm old-output --results removal.ndjson         # structured per-path outcomes

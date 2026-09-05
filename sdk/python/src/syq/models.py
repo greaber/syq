@@ -281,6 +281,7 @@ class ProgressEvent:
     scanned: int
     scan_done: bool
     elapsed_ms: int
+    destination_index: int | None = None
     type: str = "progress"
 
 
@@ -295,6 +296,7 @@ class TraceEvent:
     kind: EntryKind
     bytes: int | None
     reason: TraceReason
+    destination_index: int | None = None
     type: str = "trace"
 
 
@@ -314,6 +316,7 @@ class OperationResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
+    destination_index: int | None = None
     provenance: str | None = None
     scope: int | None = None
     code: ReceiptCode | None = None
@@ -388,6 +391,7 @@ class ErrorEvent:
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
+    destination_index: int | None = None
     provenance: str | None = None
     code: ReceiptCode | None = None
     type: str = "error"
@@ -480,6 +484,33 @@ class CpResult(OperationSummary):
 
 
 @dataclass(frozen=True, slots=True)
+class DestinationResult(OperationSummary):
+    """The settled outcome for one target in a multi-target copy."""
+
+    schema: str
+    schema_version: int
+    seq: int
+    destination_index: int
+    status: OperationStatus
+    exit_code: int
+    dry_run: bool
+    files_transferred: int
+    files_unchanged: int
+    files_excluded: int
+    directories_created: int
+    symlinks_created: int
+    specials_created: int
+    errors: int
+    bytes_transferred: int
+    bytes_unchanged: int
+    elapsed_ms: int
+    deletions_planned: int | None
+    deletions_completed: int | None
+    deletions_blocked: int | None
+    type: str = "destination_result"
+
+
+@dataclass(frozen=True, slots=True)
 class RmResult(OperationSummary):
     schema: str
     schema_version: int
@@ -503,6 +534,7 @@ class RmResult(OperationSummary):
 AutomationEvent = (
     RunEvent
     | ProgressEvent
+    | DestinationResult
     | TraceEvent
     | OperationResult
     | SelectionResult

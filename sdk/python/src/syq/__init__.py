@@ -15,6 +15,7 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    DestinationResult,
     Disposition,
     AttestedDigest,
     FinalObjectKind,
@@ -62,6 +63,7 @@ __all__ = [
     "AutomationEvent",
     "Client",
     "CpResult",
+    "DestinationResult",
     "Disposition",
     "AttestedDigest",
     "FinalObjectKind",

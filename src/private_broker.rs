@@ -14,14 +14,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
+static SIGNAL_CANCELLATIONS: Mutex<Vec<Weak<crate::cancellation::Cancellation>>> =
+    Mutex::new(Vec::new());
 static SIGNAL_CLEANUP_THREAD: OnceLock<io::Result<()>> = OnceLock::new();
 
-fn register_signal_cleanup(path: &Path) -> Result<()> {
+fn ensure_signal_cleanup() -> Result<()> {
     let paths = SIGNAL_CLEANUP_PATHS
         .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
         .clone();
@@ -35,6 +37,14 @@ fn register_signal_cleanup(path: &Path) -> Result<()> {
             .name("syq-broker-signal-cleanup".into())
             .spawn(move || {
                 if let Some(signal) = signals.forever().next() {
+                    for token in SIGNAL_CANCELLATIONS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                    {
+                        token.cancel();
+                    }
                     let paths: Vec<_> = cleanup_paths
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -53,7 +63,26 @@ fn register_signal_cleanup(path: &Path) -> Result<()> {
         return Err(io::Error::new(error.kind(), error.to_string()))
             .context("register private broker signal cleanup");
     }
-    paths
+    Ok(())
+}
+
+pub(crate) fn register_transfer_cancellation(
+    token: &Arc<crate::cancellation::Cancellation>,
+) -> Result<()> {
+    // Use the broker's existing signal handler so cleanup completes before
+    // the default action exits, including before any broker has been opened.
+    ensure_signal_cleanup()?;
+    let mut tokens = SIGNAL_CANCELLATIONS.lock().unwrap();
+    tokens.retain(|token| token.strong_count() != 0);
+    tokens.push(Arc::downgrade(token));
+    Ok(())
+}
+
+fn register_signal_cleanup(path: &Path) -> Result<()> {
+    ensure_signal_cleanup()?;
+    SIGNAL_CLEANUP_PATHS
+        .get()
+        .unwrap()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(path.to_path_buf());

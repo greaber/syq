@@ -84,6 +84,7 @@ pub struct Opts {
     pub dst_remote: bool,
     pub restricted_receiver: bool,
     pub dry_run: bool,
+    pub fanout: bool,
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
@@ -154,6 +155,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
+                cancellation: args
+                    .fanout_run
+                    .as_ref()
+                    .map(|run| run.group.cancellation.clone()),
             })
         }
     })
@@ -660,7 +665,7 @@ fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
 
 /// The endpoint half of a copy identity: `user@host[:port]` (the user and an
 /// explicit port matter — they may select different filesystems), or `local`.
-fn endpoint_identity(l: &Location) -> String {
+pub(crate) fn endpoint_identity(l: &Location) -> String {
     match (&l.user, &l.host) {
         (_, None) => "local".into(),
         (user, Some(host)) => {
@@ -699,6 +704,7 @@ pub(crate) fn path_identity(path: &std::path::Path) -> String {
     encoded
 }
 
+#[derive(Clone, Copy)]
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
@@ -839,6 +845,8 @@ fn small_copy_eligible(
         return false;
     }
     args.interface == Interface::NativeCp
+        // Fan-out must finish every target plan before any publication.
+        && args.fanout_run.is_none()
         && matches!(args.placement, Placement::Into | Placement::As)
         && args.target_existence == Existence::Any
         && dst.is_remote()
@@ -1139,6 +1147,7 @@ fn attempt_small_copy(
             progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
             if let Some(results) = progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
+                    destination_index: None,
                     action: "transfer_file",
                     dst: rel_bytes,
                     src: None,
@@ -1158,6 +1167,7 @@ fn attempt_small_copy(
         progress.files_done.fetch_add(1, Relaxed);
         if let Some(results) = progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
+                destination_index: None,
                 action: "transfer_file",
                 dst: rel_bytes,
                 src: None,
@@ -1351,10 +1361,16 @@ pub fn run(args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
-    // The detach and remote-coordinator combinations were refused at
-    // argument parsing (exit 2, no stream); every request that reaches this
-    // point settles with a terminal record.
-    if let Some(writer) = crate::results::start(
+    let fanout_run = args.fanout_run.clone();
+    if let Some(run) = &args.fanout_run {
+        progress.set_result_destination(run.destination_index);
+        progress.set_fanout_group(&run.group);
+        run.group
+            .register_progress(run.destination_index, &progress);
+        if let Some(writer) = run.group.results() {
+            progress.set_results(writer);
+        }
+    } else if let Some(writer) = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
             prune: args.delete,
@@ -1366,7 +1382,7 @@ pub fn run(args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let prune = args.delete;
     let outcome = run_transfer(args, Arc::clone(&progress));
-    if outcome.is_err() {
+    if let Err(error) = &outcome {
         // An error can unwind past run_transfer's own ticker shutdown; stop
         // it here so no progress render races the terminal record below
         // (the writer additionally seals itself after emit_result).
@@ -1374,30 +1390,22 @@ pub fn run(args: Args) -> Result<i32> {
         // The error text reaches stderr via main; the stream still gets its
         // terminal record so a consumer never mistakes a handled fatal for a
         // crash (only a real crash leaves the terminal record missing).
-        if let Some(results) = progress.results_writer() {
-            results.emit_result(&crate::results::ResultRecord {
-                status: "failed",
-                exit_code: 1,
-                dry_run,
-                files_transferred: progress.files_done.load(Relaxed),
-                files_unchanged: progress.files_unchanged.load(Relaxed),
-                files_excluded: progress.files_excluded.load(Relaxed),
-                // Mutations that settled (and streamed their records)
-                // before the run died must not vanish from the aggregates.
-                directories_created: progress.directories_created.load(Relaxed),
-                symlinks_created: progress.symlinks_created.load(Relaxed),
-                specials_created: progress.specials_created.load(Relaxed),
-                errors: progress.errors.load(Relaxed),
-                bytes_transferred: progress.bytes_done.load(Relaxed),
-                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                elapsed_ms: progress.start.elapsed().as_millis() as u64,
-                // What the deletion pass did before the run died; zeros
-                // mean it never got that far, and status "failed" already
-                // marks every aggregate here as pre-failure state.
-                deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
-                deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
-                deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
-            });
+        // Mutations and deletions that settled before the run died remain in
+        // this authoritative member record. Fan-out adds the fatal member
+        // error that its coordinator also writes to the shared error stream.
+        let terminal = progress.failed_result(dry_run, prune, u64::from(fanout_run.is_some()));
+        if let Some(run) = fanout_run {
+            if let Some(results) = progress.results_writer() {
+                results.emit_error_classified_for(
+                    &format!("syq: fan-out: target {}: {error:#}", run.label),
+                    None,
+                    None,
+                    Some(run.destination_index),
+                );
+            }
+            run.group.complete_member(run.destination_index, terminal);
+        } else if let Some(results) = progress.results_writer() {
+            results.emit_result(&terminal);
         }
     }
     outcome
@@ -1462,6 +1470,38 @@ fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
         .cloned()
 }
 
+/// Collapse exactly repeated native selectors in the same stable order used
+/// by planning. The original operand count remains separate because repeated
+/// operands still have multi-source placement semantics.
+pub(crate) fn deduplicate_native_sources(sources: &[Location]) -> Vec<Location> {
+    let mut seen_sources = std::collections::HashSet::new();
+    sources
+        .iter()
+        .filter(|source| seen_sources.insert((source.path.clone(), source.selection)))
+        .cloned()
+        .collect()
+}
+
+/// Acquire a native mapping through the operator-side control-path policy.
+/// Fan-out calls this once before starting members; a single-target run calls
+/// it in the ordinary engine before any destination can be created.
+pub(crate) fn read_native_mapping(args: &Args) -> Result<Option<Vec<u8>>> {
+    let Some(mapping) = args.native_mapping.as_deref() else {
+        return Ok(None);
+    };
+    let mut contents = Vec::new();
+    if mapping == b"-" {
+        std::io::stdin()
+            .read_to_end(&mut contents)
+            .context("--mapping -: read stdin")?;
+    } else {
+        crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(args))
+            .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
+            .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
+    }
+    Ok(Some(contents))
+}
+
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
@@ -1470,10 +1510,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
-    let bwlimit = (args.bwlimit_bytes > 0)
-        .then_some(args.bwlimit_bytes)
-        .map(BandwidthLimit::new)
-        .map(Arc::new);
+    let bwlimit = args
+        .fanout_run
+        .as_ref()
+        .and_then(|run| run.group.bandwidth())
+        .or_else(|| {
+            (args.bwlimit_bytes > 0)
+                .then_some(args.bwlimit_bytes)
+                .map(BandwidthLimit::new)
+                .map(Arc::new)
+        });
     let native_locations = !args.locations.is_empty();
     let locs: Vec<Location> = if !native_locations {
         args.paths
@@ -1540,12 +1586,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // commands.
     let multiple_source_operands = source_operand_count > 1;
     let srcs: Vec<Location> = if native_locations {
-        let mut seen_sources = std::collections::HashSet::new();
-        original_srcs
-            .iter()
-            .filter(|source| seen_sources.insert((source.path.clone(), source.selection)))
-            .cloned()
-            .collect()
+        deduplicate_native_sources(original_srcs)
     } else {
         let mut seen_sources = std::collections::HashSet::new();
         raw_source_operands
@@ -1670,6 +1711,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
         dry_run: args.dry_run,
+        fanout: args.fanout_run.is_some(),
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
@@ -1690,22 +1732,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // destination root can be created. The planner already consumes the whole
     // manifest; retaining these bytes also makes later namespace replacement
     // irrelevant.
-    let mapping_contents = if let Some(mapping) = args.native_mapping.as_deref() {
-        let mut contents = Vec::new();
-        if mapping == b"-" {
-            std::io::stdin()
-                .read_to_end(&mut contents)
-                .context("--mapping -: read stdin")?;
-        } else {
-            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
-                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
-                .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
-        }
+    let mapping_contents = if let Some(contents) = args.fanout_mapping.clone() {
         Some(contents)
     } else {
-        None
+        read_native_mapping(&args)?.map(Arc::new)
     };
     let sched = Arc::new(Sched::new(block, DEFAULT_MIN_SPLIT_BYTES));
+    if let Some(run) = &args.fanout_run {
+        run.group.register_scheduler(&sched);
+    }
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -1798,7 +1833,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .clone();
                 let mut failures = 0u32;
                 loop {
-                    if !gate.retained(id) {
+                    if sched.is_aborted() || !gate.retained(id) {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -1845,7 +1880,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            sched.wait_for_abort(std::time::Duration::from_secs(
+                                1 << (failures - 1),
+                            ));
                             continue;
                         }
                     };
@@ -1900,7 +1937,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     1 << (failures - 1)
                                 );
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (failures - 1)));
+                            sched.wait_for_abort(std::time::Duration::from_secs(
+                                1 << (failures - 1),
+                            ));
                         }
                         Err(error) => {
                             gate.mark_failed(id);
@@ -2336,7 +2375,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             overflowed: false,
         })
     });
-    let defer_destination_mutations = multiple_distinct_sources
+    let defer_destination_mutations = args.fanout_run.is_some()
+        || multiple_distinct_sources
         || (fresh_capacity.is_some() && !args.dry_run && !args.verify_only);
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
@@ -2638,7 +2678,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         workers_started = true;
     }
 
-    let ticker = progress.spawn_ticker();
+    let ticker = if args.fanout_run.is_some() {
+        None
+    } else {
+        progress.spawn_ticker()
+    };
 
     let mut st = Planner {
         dst: &mut *dst_ctl,
@@ -2766,23 +2810,47 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             src.basename()
         };
-        match st.scan_source(
-            &mut *src_ctl,
-            &src_root,
-            SourceMapping {
-                follow_root,
-                contents,
-                selection: src.selection,
-                sub: &sub,
-            },
-            DestinationRoot {
-                path: &dst_root,
-                existed: dst_existed,
-                is_container: dst_is_dir,
-                entry_is_dir: dst_entry_is_dir,
-                exact: args.placement == Placement::As,
-            },
-        ) {
+        let source_mapping = SourceMapping {
+            follow_root,
+            contents,
+            selection: src.selection,
+            sub: &sub,
+        };
+        let destination = DestinationRoot {
+            path: &dst_root,
+            existed: dst_existed,
+            is_container: dst_is_dir,
+            entry_is_dir: dst_entry_is_dir,
+            exact: args.placement == Placement::As,
+        };
+        let planned = if let Some(run) = &args.fanout_run {
+            match run.group.claim_source(source_index) {
+                Ok(crate::fanout::ScanClaim::Populate) => {
+                    match st.scan_source(&mut *src_ctl, &src_root, source_mapping, destination) {
+                        Ok((mapping, scanned)) => {
+                            run.group.complete_source(source_index, scanned);
+                            Ok(mapping)
+                        }
+                        Err(error) => {
+                            run.group.fail_source(source_index, &error);
+                            Err(error)
+                        }
+                    }
+                }
+                Ok(crate::fanout::ScanClaim::Cached(scanned)) => st.scan_cached_source(
+                    &mut *src_ctl,
+                    &src_root,
+                    source_mapping,
+                    destination,
+                    &scanned,
+                ),
+                Err(error) => Err(error),
+            }
+        } else {
+            st.scan_source(&mut *src_ctl, &src_root, source_mapping, destination)
+                .map(|(mapping, _)| mapping)
+        };
+        match planned {
             Ok(mapping) => dry_run_mappings.push(mapping),
             Err(e) => {
                 scan_err = Some(e);
@@ -2805,6 +2873,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             }
             Err(error) => scan_err = Some(error),
+        }
+    }
+    if scan_err.is_none() && !st.collision {
+        if let Some(run) = &args.fanout_run {
+            if let Err(error) = run.group.arrive(&run.label) {
+                scan_err = Some(error);
+            }
         }
     }
     if scan_err.is_none() && !st.collision {
@@ -3161,15 +3236,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let elapsed = progress.start.elapsed().as_secs_f64();
     let done = progress.bytes_done.load(Relaxed);
     let capacity_only_dry_run_abort = opts.dry_run && fresh_capacity_shortage.is_some();
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && !args.suppress_summary {
+    let show_human_output = !args.quiet && (!aborted || capacity_only_dry_run_abort);
+    let mut human_output = Vec::new();
+    if show_human_output && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
-                crate::output::human_stdout!(
+                human_output.push(format!(
                     "create directory {} (destination missing)",
                     display_directory(&dst_root)
-                );
+                ));
             }
-            print_dry_run_summary(
+            human_output.push(dry_run_summary(
                 srcs,
                 dst,
                 &dry_run_mappings,
@@ -3181,26 +3258,43 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 delete_plan,
                 &dry_run_changes,
                 fresh_capacity_assessment,
-            );
+            ));
         } else if opts.verify_only {
-            crate::output::human_stdout!(
-                "syq: verified {} files, {} differ/missing, {} in {}",
+            human_output.push(format!(
+                "syq: {}verified {} files, {} differ/missing, {} in {}",
+                target_summary_prefix(&args),
                 commas(progress.files_done.load(Relaxed) + errors),
                 errors,
                 human(done),
                 crate::progress::hms(elapsed)
-            );
+            ));
         } else {
-            print_transfer_summary(
-                &terminal,
-                elapsed,
-                &deletion_summary(delete_plan, deleted, opts.max_delete),
-            );
+            human_output.push(format!(
+                "syq: {}transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
+                target_summary_prefix(&args),
+                commas(terminal.files_transferred),
+                human(terminal.bytes_transferred),
+                human(terminal.bytes_unchanged),
+                commas(terminal.files_unchanged),
+                commas(terminal.directories_created),
+                deletion_summary(delete_plan, deleted, opts.max_delete),
+                format_args!(
+                    ", {} at {}/s",
+                    crate::progress::hms(elapsed),
+                    human((terminal.bytes_transferred as f64 / elapsed.max(0.001)) as u64)
+                ),
+                if terminal.errors > 0 {
+                    format!(", {} errors", terminal.errors)
+                } else {
+                    String::new()
+                }
+            ));
         }
     }
     // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
-    if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
+    // attested settlement re-renders; a delegated coordinator keeps it. Keep
+    // it in the same write as the summary so another target cannot interleave.
+    if show_human_output && args.stats {
         let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
             if opts.dry_run {
                 (
@@ -3223,8 +3317,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
             });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        crate::output::human_stdout!(
-                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
+        let heading = args.fanout_run.as_ref().map_or_else(String::new, |run| {
+            format!("syq: target {}: stats\n", run.label)
+        });
+        human_output.push(format!(
+                "{heading}  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
                 commas(progress.scanned.load(Relaxed)),
                 commas(progress.files_total.load(Relaxed)),
                 commas(progress.files_unchanged.load(Relaxed)),
@@ -3246,9 +3343,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     None => args.connections.to_string(),
                 },
                 tcp_stats,
-            );
+            ));
     }
-    if let Some(results) = progress.results_writer() {
+    if !human_output.is_empty() {
+        progress.println(&human_output.join("\n"));
+    }
+    if let Some(run) = &args.fanout_run {
+        run.group
+            .complete_member(run.destination_index, terminal.clone());
+    } else if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
     Ok(exit_code)
@@ -3937,6 +4040,24 @@ struct DryRunMapping {
     semantics: &'static str,
 }
 
+struct SourceScanState {
+    first: bool,
+    sub: PathBytes,
+    skip_all: bool,
+    mapping: Option<DryRunMapping>,
+}
+
+impl SourceScanState {
+    fn new(sub: &[u8]) -> Self {
+        Self {
+            first: true,
+            sub: sub.to_vec(),
+            skip_all: false,
+            mapping: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FreshCapacityPlan {
     device: u64,
@@ -4076,7 +4197,7 @@ fn deletion_summary(plan: DeletePlan, deleted: u64, max: Option<u64>) -> String 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_dry_run_summary(
+fn dry_run_summary(
     srcs: &[Location],
     dst: &Location,
     mappings: &[DryRunMapping],
@@ -4088,44 +4209,47 @@ fn print_dry_run_summary(
     deletes: DeletePlan,
     changes: &DryRunChanges,
     capacity: Option<FreshCapacityAssessment>,
-) {
-    crate::output::human_stdout!("syq: dry-run summary");
+) -> String {
+    let mut lines = vec![format!(
+        "syq: {}dry-run summary",
+        target_summary_prefix(args)
+    )];
     for (source, mapping) in srcs.iter().zip(mappings) {
-        crate::output::human_stdout!(
+        lines.push(format!(
             "  mapping: {} -> {} ({})",
             display_plan_source(source, args),
             display_plan_target(dst, &mapping.target, args),
             mapping.semantics
-        );
+        ));
     }
-    crate::output::human_stdout!("  changes: {}", changes.summary());
+    lines.push(format!("  changes: {}", changes.summary()));
 
     match deletes {
-        DeletePlan::Disabled => crate::output::human_stdout!("  deletions: disabled"),
+        DeletePlan::Disabled => lines.push("  deletions: disabled".into()),
         DeletePlan::Planned(n) => {
             if let Some(limit) = opts.max_delete.filter(|limit| n > *limit) {
-                crate::output::human_stdout!(
+                lines.push(format!(
                     "  deletions: {} planned; blocked by --max-delete {limit}",
                     count_label(n, "entry", "entries")
-                );
+                ));
             } else {
-                crate::output::human_stdout!(
+                lines.push(format!(
                     "  deletions: {} planned after a successful copy",
                     count_label(n, "entry", "entries")
-                );
+                ));
             }
         }
         DeletePlan::Skipped(reason) => {
-            crate::output::human_stdout!("  deletions: skipped ({reason})")
+            lines.push(format!("  deletions: skipped ({reason})"));
         }
     }
-    crate::output::human_stdout!(
+    lines.push(format!(
         "  logical data: {} in {} needing content work (upper bound); {} in {} with unchanged content",
         human(progress.bytes_total.load(Relaxed)),
         count_label(progress.files_total.load(Relaxed), "file", "files"),
         human(progress.bytes_unchanged.load(Relaxed)),
         count_label(progress.files_unchanged.load(Relaxed), "file", "files")
-    );
+    ));
     if let Some(capacity) = capacity {
         let inode_detail = capacity.available_inodes.map_or_else(
             || {
@@ -4142,7 +4266,7 @@ fn print_dry_run_summary(
                 )
             },
         );
-        crate::output::human_stdout!(
+        lines.push(format!(
             "  capacity: {} logical data required; {} available; {inode_detail} ({})",
             human(capacity.logical_bytes),
             human(capacity.available_bytes),
@@ -4151,7 +4275,7 @@ fn print_dry_run_summary(
             } else {
                 "insufficient"
             }
-        );
+        ));
     }
 
     let ignored = progress.paths_ignored.load(Relaxed);
@@ -4166,7 +4290,7 @@ fn print_dry_run_summary(
     if other > 0 {
         exclusions.push(count_label(other, "other entry", "other entries"));
     }
-    crate::output::human_stdout!(
+    lines.push(format!(
         "  exclusions: {}",
         if exclusions.is_empty() {
             if opts.ignore.is_empty() {
@@ -4177,9 +4301,16 @@ fn print_dry_run_summary(
         } else {
             exclusions.join("; ")
         }
-    );
+    ));
 
-    crate::output::human_stdout!("  route: {}", selected_route(src_ep, dst_ep, args));
+    lines.push(format!("  route: {}", selected_route(src_ep, dst_ep, args)));
+    lines.join("\n")
+}
+
+fn target_summary_prefix(args: &Args) -> String {
+    args.fanout_run
+        .as_ref()
+        .map_or_else(String::new, |run| format!("target {}: ", run.label))
 }
 
 fn path_has_partial_component(path: &[u8]) -> bool {
@@ -4469,28 +4600,28 @@ impl Planner<'_> {
         src_root: &[u8],
         source: SourceMapping<'_>,
         destination: DestinationRoot<'_>,
-    ) -> Result<DryRunMapping> {
+    ) -> Result<(DryRunMapping, crate::fanout::ScannedSource)> {
         let SourceMapping {
             follow_root,
             contents,
             selection,
             sub,
         } = source;
-        let dst_root = destination.path;
-        let dst_is_dir = destination.is_container;
-        let dst_existed = destination.existed;
-        let mut first = true;
-        let mut sub = sub.to_vec();
-        let mut skip_all = false;
-        let mut mapping = None;
+        let mut state = SourceScanState::new(sub);
         let ignore = self.opts.ignore.clone();
         let source = self
             .active_source
             .clone()
             .context("registered source reference was not initialized")?;
-        scan_into_planner(
-            self,
-            src,
+        let progress = self.progress;
+        let quiet = self.opts.quiet;
+        let report_ignored = self.opts.dry_run;
+        let capture_scan = self.opts.fanout;
+        let warned = std::cell::Cell::new(false);
+        let mut batches = Vec::new();
+        let mut ignored = 0u64;
+        let mut warnings = Vec::new();
+        src.scan(
             src_root,
             if self.opts.insecure_links {
                 None
@@ -4499,70 +4630,182 @@ impl Planner<'_> {
             },
             follow_root,
             &ignore,
-            |pl, batch| {
-                if skip_all {
-                    return Ok(());
+            report_ignored,
+            &mut |batch| {
+                if capture_scan {
+                    batches.push(batch.clone());
                 }
-                if first {
-                    first = false;
-                    if let Some(root) = batch.first() {
-                        validate_native_source_type(src_root, selection, root.kind)?;
-                        if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
-                            bail!(
-                            "destination {} is an existing directory; cannot replace it with non-directory source {}",
-                            display(dst_root),
-                            display(src_root)
-                        );
-                        }
-                        if pl.opts.dry_run
-                            && root.kind == Kind::Dir
-                            && !contents
-                            && pl.opts.recursive
-                            && dst_existed
-                            && !destination.entry_is_dir
-                            && !destination.exact
-                            && !pl.opts.existing
-                        {
-                            bail!(
-                            "destination {} is not a directory; cannot place directory {} inside it",
-                            display(dst_root),
-                            display(src_root)
-                        );
-                        }
-                        if root.kind != Kind::Dir && !dst_is_dir {
-                            sub.clear();
-                        }
-                        mapping = Some(DryRunMapping {
-                            target: join(dst_root, &sub),
-                            semantics: if destination.exact {
-                                "exact destination path"
-                            } else {
-                                match (root.kind, contents, dst_is_dir) {
-                                    (Kind::Dir, true, _) => "directory contents",
-                                    (Kind::Dir, false, _) => "directory as child",
-                                    (_, _, true) => "entry inside destination directory",
-                                    _ => "exact destination path",
-                                }
-                            },
-                        });
-                        if root.kind == Kind::Dir && !pl.opts.recursive {
-                            if !pl.opts.quiet {
-                                pl.progress
-                                    .eprintln(&format!("skipping directory {}", display(src_root)));
-                            }
-                            skip_all = true;
-                            return Ok(());
-                        }
-                        if root.kind == Kind::Dir {
-                            pl.delete_roots.push((join(dst_root, &sub), sub.clone()));
-                        }
+                self.apply_source_batch(
+                    src_root,
+                    contents,
+                    selection,
+                    destination,
+                    &mut state,
+                    batch,
+                )
+            },
+            &mut |paths| {
+                if capture_scan {
+                    ignored = ignored.saturating_add(paths.len() as u64);
+                }
+                progress
+                    .paths_ignored
+                    .fetch_add(paths.len() as u64, Relaxed);
+                Ok(())
+            },
+            &mut |warning| {
+                if capture_scan {
+                    warnings.push(warning.clone());
+                }
+                if warning.starts_with("skipping ") {
+                    if !quiet {
+                        progress.eprintln(&format!("syq: {warning}"));
                     }
+                } else {
+                    warned.set(true);
+                    progress.error(&format!("syq: {warning}"));
                 }
-                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                pl.handle_batch(batch, src_root, &sub, dst_root)
             },
         )?;
-        mapping.ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))
+        if warned.get() {
+            self.scan_warned = true;
+        }
+        let mapping = state
+            .mapping
+            .ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))?;
+        Ok((
+            mapping,
+            crate::fanout::ScannedSource {
+                batches,
+                ignored,
+                warnings,
+            },
+        ))
+    }
+
+    fn scan_cached_source(
+        &mut self,
+        src: &mut dyn Conn,
+        src_root: &[u8],
+        source: SourceMapping<'_>,
+        destination: DestinationRoot<'_>,
+        cached: &crate::fanout::ScannedSource,
+    ) -> Result<DryRunMapping> {
+        let registered = self
+            .active_source
+            .clone()
+            .context("registered source reference was not initialized")?;
+        let current = stat_one_registered(src, src_root, &registered, source.follow_root)?
+            .with_context(|| format!("source {} disappeared", display(src_root)))?;
+        let scanned = cached
+            .root()
+            .context("shared source scan returned no root entry")?;
+        if (current.dev, current.ino, current.kind) != (scanned.dev, scanned.ino, scanned.kind) {
+            bail!(
+                "source {} changed while preparing the fan-out copy",
+                display(src_root)
+            );
+        }
+
+        self.progress
+            .paths_ignored
+            .fetch_add(cached.ignored, Relaxed);
+        for warning in &cached.warnings {
+            if warning.starts_with("skipping ") {
+                if !self.opts.quiet {
+                    self.progress.eprintln(&format!("syq: {warning}"));
+                }
+            } else {
+                self.scan_warned = true;
+                self.progress.error(&format!("syq: {warning}"));
+            }
+        }
+        let mut state = SourceScanState::new(source.sub);
+        for batch in &cached.batches {
+            self.apply_source_batch(
+                src_root,
+                source.contents,
+                source.selection,
+                destination,
+                &mut state,
+                batch.clone(),
+            )?;
+        }
+        state
+            .mapping
+            .ok_or_else(|| anyhow::anyhow!("shared source scan returned no root entry"))
+    }
+
+    fn apply_source_batch(
+        &mut self,
+        src_root: &[u8],
+        contents: bool,
+        selection: SourceSelection,
+        destination: DestinationRoot<'_>,
+        state: &mut SourceScanState,
+        batch: Vec<Entry>,
+    ) -> Result<()> {
+        if state.skip_all {
+            return Ok(());
+        }
+        if state.first {
+            state.first = false;
+            if let Some(root) = batch.first() {
+                validate_native_source_type(src_root, selection, root.kind)?;
+                if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
+                    bail!(
+                        "destination {} is an existing directory; cannot replace it with non-directory source {}",
+                        display(destination.path),
+                        display(src_root)
+                    );
+                }
+                if self.opts.dry_run
+                    && root.kind == Kind::Dir
+                    && !contents
+                    && self.opts.recursive
+                    && destination.existed
+                    && !destination.entry_is_dir
+                    && !destination.exact
+                    && !self.opts.existing
+                {
+                    bail!(
+                        "destination {} is not a directory; cannot place directory {} inside it",
+                        display(destination.path),
+                        display(src_root)
+                    );
+                }
+                if root.kind != Kind::Dir && !destination.is_container {
+                    state.sub.clear();
+                }
+                state.mapping = Some(DryRunMapping {
+                    target: join(destination.path, &state.sub),
+                    semantics: if destination.exact {
+                        "exact destination path"
+                    } else {
+                        match (root.kind, contents, destination.is_container) {
+                            (Kind::Dir, true, _) => "directory contents",
+                            (Kind::Dir, false, _) => "directory as child",
+                            (_, _, true) => "entry inside destination directory",
+                            _ => "exact destination path",
+                        }
+                    },
+                });
+                if root.kind == Kind::Dir && !self.opts.recursive {
+                    if !self.opts.quiet {
+                        self.progress
+                            .eprintln(&format!("skipping directory {}", display(src_root)));
+                    }
+                    state.skip_all = true;
+                    return Ok(());
+                }
+                if root.kind == Kind::Dir {
+                    self.delete_roots
+                        .push((join(destination.path, &state.sub), state.sub.clone()));
+                }
+            }
+        }
+        self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+        self.handle_batch(batch, src_root, &state.sub, destination.path)
     }
 
     /// --files-from: instead of walking the source, stat each listed path (and
@@ -5003,6 +5246,9 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
+        if self.opts.fanout && self.sched.is_aborted() {
+            bail!("fan-out copy cancelled because another target failed");
+        }
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
         if !namespace_files.is_empty() {
             self.sched.anticipate_file_work();
@@ -5573,6 +5819,7 @@ impl Planner<'_> {
                                 self.mapping_source_rel(dst_rel)
                             };
                             results.emit_operation(&crate::results::OperationRecord {
+                                destination_index: self.progress.result_destination(),
                                 action: "create_directory",
                                 dst: dst_rel,
                                 src: src.as_deref(),
@@ -6096,6 +6343,7 @@ impl Planner<'_> {
                 }
                 if let Some(results) = self.progress.results_writer() {
                     results.emit_operation(&crate::results::OperationRecord {
+                        destination_index: self.progress.result_destination(),
                         action: queued.action,
                         dst: &queued.dst_rel,
                         src: self.mapping_source_rel(&queued.dst_rel).as_deref(),
@@ -6332,6 +6580,7 @@ impl Planner<'_> {
                 _ => ("transfer_file", "file"),
             };
             results.emit_operation(&crate::results::OperationRecord {
+                destination_index: self.progress.result_destination(),
                 action,
                 dst: &entry.dst,
                 src: Some(&entry.src),
@@ -6373,6 +6622,7 @@ impl Planner<'_> {
         if let Some(results) = self.progress.results_writer() {
             let src = with_src.then(|| self.mapping_source_rel(dst_rel)).flatten();
             results.emit_trace(&crate::results::TraceRecord {
+                destination_index: self.progress.result_destination(),
                 action,
                 dst: dst_rel,
                 src: src.as_deref(),
@@ -6683,6 +6933,7 @@ impl Planner<'_> {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {
+                            destination_index: self.progress.result_destination(),
                             action: "delete",
                             dst: dst_rel,
                             src: None,
@@ -6756,6 +7007,7 @@ impl Planner<'_> {
                             continue;
                         };
                         results.emit_operation(&crate::results::OperationRecord {
+                            destination_index: me.progress.result_destination(),
                             action: "delete",
                             dst: dst_rel,
                             src: None,
@@ -7367,6 +7619,7 @@ impl Worker {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
+                    destination_index: self.progress.result_destination(),
                     action: "transfer_file",
                     dst: &j.rel_bytes,
                     src: j.src_rel.as_deref(),
@@ -7421,6 +7674,7 @@ impl Worker {
     ) {
         if let Some(results) = self.progress.results_writer() {
             results.emit_operation(&crate::results::OperationRecord {
+                destination_index: self.progress.result_destination(),
                 action: "transfer_file",
                 dst: &job.rel_bytes,
                 src: job.src_rel.as_deref(),
@@ -7951,7 +8205,9 @@ impl Worker {
 
     fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
-            limit.wait(bytes);
+            limit.wait(bytes, |duration| {
+                self.sched.wait_for_abort(duration);
+            });
         }
     }
 
@@ -8099,6 +8355,7 @@ impl Worker {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
                 results.emit_operation(&crate::results::OperationRecord {
+                    destination_index: self.progress.result_destination(),
                     action: "transfer_file",
                     dst: &job.rel_bytes,
                     src: job.src_rel.as_deref(),

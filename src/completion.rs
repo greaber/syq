@@ -766,6 +766,14 @@ fn filesystem_command_candidates(
             }
             return Ok(candidates);
         }
+        if command == "cp" && tos_group_accepts_another_endpoint(args) {
+            return complete_value(
+                command,
+                args,
+                current,
+                ValueCompletion::Endpoint(EndpointSyntax::Native),
+            );
+        }
     }
 
     match command {
@@ -779,6 +787,7 @@ fn filesystem_command_candidates(
 fn native_copy_destination_started(args: &[Vec<u8>]) -> bool {
     const OPTIONS: &[&[u8]] = &[
         b"--to",
+        b"--tos",
         b"--into",
         b"--into-new",
         b"--into-existing",
@@ -828,7 +837,7 @@ fn value_completion(
     let known = match command {
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
-            b"--to" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"--to" | b"--tos" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
             | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
@@ -961,13 +970,54 @@ fn complete_path_for(
     if source {
         return complete_source_path(command, args, current, true);
     }
-    let Some(endpoint_text) = find_option_value(args, b"--to") else {
+    let Some(endpoint_text) = destination_group_endpoint(args) else {
         return Ok(local_path_candidates_at(current, false, None));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
         return Ok(local_path_candidates_at(current, false, None));
     };
     remote_path_candidates(command, args, endpoint, current, Vec::new(), None)
+}
+
+/// Return one endpoint from the most recent target group. A `--tos` group can
+/// span hosts whose directory listings differ; using its first endpoint keeps
+/// completion useful without pretending that the candidates exist everywhere.
+fn destination_group_endpoint(args: &[Vec<u8>]) -> Option<&str> {
+    let mut endpoint = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_slice();
+        if argument == b"--" {
+            break;
+        }
+        if matches!(argument, b"--to" | b"--tos") {
+            if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with(b"-")) {
+                endpoint = std::str::from_utf8(value).ok();
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix(b"--to=")
+            .or_else(|| argument.strip_prefix(b"--tos="))
+        {
+            endpoint = std::str::from_utf8(value).ok();
+        }
+        index += 1;
+    }
+    endpoint
+}
+
+fn tos_group_accepts_another_endpoint(args: &[Vec<u8>]) -> bool {
+    let mut open = false;
+    for argument in option_arguments(args) {
+        if argument == b"--tos" {
+            open = true;
+        } else if argument.starts_with(b"-") {
+            open = false;
+        }
+    }
+    open
 }
 
 fn complete_source_path(
@@ -1163,6 +1213,7 @@ fn connect_completion_endpoint(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        cancellation: None,
     };
     spec.connect_completion()
 }
@@ -1886,6 +1937,25 @@ mod tests {
         assert!(filesystem_command_candidates("cp", &invalid_source, b"s")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn destination_completion_tracks_the_current_target_group() {
+        let args = ["--to", "alpha", "--into", "one", "--tos", "beta", "gamma"]
+            .map(|value| value.as_bytes().to_vec());
+        assert_eq!(destination_group_endpoint(&args), Some("beta"));
+        assert!(tos_group_accepts_another_endpoint(&args));
+
+        let mut complete = args.to_vec();
+        complete.extend([b"--into-existing".to_vec(), b"two".to_vec()]);
+        assert!(!tos_group_accepts_another_endpoint(&complete));
+
+        let inline = [b"--to=delta".to_vec(), b"--as".to_vec()];
+        assert_eq!(destination_group_endpoint(&inline), Some("delta"));
+
+        let inline_tos = [b"--tos=epsilon".to_vec()];
+        assert_eq!(destination_group_endpoint(&inline_tos), Some("epsilon"));
+        assert!(!tos_group_accepts_another_endpoint(&inline_tos));
     }
 
     #[test]

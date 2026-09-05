@@ -8,7 +8,9 @@
 //! sanitized endpoints, and copy-only prune/mapping flags); sampled `progress`
 //! records; command-specific per-path records; an `error` record for every
 //! counted error; and exactly one terminal `result` whose numbers also feed the
-//! human summary, so the two cannot disagree. Copy emits `operation_result` or
+//! human summary, so the two cannot disagree. A multi-target copy attributes
+//! progress and operations by destination and emits one `destination_result`
+//! per target before the aggregate terminal. Copy emits `operation_result` or
 //! dry-run `trace` records. Removal emits one `selection_result` per explicit
 //! selector followed by `removal_result` or dry-run `removal_trace` records for
 //! entries in the selected trees. Unchanged and excluded copy entries are
@@ -20,7 +22,7 @@
 //! its provenance, omits source-side claims hostB cannot authenticate, and
 //! includes closure-time final-state records.
 
-use crate::cli::{Args, Interface, Location};
+use crate::cli::{Args, Interface};
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -49,6 +51,7 @@ pub struct ResultsWriter {
 /// bytes; together with `kind` a failed record round-trips as a mapping
 /// entry for retry.
 pub struct OperationRecord<'a> {
+    pub destination_index: Option<usize>,
     pub action: &'static str,
     pub dst: &'a [u8],
     pub src: Option<&'a [u8]>,
@@ -81,6 +84,7 @@ pub struct EndpointRecord {
 }
 
 pub struct ProgressRecord {
+    pub destination_index: Option<usize>,
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub bytes_unchanged: u64,
@@ -94,6 +98,7 @@ pub struct ProgressRecord {
 }
 
 pub struct TraceRecord<'a> {
+    pub destination_index: Option<usize>,
     pub action: &'static str,
     pub dst: &'a [u8],
     pub src: Option<&'a [u8]>,
@@ -121,6 +126,7 @@ pub struct RemovalRecord<'a> {
     pub message: Option<&'a str>,
 }
 
+#[derive(Clone, Debug)]
 pub struct ResultRecord {
     pub status: &'static str,
     pub exit_code: i32,
@@ -241,7 +247,7 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
         prune,
         mapping,
         dry_run: args.dry_run,
-        endpoints: run_endpoints(&args.locations, include_destination),
+        endpoints: run_endpoints(args, include_destination),
     });
     if writer.is_dead() {
         bail!("--results stream failed before the run record was written");
@@ -249,23 +255,32 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     Ok(Some(writer))
 }
 
-fn run_endpoints(locations: &[Location], include_destination: bool) -> Vec<EndpointRecord> {
+fn run_endpoints(args: &Args, include_destination: bool) -> Vec<EndpointRecord> {
     let mut endpoints = Vec::new();
-    if let Some(source) = locations.first() {
+    if let Some(source) = args.locations.first() {
         endpoints.push(EndpointRecord {
             role: "source",
             host: source.host.clone(),
             user: source.user.clone(),
         });
     }
-    if include_destination && locations.len() >= 2 {
-        if let Some(destination) = locations.last() {
+    if include_destination && args.locations.len() >= 2 {
+        if let Some(destination) = args.locations.last() {
             endpoints.push(EndpointRecord {
                 role: "destination",
                 host: destination.host.clone(),
                 user: destination.user.clone(),
             });
         }
+        endpoints.extend(
+            args.fanout_targets
+                .iter()
+                .map(|destination| EndpointRecord {
+                    role: "destination",
+                    host: destination.location.host.clone(),
+                    user: destination.location.user.clone(),
+                }),
+        );
     }
     endpoints
 }
@@ -319,7 +334,7 @@ impl ResultsWriter {
     }
 
     pub fn emit_progress(&self, progress: &ProgressRecord) {
-        self.write(serde_json::json!({
+        let mut record = serde_json::json!({
             "type": "progress",
             "bytes_done": progress.bytes_done,
             "bytes_total": progress.bytes_total,
@@ -331,7 +346,14 @@ impl ResultsWriter {
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
             "elapsed_ms": progress.elapsed_ms,
-        }));
+        });
+        if let Some(destination_index) = progress.destination_index {
+            record
+                .as_object_mut()
+                .expect("record is an object")
+                .insert("destination_index".into(), destination_index.into());
+        }
+        self.write(record);
     }
 
     /// Dry run only: one intended mutation, sharing `operation_result`'s
@@ -345,6 +367,9 @@ impl ResultsWriter {
             "reason": trace.reason,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(destination_index) = trace.destination_index {
+            object.insert("destination_index".into(), destination_index.into());
+        }
         if let Some(src) = trace.src {
             object.insert("src".into(), tagged(src));
         }
@@ -418,11 +443,24 @@ impl ResultsWriter {
         class: Option<&'static str>,
         os_kind: Option<&'static str>,
     ) {
+        self.emit_error_classified_for(message, class, os_kind, None);
+    }
+
+    pub fn emit_error_classified_for(
+        &self,
+        message: &str,
+        class: Option<&'static str>,
+        os_kind: Option<&'static str>,
+        destination_index: Option<usize>,
+    ) {
         let mut record = serde_json::json!({
             "type": "error",
             "message": message,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(destination_index) = destination_index {
+            object.insert("destination_index".into(), destination_index.into());
+        }
         if let Some(class) = class {
             object.insert("class".into(), class.into());
         }
@@ -452,6 +490,9 @@ impl ResultsWriter {
             "disposition": op.disposition,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(destination_index) = op.destination_index {
+            object.insert("destination_index".into(), destination_index.into());
+        }
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));
         }
@@ -476,10 +517,9 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    /// The terminal record; flushes the stream. Nothing may be written after.
-    pub fn emit_result(&self, result: &ResultRecord) {
+    fn copy_result_record(record_type: &'static str, result: &ResultRecord) -> serde_json::Value {
         let mut record = serde_json::json!({
-            "type": "result",
+            "type": record_type,
             "status": result.status,
             "exit_code": result.exit_code,
             "dry_run": result.dry_run,
@@ -504,7 +544,22 @@ impl ResultsWriter {
         if let Some(blocked) = result.deletions_blocked {
             object.insert("deletions_blocked".into(), blocked.into());
         }
-        self.write_and_seal(record, true);
+        record
+    }
+
+    /// One target's settled outcome in a coordinated multi-target copy.
+    pub fn emit_destination_result(&self, destination_index: usize, result: &ResultRecord) {
+        let mut record = Self::copy_result_record("destination_result", result);
+        record
+            .as_object_mut()
+            .expect("record is an object")
+            .insert("destination_index".into(), destination_index.into());
+        self.write(record);
+    }
+
+    /// The terminal record; flushes the stream. Nothing may be written after.
+    pub fn emit_result(&self, result: &ResultRecord) {
+        self.write_and_seal(Self::copy_result_record("result", result), true);
     }
 
     pub fn emit_rm_result(&self, result: &RmResultRecord) {
@@ -666,6 +721,7 @@ mod tests {
         let after = sink.0.lock().unwrap().len();
         // A straggling ticker render (or a second terminal) must be inert.
         writer.emit_progress(&ProgressRecord {
+            destination_index: None,
             bytes_done: 1,
             bytes_total: 1,
             bytes_unchanged: 0,

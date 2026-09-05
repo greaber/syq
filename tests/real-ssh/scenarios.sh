@@ -359,6 +359,8 @@ assert_same_tree \
     destination /tmp/syq-real-ssh/relay-destination \
     relay
 
+python3 /usr/local/libexec/syq-real-ssh-fanout.py
+
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2
     exit 1

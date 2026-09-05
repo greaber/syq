@@ -26,6 +26,8 @@ print(syq.managed_executable())  # downloads once, then returns the cached path
 
 plan = syq.cp("project", to="server", into="/backup", dry_run=True)
 print(plan.files_transferred, plan.bytes_transferred)
+
+replicated = syq.cp("project", tos=["server-a", "server-b"], into="/backup")
 ```
 
 The typed API validates syq's complete automation results stream and its agreement
@@ -75,6 +77,8 @@ potentially enormous operation ledger in memory:
 def observe(event: syq.AutomationEvent) -> None:
     if isinstance(event, (syq.TraceEvent, syq.OperationResult)):
         print(event.action, event.dst)
+    elif isinstance(event, syq.DestinationResult):
+        print(event.destination_index, event.status)
     elif isinstance(event, (syq.RemovalTrace, syq.RemovalResult)):
         print(event.disposition, event.path)
 

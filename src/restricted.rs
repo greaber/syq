@@ -1779,7 +1779,7 @@ impl RestrictedAuthority {
         }
         drop(state);
         if let Some(limit) = &self.file_data_limit {
-            limit.wait(bytes);
+            limit.wait(bytes, std::thread::sleep);
             self.check_deadline()?;
         }
         Ok(())
