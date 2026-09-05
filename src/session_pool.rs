@@ -8,7 +8,7 @@
 //! next command over a Unix socket beside the control socket.
 //!
 //! Two invariants keep it simple and safe. The pool never reads from a
-//! session: it writes the hello and watches the pipe for hang-up only, so a
+//! session: it writes the hello and checks the child for exit only, so a
 //! taken session is byte-for-byte what a fresh one would be, and the command
 //! completes the hello itself. And the pool never authenticates: a spare is
 //! attached to a live master with every authentication method disabled, so a
@@ -368,28 +368,15 @@ impl Pool {
             if let Verdict::Exit = self.housekeeping() {
                 return Ok(());
             }
-            // Spares are watched for hang-up only: a readable pipe just
-            // holds the hello reply the taker will read.
-            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(1 + self.spares.len());
-            fds.push(libc::pollfd {
+            // Check child exits during housekeeping without consuming the
+            // hello reply. Darwin does not monitor poll entries with events=0.
+            let mut listener = libc::pollfd {
                 fd: self.listener.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
-            });
-            for spare in &self.spares {
-                fds.push(libc::pollfd {
-                    fd: spare.stdout.as_raw_fd(),
-                    events: 0,
-                    revents: 0,
-                });
-            }
-            let ready = unsafe {
-                libc::poll(
-                    fds.as_mut_ptr(),
-                    fds.len() as libc::nfds_t,
-                    HOUSEKEEPING.as_millis() as libc::c_int,
-                )
             };
+            let ready =
+                unsafe { libc::poll(&mut listener, 1, HOUSEKEEPING.as_millis() as libc::c_int) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -397,18 +384,7 @@ impl Pool {
                 }
                 return Err(error).context("poll session pool descriptors");
             }
-            let hung_up = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-            for (index, pollfd) in fds.iter().enumerate().skip(1).rev() {
-                if pollfd.revents & hung_up != 0 {
-                    let mut spare = self.spares.remove(index - 1);
-                    let _ = spare.child.kill();
-                    let _ = spare.child.wait();
-                    // spawn can succeed before SSH refuses the session or
-                    // the helper exits. Back off these failures too.
-                    self.last_failure = Some(Instant::now());
-                }
-            }
-            if fds[0].revents & libc::POLLIN != 0 {
+            if listener.revents & libc::POLLIN != 0 {
                 loop {
                     match self.listener.accept() {
                         Ok((stream, _)) => {
@@ -426,6 +402,13 @@ impl Pool {
     }
 
     fn housekeeping(&mut self) -> Verdict {
+        for index in (0..self.spares.len()).rev() {
+            if matches!(self.spares[index].child.try_wait(), Ok(Some(_))) {
+                self.spares.remove(index);
+                // An SSH process can start and then refuse the session.
+                self.last_failure = Some(Instant::now());
+            }
+        }
         self.handed
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         if self.last_handoff.elapsed() >= self.idle {
