@@ -89,3 +89,6 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
   #mdbook-sidebar-toggle-anchor:checked ~ .page-wrapper{transform:none}
   .sidebar{top:calc(var(--site-header-height) + var(--menu-bar-height));z-index:105}
 }
+
+/* Chapter navigation is in the sidebar and at the end of each page. */
+.nav-wide-wrapper{display:none}

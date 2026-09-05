@@ -40,3 +40,6 @@ and overrides inline scroll offsets. When upgrading mdBook, check `reference.htm
 at 390, 820 and 1440 pixels: scroll down several screens, reverse direction, hover
 the toolbar, hide/show the sidebar, and use search and theme controls without
 returning to the top. Also check reload at a saved scroll position.
+
+The oversized side-of-page chapter arrows are hidden; sidebar links and the
+end-of-page navigation provide the chapter routes.
