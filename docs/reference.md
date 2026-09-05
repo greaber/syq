@@ -1,502 +1,412 @@
-# Command reference
+# Commands
 
-This is the detailed behavioral reference for syq's commands: the native
-commands (`syq cp`, `syq rm`, and `syq map`), persistent SSH connections,
-rsync mode (`syq rsync`), path semantics, how a copy works, resume,
-verification, filtering, deletion, and exit codes. [Speed](speed.md), [Remote-to-remote
-transfers](remote-to-remote.md), [Security](security.md), and
-[Composability](composability.md) cover those topics in depth. The code is
-authoritative where this document and the binary disagree; please report the
-disagreement.
+Use `syq cp` to copy, `syq rm` to remove, and `syq map` to produce a
+[placement manifest](mappings.md). For existing rsync commands, see
+[rsync mode](#rsync-compatibility).
 
 ## Command-line help
 
-`syq --help` lists commands and top-level options. For each command, `-h`
-and `--help` show the same examples and commonly used options; `--help-all`
-shows the complete option reference, grouped by purpose. For example:
-
 ```sh
+syq --help
 syq cp --help
 syq cp --help-all
 syq help receiver enroll
 ```
 
-Small management commands show the same options at both levels. Every common
-help page points to its full reference. Options omitted from common help still
-work and remain available in shell completion. In rsync mode, `-h` keeps its
-rsync meaning (human-readable sizes); use `syq rsync --help` for common help
-or `syq rsync --help-all` for all options.
-
-`syq --self-update --help` explains standalone upgrades and update reminders.
-Homebrew installs use `brew upgrade syq`; see [Installation](install.md#standalone-installer).
+`--help` shows examples and common options; `--help-all` lists all options.
+`-h` also means help, except in rsync mode, where it means human-readable sizes.
 
 ## Native commands
 
-A native command starts with an operation and keeps endpoints, selectors,
-and destination placement in separate arguments:
+### Copy a directory or its contents
 
 ```sh
-syq cp project --to server --into /backup       # named object → /backup/project
-syq cp --srcs-in project --to server --into /app # project contents → /app
-syq cp --from server --cwd /data --src a --src b --into ./data
-syq cp --from server:2222 data --to backup:2200 --into /archive
-# Pull using credentials already on backup for server:
-syq cp --from server data --to backup --coordinate-at dst --peer-auth own-credentials --into /archive
-syq cp --src-file report --src-dir assets --into /backup
-syq cp --src-files a.txt b.txt --src-dirs images fonts --into /archive
-syq cp report --to server --as-new /reports/final
-syq cp --hash report --to server --as-existing /reports/final
-syq cp --ignore '*.tmp' --srcs-in project --to server --into /app
-syq cp --follow-src --srcs-in current-project --to server --into /app
-syq cp --preserve=permissions,ownership project --to server --into /backup
-syq cp --inplace disk.img --to server --as-existing /images/disk.img
-syq cp --prune --srcs-in build --to server --into-existing /srv/app
-syq rm cache old-output
-syq rm --from server --cwd /srv --src old-output
-syq rm --from server --syq-path /opt/syq-dev --src old-output
-syq rm --root /srv --src-dir cache
-syq rm --cwd /srv --follow-src --src-dir current-release
+syq cp project --into backup
+syq cp --srcs-in project --into backup
 ```
 
-Native path and pattern option values that begin with `-` use the attached
-`--option=value` spelling, for example `--src=--archive`, `--src-dir=-`, or
-`--into=-archive`. This keeps a following option recognizable. `--mapping -`
-is the intentional exception: there, `-` means to read the mapping from
-standard input.
+```text
+Source                    First command        Second command
+project/                  backup/              backup/
+  report.txt                project/             report.txt
+                              report.txt
+```
 
-`--from [USER@]HOST[:PORT]` selects one source endpoint and `--to
-[USER@]HOST[:PORT]` selects one destination endpoint; omission means local. Enclose
-an IPv6 address in brackets, for example `alice@[2001:db8::1]:2222`. The port
-override is used consistently for the SSH connection, `ssh -G` policy
-resolution, known-host lookup, automatic enrollment, and later enrollment
-reuse. A local path containing `:` stays local because native mode never
-guesses endpoints from path text.
+A bare path copies the named file or directory. `--srcs-in DIR` copies its
+contents. **Trailing slashes do not change native placement.**
 
-A **placement** specifies the destination path and how to use it. `--into DIR`
-puts selected names inside a directory (`foo` becomes `DIR/foo`); `--as PATH`
-copies one named object to that exact path. The `-new` and `-existing` variants
-also require the destination to be absent or present.
-
-For remote copies, omitting placement defaults to `--into .` at the destination:
+To copy over SSH, add `--from` or `--to`:
 
 ```sh
-syq cp foo --to j5        # copy foo into your home directory on j5
-syq cp --from j5 foo      # copy foo from j5's home into your local current directory
+syq cp project --to server --into /backup
+syq cp --from server -C /data --src a --src b --into ./data
+syq cp --from alice@server:2222 data --into backup
 ```
 
-With both `--from` and `--to`, the default is the destination host's home
-directory. `--cwd` changes only the source base, not this destination default.
-`--prune` always requires an explicit placement, even for remote copies.
-Matching destination files may be overwritten; use `--dry-run` to preview a copy.
-Local-only copies still require a placement option; bare paths always select
-sources, so `syq cp foo bar` does not treat `bar` as a destination.
+Omitted endpoints mean local. Endpoints use `[USER@]HOST[:PORT]`; enclose IPv6
+addresses in brackets, as in `alice@[2001:db8::1]:2222`. A colon inside a
+native path is just part of its name.
 
-In `cp`, finish the source specification before starting the destination. The
-source endpoint, `--cwd` or `--root`, every positional or `--src*` selector,
-and `--mapping` must all appear before the first `--to` or placement option.
-Other options remain order-independent, so flags such as `--dry-run` may still
-follow the placement. This rule makes every bare path's role clear and applies
-equally to local and remote copies.
-
-`--cwd DIR`/`-C DIR` changes where relative source selectors are resolved at
-the source endpoint. For `cp` and `rm`, selectors may be absolute, or use
-`.` and `..` to resolve outside that base. `--cwd` changes where resolution
-starts; it does not confine a selection. `syq map` needs named selectors to be
-relative and resolve inside the base so it can emit relative source paths.
-A contents selector (`--srcs-in DIR`) may point outside the base instead.
-With `--root DIR` in place of `--cwd`, all three commands require relative
-selectors that stay beneath `DIR`; absolute paths, `~` paths, and `..` that
-would leave it are refused before anything changes.
-
-Bare paths and repeatable `--src PATH` select named objects (an object is a
-file, directory, symlink, or special file). A named directory keeps its
-basename at the destination; by default a named symlink is copied as a
-symlink. A trailing slash is just part of how a path is spelled and changes
-nothing.
-`--src-file PATH` adds the precondition that the named object is not a
-directory, while `--src-dir DIR` requires a directory. Without `--follow`, a
-symlink satisfies `--src-file` and is copied as a symlink, while it fails the
-`--src-dir` precondition. With `--follow-src` (or `--follow`), the precondition
-and copy both apply to the referent. These typed selectors are available to
-`cp` and `rm`.
-`--srcs-in DIR` selects a directory's contents and merges them directly into
-the destination directory. `--srcs PATH...`, `--src-files PATH...`, and
-`--src-dirs DIR...` are bulk conveniences for the corresponding singular
-selectors. Symlinks found while traversing a selected directory are copied as
-symlinks and are never followed. A singular selector option takes the next
-argument as its value; the attached spelling above works for singular and bulk
-selectors and preserves every Unix filename and its raw path bytes.
-
-All native commands use one link-resolution rule for the filesystem paths you
-name on the command line. By default, syq refuses a symlink in any component
-that must be traversed. The last path component of a named `--src` is the
-selected object rather than something to traverse, so a symlink there is
-copied as the link itself, not followed. A directory-required selector such as
-`--srcs-in` or `--src-dir` cannot use a symlink as its selected directory by
-default. `--follow-src` permits this traversal only in source paths you name,
-including `--cwd`, `--root`, and source selectors. `cp --follow-dst`
-permits it only in the destination placement path. `--follow` is the umbrella:
-it enables both directions and also permits traversal in the control paths
-read by the coordinator (the process that runs the copy; for a
-remote-to-remote copy that is one of the two remote hosts unless you pass
-`--coordinate-at local`), such as `--ignore-from`, `--mapping`, and
-`--results`. The directional options deliberately do not authorize those
-control paths. None of these options makes syq follow symlinks discovered
-beneath a selected directory, nor paths that come from a mapping manifest, a
-directory scan, or the other endpoint.
-
-A follow option resolves the selected filesystem identity; it is not a textual
-substitution of every operand with the output of `realpath`. Logical source
-mapping remains separate. If `current` points to `releases/v3`, then
-`syq cp --follow-src current --into backup` copies the referent as
-`backup/current`, not `backup/v3`. A contents selector still omits that name:
-`--follow-src --srcs-in current --into backup` merges the referent's children
-directly into `backup`.
-
-For exact placement, the last path component is the requested directory entry,
-not something to traverse. Both `--as link` and `--follow-dst --as link`
-address and may replace the symlink itself; `--follow-dst` controls only
-symlinks in the parent path. The `new` and `existing` preconditions test the
-named entry, so a dangling symlink exists for `--as-new` and `--as-existing`.
-
-An `--into` destination, by contrast, must be traversed as a container. A symlink
-there is refused by default and accepted with `--follow-dst` (or the
-`--follow` umbrella). If the container link is dangling, a placement form that
-permits creation may create its referent directory. Thus, if `live` points to
-`../releases/v3`, `--follow-dst --into live` uses `v3` as the container,
-while `--follow-dst --as live` replaces the directory entry named `live` and
-leaves `v3` untouched. To update the referent itself, pass its explicit path,
-for example from `realpath`.
-
-When link traversal is intentional, resolving it before invoking syq often
-makes the choice clearer than using a follow option:
+Remote copies may omit placement:
 
 ```sh
-readlink -- current-project                 # inspect the link's stored target
-realpath -- current-project                 # print the fully resolved path
-syq cp --srcs-in "$(realpath -- current-project)" --into /backup
+syq cp project --to server       # put project in your remote home directory
+syq cp --from server project     # put project in your local current directory
 ```
 
-A relative value printed by `readlink` is relative to the directory containing
-the link, not necessarily the shell's current directory. `realpath` is usually
-the safer way to turn a link chain into an explicit operand.
+The default is `--into .` at the destination. `--cwd` changes only the source
+base. Local-only copies and every `--prune` copy still require explicit
+placement: `syq cp a b` selects two sources, not a destination.
 
-These rules are how native copy and removal stay inside the directories you
-selected, even when someone else is renaming paths around them. syq opens each
-selected directory once (for a selected file or symlink, its parent directory
-and the object itself) and keeps that handle open for the whole run, so later
-work is relative to the handle and renaming the path cannot redirect it.
-Native `rm` keeps those handles open until its last change is made. Copy
-resolves and opens every selected source before it changes anything at the
-destination, and every source worker acquires those same open handles when it
-starts, before it reports that it is ready. Finding source files and checking
-their metadata, including retry checks, source content hashes, and file reads,
-all work relative to the open handle plus a strict relative path. They never
-reopen the path you typed and never follow symlinks found inside a selected
-directory; a selected file authorizes only that one file as it was when it was
-opened, not its siblings in the same parent directory. The endpoint and every
-started worker keep the selected object open, so the handle stays valid even
-if the control connection exits first, and every open for content verifies
-that it reached the same file. The target of a selected symlink is read once
-through the opened symlink itself and never reread through its directory name,
-which could change. Replacing a selected file or symlink itself during the run
-is an error, while a file that changes beneath a selected directory is retried.
-On macOS this handle-based symlink read requires macOS 13 or newer; older
-releases fail when syq opens the sources rather than fall back to reading the
-link by name.
+Finish the source specification before the destination: `--from`, `-C`,
+`--root`, selectors, and `--mapping` must precede the first `--to` or
+placement option. Other flags, such as `--dry-run`, may follow placement.
 
-Copy gives every destination worker the same open handle for the selected
-destination directory. Inspecting the destination, scanning it, planning what
-`--prune` will delete, creating directories and special files, changing
-metadata, and the planned deletions are all relative to that handle. Checking,
-preparing, hashing, and seeding regular files, writing file data, finishing a
-file, cleaning up its partial file, and renaming it into place also stay
-beneath that open handle and never follow symlinks found there. (The partial
-file is the temporary file, named `.name.syq-part.<copy-id>`, that syq writes
-beside a destination file and renames into place once it is complete; see
-[How it works](#how-it-works).) Using the handle does not change the worker
-process's current directory; destination operations do not depend on it.
-If a write request reaches an endpoint before that handle exists and carries
-no signed grant, syq refuses it instead of resolving the path by name.
+### Choose where files land
 
-Control files on the machine running syq get the same treatment:
-`--ignore-from`, `--syq-ignore-from`, `--files-from`, and a named `--mapping`
-are read from the file syq reached by walking the path one component at a
-time, so renaming that path afterward cannot redirect the read. Their filenames
-keep their raw Unix path bytes even though ignore-pattern contents must be
-UTF-8. The mapping is read in full before anything at the destination changes.
-On Linux, a named FIFO used as one of these inputs is reopened through the
-handle syq already holds (via `/proc/self/fd`, after checking that it is the
-same object); it therefore waits for a writer like a normal blocking open and
-still reads the FIFO that was originally selected even after a rename. A
-`/proc` file-descriptor link as the final component, which is what shell
-process substitution produces, is opened relative to the open handle for its
-`/proc` parent, so process substitution keeps working without falling back to
-a plain path lookup. A Linux system without `/proc`, and macOS, refuse a named
-FIFO for these inputs before anything at the destination changes, because they
-cannot reopen it safely. Use `--files-from -` or `--mapping -`, which read
-standard input, or put ignore rules in a regular file. A named `--results`
-file is likewise created fresh relative to the open handle for its parent
-directory; if an entry already exists there, syq refuses rather than truncating
-it. With `--follow`, the selected object is the resolved link target, and a
-missing target is created beneath the open handle for its parent. Replacing
-the link afterward does not redirect the output. Use `--results-fd` when the
-caller needs a pipe, process substitution, device, or other sink that is not a
-regular file.
-
-On Linux, a copy whose source and destination are on the same machine can
-use the kernel copy (`copy_file_range`): its destination worker receives the
-open handles for both sides when it starts, then opens source and destination
-files relative to those handles. Rsync mode's `--insecure-links` skips the
-kernel copy because it deliberately follows symlinks in source paths, which a
-request expressed only in open handles cannot represent. The check that a
-directory is not being copied into itself uses the same handles on a
-same-machine copy: the destination side takes the opened source directory and
-walks up the parents of its open destination handle. Renaming either path on
-the command line cannot change that decision.
-
-Rsync mode's `--insecure-links` is the explicit opt-out for rsync
-compatibility: that run follows symlinks regardless of who owns them in the
-source, destination, and control paths you name, and finds and reads source
-files by path name rather than relative to an open handle. As in rsync, the flag is local only. It applies to the source or
-destination on the machine where you run syq and to the control files syq
-reads there; it is never passed to a remote endpoint, which keeps the default
-trusted-owner policy and reads its source files relative to open handles.
-Rsync lets the remote side opt out through `--rsync-path`; syq's
-`--rsync-path` is an executable path only, so a remote endpoint cannot opt
-out. Names that come from a native mapping or from scanning never inherit
-native `--follow`; they must stay strictly beneath the opened source directory.
-In rsync mode, control paths keep rsync's implicit policy of following a
-symlink owned by root or by the endpoint's effective user. The link's owner
-and its target are read from the same opened symlink on Linux and macOS 13 or
-newer. On platforms that cannot read a link through an open handle (including
-older macOS releases), this implicit trusted-owner traversal fails rather than
-re-reading the link by name. Native `--follow` remains the explicit way to
-follow links regardless of ownership.
-
-Before it starts, syq counts the open file handles the run will need against
-the process's open-file limit: the handles already open in the environment
-that starts syq, one open parent directory per selected source, one open
-handle per selected file or symlink itself, for the endpoint, the control
-connection, and every worker that may share its process, plus a conservative
-allowance per worker for its file cache, its transport, and handing open
-handles between workers that run at the same time. On a same-machine Linux
-copy the destination workers' handoffs are counted too. If the endpoint's
-open-file limit cannot hold that set, the copy fails before anything at the
-destination changes, with guidance to reduce selectors or `--connections`.
-syq promises no particular minimum limit; the transports and the files
-already open in the invoking environment count against the same limit.
-
-Placement options choose the destination path and how to use it:
-
-| Placement | Mapping | Destination precondition |
+| Placement | Result | Requirement |
 |---|---|---|
-| `--into DIR` | Put selected names inside `DIR` | Use or create the directory |
-| `--into-new DIR` | Put selected names inside `DIR` | Must not exist |
-| `--into-existing DIR` | Put selected names inside `DIR` | Must already be a directory |
-| `--as PATH` | Map one named source exactly to `PATH` | Create or update the path |
-| `--as-new PATH` | Map one named source exactly to `PATH` | Must not exist |
-| `--as-existing PATH` | Map one named source exactly to `PATH` | Must exist |
+| `--into DIR` | Selected names inside `DIR` | Use or create a directory |
+| `--into-new DIR` | Selected names inside `DIR` | Directory must not exist |
+| `--into-existing DIR` | Selected names inside `DIR` | Directory must exist |
+| `--as PATH` | One named source exactly at `PATH` | Create or update |
+| `--as-new PATH` | One named source exactly at `PATH` | Path must not exist |
+| `--as-existing PATH` | One named source exactly at `PATH` | Path must exist |
 
-The `new` and `existing` forms are checked during the initial look at the
-destination, before anything is written. A mismatch fails before the copy
-changes anything, and the selected destination directory stays held open while
-workers operate on strict relative names beneath it. Conditional updates of
-regular files, and the rename that puts a finished partial file in place, then
-verify that the destination entry is the one that was inspected instead of
-following a replaced name. This is not a snapshot of the whole directory: an
-unconditional placement may still replace whatever non-directory entry is
-present when it renames the finished file into place. Changed regular files
-are always written to the partial file and then renamed into place.
-Mapping a non-directory source exactly onto an existing directory is rejected
-during the source's first scan batch, in both dry-run and execution. On the
-restricted path (a remote-to-remote copy through the command-restricted
-receiver, a forced command on hostB that syq installs when you enroll a
-destination) the precondition is also signed into the grant, the signed,
-single-use request that describes exactly what this one copy may do: the
-receiver checks it against the enrolled directory when it redeems the grant,
-and a `new` directory can only be created without replacing anything.
+```sh
+syq cp report.txt --as-new reports/final.txt
+syq cp --srcs-in build --into-existing deploy
+```
 
-`cp` copies or updates the selected source objects and keeps unrelated
-destination objects by default. With `--prune`, it then deletes
-destination-only paths beneath the directories it mapped, using the same
-rules as rsync mode's `--delete` (see Deleting extras below). Pruning never
-removes a source and requires explicit placement; `--max-delete N` applies the
-same all-or-nothing limit.
+A named directory keeps its basename with `--into`; a contents selection
+merges directly into the container. `--as` takes one named source, including
+a directory, and chooses its exact destination name.
 
-Native `rm` resolves every selector at the endpoint and opens the result,
-keeping it open, before it makes its first change. A selector that names
-nothing succeeds, and duplicate or overlapping selectors may perform redundant
-work; they are not normalized or deduplicated. Removal then runs in a pool of
-workers on the endpoint, relative to those open directory handles. An entry
-already removed by another selector counts as success. Symlinks encountered
-while walking inside a selected directory are removed as entries and are never
-followed.
+The `new` and `existing` conditions are checked before copying. A
+non-directory source cannot replace a directory through `--as`. Multiple
+sources claiming the same destination are refused before writing. These
+checks do not freeze the filesystem or make the whole copy transactional.
 
-By default, native `rm` follows no symlinks while resolving `--cwd`, `--root`,
-or a selector. A symlink selected by name is removed as a symlink without
-touching its referent. A symlink in `--cwd`, or in a selector before the
-selected name, would have to be traversed; encountering one therefore aborts
-the entire command before it changes anything. `--follow-src` or the `--follow` umbrella
-explicitly enables that traversal. The resolved non-symlink file or directory
-is then removed while the symlinks used to reach it remain in place, usually
-dangling.
+### Select files
 
-`--root DIR` is mutually exclusive with `--cwd`. Without a source follow
-option, the root path must contain no symlink. With `--follow-src` or
-`--follow`, syq resolves the root's link target and holds it open before
-resolving selectors; selectors still cannot leave it. Selector resolution
-stays inside the open root and fails as soon as a relative or absolute symlink
-target would leave it, even if later components would re-enter. `--cwd` is
-not such a boundary when source links are followed.
+| Selector | Selects |
+|---|---|
+| Bare `PATH` or `--src PATH` | A named file, directory, or link |
+| `--src-file PATH` | A named non-directory; refuses a directory |
+| `--src-dir DIR` | A named directory; refuses other types |
+| `--srcs-in DIR` | The directory's contents |
+| `--srcs PATH...` | Several named objects |
+| `--src-files PATH...`, `--src-dirs DIR...` | Several typed objects |
 
-For removal, `--src PATH` and bare paths accept either a selected file or
-directory and remove that object, recursively for a directory. As with copy,
-`--src-file PATH` requires a selected non-directory object, while
-`--src-dir DIR` requires a directory and removes its entire tree.
-`--srcs-in DIR` requires a directory, removes its contents, and leaves the
-directory itself in place. All type checks and selector resolution finish
-before deletion begins. `-vv` prints the base identity, symlink hops, and final
-device/inode resolution used for the operation's audit trail.
+Singular options can be repeated. A symlink counts as a non-directory unless
+you ask to follow it. Type mismatches fail before changes begin.
 
-Remote native `rm` is attached to its control connection. While work remains,
-the endpoint sends a result or liveness frame at least once per second. A
-detected write failure cancels queued work and stops directory scans from
-scheduling more removals; operations already completed or inside a filesystem
-call are not rolled back. Native `rm` has no detached mode.
+For option values beginning with `-`, attach the value:
+`--src=--archive`, `--src-dir=-`, or `--into=-backup`.
+`--mapping -` is the exception: it reads standard input.
 
-Native copy fidelity defaults to `-rlt`: recurse through directories, copy
-symlinks as symlinks, and keep modification times. `--preserve=permissions` additionally
-copies modes, `--preserve=ownership` requests numeric owner and group, and
-`--preserve=specials` copies device, FIFO, and socket nodes. The option is
-repeatable and accepts comma-separated values. On macOS, socket nodes are
-reported and skipped, even under `--quiet`, because macOS cannot create them
-through the open destination directory handle; regular files and other
-special files in the same copy continue normally. Ownership follows the same
-destination-side rules as rsync mode's `-a`: owner is set only when the
-process writing the destination runs as root, while group changes that fail
-with `EPERM` are skipped. Hard links,
-ACLs, and xattrs are not preserved.
+### Resolve or confine paths
 
-Native `cp` and `rm` accept `--follow-src`, the `--follow` umbrella,
-`-n`/`--dry-run`, `-v`/`--verbose`,
-`-q`/`--quiet`, `-j`/`--connections`, `--progress`/`--no-progress`, and
-`--progress-json` in addition to their endpoint and selector options. `cp`
-also accepts `--follow-dst`, `--hash`, `--no-compress`, `--bwlimit RATE`,
-`--stats`, repeatable `--ignore PATTERN`/`--ignore-from FILE`, `--preserve`,
-and `--inplace`. Native `cp` and `rm` also accept an ephemeral SSH persistence
-scope through `--pscope PATH`. Filters
-use the gitignore semantics described below and apply at every source root;
-`--prune` protects excluded destination paths from pruning. `--hash`
-compares existing regular-file contents with full BLAKE3 digests instead of
-trusting equal size and modification time; it does not add a second
-post-transfer verification pass. The bandwidth limit applies only to file
-data, not scanning, hashing, metadata, or pruning. A
-native copy may also use `--max-size SIZE` or `--min-size SIZE` to skip regular
-source files outside that inclusive range. Those files remain part of the
-source population, so `--prune` protects any corresponding destination paths.
-A remote-to-remote copy on the restricted path refuses `--min-size` and
-refuses `--max-size` with `--prune`. The restricted receiver independently enforces the signed total-size ceiling, the signed
-filters, and the signed choice between writing through partial files and
-writing in place. On a direct remote-to-remote copy through that receiver,
-`cp` also accepts the receiver ceilings `--receiver-max-entries N` and
-`--receiver-max-bytes SIZE`, and `--receiver-receipt digests`, which asks the
-receiver to record a BLAKE3 digest, taken when the transfer closes, of every
-regular file whose path the transfer could have changed. They are signed into
-the grant and enforced or honored by hostB, and are refused anywhere else
-because nothing would act on them.
-`cp` additionally accepts `--mapping` (see [Mappings](mappings.md)). Native
-`cp` and `rm` can write the results stream, a machine-readable NDJSON record
-of what happened: `--results FILE` creates the file fresh (an existing file is
-refused: one file, one run), and `--results-fd N` writes to a file descriptor
-the caller opened, e.g. `--results-fd 3 3>run.ndjson` (see
-[Automation results](automation.md)). The stream is always written on the machine
-where you run syq. For a remote-to-remote copy the coordinator is normally one
-of the remote hosts, so the copy is refused unless you pass
-`--coordinate-at local` explicitly (routing through this machine is never
-chosen implicitly for the stream's sake) or the restricted receiver's verified
-receipt supplies a receiver-attested stream (built from hostB's signed receipt
-rather than from what hostA reported) while data flows directly between the
-remotes. Both forms are rejected with `--detach`. Choose a results path
-outside the copy or removal trees; one inside them can make the run's own
-accounting unpredictable. A remote `rm` over a normal SSH login returns
-structured outcomes from the endpoint, but the restricted receiver rejects
-native removal because its signed grants authorize copy changes only.
+`--cwd DIR` / `-C DIR` resolves relative sources from `DIR` at the source
+endpoint. For `cp` and `rm`, absolute paths and `..` may leave that base.
 
-Copy and removal continue if writing human summaries, file listings, or
-diagnostics fails; the exit status still describes the filesystem operation.
-If stdout fails, syq attempts one warning on stderr. A failed stderr cannot
-carry that warning. A slow output consumer can still block the worker writing
-to it. Progress can continue on a separate, writable stderr or results stream
-while stdout is blocked.
+`--root DIR` replaces `--cwd` with a boundary: selectors must be relative
+and remain beneath it. Absolute paths, `~` paths, and attempts to leave the
+root are refused before changes begin. This also bounds native removal.
 
-`--mapping` cannot be combined with `--prune` because mapping manifests define
-no region to prune; `--results` covers `--prune` runs, including their
-removals. `--max-delete` requires `--prune`. `cp`, `rm`, and `map` all accept
-`--root DIR` in place of `--cwd` to confine selectors beneath `DIR`. For `rm`,
-that directory also bounds the removal itself.
+```sh
+syq cp -C /data reports images --into backup
+syq rm --root /srv --src-dir cache
+```
 
-Native `cp` exposes the remote runtime and transport controls
-directly: `--rsh COMMAND`, `--syq-path PATH`, `--no-bootstrap`, `--no-tcp`,
-`--tcp-plain`, `--tcp-ports LO-HI`, and Linux `--tcp-congestion ALGO`. An
-explicit `--rsh` is the complete SSH and agent policy and bypasses the
-automatic setup of the agent broker (syq's temporary local SSH agent that only
-signs for the intended destination) and the restricted receiver. A port in
-native endpoint syntax can be combined with the default SSH command or an
-explicit command whose executable is `ssh`; an arbitrary remote-shell wrapper
-must carry its own port option.
-Remote `rm` accepts the same `--syq-path PATH` and `--no-bootstrap` helper
-selection; those options are mutually exclusive and are rejected for a local
-removal.
+`map` has additional rules because it emits relative paths; see
+[Mappings](mappings.md#semantics-and-limits).
 
-For two remote endpoints, `--coordinate-at auto` (the default) places the coordinator
-at the source. Path operands travel base64-encoded inside the command line
-sent to that host, so placing the coordinator on a remote host works for every
-filename, and data is never routed through this machine implicitly.
-`--coordinate-at src` explicitly selects a direct push, `--coordinate-at dst`
-selects a direct pull, in which the destination host opens the SSH connection
-to the source host, and `--coordinate-at local` explicitly selects a relay
-through this machine. The explicit values `src`, `dst`, and `local` are
-rejected for copies without two remote endpoints; `auto` is accepted
-everywhere.
+### Symlinks
 
-The default push (`--peer-auth restricted`) authenticates to the destination
-through the agent broker, which signs only for that destination, and writes
-through the restricted receiver. A default pull fails, because there is no
-read-restricted receiver and syq never silently downgrades to a mode whose
-only protection is authentication. Pull is available with an explicit
-`--rsh`, `--peer-auth own-credentials` when the destination host already
-holds its own credentials for the source, `--peer-auth broker`, or
-`--peer-auth full-agent`. `--peer-auth` and `--detach` apply only to a direct
-copy between distinct remote endpoints. The agent broker (the default and
-`--peer-auth broker`) needs OpenSSH 8.9 or newer for the client on the local
-machine, the client on the coordinator host, and the peer's server (the peer
-is the other remote host, the one the coordinator connects to); syq checks
-both clients before connecting and names the older one together with these
-alternatives. A detached launch requires the coordinator to hold its own
-credentials (`--peer-auth own-credentials`) or an explicit remote-shell
-policy, and the coordinator host needs `/bin/kill` plus either `setsid` or
-`perl` to start the new session (macOS has no `setsid`); the launcher reports
-its coordinator and log only after the detached coordinator has established
-the transfer route and finished checking the destination, before anything is
-written. If that readiness deadline expires, the launcher
-terminates and verifies the complete detached process group before reporting
-failure.
+Native commands refuse symlink traversal in paths you supply by default.
+A symlink selected by name is copied as a link, or removed as a link by `rm`.
+Links found inside a selected directory are never followed.
 
-If the job starts but the launcher cannot write its coordinator and log to
-stdout, the launcher exits with an error and attempts to report that location
-on stderr. The background job continues running.
+| Option | Allows traversal in |
+|---|---|
+| `--follow-src` | Source selectors, `--cwd`, and `--root` |
+| `--follow-dst` | Copy destination placement |
+| `--follow` | Both directions and control paths such as `--mapping`, `--ignore-from`, and `--results` |
 
-The restricted receiver, which serves one copy and then exits, requires
-encrypted TCP data connections. Consequently `--no-tcp`, falling back from TCP
-to SSH, `--tcp-plain`, and `--tcp-congestion` work for a copy that does not
-use the restricted receiver but are refused on it. Verification-only mode,
-destination-state filters such as `--update`, and block sizing remain
-available only in rsync mode.
+```sh
+syq cp --follow-src current-project --into backup
+syq cp --follow-src --srcs-in current-project --into backup
+```
+
+If `current-project` points to `releases/v3`, the first command copies the
+referent as `backup/current-project`; the second copies its contents into
+`backup`.
+
+An `--into` container link is followed only with `--follow-dst` or `--follow`.
+With `--as`, the last component is the entry to replace: even
+`--follow-dst --as link` replaces the link itself, leaving its target alone.
+A dangling link counts as existing for `--as-new` and `--as-existing`.
+
+For an explicit target, inspect it with `readlink` or use its resolved path
+from `realpath`. A relative `readlink` result is relative to the link's parent.
+Follow options never apply to paths inside a mapping manifest. With `--root`,
+even a followed selector must remain inside the root.
+
+### Preserve metadata
+
+Native copy recurses, copies links as links, and preserves modification times
+(the equivalent of rsync's `-rlt`). Add preservation only when needed:
+
+```sh
+syq cp --preserve=permissions,ownership project --into backup
+```
+
+| Value | Adds |
+|---|---|
+| `permissions` | File and directory modes |
+| `ownership` | Numeric owner and group |
+| `specials` | Device, FIFO, and socket nodes |
+
+`--preserve` is repeatable and accepts comma-separated values. Owners are
+set only when the destination process runs as root; group changes refused
+with `EPERM` are skipped. Without permission preservation, new files use
+source modes masked by the destination umask; existing files keep their modes.
+
+Hard links, ACLs, and xattrs are not preserved. On macOS, socket nodes are
+reported and skipped even when specials are requested.
+
+### Common copy options
+
+| Option | Effect |
+|---|---|
+| `-n`, `--dry-run` | Preview changes |
+| `-v`, `-vv` | List changes; also show route diagnostics at `-vv` |
+| `-q`, `--quiet` | Suppress non-error output |
+| `--hash` | Compare existing contents instead of trusting size and mtime |
+| `--ignore`, `--ignore-from` | Filter with gitignore patterns |
+| `--prune`, `--max-delete N` | Remove destination extras with an optional cap |
+| `--inplace` | Update final files directly; interrupted files may be incomplete |
+| `--min-size SIZE`, `--max-size SIZE` | Select regular files within an inclusive size range |
+| `-j N`, `--connections N` | Fix parallelism instead of tuning it automatically |
+| `--bwlimit RATE` | Cap aggregate file-data throughput |
+| `--no-compress` | Disable transport compression |
+| `--progress`, `--no-progress` | Override progress display, normally on for terminals |
+| `--stats` | Print totals and transport statistics |
+| `--results FILE`, `--results-fd N` | Write [structured results](automation.md) |
+
+A bare bandwidth rate is KiB/s; suffixes such as `K`, `M`, `G`, and `MiB` use
+powers of 1024. `0` means unlimited. The cap is shared across workers and
+counts uncompressed file bytes, excluding scanning, hashing, and metadata.
+
+`--hash` compares and repairs existing contents; it does not add a second
+post-transfer verification pass. Verification without writing is available
+in rsync mode as `--syq-verify-only`.
+
+## Removing files
+
+```sh
+syq rm cache old-output
+syq rm --srcs-in cache
+syq rm --from server --root /srv --src-dir old-output
+```
+
+The first command recursively removes the selected trees. The second empties
+`cache` and keeps the directory. Add `--dry-run -v` to inspect the selection
+before deleting it.
+
+All selectors are resolved and type-checked before deletion begins. Missing
+paths succeed. Duplicate or overlapping selectors are allowed and may produce
+redundant work; an already removed entry counts as success.
+
+`rm` takes the same source selectors, `--cwd`, `--root`, and source follow
+options as copy. It does not take filters. A selected symlink is unlinked;
+with `--follow-src`, its referent is removed and the link remains, usually
+dangling. Symlinks discovered inside a directory are only unlinked.
+
+Removal continues with independent entries after per-entry failures and exits
+23. A fatal setup or transport failure exits 1. Already completed removals
+are never rolled back. Remote removal is attached to its SSH connection;
+detected disconnection stops scheduling further work. There is no detached
+removal and no removal through the restricted receiver.
+
+## Previewing a copy
+
+```sh
+syq cp --dry-run -v --srcs-in project --into backup
+```
+
+The summary shows where each source lands, intended changes, logical bytes,
+exclusions, planned deletions, and the data route. `-v` adds a line per change:
+
+```text
+create file report.txt (destination missing)
+delete old.txt (destination only)
+```
+
+Logical bytes are an upper bound: resume, compression, and kernel copies may
+reduce actual I/O. An ignored directory counts as one excluded subtree;
+its children are not scanned.
+
+For a missing or empty destination, syq also checks required logical space
+and available inodes when the filesystem reports them. Insufficient capacity
+fails both a dry run and a real copy. This check reserves nothing and is
+omitted for nonempty destinations.
+
+Dry runs do not change copy data. They still connect and scan, may install
+remote helpers or update caches, and write a requested results file. The plan
+is a snapshot of current conditions, not a saved transaction. Remote-to-remote
+previews have [additional requirements](remote-to-remote.md#preview-and-mirror).
+
+## Resume
+
+**Rerun the same command after an interruption.** Completed files whose size
+and mtime match are skipped. Partial files are reused, and only mismatching
+blocks need to move. Existing destination files that differ can also supply
+matching blocks.
+
+By default, changed content is written beside the destination as
+`.name.syq-part.<copy-id>` and renamed into place when complete. Readers see a
+whole old or new file. `--inplace` gives this up: readers can see partially
+updated contents, and interruption leaves the final file incomplete.
+
+Changing placement, preservation, ordered filters, or block size can change
+the copy ID and start different partial files. Changing verbosity, connection
+count, checksum checking, or bandwidth limiting does not. Abandoned partial
+files may be removed manually once you no longer intend to resume that copy.
+
+Resume compares blocks at the same offsets. Appends and in-place changes can
+reuse data; an insertion near the start of a file causes the shifted tail to
+be resent. Syq cannot reuse rsync's partial files.
+
+Do not run the same logical command twice concurrently: both runs use the
+same partial files. Different commands may copy into one tree, but when they
+write the same path one whole-file rename wins. Do not combine concurrent
+copies with pruning, which can delete the other copy's files and partials.
+
+The destination directory must not be writable by untrusted users, especially
+for privileged copies. See [Security](security.md).
+
+## Verification and consistency
+
+Transferred blocks are checked with BLAKE3. A mismatch fails the file rather
+than reporting success. Source files whose size or mtime changes during a
+copy are retried, up to three attempts, then reported as failures.
+
+```sh
+syq cp --hash --srcs-in project --into backup
+syq rsync -a --syq-verify-only project/ backup/
+```
+
+The first compares existing file contents and repairs differences. The second
+writes nothing and reports `DIFFERS` or `MISSING`, with a nonzero exit status
+for failures or differences. Its scope respects selection and size filters.
+
+A copy is not a snapshot. Concurrent in-place writes can produce inconsistent
+contents; stop writers or use filesystem snapshots. Metadata is set but not
+fully read back for verification. Syq does not `fsync` transfer data, so a
+successful copy is not a guarantee of durability across power loss.
+
+## Ignoring paths
+
+Native copy uses `--ignore` and `--ignore-from`; rsync mode uses
+`--syq-ignore` and `--syq-ignore-from`. Patterns follow gitignore syntax and
+are applied in command-line order. Last match wins; `!` re-includes.
+
+```sh
+syq cp --ignore-from .gitignore --srcs-in project --into backup
+syq cp --ignore node_modules --ignore '*.o' --srcs-in project --into backup
+syq cp --ignore 'logs/*' --ignore '!logs/keep/' --srcs-in project --into backup
+```
+
+| Pattern | Matches |
+|---|---|
+| `foo` | A file or directory named `foo` at any depth |
+| `/foo` | `foo` at the source root |
+| `foo/` | Directories named `foo` |
+| `*` | Within one path component |
+| `**` | Across path components |
+
+An ignored directory is not scanned. A later rule cannot re-include its
+children unless the parent is included too. To select only JPEG files while
+still descending into directories:
+
+```sh
+syq cp --ignore '*' --ignore '!*/' --ignore '!*.jpg' --srcs-in photos --into backup
+```
+
+Rules start afresh at each source root. They also protect matching destination
+paths from pruning. Native `rm` does not take filters.
+
+## Deleting extras (`--delete`)
+
+Native `--prune` and rsync's `--delete` remove destination-only paths after
+copying:
+
+```sh
+syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
+syq rsync -a --delete --max-delete 100 build/ deploy/
+```
+
+Preview with `--dry-run -v` first.
+
+- **Only mapped directories are pruned.** Copying named directories `a` and
+  `b` into `dst` prunes inside `dst/a` and `dst/b`, leaving `dst/c` alone.
+  A single-file source deletes nothing.
+- **Ignored paths are protected.** Rsync mode's `--delete-excluded` removes
+  that protection. `cache/` protects a directory, while `cache` protects a
+  file or directory of that name.
+- **Skipped source files still count as present.** Size filters and rsync's
+  state filters do not turn their destination counterparts into extras.
+- **Scan errors prevent deletion.** Both source and destination must be
+  scanned successfully. Per-file read failures during transfer do not by
+  themselves disable deletion; the failed source file still counts as present.
+- **A positive deletion cap is all-or-nothing.** If more than N entries are
+  planned, `--max-delete N` deletes none and exits 25. A zero cap reports
+  extras without deleting them. Once deletion starts, an interruption may
+  leave some extras removed; rerun to finish.
+
+This copy's live partial files are protected. Orphaned partials and partials
+from other logical commands are ordinary extras and may be deleted.
+
+Native `--max-delete` requires `--prune`. In rsync mode it has no effect
+without `--delete`, and `--max-delete=-1` aliases zero. Pruning cannot be
+combined with mapping manifests; rsync deletion cannot be combined with
+`--files-from` or verification-only mode. Restricted remote-to-remote pruning
+requires an [explicit cap](remote-to-remote.md#preview-and-mirror).
+
+## Remote options
+
+| Option | Purpose |
+|---|---|
+| `--syq-path PATH` | Use a specific remote syq executable |
+| `--no-bootstrap` | Use a matching syq on the remote `PATH` |
+| `--rsh COMMAND` | Supply your own remote-shell and authentication policy |
+| `--no-tcp` | Send file data through SSH |
+| `--tcp-ports LO-HI` | Choose listening ports; default `47600–47699` |
+| `--tcp-plain` | Disable data encryption; trusted networks only |
+| `--tcp-congestion ALGO` | Linux: select congestion control for syq's TCP sockets |
+
+Remote `rm` accepts helper selection through `--syq-path` or
+`--no-bootstrap`; these are mutually exclusive and invalid for local removal.
+Source builds upload themselves to compatible hosts automatically. See
+[installation](install.md#remote-helper-bootstrap) for other platforms or
+manually installed helpers.
+
+An explicit `--rsh` controls authentication and bypasses automatic broker and
+receiver setup. Native endpoint ports work with the default SSH command or
+an explicit `ssh`; other wrappers must carry their own port setting.
+
+For two remote endpoints, `--coordinate-at src` sends directly from source
+to destination, `dst` selects a direct pull, and `local` relays through your
+machine. The default `auto` selects the source. Explicit placements require
+two remote endpoints; `auto` is accepted everywhere. Authentication choices,
+receiver limits, and detached copies are in
+[Copy between servers](remote-to-remote.md).
 
 ## Persistent SSH connections
 
-For interactive use, enable SSH connection persistence once:
+Keep logins available for repeated commands and faster remote completion:
 
 ```sh
 syq persist on
@@ -504,137 +414,45 @@ syq persist status
 syq persist off
 ```
 
-While it is on, transfer and removal commands that use syq's implicit SSH
-transport keep one control connection per `user@host:port` alive for five
-minutes after its last session (OpenSSH `ControlMaster` with
-`ControlPersist`). Later commands reuse that authenticated connection and
-avoid another hardware-token interaction.
+Persistence avoids repeated authentication and keeps a helper session ready.
+Connections may remain reusable for up to ten minutes after your last command;
+`off` ends the window immediately. During it, processes acting as your local
+user can reuse those logins without another key touch or agent approval.
 
-Reusing the connection alone still costs each command a new SSH session, a
-helper launch, and a handshake before its first request: three network round
-trips, which on a distant host is most of a second. So while persistence is
-on, the first command to reach an endpoint also starts a small background
-process, the session pool, that keeps one helper session ready for that
-endpoint. The next command takes the ready session instead of opening its
-own, so a remote completion or a small copy costs one round trip. The pool
-opens its session through the existing control connection only: it checks
-that the master is alive, attaches to it with every authentication method
-disabled, no agent, display, or port forwarding, and no proxy of its own, and
-never reads from the session it holds. If the master has gone away the pool
-simply stays empty, and the next command logs in normally and shows whatever
-OpenSSH has to say. The pool exits after five minutes without
-handing over a session, and the control connection's own five-minute window
-begins after that, so the reuse window after your last command can reach ten
-minutes in total. It also exits when its scope is removed or when a newer
-syq binary starts using the endpoint.
-
-The pool keeps the environment variables it inherited from the command that
-started it; later commands do not update them. If your SSH configuration uses
-`SendEnv`, sessions opened by the pool send values from that original
-environment, subject to the server's `AcceptEnv` settings. For example, changing
-`LANG` before a later syq command does not change the value sent by the pool.
-A session opened directly by that later command uses its current environment.
-To start again with a changed environment, run `syq persist off`, then
-`syq persist on`, and run your next command with the desired values.
-
-`status` shows the global scope and its recorded endpoints, marking an
-endpoint whose session pool is running; `off` disables the policy, stops
-every session pool, asks every live syq-owned master to exit, and removes the
-global runtime scope. The durable preference lives in
-`$XDG_CONFIG_HOME/syq/persistence.json` (normally under `~/.config`), while
-control sockets and pool sockets live in a per-user runtime directory that
-only that user can read.
-
-Scripts can avoid changing that shared preference by creating an ephemeral
-persistence scope:
+Scripts can create their own scope without changing the global preference:
 
 ```sh
 pscope=$(syq persist on --ephemeral) || exit
 trap 'syq persist off --pscope "$pscope"' EXIT
-
 syq cp --pscope "$pscope" first --to server --into /backup
 syq cp --pscope "$pscope" second --to server --into /backup
-syq persist status --pscope "$pscope"
 ```
 
-`on --ephemeral` prints exactly the new ephemeral scope path. Passing that path
-with `--pscope` lets separately launched or parallel commands share only that
-scope, independently of the global setting. `off --pscope` closes its live
-masters and removes it. If a script is killed before its cleanup trap runs,
-the masters still leave after their five-minute idle limit; the inert scope
-can be inspected or removed later with the printed path. Scope paths beginning
-with a literal `~` or containing `${...}` are refused because OpenSSH expands
-those forms before opening a control socket.
+Scopes may be shared by parallel commands. Inspect one with
+`syq persist status --pscope "$pscope"`. After a crashed script, idle
+connections expire, but its inert scope directory may remain.
 
-`--pscope` is deliberately not treated like the other control files. It
-names a directory that syq creates with restrictive permissions and checks
-before use; OpenSSH derives socket names beneath that directory. Its
-protection therefore comes from that directory's ownership and permissions,
-not from the open file handles syq uses for filters, mappings, file lists, and
-results.
+Persistence applies to syq's implicit SSH connections on the invoking machine.
+It does not apply to explicit `--rsh`, remote coordinators, or restricted
+receiver authentication; an explicit scope is refused where unsupported.
+Use `--coordinate-at local` to reuse connections for a relayed copy.
 
-During either persistence window, anything able to act as the same local user
-can open sessions through the socket without touching the key or agent, and
-can take the ready helper session the pool holds. This is comparable to
-sudo's credential cache; do not enable it where that window is unacceptable.
-On the remote side the pool keeps one idle SSH session and one idle helper
-process per endpoint for as long as the window lasts, and nothing else. Data
-connections are unaffected: they remain separate TCP
-streams (or independent SSH processes under `--no-tcp`), so bulk throughput
-does not change. Persistence is not applied to an explicit `--rsh`, a
-coordinator running on a remote host, or authentication to the restricted
-receiver. A global preference is simply ignored on those paths; an explicit
-`--pscope` is refused when the requested arrangement of hosts cannot honor
-it. Use `--coordinate-at local` to keep a
-native remote-to-remote copy's reusable connections on the invoking machine;
-`syq rsync` does not accept remote-to-remote copies.
+If your SSH configuration uses `SendEnv`, pooled sessions use the environment
+from the command that started the pool. Run `persist off`, then `persist on`,
+to pick up changed values. Bulk data throughput is unaffected by persistence.
 
 ## Shell completion
 
-`syq completion bash`, `syq completion zsh`, and `syq completion fish` print a
-small adapter for the named shell. See [Installing](install.md#shell-completion)
-for the startup-file lines. The adapter asks syq for each set of candidates, so
-the command parser, endpoint rules, and path handling do not have to be
-reimplemented in shell code.
+[Install the adapter](install.md#shell-completion) for Bash, Zsh, or fish.
+Completion covers options, endpoint names, and local and remote filenames.
 
-Completion covers command and option names, fixed values such as
-`--coordinate-at`, native `--from` and `--to` endpoints, local filenames, and
-remote filenames. In native commands, source path options are listed at the
-`--from` endpoint and placement paths at the `--to` endpoint. In `syq rsync`,
-an operand such as `host:dir/fi` is listed on `host`. Files named with spaces,
-newlines, or non-UTF-8 bytes remain single candidates in shells that support
-those names.
+Remote completion uses an ordinary noninteractive SSH login, even for a host
+used as a restricted receiver. It never prompts for a password. Failures give
+no candidates; set `SYQ_COMPLETION_DEBUG=1` to see diagnostics. Explicit
+`--rsh` commands have no remote path completion.
 
-Remote completion uses a normal SSH login in batch mode: it never opens a
-password prompt, starts TCP data listeners, or uses the enrollment key (the
-key that authenticates to a restricted receiver). This means a destination
-used by a restricted remote-to-remote transfer can still be browsed when your
-normal SSH key can log in to the same endpoint. An explicit `--rsh` gets no remote path completion,
-because syq cannot safely infer how an arbitrary wrapper should be invoked.
-Connection and listing failures simply produce no candidates; set
-`SYQ_COMPLETION_DEBUG=1` to show their diagnostics.
-
-The helper syq installs on a remote host serves one bounded, read-only
-directory listing. If the matching helper is absent, the first completion may
-install it through the same [helper installation](install.md#remote-helper-bootstrap)
-used by a transfer: a verified release download or a source-build upload.
-With persistence enabled, completion uses the same per-endpoint SSH control
-connection as later transfers, which removes the repeated login latency. It
-also takes the session pool's ready helper when one is waiting, which makes a
-Tab one network round trip. Without persistence, the completion process opens
-its own connection, which ends with that request.
-
-After a successful SSH connection, syq remembers the endpoint as a future
-suggestion. It also suggests literal aliases from SSH configuration,
-unhashed names from `known_hosts`, and endpoints in the applicable persistence
-scope. Port-specific entries are offered in native endpoint syntax only;
-`host:2222` is a remote path, not a port, in rsync syntax.
-
-The learned suggestions are a disposable local cache at
-`$XDG_CACHE_HOME/syq/completion-endpoints.json`, normally
-`~/.cache/syq/completion-endpoints.json`. It contains at most 100 recently
-successful endpoint names, users, ports, and timestamps. It contains no paths,
-credentials, keys, or transfer history. Manage it with:
+Successful endpoints join suggestions from SSH configuration and known hosts.
+Manage the learned cache with:
 
 ```sh
 syq completion cache list
@@ -642,60 +460,27 @@ syq completion cache forget user@host:2222
 syq completion cache clear
 ```
 
-Clearing the file does not affect remote data, credentials, helpers, or
-persistent SSH sessions. An endpoint can still be suggested afterward when it
-comes from SSH configuration, `known_hosts`, or a current persistence scope.
+Clearing it removes learned suggestions, not SSH configuration, credentials,
+remote data, or persistent sessions.
 
 ## Mappings
 
-Placement can also be data instead of flags: `syq map` prints a local source
-selection and optional root rename as NDJSON, and `syq cp --mapping`
-executes such a manifest — a generalized `--as` covering many entries, each
-with its own destination. Between the two, any tool that edits JSON can reshape
-a transfer:
-
-```bash
-set -o pipefail
-syq map --srcs-in photos \
-  | jq -c '.dst.value |= ascii_downcase' \
-  | syq cp --mapping - -C photos --to nas --into /pub
-```
-
-`syq map` is local and destination-independent. Its options are `-C` or `--root`,
-`--follow-src`/`--follow`, the source-selector family, and `--as PATH` for
-placing the single selected top-level object at `PATH`. Copy destinations,
-filtering, transfer policy, execution
-controls, results, receiver ceilings, and receipts belong to the downstream `cp`
-invocation or the manifest transform.
-
-Conflicting destinations are refused before any byte moves. See
-[Mappings](mappings.md) for the format, more one-line transforms, and
-limits.
+Use `syq map` to generate source/destination entries and `syq cp --mapping`
+to execute them. This supports renaming and reorganizing during a copy.
+See [Mappings](mappings.md) for recipes, the format, and retrying failed entries.
 
 ## Rsync compatibility
 
-Rsync mode, `syq rsync`, accepts a deliberately narrow set of rsync's options
-for local, push, and pull copies:
-
-```
-syq rsync [OPTIONS] SRC... DEST
-syq rsync [OPTIONS] [USER@]HOST:SRC... DEST
-syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
-```
-
 ```sh
-syq rsync -av project/ server:backup/project/       # push
-syq rsync -av server:data/ ./data/                  # pull
-syq rsync -a /mnt/nfs/tree /local/tree              # local → local
-syq rsync -av --syq-connections 16 bigdir server:dest # fixed parallelism
-syq rsync -a --dry-run -v src host:dst              # preview
-syq rsync -a --syq-verify-only src host:dst          # compare only
+syq rsync -av project/ server:backup/project/
+syq rsync -av server:data/ ./data/
+syq rsync -a --dry-run -v src/ dest/
 ```
 
-As with rsync itself, the source and destination cannot both be remote. Use
-native `syq cp` or `syq cp --prune` for remote-to-remote work. Options that are
-specific to syq and remain useful in rsync mode begin with `--syq-`; their
-names make clear that an rsync installation will not accept them.
+Syntax is `syq rsync [OPTIONS] SRC... DEST`, with at most one remote endpoint.
+Syq-specific options have a `--syq-` prefix. It cannot connect to an rsync
+server; `--rsync-path` must name a syq executable, not a shell fragment.
+See [compatibility differences](rsync-compat.md) before replacing rsync in scripts.
 
 ### Compatibility options
 
@@ -742,520 +527,86 @@ names make clear that an rsync installation will not accept them.
 | `-h`, `--human-readable` | No-op for rsync compatibility; sizes are always human-readable. Use `--help` for help |
 | `-V`, `--version` | Print the version |
 
-Like rsync, `-q` suppresses all non-error output: progress, summaries,
-notices, and `-v` file listings are hidden. Copy failures are still written to
-stderr and reflected in the exit status.
 
-`--bwlimit` is one approximate limit shared by every `--syq-connections` worker, not a
-per-connection limit. As in rsync, a bare rate is KiB/s, suffixes such as `K`,
-`M`, `G`, and `MiB` use powers of 1024, a final `+1` or `-1` adjusts the scaled
-value by one byte, and `0` means unlimited. Syq counts uncompressed file bytes;
-protocol overhead is not counted, and transport compression may make the actual
-network rate lower. Scanning, hashing, and metadata operations are not limited.
+### Path semantics
 
-Remote transfers use fast zstd level-1 compression by default. Each protocol
-frame is sent compressed only when that representation is smaller, so archives,
-media, and encrypted data do not expand on the wire. They still cost a fast
-compression attempt; use `--no-compress` when CPU is scarcer than network
-bandwidth, particularly on a very fast LAN. Compression is transport-only and
-does not change file contents, hashes, resume offsets, or `--bwlimit` accounting.
+| Command | Placement |
+|---|---|
+| `syq rsync -a src dest` | Directory `src` becomes `dest/src` |
+| `syq rsync -a src/ dest` | Contents of `src` go directly into `dest` |
+| `syq rsync -a file dest` | `dest/file` if `dest` is a directory; otherwise exact name `dest` |
+| `syq rsync -a a b dest` | Multiple sources require or create directory `dest` |
 
-### Native remote-to-remote
+`src/.` selects contents too. Exactly repeated operands are scanned once but
+still count as multiple sources for placement. Collisions between distinct
+sources are refused.
 
-`syq cp --from hostA ... --to hostB ...` copies directly from one remote host
-to another (`syq rsync` refuses two remote operands, as rsync does). The
-arrangement of hosts, the default restricted path, what is signed into the
-grant and which options are refused under it, enrolling and revoking
-destinations, and the alternatives are documented in
-[Remote-to-remote transfers](remote-to-remote.md).
+A destination symlink in a supplied path is followed when root or the
+receiving user owns it. Links inside the destination tree are replaced when
+needed, never traversed. The local-only `--insecure-links` escape hatch and
+its risks are described in [Security](security.md#symlinks-and-shared-directories).
 
-## Path semantics
-
-Identical to rsync:
-
-- `syq rsync -a src dest` copies the directory itself → `dest/src`. `dest` is
-  created if missing.
-- An existing non-directory `dest` cannot be the parent of that `dest/src`
-  mapping; dry-run rejects it instead of presenting an impossible summary.
-  With `--existing`, both dry-run and the real command skip the whole mapping
-  as a no-op because creating `dest/src` is outside the selected scope.
-- `syq rsync -a src/ dest` copies the *contents* of `src` into `dest`. `src/.` and
-  `.` behave the same way.
-- A single file source goes to `dest/file` if `dest` is an existing directory,
-  otherwise `dest` is the new filename.
-- Several sources require (or create) a directory destination. With several
-  sources syq scans them all before writing anything, so two sources mapping
-  onto one destination path is refused before the destination is touched —
-  not even a missing destination directory is created (the transfer starts
-  once the scans finish). Naming the destination file itself as one of the
-  sources doesn't change that: it would be overwritten, so it's a conflict.
-  The price is memory: every scanned entry is held until the scans are
-  validated, roughly a few hundred bytes per entry across all sources.
-- An exactly repeated source operand is scanned once. It still counts toward
-  the original source count for placement, so `syq file file new-dest` creates
-  the directory `new-dest` and writes `new-dest/file`.
-- An explicitly supplied destination root that is a symlink to a directory is
-  that directory when the link is owned by root or by the effective user of
-  the process writing the destination (the link is kept, with or without a
-  trailing slash). A component owned by anyone else is refused. The control
-  connection opens the selected directory and keeps it open, and every worker
-  receives that same open handle rather than resolving the path again.
-  Renaming the destination path afterward therefore cannot redirect its
-  writes. A symlink found below the destination root is treated as an entry
-  at that path: it is replaced rather than followed, even when it points to a
-  directory.
-- Source paths that look like partial files (`.name.syq-part.<copy-id>`) are
-  copied as ordinary data and produce one warning summary. Before transfer
-  starts, syq rejects the unusual case where a source path maps exactly onto
-  the partial file this copy would use for another file.
-- `host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
-  A colon before the first slash means remote; `./x:y` is local. All sources
-  must be on the same host. `host::module` (daemon syntax) is not supported.
-
-### Previewing a copy
-
-`-n` / `--dry-run` connects to the endpoints and scans both sides without
-creating, updating, or deleting copy data. Requested `--results` files are
-still written, and remote connections may install helpers or update caches.
-Its concise summary makes path placement, intended changes, logical work, and
-the selected data route explicit before a real copy:
-
-```text
-syq: dry-run summary
-  mapping: ./dataset/ -> gpu01:/scratch/run42 (directory contents)
-  changes: 82,411 regular files; 96 directories; 14 symlinks; 3 metadata-only entries; 2 type replacements among them
-  deletions: 7 entries planned after a successful copy
-  logical data: 1.70 TiB in 82,411 files needing content work (upper bound); 340 GiB in 18,204 files with unchanged content
-  capacity: 1.70 TiB logical data required; 2.30 TiB available; 82,522 destination objects; 14,200,000 inodes available (appears sufficient)
-  exclusions: 3 paths/subtrees skipped by ignore rules; 12 other entries
-  route: encrypted TCP to gpu01; 16 initial connections (auto-tuned)
-```
-
-Each source gets its own `mapping` line. The annotation distinguishes directory
-contents, a directory copied as a child, a file placed inside a directory, and
-an exact destination path. `--files-from` is identified as a selected-path
-mapping. A destination-root symlink is shown as the effective directory it
-resolves to. By default, syq follows a symlink in this path you named only
-when the link is owned by root or by the effective user of the process writing
-the destination, matching rsync. The rule is the same whoever runs that
-process; running it as root makes links owned by an unprivileged user fail it. The `changes` line separately
-accounts for regular files, directories, symlinks, special files, and metadata-only updates; type
-replacements are called out as an overlapping subset. This is an assessment
-made at preview time, not a frozen list of changes that can later be executed
-unchanged. When a destination entry will be replaced by a directory, its
-descendants are assessed against that new directory rather than through the
-old entry (including an old symlink).
-
-The logical-data upper bound is the full size of regular files that fail the
-planning-time metadata check. Resume state, block reuse, reflinks, compression,
-server-side copying, or a content comparison can make the real I/O or wire-byte
-count smaller.
-
-When the effective destination is missing or is an existing empty directory,
-Syq also has a useful simple capacity check: no replaced destination file can
-free space, and newly created descendants cannot already cross filesystem
-boundaries. After scanning the selected source entries, syq rechecks the same
-destination filesystem and refuses a real copy if their logical file sizes
-exceed the space available to the user writing the destination, or if their
-object count exceeds an available inode count reported by the filesystem. The
-dry-run `capacity` line shows the same assessment. The line is omitted for a
-nonempty destination, a destination or filesystem that cannot report the
-figures, or a changed filesystem; those cases still fail when an allocation
-runs out of space, because updates, mounts, and replacement order make a
-simple whole-copy estimate misleading. An
-insufficient dry run exits unsuccessfully while still printing its plan and
-capacity line. This is a sanity check rather than a reservation, and it imposes
-no separate free-space reserve: another process can still consume or release
-space after it runs.
-
-An ignored directory is skipped without scanning its descendants,
-so the exclusions line counts that directory as one `path/subtree`; it does not
-invent a descendant count. Other exclusions cover state and size options and
-unsupported entry types. With `--delete`, the destination is walked and the
-exact deletion count is shown; scan errors and `--max-delete` guards are shown
-as skipped or blocked rather than as a misleading zero.
-
-Add `-v` for a typed explanation of each intended change, for example `create
-file PATH (destination missing)`, `replace with symlink PATH -> TARGET
-(destination is regular file)`, `update metadata PATH (requested file metadata
-differs)`, or `delete PATH (destination only)`. The default stays compact for
-large trees.
+`host:path` is relative to the remote home; `host:/abs` and `host:~/x` work.
+A colon before the first slash means remote; spell `./x:y` for a local name.
+All sources must be on the same host. Daemon syntax is unsupported.
 
 ### What `-a` does here
 
-`-rlptgoD`: recurse, symlinks as symlinks (targets copied verbatim,
-dangling links included), permissions, mtimes, group, owner, and device /
-fifo / socket nodes via `mknod`. Owner is only set when the *destination* side
-runs as root; group is attempted for everyone and silently skipped on
-`EPERM`, as rsync does. Without `-p`, new files get the source mode masked
-by the local umask and existing files keep their mode. Without `-t`, every
-file is transferred every time (the quick check needs mtimes).
+`-a` expands to `-rlptgoD`: recursion, links, modes, times, group, owner, and
+special files. Owner is set only by root on the destination; group changes
+refused with `EPERM` are skipped. Without `-p`, new files use the umask and
+existing files keep their modes. Without `-t`, every file is transferred again.
 
-Directory mtimes are set last, deepest first, so writing children doesn't
-disturb them. A directory syq must write into but can't (no owner write bit)
-is opened up for the duration and gets its own mode back at the end — or the
-source's mode with `-p`.
+Hard links, ACLs, and xattrs are not preserved by `-a` or any other option.
 
-## How it works
+### Skipping by state and size
 
-One control connection per endpoint does the scan (a parallel walk on each
-side, streamed in batches), the diff, directory creation and metadata.
-Workers receive no file work until syq has checked that no file's
-destination path collides with another file's partial file. For a fresh remote
-destination with a selected TCP route, they begin connecting as soon as a
-source batch proves that file work exists, overlapping authentication with
-those partial-file checks and directory creation; an empty tree opens no
-worker connection.
-The data connections — by default separate TCP sockets carrying AES-256-GCM
-records — carry only "read range" / "write range" requests. When data uses SSH
-(through `--syq-no-tcp` or TCP fallback), a transfer consisting entirely of fresh
-small files opens worker sessions over the already-authenticated OpenSSH control
-connection; larger or mixed workloads keep separate `ssh` processes, TCP
-flows, and cipher processes. A custom `-e` command keeps its own SSH
-multiplexing policy. Files go onto a largest-first queue; when a worker runs dry
-it steals the back half of the remaining range of whichever file has the most
-left, so the tail of a transfer stays parallel without pre-deciding chunk
-counts.
+| Option | Skips |
+|---|---|
+| `-u`, `--update` | Regular files newer on the destination |
+| `--existing` | Anything missing on the destination |
+| `--ignore-existing` | Anything already present |
+| `--min-size`, `--max-size` | Regular files outside the inclusive range |
 
-On the destination side a file that needs content changes is written beside
-its final path as the partial file `.name.syq-part.<copy-id>`, written with
-`pwrite` from several workers, given its metadata, and `rename`d over the
-final path. Eligible local filesystems preallocate fresh partial files with
-`fallocate`; on NFS, partial files grow from the data writes themselves so
-allocation and initial-size requests do not add metadata-server round trips.
-Newly created partial files are mode `0600`; final metadata is applied just
-before the rename into place. On Linux, local filesystems fall back to setting
-the file's length only when `fallocate` is unsupported; actual space and quota
-failures remain errors and abort the whole transfer instead of letting later
-files keep filling the filesystem. When an existing final file is the basis
-for comparison, the destination side keeps that file open while its blocks are
-hashed. If every block matches, metadata is applied through that open file
-without creating or renaming a partial file; otherwise that same open file
-seeds the partial file.
-The copy ID, the identity of one logical copy, is a 128-bit digest of the
-normalized source/destination mapping and content-affecting options, and is
-stable when the same logical command is rerun. It includes trailing-slash mapping, order-sensitive filters, metadata
-semantics and block size, but not operational controls such as checksum
-checking, connection count, verbosity, progress or bandwidth limiting.
-Filesystem component limits are queried once per observed filesystem and reused
-by missing descendants; long basenames are deterministically truncated and
-disambiguated to fit. An exceptionally long full path still fails that one file
-with a clear error (even when it is already up to date) while the rest of the
-transfer continues. The same is true when a destination entry (say, a
-directory some other tool left) already occupies the exact path this copy's
-partial file for that file needs. Syq does not `fsync` transfer data; renaming
-a complete partial file into place means a reader sees either the old file or
-the new one, and interrupted work can be resumed, but it is not durability
-across power loss.
-Small files still use a pipelined whole-file request, but the destination side
-writes each request through its partial file and renames it before
-acknowledging success. Thus every non-`--inplace` content change appears
-atomically complete, while an existing file that syq compares block by block
-and finds content-identical keeps its inode and any destination hardlinks. The
-kernel copy used when source and destination are on the same host may replace
-a byte-identical destination that failed the quick check, because it
-deliberately avoids that comparison.
-`--inplace` writes every file directly (for example, to update a large file
-without room for a second copy); eligible new small files keep the same
-pipelined batching without creating partial files. Readers can observe partially
-updated contents and an interruption leaves the final file unfinished.
+`--ignore-existing` also keeps an existing file where a directory would land,
+skipping that source subtree. `--update` does not prevent type replacements.
+Neither `--update` nor `--ignore-existing` combines with `--inplace`: an
+interrupted file could otherwise look newer and be skipped forever.
 
-Local → local runs the same machinery in-process with N threads, which helps
-on NFS and NVMe.
-
-### Resume
-
-With the default of writing to a partial file and renaming it into place,
-Ctrl-C is safe: kill it and rerun the same command. `--inplace` deliberately gives up that guarantee. Resume works at two
-levels.
-
-**Within a file.** There is no per-file state file; the partial file *is* the
-state:
-
-- Files whose size and mtime already match are skipped (the rsync quick check).
-- If this copy's partial file `.name.syq-part.<copy-id>` exists, both sides
-  hash it and the source with full BLAKE3 digests in `--block-size` blocks and
-  only the mismatching blocks are sent. A leftover is reused only when it can
-  be safely opened as a singly-linked regular file without following a symlink; numeric ownership is
-  deliberately not required because NFS root squashing and some FUSE/CIFS
-  mounts remap it. A safe leftover that cannot be made mode `0600` is discarded
-  and recreated instead of permanently blocking that file. Anything else is
-  safely replaced or reported as an error.
-  On NFS, reuse requires the destination side to reread the partial file; syq
-  deliberately keeps no separate record of which blocks are complete.
-  Pipelined small files are rewritten wholesale on retry instead of paying an
-  extra partial-file probe.
-- If the destination file exists but differs, its blocks are hashed against
-  the source too; if all match only metadata is fixed, otherwise the matching
-  blocks are copied locally into a new partial and the rest transferred.
-
-This block-level skip catches appends and in-place modifications (VM images,
-databases, logs). It does **not** catch a byte inserted near the start of a
-file, which rsync's rolling checksum would — for syq's intended use (fresh
-uploads and downloads) that trade was made deliberately.
-
-The copy ID includes `--block-size` and the ordered ignore rules, so changing
-either starts a separate set of partial files. Old partial files are not
-cleaned up automatically and may be deleted manually when the earlier command
-will not be resumed. Options that do not change the copy itself, such as
-`-c`, `--bwlimit`, and `--syq-connections`, do not change the copy ID.
-
-The directory containing a partial file is a trust boundary, as with rsync's
-partial directories. It must not be writable by untrusted users, especially
-when syq runs with elevated privileges. A reused partial file may have a
-numeric owner remapped by the filesystem; checking its mode and link count
-cannot prove who originally created a predictable pathname in a shared
-writable directory.
-
-**Across the whole copy.** Copies keep no transfer history. Their source and
-destination scans skip files already complete, and deleting or changing a
-destination file affects the next run just as it does with rsync.
-
-Like rsync, separate syq runs do not coordinate with each other. Different
-logical commands use different partial-file names, so concurrent copies into
-one tree produce the union of their files and one whole-file rename wins for
-any path both write. But do not combine concurrent copies with `--delete`,
-which mirrors *its* source and removes the other command's not-yet-shared
-files and partial files as extras. A content-identical comparison applies
-metadata only through the inode it verified, so it cannot mix its metadata
-with another copy's newly renamed contents. Quick-check metadata repair likewise verifies the inode;
-if a concurrent rename put a new file in its place, the repair reports an
-error instead of mixing metadata with the new contents.
-Starting the same logical command twice at once is
-unsupported: both invocations intentionally address the same partial files.
-After a crash, abandoned partial files may be deleted manually if that command
-will not be resumed.
-
-These guarantees cover other syq copies, which put complete files in place by
-rename.
-They do not cover another process modifying an existing destination inode in
-place while syq is hashing or reusing it. As with rsync, such an external
-writer can invalidate a comparison after it was made; do not independently
-modify destination files during a transfer.
-
-### Verification and consistency
-
-Always:
-
-- Every transferred block carries a full BLAKE3 digest computed by the reader
-  and checked by the destination side; a mismatch aborts that file with an
-  error (exit 23) rather than silently continuing. It indicates transport
-  corruption, which is rare.
-- After a file completes, the source is re-stat'ed. If its size or mtime
-  changed during the transfer the file is redone (up to three attempts), then
-  reported as an error.
-- Unless `--inplace` was explicit, destination content changes appear
-  atomically via rename, including new small files.
-- Non-zero exit if anything failed.
-
-On request:
-
-- `--syq-verify-only` hashes every file on both sides with BLAKE3 in parallel and
-  reports `DIFFERS` / `MISSING`.
-- `-c`/`--checksum` (`--hash` in the native commands) does the BLAKE3 block
-  comparison for every file, not just ones that fail the quick check, and
-  repairs what differs.
-
-Content decisions use full BLAKE3 digests so that a digest match is
-collision-resistant rather than merely a fast corruption check. In one
-release-mode, single-thread CPU microbenchmark with 4 MiB inputs
-on an AMD EPYC 9454P, BLAKE3 processed 6.69 GB/s, compared with 31.25 GB/s for
-XXH3 and 1.86 GB/s for SHA-256. This is design-rationale data, not an end-to-end
-copy-speed claim; filesystem and transport work usually dominate, and syq
-hashes concurrently across workers.
-
-Not verified: directory and symlink metadata are set but not read back; a
-source that changes *between* the final re-stat and the next block of another
-file isn't noticed (same as rsync). Two chunks of one file are read at
-different moments, so a file being written while copied may come out mixed —
-the re-stat catches the common case, `--syq-verify-only` afterwards catches the
-rest.
-
-Compared with rsync: content-changing writes use the same temporary-file
-plus atomic rename model; `--inplace` explicitly gives that up.
-Rsync chooses a random temporary suffix, while syq uses a deterministic copy ID
-so an interrupted command can find its partial again without a local state
-file. The change-during-transfer check is the same idea; `--delete` runs
-strictly after the transfer (see below); hardlinks aren't implemented.
-
-## Ignoring paths
-
-syq has one filter mechanism instead of rsync's include/exclude/filter rules:
-native copy calls it `--ignore`/`--ignore-from`, while rsync mode uses the
-explicitly extended `--syq-ignore`/`--syq-ignore-from` spellings. Each pattern
-is a line of a virtual `.gitignore` placed at every source root, and each
-pattern file is spliced into that sequence. Rules are applied in command-line
-order with gitignore semantics (last match wins, `!` re-includes):
+### Copying a list (`--files-from`)
 
 ```sh
-syq rsync -a --syq-ignore node_modules --syq-ignore .git src/ host:dst/
-syq rsync -a --syq-ignore '*.o' --syq-ignore /build src/ host:dst/
-syq rsync -a --syq-ignore 'logs/*' --syq-ignore '!logs/keep/' src/ dst/
-syq rsync -a --syq-ignore-from .gitignore --syq-ignore '!dist/' repo/ host:repo/
-syq rsync -a --syq-ignore '*' --syq-ignore '!*/' --syq-ignore '!*.jpg' photos/ bak/
-syq cp --ignore-from .gitignore --srcs-in repo --to host --into repo
-syq cp --prune --ignore cache/ --srcs-in build --into-existing deploy
+syq rsync -a --files-from list.txt server:src/ dst/
 ```
 
-Rules of thumb (they're git's): `foo` matches a file or directory named `foo`
-at any depth; `/foo` only at the source root; `foo/` only a directory; `*`
-doesn't cross `/`, `**` does. An ignored directory is skipped, so nothing
-inside it is transferred or even scanned, which is why "only `*.jpg`" needs
-the `!*/` line to keep descending. Empty directories are copied like any other
-(this is a filter on the walk, not git's notion of what's tracked). The source
-root itself is never ignored; with several sources each is filtered from its
-own root. `-n` previews the selected scope and intended changes. The same rules
-are available on native `cp`, with or without `--prune`. Neither native `rm`
-takes filters: removal always selects the whole explicit tree.
+Each line selects a path relative to one source directory. `--from0` uses
+NUL separators; `--files-from -` reads stdin. Only listed paths are inspected,
+and missing parents are created at the destination.
 
-As in git, a `!` rule cannot re-include something whose parent directory is
-ignored: `logs/**` ignores `logs/keep` itself, so `!logs/keep/**` after it has
-nothing to act on. Ignore the siblings instead (`logs/*`, which does not cross
-`/`) and re-include the directory (`!logs/keep/`), as above.
+A listed directory copies without its contents unless you explicitly add
+`-r`; `-a` alone does not count. Missing entries fail with exit 23 while other
+entries continue. The destination must be a directory.
 
-## Deleting extras (`--delete`)
+Blank entries and entries beginning with `#` or `;` are ignored in either
+separator mode; use `./#name` for a literal comment-looking name. Leading
+`/` or `./` and trailing `/` are stripped. `..` components and root entries
+are refused. A symlinked source parent fails that entry unless a local source
+uses `--insecure-links`; remote sources always refuse it.
 
-`syq rsync -a --delete src/ host:dst/` makes `dst` look like `src`: after the
-transfer, anything under a destination directory that the source doesn't
-have is removed. The rules are simpler than rsync's, deliberately:
+`--files-from` cannot combine with ignore filters or deletion. For custom
+placement, use a [mapping](mappings.md).
 
-- **Scope.** Only inside directories the sources map onto: `syq rsync --delete a b
-  dst/` cleans `dst/a` and `dst/b`, never `dst/c`. A single-file source deletes
-  nothing.
-- **Ignored means out of scope, on both sides.** The `--syq-ignore` patterns are applied
-  to the destination walk from the same roots, so an ignored entry is neither
-  copied nor deleted, and a directory that holds one is kept (`not deleting
-  keep/: it holds ignored paths`, on stderr, not an error). Patterns are
-  matched against each side's actual entry, with gitignore's one type
-  distinction: `cache/` matches only directories, so it protects a destination
-  directory named `cache` but not a destination *file* of that name, which is
-  an ordinary extra (rsync behaves the same). Write `cache` without the slash
-  to cover both. `--delete-excluded` drops that protection: ignored paths on
-  the destination are extras too.
-- **Anything the source has is safe.** A file skipped by `-u`, `--existing`,
-  `--ignore-existing`, `--max-size` or `--min-size` — or a symlink or special
-  file skipped for lack of `-l`/`-D` — still exists in the source, so its
-  destination copy is left alone, as in rsync. Such files are reported under
-  `files excluded` in `--stats`.
-- With `--delete` the partial-file path of every mapped regular file stays in
-  memory until deletions run (that set is what tells a live partial file from
-  an orphan); on multi-million-file trees this is the option's main memory
-  cost.
-- **After, not before.** Deletions run once every file has been transferred
-  and only if the whole source scan succeeded: an unreadable source directory
-  would otherwise look like one whose contents vanished (`source scan reported
-  errors; skipping deletions`). The destination walk is held to the same rule:
-  an unreadable directory *there* looks empty and would be removed over its
-  unknown contents, so its errors also skip all deletions. A run interrupted
-  during scanning or transfer therefore never starts deletion. Once deletion
-  has begun, interruption can leave some planned extras removed; rerunning
-  finishes the mirror. Directory mtimes are set after the deletes.
-- **Files named like partial files are extras unless they are this copy's
-  live resume state.** A `.name.syq-part.<copy-id>` of *this* command whose
-  `name` is still in the source stays, whatever happened to that file this run
-  (failed, filtered, already up to date): the next transfer of that file
-  consumes it. Everything else matching the pattern (an orphan of this
-  command, or any other copy ID) is an ordinary extra: syq copies such names
-  as ordinary data, so the name alone proves nothing, and mirroring the source
-  is what --delete is for. Note that the copy ID includes the command's
-  semantic options: change those (or the source/destination spelling they
-  normalize to) and the previous copy ID's partial files become orphans,
-  removed by `--delete` and inert otherwise.
-- `--max-delete N` is an intentional positive-limit divergence. Syq plans the
-  complete deletion set and, if it contains more than N entries, deletes
-  nothing, reports the refusal, and exits 25. Rsync instead deletes the first N
-  and then stops. `--max-delete=0` therefore has rsync's useful no-deletion
-  reporting behavior; `--max-delete=-1` is accepted as its historical synonym.
-  Without `--delete`, the option is accepted and has no effect, as in rsync.
-- `-n --delete -v` lists every intended removal as `delete path (destination
-  only)`. The dry-run summary reports the number planned; a real run reports
-  the number deleted. `--delete`
-  conflicts with `--syq-verify-only` (deleting is the opposite of writing
-  nothing) and with `--files-from` (deletion scope under a file list is
-  ambiguous).
+## Output and exit codes
 
-Deletion goes through the control connection in batches of 1000 (the
-destination side unlinks each batch in parallel); it is not spread over the
-copy's data connections.
-
-## Skipping by state and size
-
-- `-u` / `--update`: a file whose destination copy has a newer mtime is left
-  alone (regular files only). Neither `-u` nor `--ignore-existing` can be
-  combined with `--inplace`: an interrupted in-place write leaves a
-  partially-written final file that looks newer, which those filters would
-  then skip on every retry.
-- `--existing`: never create anything — files, symlinks, specials,
-  directories, *or the destination itself* — that isn't already there;
-  existing files are still updated. `--ignore-existing` is the mirror image: create what's
-  missing, never touch what exists — including an existing file or symlink
-  where the source maps a *directory*: it stays, and that directory with its
-  whole subtree is skipped with a notice (rsync would delete the file to
-  make room). Both apply to every non-directory entry.
-- `--max-size` / `--min-size`: regular files outside the range are not
-  transferred (`4K`, `100M`, `2G`; the same suffixes as `--block-size`).
-  Directories and symlinks are unaffected.
-
-All of these define the scope of the run, so `--syq-verify-only` checks the files
-the same command would transfer and nothing else.
-
-## Copying a list (`--files-from`)
-
-`syq rsync -a --files-from list.txt host:src/ dst/` copies only the paths named in
-`list.txt`, one per line (`--from0`: NUL-separated; `-` reads stdin), each
-relative to the single source directory, to the same relative path under the
-destination. The source is not walked, which is the point on a slow
-filesystem when the list is known. Parent directories of listed paths are
-created (with their metadata). By default, a parent that is a symlink on the
-source is not traversed and that listed path fails. This is deliberately
-stricter than hardened rsync 3.5.0: rsync may first emit the implied destination
-directory and then fail the content open, while syq refuses the path before
-emitting that implied parent. Both report a partial-transfer error (exit 23).
-`--insecure-links` opts a local source into walking by path name instead of
-by open handle: such a parent is followed and becomes a real directory on the
-destination. A remote source keeps the default behavior, because the flag is
-never sent to the remote side. A parent that resolves to a file or dangles is an error. A
-listed directory is copied *without*
-its contents unless `-r` is given on the command line itself — `-a` alone
-does not count, as in rsync — so `-a -r --files-from` walks the directories
-the list names (never the implied parents).
-Blank entries and entries starting with `#` or `;` are ignored in both modes;
-spell a literal comment-looking name as `./#name` or `./;name`. Leading `/` or
-`./` and trailing `/` are stripped, and `..` components or an entry that names
-the root itself are rejected. A listed path that doesn't exist is an error
-(exit 23) and the rest is still copied. The destination must be a directory (an
-existing file there is an error, never replaced). `--files-from` cannot be
-combined with `--syq-ignore`/`--syq-ignore-from` or `--delete`. To also choose
-each entry's destination path, use a native mapping instead (see
-[Mappings](mappings.md)).
-
-## Not implemented (on purpose, for now)
-
-[rsync-compat.md](rsync-compat.md) tracks rsync compatibility in full: what matches, what
-differs and why, and what's missing. The short version:
-
-- rsync filter rules (`--exclude`/`--include`/`--filter`); use the
-  `--syq-ignore` extension (gitignore syntax) instead.
-- `--link-dest`, `--backup`.
-- `--delete-before`/`--delete-during` and `--force`. syq deletes only after
-  the transfer (`--delete-after`/`--delete-delay` are accepted as synonyms).
-- Hardlinks (`-H`), ACLs and xattrs (`-A`/`-X`).
-- rsync daemon mode / `rsync://`. syq speaks its own protocol; it cannot talk
-  to an rsync server.
-- Rolling-checksum delta transfer (see Resume above).
-- UDP or forward-error-correcting data transport. TCP retransmission/RTT
-  counters are collected for diagnosis, but a loss-tolerant transport would be
-  a separate protocol and security design.
-- Preserving existing partial files from `rsync --partial`; only syq's own
-  `.name.syq-part.<copy-id>` partial files for the same logical command are
-  recognised.
-
-## Exit codes
+Copy and removal continue if human output fails; their exit status still
+reports the filesystem operation. A slow output consumer may block the thread
+writing to it. Use [results](automation.md) for structured accounting, and
+always check for a terminal record.
 
 | Code | Meaning |
 |---|---|
-| 0 | Everything copied and verified |
-| 1 | Fatal: couldn't connect, remote `syq` missing, connection lost |
-| 2 | Bad arguments or usage |
-| 23 | Finished, but some files failed (unreadable source, `DIFFERS`, changed during transfer …) — errors are on stderr |
-| 25 | Finished, but `--max-delete` stopped the deletions |
+| `0` | Requested operation succeeded |
+| `1` | Fatal setup, connection, or runtime failure |
+| `2` | Invalid arguments or usage |
+| `23` | Some entries failed; independent work continued |
+| `25` | Deletions refused by a safety cap |

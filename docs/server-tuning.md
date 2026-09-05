@@ -1,301 +1,73 @@
 # Server setup
 
-This page is about setting up a server (its firewall, sshd, and sysctl
-settings) so syq can run fast on it. That is separate from syq's own
-auto-tuner, which adjusts the connection count during a copy without any
-change to the host. syq does not require a specially configured server. It
-installs a matching remote helper automatically when using an official
-release build, encrypts its TCP data connections by default, and adjusts its
-connection count while a copy runs. If TCP cannot be reached, syq falls back
-to ssh, except with the restricted receiver, which requires encrypted TCP
-and fails instead. Start with the defaults and change the host only when a
-representative transfer shows a specific bottleneck.
+Syq needs no special server tuning. If a representative copy is slow, use
+`-vv --stats` and check CPU, disk, and network use on both ends before changing
+host settings. [Speed](speed.md) covers syq's own controls.
 
-This is deliberately a guide, not an installer. Firewall policy, ssh capacity,
-kernel versions, network paths, and storage differ too much for one script to
-make safe choices. Most settings below affect every user and service on the
-host, not just syq.
+## Make TCP reachable
 
-## Measure before changing the host
+The most useful server change is often allowing syq's TCP data port.
+The remote listens on one available port in `47600–47699`, or your
+`--tcp-ports LO-HI` range, for the transfer's duration.
 
-Use the same source, destination, and direction for comparisons. Large files
-exercise the network and storage bandwidth; a tree of small files exercises
-latency and metadata performance.
-
-```sh
-syq rsync -avv --stats SOURCE HOST:DESTINATION
-SYQ_DEBUG=1 syq rsync -a --stats SOURCE HOST:DESTINATION
-```
-
-`-vv` reports the remote helper and platform, candidate TCP addresses, the
-planned data transport, and the initial connection count; `--stats` reports
-the connection count the auto-tuner finished on. `SYQ_DEBUG=1` adds engineering
-timings showing connection setup and where workers spent their time. Check CPU,
-disk, and network utilization on both endpoints at the same time. More network
-changes cannot fix a saturated disk, one busy CPU core, or a slow destination
-filesystem.
-
-Change one thing at a time and repeat the same transfer. Record the original
-value, the reason for the change, and the before/after result. If the result is
-within normal run-to-run variation, revert the change.
-
-## 1. Make TCP data connections reachable
-
-This is usually the most useful server-side change. syq authenticates over ssh,
-then asks the remote helper to listen on one available port in
-`47600-47699` (or the range given with `--syq-tcp-ports`) for the duration of that
-transfer. The default TCP records are encrypted with a key exchanged through
-ssh. The helper listens on that port over both IPv4 and IPv6, so a firewall
-rule must allow whichever family the client will use. If no advertised
-address and port is reachable, syq reports the fallback once and carries data
-over ssh instead. A restricted remote-to-remote copy requires encrypted TCP
-and fails instead of falling back.
-
-Allow the chosen port range only from clients or trusted networks that need it.
-For example, an administrator using ufw could adapt one of these rules:
+For a host using ufw, an administrator can adapt this rule:
 
 ```sh
 sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
-sudo ufw allow from <trusted-network/CIDR> to any port 47600:47699 proto tcp
 ```
 
-Do not paste the placeholders literally. Use the host's existing firewall tool
-and policy, and verify the effective rule afterward. Remove the rule with that
-tool's normal delete operation to roll it back. Opening the range to the whole
-internet creates unnecessary exposure even though syq's protocol requires a
-per-transfer token and is encrypted unless `--syq-tcp-plain` was requested.
+Use the host's existing firewall policy and allow the address family the
+client uses. Limit access to the clients or networks that need it, then check
+with `syq cp -vv --stats`.
 
-Trade-offs:
+Ordinary copies fall back to SSH if TCP is unreachable. Restricted
+remote-to-remote copies require encrypted TCP and fail instead.
 
-- A reachable TCP path avoids ssh's per-channel flow-control and cipher-process
-  limits. A job made only of new small files, using default ssh with no
-  bandwidth limit, reuses the authenticated control connection. Larger or
-  mixed workloads and bandwidth-limited copies use independent SSH data
-  processes so they can use multiple flows and cipher processes.
-- A firewall exception increases reachable attack surface. A private LAN, VPN,
-  or narrowly scoped source rule is preferable to a public allow rule.
-- `--syq-tcp-plain` saves encryption work but removes data confidentiality and
-  integrity. Use it only on a network whose trust boundary you understand.
-- `--syq-no-tcp` requires no additional inbound ports, at the cost of using SSH for
-  the data transport.
+## SSH connections are being dropped
 
-## 2. Raise sshd `MaxStartups` only after observed drops
-
-This setting matters when data falls back to independent ssh connections. It
-limits concurrent *unauthenticated* ssh connections; it does not limit
-established sessions, small-file workers sharing the control connection
-(which a nonzero `--bwlimit` disables), or workers using the TCP data path.
-Syq already retries shed connections and reduces the number of simultaneous
-handshakes, so the default is functional but
-can make connection setup slower.
-
-Inspect the effective value rather than assuming the distribution default:
+If SSH data connections are refused during startup, inspect the server's
+unauthenticated-connection limit:
 
 ```sh
 sudo sshd -T | awk '$1 == "maxstartups" { print }'
 ```
 
-OpenSSH accepts either one maximum or `start:rate:full`. In the three-part
-form, random refusal begins at `start` concurrent unauthenticated connections,
-with `rate` percent refused initially, and reaches 100 percent at `full`. A
-value such as `64:30:128` is an example with headroom for syq's connection
-bursts and unrelated logins, not a universal recommendation.
+Prefer making the TCP data route reachable. Raise `MaxStartups` only if
+observed connection drops justify it: the limit also affects unrelated logins
+and exposure to connection floods. Follow your distribution's configuration
+procedure, validate with `sshd -t`, and keep an administrative session open
+while reloading. See [OpenSSH's option reference](https://man.openbsd.org/sshd_config#MaxStartups).
 
-If debug output shows ssh connection failures and setup time matters, put the
-chosen value in the location your distribution uses for local sshd policy.
-Many systems support a drop-in such as:
+## Test congestion control
 
-```text
-# /etc/ssh/sshd_config.d/90-syq-performance.conf
-MaxStartups 64:30:128
-```
-
-Before reloading sshd, keep an existing administrative session open, confirm
-that the main configuration includes that directory, validate the complete
-configuration with `sudo sshd -t`, and check the effective value again with
-`sshd -T`. Reload the service using the name appropriate for the distribution.
-To roll back, remove the line or drop-in, validate, reload, and recheck the
-effective value.
-
-The cost is additional CPU and memory available to unauthenticated clients and
-greater exposure to connection-flood denial of service. Prefer a reachable TCP
-data path, source-address restrictions, and ordinary ssh hardening over a large
-global limit.
-
-See the OpenSSH [`MaxStartups` documentation][maxstartups] for the exact syntax
-and interaction with per-source limits.
-
-## 3. Change TCP buffer ceilings only when the window is limiting throughput
-
-Linux already adjusts TCP buffer sizes on its own. syq also uses several flows, so a single
-flow's window often is not the transfer limit. Raising global ceilings consumes
-no full buffer up front, but it permits each busy connection to consume more
-kernel memory; multiplied across many connections and services, that can be
-substantial.
-
-The bandwidth-delay product is a useful upper-bound estimate:
-
-```text
-per-flow window (MB) ~= bandwidth (Gbit/s) * round-trip time (ms) / 8
-```
-
-Use measured per-flow bandwidth, not merely the NIC's advertised rate. Inspect
-the current ceilings and live sockets first:
-
-```sh
-sysctl net.core.rmem_max net.core.wmem_max
-sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
-ss -ti
-```
-
-Consider a temporary `sysctl -w` experiment only when the observed receive or
-send window is consistently below the bandwidth-delay product while the disks
-and CPUs have headroom. Record all four old values. If a larger ceiling gives a
-repeatable improvement, persist the measured value in the distribution's
-sysctl configuration; otherwise restore the old values. Do not copy a fixed
-64 MiB or larger value merely because it worked on a different WAN.
-
-The kernel's [IP sysctl documentation][ip-sysctl] describes `tcp_rmem`,
-`tcp_wmem`, and the global socket limits. Kernel and distribution defaults
-change, which is another reason to inspect the running host.
-
-## 4. Try congestion control per transfer before changing the host default
-
-TCP congestion control decides how a sender reacts when a path fills or drops
-packets. Linux normally uses CUBIC, which treats packet loss as a congestion
-signal. BBR instead models the path's delivery rate and round-trip time and
-paces traffic to match them. That difference can make BBR much faster on a
-long-distance path with occasional loss, while a clean LAN or an already
-saturated disk may show no useful difference.
-
-This does not make BBR a universally better system default. CUBIC is a
-standardized, widely deployed algorithm designed to coexist with traditional
-TCP traffic. The `bbr` in ordinary mainline Linux is the older BBRv1; the
-current BBRv3 work is a separate, experimental implementation. BBRv1 can share
-a bottleneck unevenly with CUBIC or with BBR flows that have different
-round-trip times, depending on the path and its buffers. Because syq may use
-several flows, that fairness cost matters on a shared link even when the syq
-transfer itself is fast. BBR also relies on packet pacing. With the `fq` qdisc,
-Linux can pace it efficiently in the queueing layer; without `fq`, mainline BBR
-falls back to internal per-socket pacing, which may use more resources. `fq` is
-therefore useful on some hosts, but it is not a prerequisite for trying BBR.
-These are good reasons for Linux to keep a conservative default for every
-application, but not reasons to avoid a scoped BBR test for a bulk copy.
-
-See the [CUBIC standard][cubic-rfc], the [BBR project and version
-notes][bbr-project], the current [experimental BBR specification][bbr-draft],
-the [mainline BBR implementation's pacing note][bbr-linux], and an
-[experimental analysis of BBRv1 RTT fairness][bbr-fairness] for the details
-behind those trade-offs.
-
-First inspect what each Linux endpoint supports and currently uses:
+On a lossy or long-distance Linux path, compare an alternative algorithm per
+transfer. First check both endpoints:
 
 ```sh
 sysctl net.ipv4.tcp_available_congestion_control
 sysctl net.ipv4.tcp_allowed_congestion_control
-sysctl net.ipv4.tcp_congestion_control
-sysctl net.core.default_qdisc
-tc qdisc show
 ```
 
-For a scoped comparison on Linux, `syq rsync --syq-tcp-congestion ALGO` selects an
-algorithm only for syq's TCP data sockets, on both the connecting and
-listening hosts. It does not change the host default. Both kernels must have
-the algorithm registered, and an unprivileged syq process may choose only an
-entry in `net.ipv4.tcp_allowed_congestion_control`. A rejected explicit request
-stops the transfer rather than silently changing the experiment. Without the
-option, each socket inherits its host's default.
+The algorithm must be available and permitted on both. Syq changes only its
+sockets, not the system default. The restricted receiver does not support
+this option.
 
-Compare algorithms with a fixed connection count so syq's auto-tuner does
-not hide their effect. Use only a disposable test destination, and restore it
-to the same absent or empty state before every invocation. Otherwise the first
-command copies the data and the second measures an up-to-date no-op. Reset the
-scratch path with the procedure appropriate to that host; never remove or
-empty a real destination for a benchmark.
+Use a disposable destination and return it to the same empty or absent state
+before each run:
 
 ```sh
-# Reset HOST:DISPOSABLE-DESTINATION to absent or empty before this command.
-syq rsync -a --syq-connections 1 --syq-tcp-congestion cubic --stats SOURCE HOST:DISPOSABLE-DESTINATION
-# Reset the same disposable destination again before this command.
-syq rsync -a --syq-connections 1 --syq-tcp-congestion bbr --stats SOURCE HOST:DISPOSABLE-DESTINATION
+syq cp --connections 1 --tcp-congestion cubic --stats SOURCE --to HOST --into DISPOSABLE-DESTINATION
+syq cp --connections 1 --tcp-congestion bbr --stats SOURCE --to HOST --into DISPOSABLE-DESTINATION
 ```
 
-Repeat and alternate the two commands, then test the other transfer direction:
-congestion control is sender-side, so a path can behave very differently in
-reverse. `--stats` reports the effective algorithm, retransmitted packets and
-bytes, round-trip time, congestion window, and delivery rate. If BBR wins
-repeatedly, pass `--syq-tcp-congestion bbr` for that workload and rerun once without
-`--syq-connections 1` to measure it with the auto-tuner active. Prefer this per-transfer
-choice to a global sysctl change.
+Alternate runs and try the reverse direction. Keep the fixed connection count
+for comparison, then test the better choice with normal automatic tuning.
+A faster result can have fairness costs for other traffic; use `--bwlimit`
+when sharing bandwidth matters.
 
-The server setting governs bulk downloads, while the uploading client setting
-governs bulk uploads. The per-socket option does not attach or replace a
-queueing discipline, and changing the qdisc is not necessary for a BBR test.
-Changing
-`net.core.default_qdisc` alone may not replace qdiscs already attached to live
-interfaces, and virtual or multiqueue devices can have different behavior.
-Changing `net.ipv4.tcp_congestion_control` affects new connections from every
-application. If both endpoints already default to the wanted algorithm, syq's
-new TCP data sockets inherit it and no application option is needed.
+## Stop at the actual bottleneck
 
-Only test these settings when network measurements point to congestion, loss,
-or queueing rather than CPU or storage. Confirm kernel support, follow the
-operating system or network provider's guidance, record the prior algorithm and
-qdisc, consider other users of the path, and have an out-of-band recovery path
-before changing a remote host. Use `--bwlimit` when sharing capacity matters
-more than finishing as quickly as possible.
-
-## 5. Leave MTU, RDMA, and interface addressing to the network owner
-
-syq uses TCP; it does not require RDMA or RoCE configuration. It can use IP
-interfaces backed by that hardware when the operating system and fabric have
-already configured them.
-
-Jumbo frames help only when every hop and both endpoints support the same MTU.
-A mismatch can cause fragmentation, packet loss, or a path-MTU black hole, and
-changing the interface carrying the current ssh session can disconnect you.
-Likewise, guessed private addresses, routes, firewall rules, or generated
-network-manager files are specific to one site and do not belong in a generic
-syq procedure. Use the provider's fabric instructions and verify errors and
-drops with `ip -s link` and the vendor's tools.
-
-## 6. Stop when the bottleneck is storage or CPU
-
-- A single spinning disk often performs better with one fixed connection;
-  use native `--connections 1` or compatibility `--syq-connections 1`. Syq's
-  auto-tuner can reduce active workers during longer runs, but short jobs
-  may finish before it measures the slowdown.
-- NVMe, RAID, NFS, and other high-latency filesystems often benefit from
-  parallelism across files. A same-machine copy from a recognized local disk
-  filesystem into one asynchronous NFS file is the exception: when kernel
-  offload is unavailable, syq automatically uses one sequential writer on the
-  destination side to avoid per-inode contention. Other source types and synchronous NFS
-  destinations keep the adaptive parallel path. NFS mount choices such as
-  `nconnect` are client and server policy; see the
-  [NFS notes](speed.md#nfs) and test with disposable data.
-- Compression trades network bytes for CPU and is on by default. Compare the
-  default with `--no-compress` when either the link or CPU is near saturation.
-- `--bwlimit` is the appropriate control when the goal is coexistence with
-  other traffic, not maximum benchmark throughput.
-
-## Change record
-
-Keep a small record for each host so later administrators can distinguish a
-measured decision from an inherited assumption:
-
-| Item | Record |
-|---|---|
-| Workload and bottleneck | What was measured and where saturation appeared |
-| Original state | Effective setting and configuration file before the change |
-| Proposed state | Exact setting and its expected benefit |
-| Validation | Repeated before/after command and result |
-| Trade-off | Host-wide resource, security, or fairness cost |
-| Rollback | Exact removal or prior value, tested while access was available |
-
-[ip-sysctl]: https://docs.kernel.org/networking/ip-sysctl.html#tcp-variables
-[maxstartups]: https://man.openbsd.org/sshd_config#MaxStartups
-[bbr-draft]: https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/
-[bbr-fairness]: https://arxiv.org/abs/1706.09115
-[bbr-linux]: https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c
-[bbr-project]: https://github.com/google/bbr
-[cubic-rfc]: https://www.rfc-editor.org/rfc/rfc9438.html
+More network tuning will not help a saturated disk or CPU. Try one connection
+for a spinning disk, or `--no-compress` when compression costs more than the
+network bytes it saves. Leave global TCP buffers, MTU, routing, and storage
+mount settings to the host or network administrator.

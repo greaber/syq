@@ -1,329 +1,168 @@
-# Remote-to-remote transfers
+# Copy between servers
 
-Rsync can copy between the machine you run it on and one remote host. Syq can
-also copy directly between two remote hosts, `syq cp --from hostA ... --to
-hostB ...`, and it does so without handing hostA your ssh agent. In such a
-copy, hostA is the coordinator (the host that runs the copy) and hostB is the
-peer (the other remote host). This document describes how the copy is laid
-out; the restricted path, which is the default for a remote-to-remote copy (a
-constrained agent broker on your machine plus the command-restricted receiver,
-a forced command on hostB that syq installs when you enroll a destination);
-what that path does and does not protect; the policies signed into each
-transfer and the options that are refused under it; the enrollment lifecycle;
-and the escape hatches. The design rationale and threat model are in
-[Security](security.md); the native layout and transport options are in the
-[command reference](reference.md#native-commands).
-
-## Topology
-
-Rsync refuses two remote operands, and so does rsync mode (`syq rsync`). The
-native commands accept them:
+Start a copy from your machine while the data travels directly between two
+servers:
 
 ```sh
 syq cp --from hostA --srcs-in big --to hostB --into big
-syq cp --prune --from hostA --srcs-in tree --to hostB --into-existing tree
 ```
-
-syq starts the coordinator on hostA and sends data straight to hostB, so file
-data does not pass through your machine; path arguments travel encoded in the
-command syq runs on hostA, so any filename works. Matching helpers are
-installed automatically on both hosts and output is streamed back. When both
-endpoints name the same host and user, syq runs a local copy on that host.
-For a source build, `--syq-path` or `--no-bootstrap` chooses the syq executable
-that runs as the coordinator on hostA, including on the restricted path. It
-does not choose the receiver on hostB: that executable is the restricted
-receiver installed by enrollment and is replaced only by enrolling again.
-
-## The default path: enrolled receiver plus constrained broker
-
-When syq runs ssh itself (no `--rsh`), the default is the restricted path: the
-restricted receiver enrolled on hostB plus the broker, a temporary agent socket
-on your machine. The first transfer to a destination parent generates an
-Ed25519 enrollment key locally, uploads the exact running syq as
-`~/.local/libexec/syq-receiver` on hostB, and appends one managed
-`restrict,command=...` line to hostB's `authorized_keys`. The private enrollment
-key stays under `~/.local/state/syq/restricted/` on the local machine and is
-never copied to hostA. HostB keeps the enrollment key's public half, the policy
-file it uses to verify signed grants, its record of which grants were already
-redeemed, and a receipt signing key it generates at installation under
-`~/.local/share/syq/restricted/`; the receipt key's public half is returned to
-the local machine and recorded with the enrollment. Syq creates private
-enrollment directories with mode 0700 and secret files with mode 0600; it does
-not refuse to run because of the Unix ownership, group membership, or ACLs of
-the receiver binary, the verifier, or their ancestor directories. Those files
-are part of the trusted receiver machine, not something a hostile source can
-make trustworthy through a permission check.
-
-Instead, every grant (the signed, single-use authorization for one transfer)
-is rejected before copying if any destination directory it may change overlaps
-the receiver's SSH configuration, installed receiver directory, enrollment
-state, or configured signature verifier. Your machine performs the same check
-before anything is written where it knows the paths, and the receiver's own
-check is the one that counts. This protection applies only to the restricted
-receiver; local copies and remote copies that do not use it keep their normal
-destination behavior.
-
-That state directory is not a cache. Removing `~/.cache/syq` on either host
-only costs a fresh helper bootstrap on the next transfer, but removing
-`~/.local/share/syq/restricted` on hostB breaks every enrollment there and
-discards the record of which grants were already redeemed; revoke and
-enroll again instead.
-
-Enrollment first tries local→hostB directly. If SSH reports a transport
-failure, it retries through hostA with OpenSSH `ProxyJump`; a remote validation
-or installation error is reported against hostB without repeating it through
-the proxy. HostA gets only
-`ssh -W` byte forwarding and cannot see the encrypted hostB session, an agent
-socket, or the enrollment key. The destination parent must already exist.
-Enrollment is durable, is reused for later destinations inside the same
-parent, and is reported as an intentional remote state change. The local
-OpenSSH client has ordinary command authority on hostB during this initial
-installation, whether the connection is direct or tunneled through hostA. That
-one setup session is the bootstrap trust boundary; later transfers use only the
-enrollment key. Syq generates that key automatically, and its
-`syq-enrollment:ID` marker makes the managed `authorized_keys` line
-recognizable to users, administrators, and monitoring tools.
-
-## Signed per-transfer requests
-
-For each transfer, your machine signs a grant naming the exact destination,
-login, copy semantics, hash block size, TCP port range, limits, start-by and
-finish-by times, and a fresh single-use nonce. The broker advertises only the
-enrollment key to hostA and releases its signature only after validating this
-path:
 
 ```text
-trusted hostA session -> configured-user@trusted-hostB session
+Your machine ── starts the copy and displays results
+                       │
+                    hostA ───── file data ─────▶ hostB
 ```
 
-The broker verifies OpenSSH session-bind signatures for both hosts and strictly checks
-the final host-bound authentication request's session ID, destination login
-user, host key, selected credential, and signature algorithm. Key addition,
-removal, raw or non-host-bound signing, unknown extensions, and extra forwarding hops
-are refused. The A → B client is forced to use host-bound public-key
-authentication. The restricted receiver verifies the grant and records it as
-redeemed on disk before starting syq's protocol. Every destination scan, stat,
-hash, partial-file operation (the partial file is `.name.syq-part.<copy-id>`,
-which syq writes into before renaming it into place), metadata change, write,
-and deletion happens relative to the open handle of the enrolled directory. A
-symlink below it is copied as data, never followed. HostA cannot replace that
-guard, widen the destination, add an unsigned preservation option, exceed the
-signed entry, byte, deletion, or connection limits, or replay the grant.
-Copying with `--preserve=permissions` and copying without it use distinct
-protocol flags and signed policy. Without it, existing objects keep the mode
-hostB observed; new objects (an object is a file, directory, symlink, or
-special file) accept only ordinary permission bits masked by hostB's umask.
-HostA cannot supply special bits or turn this path into chmod authority over
-existing objects. A new directory does keep a setgid bit inherited from its
-destination parent by hostB's kernel; that bit is read from the newly created
-inode and is not accepted from hostA's mode proposal. A preserved mode is bound
-to the inode the receiver observed; if that object changes, publication (the
-final rename into place) fails instead of carrying the mode onto a
-replacement. Hash requests must use the signed block size, and the receiver
-rejects any request whose hash vector could exceed the protocol frame limit.
-Workers on TCP data connections, encrypted and authenticated by a token,
-inherit the same authority. The receiver permits one encrypted listener in the
-signed port range and closes it when the control session through the
-restricted receiver ends or the grant expires; after redemption there is no
-second SSH authentication or silent SSH fallback.
+The default uses a restricted receiver on hostB. HostA receives permission
+for this copy, without your SSH agent or a reusable credential for hostB.
+Official releases set up matching helpers automatically; source builds upload
+their executable to compatible hosts. Two endpoints
+with the same host and user run a local copy on that host.
 
-The restricted path gives hostA neither a credential nor access to your
-agent. Your own agent (including a YubiKey) is used for the login from your
-machine to hostA and for the enrollment sessions, but hostA never gets access
-to it.
+`syq rsync` does not accept two remote endpoints; use native `cp`.
 
-## What the restriction does and does not protect
+## Requirements
 
-The restriction protects hostB; it does not make hostA a trustworthy source.
-A compromised hostA can invent the source tree wholesale: names, object types,
-metadata, and file bytes need not correspond to anything on hostA's filesystem.
-It can also omit entries or stop the transfer. HostB can enforce only what is
-signed into the grant and visible in the requests it receives: the destination
-directories, the publication, preservation, and existing-object policies,
-resource limits, and whether a requested change could have come through the
-signed ignore rules. HostA still cannot escape those checks or independently
-authenticate to hostB with the enrollment key.
+- SSH access from your machine to hostA and hostB. Enrollment can reach hostB
+  through hostA using `--via` if needed.
+- OpenSSH 8.9 or newer on your machine, hostA's SSH client, and hostB's server;
+  a local `SSH_AUTH_SOCK`.
+- Already trusted, exact host keys for both hosts in your local known-hosts
+  files. Establish first-contact trust with ordinary SSH before copying.
+- A reachable encrypted TCP data port on hostB, normally in `47600–47699`.
+  The restricted receiver does not fall back to SSH data transport.
+- An existing destination parent directory for enrollment.
 
-## Signed receipts
+Host-certificate-only trust, `KnownHostsCommand`, and `RevokedHostKeys` are
+unsupported by the broker. Custom known-hosts paths must be unambiguous:
+one absolute, whitespace-free filename per configured user/global directive.
+The default known-hosts file list works. Syq reports unsupported configurations
+instead of relaxing host verification.
 
-HostA also cannot forge a clean account of what hostB's restricted receiver
-did. Every transfer on the restricted path that stays attached (not
-`--detach`) ends with a receipt. Its stream records one outcome for every
-change to a pathname that the receiver saw: one file lifecycle, each
-directory, symlink, special-file, or metadata operation, and each individual
-`--prune` unlink or rmdir. Failed and abandoned operations, and a bounded
-number of records for refused requests, remain visible. After closing the grant
-and waiting for admitted requests to settle, hostB records the final type,
-size, symlink target, applicable metadata, and optional BLAKE3 digest of every
-path an admitted change could have touched. Paths are raw bytes relative to
-the numbered destination directories in the grant, never absolute hostB paths.
-
-A small signed terminal record (the record that closes the receipt) binds the
-complete signed grant, the enrollment ID and the grant's single-use ID, the
-stream's digest, record count, and size, the policy, the summary, and a clean
-or non-clean status. HostB then encrypts the stream and the terminal record to
-a fresh per-transfer X25519 recipient key using HPKE (X25519/HKDF-SHA-256/
-ChaCha20-Poly1305). HostA relays bounded opaque frames. Your machine spools
-them to a temporary file rather than holding them in memory, decrypts them,
-and checks the HPKE authentication, the enrolled Ed25519 signature, the grant
-binding, the sequence, the digest of the complete stream, the summary, and the
-terminal status before printing trusted results. Missing, altered, reordered,
-replayed, or suppressed frames cannot become a valid clean receipt; suppression
-remains a denial of service. `-v` prints the verified totals. Enrollments made
-by an older syq must be refreshed with `syq receiver enroll` first (a copy
-that is not read-only does this automatically). The initial signed policy caps
-the stream at 4,000,000 records and 512 MiB of plaintext. Reaching either cap
-ends the receiver's authority to make further changes and produces an explicit
-non-clean terminal record instead of a truncated clean receipt. Encryption
-does not pad or conceal frame count, ciphertext length, or timing.
-
-This is hostB's account of its own state when the transfer closed, not a
-transaction or a list of what the source held. It does not prove that hostA
-supplied every intended path or the intended bytes, roll back a failed
-transfer, list source scans, blocks, system calls, or the descendants of one
-recursive operation, protect against a compromised hostB or receipt key,
-protect against a writer on hostB already authorized to modify the tree, or
-freeze the observed state after the receipt is issued. Diagnostic text is
-there for context and may change; the structured codes and outcomes are the
-stable part. Proving that every intended path and byte arrived would need an
-authenticated list of what was expected, which the receipt does not provide.
-
-`--detach` is not available with the restricted receiver because the broker
-exists only while syq remains attached. A detached launch instead requires
-hostA to hold its own credentials for hostB (`--peer-auth own-credentials`) or
-an explicit `--rsh` policy. Neither path prepares a restricted grant or signed
-receipt; the returned remote log is not a receipt your machine can verify.
-
-## Signed policies and options that fail closed
-
-The restricted path requires encrypted TCP data connections (`--no-tcp` and
-`--tcp-plain` are refused). The ordered `--ignore` rules are signed into the
-grant: the receiver requires destination scans to use exactly those rules and
-rejects changes that could only descend through an ignored source directory.
-Whether such destination paths may be deleted is also signed; native `--prune`
-protects ignored paths and does not delete them. The destination directory
-each source maps to is signed, so a source you named explicitly keeps its own
-destination directory even when it overlaps a path ignored under a `--srcs-in`
-selection.
-The signed publication policy distinguishes writing to a partial file and
-renaming it into place from `--inplace`; an in-place write opens and writes the
-final file relative to the open handle of the enrolled directory and cannot
-silently switch back to the partial-file method.
-
-Native placement options `--into-new`/`--as-new` and
-`--into-existing`/`--as-existing` are signed into the grant and checked against
-the enrolled destination when the grant is redeemed. `--inplace` is refused
-with `--as-new`: writing directly to the final path cannot guarantee that the
-copy will never replace an existing entry.
-
-`--mapping` and `--min-size` are refused because the receiver cannot check
-them independently of hostA.
-`--max-size` is enforced as a signed per-file limit, but is refused together
-with `--prune` because filtered source files could otherwise make hostA's
-deletion plan ambiguous. Explicit `--connections` values above 64 are also
-refused; automatic tuning may use up to that signed ceiling.
-
-Deletion through the receiver (`cp --prune`) requires an explicit
-`--max-delete`, so the deletion authority a compromised hostA could exercise
-inside the scope is always stated on the command line rather than defaulting
-to a hundred million; `--max-delete 0` signs a grant that forbids deletion
-outright. The other signed ceilings default to 100 million entries and 8 TiB of
-file data. `--receiver-max-entries` and `--receiver-max-bytes` replace those
-limits for one transfer and can increase or decrease them, within the allowed
-ranges. What hostA can do is bounded by these limits, whether you use the
-defaults or set your own. Every grant also carries two deadlines: hostA must
-start within 24 hours of issue and finish within 7 days of issue.
-
-`--dry-run` is read-only in a way hostA cannot override: the signed grant
-marks it read-only and the receiver rejects every mutation even if hostA sends
-one. A dry run uses an existing enrollment but does not install one; run
-`syq receiver enroll` first when previewing a new destination.
-
-Enrollment never follows a destination-root symlink. Enroll the directory the
-link points to so the signed pathname and the opened directory identify the
-same object.
+Your local SSH configuration selects hostB's login, address, port, and trusted
+host keys. HostA's SSH configuration does not override those choices.
 
 ## Enrollment lifecycle
 
-Use `syq receiver enroll [USER@]HOST:DEST [--via [USER@]HOST]` to pre-enroll,
-`syq receiver list` to list local enrollments, and
-`syq receiver revoke ID [--via ...]` to
-remove the enrollment key from hostB's `authorized_keys` and both sides'
-per-enrollment state. Before changing
-hostB, syq durably records a pending enrollment and its private key locally. If
-the installation response is lost, the next enrollment of the same endpoint
-and destination retries the same ID safely; `syq receiver list` labels that
-state `pending`, and `syq receiver revoke` can remove either pending or
-active state. Running `syq receiver enroll` again for an active destination
-also refreshes the installed
-receiver to the exact local syq binary; the receipt key is kept for the life
-of the enrollment, so a refresh, or a retry after a lost reply, never leaves
-the two sides holding different keys. To rotate it, revoke and enroll again.
-Revocation keeps the shared receiver while another enrollment or managed
-`authorized_keys` entry may use it. The final revoke removes the shared
-receiver and, once it is empty, the `syq/restricted` state directory on hostB.
-General account directories such as `.local`, `share`, and `libexec` are
-preserved even when empty because syq does not assume it created them.
-Enrolling and revoking each upload and run a temporary helper within one SSH
-session, which removes the helper's files when it ends. Enrolling and revoking
-take turns with the shared receiver, so an enrollment that runs at the same
-time as a revoke reinstalls the receiver before installing its enrollment key.
-Revocation prevents new receiver sessions. A session that already redeemed its
-grant can finish an operation already in progress; once the grant's finish-by
-deadline passes, later protocol requests are rejected rather than interrupting
-a filesystem call midway.
+The first real copy automatically enrolls the destination parent. This adds a
+managed restricted key to hostB's `authorized_keys` and installs a receiver.
+The private enrollment key stays on your machine. Enrollment is reused for
+later copies inside that parent.
 
-## Requirements and host identity
+You can enroll ahead of time, inspect state, or revoke access:
 
-The restricted path requires OpenSSH 8.9 or newer session-bind and host-bound
-authentication support on the local machine, hostA, and hostB; a local
-`SSH_AUTH_SOCK`; and exact plain host keys for both hosts in the effective local
-`known_hosts` files. Host-certificate/CA-only trust is refused because syq does
-not validate certificate principals and validity as strictly as OpenSSH. Static
-`HostKeyAlgorithms` and `RequiredRSASize` policy is enforced. A configured
-`KnownHostsCommand` or `RevokedHostKeys` KRL is refused because the broker does
-not reproduce those dynamic or external revocation checks. Host-key
-algorithms that syq's SSH library cannot cryptographically verify are refused.
-OpenSSH's `ssh -G` output does not preserve quoting for custom known-hosts
-filenames. Syq uses OpenSSH's debug provenance to inspect the configuration
-files OpenSSH actually read for the host. It accepts the compiled default list
-only when none of those files contains the corresponding known-hosts directive;
-an explicitly configured value that renders exactly like the defaults is still
-treated as configured. Otherwise syq accepts one absolute whitespace-free
-configured file per
-`UserKnownHostsFile`/`GlobalKnownHostsFile` directive. Ambiguous custom
-multi-file or whitespace-containing values fail closed.
+```sh
+syq receiver enroll hostB:/archive
+syq receiver enroll hostB:/archive --via hostA
+syq receiver list
+syq receiver revoke ID
+```
 
-The local configuration resolves hostB's login user, network hostname, port,
-and host-key algorithms, and syq passes those values explicitly to hostA. The
-ssh client hostA runs to reach hostB (the inner client) reads no hostA SSH
-configuration, disables all identity and
-certificate files and PKCS#11 providers, and permits only public-key
-authentication through its forwarded `SSH_AUTH_SOCK`. Its ordinary
-`known_hosts` lookup is disabled because the broker independently validates
-the session-bound host key against the stricter local policy before releasing
-a signature. Thus hostA's `IdentityFile`, `CertificateFile`, `IdentityAgent`,
-`IdentitiesOnly`, proxy, and multiplexing configuration cannot accidentally
-bypass the broker. This does not revoke unrelated credentials that an already
-privileged hostA possessed before syq; the restricted path assumes precisely
-that hostA has no hostB credential of its own. Connection multiplexing is
-disabled for the session from your machine to hostA (the outer session) so a
-pre-existing master connection cannot substitute another forwarded agent.
-Configured
-port forwards, X11 and GSS credential delegation, PTY allocation, and
-`LocalCommand` are also disabled on that session.
+Use the ID printed by `list`. Repeating `enroll` refreshes the receiver to
+match your local build. A `pending` enrollment can be retried or revoked.
+Revoke and enroll again to rotate its receipt key.
 
-Session binding identifies a host by its host key, not by a DNS name or network
-address. The configured name chooses the locally trusted key set, but an
-endpoint that shares hostB's private host key is intentionally equivalent to
-hostB for this broker. Deployments requiring distinct host identities must not
-reuse host private keys between them.
+Enrollment requires normal command authority on hostB during setup. Later
+copies use only the restricted key. It refuses a symlink as the enrolled
+root: enroll the real directory instead. Copies that overlap receiver SSH
+configuration, installed programs, or enrollment state are refused.
 
-Syq uses your SSH configuration to resolve the login user, host-key name,
-port, static known-hosts files, host-key algorithms, and RSA size. The broker
-requires already recorded exact keys for hostA and hostB before connecting; it
-never learns a key through hostA or silently accepts one.
-Dynamic `KnownHostsCommand`, external `RevokedHostKeys`, and host-certificate
-trust are refused as described above. If first-contact trust is
-appropriate, establish it with ordinary SSH (directly or through the configured
-jump path) before starting the transfer.
+Manage enrollment through these commands. Its state is not a disposable
+helper cache. Revocation prevents new sessions; work already in progress may
+finish. `revoke` also accepts `--via`.
+
+For source builds, `--syq-path` or `--no-bootstrap` selects the coordinator
+on hostA, not hostB's receiver. Refresh the receiver with `enroll`.
+
+## Preview and mirror
+
+A dry run needs an existing enrollment; it does not create one:
+
+```sh
+syq receiver enroll hostB:/archive
+syq cp --dry-run -v --from hostA --srcs-in data --to hostB --into /archive
+```
+
+Pruning requires an explicit deletion cap:
+
+```sh
+syq cp --prune --max-delete 100 --from hostA --srcs-in data --to hostB --into-existing /archive
+```
+
+If more than 100 deletions are planned, none are performed and the command
+exits 25. Ignored paths remain protected. The receiver independently checks
+that changes are permitted by the transfer's authorization.
+
+## Limits and unsupported options
+
+Default limits are 100 million entries and 8 TiB of file data. Override them
+for one transfer with `--receiver-max-entries N` and
+`--receiver-max-bytes SIZE`. Values can raise or lower the defaults within the
+allowed ranges. The transfer must start within 24 hours of authorization and
+finish within seven days of authorization.
+
+| Option or combination | Restricted receiver |
+|---|---|
+| `--no-tcp`, `--tcp-plain`, `--tcp-congestion` | Unsupported; encrypted TCP is required |
+| `--mapping`, `--min-size` | Unsupported |
+| `--max-size` with `--prune` | Unsupported |
+| Fixed `--connections` above 64 | Unsupported |
+| `--inplace` with `--as-new` | Unsupported |
+| `--detach` | Unsupported; the local broker must remain attached |
+| Native `rm` | Unsupported; use a normal SSH login |
+
+## Receipts and results
+
+The destination signs a receipt describing the operations it saw and the
+final state of paths they could have changed. Your machine verifies it before
+reporting trusted results. Use `-v` for verified totals, or `--results FILE`
+for [machine-readable records](automation.md).
+
+Add `--receiver-receipt digests` to include BLAKE3 hashes of affected regular
+files at completion. Receipt size is capped at four million records and
+512 MiB of plaintext; reaching a cap stops further changes and reports an
+incomplete outcome.
+
+A receipt proves what the destination reported, not that the source supplied
+every file or the right contents. It provides no rollback and cannot protect
+against a compromised destination. See [Security](security.md).
+
+Direct receiver-attested results arrive after receipt verification, rather
+than as live per-file progress. For `--dry-run --results`, use
+`--coordinate-at local`; only that mode supplies the preview stream.
+
+## Other routes and authentication
+
+If hostA cannot reach hostB, relay through your machine explicitly:
+
+```sh
+syq cp --coordinate-at local --from hostA --srcs-in data --to hostB --into /archive
+```
+
+This uses your machine's bandwidth. Syq never switches to this route silently.
+
+A direct pull makes hostB connect to hostA. It requires another authentication
+choice because there is no restricted source receiver. For example, when
+hostB already holds credentials for hostA:
+
+```sh
+syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to hostB --into /archive
+```
+
+Other choices are `--peer-auth broker` (your destination account's authority,
+limited to that host and user), `--peer-auth full-agent` (ordinary agent
+forwarding), or `--rsh COMMAND` (your complete policy). Their
+[security tradeoffs](security.md#what-a-compromised-source-can-do) differ.
+
+## Detached copies
+
+To leave a direct copy running after your command exits, use `--detach` with
+`--peer-auth own-credentials`, or an explicit `--rsh` policy. The coordinator
+must be able to authenticate independently. The restricted receiver and
+`--results` do not support detached operation.
+
+The launcher reports the coordinator and log location after checking that the
+job is ready. Save that location; the job continues remotely. If printing it
+fails, the launcher reports an error but the job may still be running.
+Detached launch needs `/bin/kill` and either `setsid` or `perl` on the
+coordinator. Its remote log is not a signed receipt.
