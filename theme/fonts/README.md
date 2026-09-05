@@ -1,8 +1,10 @@
 # Shared site fonts
 
-Latin subsets of Manrope (headings and navigation), Newsreader (prose), and
-IBM Plex Mono (commands and numbers, regular and semibold). All are under
-the SIL Open Font License 1.1; the license files travel with the fonts.
+Open Sans provides headings, navigation and prose. Manrope is used for the
+blue syq wordmark; IBM Plex Mono is used for commands and numbers.
+Open Sans is the mdBook-bundled v17 font (all charsets, normal 400/600/700/800),
+under Apache 2.0. Manrope and IBM Plex Mono are Latin subsets under SIL OFL 1.1.
+The licenses travel with the fonts.
 
 `fonts.css` uses mdBook resource placeholders so its asset hashing works.
 The benchmark renderer replaces those same placeholders with data URIs,

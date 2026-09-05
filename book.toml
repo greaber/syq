@@ -15,5 +15,5 @@ git-repository-url = "https://github.com/greaber/syq"
 edit-url-template = "https://github.com/greaber/syq/edit/master/{path}"
 
 # Shared branding and mdBook layout, plus the interactive copy examples.
-additional-css = ["theme/brand.css", "theme/docs.css", "theme/copy-demo.css"]
+additional-css = ["theme/copy-demo.css", "theme/brand.css", "theme/docs.css"]
 additional-js = ["theme/docs.js", "theme/copy-demo.js"]

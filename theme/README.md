@@ -1,8 +1,9 @@
 # syq documentation theme
 
-As of 2026-09-05, the docs use the visual design established by syq-bench:
-paper and cerulean, Manrope headings and navigation, Newsreader prose, and
-IBM Plex Mono commands and numbers. The same header links both sites.
+As of 2026-09-05, docs and benchmarks share Open Sans headings and prose,
+a blue Manrope syq wordmark, IBM Plex Mono commands and numbers, and white/dark
+palettes. Main text is 20px. The same top navigation links both sites, while
+the docs retain mdBook's compact sidebar and benchmarks keep their own layout.
 
 The shared source lives in syq-bench. Keep these copies byte-for-byte identical:
 
@@ -18,11 +19,11 @@ keeps its own committed assets and builds independently; neither site fetches
 styles or fonts from the other at build time or in the browser.
 
 `docs.css` is the mdBook adapter: prose, code, tables, sidebar, toolbar and
-anchor offsets. `docs.js` adds the current-site marker and sidebar label.
+anchor offsets. `docs.js` adds the current-site marker.
 The header is a supported partial; the full mdBook template and scripts remain
 upstream so search, chapter navigation, keyboard shortcuts and code copying
 continue to receive mdBook fixes. The built-in light/rust preferences use the
-paper palette; navy/coal/ayu use the matching dark palette. Auto follows the OS.
+white palette; navy/coal/ayu use the matching dark palette. Auto follows the OS.
 
 Use the mdBook version pinned in `.github/workflows/pages.yml`, run
 `mdbook build` and `python3 scripts/check-doc-links.py`, and check rendered
