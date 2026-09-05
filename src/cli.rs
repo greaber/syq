@@ -220,6 +220,9 @@ pub struct Args {
     /// Transfer/hash block size (e.g. 4M)
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
+    /// Override transfer internals for benchmarking (see --help-all)
+    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
+    pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
     /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
@@ -785,6 +788,9 @@ struct NativeCopyOperationalArgs {
     /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     bwlimit: Option<String>,
+    /// Override transfer internals for benchmarking (see --help-all)
+    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
+    tuning_options: Option<crate::transfer_tuning::TransferTuning>,
     /// Print transfer statistics at the end
     #[arg(long)]
     stats: bool,
@@ -1718,6 +1724,7 @@ fn apply_native_copy_operational(
         update,
         no_compress,
         bwlimit,
+        tuning_options,
         stats,
         ignore,
         ignore_from,
@@ -1745,6 +1752,7 @@ fn apply_native_copy_operational(
         .transpose()?
         .unwrap_or(0);
     args.bwlimit = bwlimit;
+    args.tuning_options = tuning_options;
     args.stats = stats;
     args.ignore_lines = ordered_ignore_lines(
         &ignore,
@@ -2037,6 +2045,7 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
         "--syq-ignore-from",
         "--syq-connections",
         "--block-size",
+        "--tuning-options",
         "--bwlimit",
         "--max-size",
         "--min-size",

@@ -59,6 +59,49 @@ including mounted NFS paths, do not use the tuning cache.
 `--bwlimit` to cap bandwidth rather than trying to control it indirectly
 through worker count. Short copies may finish before tuning has enough data.
 
+## Benchmark tuning
+
+`syq cp` and `syq rsync` accept `--tuning-options` for controlled performance
+experiments. It appears in `--help-all`, outside the common options. Set one
+or both keys in a comma-separated value:
+
+```sh
+syq cp large-file --to server --as /scratch/benchmark-copy \
+  --connections 1 --tuning-options request-size=1M,pipeline-depth=8 --stats
+```
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB; `K`, `M`, and `G` use powers of 1024 |
+| `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
+
+Request size controls the maximum payload of an individual range read or write.
+It does not change the blocks used to compare file contents, identify partial
+files, or resume a copy. `--bwlimit` can lower the effective request size to keep
+bursts small. With overrides, `--stats` or `-v` reports the effective request size,
+pipeline depth, and hash block size. A final request or a range selected for
+repair can be smaller than the effective request size.
+
+Larger requests reduce overhead per byte. Deeper pipelines allow more work to
+remain outstanding while replies travel back. Either can help a fast connection
+with high latency, but both increase potential buffering; neither guarantees
+higher throughput. In-process endpoints handle one request at a time. The
+background response queue on each worker connection follows its pipeline depth.
+
+These settings apply to range transfers. Small-file batches and same-machine
+whole-file copying can bypass them. Use a large remote file and a fresh,
+disposable destination for each comparison, and fix `--connections` (or
+`--syq-connections` with `syq rsync`) to isolate the two settings. Leave
+`--bwlimit` unset when measuring unrestricted throughput. Include capped runs
+when evaluating burst behavior.
+
+Overrides apply to this command, including any remote coordinator. They are
+not saved. Copies using overrides neither read nor update the remembered
+connection count; connection auto-tuning still runs unless you fix that count.
+These are experimental controls whose keys and bounds may change between
+releases. The default request size and pipeline depth are not automatically
+tuned.
+
 ## TCP data connections
 
 SSH authenticates and controls remote copies. When reachable, encrypted TCP

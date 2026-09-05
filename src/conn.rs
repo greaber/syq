@@ -605,16 +605,16 @@ pub struct RemoteConn {
     detached: bool,
 }
 
-const READ_AHEAD: usize = 4;
 const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn spawn_reader(
     input: Box<dyn Read + Send>,
+    read_ahead: usize,
 ) -> (
     std::sync::mpsc::Receiver<std::io::Result<Response>>,
     std::thread::JoinHandle<()>,
 ) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(READ_AHEAD);
+    let (tx, rx) = std::sync::mpsc::sync_channel(read_ahead);
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         loop {
@@ -686,7 +686,10 @@ impl RemoteConn {
         compress: bool,
         label: String,
     ) -> Self {
-        let (rx, reader) = spawn_reader(Box::new(session.stdout));
+        let (rx, reader) = spawn_reader(
+            Box::new(session.stdout),
+            crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        );
         let mut stderr = session.stderr;
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
@@ -1220,6 +1223,10 @@ pub struct RemoteSpec {
     /// the control connection to consume. An empty result also prevents
     /// descriptor receipt during the later parallel connect.
     pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<PrimedControl>>,
+    /// Must cover the worker request pipeline: otherwise a helper blocked
+    /// writing responses can stop reading requests while the coordinator is
+    /// still filling its pipeline. Control sessions do not need this depth.
+    pub(crate) read_ahead: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1246,6 +1253,7 @@ impl RemoteSpec {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
     }
 
@@ -1651,7 +1659,7 @@ impl RemoteSpec {
         })?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let (rx, reader) = spawn_reader(Box::new(stdout));
+        let (rx, reader) = spawn_reader(Box::new(stdout), self.read_ahead);
         let conn = RemoteConn {
             child: Some(child),
             w: FrameWriter::new(Box::new(stdin), compress),
@@ -1974,7 +1982,7 @@ impl RemoteSpec {
             let writer = RecordWriter::new(stream.try_clone()?, wc);
             let tcp_socket = stream.try_clone()?;
             let reader = RecordReader::new(stream, rc);
-            let (rx, reader) = spawn_reader(Box::new(reader));
+            let (rx, reader) = spawn_reader(Box::new(reader), self.read_ahead);
             let conn = RemoteConn {
                 child: None,
                 w: FrameWriter::new(Box::new(writer), compress),
@@ -3106,6 +3114,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let info = TcpInfo {
             addrs: vec!["127.0.0.1".into()],
@@ -3194,7 +3203,10 @@ mod tests {
         });
 
         let socket = TcpStream::connect(address).unwrap();
-        let (rx, reader) = spawn_reader(Box::new(socket.try_clone().unwrap()));
+        let (rx, reader) = spawn_reader(
+            Box::new(socket.try_clone().unwrap()),
+            crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        );
         let conn = RemoteConn {
             child: None,
             w: FrameWriter::new(Box::new(socket), false),
@@ -3240,7 +3252,10 @@ mod tests {
         });
 
         let socket = TcpStream::connect(address).unwrap();
-        let (rx, reader) = spawn_reader(Box::new(socket.try_clone().unwrap()));
+        let (rx, reader) = spawn_reader(
+            Box::new(socket.try_clone().unwrap()),
+            crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        );
         let conn = RemoteConn {
             child: None,
             w: FrameWriter::new(Box::new(socket), false),
@@ -3309,6 +3324,59 @@ mod tests {
     }
 
     #[test]
+    fn tuning_pipeline_drains_responses_while_sending_large_requests() {
+        use std::os::unix::net::UnixStream;
+        let (coordinator, helper) = UnixStream::pair().unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        for socket in [&coordinator, &helper] {
+            socket.set_read_timeout(Some(timeout)).unwrap();
+            socket.set_write_timeout(Some(timeout)).unwrap();
+        }
+        let depth = 64;
+        let server = std::thread::spawn(move || {
+            let mut requests = FrameReader::new(helper.try_clone().unwrap());
+            let mut responses = FrameWriter::new(helper, false);
+            for _ in 0..depth {
+                let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
+                    panic!("expected a range request");
+                };
+                responses
+                    .write_msg(&Response::Block {
+                        off,
+                        hash: [0; 32],
+                        data: vec![7; len as usize],
+                    })
+                    .unwrap();
+            }
+        });
+        let (responses, reader) = spawn_reader(Box::new(coordinator.try_clone().unwrap()), depth);
+        let mut requests = FrameWriter::new(coordinator, false);
+        // Both directions exceed socket buffering. A reader queue stuck at
+        // four responses deadlocks against a sequential helper while the
+        // coordinator is still sending its 64 requests.
+        for i in 0..depth {
+            requests
+                .write_msg(&Request::ReadRange {
+                    path: vec![b'x'; 16 << 10],
+                    source: None,
+                    attempt: 0,
+                    off: i as u64 * (64 << 10),
+                    len: 64 << 10,
+                })
+                .unwrap();
+        }
+        for i in 0..depth {
+            let response = responses.recv_timeout(timeout).unwrap().unwrap();
+            assert!(matches!(response, Response::Block { off, data, .. }
+                if off == i as u64 * (64 << 10) && data == vec![7; 64 << 10]));
+        }
+        drop(responses);
+        drop(requests);
+        server.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn transport_stats_response_wait_has_a_deadline() {
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let timeout = std::time::Duration::from_millis(20);
@@ -3341,7 +3409,10 @@ mod tests {
                 inner: socket,
                 dropped: dropped.clone(),
             };
-            let (rx, reader) = spawn_reader(Box::new(input));
+            let (rx, reader) = spawn_reader(
+                Box::new(input),
+                crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+            );
             let mut connection = RemoteConn {
                 child: None,
                 w: FrameWriter::new(Box::new(writer), false),
@@ -3483,6 +3554,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let command = spec.ssh_command(SshConnection::Independent, false);
         assert!(!command
@@ -3543,6 +3615,7 @@ mod tests {
             }))),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let endpoint = Endpoint::Remote(spec.clone());
         assert!(endpoint
@@ -3571,6 +3644,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let args = |connection| {
             spec.ssh_command(connection, false)
@@ -3663,6 +3737,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let args = |connection| {
             spec.ssh_command(connection, false)
@@ -3741,6 +3816,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
 
         let command = spec.ssh_command(SshConnection::Control, false);
