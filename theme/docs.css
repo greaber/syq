@@ -59,7 +59,18 @@ h1,h2,h3,h4,h5,h6 {font-family:var(--display);font-weight:700;letter-spacing:-.0
 .chapter li a:hover {background:var(--na-bg);text-decoration:none}
 .chapter li a.active {background:var(--accent-soft);color:var(--syq);box-shadow:inset 3px 0 var(--syq)}
 .chapter li a strong {font:11px var(--mono);color:var(--muted);margin-right:8px}
-#mdbook-menu-bar {top:var(--site-header-height);border-bottom:1px solid var(--line);background:var(--bg)}
+#mdbook-menu-bar {border-bottom:1px solid var(--line);background:var(--bg)}
+/* Keep the toolbar visible below the shared header in every scroll state.
+   Match mdBook's sticky/hover selectors: its top:0 !important and the scroll
+   handler's inline top offsets would otherwise cover or displace the controls. */
+#mdbook-menu-bar,
+#mdbook-menu-bar.sticky,
+#mdbook-menu-bar-hover-placeholder:hover + #mdbook-menu-bar,
+#mdbook-menu-bar:hover,
+html.sidebar-visible #mdbook-menu-bar {
+  position:sticky;
+  top:var(--site-header-height)!important;
+}
 .menu-title {font:500 11px/50px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .theme-popup,.searchbar-outer,.searchresults-outer,.nav-wrapper {font-family:var(--display)}
 .nav-chapters,.mobile-nav-chapters {border:1px solid var(--line);border-radius:2px}

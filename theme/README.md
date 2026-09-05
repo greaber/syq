@@ -33,3 +33,10 @@ are included in the Pages trigger and mdBook's preview watch list.
 The font stylesheet uses mdBook's resource helper to resolve hashed font
 filenames. syq-bench embeds the same resources as data URIs. Do not replace the
 resource placeholders with literal paths: those break mdBook's asset hashing.
+
+The toolbar stays sticky below the shared header during both forward and backward
+scrolling. Its offset rule deliberately matches mdBook's sticky/hover selectors
+and overrides inline scroll offsets. When upgrading mdBook, check `reference.html`
+at 390, 820 and 1440 pixels: scroll down several screens, reverse direction, hover
+the toolbar, hide/show the sidebar, and use search and theme controls without
+returning to the top. Also check reload at a saved scroll position.
