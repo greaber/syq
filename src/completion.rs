@@ -523,7 +523,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" => {
+        "completion" | "persist" | "receiver" | "receive" | "destination" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -673,6 +673,8 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "map",
         "rsync",
         "persist",
+        "receive",
+        "destination",
         "completion",
         "receiver",
         "help",
@@ -692,6 +694,8 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "completion" => Some(command_for_help()),
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
+        "receive" => Some(crate::destination::receive_help()),
+        "destination" => Some(crate::destination::destination_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         _ => crate::cli::command_for_completion(name),
     }
@@ -797,6 +801,12 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
+        ("destination", "wait" | "forget") => Ok(crate::destination::registered_names()
+            .into_iter()
+            .map(String::into_bytes)
+            .filter(|name| name.starts_with(current))
+            .map(Candidate::text)
+            .collect()),
         ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
         _ => Ok(Vec::new()),
     }
@@ -809,6 +819,7 @@ enum EndpointSyntax {
 }
 
 enum ValueCompletion {
+    NamedOrSshDestination,
     Endpoint(EndpointSyntax),
     SourcePath { apply_base: bool },
     DestinationPath,
@@ -1163,7 +1174,7 @@ fn value_completion(
     let known = match command {
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
-            b"--to" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"--to" => Some(ValueCompletion::NamedOrSshDestination),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
             | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
@@ -1201,6 +1212,13 @@ fn value_completion(
         },
         "persist" => match option {
             b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
+            _ => None,
+        },
+        "receive" => match option {
+            b"--via" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"--into" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
             _ => None,
@@ -1244,6 +1262,21 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
+        ValueCompletion::NamedOrSshDestination => {
+            let mut candidates = endpoint_candidates(
+                current,
+                EndpointSyntax::Native,
+                pscope_from_args(command, args),
+            );
+            candidates.extend(
+                crate::destination::registered_names()
+                    .into_iter()
+                    .map(|name| format!("@{name}").into_bytes())
+                    .filter(|name| name.starts_with(current))
+                    .map(Candidate::text),
+            );
+            Ok(candidates)
+        }
         ValueCompletion::Endpoint(syntax) => Ok(endpoint_candidates(
             current,
             syntax,
@@ -1327,6 +1360,9 @@ fn complete_path_for(
             path_policy(command, args, false),
         ));
     };
+    if endpoint.host.starts_with('@') {
+        return Ok(Vec::new());
+    }
     remote_path_candidates(
         command,
         args,

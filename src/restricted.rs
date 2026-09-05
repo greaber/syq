@@ -4129,6 +4129,120 @@ pub(crate) fn prepare_transfer(
     })
 }
 
+/// Build a request without trusting the source's eventual filesystem claims.
+/// The receiving laptop separately confines and approves every mutation scope.
+pub(crate) fn named_request(
+    args: &Args,
+    receipt_policy: crate::receipt::ReceiptPolicy,
+) -> Result<crate::destination::CopyRequest> {
+    let (destination, sources) = args
+        .locations
+        .split_last()
+        .context("copy endpoints missing")?;
+    let mut checked = args.clone();
+    // These channels are encrypted by the laptop-initiated SSH connection.
+    checked.no_tcp = false;
+    let path = crate::destination::request_path(&destination.path)?;
+    let grant = grant_for(
+        &checked,
+        sources,
+        EnrollmentId::random(),
+        "named-destination",
+        &path,
+    )?;
+    let GrantOperation::Copy(copy) = grant.operation;
+    Ok(crate::destination::CopyRequest {
+        copy,
+        constraints: GrantConstraints {
+            max_file_data_bytes_per_second: args.bwlimit_bytes,
+            filters: FilterPolicy {
+                ignore: args.ignore_lines.clone(),
+                destination_roots: filter_destination_roots(args, sources, &path)?,
+                delete_excluded: args.delete_excluded,
+            },
+            root_existence: root_existence_for(args.target_existence),
+            receipt_policy,
+        },
+    })
+}
+
+/// A fresh, in-memory authorization minted on the receiving machine after
+/// approval. It shares the restricted executor, but never reads or changes an
+/// SSH enrollment, a signed grant's replay store, or persistence preferences.
+pub(crate) fn named_authority(
+    root: &Path,
+    request: crate::destination::CopyRequest,
+) -> Result<(
+    std::sync::Arc<RestrictedAuthority>,
+    crate::destination::Approved,
+)> {
+    let (login, home) = current_account()?;
+    let parent = root
+        .parent()
+        .context("receiving directory must not be filesystem root")?;
+    let metadata = fs::metadata(parent)?;
+    let id = EnrollmentId::random();
+    let issued_at = now()?;
+    let request_id = RequestId::fresh(issued_at)?;
+    let grant = Grant {
+        enrollment_id: id,
+        target_login: login.clone(),
+        signer: signer_name(id),
+        request_id,
+        issued_at,
+        not_before: issued_at,
+        start_by: issued_at + 60,
+        finish_by: issued_at + FINISH_WINDOW_SECONDS,
+        operation: GrantOperation::Copy(request.copy.clone()),
+    };
+    let key = generate_receipt_key(id)?;
+    // Reuse the complete canonical grant validator. This ephemeral signature
+    // is not sent to the requester as a redeemable enrollment credential.
+    let signed = delegation::sign_grant(grant.clone(), request.constraints.clone(), &key)?;
+    let digest = delegation::signed_grant_digest(&signed)?;
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let home = fs::canonicalize(home)?;
+    let mut protected = receiver_control_paths(&home, &executable, None)?;
+    for directory in [".syq-receive-v1", ".syq-destinations-v1"] {
+        protected.push(ReceiverControlPath {
+            path: home.join(directory).as_os_str().as_bytes().to_vec(),
+            label: "named destination authority state",
+        });
+    }
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        target_login: login,
+        signer: signer_name(id),
+        root: parent
+            .to_str()
+            .context("receiving directory must be UTF-8")?
+            .into(),
+        root_dev: metadata.dev(),
+        root_ino: metadata.ino(),
+        ssh_keygen: String::new(),
+        receiver_path: executable.to_string_lossy().into_owned(),
+    };
+    let approved = crate::destination::Approved {
+        token: String::new(),
+        destination: request.copy.destination.clone(),
+        enrollment: id,
+        request: request_id,
+        digest,
+        receipt_key: key.public_key().to_openssh()?,
+    };
+    let authority = RestrictedAuthority::new(
+        &config,
+        grant,
+        request.constraints,
+        digest,
+        key,
+        Instant::now() + std::time::Duration::from_secs(FINISH_WINDOW_SECONDS as u64),
+        &protected,
+    )?;
+    Ok((std::sync::Arc::new(authority), approved))
+}
+
 pub(crate) fn receiver_config(id: EnrollmentId) -> Result<(ReceiverEnrollment, PathBuf, PathBuf)> {
     let (_, home) = current_account()?;
     let state = home

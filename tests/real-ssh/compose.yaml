@@ -10,6 +10,8 @@ services:
   source:
     <<: *node
     hostname: source
+    environment:
+      SYQ_REAL_SSH_RETURN_FORWARDING: "1"
     command: ["endpoint"]
     volumes:
       - type: bind

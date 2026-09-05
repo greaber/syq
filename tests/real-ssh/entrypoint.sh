@@ -14,6 +14,11 @@ endpoint() {
             --dport "$SYQ_REAL_SSH_BLOCKED_TCP_PORT" \
             -j REJECT --reject-with tcp-reset
     fi
+    if [ "${SYQ_REAL_SSH_RETURN_FORWARDING:-0}" = 1 ]; then
+        # OpenSSH 9.2 gates remote Unix sockets on TCP forwarding as well.
+        # Only the source needs return forwarding; the destination keeps it disabled.
+        printf 'AllowTcpForwarding remote\nAllowStreamLocalForwarding remote\n' > /etc/ssh/sshd_config.d/00-return.conf
+    fi
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config
     if [ -n "${SYQ_REAL_SSH_EXPECT_MAX_SESSIONS:-}" ]; then
         effective_max_sessions=$(

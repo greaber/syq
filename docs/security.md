@@ -75,6 +75,20 @@ have different boundaries: broker-only authentication permits that destination
 account's full authority during the session; full agent forwarding exposes
 your agent as `ssh -A` would.
 
+## Named receiving destinations
+
+A [named destination](receive.md) lets a server account request copies through
+an outbound connection maintained by your laptop. Keeping that connection open
+does not approve a transfer. The laptop checks the requested paths and limits
+and either asks in its receiving terminal or applies your explicit automatic
+permission. The same restricted filesystem executor checks every operation.
+The server receives no SSH agent and no general command-execution interface.
+
+Approval grants authority within the displayed destination scopes. It cannot
+prove that source files contain what you expect. A compromised authorized
+server can invent content, request more copies, and consume disk space within
+approved per-transfer limits. The laptop's receiving account is trusted.
+
 ## Limits to keep in mind
 
 - **Privileged copies need trusted destination directories.** Resume uses
