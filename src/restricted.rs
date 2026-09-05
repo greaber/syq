@@ -4221,45 +4221,26 @@ fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
     Ok(envelope)
 }
 
-fn management_via(arguments: &[OsString]) -> Result<Option<SshEndpoint>> {
-    if arguments.is_empty() {
-        return Ok(None);
-    }
-    if arguments.len() != 2 || arguments[0] != "--via" {
-        bail!("expected optional --via [USER@]HOST");
-    }
-    Ok(Some(SshEndpoint::parse(
-        arguments[1]
-            .to_str()
-            .context("--via endpoint is not UTF-8")?,
-    )?))
-}
-
-const RECEIVER_USAGE: &str = "Usage: syq receiver <COMMAND>\n\nManage command-restricted receiver enrollments.\n\nCommands:\n  enroll  Enroll a remote destination, or refresh an existing enrollment\n  list    List local enrollments\n  revoke  Remove an enrollment from both machines\n\nRun `syq receiver <COMMAND> --help` for command-specific help.";
-
 /// `syq receiver enroll|list|revoke`: the receiver enrollment system is one
-/// subcommand with its verbs beneath it. `argv[1]` is `enrollment`.
+/// subcommand with its verbs beneath it.
 pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>> {
     if argv.get(1)?.to_str()? != "receiver" {
         return None;
     }
-    let Some(command) = argv.get(2).and_then(|argument| argument.to_str()) else {
-        crate::output::diagnostic!("{RECEIVER_USAGE}");
-        return Some(Ok(2));
+    let matches = crate::help::receiver()
+        .try_get_matches_from(
+            std::iter::once(OsString::from("syq receiver")).chain(argv[2..].iter().cloned()),
+        )
+        .unwrap_or_else(|error| error.exit());
+    let (command, options) = matches.subcommand().expect("subcommand required");
+    let via = || -> Result<Option<SshEndpoint>> {
+        options
+            .get_one::<String>("via")
+            .map(|value| SshEndpoint::parse(value))
+            .transpose()
     };
     match command {
-        "--help" | "-h" => {
-            println!("{RECEIVER_USAGE}");
-            Some(Ok(0))
-        }
         "list" => Some((|| {
-            if argv.get(3).is_some_and(|argument| argument == "--help") {
-                println!("Usage: syq receiver list\n\nList local command-restricted receiver enrollments.");
-                return Ok(0);
-            }
-            if argv.len() != 3 {
-                bail!("usage: syq receiver list");
-            }
             let active = load_local_enrollments()?;
             let active_ids = active
                 .iter()
@@ -4288,16 +4269,9 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             Ok(0)
         })()),
         "enroll" => Some((|| {
-            if argv.get(3).is_some_and(|argument| argument == "--help") {
-                println!(
-                    "Usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]\n\nEnroll a command-restricted receiver for DESTINATION's existing parent, or refresh an existing enrollment's receiver."
-                );
-                return Ok(0);
-            }
-            if argv.len() < 4 {
-                bail!("usage: syq receiver enroll [USER@]HOST:DESTINATION [--via [USER@]HOST]");
-            }
-            let target = argv[3].to_str().context("enrollment target is not UTF-8")?;
+            let target = options
+                .get_one::<String>("target")
+                .expect("target required");
             let location = Location::parse(target)?;
             let host = location
                 .host
@@ -4305,7 +4279,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 .context("enrollment target must be remote")?;
             let requested = std::str::from_utf8(&location.path)
                 .context("enrollment destination is not UTF-8")?;
-            let via = management_via(&argv[4..])?;
+            let via = via()?;
             let policy =
                 crate::agent_broker::resolve_host_policy("ssh", location.user.as_deref(), host)?;
             let (metadata, _, destination) = enroll(
@@ -4325,17 +4299,8 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             Ok(0)
         })()),
         "revoke" => Some((|| {
-            if argv.get(3).is_some_and(|argument| argument == "--help") {
-                println!(
-                    "Usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]\n\nRemove the forced key and per-enrollment state from both machines."
-                );
-                return Ok(0);
-            }
-            if argv.len() < 4 {
-                bail!("usage: syq receiver revoke ENROLLMENT-ID [--via [USER@]HOST]");
-            }
-            let id = EnrollmentId::parse(argv[3].to_str().context("enrollment ID is not UTF-8")?)?;
-            let via = management_via(&argv[4..])?;
+            let id = EnrollmentId::parse(options.get_one::<String>("id").expect("ID required"))?;
+            let via = via()?;
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
@@ -4392,9 +4357,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             println!("revoked {id} from {}", target.label());
             Ok(0)
         })()),
-        other => Some(Err(anyhow::anyhow!(
-            "unknown receiver command {other:?}\n{RECEIVER_USAGE}"
-        ))),
+        _ => unreachable!("receiver subcommand validated by clap"),
     }
 }
 

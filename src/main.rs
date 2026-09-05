@@ -8,6 +8,7 @@ mod delegation;
 mod descriptor_broker;
 pub mod enrollment;
 mod fsops;
+mod help;
 mod identity;
 mod janky_cat;
 mod native_map;
@@ -118,6 +119,13 @@ fn main() {
     raise_nofile();
     fsops::capture_process_umask();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
+        if let Err(error) = help::show_topic(&argv[2..]) {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
         return;

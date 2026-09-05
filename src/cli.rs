@@ -44,9 +44,7 @@ pub enum SourceSelection {
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CoordinateAt {
-    /// Run locally unless both endpoints are remote, then use the source
-    /// endpoint (delegated path operands travel encoded, so any filename
-    /// works).
+    /// Run locally unless both endpoints are remote, then run at the source.
     #[default]
     Auto,
     /// Run the coordinator at the source endpoint.
@@ -61,7 +59,8 @@ pub enum CoordinateAt {
 #[command(
     name = "syq rsync",
     version,
-    about = "Parallel copy with an rsync-shaped interface",
+    about = "Copy using rsync-compatible syntax.\n\nA trailing source slash copies directory contents; without it, copy the named\ndirectory. Source and destination cannot both be remote; use syq cp for that.\n-h means human-readable sizes, as in rsync. Use --help for help.",
+    before_help = "Examples:\n  syq rsync -a photos/ backup/\n  syq rsync -av photos/ nas:/backup/photos/\n  syq rsync -av nas:photos/ backup/",
     disable_help_flag = true,
     override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
@@ -197,7 +196,7 @@ pub struct Args {
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
     /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// change nothing
+    /// leave source and destination data unchanged (remote helper setup may write cache files)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -423,11 +422,11 @@ impl Args {
             bail!("command name is not valid UTF-8");
         };
         match command {
-            "rsync" => Self::parse_rsync(&argv[1..], false),
+            "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native(&argv[1..], Interface::NativeCp),
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
-            "--help" | "-h" => {
+            "--help" | "-h" | "--help-all" => {
                 print_root_help();
                 std::process::exit(0);
             }
@@ -437,28 +436,33 @@ impl Args {
             }
             // Installation lifecycle switches remain top-level. Internal
             // helper switches are handled in main.
-            "--self-update" | "--register-standalone-install" => Self::parse_rsync(&argv, true),
+            "--self-update" | "--register-standalone-install" => {
+                let matches = crate::help::lifecycle().try_get_matches_from(
+                    std::iter::once(OsString::from("syq")).chain(argv)
+                ).unwrap_or_else(|error| error.exit());
+                let mut args = native_engine_defaults();
+                args.self_update = matches.get_flag("self_update");
+                args.register_standalone_install = matches.get_flag("register_standalone_install");
+                Ok(args)
+            },
             _ => bail!(
                 "expected a command (`cp`, `rm`, `map`, `rsync`, `persist`, `completion`, or `receiver`); rsync-shaped syntax now starts with `syq rsync`"
             ),
         }
     }
 
-    fn parse_rsync(argv: &[OsString], allow_lifecycle: bool) -> Result<Args> {
-        if !allow_lifecycle
-            && argv
-                .iter()
-                .filter_map(|argument| argument.to_str())
-                .any(|argument| {
-                    matches!(argument, "--self-update" | "--register-standalone-install")
-                })
+    fn parse_rsync(argv: &[OsString]) -> Result<Args> {
+        if argv
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .any(|argument| matches!(argument, "--self-update" | "--register-standalone-install"))
         {
             bail!("installation lifecycle options are top-level syq options, not rsync options");
         }
         reject_unsupported_rsync_flags(argv)?;
         let mut full_argv = vec![OsString::from("syq rsync")];
         full_argv.extend(argv.iter().cloned());
-        let matches = Args::command()
+        let matches = crate::help::filesystem(Args::command())
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let args = Args::from_arg_matches(&matches)?;
@@ -608,9 +612,10 @@ fn ordered_ignore_lines(
 }
 
 fn print_root_help() {
-    println!(
-        "Parallel endpoint-aware filesystem operations\n\nUsage: syq <COMMAND> [OPTIONS]\n       syq --self-update\n\nCommands:\n  cp           Copy selected objects, optionally pruning target-only objects\n  rm           Remove explicitly selected object trees\n  map          Print a local source selection as an NDJSON mapping\n  rsync        Use the rsync-shaped command surface\n  persist      Manage reusable SSH control connections\n  completion   Generate shell completion and manage its disposable local cache\n  receiver     Manage command-restricted receiver enrollments (enroll, list, revoke)\n\nRun `syq <COMMAND> --help` for command-specific help."
-    );
+    crate::help::root().print_help().unwrap_or_else(|error| {
+        crate::output::diagnostic!("syq: {error}");
+        std::process::exit(1);
+    });
 }
 
 /// Clap metadata for the public filesystem command surfaces. The dynamic
@@ -618,10 +623,10 @@ fn print_root_help() {
 /// spelling and hidden flags in one place.
 pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     match name {
-        "rsync" => Some(Args::command()),
-        "cp" => Some(NativeCopyCommand::command()),
-        "rm" => Some(NativeRmCommand::command()),
-        "map" => Some(NativeMapCommand::command()),
+        "rsync" => Some(crate::help::filesystem(Args::command())),
+        "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
+        "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
+        "map" => Some(crate::help::filesystem(NativeMapCommand::command())),
         _ => None,
     }
 }
@@ -720,7 +725,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Resolve and preview the operation without changing anything
+    /// Preview without changing copy/removal data; requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity
@@ -729,7 +734,7 @@ struct NativeOperationalArgs {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Use a fixed number of parallel connections/workers
+    /// Fix parallel connections/workers (copies otherwise tune automatically)
     #[arg(short = 'j', long = "connections", value_name = "N")]
     connections: Option<usize>,
     /// Show progress even when stderr is not a terminal
@@ -777,8 +782,8 @@ struct NativeCopyOperationalArgs {
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
     #[arg(long, value_name = "FILE")]
     ignore_from: Vec<OsString>,
-    /// Preserve additional metadata (permissions, ownership, or specials; repeatable/comma-separated)
-    #[arg(long, value_name = "ATTRIBUTE", value_delimiter = ',')]
+    /// Preserve permissions or ownership, or copy special files (repeatable/comma-separated)
+    #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     preserve: Vec<NativePreserve>,
     /// Update destination files directly, using no full-sized staging file; interruption can leave them incomplete
     #[arg(long)]
@@ -873,8 +878,11 @@ struct NativeRemoteArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum NativePreserve {
+    /// Preserve permission bits
     Permissions,
+    /// Preserve owner and group IDs
     Ownership,
+    /// Copy device nodes and special files
     Specials,
 }
 
@@ -940,9 +948,10 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy selected objects with explicit endpoint and placement syntax",
+    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Destination-only objects remain unless --prune is selected.\nSource arguments must precede destination arguments.",
+    before_help = "Examples:\n  syq cp photos --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
     long_about = "Copy selected objects with explicit endpoint and placement syntax.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
-    override_usage = "syq cp [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]... PLACEMENT"
+    override_usage = "syq cp [OPTIONS] SOURCE... PLACEMENT"
 )]
 struct NativeCopyCommand {
     #[command(flatten)]
@@ -1018,9 +1027,10 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
 #[command(
     name = "syq map",
     version,
-    about = "Print a local source selection as an NDJSON mapping",
-    long_about = "Print a local source selection as an NDJSON mapping.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq map [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources and write one JSON object per line for later cp --mapping.\n--as changes placement relative to that copy's destination directory.\nNamed selectors must be relative (use -C for the source base).\n--srcs-in must be the only selector; --as requires one named object.\nNames must be valid UTF-8. No destination is contacted.",
+    before_help = "Examples:\n  syq map --srcs-in photos\n  syq map photos --as archive/photos > mapping.ndjson\n  syq cp --mapping mapping.ndjson --into backup",
+    long_about = "Print source-to-destination mappings as NDJSON.\n\nScan local sources for later cp --mapping. Named selectors must be relative (use -C for the source base). --srcs-in must be the only selector; --as requires one named object and changes its placement relative to the future destination directory.\n\nOne JSON object per line: tagged src and dst paths (src relative to the source base, dst relative to a future target container), the object kind, and size/mtime for regular files. Emission is local and read-only. Names must be valid UTF-8. Attach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
     #[command(flatten)]
@@ -1034,9 +1044,10 @@ struct NativeMapCommand {
 #[command(
     name = "syq rm",
     version,
-    about = "Remove endpoint-resolved object trees without following symlinks by default",
-    long_about = "Remove endpoint-resolved object trees without following symlinks by default.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
-    override_usage = "syq rm [OPTIONS] [--src PATH | --srcs-in DIR | --src-file PATH | --src-dir DIR | PATH]..."
+    about = "Remove selected files and directory trees.\n\nDirectories are removed recursively. --srcs-in removes their contents instead.\nBy default, selected symlinks are removed as links and path symlinks are refused.",
+    before_help = "Examples:\n  syq rm --dry-run old-backup\n  syq rm old-backup\n  syq rm --from nas --srcs-in /backup/old",
+    long_about = "Remove selected files and directory trees. Directories are removed recursively; --srcs-in removes their contents instead. By default, selected symlinks are removed as links and path symlinks are refused.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
     #[command(flatten)]
@@ -1183,7 +1194,7 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
 fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
-    let matches = NativeCopyCommand::command()
+    let matches = crate::help::filesystem(NativeCopyCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     validate_native_copy_argument_order(&matches)?;
@@ -1360,7 +1371,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
 fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq map")];
     full_argv.extend_from_slice(argv);
-    let matches = NativeMapCommand::command()
+    let matches = crate::help::filesystem(NativeMapCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     let mut parsed = NativeMapCommand::from_arg_matches(&matches)?;
@@ -1431,7 +1442,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
 fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq rm")];
     full_argv.extend_from_slice(argv);
-    let matches = NativeRmCommand::command()
+    let matches = crate::help::filesystem(NativeRmCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
     let mut parsed = NativeRmCommand::from_arg_matches(&matches)?;
