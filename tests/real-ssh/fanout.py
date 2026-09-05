@@ -119,6 +119,30 @@ def main():
             verify_tree(source, destination)
             no_helpers()
 
+        print("case: multi-destination copies preserve persistent SSH masters", flush=True)
+        trace = Path("/tmp/syq-real-ssh-ssh.trace")
+        trace_start = len(trace.read_text().splitlines())
+        subprocess.run(["syq", "persist", "on"], check=True, capture_output=True, timeout=10)
+        try:
+            for attempt in range(2):
+                with copying(local, f"persistent-{attempt}", source, f"{REMOTE}/persistent",
+                             options=["--hash"]) as (child, result):
+                    assert child.wait(timeout=30) == 0
+                    settled(result, 0)
+                controls = {}
+                for line in trace.read_text().splitlines()[trace_start:]:
+                    fields = dict(field.split("=", 1) for field in line.split("\t"))
+                    if fields.get("control_master") == "auto" and fields.get("host") in HOSTS:
+                        controls[fields["host"]] = fields["control_path"]
+                assert set(controls) == set(HOSTS), controls
+                for host, control in controls.items():
+                    subprocess.run(["/usr/bin/ssh", "-S", control, "-O", "check", host],
+                                   check=True, capture_output=True, timeout=10)
+            verify_tree(source, f"{REMOTE}/persistent")
+        finally:
+            subprocess.run(["syq", "persist", "off"], check=True, capture_output=True, timeout=15)
+        no_helpers()
+
         print("case: multi-destination refusal before any target mutation", flush=True)
         with copying(local, "refusal", source, "unused", placements=[
             "--to", "source", "--into", f"{REMOTE}/refused",
