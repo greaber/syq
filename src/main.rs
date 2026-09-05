@@ -6,6 +6,7 @@ mod conn;
 mod delegation;
 #[allow(dead_code)]
 mod descriptor_broker;
+mod destination;
 pub mod enrollment;
 mod fsops;
 mod help;
@@ -235,6 +236,15 @@ fn main() {
             }
         }
     }
+    if let Some(result) = destination::dispatch(&argv) {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                crate::output::diagnostic!("syq: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut args = match cli::Args::parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -258,6 +268,12 @@ fn main() {
         return;
     }
     persistence::mark_explicit_scope(&mut args);
+    if args.interface != cli::Interface::NativeCp {
+        if let Err(error) = destination::prepare(&mut args) {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(2);
+        }
+    }
     let quiet = args.quiet;
     let result = if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)

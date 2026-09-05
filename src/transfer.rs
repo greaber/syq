@@ -1507,6 +1507,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
     let mut args = args;
+    // Authorization failures settle the already-open automation stream too.
+    if args.interface == Interface::NativeCp {
+        crate::destination::prepare(&mut args)?;
+    }
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
@@ -1555,7 +1559,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     if args.restricted_grant.is_some()
-        && (args.no_tcp || args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
+        && ((args.no_tcp && !crate::destination::is_named(&args.restricted_grant))
+            || args.tcp_plain
+            || original_srcs[0].is_remote()
+            || !dst.is_remote())
     {
         bail!(
             "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
@@ -3063,7 +3070,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // every mutation is settled, and hand its bounded frames to the invoking
     // machine as marked lines. That machine verifies it; this coordinator's
     // own report is not trusted for what landed.
-    if args.restricted_grant.is_some() {
+    if let Some(receipt) = &args.named_receipt {
+        if let Err(error) = crate::destination::finish_receipt(receipt, dst_ctl.as_mut()) {
+            progress.error(&format!("syq: receipt: {error:#}"));
+        }
+    } else if args.restricted_grant.is_some() {
         use base64::Engine as _;
         if let Err(error) = dst_ctl.send(Request::Receipt) {
             progress.error(&format!("syq: receipt: {error:#}"));

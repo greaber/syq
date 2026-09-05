@@ -65,6 +65,8 @@ pub enum CoordinateAt {
     override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
 pub struct Args {
+    #[arg(skip)]
+    pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     /// Which public command produced this execution request.
     #[arg(skip)]
     pub interface: Interface,
@@ -911,7 +913,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination endpoint ([USER@]HOST[:PORT]); without --into/--as, copy into its home directory
+    /// Destination SSH endpoint ([USER@]HOST[:PORT]) or @NAME registered by syq receive; placement defaults to --into .
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
@@ -1866,6 +1868,14 @@ pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeE
     let Some(spec) = spec else {
         return Ok(None);
     };
+    if let Some(name) = spec.strip_prefix('@') {
+        crate::destination::validate_name(name)?;
+        return Ok(Some(NativeEndpoint {
+            user: None,
+            host: spec.to_owned(),
+            port: None,
+        }));
+    }
     let (user, authority) = match spec.rsplit_once('@') {
         Some((user, authority)) if !user.is_empty() => (Some(user.to_string()), authority),
         Some(_) => bail!("empty user in endpoint {spec:?}"),

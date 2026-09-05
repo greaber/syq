@@ -55,6 +55,13 @@ Endpoint helper caches start empty. The suite copies a file to each endpoint
 using the source build, exercising automatic executable upload over real SSH
 before the remaining scenarios reuse those helpers.
 
+The source sshd permits remote Unix socket forwarding for named return transfers
+(OpenSSH 9.2 also requires remote TCP forwarding permission). The destination
+keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
+copies from independent source shells without a forwarded agent, destination
+traversal refusal, conflicting names, reconnection after killing the owned SSH
+transport, and stopping the receiver.
+
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new
 values. A remote wrapper records one test variable and executes the candidate

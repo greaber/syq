@@ -1080,7 +1080,7 @@ pub(crate) struct VerifiedGrant {
 }
 
 /// Signed receiver policy carried alongside the copy grant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GrantConstraints {
     pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,

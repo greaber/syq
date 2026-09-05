@@ -14236,6 +14236,8 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "persist",
             "completion",
             "receiver",
+            "receive",
+            "destination",
             "--self-update",
         ],
     );
@@ -17046,4 +17048,54 @@ fn native_verify_only_remote_results_require_local_coordination() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
     assert!(stderr_of(&out).contains("--coordinate-at local"));
     assert!(!t.path("results").exists());
+}
+
+#[test]
+fn named_destination_offline_failure_settles_results_and_completes_names_locally() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "source",
+            "--to",
+            "@laptop",
+            "--results",
+            "result.ndjson",
+        ])
+        .env("HOME", t.path(""))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .current_dir(t.path(""))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["status"], "failed");
+    // The completion route uses private local registration names only, without
+    // attempting SSH or contacting the receiving laptop.
+    write(&t.path(".syq-destinations-v1/laptop.json"), b"{}");
+    let completion = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "completion",
+            "__complete",
+            "fish",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "source",
+            "--to",
+            "@lap",
+        ])
+        .env("HOME", t.path(""))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .current_dir(t.path(""))
+        .output()
+        .unwrap();
+    assert_output_ok(&completion);
+    assert_eq!(completion.stdout, b"@laptop\0");
 }

@@ -92,6 +92,25 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
+        Self::start_inner(config, handler, true)
+    }
+
+    /// The foreground receiver owns signal handling and child cleanup.
+    pub(crate) fn start_managed<F>(config: PrivateBrokerConfig<'_>, handler: F) -> Result<Self>
+    where
+        F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
+    {
+        Self::start_inner(config, handler, false)
+    }
+
+    fn start_inner<F>(
+        config: PrivateBrokerConfig<'_>,
+        handler: F,
+        signal_cleanup: bool,
+    ) -> Result<Self>
+    where
+        F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
+    {
         if config.max_connections == 0 {
             bail!("private broker needs at least one connection slot");
         }
@@ -105,7 +124,9 @@ impl PrivateBroker {
             .with_context(|| format!("bind private broker at {}", socket_path.display()))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        register_signal_cleanup(socket_dir.path())?;
+        if signal_cleanup {
+            register_signal_cleanup(socket_dir.path())?;
+        }
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(ConnectionRegistry::new(config.io_timeout));
@@ -293,6 +314,10 @@ pub(crate) struct TrackedStream {
 }
 
 impl TrackedStream {
+    pub(crate) fn try_clone(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn read_timeout(&self) -> io::Result<Option<Duration>> {
         self.stream.read_timeout()

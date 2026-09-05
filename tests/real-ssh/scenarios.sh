@@ -10,6 +10,14 @@ blocked_tcp_port=${SYQ_REAL_SSH_BLOCKED_TCP_PORT:?missing blocked TCP port}
 cleanup() {
     rc=$?
     trap - EXIT INT TERM
+    if [ -n "${return_copy_pid:-}" ]; then
+        kill -TERM "$return_copy_pid" 2>/dev/null || true
+        wait "$return_copy_pid" 2>/dev/null || true
+    fi
+    if [ -n "${receive_pid:-}" ]; then
+        kill -TERM "$receive_pid" 2>/dev/null || true
+        wait "$receive_pid" 2>/dev/null || true
+    fi
     if [ -n "${SSH_AGENT_PID:-}" ]; then
         ssh-agent -k >/dev/null 2>&1 || true
     fi
@@ -118,6 +126,95 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: named return destination works from independent server shells without agent forwarding\n'
+receive_root=/tmp/syq-real-ssh-receive
+mkdir -p "$receive_root" /tmp/syq-real-ssh-receive-other
+make_tree source /tmp/syq-real-ssh/return-source return
+syq receive --via source --name laptop --into "$receive_root" --approve always &
+receive_pid=$!
+ssh source 'syq destination wait laptop --timeout 30'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
+(
+    cd "$receive_root/first"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) > /tmp/syq-return-local.manifest
+diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
+
+printf 'case: named return rejects traversal and receiver symlink escape\n'
+ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
+if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as escape/escaped'; then
+    echo 'named destination followed an escaping destination symlink' >&2
+    exit 1
+fi
+test ! -e /tmp/syq-real-ssh-receive-other/escaped
+if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as ../escaped'; then
+    echo 'named destination accepted parent traversal' >&2
+    exit 1
+fi
+
+printf 'case: duplicate named return cannot displace the existing laptop\n'
+if timeout 20 syq receive --via source --name laptop --into /tmp/syq-real-ssh-receive-other --approve always; then
+    echo 'duplicate named destination unexpectedly succeeded' >&2
+    exit 1
+else
+    duplicate_status=$?
+    test "$duplicate_status" -eq 1
+fi
+ssh source 'syq destination wait laptop --timeout 5'
+
+printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
+ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=6 status=none'
+timeout 30 ssh source 'syq cp --bwlimit 512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+return_copy_pid=$!
+deadline=$(($(date +%s) + 15))
+next_progress=$(($(date +%s) + 5))
+while :; do
+    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)
+    if [ "$partial_count" -eq 1 ]; then break; fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+        echo "named partial readiness timed out: partial_count=$partial_count" >&2
+        exit 1
+    fi
+    if [ "$now" -ge "$next_progress" ]; then
+        echo "waiting for named copy partial: partial_count=$partial_count" >&2
+        next_progress=$((now + 5))
+    fi
+    sleep 0.1
+done
+# Let the rate-limited transfer write data before severing its transport.
+sleep 2
+# Only kill the receiver's owned SSH child; the tracing wrapper is its parent.
+receive_wrapper=$(pgrep -P "$receive_pid")
+pkill -KILL -P "$receive_wrapper" -x ssh
+if wait "$return_copy_pid"; then
+    echo 'interrupted named transfer reported success' >&2
+    exit 1
+else
+    interrupted_status=$?
+    test "$interrupted_status" -ne 124
+fi
+return_copy_pid=
+test ! -e "$receive_root/interrupted"
+ssh source 'syq destination wait laptop --timeout 30'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
+ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
+test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
+printf 'return\n' | cmp - "$receive_root/after-reconnect"
+kill -TERM "$receive_pid"
+wait "$receive_pid"
+receive_pid=
+if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-stop'; then
+    echo 'stopped receiver unexpectedly accepted a transfer' >&2
+    exit 1
+fi
+test ! -e "$receive_root/after-stop"
+
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
 # Observe the environment at the remote helper, after real SendEnv/AcceptEnv
@@ -168,7 +265,11 @@ open_spares() {
     ' "$trace"
 }
 complete_remote
-test "$(direct_logins)" -eq 1
+if [ "$(direct_logins)" -ne 1 ]; then
+    echo 'first completion did not finish exactly one direct login:' >&2
+    cat "$trace" >&2
+    exit 1
+fi
 deadline=$(($(date +%s) + 15))
 next_progress=$(($(date +%s) + 5))
 while :; do

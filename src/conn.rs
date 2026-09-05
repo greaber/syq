@@ -599,6 +599,7 @@ pub struct RemoteConn {
     dead: bool,
     peer: Option<PeerInfo>,
     tcp_socket: Option<TcpStream>,
+    named_socket: Option<std::os::unix::net::UnixStream>,
     multiplexed_ssh: bool,
     /// A session taken from the session pool: no child of ours to wait for,
     /// and a reader that ends when the remote closes the pipe.
@@ -700,6 +701,7 @@ impl RemoteConn {
             dead: false,
             peer: None,
             tcp_socket: None,
+            named_socket: None,
             multiplexed_ssh: false,
             detached: true,
         }
@@ -893,6 +895,9 @@ impl Drop for RemoteConn {
         // timed out. Drop the receiver before joining so a reader blocked on a
         // full response channel can exit as well.
         if let Some(socket) = &self.tcp_socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(socket) = &self.named_socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         self.rx.take();
@@ -1612,6 +1617,29 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        if crate::destination::is_named(&self.restricted_grant) {
+            let stream = crate::destination::connect(
+                self.restricted_grant.as_deref().unwrap(),
+                matches!(role, ConnectionRole::Control),
+            )?;
+            let (rx, reader) = spawn_reader(Box::new(stream.try_clone()?));
+            let conn = RemoteConn {
+                child: None,
+                w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
+                rx: Some(rx),
+                reader: Some(reader),
+                label: self.label(),
+                dead: false,
+                peer: None,
+                tcp_socket: None,
+                named_socket: Some(stream),
+                multiplexed_ssh: false,
+                detached: false,
+            };
+            let conn = hello(conn, compress, Vec::new(), role)?;
+            self.record_peer(&conn);
+            return Ok(conn);
+        }
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
             server_args.push(format!("--restricted-grant={grant}"));
@@ -1661,6 +1689,7 @@ impl RemoteSpec {
             dead: false,
             peer: None,
             tcp_socket: None,
+            named_socket: None,
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
             detached: false,
         };
@@ -1984,6 +2013,7 @@ impl RemoteSpec {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                named_socket: None,
                 multiplexed_ssh: false,
                 detached: false,
             };
@@ -2794,7 +2824,9 @@ impl Endpoint {
                         }
                     }
                 }
-                if spec.restricted_grant.is_some() {
+                if spec.restricted_grant.is_some()
+                    && !crate::destination::is_named(&spec.restricted_grant)
+                {
                     bail!(
                         "{}: signed receiver has no authorized TCP data connection",
                         spec.label()
@@ -3204,6 +3236,7 @@ mod tests {
             dead: false,
             peer: None,
             tcp_socket: None,
+            named_socket: None,
             multiplexed_ssh: false,
             detached: false,
         };
@@ -3250,6 +3283,7 @@ mod tests {
             dead: false,
             peer: None,
             tcp_socket: None,
+            named_socket: None,
             multiplexed_ssh: false,
             detached: false,
         };
@@ -3291,6 +3325,7 @@ mod tests {
             dead: false,
             peer: None,
             tcp_socket: None,
+            named_socket: None,
             multiplexed_ssh: false,
             detached: false,
         };
@@ -3351,6 +3386,7 @@ mod tests {
                 dead: false,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
+                named_socket: None,
                 multiplexed_ssh: false,
                 detached: false,
             };
