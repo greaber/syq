@@ -1,25 +1,26 @@
 # Summary
 
-[Introduction](index.md)
+[Get started](index.md)
 
 # Using syq
 
-- [Installing](install.md)
-- [Command reference](reference.md)
-- [Mappings](mappings.md)
-- [Automation results](automation.md)
-- [Composability](composability.md)
+- [Install and setup](install.md)
+- [Copy files](reference.md)
+- [Remove files](remove.md)
+- [Copy between servers](remote-to-remote.md)
+- [Rename and reorganize](mappings.md)
 
 # Performance
 
 - [Speed](speed.md)
-- [Server setup](server-tuning.md)
+  - [Server setup](server-tuning.md)
 
-# Trust
+# Security
 
-- [Remote-to-remote transfers](remote-to-remote.md)
-- [Security](security.md)
+- [Threat model and protections](security.md)
 
-# Compatibility
+# Reference
 
+- [Remote copy details](remote-reference.md)
+- [Automation results](automation.md)
 - [Rsync compatibility](rsync-compat.md)

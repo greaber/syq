@@ -1,239 +1,58 @@
-# Introduction
+# Copy files with syq
 
-Syq is fast, safe, programmable *file motion*: copying and deleting files and
-directory trees on one machine or across a network. It is built for the jobs
-where `cp -r`, `rm -r`, and rsync are too slow or too trusting. Compared with
-rsync, the headline differences for a casual user are:
+Syq copies and removes files in parallel, on one machine or over SSH. It can
+resume interrupted copies and transfer directly between servers without
+forwarding your SSH agent.
 
-- **Much faster in many common situations**: fast LANs and lossy WANs, many
-  small files and a few giant ones. Syq parallelizes across files and inside
-  large files, moves data over encrypted TCP data connections instead of one
-  SSH stream, lets the kernel copy on a single machine, and tunes its own
-  connection count while a copy runs. See [Speed](speed.md).
-- **Direct server-to-server transfers without dangerous SSH agent
-  forwarding.** `syq cp --from hostA --srcs-in big --to hostB --into big`
-  sends data straight from A to B. HostA never receives your agent or a
-  reusable credential for hostB; it gets a signed, single-use grant for
-  exactly this transfer, and hostB signs a receipt saying what it actually
-  wrote. See [Remote-to-remote transfers](remote-to-remote.md).
-- **Filters in gitignore syntax** (`--ignore node_modules`, `--ignore '*.o'`,
-  `--ignore-from .gitignore`) instead of rsync's include, exclude, and filter
-  rules.
+In published tests, syq copied a folder from Amsterdam to Tokyo
+[5.2× faster than rsync](https://greaber.github.io/syq-bench/#fly-cross-region-memory),
+and 20,000 small files to NFS
+[4.6× faster than cp](https://greaber.github.io/syq-bench/#nfs-directory-trees).
+These are workload-specific results; the benchmarks include cases where other
+tools win.
 
-Unsafe agent forwarding (`ssh -A`) lets anyone who compromises a server you
-log into use all of your SSH keys, against every host they can name, for as
-long as you stay logged in. It is one of the most common insecure habits among
-otherwise careful people, because the alternatives were inconvenient. Syq's
-answer has two parts: a constrained agent broker, a temporary process on your
-machine that signs SSH logins only for the one hop from hostA to hostB, and
-the command-restricted receiver, a forced command on hostB that syq installs
-when you enroll a destination. [Security](security.md) explains how they work
-and what each protects.
+[Install syq](install.md), then try a copy:
 
-## Why another file tool?
+```sh
+syq cp project --to server --into /backup
+```
 
-Some of the first commands anyone learns are `cp`, `rm`, and `mv`. They do
-essential work and have barely changed in fifty years, and they have four
-serious limitations.
+This creates or updates `/backup/project` on `server`. To copy the contents
+of `project` directly into `/backup`, use `--srcs-in`:
 
-1. **Connectivity.** They do not work between computers.
-2. **Speed.** They are slow, mostly because nothing in them is parallel. This
-   bites hardest on networked filesystems such as NFS and sshfs, which are
-   otherwise the easy way around the connectivity problem.
-3. **Composability.** They fuse planning with execution. `cp -r`, `rm -r`, and
-   `mv` cannot tell you in advance how many files or bytes they will touch, so
-   they cannot refuse before changing anything when you lack a permission or
-   the disk is too small. More important, a command that cannot plan is hard to
-   build on.
-4. **Security.** They are hard to use safely if your threat model includes the
-   possibility that an attacker can modify part of the filesystem while you
-   work in it. Defense in depth says that it should.
+```sh
+syq cp --srcs-in project --to server --into /backup
+```
 
-Rsync helps considerably with connectivity and security, and to a limited
-degree with speed and composability. It is mainly a replacement for `cp`, not
-`rm` or `mv`, but `cp` is the command that most needed replacing, and rsync's
-`--delete` adds mirroring, which the classical commands never had.
+Use `--dry-run` to preview a summary without copying, or `--dry-run -v`
+to list the planned changes by path.
+Existing destination files are updated when needed. Unrelated files stay
+unless you request `--prune`.
 
-Syq's biggest strengths are speed and secure remote-to-remote transfers.
-Its composability comes from planning before acting: a dry run reports what
-would change, mappings let a program choose placement, and a results stream
-reports each operation's outcome. On filesystem hardening, rsync, and
-especially [its security
-design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md), has
-been a great teacher; native `cp` and `rm` now follow the same design, and the
-remaining differences are documented rather than hidden.
+## Already use rsync?
 
-## Speed
+Start with your usual command, prefixed by `syq`:
 
-Syq was born of frustration with how slow existing tools are, and speed is the
-reason most people will use it. In rough order of importance, syq is faster
-because it:
+```sh
+syq rsync -av project/ server:backup/project/
+syq rsync -av server:data/ ./data/
+```
 
-1. **Parallelizes everything.** It scans both sides in parallel, transfers
-   many files at once, and splits large files into ranges that different
-   workers move concurrently, so a tree of small files and a single giant file
-   both benefit. An auto-tuner adjusts the connection count during the copy,
-   choosing the smallest count that is within a few percent of the best
-   measured rate, and remembers it per path.
-2. **Moves data over TCP, not through SSH.** SSH authenticates and controls the
-   transfer; file data flows over separate AES-256-GCM encrypted TCP data
-   connections, escaping OpenSSH's per-channel window (about 2 MB per round
-   trip) and per-process cipher throughput. Comparably fast NICs are used
-   together. If the ports are firewalled, syq says so once and falls back to
-   SSH.
-3. **Lets the kernel copy.** On one machine, `copy_file_range` does a reflink
-   or an in-kernel copy, and an NFS 4.2 server copies the file itself without
-   moving the bytes through the client.
-4. **Resumes at block granularity with no state file.** Interrupted or changed
-   files are hashed in blocks on both sides, and only mismatching blocks move.
-5. **Pipelines small files** in batches, overlaps connection setup with
-   scanning, keeps one authenticated SSH connection per host alive between
-   commands when you ask it to, and compresses each protocol frame with zstd
-   only when that makes it smaller.
+Syq supports common rsync options, but uses its own protocol. Rsync filter
+rules, hard links, ACLs, xattrs, sparse files, and rolling-checksum deltas
+are not supported. Check [rsync compatibility](rsync-compat.md) before
+substituting it in an existing script.
 
-Measured numbers, the cases where parallelism does not help (one spinning
-disk), and host tuning are in [Speed](speed.md) and [Server
-tuning](server-tuning.md). You can benchmark syq against rsync and cp in your
-own environment with [syq-bench](https://github.com/greaber/syq-bench).
+## Common tasks
 
-There is one scenario in which rsync moves less data than syq. When an old
-version of a file already exists on the destination, rsync's rolling checksum
-finds matching blocks at *any* byte offset, so one byte inserted near the start
-of a 100 GB file costs rsync a few tens of megabytes of hashes. Syq compares
-blocks at the same offsets: appends and in-place modifications (VM images,
-databases, logs) are handled with the same economy, but an insertion shifts
-everything after it and that tail is resent. Delta transfer has costs of its
-own: the destination side must read its entire old copy, which on a network filesystem
-can be slower than the transfer it saves, and it must hold that copy still
-while waiting for the sender. Most large files are never modified in place, so
-for most workloads this does not matter. Rolling-checksum delta transfer is not
-implemented; if your workload needs it, measure with syq-bench and tell us.
-
-## Connectivity
-
-Like rsync, syq uses SSH to reach other machines, so it cannot reach a host
-that rsync could not. In practice it has two connectivity advantages.
-
-**Self-installation.** Rsync must already be installed on the remote host, and
-you trust whatever version is there, however old. Syq installs a remote
-helper, a copy of syq of its own exact version, on the remote host the first
-time it connects, one per version, so both ends always run
-matching code. The remote downloads the release directly when it has the tools,
-or the local machine uploads it. Either way the binary is checked against a
-signed release manifest, verified with a public key compiled into your local
-syq, before it runs. Cargo and checkout builds instead upload their own binary
-to hosts that can run it; see [Installing](install.md#cargo).
-
-**Direct remote-to-remote transfers.** Rsync cannot copy between two remote
-hosts from your laptop. You download and re-upload, at your laptop's bandwidth,
-or you log in to one server with agent forwarding and run rsync there. Syq starts
-the transfer on hostA and streams data to hostB while progress comes back to
-you, and hostA never holds your credentials. When hostA cannot reach hostB,
-`--coordinate-at local` routes the bytes through your machine instead. See
-[Remote-to-remote transfers](remote-to-remote.md).
-
-## Composability
-
-The classical commands fuse planning and execution. Syq separates them as far
-as the filesystem allows.
-
-- **Plan before touching anything.** `--dry-run` scans both sides and reports
-  the mapping, how many files it would create, update, and delete, how much
-  data would move, and the network route it would take. Conflicts such as two
-  sources writing one destination path are refused before the destination is
-  touched. Pruning (deleting paths that exist only on the destination) runs
-  only after a complete, error-free scan, and `--max-delete` is
-  all-or-nothing.
-- **Selection and placement as data.** `--files-from` and `--ignore-from` read
-  lists. Native placement (`--into`, `--as`, `--into-new`, ...) is explicit
-  rather than inferred from trailing slashes and whether the destination
-  exists. A *mapping* is an NDJSON manifest (one JSON object per line) of
-  source→destination claims that `syq map` emits and `syq cp --mapping`
-  executes, with conflict checking across the whole manifest, so any tool
-  that edits JSON can reshape a transfer.
-- **Results as data.** Exit codes distinguish partial failure, `--progress-json`
-  streams progress, and `--results` writes the results stream, a
-  machine-readable outcome per operation, so "retry what failed" is one `jq`
-  filter away.
-
-Filesystems are not transactional, so plans do not make a copy reversible.
-Permissions can change or a disk can fill between the plan and the write, and
-a partially executed plan cannot always be rolled back. Separating planning
-from execution is still worth a great deal. See
-[Composability](composability.md) and [Mappings](mappings.md).
-
-## Security
-
-Syq's security story has two parts, and this documentation is candid about the
-state of each.
-
-**Hardening against a hostile filesystem.** If attackers might modify a tree
-while you copy it (when you run as root, or over shared storage, they might),
-a file tool must not be redirected by a swapped symlink, a crafted file list,
-or a pre-planted temporary file. Rsync 3.5 is the state of the art here. Syq
-already validates every path the other end of a transfer supplies, follows a
-destination symlink you named on the command line only when root or the
-receiving user owns it, opens the named file or directory itself without
-following links, never recursively deletes anything that changed type, and
-opens every selected source and destination once, before anything changes,
-and keeps those handles open for the whole run, so every worker reads and
-writes relative to an open handle and a directory swapped for a symlink
-mid-transfer cannot redirect it. Two things remain weaker than rsync: syq's
-always-on resume files assume their directory is not writable by untrusted
-users, and the protocol between syq processes has not been fuzzed the way
-rsync's has.
-
-**Least privilege for remote transfers.** For a remote-to-remote copy, the
-default gives hostA neither your agent nor a credential. The broker on your
-machine signs only for the exact hostA→user@hostB hop, checked through
-OpenSSH's session binding; a dedicated key on hostB is bound to the restricted
-receiver; each transfer carries a signed, single-use grant naming the
-destination, the semantics, and the limits, which the receiver enforces on its
-own, working relative to an open handle on the destination directory so writes
-stay inside it; and hostB ends the transfer with a signed receipt of what it
-wrote, verified on your machine. A compromised hostA can lie about the source.
-It cannot escape the destination, widen the grant, replay it, reach anything
-else, or misreport what landed.
-
-**Release integrity.** Releases are built by a protected workflow from signed
-tags and published with attestations and an Ed25519-signed manifest. Every
-remote helper and self-update is verified against that manifest before it
-runs.
-
-[Security](security.md) explains all three, what each protects, and what it
-does not. Report vulnerabilities as described in
-[SECURITY.md](https://github.com/greaber/syq/blob/master/SECURITY.md).
-
-## Interfaces
-
-1. **Rsync mode.** `syq rsync` accepts rsync's argument shape
-   and most of its common options for local, push, and pull copies. **This is
-   the easiest way to start today.** Syq-specific options carry a `--syq-`
-   prefix there (`--syq-ignore`, `--syq-connections`, `--syq-verify-only`), so
-   a command that works with rsync keeps working and the extensions are
-   unmistakable. Rsync's filter rules are the biggest missing piece;
-   `--syq-ignore` takes gitignore syntax instead. Two remote paths are
-   refused, as rsync refuses them. The [rsync compatibility](rsync-compat.md)
-   page lists what matches, what differs on purpose, and what is missing.
-2. **Native mode.** `syq cp`, `syq rm`, and `syq map` put the verb first, make
-   endpoints, selection, and placement explicit, and add what rsync lacks:
-   remote-to-remote copies, a parallel `rm`, exact placement, filters and
-   preservation as plain command-line options, mappings. Native mode is
-   experimental, and its command line may change between releases.
-3. **Programmatic.** `--progress-json` streams progress, native `cp` and `rm`
-   accept `--results`, which writes the results stream, one NDJSON record per
-   operation in a versioned format
-   ([Automation results](automation.md)), and mappings let a program
-   supply selection and placement as data. See
-   [Composability](composability.md).
-
-## Status and limitations
-
-Syq is 0.1.x software with release binaries for Linux (x86-64, ARM64) and
-macOS (Apple Silicon, Intel). Rsync mode is the most stable part of syq; the
-native commands are experimental. Not implemented: rsync
-filter rules, `--link-dest`, hard links (`-H`), ACLs and xattrs, sparse files,
-rolling-checksum delta transfer, and rsync daemon mode. The
-[rsync compatibility](rsync-compat.md) page has the complete list with reasons.
-Syq is MIT licensed; the source is at
-[github.com/greaber/syq](https://github.com/greaber/syq).
+| I want to… | Start here |
+|---|---|
+| Choose exactly where files land | [Copy and placement](reference.md) |
+| Preview changes | [Dry runs](reference.md#preview-changes) |
+| Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |
+| Mirror a directory | [Mirroring](reference.md#mirror-a-directory) |
+| Remove files in parallel | [Removal](remove.md) |
+| Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
+| Rename or reorganize files during a copy | [Mappings](mappings.md) |
+| Read results from a script | [Automation results](automation.md) |
+| Make copies faster | [Speed](speed.md) |

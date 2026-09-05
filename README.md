@@ -1,20 +1,16 @@
 # syq
 
-Syq is fast, safe, programmable *file motion*: copying and deleting files and
-directory trees on one machine or across a network, built for the jobs where
-`cp -r`, `rm -r`, and rsync are too slow or too trusting.
+Syq copies and removes files in parallel, on one machine or over SSH.
+It is built for large files, large trees, and fast networks.
 
-- **Much faster in many common situations.** Parallel across files and inside
-  large files, data over encrypted TCP connections instead of one SSH stream,
-  kernel-side copies on a single machine, and a connection count that tunes
-  itself while the copy runs.
-- **Direct server-to-server transfers without dangerous SSH agent
-  forwarding.** HostA gets a signed, single-use grant for exactly this
-  transfer, never your agent, and hostB signs a receipt of what it wrote.
-- **Filters in gitignore syntax** instead of rsync's include, exclude, and
-  filter rules.
+- **Parallel copies and removal**, with automatic connection tuning.
+- **Resume interrupted copies** by rerunning the command.
+- **Direct server-to-server transfers** without forwarding your SSH agent.
+- **Gitignore-style filters**, programmable file placement, and JSON results.
 
-**Documentation: <https://greaber.github.io/syq/>**
+[Documentation](https://greaber.github.io/syq/) ·
+[Speed](https://greaber.github.io/syq/speed.html) ·
+[Security](https://greaber.github.io/syq/security.html)
 
 ## Install
 
@@ -22,29 +18,48 @@ directory trees on one machine or across a network, built for the jobs where
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
 ```
 
-Installs into `~/.local/bin` without `sudo`. Or use Homebrew:
-`brew install greaber/tap/syq`. Both install matching remote helpers on first
-use. Update with `syq --self-update` (standalone) or `brew upgrade syq`.
+Linux and macOS; no `sudo` needed. Installs into `~/.local/bin`.
+Homebrew and shell setup are covered in the
+[installation guide](https://greaber.github.io/syq/install.html).
 
-Source builds upload themselves to compatible remote hosts, but do not check
-for release updates or support self-update. See the
-[installation guide](https://greaber.github.io/syq/install.html) for source
-builds, remote setup, and shell completion.
-
-## Quick start
+## Try it
 
 ```sh
-syq rsync -av project/ server:backup/project/      # rsync syntax: push
-syq rsync -av server:data/ ./data/                 # pull
-syq rsync -a --dry-run -v src/ host:dst/           # preview; change nothing
-syq cp project --to server --into /backup          # native mode → /backup/project
-syq cp --from hostA --srcs-in big --to hostB --into big   # direct server-to-server
-syq rm --root /srv --src-dir cache                 # remove /srv/cache; never leave /srv
-syq rm old-output --results removal.ndjson         # structured per-path outcomes
+syq cp project --to server --into /backup        # copy as /backup/project
+syq cp --dry-run --srcs-in project --into backup # preview a contents copy
+syq rsync -av server:data/ ./data/               # familiar rsync syntax
+syq cp --from hostA --srcs-in big --to hostB --into big
+syq rm old-output                               # parallel recursive removal
 ```
 
-The [documentation site](https://greaber.github.io/syq/) has the reasoning,
-the full command reference, and the speed and security details.
+Rsync mode is the most stable interface; native commands are experimental.
+Syq uses its own protocol and does not implement every rsync feature. See
+[rsync compatibility](https://greaber.github.io/syq/rsync-compat.html).
+
+## Developing syq
+
+Build from source only when developing syq itself. For everyday use, install
+an official release: it can fetch the right remote executable across platforms.
+
+With [rustup](https://rustup.rs/), Git, and a C compiler installed:
+
+```sh
+git clone https://github.com/greaber/syq.git
+cd syq
+cargo build --locked --release
+./target/release/syq cp data --to server
+```
+
+Local edits work without a commit or published branch. A source build uploads
+its running executable to compatible remote hosts; OS, CPU, and required
+system libraries must match. This caches a helper for syq's own use, not a
+`syq` command on the remote `PATH`. Source builds do not check for release
+updates or support `--self-update`.
+
+For another platform, build the same commit and source changes there. Both
+binaries must report the same `--build-identity`. Select that remote executable
+with `--syq-path /path/to/syq`, or use `--no-bootstrap` when it is already on
+the remote `PATH` (rsync mode: `--rsync-path` or `--syq-no-bootstrap`).
 
 ## License
 

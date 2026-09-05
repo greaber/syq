@@ -1,0 +1,57 @@
+{
+  "source": {
+    "index.html": "updated home page\n",
+    "images/logo.svg": "new logo\n"
+  },
+  "before": {
+    "index.html": "old home page\n",
+    "notes.txt": "keep these notes\n"
+  },
+  "examples": [
+    {
+      "id": "directory",
+      "title": "Copy the directory",
+      "command": "syq cp project --to server --into /backup",
+      "description": "Copies project into /backup/project on server. Existing files outside that directory stay.",
+      "after": {
+        "index.html": "old home page\n",
+        "notes.txt": "keep these notes\n",
+        "project/index.html": "updated home page\n",
+        "project/images/logo.svg": "new logo\n"
+      }
+    },
+    {
+      "id": "contents",
+      "title": "Copy its contents",
+      "command": "syq cp --srcs-in project --to server --into /backup",
+      "description": "Copies the contents directly into /backup. index.html is updated; notes.txt stays.",
+      "after": {
+        "index.html": "updated home page\n",
+        "notes.txt": "keep these notes\n",
+        "images/logo.svg": "new logo\n"
+      }
+    },
+    {
+      "id": "rename",
+      "title": "Give it another name",
+      "command": "syq cp project --to server --as /backup/site",
+      "description": "Copies project as /backup/site. The files already in /backup stay.",
+      "after": {
+        "index.html": "old home page\n",
+        "notes.txt": "keep these notes\n",
+        "site/index.html": "updated home page\n",
+        "site/images/logo.svg": "new logo\n"
+      }
+    },
+    {
+      "id": "mirror",
+      "title": "Mirror its contents",
+      "command": "syq cp --prune --max-delete 10 --srcs-in project --to server --into /backup",
+      "description": "Updates /backup to match project. index.html is updated and notes.txt is removed.",
+      "after": {
+        "index.html": "updated home page\n",
+        "images/logo.svg": "new logo\n"
+      }
+    }
+  ]
+}
