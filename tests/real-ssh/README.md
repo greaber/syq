@@ -69,6 +69,10 @@ the reversed constrained-agent edge, and an explicit local relay. Every path
 uses real SSH for control and bootstrap, and the suite compares the complete
 source and destination manifests afterward.
 
+Range-transfer checks also copy a large file with a 64-request pipeline and
+64 KiB requests over TCP and SSH, then through source, destination, and local
+coordinators. Each result is compared byte for byte with the original.
+
 This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. For release preparation, use

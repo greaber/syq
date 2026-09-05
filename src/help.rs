@@ -113,6 +113,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "Progress and results"
             }
             "connections" | "connections_opt" | "block_size" | "bwlimit" => "Performance",
+            "tuning_options" => "Benchmark tuning",
             "rsh" | "syq_path" | "no_bootstrap" | "no_tcp" | "tcp_plain" | "tcp_ports"
             | "tcp_congestion" | "pscope" | "compress" | "no_compress" => "SSH and transport",
             "coordinate_at"
