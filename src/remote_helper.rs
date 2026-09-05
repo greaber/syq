@@ -1,10 +1,10 @@
 //! Release/build-identified remote helper discovery and installation commands.
 //!
 //! Official clients name their exact release; development clients carry a Git
-//! identity but may not populate the managed cache. A cache hit adds no extra
+//! identity and upload their own executable to compatible hosts. A cache hit adds no extra
 //! ssh round trip: the normal remote command computes the target name and execs
 //! the cached binary directly. On a miss, `conn` probes the target and either
-//! authorizes a remote download or uploads a locally verified matching asset.
+//! authorizes a release download or uploads a matching executable.
 
 pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
 pub const HELPER_MISSING_EXIT: i32 = 125;
@@ -255,7 +255,7 @@ trap - EXIT HUP INT TERM"#,
     )
 }
 
-/// Install a locally verified, uncompressed helper received on standard input.
+/// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
 pub fn upload_script(target: Target) -> String {
     let release = cache_key();
@@ -282,7 +282,7 @@ if ! chmod 700 "$tmp"; then
     exit {install_failed_exit}
 fi
 got=$("$tmp" --version 2>/dev/null) || {{
-    echo "syq: uploaded helper cannot run on this host" >&2
+    echo "syq: uploaded helper cannot run on this host; use a build compatible with its system libraries and CPU" >&2
     exit {install_failed_exit}
 }}
 [ "$got" = {expected_version} ] || {{

@@ -26,8 +26,8 @@ Installs into `~/.local/bin` without `sudo`. Or use Homebrew:
 `brew install greaber/tap/syq`. Both install matching remote helpers on first
 use. Update with `syq --self-update` (standalone) or `brew upgrade syq`.
 
-**Cargo and other source builds do not install remote helpers automatically,
-check for release updates, or support self-update.** See the
+Source builds upload themselves to compatible remote hosts, but do not check
+for release updates or support self-update. See the
 [installation guide](https://greaber.github.io/syq/install.html) for source
 builds, remote setup, and shell completion.
 

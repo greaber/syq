@@ -597,7 +597,8 @@ Connection and listing failures simply produce no candidates; set
 
 The helper syq installs on a remote host serves one bounded, read-only
 directory listing. If the matching helper is absent, the first completion may
-install it through the same signed, verified bootstrap used by a transfer.
+install it through the same [helper installation](install.md#remote-helper-bootstrap)
+used by a transfer: a verified release download or a source-build upload.
 With persistence enabled, completion uses the same per-endpoint SSH control
 connection as later transfers, which removes the repeated login latency. It
 also takes the session pool's ready helper when one is waiting, which makes a

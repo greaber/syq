@@ -39,7 +39,7 @@ pub fn require_release_build() -> Result<()> {
     )
 }
 
-fn is_release_build() -> bool {
+pub(crate) fn is_release_build() -> bool {
     if env!("SYQ_IS_RELEASE_BUILD") == "1" {
         return true;
     }

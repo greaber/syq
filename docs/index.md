@@ -121,9 +121,8 @@ time it connects, one per version, so both ends always run
 matching code. The remote downloads the release directly when it has the tools,
 or the local machine uploads it. Either way the binary is checked against a
 signed release manifest, verified with a public key compiled into your local
-syq, before it runs. This requires an official release build; Cargo and
-checkout builds need a compatible remote `syq`, as
-[Installing](install.md#cargo) explains.
+syq, before it runs. Cargo and checkout builds instead upload their own binary
+to hosts that can run it; see [Installing](install.md#cargo).
 
 **Direct remote-to-remote transfers.** Rsync cannot copy between two remote
 hosts from your laptop. You download and re-upload, at your laptop's bandwidth,
