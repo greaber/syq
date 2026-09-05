@@ -177,9 +177,10 @@ Syq normally skips files whose size and modification time match.
 syq cp --hash --srcs-in project --into backup
 ```
 
-This changes how syq decides what needs copying. Without `--hash`, a network
-copy still compares blocks when size or modification time differs, so it can
-reuse unchanged data. Local copies may instead use a faster whole-file copy.
+This changes how syq decides what needs copying. For larger network
+copies, syq still compares blocks when size or modification time differs,
+even without `--hash`, so it can reuse unchanged data. Local and small copies
+may use faster paths instead.
 
 Transferred data is always checked for corruption. For files being changed by
 another program, stop the writer or copy a snapshot. No copy makes the whole

@@ -3,7 +3,8 @@
 Start with the defaults. Syq copies files in parallel, splits large files
 between workers, and adjusts connection count during the transfer. If a TCP
 data port is reachable, it sends data through separate encrypted connections.
-Otherwise, ordinary copies send their data over SSH.
+Otherwise, ordinary copies send their data over SSH. Small copies can stay
+on the SSH control connection to avoid extra setup.
 
 ## Benchmarks
 

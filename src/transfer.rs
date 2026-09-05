@@ -869,7 +869,7 @@ fn small_copy_eligible(
         && clean_root(&dst.path) != b"~"
 }
 
-/// Push fresh small regular files in one control-connection turn. Sources
+/// Push small regular files in one control-connection turn. Sources
 /// are read through the same registered references the engine's workers
 /// use; the receiver selects, anchors, checks, stages, and publishes in one
 /// request. Every result record and the summary come from the same counters
@@ -1039,12 +1039,12 @@ fn attempt_small_copy(
             ..
         }) if results.len() == srcs.len() => results,
         Response::SmallFilesCopied(SmallCopyResponse {
-            outcome: SmallCopyOutcome::NotFresh,
+            outcome: SmallCopyOutcome::UnsupportedTarget,
             ..
         }) => {
             if debug() {
                 crate::output::diagnostic!(
-                    "syq: small copy: a destination exists; using the ordinary engine"
+                    "syq: small copy: a destination is not a regular file; using the ordinary engine"
                 );
             }
             return Ok(SmallCopy::Declined);
@@ -1098,42 +1098,70 @@ fn attempt_small_copy(
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
-    // Did any source change while we were at it? Same check as the worker's
-    // small-file batch, through the same registered references.
-    let now = stat_many_registered(
-        src_ctl,
-        srcs.iter().map(|source| source.path.clone()).collect(),
-        Some(roots.iter().map(|root| root.selection.clone()).collect()),
-        false,
-    )?;
-    for (((entry, (_, rel_bytes, rel)), result), now) in
-        entries.iter().zip(&targets).zip(results).zip(now)
-    {
+    // The engine's quick check is a planning-time decision, including
+    // metadata-only repairs. Recheck only files whose content was copied or
+    // compared, not those already skipped on size/mtime.
+    let check_source: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, result)| {
+            (result.disposition != SmallCopyDisposition::QuickChecked).then_some(i)
+        })
+        .collect();
+    let mut now = if check_source.is_empty() {
+        Vec::new()
+    } else {
+        stat_many_registered(
+            src_ctl,
+            check_source.iter().map(|&i| srcs[i].path.clone()).collect(),
+            Some(
+                check_source
+                    .iter()
+                    .map(|&i| roots[i].selection.clone())
+                    .collect(),
+            ),
+            false,
+        )?
+    }
+    .into_iter();
+    for ((entry, (_, rel_bytes, rel)), result) in entries.iter().zip(&targets).zip(results) {
+        if result.disposition == SmallCopyDisposition::QuickChecked {
+            progress.files_unchanged.fetch_add(1, Relaxed);
+            progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            if let Some(error) = result.error {
+                progress.error(&format!("syq: {}", endpoint_error(error)));
+            }
+            continue;
+        }
+        let now = now.next().expect("one stat per checked source");
+        let source_changed = now.as_ref().is_none_or(|e| {
+            e.kind != Kind::File
+                || e.size != entry.size
+                || e.mtime != entry.mtime
+                || e.mtime_nsec != entry.mtime_nsec
+        });
+        if result.disposition == SmallCopyDisposition::ContentMatched && !source_changed {
+            progress.files_unchanged.fetch_add(1, Relaxed);
+            progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            if let Some(error) = result.error {
+                progress.error(&format!("syq: {}", endpoint_error(error)));
+            }
+            continue;
+        }
         progress.files_total.fetch_add(1, Relaxed);
         progress.bytes_total.fetch_add(entry.size, Relaxed);
-        let failure = match result {
+        let failure = match result.error {
             Some(error) => {
                 let error = endpoint_error(error).context("put");
                 Some(("unknown", os_kind_of(&error), format!("{error:#}")))
             }
-            None => {
-                let changed = match &now {
-                    Some(e) => {
-                        e.kind != Kind::File
-                            || e.size != entry.size
-                            || e.mtime != entry.mtime
-                            || e.mtime_nsec != entry.mtime_nsec
-                    }
-                    None => true,
-                };
-                changed.then(|| {
-                    (
-                        "yes",
-                        None,
-                        "source changed during transfer (or vanished)".to_string(),
-                    )
-                })
-            }
+            None => source_changed.then(|| {
+                (
+                    "yes",
+                    None,
+                    "source changed during transfer (or vanished)".to_string(),
+                )
+            }),
         };
         if let Some((retryable, os_kind, message)) = failure {
             progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
@@ -1189,14 +1217,14 @@ fn attempt_small_copy(
         exit_code,
         dry_run: false,
         files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: 0,
+        files_unchanged: progress.files_unchanged.load(Relaxed),
         files_excluded: 0,
         directories_created: 0,
         symlinks_created: 0,
         specials_created: 0,
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: 0,
+        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned: None,
         deletions_completed: None,

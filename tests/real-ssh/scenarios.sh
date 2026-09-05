@@ -259,6 +259,62 @@ small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
 small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
 test "$small_expected" = "$small_actual"
 
+printf 'case: persistent debug output closes with the copying process\n'
+small_scope=$(syq persist on --ephemeral)
+# A verbose detached SSH master holds this pipe open until ControlPersist
+# expires. Do not close the scope until the pipeline has drained (or timed out).
+small_exit=/tmp/syq-real-ssh-persistent-debug.exit
+# Arguments and exit status are expanded by the timed child shell.
+# shellcheck disable=SC2016
+if timeout 15 sh -c '
+    { SYQ_DEBUG=1 syq cp --no-progress --pscope "$1" "$2" \
+        --to source --into /tmp/syq-real-ssh/small-destination
+      echo "$?" >"$3"
+    } 2>&1 | cat
+' sh "$small_scope" "$small_source" "$small_exit" >"$small_debug"; then
+    small_timeout=0
+else
+    small_timeout=$?
+fi
+syq persist off --pscope "$small_scope" >/dev/null
+if [ "$small_timeout" -ne 0 ] || [ "$(cat "$small_exit")" != 0 ]; then
+    echo 'persistent debug copy failed or held its output open:' >&2
+    cat "$small_debug" >&2
+    exit 1
+fi
+
+printf 'case: existing small files skip TCP setup and SSH data sessions\n'
+for small_case in unchanged updated; do
+    small_results="/tmp/syq-real-ssh-small-$small_case.ndjson"
+    if [ "$small_case" = updated ]; then
+        printf 'changed payload\n' >>"$small_source"
+    fi
+    if ! SYQ_DEBUG=1 syq cp --no-progress --results "$small_results" \
+        "$small_source" --to source --into /tmp/syq-real-ssh/small-destination \
+        2>"$small_debug"; then
+        cat "$small_debug" >&2
+        exit 1
+    fi
+    small_status=$(tail -n 1 "$small_results")
+    case "$small_status" in
+        *'"status":"success"'*'"type":"result"'*) ;;
+        *) cat "$small_results" "$small_debug" >&2; exit 1 ;;
+    esac
+    case "$small_case:$small_status" in
+        unchanged:*'"files_unchanged":1'*|updated:*'"files_transferred":1'*) ;;
+        *) cat "$small_results" >&2; exit 1 ;;
+    esac
+    if ! grep -q 'small copy: published' "$small_debug" ||
+        grep -q 'TCP route probes started' "$small_debug" ||
+        ! grep -q 'OpenSSH_' "$small_debug"; then
+        cat "$small_debug" >&2
+        exit 1
+    fi
+    small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
+    small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
+    test "$small_expected" = "$small_actual"
+done
+
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
 if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
