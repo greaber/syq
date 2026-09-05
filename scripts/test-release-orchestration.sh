@@ -347,6 +347,10 @@ EOF
 cat >"$preflight_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "$1" = api ] && [ "${2:-}" = --paginate ]; then
+  shift 3
+  set -- api "$@"
+fi
 case "$1:$2" in
   repo:view) printf 'greaber/syq\n' ;;
   secret:list) printf '[{"name":"SYQ_RELEASE_SIGNING_KEY_PEM_B64"},{"name":"HOMEBREW_TAP_DEPLOY_KEY"}]\n' ;;
@@ -355,7 +359,8 @@ case "$1:$2" in
   api:*)
     case " $* " in
       *'/commits/'*'/check-runs'*) printf '%s\n' "$SYQ_TEST_CHECKS_JSON" ;;
-      *'/actions/workflows/'*'/runs?'*) printf '%s\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
+      *'/attempts/'*'/jobs?'*) printf '[{"jobs":[{"name":"release-certification","status":"completed","conclusion":"success"}]}]\n' ;;
+      *'/actions/workflows/'*'/runs?'*) printf '[%s]\n' "$SYQ_TEST_WORKFLOW_RUNS_JSON" ;;
       *'/actions/permissions/selected-actions '*) printf '%s\n' "$SYQ_TEST_SELECTED_ACTIONS_JSON" ;;
       *'/actions/permissions '*) printf '{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}\n' ;;
       *'/deployment-branch-policies '*) printf '{"branch_policies":[{"name":"v*","type":"tag"}]}\n' ;;
@@ -377,7 +382,7 @@ EOF
 chmod 755 "$preflight_bin/git" "$preflight_bin/gh" "$preflight_bin/curl"
 checks_json=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64","conformance"] | map({name:.,conclusion:"success"})}')
 workflow_runs_json=$(jq -cn --arg head "$preflight_head" '{workflow_runs:[{
-  id:601,event:"workflow_dispatch",head_sha:$head,status:"completed",
+  head_branch:"master",head_repository:{full_name:"greaber/syq"},id:601,event:"workflow_dispatch",head_sha:$head,status:"completed",
   conclusion:"success",run_number:1,run_attempt:1}]}')
 selected_json=$(jq -cn '{github_owned_allowed:true,verified_allowed:false,
   patterns_allowed:["rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"]}')
@@ -409,7 +414,7 @@ if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   echo 'preflight unexpectedly accepted missing full release CI' >&2
   exit 1
 fi
-grep -F 'has no workflow_dispatch run' "$work/failure.out" >/dev/null
+grep -F 'has no push or workflow_dispatch run on master' "$work/failure.out" >/dev/null
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_EXISTING_CRATE_VERSION=9.9.9 \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then

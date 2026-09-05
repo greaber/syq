@@ -121,3 +121,13 @@ jobs:
           needs.scope.outputs.conformance == 'true' &&
           needs.conformance_platforms.result == 'success'
         run: echo 'Selected rsync conformance succeeded.'
+
+  # A skipped certificate cannot certify successful selective stubs.
+  release-certification:
+    needs: [scope, conformance]
+    if: >-
+      needs.scope.outputs.full_suite == 'true' &&
+      needs.scope.outputs.conformance == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Every release validation suite in this workflow succeeded.'
