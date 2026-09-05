@@ -4407,24 +4407,83 @@ exit 23
 }
 
 #[test]
-fn development_build_refuses_managed_remote_bootstrap() {
+fn development_build_uploads_itself_and_reuses_cached_helper() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-
-    write(&t.path("src"), b"offline");
+    executable(
+        &t.path("remote-bin/curl"),
+        b"#!/bin/sh\necho unexpected-download >> \"$FAKE_CURL_LOG\"\nexit 1\n",
+    );
+    write(&t.path("src"), b"offline source build");
     let remote = format!("fake:{}", t.s("dst"));
     let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
-    assert!(!out.status.success(), "bootstrap unexpectedly succeeded");
-    assert!(!t.path("dst").exists());
-    assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"offline source build");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert!(!t.path("curl.log").exists());
+    assert!(!cached_local_helper(&t).exists());
+
+    write(&t.path("rsh.log"), b"");
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !log.contains("syq-helper-target:"),
+        "cache hit probed: {log}"
+    );
+    assert!(!log.contains(".upload"), "cache hit uploaded: {log}");
+}
+
+#[test]
+fn development_build_rejects_cross_platform_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let other_os = if cfg!(target_os = "linux") {
+        "Darwin"
+    } else {
+        "Linux"
+    };
+    executable(
+        &t.path("remote-bin/uname"),
+        format!("#!/bin/sh\ncase \"$1\" in -s) echo {other_os};; -m) echo x86_64;; esac\n")
+            .as_bytes(),
+    );
+    write(&t.path("src"), b"must not copy");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(
-            "managed remote bootstrap is only available from an official syq release build"
-        ),
+        stderr.contains("cannot automatically install a source-built helper"),
         "{stderr}"
     );
-    assert!(!stderr.contains("uploading"), "{stderr}");
+    assert!(stderr.contains("--syq-path"), "{stderr}");
+    assert!(!t.path("dst").exists());
+    assert!(!t.path("remote-home/.cache/syq/helpers").exists());
+}
+
+#[test]
+fn development_build_does_not_install_an_unrunnable_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // Model a host on which the uploaded binary cannot execute.
+    executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
+    write(&t.path("src"), b"must not copy");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("uploaded helper cannot run on this host"),
+        "{stderr}"
+    );
+    assert!(!t.path("dst").exists());
+    let helper = cached_remote_helper(&t);
+    assert!(!helper.exists());
+    assert_eq!(fs::read_dir(helper.parent().unwrap()).unwrap().count(), 0);
 }
 
 #[test]

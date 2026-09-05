@@ -827,10 +827,10 @@ const REMOTE_TO_REMOTE_HEADING: &str = "Remote-to-remote transfers";
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteHelperArgs {
-    /// Use this exact syq executable for ordinary remote helpers, including a remote-to-remote coordinator
+    /// Use this remote syq executable instead of installing a helper
     #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
     syq_path: Option<String>,
-    /// Require ordinary remote helpers on PATH instead of installing a versioned helper
+    /// Use syq on the remote PATH instead of installing a helper
     #[arg(long)]
     no_bootstrap: bool,
 }

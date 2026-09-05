@@ -51,10 +51,9 @@ internal Docker network: no ports are published and no real SSH configuration,
 agent, keys, homes, or remote hosts are used. The destination service alone gets
 `NET_ADMIN`, solely to install the test's port-specific firewall rule.
 
-Managed bootstrap rejects unpublished development identities, so endpoint
-startup seeds the exact candidate binary into its expected helper-cache path.
-The scenarios still use normal SSH control, constrained agent forwarding, and
-destination enrollment; they do not substitute a fake remote shell.
+Endpoint helper caches start empty. The suite copies a file to each endpoint
+using the source build, exercising automatic executable upload over real SSH
+before the remaining scenarios reuse those helpers.
 
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new

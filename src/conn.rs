@@ -1460,7 +1460,7 @@ impl RemoteSpec {
 
     /// `limited`: take a connect slot (data connections). The control
     /// connection passes false: everything waits on it, so it must never
-    /// queue behind workers. In managed mode the release helper is installed
+    /// queue behind workers. In managed mode the matching helper is installed
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let role = if limited {
@@ -2180,10 +2180,8 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
 }
 
 impl RemoteSpec {
-    /// Ensure the exact release helper exists in the remote cache.
-    /// Only authorized release assets may populate the managed helper cache.
+    /// Install a matching release asset or upload this source-built executable.
     pub fn install_helper(&self) -> Result<()> {
-        crate::identity::require_release_build()?;
         let mut installed = self.helper_install.lock().unwrap();
         if *installed {
             return Ok(());
@@ -2201,7 +2199,7 @@ impl RemoteSpec {
         }
         self.bootstrap_helper(bootstrap).with_context(|| {
             format!(
-                "could not install the authorized {} helper on {} ({})",
+                "could not install the matching {} helper on {} ({})",
                 remote_helper::helper_identity(),
                 self.label(),
                 target.key
@@ -2259,6 +2257,36 @@ impl RemoteSpec {
     }
 
     fn bootstrap_helper(&self, bootstrap: RemoteBootstrap) -> Result<()> {
+        if !crate::identity::is_release_build() {
+            if Some(bootstrap.target) != Target::local() {
+                bail!(
+                    "cannot automatically install a source-built helper for {} from {}; \
+                     run syq from a compatible host, use an official release, or install a matching \
+                     build on the remote and select it with --syq-path (--rsync-path for syq rsync)",
+                    bootstrap.target.key,
+                    crate::identity::platform()
+                );
+            }
+            // On Linux this refers to the running image even if a rebuild has
+            // replaced or removed its original path.
+            #[cfg(target_os = "linux")]
+            let executable = std::path::PathBuf::from("/proc/self/exe");
+            #[cfg(not(target_os = "linux"))]
+            let executable =
+                std::env::current_exe().context("locate the running syq executable")?;
+            let binary =
+                std::fs::read(&executable).context("read the running syq for helper upload")?;
+            if !self.quiet {
+                crate::output::diagnostic!(
+                    "syq: {}: uploading this source build over SSH",
+                    self.label()
+                );
+            }
+            // The upload script runs the temporary helper and checks its build
+            // identity before renaming it into the cache. OS/CPU agreement alone
+            // does not guarantee compatible dynamic libraries or CPU features.
+            return self.upload_helper(bootstrap.target, &binary);
+        }
         let mut trusted = None;
         if bootstrap.remote_download {
             match self.try_remote_download(bootstrap.target)? {

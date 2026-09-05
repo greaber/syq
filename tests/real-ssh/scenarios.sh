@@ -108,6 +108,16 @@ if [ -z "$ssh_release" ] || [ "$ssh_major" -lt 8 ] || { [ "$ssh_major" -eq 8 ] &
     exit 1
 fi
 
+printf 'case: source build uploads itself over real SSH to empty helper caches\n'
+printf 'development helper upload\n' > /tmp/dev-helper-upload.txt
+for host in source destination; do
+    ssh "$host" 'test ! -e "$HOME/.cache/syq/helpers"'
+    syq cp /tmp/dev-helper-upload.txt --to "$host" --into /tmp
+    ssh "$host" 'cmp /tmp/dev-helper-upload.txt /dev/stdin' < /tmp/dev-helper-upload.txt
+done
+# The completion scenario expects to discover only its own endpoint.
+syq completion cache clear >/dev/null
+
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
 # Observe the environment at the remote helper, after real SendEnv/AcceptEnv

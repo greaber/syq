@@ -1,20 +1,6 @@
 #!/bin/sh
 set -eu
 
-seed_helper() {
-    identity=$(syq --build-identity)
-    case "$(uname -m)" in
-        x86_64) target=linux-x86_64 ;;
-        aarch64) target=linux-aarch64 ;;
-        *)
-            echo "unsupported real-SSH test architecture: $(uname -m)" >&2
-            exit 1
-            ;;
-    esac
-    helper="/home/syq/.cache/syq/helpers/${identity}-release/${target}/syq"
-    install -D -m 0755 -o syq -g syq /usr/local/bin/syq "$helper"
-}
-
 endpoint() {
     test -r /run/lab/authorized_keys
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
@@ -28,7 +14,6 @@ endpoint() {
             --dport "$SYQ_REAL_SSH_BLOCKED_TCP_PORT" \
             -j REJECT --reject-with tcp-reset
     fi
-    seed_helper
     /usr/sbin/sshd -t -f /etc/ssh/sshd_config
     if [ -n "${SYQ_REAL_SSH_EXPECT_MAX_SESSIONS:-}" ]; then
         effective_max_sessions=$(

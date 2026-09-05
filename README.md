@@ -22,16 +22,14 @@ directory trees on one machine or across a network, built for the jobs where
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
 ```
 
-No `sudo` is needed; the binary lands in `~/.local/bin`. Homebrew
-(`brew install greaber/tap/syq`) and Cargo (`cargo install --locked syq`) also
-work. With the installer or Homebrew, syq installs its matching remote helper
-on first use. Cargo builds need a compatible remote `syq`; see the
-[installation guide](https://greaber.github.io/syq/install.html#cargo).
-To use unreleased code, see [installing from `master` or another branch](https://greaber.github.io/syq/install.html#installing-from-master-or-another-branch),
-including how to update and set up matching remote binaries.
+Installs into `~/.local/bin` without `sudo`. Or use Homebrew:
+`brew install greaber/tap/syq`. Both install matching remote helpers on first
+use. Update with `syq --self-update` (standalone) or `brew upgrade syq`.
 
-Bash, Zsh, and fish completion includes remote paths and becomes especially
-fast with `syq persist on`; see the [installation guide](https://greaber.github.io/syq/install.html#shell-completion).
+Source builds upload themselves to compatible remote hosts, but do not check
+for release updates or support self-update. See the
+[installation guide](https://greaber.github.io/syq/install.html) for source
+builds, remote setup, and shell completion.
 
 ## Quick start
 
