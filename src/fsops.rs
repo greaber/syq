@@ -1710,14 +1710,10 @@ impl FsOps {
         Ok(ticket)
     }
 
-    /// One-turn push of fresh small files. This composes the steps the
-    /// ordinary engine issues separately, in the same order, on one fresh
-    /// control session: select and retain the operator directory, refuse if
-    /// any target exists, register and install the directory as the
-    /// destination root exactly as `AnchorDestination` does, then publish
-    /// every file through `put_small` with an absent-target condition. A
-    /// refusal leaves the session as it found it, so the engine can continue
-    /// on this connection.
+    /// Select and retain the destination once, quick-check regular files,
+    /// then stage and publish changed content through the normal rooted path.
+    /// Unsupported target types decline before installing session state.
+    #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
     fn copy_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
         if self.operator_selection.is_some()
             || self.destination_root.is_some()
@@ -1735,6 +1731,9 @@ impl FsOps {
         let mut total = 0u64;
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
+            if content_digest(&file.data) != file.hash {
+                bail!("block hash mismatch on receive");
+            }
             let bytes = file.data.len() as u64;
             if bytes > SMALL_COPY_MAX_FILE_BYTES {
                 bail!("small copy file exceeds {SMALL_COPY_MAX_FILE_BYTES} bytes");
@@ -1768,17 +1767,21 @@ impl FsOps {
         let (selection, anchor) =
             select_operator_directory(&request.directory, false, request.symlink_policy)?;
         let anchor = anchor.context("destination directory is missing")?;
-        // Freshness is decided through the retained descriptor, before
-        // anything is registered, so a refusal has no session side effect.
+        // Inspect through the retained directory before installing state,
+        // so unsupported type replacements can use the general engine.
+        let mut destinations = Vec::with_capacity(names.len());
         for name in &names {
             match operator_lstat_at(&selection.directory, name) {
+                Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+                    destinations.push(Some(stat));
+                }
                 Ok(_) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
-                        outcome: SmallCopyOutcome::NotFresh,
+                        outcome: SmallCopyOutcome::UnsupportedTarget,
                     }))
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => destinations.push(None),
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!(
@@ -1789,6 +1792,20 @@ impl FsOps {
                 }
             }
         }
+        // Match the engine's size + whole-second mtime quick check. A
+        // nanosecond difference alone does not cause a content transfer.
+        let mut unchanged: Vec<bool> = request
+            .files
+            .iter()
+            .zip(&destinations)
+            .map(|(file, stat)| {
+                stat.as_ref().is_some_and(|stat| {
+                    request.flags & flags::TIMES != 0
+                        && stat.st_size as u64 == file.data.len() as u64
+                        && stat.st_mtime == file.meta.mtime
+                })
+            })
+            .collect();
         // The engine's fresh-destination capacity preflight, on the retained
         // selection. An exact target whose leaf is absent is fresh; a
         // directory is fresh only while it is empty. A filesystem that cannot
@@ -1796,7 +1813,8 @@ impl FsOps {
         let exact = request.identity.dst_leaf.is_some();
         self.operator_selection = Some(selection);
         let info = self.destination_filesystem_info(!exact, None).ok();
-        let fresh = exact || info.as_ref().is_some_and(|info| info.empty == Some(true));
+        let fresh = (exact && destinations[0].is_none())
+            || info.as_ref().is_some_and(|info| info.empty == Some(true));
         if let Some(info) = info.filter(|_| fresh) {
             let assessment = crate::transfer::FreshCapacityAssessment {
                 logical_bytes: total,
@@ -1820,19 +1838,78 @@ impl FsOps {
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
 
+        // Existing files with different mtimes may still have identical
+        // content. Compare one bounded block locally, as the worker does,
+        // without another data connection or a rewrite of the destination.
+        let mut matched_content: Vec<Option<(RootedTarget, File)>> =
+            (0..request.files.len()).map(|_| None).collect();
+        for (i, file) in request.files.iter().enumerate() {
+            if unchanged[i]
+                || destinations[i]
+                    .as_ref()
+                    .is_none_or(|stat| stat.st_size as u64 != file.data.len() as u64)
+            {
+                continue;
+            }
+            let check = (|| -> Result<Option<(RootedTarget, File)>> {
+                let path = self.destination_relative(&file.path)?;
+                let target = self
+                    .rooted_destination_target(&path, None)?
+                    .context("small copy requires a destination root")?;
+                let mut opened = target.root.open_regular_read(&target.relative)?;
+                let stat = destinations[i].as_ref().unwrap();
+                require_open_target(
+                    &opened,
+                    &target.label,
+                    TargetCondition::Matches {
+                        dev: stat.st_dev as u64,
+                        ino: stat.st_ino as u64,
+                    },
+                )?;
+                let mut bytes = Vec::with_capacity(file.data.len());
+                Read::by_ref(&mut opened)
+                    .take(file.data.len() as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                Ok(
+                    (bytes.len() == file.data.len() && content_digest(&bytes) == file.hash)
+                        .then_some((target, opened)),
+                )
+            })();
+            match check {
+                Ok(Some(held)) => {
+                    unchanged[i] = true;
+                    matched_content[i] = Some(held);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                        anchor,
+                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
+                    }))
+                }
+            }
+        }
+
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
-        for file in &request.files {
-            match self.stage_small_file(
-                &file.path,
-                &copy_id,
-                &file.data,
-                file.hash,
-                &file.meta,
-                request.flags,
-            ) {
-                Ok(item) => staged.push(item),
+        for ((file, destination), unchanged) in
+            request.files.iter().zip(&destinations).zip(&unchanged)
+        {
+            if *unchanged {
+                staged.push(None);
+                continue;
+            }
+            let mut meta = file.meta;
+            // Without source permission preservation, a replacement keeps
+            // the destination's mode, as in the ordinary worker.
+            if request.flags & flags::MODE == 0 {
+                if let Some(stat) = destination {
+                    meta.mode = stat.st_mode as u32 & 0o7777;
+                }
+            }
+            match self.stage_small_file(&file.path, &copy_id, &file.data, &meta, request.flags) {
+                Ok(item) => staged.push(Some(item)),
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
@@ -1841,20 +1918,102 @@ impl FsOps {
                 }
             }
         }
-        // Each publication has its own outcome; earlier successes remain
-        // published if a later file fails.
-        let results = staged
+        // Each publication/metadata repair has its own outcome. Unchanged
+        // files keep their inode and reconcile only requested mode/ownership.
+        let results = request
+            .files
             .iter()
-            .map(|item| {
-                publish_partial_rooted(
-                    &item.root,
-                    &item.partial,
-                    &item.target,
-                    &item.file,
-                    TargetCondition::Absent,
-                )
-                .err()
-                .map(|error| wire_error(&error))
+            .zip(destinations)
+            .zip(staged)
+            .zip(matched_content)
+            .map(|(((file, destination), item), matched_content)| {
+                let condition = destination
+                    .as_ref()
+                    .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {
+                        dev: stat.st_dev as u64,
+                        ino: stat.st_ino as u64,
+                    });
+                match item {
+                    Some(item) => SmallCopyFileResult {
+                        disposition: SmallCopyDisposition::Copied,
+                        error: publish_partial_rooted(
+                            &item.root,
+                            &item.partial,
+                            &item.target,
+                            &item.file,
+                            condition,
+                        )
+                        .err()
+                        .map(|error| wire_error(&error)),
+                    },
+                    None => {
+                        let stat = destination.expect("unchanged file has a destination");
+                        let mut repair = if matched_content.is_some() {
+                            request.flags & flags::TIMES
+                        } else {
+                            0
+                        };
+                        if request.flags & flags::MODE != 0
+                            && stat.st_mode as u32 & 0o7777 != file.meta.mode & 0o7777
+                        {
+                            repair |= flags::MODE;
+                        }
+                        if request.flags & flags::OWNER != 0 && stat.st_uid != file.meta.uid {
+                            repair |= flags::OWNER;
+                        }
+                        if request.flags & flags::GROUP != 0 && stat.st_gid != file.meta.gid {
+                            repair |= flags::GROUP;
+                        }
+                        let disposition = if matched_content.is_some() {
+                            SmallCopyDisposition::ContentMatched
+                        } else {
+                            SmallCopyDisposition::QuickChecked
+                        };
+                        let error = if let Some((target, held)) = matched_content {
+                            // A content match repairs timestamps through the
+                            // readable inode that was hashed; O_PATH metadata
+                            // handles intentionally cannot change timestamps.
+                            (|| -> Result<()> {
+                                require_rooted_named_identity(
+                                    &target.root,
+                                    &target.relative,
+                                    &target.label,
+                                    &held,
+                                    condition,
+                                )?;
+                                set_meta_file(&held, &file.meta, repair)?;
+                                require_rooted_named_identity(
+                                    &target.root,
+                                    &target.relative,
+                                    &target.label,
+                                    &held,
+                                    condition,
+                                )
+                            })()
+                            .err()
+                            .map(|error| wire_error(&error))
+                        } else if repair == 0 {
+                            None
+                        } else {
+                            match self.destination_relative(&file.path) {
+                                Ok(path) => self
+                                    .apply(
+                                        &[Op::SetFileMetaIfSame {
+                                            path,
+                                            condition,
+                                            meta: file.meta,
+                                            flags: repair,
+                                        }],
+                                        None,
+                                    )
+                                    .pop()
+                                    .flatten(),
+                                Err(error) => Some(wire_error(&error)),
+                            }
+                        };
+                        SmallCopyFileResult { disposition, error }
+                    }
+                }
             })
             .collect();
         Ok(Response::SmallFilesCopied(SmallCopyResponse {
@@ -1870,13 +2029,9 @@ impl FsOps {
         path: &[u8],
         copy_id: &CopyId,
         data: &[u8],
-        hash: ContentDigest,
         meta: &Meta,
         flags: u8,
     ) -> Result<StagedSmallFile> {
-        if content_digest(data) != hash {
-            bail!("block hash mismatch on receive");
-        }
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path, None)?
@@ -7536,7 +7691,16 @@ mod tests {
             Response::SmallFilesCopied(SmallCopyResponse {
                 outcome: SmallCopyOutcome::Published(results),
                 ..
-            }) => assert_eq!(results, vec![None, None]),
+            }) => assert_eq!(
+                results,
+                vec![
+                    SmallCopyFileResult {
+                        disposition: SmallCopyDisposition::Copied,
+                        error: None
+                    };
+                    2
+                ]
+            ),
             other => panic!("{other:?}"),
         }
         assert_eq!(fs::read(dir.path().join("one")).unwrap(), b"one");
@@ -7544,12 +7708,11 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
-    /// The one-turn small copy publishes fresh files through the ordinary
-    /// staged path and leaves the session anchored; an existing target makes
-    /// it write nothing and leave the session untouched; its bounds and the
-    /// one-entry shape are enforced here, not only by the coordinator.
+    /// The bounded copy stages regular files and leaves the session anchored;
+    /// a non-file target declines without mutations. The receiver enforces
+    /// bounds and leaf names, independently of coordinator eligibility.
     #[test]
-    fn small_copy_publishes_fresh_files_and_declines_existing_ones() {
+    fn small_copy_publishes_regular_files_and_declines_other_types() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
         let prefix = dir.as_os_str().as_bytes().to_vec();
@@ -7597,7 +7760,16 @@ mod tests {
                 anchor,
                 outcome: SmallCopyOutcome::Published(results),
             }) => {
-                assert_eq!(results, vec![None, None]);
+                assert_eq!(
+                    results,
+                    vec![
+                        SmallCopyFileResult {
+                            disposition: SmallCopyDisposition::Copied,
+                            error: None
+                        };
+                        2
+                    ]
+                );
                 assert_eq!(anchor.ino, fs::metadata(&dir).unwrap().ino());
             }
             other => panic!("{other:?}"),
@@ -7621,16 +7793,17 @@ mod tests {
         );
         assert!(!dir.join("three").exists());
 
+        fs::create_dir(dir.join("directory")).unwrap();
         let mut declined = FsOps::new();
         let response = declined.handle(&request(
             prefix.clone(),
-            vec![file("three", b"x"), file("one", b"replaced")],
+            vec![file("three", b"x"), file("directory", b"replaced")],
         ));
         assert!(
             matches!(
                 &response,
                 Response::SmallFilesCopied(SmallCopyResponse {
-                    outcome: SmallCopyOutcome::NotFresh,
+                    outcome: SmallCopyOutcome::UnsupportedTarget,
                     ..
                 })
             ),

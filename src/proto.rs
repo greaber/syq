@@ -818,11 +818,10 @@ pub enum Request {
     /// ends the grant's mutation authority.
     Receipt,
     Shutdown,
-    /// One turn for a push of fresh small regular files on a fresh control
-    /// session: select and retain the destination directory, refuse if any
-    /// target already exists, register the directory as the session's
-    /// destination root, then stage and publish every file through the
-    /// ordinary small-file path. See `SmallCopyRequest`.
+    /// One turn for a bounded push of regular files on a fresh control
+    /// session: retain and register the destination directory, quick-check
+    /// existing files, repair metadata and publish changed content through
+    /// the ordinary staged path. See `SmallCopyRequest`.
     CopySmallFiles(SmallCopyRequest),
 }
 
@@ -875,11 +874,11 @@ pub struct SmallCopyRequest {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum SmallCopyOutcome {
     /// Every file was attempted; one result per file in request order.
-    Published(Vec<Option<WireError>>),
-    /// At least one target already exists. Nothing was written and the
+    Published(Vec<SmallCopyFileResult>),
+    /// At least one target is not a regular file. Nothing was written and the
     /// session holds no selection or root, so the ordinary engine can
     /// continue on this connection.
-    NotFresh,
+    UnsupportedTarget,
     /// The fresh-destination capacity preflight would refuse this copy.
     /// Nothing was written and the session is untouched; the engine repeats
     /// the preflight and reports the shortage itself.
@@ -888,6 +887,21 @@ pub enum SmallCopyOutcome {
     /// remain for resume, and the session now holds the destination root,
     /// so the engine needs a fresh control session to continue.
     StagingFailed(WireError),
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmallCopyDisposition {
+    Copied,
+    /// Size/mtime matched at planning time; no later source recheck.
+    QuickChecked,
+    /// Content was read and matched; the source must still be rechecked.
+    ContentMatched,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallCopyFileResult {
+    pub disposition: SmallCopyDisposition,
+    pub error: Option<WireError>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
