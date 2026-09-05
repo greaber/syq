@@ -19,7 +19,10 @@ keeps its own committed assets and builds independently; neither site fetches
 styles or fonts from the other at build time or in the browser.
 
 `docs.css` is the mdBook adapter: prose, code, tables, sidebar, toolbar and
-anchor offsets. `docs.js` adds the current-site marker.
+anchor offsets. `docs.js` adds the current-site marker and moves the existing search, theme and
+sidebar controls into the shared header, preserving mdBook listeners and shortcuts.
+Print and edit links appear below the article; the duplicate title and GitHub
+shortcut no longer need a separate toolbar row. Search opens only when requested.
 The header is a supported partial; the full mdBook template and scripts remain
 upstream so search, chapter navigation, keyboard shortcuts and code copying
 continue to receive mdBook fixes. The built-in light/rust preferences use the
@@ -35,12 +38,17 @@ The font stylesheet uses mdBook's resource helper to resolve hashed font
 filenames. syq-bench embeds the same resources as data URIs. Do not replace the
 resource placeholders with literal paths: those break mdBook's asset hashing.
 
-The toolbar stays sticky below the shared header during both forward and backward
-scrolling. Its offset rule deliberately matches mdBook's sticky/hover selectors
-and overrides inline scroll offsets. When upgrading mdBook, check `reference.html`
-at 390, 820 and 1440 pixels: scroll down several screens, reverse direction, hover
-the toolbar, hide/show the sidebar, and use search and theme controls without
-returning to the top. Also check reload at a saved scroll position.
+With JavaScript enabled, the original toolbar and hover placeholder are hidden,
+and the page margin no longer compensates for that placeholder. Header controls
+remain fixed while scrolling. Without JavaScript, the native toolbar remains
+available below the header for sidebar and page links; its sticky offset still
+overrides mdBook's default. Mobile chapter drawers start below the shared header.
+
+When upgrading mdBook, check 320/390/620/760/820/1440px layouts, navigation and
+control overlap, initial headings and fragment offsets, search via click and `/`,
+themes via mouse/keyboard, chapter toggling, scrolled reload, print/edit links,
+and navigation without JavaScript. The adapter moves upstream nodes rather than
+forking the book template or replacing the control implementations.
 
 The oversized side-of-page chapter arrows are hidden; sidebar links and the
 end-of-page navigation provide the chapter routes.

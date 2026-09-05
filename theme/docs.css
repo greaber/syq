@@ -100,3 +100,31 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
 
 /* Chapter navigation is in the sidebar and at the end of each page. */
 .nav-wide-wrapper{display:none}
+
+/* mdBook controls share the site header after docs.js moves their existing nodes.
+   Keep the native toolbar as a functional fallback when JavaScript is disabled. */
+.docs-compact-header #mdbook-menu-bar,
+.docs-compact-header #mdbook-menu-bar-hover-placeholder {display:none}
+.docs-compact-header .page {margin-block-start:0}
+.docs-controls {position:relative;display:flex;align-items:center;gap:2px;margin:0 0 0 auto;flex:none;color:var(--muted)}
+.docs-controls .icon-button,.docs-controls>label {display:flex;align-items:center;justify-content:center;width:42px;height:44px;cursor:pointer}
+.docs-controls .fa-svg {font-size:18px;line-height:1;padding:0}
+.docs-controls .icon-button:hover,.docs-controls>label:hover {color:var(--syq)}
+.docs-controls .theme-popup {top:48px;left:auto;right:0;font-size:14px}
+.docs-controls .theme-popup .theme {padding:5px 20px}
+.docs-compact-header :target {scroll-margin-top:calc(var(--site-header-height) + 24px)}
+.docs-page-actions {display:flex;gap:24px;flex-wrap:wrap;margin-top:48px;padding-top:20px;border-top:1px solid var(--line);font:14px/1.5 var(--display)}
+@media(max-width:760px) {
+  :root.docs-compact-header {--site-header-height:108px}
+  .docs-compact-header .site-header {display:grid;grid-template-columns:1fr auto;grid-template-rows:44px auto;align-content:center;gap:4px 16px}
+  .docs-compact-header .site-wordmark {grid-column:1;grid-row:1}
+  .docs-compact-header .site-nav {grid-column:1/-1;grid-row:2}
+  .docs-controls {grid-column:2;grid-row:1}
+}
+@media(max-width:619px) {
+  .docs-compact-header .sidebar {top:var(--site-header-height)}
+}
+@media(max-width:480px) {
+  .docs-compact-header .site-nav {font-size:14px;gap:8px}
+}
+@media print {.docs-page-actions{display:none}}
