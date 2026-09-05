@@ -888,9 +888,18 @@ pub enum SmallCopyOutcome {
     StagingFailed(WireError),
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmallCopyDisposition {
+    Copied,
+    /// Size/mtime matched at planning time; no later source recheck.
+    QuickChecked,
+    /// Content was read and matched; the source must still be rechecked.
+    ContentMatched,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SmallCopyFileResult {
-    pub unchanged: bool,
+    pub disposition: SmallCopyDisposition,
     pub error: Option<WireError>,
 }
 

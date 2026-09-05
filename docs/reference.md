@@ -537,10 +537,13 @@ Concurrent data-worker connections can still retry when a server limits new
 connections.
 
 For startup diagnostics, prefix a command with `SYQ_DEBUG=1`. It prints syq's
-transfer phases and enables OpenSSH's verbose startup diagnostics for ordinary
-connections, including errors that happen before the remote helper starts.
-SSH command logging is not enabled for signed receivers because their remote
-command carries an authorization token. A helper taken from the session pool
+transfer phases and enables OpenSSH's verbose startup diagnostics for
+non-persistent helper connections, including errors before the remote helper
+starts. Persistent connections and bootstrap commands keep their normal SSH
+diagnostics: a detached verbose SSH master can keep stderr open until it exits,
+and bootstrap captures stderr for error reports. SSH command logging is not
+enabled for restricted receivers because their remote command carries an
+authorization token. A helper taken from the session pool
 keeps the debug setting it started with.
 
 Scripts can avoid changing that shared preference by creating an ephemeral
@@ -899,8 +902,8 @@ A native push of up to 64 explicitly named regular files, each at most 1 MiB
 and at most 4 MiB in total, can finish over its SSH control connection. This
 covers new files, unchanged files, and small replacements in an existing
 destination directory (`--into`) or at an exact file path (`--as`). It skips
-TCP discovery and additional SSH data connections. The receiver uses the same
-size/mtime quick check, reconciles requested metadata, and stages changed
+TCP connection setup and additional SSH data connections. The receiver uses
+the same size/mtime quick check, reconciles requested metadata, and stages changed
 content beside its final path before publishing it. Existing files with equal
 content but different mtimes can finish with only a metadata update. A
 replacement fails if the destination name changes to a different inode before
@@ -910,7 +913,11 @@ Directory sources, missing destination directories, non-file target types,
 restricted receivers, and options requiring the full scan or verification path
 use the general transfer path. The control-connection path sends the bounded
 source contents with its request, including files the receiver then finds
-unchanged; unchanged files are not rewritten.
+unchanged; unchanged files are not rewritten. A size/mtime match is a decision
+made when syq plans the copy. If the source changes afterward, a file already
+skipped by that check remains unchanged in this run; run another copy to pick
+up the edit. Files whose contents syq copies or compares still get the usual
+source-change check.
 
 One control connection per endpoint does the scan (a parallel walk on each
 side, streamed in batches), the diff, directory creation and metadata.

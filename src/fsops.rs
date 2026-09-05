@@ -1883,14 +1883,7 @@ impl FsOps {
                     meta.mode = stat.st_mode as u32 & 0o7777;
                 }
             }
-            match self.stage_small_file(
-                &file.path,
-                &copy_id,
-                &file.data,
-                file.hash,
-                &meta,
-                request.flags,
-            ) {
+            match self.stage_small_file(&file.path, &copy_id, &file.data, &meta, request.flags) {
                 Ok(item) => staged.push(Some(item)),
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
@@ -1917,7 +1910,7 @@ impl FsOps {
                     });
                 match item {
                     Some(item) => SmallCopyFileResult {
-                        unchanged: false,
+                        disposition: SmallCopyDisposition::Copied,
                         error: publish_partial_rooted(
                             &item.root,
                             &item.partial,
@@ -1946,6 +1939,11 @@ impl FsOps {
                         if request.flags & flags::GROUP != 0 && stat.st_gid != file.meta.gid {
                             repair |= flags::GROUP;
                         }
+                        let disposition = if matched_content.is_some() {
+                            SmallCopyDisposition::ContentMatched
+                        } else {
+                            SmallCopyDisposition::QuickChecked
+                        };
                         let error = if let Some((target, held)) = matched_content {
                             // A content match repairs timestamps through the
                             // readable inode that was hashed; O_PATH metadata
@@ -1988,10 +1986,7 @@ impl FsOps {
                                 Err(error) => Some(wire_error(&error)),
                             }
                         };
-                        SmallCopyFileResult {
-                            unchanged: true,
-                            error,
-                        }
+                        SmallCopyFileResult { disposition, error }
                     }
                 }
             })
@@ -2009,13 +2004,9 @@ impl FsOps {
         path: &[u8],
         copy_id: &CopyId,
         data: &[u8],
-        hash: ContentDigest,
         meta: &Meta,
         flags: u8,
     ) -> Result<StagedSmallFile> {
-        if content_digest(data) != hash {
-            bail!("block hash mismatch on receive");
-        }
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path, None)?
@@ -7672,7 +7663,7 @@ mod tests {
                 results,
                 vec![
                     SmallCopyFileResult {
-                        unchanged: false,
+                        disposition: SmallCopyDisposition::Copied,
                         error: None
                     };
                     2
@@ -7741,7 +7732,7 @@ mod tests {
                     results,
                     vec![
                         SmallCopyFileResult {
-                            unchanged: false,
+                            disposition: SmallCopyDisposition::Copied,
                             error: None
                         };
                         2

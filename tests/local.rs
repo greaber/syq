@@ -7420,6 +7420,92 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
     assert_eq!(read(&t.path("dest-fast/new/one.txt")), b"one");
 }
 
+/// Quick checks use the scan-time snapshot in both transfer paths, even if
+/// the source changes while the receiver is repairing destination metadata.
+#[cfg(debug_assertions)]
+#[test]
+fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
+    for engine in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        write(&t.path("source"), b"old");
+        write(&t.path("remote-home/dest/source"), b"old");
+        for path in ["source", "remote-home/dest/source"] {
+            set_mtime(&t.path(path), 1_700_000_000);
+        }
+        fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            t.path("remote-home/dest/source"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let ready = t.path("ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--preserve=permissions",
+                "--no-progress",
+            ])
+            .arg(t.path("source"))
+            .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
+            .args(["--results", &t.s("results.ndjson")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+            .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+            .env("SYQ_DEBUG", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if engine {
+            command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
+        }
+        let mut child = command.start().unwrap();
+        wait_for(
+            "quick-check metadata repair",
+            std::time::Duration::from_secs(5),
+            || ready.exists(),
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        write(&t.path("source"), b"new contents");
+        set_mtime(&t.path("source"), 1_700_000_001);
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("remote-home/dest/source")), b"old");
+        assert_eq!(
+            fs::metadata(t.path("remote-home/dest/source"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["files_unchanged"], 1);
+        assert_eq!(terminal["bytes_unchanged"], 3);
+        assert_eq!(terminal["files_transferred"], 0);
+        assert_eq!(terminal["errors"], 0);
+        assert!(!records
+            .iter()
+            .any(|record| record["type"] == "operation_result"));
+        assert_eq!(
+            stderr_of(&output).contains("small copy: published"),
+            !engine
+        );
+    }
+}
+
 /// Human output failures must leave the small-copy result and receipt intact.
 #[test]
 fn small_push_preserves_results_with_closed_human_streams() {
@@ -15125,21 +15211,23 @@ fn persistence_rejects_long_socket_paths_before_enabling() {
     let t = Tmp::new();
     let runtime = t.path(&"r".repeat(100));
     fs::create_dir(&runtime).unwrap();
-    let output = persistence_command(&t, &["on"])
-        .env("XDG_RUNTIME_DIR", &runtime)
-        .run()
-        .unwrap();
-    assert!(!output.status.success());
-    let diagnostic = stderr_of(&output);
-    assert!(
-        diagnostic.contains("SSH control socket path"),
-        "{diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("OpenSSH's temporary suffix"),
-        "{diagnostic}"
-    );
-    assert!(!t.path("config/syq/persistence.json").exists());
+    for args in [&["on"][..], &["on", "--ephemeral"][..]] {
+        let output = persistence_command(&t, args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .run()
+            .unwrap();
+        assert!(!output.status.success());
+        let diagnostic = stderr_of(&output);
+        assert!(
+            diagnostic.contains("SSH control socket path"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("OpenSSH's temporary suffix"),
+            "{diagnostic}"
+        );
+        assert!(!t.path("config/syq/persistence.json").exists());
+    }
 }
 
 #[cfg(target_os = "macos")]

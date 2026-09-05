@@ -1098,24 +1098,49 @@ fn attempt_small_copy(
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
-    // Did any source change while we were at it? Same check as the worker's
-    // small-file batch, through the same registered references.
-    let now = stat_many_registered(
-        src_ctl,
-        srcs.iter().map(|source| source.path.clone()).collect(),
-        Some(roots.iter().map(|root| root.selection.clone()).collect()),
-        false,
-    )?;
-    for (((entry, (_, rel_bytes, rel)), result), now) in
-        entries.iter().zip(&targets).zip(results).zip(now)
-    {
+    // The engine's quick check is a planning-time decision, including
+    // metadata-only repairs. Recheck only files whose content was copied or
+    // compared, not those already skipped on size/mtime.
+    let check_source: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, result)| {
+            (result.disposition != SmallCopyDisposition::QuickChecked).then_some(i)
+        })
+        .collect();
+    let mut now = if check_source.is_empty() {
+        Vec::new()
+    } else {
+        stat_many_registered(
+            src_ctl,
+            check_source.iter().map(|&i| srcs[i].path.clone()).collect(),
+            Some(
+                check_source
+                    .iter()
+                    .map(|&i| roots[i].selection.clone())
+                    .collect(),
+            ),
+            false,
+        )?
+    }
+    .into_iter();
+    for ((entry, (_, rel_bytes, rel)), result) in entries.iter().zip(&targets).zip(results) {
+        if result.disposition == SmallCopyDisposition::QuickChecked {
+            progress.files_unchanged.fetch_add(1, Relaxed);
+            progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
+            if let Some(error) = result.error {
+                progress.error(&format!("syq: {}", endpoint_error(error)));
+            }
+            continue;
+        }
+        let now = now.next().expect("one stat per checked source");
         let source_changed = now.as_ref().is_none_or(|e| {
             e.kind != Kind::File
                 || e.size != entry.size
                 || e.mtime != entry.mtime
                 || e.mtime_nsec != entry.mtime_nsec
         });
-        if result.unchanged && !source_changed {
+        if result.disposition == SmallCopyDisposition::ContentMatched && !source_changed {
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {

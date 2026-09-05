@@ -1300,14 +1300,21 @@ impl RemoteSpec {
         }
     }
 
-    fn ssh_command(&self, connection: SshConnection) -> Command {
+    fn ssh_command(&self, connection: SshConnection, verbose: bool) -> Command {
         let mut cmd = Command::new(&self.rsh[0]);
         cmd.args(&self.rsh[1..]);
         if self.rsh[0].ends_with("ssh") {
-            // SSH's startup diagnostics explain failures before a remote
-            // helper exists. Do not enable its command logging for signed
-            // receiver grants, which are carried in the remote command.
-            if crate::transfer::debug() && self.restricted_grant.is_none() {
+            // Only foreground helper sessions get verbose SSH diagnostics.
+            // A persistent master keeps verbose stderr open after detaching;
+            // bootstrap captures stderr as error text. Restricted receiver
+            // commands also carry authorization material that must not be logged.
+            if verbose
+                && self.restricted_grant.is_none()
+                && !self
+                    .ssh_multiplexer
+                    .as_ref()
+                    .is_some_and(|mux| mux.persistent)
+            {
                 cmd.arg("-v");
             }
             let multiplex = match (connection, &self.ssh_multiplexer) {
@@ -1621,7 +1628,7 @@ impl RemoteSpec {
             {
                 require_constrained_openssh(&self.rsh[0], "on the coordinator host")?;
             }
-            let mut command = self.ssh_command(ssh_connection);
+            let mut command = self.ssh_command(ssh_connection, crate::transfer::debug());
             let remote_command = if self.restricted_grant.is_some() {
                 // This text is inspected by the forced receiver through
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
@@ -2224,7 +2231,7 @@ impl RemoteSpec {
     }
 
     fn remote_bootstrap(&self) -> Result<RemoteBootstrap> {
-        let mut cmd = self.ssh_command(SshConnection::Independent);
+        let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(remote_helper::probe_command())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2313,7 +2320,7 @@ impl RemoteSpec {
 
     fn try_remote_download(&self, target: Target) -> Result<RemoteDownloadOutcome> {
         let script = remote_helper::download_script(target);
-        let mut cmd = self.ssh_command(SshConnection::Independent);
+        let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2437,7 +2444,7 @@ impl RemoteSpec {
 
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
         let script = remote_helper::upload_script(target);
-        let mut cmd = self.ssh_command(SshConnection::Independent);
+        let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3448,7 +3455,7 @@ mod tests {
             diagnostics: Default::default(),
             primed_control: Default::default(),
         };
-        let command = spec.ssh_command(SshConnection::Independent);
+        let command = spec.ssh_command(SshConnection::Independent, false);
         assert!(!command
             .get_args()
             .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking=")));
@@ -3460,7 +3467,7 @@ mod tests {
             "StrictHostKeyChecking=yes".to_string(),
         ];
         assert!(configured
-            .ssh_command(SshConnection::Independent)
+            .ssh_command(SshConnection::Independent, false)
             .get_args()
             .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
     }
@@ -3537,7 +3544,7 @@ mod tests {
             primed_control: Default::default(),
         };
         let args = |connection| {
-            spec.ssh_command(connection)
+            spec.ssh_command(connection, false)
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -3629,7 +3636,7 @@ mod tests {
             primed_control: Default::default(),
         };
         let args = |connection| {
-            spec.ssh_command(connection)
+            spec.ssh_command(connection, false)
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -3648,6 +3655,33 @@ mod tests {
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
+        let mut spec = RemoteSpec::local_receiver(false);
+        spec.rsh = vec!["ssh".into()];
+        let verbose = |spec: &RemoteSpec, diagnostics| {
+            spec.ssh_command(SshConnection::Control, diagnostics)
+                .get_args()
+                .any(|arg| arg == "-v")
+        };
+        assert!(verbose(&spec, true));
+        assert!(!verbose(&spec, false)); // Bootstrap does not request verbosity.
+        spec.restricted_grant = Some("test-authorization".into());
+        assert!(!verbose(&spec, true));
+        spec.restricted_grant = None;
+        spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer {
+            _directory: None,
+            path: PathBuf::from("/tmp/syq-test-socket"),
+            persistent: true,
+            reuse_for_workers: AtomicBool::new(false),
+        }));
+        assert!(!verbose(&spec, true));
+        assert!(!spec
+            .ssh_command(SshConnection::Independent, true)
+            .get_args()
+            .any(|arg| arg == "-v"));
     }
 
     #[test]
@@ -3680,7 +3714,7 @@ mod tests {
             primed_control: Default::default(),
         };
 
-        let command = spec.ssh_command(SshConnection::Control);
+        let command = spec.ssh_command(SshConnection::Control, false);
         let args: Vec<_> = command.get_args().collect();
         let control_index = args
             .iter()
