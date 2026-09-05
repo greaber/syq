@@ -27,6 +27,8 @@ No `sudo` is needed; the binary lands in `~/.local/bin`. Homebrew
 work. With the installer or Homebrew, syq installs its matching remote helper
 on first use. Cargo builds need a compatible remote `syq`; see the
 [installation guide](https://greaber.github.io/syq/install.html#cargo).
+To use unreleased code, see [installing from `master` or another branch](https://greaber.github.io/syq/install.html#installing-from-master-or-another-branch),
+including how to update and set up matching remote binaries.
 
 Bash, Zsh, and fish completion includes remote paths and becomes especially
 fast with `syq persist on`; see the [installation guide](https://greaber.github.io/syq/install.html#shell-completion).
