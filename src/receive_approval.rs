@@ -51,8 +51,8 @@ impl Kind {
     }
     fn title(self) -> &'static str {
         match self {
-            Self::Copy => "syq: incoming copy",
-            Self::Command => "syq: incoming command",
+            Self::Copy => "syq: Allow this copy?",
+            Self::Command => "syq: Run this command?",
         }
     }
 }
@@ -137,6 +137,23 @@ impl Summary {
         match self.details {
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
+        }
+    }
+    /// Keep the decision visible; the full description remains available in
+    /// the macOS Details view and in `persist receive pending` on both platforms.
+    fn desktop_description(&self) -> String {
+        match &self.details {
+            Details::Copy { destination, permission, max_delete, .. } => {
+                let mut body = format!("To: {destination}\nFrom: {}\n\n{permission}", self.from);
+                if *max_delete > 0 {
+                    body.push_str(&format!("\nDeletion limit: {max_delete} files or folders."));
+                }
+                body
+            }
+            Details::Command { argv, cwd, .. } => format!(
+                "{}\n\nFrom: {}\nIn: {cwd}\n\nRuns with your permissions, including access to your files.",
+                argv.join(" "), self.from
+            ),
         }
     }
     pub(crate) fn description(&self) -> String {
@@ -292,7 +309,7 @@ impl Queue {
             id: id.clone(),
         };
         let mut notification = if notifications == Notifications::Desktop {
-            match Notification::spawn(&summary.description(), lifetime, summary.kind().title()) {
+            match Notification::spawn(&summary, lifetime) {
                 Ok(notification) => {
                     self.notification_status(&id, "desktop prompt requested; use local syq persist receive approve/deny if it is not visible".into());
                     Some(notification)
@@ -385,15 +402,31 @@ fn escape_markup(text: &str) -> String {
 #[cfg(target_os = "macos")]
 const APPLESCRIPT: &str = r#"on run argv
     try
-        set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Deny", "Allow once"} default button "Deny" cancel button "Deny" giving up after (item 2 of argv as integer)
-        if gave up of answer then return "expired"
-        if button returned of answer is "Allow once" then return "allow"
-        return "deny"
+        set body to item 1 of argv
+        set choices to {"Deny", "Details", "Allow once"}
+        repeat
+            set answer to display dialog body with title (item 3 of argv) buttons choices default button "Deny" cancel button "Deny" giving up after (item 2 of argv as integer)
+            if gave up of answer then return "expired"
+            set choice to button returned of answer
+            if choice is "Details" then
+                set body to item 4 of argv
+                set choices to {"Deny", "Back", "Allow once"}
+            else if choice is "Back" then
+                set body to item 1 of argv
+                set choices to {"Deny", "Details", "Allow once"}
+            else if choice is "Allow once" then
+                return "allow"
+            else
+                return "deny"
+            end if
+        end repeat
     on error number -128
         return "deny"
     end try
 end run"#;
-fn notification_command(description: &str, lifetime: Duration, title: &str) -> Command {
+fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
+    let description = summary.desktop_description();
+    let title = summary.kind().title();
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("/usr/bin/osascript");
@@ -401,9 +434,10 @@ fn notification_command(description: &str, lifetime: Duration, title: &str) -> C
             "-e",
             APPLESCRIPT,
             "--",
-            description,
+            &description,
             &lifetime.as_secs().max(1).to_string(),
             title,
+            &summary.description(),
         ]);
         cmd
     }
@@ -419,7 +453,9 @@ fn notification_command(description: &str, lifetime: Duration, title: &str) -> C
         .arg(format!("--expire-time={}", lifetime.as_millis()))
         .arg("--")
         .arg(title)
-        .arg(escape_markup(description));
+        .arg(escape_markup(&format!(
+            "{description}\n\nDetails: syq persist receive pending"
+        )));
         cmd
     }
 }
@@ -450,8 +486,8 @@ struct Notification {
     errors: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 impl Notification {
-    fn spawn(description: &str, lifetime: Duration, title: &str) -> Result<Self> {
-        Self::spawn_command(notification_command(description, lifetime, title))
+    fn spawn(summary: &Summary, lifetime: Duration) -> Result<Self> {
+        Self::spawn_command(notification_command(summary, lifetime))
     }
     fn spawn_command(mut command: std::process::Command) -> Result<Self> {
         command
@@ -535,6 +571,20 @@ mod tests {
             assert!(Instant::now() < deadline, "approval did not become pending");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn compact_copy_prompt_keeps_deletion_limits_visible() {
+        let mut summary = summary();
+        if let Details::Copy { max_delete, .. } = &mut summary.details {
+            *max_delete = 2;
+        }
+        let compact = summary.desktop_description();
+        assert!(compact.contains("May create and overwrite"));
+        assert!(compact.contains("Deletion limit: 2 files or folders."));
+        assert!(!compact.contains("100 bytes"));
+        let details = summary.description();
+        assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
+        assert!(details.contains("not been inspected"));
     }
     #[test]
     fn exited_prompt_closes_descendant_output_before_reaping() {
@@ -624,16 +674,21 @@ mod tests {
     #[test]
     fn remote_text_is_data_in_desktop_commands() {
         let text = "<a>&\"; do shell script \"touch /tmp/not-code\"";
-        let command = notification_command(text, TIMEOUT, Kind::Copy.title());
+        let mut summary = summary();
+        summary.from = text.into();
+        let command = notification_command(&summary, TIMEOUT);
         let args: Vec<_> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(args.last().unwrap(), &escape_markup(text));
+        assert!(args.last().unwrap().contains(&escape_markup(text)));
         #[cfg(target_os = "macos")]
         {
-            assert!(args.iter().any(|arg| arg == text));
+            assert_eq!(args[0], "-e");
+            assert_eq!(args[1], APPLESCRIPT);
+            assert_eq!(args[3], summary.desktop_description());
+            assert_eq!(args[6], summary.description());
             assert!(!APPLESCRIPT.contains(text));
         }
     }

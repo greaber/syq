@@ -4,7 +4,7 @@ Inspect files on your server, then copy them to your laptop from the same shell.
 The laptop opens and maintains the connection. It needs no SSH server, public
 address, or incoming network port.
 
-On your laptop, turn on persistence:
+With syq installed on both machines, turn on persistence on your laptop:
 
 ```sh
 syq persist on
@@ -32,9 +32,12 @@ syq cp report.pdf --to laptop --as reports/latest.pdf
 
 Receiving is enabled by default with persistence. Each incoming copy waits for
 approval **on your laptop** before it can inspect or change destination entries.
-The prompt identifies the connected server account, destination, overwrite
-permission, and limits. Choose **Allow once** or **Deny**. Allowing a copy trusts
-the server to supply its contents: syq cannot prove what you typed in the remote
+The prompt puts the destination first, followed by the connected server account
+and permission to change files. A positive deletion limit is shown too. Choose
+**Allow once** or **Deny**. On macOS, **Details** shows the full explanation,
+including size and entry limits; **Back** returns to the short view. On either
+platform, `syq persist receive pending` shows the complete request. Allowing a
+copy trusts the server to supply its contents: syq cannot prove what you typed in the remote
 shell or that the files contain what you intended.
 
 You can also [run commands on the receiving machine](exec.md), with separate
@@ -45,8 +48,9 @@ local approval, to build a project there or open a copied artifact.
 On Linux, desktop prompts use `/usr/bin/notify-send` with action support
 (libnotify 0.7.10 or later) and your desktop notification service. On macOS,
 syq opens a native dialog through `/usr/bin/osascript`; Deny is the default
-button. The background connection inherits the desktop session in which you
-start it. After changing desktop sessions, run `syq persist receive on` from a terminal
+button in both the short and detailed views. Opening Details does not approve
+the request or extend its five-minute deadline. The background connection
+inherits the desktop session in which you start it. After changing desktop sessions, run `syq persist receive on` from a terminal
 in the current session to restart it.
 
 You can also decide from any local terminal:

@@ -26,10 +26,12 @@ receiving machine or request approval.
 ## Approve each command locally
 
 Each command waits for approval on the receiving machine. Its desktop prompt
-shows the server account, program and literal arguments, working directory,
-and the permission being granted. Desktop notifications may truncate long
-commands and hide trailing arguments. Use `syq persist receive pending` on the receiving
-machine to inspect the complete request before approving a command whose full
+puts the program and literal arguments first, followed by the requesting server,
+working directory, and a short reminder that it runs with your permissions. On
+macOS, **Details** shows the fuller permission explanation and **Back** returns
+to the short view. Opening Details does not approve or extend the request.
+Desktop notifications may truncate long commands and hide trailing arguments.
+Use `syq persist receive pending` on the receiving machine to inspect the complete request before approving a command whose full
 text is not visible. You can inspect and decide requests from a terminal there:
 
 ```sh
