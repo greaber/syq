@@ -9,11 +9,15 @@ if TYPE_CHECKING:
     from .models import OperationSummary
 
 
-class SyqInvocationError(ValueError):
+class SyqError(Exception):
+    """Base class for errors reported by the syq SDK."""
+
+
+class SyqInvocationError(SyqError, ValueError):
     """Python inputs cannot form a valid native syq invocation."""
 
 
-class SyqProcessError(RuntimeError):
+class SyqProcessError(SyqError, RuntimeError):
     """A raw syq process completed with a nonzero status."""
 
     def __init__(self, result: Result) -> None:
@@ -21,11 +25,11 @@ class SyqProcessError(RuntimeError):
         super().__init__(f"syq exited with status {result.returncode}")
 
 
-class SyqOutputError(ValueError):
+class SyqOutputError(SyqError, ValueError):
     """A raw syq helper returned output it cannot interpret."""
 
 
-class SyqProtocolError(ValueError):
+class SyqProtocolError(SyqError, ValueError):
     """A typed operation returned an invalid or incomplete automation stream."""
 
     def __init__(
@@ -40,7 +44,7 @@ class SyqProtocolError(ValueError):
         super().__init__(message)
 
 
-class SyqOperationError(RuntimeError):
+class SyqOperationError(SyqError, RuntimeError):
     """A valid automation result reports a non-successful operation."""
 
     def __init__(self, result: OperationSummary, *, stderr: bytes = b"") -> None:

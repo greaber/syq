@@ -124,7 +124,6 @@ class CandidateCompatibilityTests(unittest.TestCase):
             ) as component_mapping:
                 component_copy = client.cp(
                     mapping=component_mapping,
-                    cwd=component_mapping.cwd,
                     follow_src=True,
                     into="component-mapped",
                 )
@@ -349,7 +348,7 @@ class AsyncCandidateCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     side_effect=create_through_alias,
                 ):
                     copied = await client.cp(
-                        mapping=mapping, cwd=mapping.cwd, into="destination"
+                        mapping=mapping, into="destination"
                     )
             self.assertEqual(copied.files_transferred, 1)
             self.assertEqual((root / "destination" / "a").read_bytes(), b"async")
