@@ -25,8 +25,10 @@ completion does not contact the receiving machine or request approval.
 
 Each command waits for approval on the receiving machine. Its desktop prompt
 shows the server account, program and literal arguments, working directory,
-and the permission being granted. You can also inspect and decide requests
-from a terminal there:
+and the permission being granted. Desktop notifications may truncate long
+commands and hide trailing arguments. Use `syq recv pending` on the receiving
+machine to inspect the complete request before approving a command whose full
+text is not visible. You can inspect and decide requests from a terminal there:
 
 ```sh
 syq recv pending
@@ -50,8 +52,9 @@ safe. Commands have a separate approval type in `recv pending --json`, with
 strings in that summary are escaped for display.
 
 Older clients that only understand copies cannot approve command requests.
-Use the matching new binary to list and approve them; old clients may show no
-pending requests while a command is pending. Their stop request still works.
+Use the matching new binary to list and approve them; old clients omit command
+requests from their pending list. They can still list and approve copies from
+other server connections, and their stop request still works.
 
 ## Arguments and working directories
 
@@ -88,8 +91,9 @@ an error even if some output arrived successfully.
 
 Interrupting the requesting syq process, losing the connection, changing
 receiving settings, `recv off`, or `persist off` cancels execution. Syq kills
-the command's process group and reaps its leader. It also cleans up that group
-when the foreground program exits. A program that deliberately creates a
+the command's process group with `SIGKILL` and reaps its leader. It also kills
+remaining processes in that group when the foreground program exits, without
+giving them time to run cleanup handlers. A program that deliberately creates a
 separate process session, or an application launched through macOS `open`, can
 outlive that group. Syq does not manage detached jobs.
 
