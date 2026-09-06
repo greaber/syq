@@ -1,4 +1,9 @@
-# Mac to j5 SSH push investigation (persist mode)
+# Historical Mac to j5 SSH push investigation (persist mode)
+
+**The runtime proposal described here was withdrawn at `4a9372e` after the
+[primary persistence-off comparison](ssh-push-benchmark-cold.md) did not show an
+improvement.** This note preserves the earlier experiments and their original
+interpretation; references to the final change below describe that proposal.
 
 2026-09-06. Grant's interactive quick benchmark reported these means over
 three trials: a 64 MiB file, syq 29.269 seconds versus rsync 22.397; 1,024
