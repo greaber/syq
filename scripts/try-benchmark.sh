@@ -288,7 +288,9 @@ main() {
     fi
     printf '\nMode: %s; workloads: %s; size: %s; rounds: %s\n' "$mode" "$workload" "$size" "$rounds"
     [[ $mode == local ]] || printf 'SSH host: %s\n' "$host"
-    printf 'Local scratch: %s\nDestination scratch: %s\n' "$local_root" "${remote_root:-$dest_root}"
+    printf 'Local scratch: %s\n' "$local_root"
+    if [[ $mode == local ]]; then printf 'Destination scratch: %s\n' "$dest_root"
+    else printf 'Remote scratch: %s\n' "$remote_root"; fi
     printf 'Each trial uses an empty destination; order rotates. Setup and checksum verification are untimed.\n'
     printf 'Caches are NOT flushed; times include startup and buffered writes, not durable disk flushes.\n'
     printf 'Allow roughly twice the selected data size locally, plus one copy remotely for SSH tests.\n'
