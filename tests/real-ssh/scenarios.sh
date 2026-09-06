@@ -516,6 +516,22 @@ if [ "$small_timeout" -ne 0 ] || [ "$(cat "$small_exit")" != 0 ]; then
     exit 1
 fi
 
+printf 'case: bounded small-file tree uses persistent SSH data and verifies every file\n'
+tree_scope=$(syq persist on --ephemeral)
+tree_source=/tmp/syq-real-ssh-bounded-tree
+tree_destination=/tmp/syq-real-ssh/bounded-tree
+mkdir "$tree_source"
+for i in $(seq 1 300); do
+    printf 'bounded tree file %s\n' "$i" >"$tree_source/file-$i"
+done
+ssh destination "mkdir '$tree_destination'"
+syq cp --no-progress --no-tcp --stats --pscope "$tree_scope" \
+    --srcs-in "$tree_source" --to destination --into-existing "$tree_destination"
+syq persist off --pscope "$tree_scope" >/dev/null
+(cd "$tree_source" && sha256sum *) >/tmp/bounded-tree-expected
+ssh destination "cd '$tree_destination' && sha256sum *" >/tmp/bounded-tree-actual
+diff -u /tmp/bounded-tree-expected /tmp/bounded-tree-actual
+
 printf 'case: existing small files skip TCP setup and SSH data sessions\n'
 for small_case in unchanged updated; do
     small_results="/tmp/syq-real-ssh-small-$small_case.ndjson"

@@ -12,8 +12,8 @@ skipping destination checks.
 
 Fresh small-file copies totaling at most 16 MiB start with one SSH data worker
 when connection count is automatic. With persistence enabled, these bounded
-copies can also reuse the existing login for data. Larger trees use independent
-SSH data connections. If the server refuses a shared channel, syq retries with
+copies can also reuse the existing login for data. With persistence enabled,
+larger trees use independent SSH data connections. If the server refuses a shared channel, syq retries with
 a separate login. An explicit `--connections` still sets the worker count.
 
 ## Benchmarks

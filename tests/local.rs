@@ -4931,6 +4931,7 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
 #[test]
 fn bounded_persistent_ssh_tree_starts_one_worker_and_recovers_channel_refusal() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     fake_ssh_rejecting_multiplexed_workers(&t);
     let scope = ephemeral_scope(&t);
     for i in 0..300 {
