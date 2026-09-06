@@ -886,6 +886,7 @@ fn run_remote(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
 

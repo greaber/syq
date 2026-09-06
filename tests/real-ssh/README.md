@@ -106,3 +106,8 @@ python3 tests/real-ssh/test-completion-display.py --syq target/debug/syq
 ```
 
 The shell dependencies are installed only in the test image.
+
+The source-shell remote-copy checks use `--via @laptop` without a source key or
+agent. They cover local approval despite automatic local receiving, denial,
+direct TCP, preview/verification, protected destination authority files,
+unreachable data ports, and revocation followed by an approved retry.

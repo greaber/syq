@@ -856,6 +856,7 @@ enum EndpointSyntax {
 }
 
 enum ValueCompletion {
+    ReturnName,
     NamedOrSshDestination,
     Endpoint(EndpointSyntax),
     SourcePath { apply_base: bool },
@@ -1212,6 +1213,7 @@ fn value_completion(
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
+            b"--via" => Some(ValueCompletion::ReturnName),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
             | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
@@ -1298,6 +1300,12 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
+        ValueCompletion::ReturnName => Ok(crate::destination::registered_names()
+            .into_iter()
+            .map(|name| format!("@{name}").into_bytes())
+            .filter(|name| name.starts_with(current))
+            .map(Candidate::text)
+            .collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
                 current,
@@ -1379,6 +1387,9 @@ fn complete_path_for(
 ) -> Result<Vec<Candidate>> {
     if source {
         return complete_source_path(command, args, current, true);
+    }
+    if find_option_value(args, b"--via").is_some() {
+        return Ok(Vec::new());
     }
     let Some(endpoint_text) = find_option_value(args, b"--to") else {
         return Ok(local_path_candidates_at(
@@ -1655,6 +1666,7 @@ fn connect_completion_endpoint(
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
+        forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     spec.connect_completion()

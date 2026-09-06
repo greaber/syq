@@ -107,6 +107,8 @@ Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
 For two remote endpoints, see [Copy between servers](remote-to-remote.md).
+From a server shell, `syq cp results --to hostB --via @laptop` can ask a live
+receiving machine to authorize the copy while data flows directly to hostB.
 
 ## Progress
 

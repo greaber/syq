@@ -19,6 +19,48 @@ HostA gets permission for this transfer only. HostB checks that permission
 and reports what it changed. See [Security](security.md#a-compromised-source-server)
 for what this protects against.
 
+## Start a copy from the source server
+
+If your laptop has a [return connection](receive.md) to the source server,
+you can inspect files in any server shell and send them to another SSH host:
+
+```sh
+# Run on hostA, including in an existing tmux shell.
+ls -lh results
+syq cp results --to hostB --via @laptop --into /archive
+```
+
+The laptop asks for approval before contacting hostB. Approve with the desktop
+prompt or `syq recv pending` and `syq recv approve REQUEST_ID` on the laptop.
+These requests require a decision even when `recv --approve always` permits
+automatic copies onto the laptop itself. `--via laptop` also works; both forms
+require a live return connection and never fall back to an SSH host named laptop.
+
+The laptop uses its own SSH configuration, credentials, and trusted host keys
+to connect to hostB and install the matching syq helper. Connect to hostB with
+ordinary SSH from the laptop first if its host key is not yet trusted. The
+source server receives no SSH credentials or agent access. The control stream
+passes through the laptop; file data goes directly from hostA to hostB over
+encrypted TCP. HostB must expose a [reachable data port](server-tuning.md#make-tcp-reachable)
+to hostA. Failure to reach it fails the copy without switching to SSH data.
+
+The prompt shows the requested SSH endpoint and destination path. Relative
+destination paths start in that account's home directory on hostB. Receiving
+`--cwd` and `--root` govern copies onto the laptop; they do not describe hostB's
+filesystem. Receiving byte, entry, and deletion ceilings still apply. The
+helper on hostB checks the approved copy permissions and protects its own
+control and SSH authority files. The source verifies its signed receipt before
+reporting success. No durable receiver enrollment or reusable grant is created.
+
+All three machines must use the same syq build. Keep the source command and
+the laptop's return connection alive until completion. Stopping receiving or
+losing that connection cancels the copy. Retry with a new approval to resume
+eligible partial files. This route accepts local sources and an ordinary SSH
+`--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
+`--no-bootstrap`, `--pscope`, alternative `--peer-auth`/`--coordinate-at`,
+`--no-tcp`, or `--tcp-plain`. Copy permissions and supported filesystem options
+match [return copies](receive.md#copy-permissions-and-limits).
+
 ## What you need
 
 - SSH access from your machine to both servers, with their host keys already

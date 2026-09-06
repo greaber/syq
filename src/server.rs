@@ -75,6 +75,7 @@ impl Drop for RequestReader {
 }
 
 struct ServeSession {
+    handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     allow_tcp: bool,
     named_socket: Option<std::os::unix::net::UnixStream>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
@@ -137,6 +138,7 @@ pub fn run() -> Result<()> {
         None,
         None,
         ServeSession {
+            handshake_pending: None,
             allow_tcp: true,
             named_socket: None,
             authority: None,
@@ -157,9 +159,37 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         None,
         ServeSession {
+            handshake_pending: None,
             allow_tcp: true,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
+    authority.close_control();
+    result
+}
+
+/// A laptop-authenticated, one-copy helper with direct encrypted TCP workers.
+pub(crate) fn run_forwarded<R: Read + Send + 'static>(
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    input: R,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
+    let result = serve(
+        input,
+        io::stdout().lock(),
+        true,
+        None,
+        None,
+        None,
+        ServeSession {
+            handshake_pending: Some(pending),
+            allow_tcp: true,
+            named_socket: None,
+            authority: Some(authority.clone()),
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -194,6 +224,7 @@ pub(crate) fn run_named(
         None,
         None,
         ServeSession {
+            handshake_pending: None,
             allow_tcp: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
@@ -219,6 +250,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     session: ServeSession,
 ) -> Result<()> {
     let ServeSession {
+        handshake_pending,
         allow_tcp,
         named_socket,
         authority,
@@ -363,6 +395,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(socket) = &named_socket {
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
+    }
+
+    if let Some(pending) = handshake_pending {
+        pending.store(false, std::sync::atomic::Ordering::Release);
     }
 
     // Requests are parsed on a reader thread so incoming data keeps flowing
@@ -1101,6 +1137,7 @@ fn serve_tcp(
         Some(&authed),
         Some(stream.try_clone()?),
         ServeSession {
+            handshake_pending: None,
             allow_tcp: true,
             named_socket: None,
             authority,
@@ -1317,6 +1354,7 @@ mod tests {
                 None,
                 Some(socket),
                 ServeSession {
+                    handshake_pending: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,
@@ -1466,6 +1504,7 @@ mod tests {
                 None,
                 None,
                 ServeSession {
+                    handshake_pending: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,
@@ -1528,6 +1567,7 @@ mod tests {
                 None,
                 None,
                 ServeSession {
+                    handshake_pending: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,

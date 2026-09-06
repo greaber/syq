@@ -534,6 +534,38 @@ impl SignedGrantEnvelope {
     }
 }
 
+/// Validate an ephemeral request before an approval can authorize outbound SSH.
+/// This does not sign, redeem, or touch any durable authority state.
+pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest) -> Result<()> {
+    let grant = Grant {
+        enrollment_id: EnrollmentId::random(),
+        target_login: "return".into(),
+        signer: "return".into(),
+        request_id: RequestId::fresh(0)?,
+        issued_at: 0,
+        not_before: 0,
+        start_by: 60,
+        finish_by: 3600,
+        operation: GrantOperation::Copy(request.copy.clone()),
+    };
+    let mut policy = request.constraints.clone();
+    if policy.filters.ignore.is_empty() {
+        policy.filters.destination_roots.clear();
+        policy.filters.delete_excluded = false;
+    } else {
+        policy.filters.destination_roots.sort();
+        policy.filters.destination_roots.dedup();
+    }
+    signing_payload(
+        &grant,
+        policy.max_file_data_bytes_per_second,
+        &policy.filters,
+        policy.root_existence,
+        &policy.receipt_policy,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn sign_grant(
     grant: Grant,
     constraints: GrantConstraints,

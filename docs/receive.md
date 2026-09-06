@@ -81,6 +81,10 @@ needed for copying, write unwanted content, or consume disk space within its
 limits. The server receives neither your SSH agent nor an interface for running
 arbitrary laptop commands.
 
+To send files from that server to another SSH host using this machine's
+permission, use `syq cp results --to hostB --via @laptop`. These requests always
+need a local decision. See [Start a copy from the source server](remote-to-remote.md#start-a-copy-from-the-source-server).
+
 ## Names and paths
 
 A bare name uses a live return connection before trying an SSH host of the same

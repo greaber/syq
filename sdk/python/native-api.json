@@ -27,6 +27,7 @@
         "max-delete",
         "dry-run",
         "connections",
+        "via",
         "coordinate-at",
         "rsh",
         "pscope",

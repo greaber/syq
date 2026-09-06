@@ -47,4 +47,6 @@ COPY tests/real-ssh/test-completion-display.py /usr/local/libexec/syq-test-compl
 
 COPY tests/real-ssh/test-receive-notifications.py /usr/local/libexec/syq-test-receive-notifications.py
 
+COPY tests/real-ssh/test-forward-copy.py /usr/local/libexec/syq-test-forward-copy.py
+
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

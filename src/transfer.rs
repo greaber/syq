@@ -166,6 +166,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
+                forwarded: args.via.as_ref().and(args.named_receipt.clone()),
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
