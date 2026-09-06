@@ -146,6 +146,22 @@ impl Queue {
             cancelled,
         )
     }
+    pub(crate) fn request_remote(
+        &self,
+        from: &str,
+        target: &str,
+        request: &crate::destination::CopyRequest,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut summary = Summary::new(from, request, TIMEOUT)?;
+        summary.destination = format!(
+            "SSH {target:?}, path {:?} (relative paths start in the destination login home)",
+            std::ffi::OsStr::from_bytes(&request.destination)
+        );
+        summary.permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
+        self.wait(summary, notifications, TIMEOUT, cancelled)
+    }
     fn wait(
         &self,
         summary: Summary,

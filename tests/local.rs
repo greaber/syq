@@ -17931,3 +17931,67 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_output_ok(&run(&["recv", "off"]));
 }
+
+#[test]
+fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    for extra in [
+        vec![],
+        vec!["--no-tcp"],
+        vec!["--tcp-plain"],
+        vec!["--detach"],
+        vec!["--rsh", "ssh"],
+        vec!["--syq-path", "/opt/syq"],
+        vec!["--no-bootstrap"],
+        vec!["--coordinate-at", "dst"],
+        vec!["--peer-auth", "full-agent"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "source", "--to", "backup", "--via", "@laptop"])
+            .args(extra)
+            .current_dir(t.path(""))
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("PATH", t.path("bin"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{:?}", output);
+        assert!(
+            !t.path("ssh-used").exists(),
+            "--via attempted ordinary SSH: {:?}",
+            output
+        );
+    }
+    assert_eq!(fs::read(t.path("source")).unwrap(), b"payload");
+}
+
+#[test]
+fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
+    let t = Tmp::new();
+    let path = t.path("config/syq/receive.json");
+    // Produced by the unchanged PR #240 f752ee8 executable, not this writer.
+    let old = include_bytes!("fixtures/receive-v3-f752ee8.json");
+    write(&path, old);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["recv", "status", "--json"])
+        .env("HOME", t.path(""))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let previous: serde_json::Value = serde_json::from_slice(old).unwrap();
+    assert_eq!(status["settings"], previous);
+    assert_eq!(fs::read(path).unwrap(), old);
+}

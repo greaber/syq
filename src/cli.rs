@@ -67,6 +67,8 @@ pub enum CoordinateAt {
 pub struct Args {
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
+    #[arg(skip)]
+    pub(crate) via: Option<String>,
     /// Which public command produced this execution request.
     #[arg(skip)]
     pub interface: Interface,
@@ -857,6 +859,9 @@ struct NativeRemoteHelperArgs {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
+    /// Ask a receiving machine to authorize a copy to another SSH host; file data goes directly to that host
+    #[arg(long, value_name = "@NAME")]
+    via: Option<String>,
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
@@ -1793,6 +1798,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
             "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
         );
     }
+    args.via = remote.via;
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.helper.syq_path;

@@ -333,6 +333,16 @@ pub(crate) struct FilterPolicy {
 }
 
 impl FilterPolicy {
+    fn normalize(&mut self) {
+        // With no filters, --delete-excluded has no observable effect.
+        if self.ignore.is_empty() {
+            self.delete_excluded = false;
+            self.destination_roots.clear();
+        } else {
+            self.destination_roots.sort();
+            self.destination_roots.dedup();
+        }
+    }
     fn validate(&self, grant: &Grant) -> Result<()> {
         if self.ignore.len() > MAX_FILTER_RULES {
             bail!("signed filter-rule count exceeds the supported range");
@@ -534,6 +544,32 @@ impl SignedGrantEnvelope {
     }
 }
 
+/// Validate an ephemeral request before an approval can authorize outbound SSH.
+/// This does not sign, redeem, or touch any durable authority state.
+pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest) -> Result<()> {
+    let grant = Grant {
+        enrollment_id: EnrollmentId::random(),
+        target_login: "return".into(),
+        signer: "return".into(),
+        request_id: RequestId::fresh(0)?,
+        issued_at: 0,
+        not_before: 0,
+        start_by: 60,
+        finish_by: 3600,
+        operation: GrantOperation::Copy(request.copy.clone()),
+    };
+    let mut policy = request.constraints.clone();
+    policy.filters.normalize();
+    signing_payload(
+        &grant,
+        policy.max_file_data_bytes_per_second,
+        &policy.filters,
+        policy.root_existence,
+        &policy.receipt_policy,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn sign_grant(
     grant: Grant,
     constraints: GrantConstraints,
@@ -548,14 +584,7 @@ pub(crate) fn sign_grant(
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted enrollment key");
     }
-    // With no filters, --delete-excluded has no observable effect.
-    if filters.ignore.is_empty() {
-        filters.delete_excluded = false;
-        filters.destination_roots.clear();
-    } else {
-        filters.destination_roots.sort();
-        filters.destination_roots.dedup();
-    }
+    filters.normalize();
     filters.validate(&grant)?;
     let payload = signing_payload(
         &grant,

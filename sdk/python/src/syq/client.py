@@ -1047,6 +1047,7 @@ class Client:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
+        via: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
         pscope: PathArgument | None = None,
@@ -1125,6 +1126,8 @@ class Client:
             min_size=min_size,
             max_delete=max_delete,
         )
+        if via is not None:
+            argv.extend(("--via", _text_arg(via, label="via")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,

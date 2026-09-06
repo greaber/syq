@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
+mod forward;
+
 const VERSION: u16 = 2;
 const MAX_MESSAGE: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -90,9 +92,20 @@ pub(crate) struct Approved {
 
 #[derive(Debug)]
 pub(crate) struct NamedReceipt {
+    control: Mutex<Option<UnixStream>>,
     secret: crate::receipt::RecipientSecret,
     approved: Approved,
     policy: crate::receipt::ReceiptPolicy,
+}
+
+impl NamedReceipt {
+    pub(crate) fn take_control(&self) -> Result<UnixStream> {
+        self.control
+            .lock()
+            .unwrap()
+            .take()
+            .context("approved return control connection was already consumed")
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,7 +120,14 @@ struct Envelope {
 enum Message {
     Ping,
     Request(Box<CopyRequest>),
-    Open { token: String, control: bool },
+    Forward {
+        target: String,
+        request: Box<CopyRequest>,
+    },
+    Open {
+        token: String,
+        control: bool,
+    },
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
@@ -440,6 +460,9 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    if args.via.is_some() {
+        return forward::prepare(args);
+    }
     let Some(destination) = args.locations.last() else {
         return Ok(());
     };
@@ -520,6 +543,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         })?)
     ));
     args.named_receipt = Some(Arc::new(NamedReceipt {
+        control: Mutex::new(None),
         secret,
         approved,
         policy,
@@ -626,6 +650,8 @@ struct Receiver {
     #[cfg(test)]
     prompts: mpsc::SyncSender<Prompt>,
     sessions: Mutex<HashMap<String, Session>>,
+    forwarded: Arc<crate::private_broker::ConnectionRegistry>,
+    forward_count: std::sync::atomic::AtomicUsize,
     request_lock: Mutex<()>,
     stop: Arc<AtomicBool>,
 }
@@ -666,6 +692,7 @@ impl Receiver {
     fn revoke_all(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.forwarded.shutdown_all();
         for (_, session) in sessions.drain() {
             session.authority.close_control();
             session.channels.shutdown_all();
@@ -683,6 +710,7 @@ impl Receiver {
         }
         match envelope.message {
             Message::Ping => write_message(&mut stream, &Reply::Ready),
+            Message::Forward { target, request } => self.forward(target, *request, stream),
             Message::Request(request) => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
                     anyhow::anyhow!(
@@ -826,31 +854,31 @@ impl Drop for OwnedSsh {
         let _ = self.0.wait();
     }
 }
+const RETURN_SSH_OPTIONS: &[&str] = &[
+    "-a",
+    "-x",
+    "-T",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
 fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-a",
-        "-x",
-        "-T",
-        "-o",
-        "ForwardAgent=no",
-        "-o",
-        "ForwardX11=no",
-        "-o",
-        "PermitLocalCommand=no",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        "ControlPath=none",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=10",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-    ]);
+    // This connection installs a remote forward and follows the user's host-key
+    // policy. The outbound --via connection adds stricter options of its own.
+    cmd.args(RETURN_SSH_OPTIONS)
+        .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
     if let Some(user) = &endpoint.user {
         cmd.arg("-l").arg(user);
     }
@@ -885,6 +913,10 @@ pub(crate) fn serve_background(
         #[cfg(test)]
         prompts,
         sessions: Mutex::new(HashMap::new()),
+        forwarded: Arc::new(crate::private_broker::ConnectionRegistry::new(
+            Duration::from_secs(10),
+        )),
+        forward_count: std::sync::atomic::AtomicUsize::new(0),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });
@@ -1204,7 +1236,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 argv[4].to_str().context("invalid credential")?,
             )
         })()),
-        _ => None,
+        _ => forward::dispatch(argv),
     }
 }
 
@@ -1215,7 +1247,7 @@ mod tests {
     use crate::conn::Conn;
     use crate::proto::{Request, Response};
 
-    fn args(source: &Path, destination: &str) -> Args {
+    pub(super) fn args(source: &Path, destination: &str) -> Args {
         let mut args =
             Args::try_parse_from(["syq", "-rlt", "--no-progress", "src", "dst"]).unwrap();
         args.interface = Interface::NativeCp;
@@ -1229,7 +1261,7 @@ mod tests {
         args.normalize();
         args
     }
-    fn request(args: &Args) -> (CopyRequest, crate::receipt::RecipientSecret) {
+    pub(super) fn request(args: &Args) -> (CopyRequest, crate::receipt::RecipientSecret) {
         let (secret, public) = crate::receipt::generate_recipient().unwrap();
         let policy = crate::receipt::ReceiptPolicy {
             required: true,
@@ -1246,7 +1278,7 @@ mod tests {
             secret,
         )
     }
-    fn broker(
+    pub(super) fn broker(
         root: &Path,
         approval: Approval,
     ) -> (
@@ -1271,6 +1303,10 @@ mod tests {
             approval,
             prompts,
             sessions: Mutex::new(HashMap::new()),
+            forwarded: Arc::new(crate::private_broker::ConnectionRegistry::new(
+                Duration::from_secs(10),
+            )),
+            forward_count: std::sync::atomic::AtomicUsize::new(0),
             request_lock: Mutex::new(()),
             stop: Arc::new(AtomicBool::new(false)),
         });
@@ -1677,6 +1713,7 @@ mod tests {
         args.locations.last_mut().unwrap().path = approved.destination.clone();
         args.restricted_grant = Some(route(registration, approved.token.clone()));
         args.named_receipt = Some(Arc::new(NamedReceipt {
+            control: Mutex::new(None),
             secret,
             approved,
             policy,

@@ -1233,6 +1233,7 @@ pub struct RemoteSpec {
     /// writing responses can stop reading requests while the coordinator is
     /// still filling its pipeline. Control sessions do not need this depth.
     pub(crate) read_ahead: usize,
+    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
 }
 
 #[derive(Debug, Default)]
@@ -1259,6 +1260,7 @@ impl RemoteSpec {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         }
     }
@@ -1473,6 +1475,12 @@ impl RemoteSpec {
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
     }
 
+    pub(crate) fn helper_command(&self, args: &[String]) -> Command {
+        let mut command = self.ssh_command(SshConnection::Independent, false);
+        command.arg(self.program_command(args));
+        command
+    }
+
     /// A shell command that runs syq with `args` on this host.  Automatic mode
     /// addresses the exact release/build-identified helper; explicit mode preserves the
     /// administrator-provided path; disabling bootstrap uses normal PATH lookup.
@@ -1627,11 +1635,20 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
-        if crate::destination::is_named(&self.restricted_grant) {
-            let stream = crate::destination::connect(
+        let return_stream = if let Some(approved) = &self.forwarded {
+            if !matches!(role, ConnectionRole::Control) {
+                bail!("copies via a return connection require encrypted TCP workers");
+            }
+            Some(approved.take_control()?)
+        } else if crate::destination::is_named(&self.restricted_grant) {
+            Some(crate::destination::connect(
                 self.restricted_grant.as_deref().unwrap(),
                 matches!(role, ConnectionRole::Control),
-            )?;
+            )?)
+        } else {
+            None
+        };
+        if let Some(stream) = return_stream {
             let (rx, reader) = spawn_reader(Box::new(stream.try_clone()?), self.read_ahead);
             let conn = RemoteConn {
                 child: None,
@@ -2804,10 +2821,12 @@ impl Endpoint {
                         Err(e) => {
                             if spec.restricted_grant.is_some() {
                                 return Err(e).with_context(|| {
-                                    format!(
-                                        "{}: signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback",
-                                        spec.label()
-                                    )
+                                    let reason = if spec.forwarded.is_some() {
+                                        "TCP data connection failed; --via requires direct encrypted TCP and cannot fall back to SSH data"
+                                    } else {
+                                        "signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback"
+                                    };
+                                    format!("{}: {reason}", spec.label())
                                 });
                             }
                             #[cfg(debug_assertions)]
@@ -2838,10 +2857,12 @@ impl Endpoint {
                 if spec.restricted_grant.is_some()
                     && !crate::destination::is_named(&spec.restricted_grant)
                 {
-                    bail!(
-                        "{}: signed receiver has no authorized TCP data connection",
-                        spec.label()
-                    );
+                    let reason = if spec.forwarded.is_some() {
+                        "--via has no authorized encrypted TCP data connection"
+                    } else {
+                        "signed receiver has no authorized TCP data connection"
+                    };
+                    bail!("{}: {reason}", spec.label());
                 }
                 Ok(Box::new(spec.connect_with_role(compress, true, role)?))
             }
@@ -3149,6 +3170,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let info = TcpInfo {
@@ -3593,6 +3615,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let command = spec.ssh_command(SshConnection::Independent, false);
@@ -3654,6 +3677,7 @@ mod tests {
             }))),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let endpoint = Endpoint::Remote(spec.clone());
@@ -3683,6 +3707,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let args = |connection| {
@@ -3776,6 +3801,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
         let args = |connection| {
@@ -3855,6 +3881,7 @@ mod tests {
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
+            forwarded: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         };
 

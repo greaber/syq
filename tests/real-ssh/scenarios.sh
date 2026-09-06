@@ -195,6 +195,8 @@ test ! -e "$receive_root/cancelled-policy"
 printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 
+python3 /usr/local/libexec/syq-test-forward-copy.py
+
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq recv on --approve always
 syq recv wait source --timeout 30

@@ -518,6 +518,11 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
+    def test_cp_can_request_permission_via_a_return_connection(self) -> None:
+        self.client.cp("source", to="backup", via="@laptop", into="out")
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--via") + 1], "@laptop")
+
     def test_cp_forwards_native_remote_controls(self) -> None:
         self.client.cp(
             "source",
