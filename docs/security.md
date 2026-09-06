@@ -55,7 +55,34 @@ without changing its owner. See the [rename rules](https://man7.org/linux/man-pa
 Native syq avoids that implicit trust decision. This is a stricter default
 for this case, not a claim that syq is more secure overall. `syq rsync`
 keeps the ownership-based policy for compatibility. Its local-only
-`--insecure-links` option relaxes source, destination, and control-path checks.
+`--insecure-links` option permits foreign-owned symlinks in typed local source,
+destination, and control paths. After opening a source root, scans and content
+reads still use its directory handles and refuse descendant symlink traversal.
+
+## TCP data connections
+
+TCP workers authenticate with a token delivered through the control connection.
+Their ten-second Hello deadline remains active across partial reads, including
+when encryption is off. After Hello succeeds, it does not limit copy duration.
+
+Encrypted TCP rejects reused connection IDs and IDs outside its 24-bit nonce
+space. If a copying process exhausts those IDs, it reports an error; restart the
+copy to continue with a fresh session.
+
+Framed input has a separate memory allowance from the signed transfer's disk
+limits. Hello is limited to 1 MiB, ordinary metadata messages to 8 MiB, and
+bulk-data or hash messages to 65 MiB. Compression cannot bypass these limits;
+zstd windows are limited to 8 MiB. Both endpoints apply the smaller Hello
+limit before reading or decompressing its body.
+
+A shared 512 MiB allowance bounds decoded collection storage, including queued
+collections, because a short frame can advertise a very large collection.
+Exhaustion fails the connection visibly. Flat byte buffers, strings, and
+compression workspace use the frame-size limits and each connection's bounded
+queue instead of competing for that shared allowance. Their aggregate memory
+use grows with the connection count, request size, and pipeline depth; reduce
+those settings to use less memory. The collection allowance is not a limit on
+total process memory or disk usage.
 
 ## A compromised source server
 
@@ -108,8 +135,9 @@ host resolution. A copy never switches routes after selecting its destination.
 
 - **Privileged copies need trusted destination directories.** Resume uses
   predictable partial-file names. Do not copy as root into a directory
-  writable by untrusted users: file checks cannot establish who created a
-  preexisting partial.
+  writable by untrusted users. Syq only reuses partials owned by its effective
+  user; foreign-owned leftovers are replaced without changing their contents
+  or permissions. This does not make a shared writable directory trusted.
 - **Copies are not snapshots or transactions.** Stop concurrent writers or
   use snapshots for consistent data. `--inplace` exposes incomplete updates.
   Syq does not `fsync` transfer data, so completion is not a power-loss
@@ -164,3 +192,6 @@ replayed automatically. Completed effects cannot be rolled back, and programs
 that create separate process sessions can outlive cancellation. See the
 [command reference](exec.md#output-completion-and-cancellation) for execution
 and interruption behavior.
+
+Human copy listings escape control characters in filenames. Diagnostics also
+escape terminal control sequences from peers; NDJSON keeps its JSON encoding.

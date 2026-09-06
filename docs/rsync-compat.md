@@ -55,8 +55,9 @@ unsupported descendant-link options.
 
 `--files-from` cannot combine with syq ignore rules or deletion. A listed
 source whose parent is a symlink fails that entry with exit 23, without
-creating its implied destination parent. `--insecure-links` allows traversal
-on a local source only; remote sources always refuse it.
+creating its implied destination parent. `--insecure-links` only relaxes the
+ownership check on symlinks in typed local paths; it does not allow symlink
+traversal beneath a selected source, including entries from `--files-from`.
 
 Other parsing differences:
 

@@ -150,3 +150,8 @@ Ignore-source regressions compare copies from matching and different builds
 using piped rules and a named FIFO with a single writer. They check ordered
 patterns, reinclusion, and protection of ignored destination entries during
 pruning, plus piped filters with automatic and explicit remote authorization.
+
+The disposable runner also checks privileged copies before dropping to its
+normal test user: foreign-owned partials are replaced without modifying their
+inodes, requested final ownership still works, and `--insecure-links` permits
+foreign-owned symlinks in typed local paths. No host files are used.
