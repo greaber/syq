@@ -36,7 +36,10 @@ copy remotely. Sizes are quick (64 MiB and 8 MiB), medium (1 GiB and 32 MiB),
 and large (8 GiB and 128 MiB), for the large-file and small-file workloads.
 
 Data comes from a fixed AES-CTR byte stream, making it reproducible and
-hard to compress. Every trial has an empty destination. The script rotates
+hard to compress. Every trial has an empty, pre-created destination; interrupted trials are
+never resumed. On Ctrl-C the script stops its local workers, moves remote
+scratch out of the transfer path, and deletes its temporary data. If SSH
+is unavailable, it reports the remote path for later cleanup. The script rotates
 tool order and reports each elapsed time and the mean for each tool. It uses
 syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
 These copy the same regular files and request permissions and modification

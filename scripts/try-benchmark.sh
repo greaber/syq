@@ -44,13 +44,12 @@ need() { command -v "$1" >/dev/null || fail "Missing required command: $1"; }
 remote() { ssh -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" "$1"; }
 
 # Background jobs have their own process groups, so interruption stops the whole
-# local copy/generation group before cleanup. Remote scratch is retained on failure:
-# disconnecting SSH does not establish that every remote writer has stopped.
+# local copy/generation group before cleanup. Remote cleanup first moves scratch
+# out of the transfer path; all copies require existing destination parents.
 active_pid=
 local_root=
 dest_root=
 remote_root=
-completed=false
 host=
 group_running() {
     local states
@@ -82,13 +81,23 @@ cleanup() {
         wait "$active_pid" 2>/dev/null || :
     fi
     if [[ -n $remote_root ]]; then
-        if $completed; then
-            if ! remote "rm -rf $(quote "$remote_root")"; then
-                printf 'Remote cleanup failed; remove after checking: %s:%s\n' "$host" "$remote_root" >&2
-                status=1
-            fi
-        else
-            printf 'Remote scratch preserved after failure/interruption: %s:%s\n' "$host" "$remote_root" >&2
+        printf 'Cleaning up remote benchmark files...\n'
+        # Fence the original path before removing files. syq requires an existing
+        # destination; rsync cannot create missing intermediate parents. Thus a
+        # late remote operation cannot recreate the tree under its old name.
+        if ! remote "set -eu
+root=$(quote "$remote_root")
+[ -d \"\$root\" ] || exit 0
+cleanup_dir=\$(mktemp -d \"\$root.cleanup.XXXXXXXX\")
+trap 'printf \"Remote cleanup incomplete: %s and %s\\n\" \"\$root\" \"\$cleanup_dir\" >&2' HUP INT TERM
+if mv \"\$root\" \"\$cleanup_dir/data\" && rm -rf \"\$cleanup_dir\"; then
+    trap - HUP INT TERM
+else
+    printf 'Remote cleanup incomplete: %s and %s\\n' \"\$root\" \"\$cleanup_dir\" >&2
+    exit 1
+fi"; then
+            printf 'Could not finish remote cleanup: %s:%s (also check sibling .cleanup.* directories).\n' "$host" "$remote_root" >&2
+            [[ $status -ne 0 ]] || status=1
         fi
     fi
     [[ -z $dest_root ]] || rm -rf -- "$dest_root" || status=1
@@ -105,6 +114,7 @@ run() {
     else
         wait "$active_pid" || status=$?
     fi
+    [[ $status -ne 130 && $status -ne 143 ]] || exit "$status"
     # Preserve the group ID on failure so EXIT can also stop surviving children.
     [[ $status -eq 0 ]] || return "$status"
     active_pid=
@@ -133,9 +143,9 @@ copy_with() {
     case $tool in
         syq)
             case $mode in
-                local) syq cp --preserve=permissions --srcs-in "$source" --into "$destination" "${syq_options[@]}" ;;
-                push) syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into "$destination" "${syq_options[@]}" ;;
-                pull) syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into "$destination" "${syq_options[@]}" ;;
+                local) syq cp --preserve=permissions --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}" ;;
+                push) syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into-existing "$destination" "${syq_options[@]}" ;;
+                pull) syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}" ;;
             esac ;;
         rsync)
             case $mode in
@@ -271,10 +281,12 @@ main() {
             mkdir "$local_root/probe"
             printf 'syq benchmark\n' > "$local_root/probe/data"
             if [[ $mode == pull ]]; then
+                mkdir "$dest_root/probe"
                 run rsync -rpt -- "$local_root/probe/" "$host:$(quote "$remote_root/probe/")"
                 run copy_with syq "$remote_root/probe" "$dest_root/probe" setup
                 rm -rf -- "$dest_root/probe"
             elif [[ $mode == push ]]; then
+                remote "mkdir $(quote "$remote_root/probe")"
                 run copy_with syq "$local_root/probe" "$remote_root/probe" setup
                 remote "rm -rf $(quote "$remote_root/probe")"
             else
@@ -314,7 +326,6 @@ main() {
     printf '\nA quick synthetic comparison, not a prediction for every workload.\n'
     printf 'Filesystem caching, cloning, network conditions and startup costs affect results.\n'
     printf 'Try larger data and your real workloads too. Resume and direct server copies are other reasons to use syq.\n'
-    completed=true
 }
 # Keep execution last: a script downloaded through a pipe is parsed before prompts run.
 main "$@"

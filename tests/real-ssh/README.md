@@ -105,3 +105,6 @@ The suite also runs the standalone interactive benchmark in noninteractive
 push and pull modes, with both synthetic workloads and scratch paths containing
 spaces and quotes. These are correctness and cleanup checks using the lab's
 debug binary, not performance measurements.
+
+A cancellation case waits for an active remote partial file, interrupts the
+benchmark, and checks that scratch is removed while an unrelated file remains.

@@ -23,11 +23,12 @@ args=sys.argv[1:]
 if args == ['--version']:
     print('syq test double'); sys.exit(0)
 src=pathlib.Path(args[args.index('--srcs-in')+1])
-dst=pathlib.Path(args[args.index('--into')+1])
+dst=pathlib.Path(args[args.index('--into-existing')+1])
 if src.name == 'probe' and os.environ.get('BENCH_TEST_ASK'):
     print('Credentials:', flush=True)
     with open('/dev/tty') as terminal:
         if terminal.readline().strip() != 'test': sys.exit(4)
+if not dst.is_dir(): sys.exit(24)
 mode=os.environ.get('BENCH_TEST_FAILURE', '') if src.name != 'probe' else ''
 if mode == 'fail': sys.exit(23)
 if mode == 'hang':
@@ -43,6 +44,7 @@ FAKE_SSH = '''#!/usr/bin/env bash
 set -eu
 while [[ $1 == -o ]]; do shift 2; done
 shift
+if [[ ${BENCH_TEST_CLEANUP_FAIL:-} == 1 && $* == *cleanup_dir=* ]]; then exit 255; fi
 exec /bin/sh -c "$*"
 '''
 
@@ -66,7 +68,7 @@ class BenchmarkTests(unittest.TestCase):
         # missing-install test. All other commands use the host's real tools.
         for name in ['bash', 'rsync', 'openssl', 'dd', 'split', 'cksum', 'cmp',
                      'awk', 'mktemp', 'mkdir', 'rm', 'cat', 'ps', 'sleep', 'sed',
-                     'cp', 'python3', 'sh']:
+                     'cp', 'mv', 'python3', 'sh']:
             executable = shutil.which(name)
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
@@ -112,11 +114,18 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn('Results (mean', result.stdout)
                 self.assert_clean()
 
-    def test_remote_failure_retains_only_owned_scratch(self):
+    def test_remote_failure_cleans_owned_scratch(self):
         result = self.invoke('--mode', 'push', '--host', 'test-host',
                              env=dict(self.env, BENCH_TEST_FAILURE='fail'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Remote scratch preserved', result.stderr)
+        self.assertIn('Cleaning up remote benchmark files', result.stdout)
+        self.assert_clean()
+
+    def test_unreachable_cleanup_reports_leftovers(self):
+        result = self.invoke('--mode', 'push', '--host', 'test-host',
+                             env=dict(self.env, BENCH_TEST_CLEANUP_FAIL='1'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not finish remote cleanup:', result.stderr)
         self.assertEqual(len(list(self.scratch.glob('syq-bench.*'))), 1)
         self.assertEqual(self.sentinel.read_text(), 'existing user data')
 
@@ -148,10 +157,18 @@ class BenchmarkTests(unittest.TestCase):
             self.assert_clean()
 
     def test_interruption_stops_child_and_cleans(self):
-        pidfile = self.root / 'child.pid'
+        self.check_interruption('local')
+
+    def test_remote_interruption_stops_child_and_cleans(self):
+        self.check_interruption('push')
+        self.check_interruption('pull')
+
+    def check_interruption(self, mode):
+        pidfile = self.root / f'child-{mode}.pid'
         proc = subprocess.Popen(
             ['/bin/bash', str(SCRIPT), '--yes', '--source-dir', str(self.scratch),
-             '--dest-dir', str(self.scratch), '--workload', 'large', '--rounds', '1'],
+             '--dest-dir', str(self.scratch), '--workload', 'large', '--rounds', '1',
+             '--mode', mode, '--host', 'test-host'],
             env=dict(self.env, BENCH_TEST_FAILURE='hang', BENCH_TEST_PID=str(pidfile)),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
@@ -174,6 +191,49 @@ class BenchmarkTests(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_keyboard_ctrl_c_cleans_remote_scratch(self):
+        pidfile = self.root / 'ctrl-c-child.pid'
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe('/bin/bash', ['/bin/bash', str(SCRIPT), '--yes', '--mode', 'push',
+                       '--host', 'test-host', '--workload', 'large', '--rounds', '1',
+                       '--source-dir', str(self.scratch), '--dest-dir', str(self.scratch)],
+                       dict(self.env, BENCH_TEST_FAILURE='hang', BENCH_TEST_PID=str(pidfile)))
+        output = b''
+        interrupted = False
+        deadline = time.monotonic() + 20
+        try:
+            while time.monotonic() < deadline:
+                if pidfile.exists() and not interrupted:
+                    os.write(fd, b'\x03')
+                    interrupted = True
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        data = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    output += data
+            else:
+                self.fail(f'Ctrl-C timed out; last output: {output[-2000:]!r}')
+            _, status = os.waitpid(pid, 0)
+            self.assertTrue(interrupted)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 130, output.decode())
+            self.assertIn(b'Cleaning up remote benchmark files', output)
+            self.assert_clean()
+        finally:
+            os.close(fd)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             if pidfile.exists():
                 try:
                     os.kill(int(pidfile.read_text()), signal.SIGKILL)

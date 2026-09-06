@@ -38,9 +38,9 @@ config alias for custom ports or IPv6 addresses. No remote system packages are
 installed; syq performs its usual remote helper setup.
 
 The quick test copies a 64 MiB file and 1,024 files of 8 KiB each. Each tool
-runs three times. Temporary test files are removed on success; after a failed
-or interrupted SSH test, the script prints the remote scratch directory for
-you to check and remove. It never uses your existing files as test data.
+runs three times. Temporary test files are removed on success, failure, or Ctrl-C. If SSH is
+unreachable during cleanup, the script prints the remote scratch path for
+you to remove later. It never uses your existing files as test data.
 
 To inspect the script first, download it with curl's `-o try-benchmark.sh`,
 then run `bash try-benchmark.sh`. Use `--help` for repeatable command-line
