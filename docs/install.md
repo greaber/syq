@@ -26,33 +26,40 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-The script asks whether to copy locally, send to an SSH host, or fetch from
-one; which workloads to try; the test size; and where to put temporary files.
-You can choose another disk or an NFS mount for a local comparison. No
-syq-bench installation is needed. If syq is missing, it offers to run the
-normal installer locally.
+Choose a local or SSH copy and a workload. The script automatically sizes
+throwaway data with syq and cleans up afterward. No syq-bench install is needed;
+if syq is missing, it offers to install it.
 
-It needs Bash, rsync, OpenSSL, and standard Unix utilities on your machine.
-Terminal runs also need Perl to keep SSH prompts available while allowing
-immediate cancellation.
-SSH tests also need SSH access and rsync on the remote machine. Use an SSH
-config alias for custom ports or IPv6 addresses. No remote system packages are
-installed; syq performs its usual remote helper setup.
+<figure class="benchmark-example">
+<div class="benchmark-example-grid">
+<section aria-label="Example benchmark choices">
+<div class="visual-step">1 <span>Choose your test</span></div>
+<dl class="benchmark-choices">
+<dt>Copy where?</dt><dd>local</dd>
+<dt>Workloads?</dt><dd>both</dd>
+<dt>Test size</dt><dd>automatic by default</dd>
+</dl>
+<p class="visual-note">Results pictured: fixed-size sample<br>64 MiB + 1,024 files of 8 KiB</p>
+</section>
+<section aria-label="Example benchmark results">
+<div class="visual-step">2 <span>Compare the results</span></div>
+<table>
+<caption>Mean MB/s · higher is faster · 3 trials</caption>
+<thead><tr><th scope="col">Tool</th><th scope="col">Large file</th><th scope="col">Small files</th></tr></thead>
+<tbody>
+<tr><th scope="row">syq</th><td>710.0</td><td>50.1</td></tr>
+<tr><th scope="row">rsync</th><td>567.3</td><td>71.1</td></tr>
+<tr><th scope="row">cp</th><td>1379.1</td><td>160.4</td></tr>
+</tbody>
+</table>
+<p class="visual-note">✓ Copied contents checked</p>
+</section>
+</div>
+<figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
+</figure>
 
-The quick test copies a 64 MiB file and 1,024 files of 8 KiB each. Each tool
-runs three times. Temporary test files are removed on success, failure, or Ctrl-C. If SSH is
-unreachable during cleanup, the script prints the remote scratch path for
-you to remove later. It never uses your existing files as test data.
-
-The transcript includes the exact syq build, the commands being timed, each
-verified trial, and the mean, minimum and maximum elapsed times. Keep that
-output when sharing a surprising result; differences smaller than the trial
-variation may not indicate a speed advantage.
-
-To inspect the script first, download it with curl's `-o try-benchmark.sh`,
-then run `bash try-benchmark.sh`. Use `--help` for repeatable command-line
-options, including `--yes` to use defaults without questions and `--install`
-to install syq if missing. See [how to interpret the comparison](speed.md#quick-comparison).
+For requirements, options and how to read the results, see
+[the benchmark guide](speed.md#quick-comparison).
 
 ## Updates
 

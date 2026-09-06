@@ -11,7 +11,6 @@
 - [Run commands on your receiving machine](exec.md)
 - [Copy between servers](remote-to-remote.md)
 - [Rename and reorganize](mappings.md)
-
 # Performance
 
 - [Speed](speed.md)
@@ -30,3 +29,9 @@
 # Development
 
 - [Developing syq](development.md)
+
+# SDKs
+
+- [Python](python.md)
+  - [Guide and examples](python-guide.md)
+  - [API reference](python-reference.md)

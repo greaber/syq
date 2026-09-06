@@ -135,6 +135,7 @@ pub struct ResultRecord {
     pub errors: u64,
     pub bytes_transferred: u64,
     pub bytes_unchanged: u64,
+    pub copying_elapsed_ms: Option<u64>,
     pub elapsed_ms: u64,
     /// `--prune` runs only; None keeps the fields out of the record.
     pub deletions_planned: Option<u64>,
@@ -500,6 +501,9 @@ impl ResultsWriter {
             "elapsed_ms": result.elapsed_ms,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(ms) = result.copying_elapsed_ms {
+            object.insert("copying_elapsed_ms".into(), ms.into());
+        }
         if let Some(planned) = result.deletions_planned {
             object.insert("deletions_planned".into(), planned.into());
         }
@@ -663,6 +667,7 @@ mod tests {
             errors: 1,
             bytes_transferred: 0,
             bytes_unchanged: 0,
+            copying_elapsed_ms: None,
             elapsed_ms: 0,
             deletions_planned: None,
             deletions_completed: None,
@@ -695,6 +700,7 @@ mod tests {
             errors: 0,
             bytes_transferred: 0,
             bytes_unchanged: 0,
+            copying_elapsed_ms: None,
             elapsed_ms: 0,
             deletions_planned: None,
             deletions_completed: None,
