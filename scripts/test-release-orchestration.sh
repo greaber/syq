@@ -249,6 +249,18 @@ case "$1:$2" in
       *'/actions/workflows/macos.yml/dispatches '*)
         printf '{"workflow_run_id":503}\n'
         ;;
+      *'/actions/workflows/ci.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:501,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
+        ;;
+      *'/actions/workflows/rsync-compat.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:502,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
+        ;;
+      *'/actions/workflows/macos.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:503,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
+        ;;
       *'/actions/runs/501/jobs?per_page=100 '*)
         jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
           '{jobs:[{name:"sdks",status:"completed",conclusion:$conclusion}]}'
@@ -281,9 +293,10 @@ expect_failure 'does not point to expected merge commit' env \
   PATH="$post_merge_bin:$PATH" \
   "$script_dir/run-generated-sdk-post-merge-ci.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml run 501 targets' env \
+expect_failure 'ci.yml dispatch did not create' env \
   SYQ_TEST_MERGE_SHA="$post_merge_sha" \
   SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  SYQ_POST_MERGE_POLL_ATTEMPTS=1 \
   PATH="$post_merge_bin:$PATH" \
   "$script_dir/run-generated-sdk-post-merge-ci.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
