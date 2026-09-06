@@ -888,7 +888,7 @@ struct NativeRemoteArgs {
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, conflicts_with = "via")]
     auth_from: Option<AuthFrom>,
     /// Alias for --auth-from @NAME; every bare value remains a receiving name
-    #[arg(long, value_name = "@NAME", help_heading = REMOTE_TO_REMOTE_HEADING)]
+    #[arg(long, value_name = "@NAME")]
     via: Option<String>,
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
