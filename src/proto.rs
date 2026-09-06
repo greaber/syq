@@ -1428,16 +1428,13 @@ impl<R: Read> FrameReader<R> {
                 "unknown frame flags",
             ));
         }
-        // Reserve before allocating or reading, not after decoding has already
-        // consumed the memory. Failed/closed streams release both holds.
-        let mut input_hold = crate::wire_budget::Hold::new();
-        input_hold.grow(len - 1)?;
+        // Encoded bytes and decompression are bounded by this reader's frame
+        // limit. Their queue count is bounded by the connection's read-ahead.
         let mut body = vec![0u8; len - 1];
         self.r.read_exact(&mut body)?;
         let payload = if flag[0] == 1 {
             // Bound zstd's advertised window as well as its output. Level-1
             // frames from the released writer use windows below this ceiling.
-            input_hold.grow(16 << 20)?;
             let mut decoder = zstd::stream::read::Decoder::new(&body[..])?;
             decoder.window_log_max(23)?;
             let mut output = Vec::new();
@@ -1453,10 +1450,7 @@ impl<R: Read> FrameReader<R> {
                         "decompressed frame exceeds limit",
                     ));
                 }
-                // Vec growth is explicit so no uncharged geometric capacity
-                // appears while decompressing an attacker-controlled stream.
-                // Cover old and new allocations during a realloc too.
-                input_hold.grow(n * 2)?;
+                // Keep output capacity close to the bounded decoded length.
                 output.try_reserve_exact(n).map_err(io::Error::other)?;
                 output.extend_from_slice(&chunk[..n]);
             }

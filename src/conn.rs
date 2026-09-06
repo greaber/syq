@@ -619,6 +619,18 @@ fn spawn_reader(
     let (tx, rx) = std::sync::mpsc::sync_channel(read_ahead);
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
+        r.set_limit(MAX_HANDSHAKE_FRAME);
+        let hello = r.read_budgeted::<Response>();
+        // Make the same acceptance check as receive_hello before allowing the
+        // background reader to allocate any ordinary data frame. This also
+        // covers pooled sessions, whose Hello was sent by another process.
+        let accepted = matches!(&hello, Ok(message)
+            if matches!(&message.value, Response::HelloOk { identity, .. }
+                if identity == crate::identity::build()));
+        if tx.send(hello).is_err() || !accepted {
+            return;
+        }
+        r.set_limit(MAX_FRAME);
         loop {
             let msg = r.read_budgeted::<Response>();
             let failed = msg.is_err();
@@ -2920,6 +2932,86 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    fn hello_ok() -> Response {
+        Response::HelloOk {
+            identity: crate::identity::build().into(),
+            platform: crate::identity::platform(),
+            supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
+        }
+    }
+
+    #[test]
+    fn client_handshake_limit_applies_before_reading_the_body() {
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false).write_preamble().unwrap();
+        wire.extend_from_slice(&((MAX_HANDSHAKE_FRAME + 1) as u32).to_le_bytes());
+        let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+        let error = rx.recv().unwrap().unwrap_err();
+        assert!(error.to_string().contains("bad frame length"));
+        assert!(rx.recv().is_err());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn client_handshake_limit_also_bounds_compressed_output() {
+        let mut hello = hello_ok();
+        if let Response::HelloOk { platform, .. } = &mut hello {
+            *platform = "x".repeat(MAX_HANDSHAKE_FRAME + 1);
+        }
+        let payload = postcard::to_stdvec(&hello).unwrap();
+        let body = zstd::bulk::compress(&payload, 1).unwrap();
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false).write_preamble().unwrap();
+        wire.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        wire.push(1);
+        wire.extend_from_slice(&body);
+        let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+        assert!(rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed frame exceeds limit"));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn client_reader_requires_accepted_hello_before_large_data() {
+        for accepted in [false, true] {
+            let mut wire = Vec::new();
+            let mut writer = FrameWriter::new(&mut wire, false);
+            let mut hello = hello_ok();
+            if let Response::HelloOk { identity, .. } = &mut hello {
+                if !accepted {
+                    *identity = "wrong-build".into();
+                }
+            }
+            writer.write_msg(&hello).unwrap();
+            writer
+                .write_msg(&Response::Block {
+                    off: 0,
+                    hash: [0; 32],
+                    data: vec![7; 2 << 20],
+                })
+                .unwrap();
+            drop(writer);
+            let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+            assert!(matches!(
+                rx.recv().unwrap().unwrap().value,
+                Response::HelloOk { .. }
+            ));
+            if accepted {
+                assert!(
+                    matches!(rx.recv().unwrap().unwrap().value, Response::Block { data, .. } if data.len() == 2 << 20)
+                );
+            } else {
+                assert!(rx.recv().is_err());
+            }
+            drop(rx);
+            thread.join().unwrap();
+        }
+    }
+
     struct ExitObserved<R> {
         inner: R,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -3440,6 +3532,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut requests = FrameReader::new(helper.try_clone().unwrap());
             let mut responses = FrameWriter::new(helper, false);
+            responses.write_msg(&hello_ok()).unwrap();
             for _ in 0..depth {
                 let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
                     panic!("expected a range request");
@@ -3454,6 +3547,10 @@ mod tests {
             }
         });
         let (responses, reader) = spawn_reader(Box::new(coordinator.try_clone().unwrap()), depth);
+        assert!(matches!(
+            responses.recv_timeout(timeout).unwrap().unwrap().value,
+            Response::HelloOk { .. }
+        ));
         let mut requests = FrameWriter::new(coordinator, false);
         // Both directions exceed socket buffering. A reader queue stuck at
         // four responses deadlocks against a sequential helper while the
@@ -3578,6 +3675,7 @@ mod tests {
         ] {
             let mut wire = Vec::new();
             let mut writer = FrameWriter::new(&mut wire, false);
+            writer.write_msg(&hello_ok()).unwrap();
             let mut root = entry(b"");
             root.kind = Kind::Dir;
             writer.write_msg(&Response::ScanBatch(vec![root])).unwrap();
@@ -3602,6 +3700,7 @@ mod tests {
                 multiplexed_ssh: false,
                 detached: false,
             };
+            remote = receive_hello(remote, false).unwrap();
             let mut planned = Vec::new();
             let result = remote.scan(
                 b"source",

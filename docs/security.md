@@ -72,12 +72,17 @@ copy to continue with a fresh session.
 Framed input has a separate memory allowance from the signed transfer's disk
 limits. Hello is limited to 1 MiB, ordinary metadata messages to 8 MiB, and
 bulk-data or hash messages to 65 MiB. Compression cannot bypass these limits;
-zstd windows are limited to 8 MiB. A shared 512 MiB budget conservatively
-accounts for frame bodies, decompression, decoded collections, and queued
-messages in each process. Exhaustion fails the connection visibly; reduce
-connections or pipeline depth before retrying. This is a decoding allowance,
-not a limit on transport buffers, application state, total process memory,
-or disk usage.
+zstd windows are limited to 8 MiB. Both endpoints apply the smaller Hello
+limit before reading or decompressing its body.
+
+A shared 512 MiB allowance bounds decoded collection storage, including queued
+collections, because a short frame can advertise a very large collection.
+Exhaustion fails the connection visibly. Flat byte buffers, strings, and
+compression workspace use the frame-size limits and each connection's bounded
+queue instead of competing for that shared allowance. Their aggregate memory
+use grows with the connection count, request size, and pipeline depth; reduce
+those settings to use less memory. The collection allowance is not a limit on
+total process memory or disk usage.
 
 ## A compromised source server
 

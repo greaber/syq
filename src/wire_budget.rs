@@ -1,5 +1,6 @@
-//! Conservative, process-wide accounting for framed input and owned decoded
-//! values. Reservations travel with queued messages and are released on drop.
+//! Shared accounting for decoded collection storage, whose size is not bounded
+//! by the encoded frame length alone. Reservations travel with queued messages.
+//! Flat byte buffers and strings are bounded separately by frame/queue limits.
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::Deserialize;
 use std::fmt;
@@ -51,7 +52,7 @@ impl Hold {
     fn try_grow(&mut self, bytes: usize) -> io::Result<()> {
         let exhausted = || {
             io::Error::other(
-                "framed input memory budget exhausted; reduce connections or pipeline depth",
+                "decoded collection memory budget exhausted; reduce connections or pipeline depth",
             )
         };
         let used = self.used.checked_add(bytes).ok_or_else(exhausted)?;
@@ -104,7 +105,9 @@ impl<T> Budgeted<T> {
 // Postcard's sequence length comes from the peer. Hide size hints to prevent
 // eager Vec/HashMap allocation, then charge conservative capacity before each
 // element. Eight times element size covers Vec growth (including its minimum
-// capacity) and map buckets; strings and byte buffers charge their own storage.
+// capacity) and map buckets. Strings and byte buffers are already bounded by
+// their bytes in the frame; charging those globally made normal bulk transfers
+// compete for this allowance as concurrency increased.
 // This is deliberately an upper bound, not an allocator/RSS measurement.
 struct Limited<'a, D> {
     inner: D,
@@ -304,27 +307,21 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for LimitedVisitor<'_, V> {
         })
     }
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_str(value)
     }
     fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_borrowed_str(value)
     }
     fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_string(value)
     }
     fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_bytes(value)
     }
     fn visit_borrowed_bytes<E: de::Error>(self, value: &'de [u8]) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_borrowed_bytes(value)
     }
     fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
-        self.hold.charge::<E>(value.len())?;
         self.inner.visit_byte_buf(value)
     }
 }
@@ -450,7 +447,7 @@ fn decode_with_hold<T: for<'de> Deserialize<'de>>(
     .map_err(|error| {
         if hold.exhausted {
             io::Error::other(
-                "framed input memory budget exhausted; reduce connections or pipeline depth",
+                "decoded collection memory budget exhausted; reduce connections or pipeline depth",
             )
         } else {
             io::Error::new(io::ErrorKind::InvalidData, error)
@@ -505,6 +502,22 @@ mod tests {
         let error = decode_with_hold::<Vec<()>>(&bytes, hold(&shared)).unwrap_err();
         assert!(error.to_string().contains("memory budget exhausted"));
         assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn bounded_bulk_bytes_do_not_consume_collection_allowance() {
+        let shared = budget();
+        let response = crate::proto::Response::Block {
+            off: 0,
+            hash: [0; 32],
+            data: vec![7; 8 << 20],
+        };
+        let bytes = postcard::to_stdvec(&response).unwrap();
+        let decoded = decode_with_hold::<crate::proto::Response>(&bytes, hold(&shared)).unwrap();
+        assert!(
+            matches!(decoded.value, crate::proto::Response::Block { data, .. } if data.len() == 8 << 20)
+        );
+        assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE);
     }
 
     #[test]
