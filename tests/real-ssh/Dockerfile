@@ -26,6 +26,7 @@ RUN apt-get update \
         openssh-client \
         openssh-server \
         procps \
+        perl \
         python3 \
         python3-dbus \
         python3-gi \

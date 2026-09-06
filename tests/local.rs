@@ -7737,7 +7737,13 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
             .collect();
         operations.sort();
         let mut terminal = records.last().unwrap().clone();
-        for key in ["seq", "elapsed_ms"] {
+        if terminal["bytes_transferred"].as_u64().unwrap() > 0 {
+            let span = terminal["copying_elapsed_ms"]
+                .as_u64()
+                .expect("copy timing");
+            assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
+        }
+        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");
@@ -8249,7 +8255,13 @@ fn small_push_refusals_and_failures_match_the_engine() {
             .collect();
         operations.sort();
         let mut terminal = records.last().unwrap().clone();
-        for key in ["seq", "elapsed_ms"] {
+        if terminal["bytes_transferred"].as_u64().unwrap() > 0 {
+            let span = terminal["copying_elapsed_ms"]
+                .as_u64()
+                .expect("copy timing");
+            assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
+        }
+        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");
@@ -13646,6 +13658,45 @@ fn native_cp_mapping_end_to_end_map_pipeline() {
 }
 
 // ---- syq cp --results ----
+
+#[test]
+fn native_cp_results_copying_interval_covers_paced_content_but_not_unchanged_files() {
+    let t = Tmp::new();
+    write(&t.path("src/data"), &vec![42; 2 * 1024 * 1024]);
+    for (result, moved) in [("first.ndjson", true), ("second.ndjson", false)] {
+        let out = syq_cp_in(
+            &t.path(""),
+            &[
+                "--srcs-in",
+                "src",
+                "--into",
+                "dst",
+                "--results",
+                result,
+                "--bwlimit",
+                "1M",
+                "--stats",
+                "--no-progress",
+            ],
+            None,
+        );
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let contents = String::from_utf8(read(&t.path(result))).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        if moved {
+            let interval = terminal["copying_elapsed_ms"]
+                .as_u64()
+                .expect("copy timing");
+            assert!(interval >= 1_000, "paced copy interval: {interval}ms");
+            assert!(interval <= terminal["elapsed_ms"].as_u64().unwrap());
+            assert!(String::from_utf8_lossy(&out.stdout).contains("copying interval:"));
+        } else {
+            assert!(terminal.get("copying_elapsed_ms").is_none());
+        }
+        assert_eq!(read(&t.path("src/data")), read(&t.path("dst/data")));
+    }
+}
 
 #[test]
 fn native_cp_results_stream_success_and_partial() {

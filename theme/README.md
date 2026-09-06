@@ -48,7 +48,8 @@ run (release-profile syq `9e73649`, three trials, 1 × 64 MiB and 1,024 × 8 KiB
 original mean times: syq 0.095/0.167 s, rsync 0.118/0.118 s, cp 0.049/0.052 s).
 The figure shows arithmetic mean trial speeds in decimal MB/s, calculated
 from the individual recorded durations rather than those rounded mean times. It illustrates
-the workflow, not comparative performance evidence: the run shared the machine
+the workflow, not comparative performance evidence. The choices now show automatic
+sizing; the example speeds still come from that fixed-size sample: the run shared the machine
 with other work. Preserve the example caption if updating its presentation.
 
 Anchor navigation scrolls smoothly, matching benchmarks. The reduced-motion

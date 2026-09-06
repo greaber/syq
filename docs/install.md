@@ -26,8 +26,8 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-Choose a local or SSH copy, a workload, and a test size. The script uses
-throwaway data and cleans up afterward. No syq-bench install is needed;
+Choose a local or SSH copy and a workload. The script automatically sizes
+throwaway data with syq and cleans up afterward. No syq-bench install is needed;
 if syq is missing, it offers to install it.
 
 <figure class="benchmark-example">
@@ -37,9 +37,9 @@ if syq is missing, it offers to install it.
 <dl class="benchmark-choices">
 <dt>Copy where?</dt><dd>local</dd>
 <dt>Workloads?</dt><dd>both</dd>
-<dt>Size?</dt><dd>quick</dd>
+<dt>Test size</dt><dd>automatic by default</dd>
 </dl>
-<p class="visual-note">One 64 MiB file<br>1,024 files of 8 KiB</p>
+<p class="visual-note">Results pictured: fixed-size sample<br>64 MiB + 1,024 files of 8 KiB</p>
 </section>
 <section aria-label="Example benchmark results">
 <div class="visual-step">2 <span>Compare the results</span></div>
@@ -55,7 +55,7 @@ if syq is missing, it offers to install it.
 <p class="visual-note">✓ Copied contents checked</p>
 </section>
 </div>
-<figcaption>Example from one local run, not a speed promise. Your results will differ.</figcaption>
+<figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
 </figure>
 
 For requirements, options and how to read the results, see
