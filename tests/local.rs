@@ -14770,6 +14770,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["syq", "help", ""],
         &[
             "cp",
+            "exec",
             "rm",
             "map",
             "rsync",
