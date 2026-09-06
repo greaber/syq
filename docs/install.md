@@ -33,6 +33,8 @@ syq-bench installation is needed. If syq is missing, it offers to run the
 normal installer locally.
 
 It needs Bash, rsync, OpenSSL, and standard Unix utilities on your machine.
+Terminal runs also need Perl to keep SSH prompts available while allowing
+immediate cancellation.
 SSH tests also need SSH access and rsync on the remote machine. Use an SSH
 config alias for custom ports or IPv6 addresses. No remote system packages are
 installed; syq performs its usual remote helper setup.

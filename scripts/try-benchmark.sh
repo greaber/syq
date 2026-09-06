@@ -27,7 +27,8 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
 
-Requires Bash, rsync, OpenSSL, and standard Unix utilities locally; remote tests
+Requires Bash, rsync, OpenSSL, and standard Unix utilities locally; terminal runs
+also need Perl (for terminal process-group control). Remote tests
 also need SSH locally and rsync plus standard utilities on the remote host.
 Only newly created syq-bench.* directories are used. Existing data is not copied.
 HELP
@@ -47,6 +48,7 @@ remote() { ssh -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCoun
 # local copy/generation group before cleanup. Remote cleanup first moves scratch
 # out of the transfer path; all copies require existing destination parents.
 active_pid=
+terminal_pgid=
 local_root=
 dest_root=
 remote_root=
@@ -57,12 +59,28 @@ group_running() {
     # A zombie cannot write or hold files open. It may await reaping by init.
     awk -v group="$active_pid" '$1 == group && $2 !~ /^Z/ {live=1} END {exit !live}' <<< "$states"
 }
+terminal_group() {
+    # Bash's fg builtin defers signal traps. Hand off only terminal ownership,
+    # leaving the shell free to use its interruptible wait builtin.
+    perl -MPOSIX -e '
+        $SIG{TTOU} = "IGNORE";
+        if (POSIX::tcsetpgrp(3, $ARGV[0]) != 0) {
+            my $error = "$!";
+            # A very short job can finish before the handoff.
+            exit 0 if !kill(0, -$ARGV[0]) && $! == POSIX::ESRCH();
+            die "terminal process group: $error\n";
+        }
+    ' "$1"
+}
 cleanup() {
     local status=$? attempt
     trap - EXIT INT TERM HUP
+    [[ -z $terminal_pgid ]] || terminal_group "$terminal_pgid" || :
     if [[ -n $active_pid ]]; then
         printf 'Stopping benchmark workers...\n' >&2
         kill -TERM -- "-$active_pid" 2>/dev/null || :
+        # A background terminal reader may have stopped on SIGTTIN.
+        kill -CONT -- "-$active_pid" 2>/dev/null || :
         for ((attempt=0; attempt<10; attempt++)); do
             group_running || break
             sleep 0.1
@@ -108,12 +126,17 @@ run() {
     "$@" &
     active_pid=$!
     local status=0
-    if [[ -t 3 ]]; then
-        # Permit SSH/passphrase prompts to read the controlling terminal.
-        fg %+ >/dev/null || status=$?
-    else
-        wait "$active_pid" || status=$?
+    # Disable job-status waits after assigning the job its own process group:
+    # wait must wait for exit, including if an early terminal read stopped it.
+    set +m
+    if [[ -n $terminal_pgid ]]; then
+        terminal_group "$active_pid" || status=$?
+        kill -CONT -- "-$active_pid" 2>/dev/null || :
     fi
+    [[ $status -eq 0 ]] || return "$status"
+    wait "$active_pid" || status=$?
+    [[ -z $terminal_pgid ]] || terminal_group "$terminal_pgid"
+    set -m
     [[ $status -ne 130 && $status -ne 143 ]] || exit "$status"
     # Preserve the group ID on failure so EXIT can also stop surviving children.
     [[ $status -eq 0 ]] || return "$status"
@@ -218,6 +241,10 @@ main() {
     fi
     # Reject newlines in scratch paths so diagnostics remain unambiguous.
     [[ $source_dir != *$'\n'* && $dest_dir != *$'\n'* ]] || fail 'Scratch paths cannot contain newlines.'
+    if [[ -t 3 ]]; then
+        need perl
+        terminal_pgid=$(ps -o pgid= -p "$$")
+    fi
     local_parent=$(cd -- "$source_dir" && pwd -P) || fail 'Local scratch parent must exist.'
     trap cleanup EXIT
     trap 'exit 130' INT

@@ -68,7 +68,7 @@ class BenchmarkTests(unittest.TestCase):
         # missing-install test. All other commands use the host's real tools.
         for name in ['bash', 'rsync', 'openssl', 'dd', 'split', 'cksum', 'cmp',
                      'awk', 'mktemp', 'mkdir', 'rm', 'cat', 'ps', 'sleep', 'sed',
-                     'cp', 'mv', 'python3', 'sh']:
+                     'cp', 'mv', 'python3', 'sh', 'perl']:
             executable = shutil.which(name)
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
@@ -198,6 +198,12 @@ class BenchmarkTests(unittest.TestCase):
                     pass
 
     def test_keyboard_ctrl_c_cleans_remote_scratch(self):
+        self.check_terminal_interruption(keyboard=True)
+
+    def test_terminal_sigterm_cleans_remote_scratch(self):
+        self.check_terminal_interruption(keyboard=False)
+
+    def check_terminal_interruption(self, *, keyboard):
         pidfile = self.root / 'ctrl-c-child.pid'
         pid, fd = pty.fork()
         if pid == 0:
@@ -211,7 +217,10 @@ class BenchmarkTests(unittest.TestCase):
         try:
             while time.monotonic() < deadline:
                 if pidfile.exists() and not interrupted:
-                    os.write(fd, b'\x03')
+                    if keyboard:
+                        os.write(fd, b'\x03')
+                    else:
+                        os.kill(pid, signal.SIGTERM)
                     interrupted = True
                 if select.select([fd], [], [], 0.1)[0]:
                     try:
@@ -222,10 +231,13 @@ class BenchmarkTests(unittest.TestCase):
                         break
                     output += data
             else:
-                self.fail(f'Ctrl-C timed out; last output: {output[-2000:]!r}')
+                self.fail(f'Terminal cancellation timed out; last output: {output[-2000:]!r}')
             _, status = os.waitpid(pid, 0)
             self.assertTrue(interrupted)
-            self.assertEqual(os.waitstatus_to_exitcode(status), 130, output.decode())
+            self.assertEqual(os.waitstatus_to_exitcode(status), 130 if keyboard else 143, output.decode())
+            child = int(pidfile.read_text())
+            state = subprocess.run(['ps', '-o', 'stat=', '-p', str(child)], capture_output=True, text=True)
+            self.assertTrue(not state.stdout.strip() or state.stdout.strip().startswith('Z'), state.stdout)
             self.assertIn(b'Cleaning up remote benchmark files', output)
             self.assert_clean()
         finally:
