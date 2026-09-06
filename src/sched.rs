@@ -489,11 +489,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_default_can_share_a_64_mib_file_after_the_first_request() {
+        for same_host in [false, true] {
+            let tuning = crate::transfer_tuning::TransferTuning::default();
+            let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20, same_host));
+            let mut inner = sched.inner.lock().unwrap();
+            inner.inflight.push(Arc::new(Mutex::new(RangeState {
+                idx: 0,
+                pos: 4 << 20,
+                end: 64 << 20,
+            })));
+            assert_eq!(sched.steal(&mut inner).is_some(), !same_host);
+        }
+    }
+
+    #[test]
     fn tuning_split_threshold_controls_when_idle_workers_can_help() {
         for (threshold, can_split) in [(8 << 20, true), (32 << 20, false)] {
             let tuning: crate::transfer_tuning::TransferTuning =
                 format!("split-min-size={threshold}").parse().unwrap();
-            let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20));
+            let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20, false));
             let mut inner = sched.inner.lock().unwrap();
             inner.inflight.push(Arc::new(Mutex::new(RangeState {
                 idx: 0,

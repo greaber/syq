@@ -1051,6 +1051,10 @@ pub(crate) struct SshMultiplexer {
 /// no-reauthentication window stays comparable to sudo's credential cache.
 const REUSE_PERSIST_SECONDS: &str = "300";
 
+/// Bound how much a small-file copy can put on a login shared with other
+/// commands. Larger trees retain independent SSH data connections.
+pub(crate) const SHARED_SSH_COPY_BYTES: u64 = 16 << 20;
+
 /// The oldest OpenSSH release whose client speaks the agent session-bind
 /// extension and host-bound public-key authentication. Constrained agent
 /// forwarding relies on both, on the local machine and on the coordinator
@@ -1176,11 +1180,6 @@ impl SshMultiplexer {
     }
 
     fn set_reuse_for_workers(&self, reuse: bool) {
-        // A persistent master is shared across runs; worker data channels
-        // must never ride it (MaxSessions contention, shared cipher stream).
-        if self.persistent {
-            return;
-        }
         self.reuse_for_workers.store(reuse, Ordering::Relaxed);
     }
 
@@ -1296,9 +1295,15 @@ impl RemoteSpec {
         }
     }
 
-    pub fn set_ssh_multiplexing(&self, reuse: bool) {
+    /// Enable worker reuse after planning a fresh small-file copy. `None`
+    /// disables reuse after an SSH channel refusal. Persistent logins accept
+    /// only bounded copies so bulk traffic keeps its own cipher stream.
+    pub fn set_ssh_multiplexing(&self, small_copy_bytes: Option<u64>) {
         if let Some(multiplexer) = &self.ssh_multiplexer {
-            multiplexer.set_reuse_for_workers(reuse);
+            multiplexer
+                .set_reuse_for_workers(small_copy_bytes.is_some_and(|bytes| {
+                    !multiplexer.persistent || bytes <= SHARED_SSH_COPY_BYTES
+                }));
         }
     }
 
@@ -1589,7 +1594,7 @@ impl RemoteSpec {
                     // healthy control connection while still allowing a new
                     // independently authenticated SSH connection. Disable
                     // reuse for every later worker and retry immediately.
-                    self.set_ssh_multiplexing(false);
+                    self.set_ssh_multiplexing(None);
                     if crate::transfer::debug() {
                         crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
@@ -3728,7 +3733,7 @@ mod tests {
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
 
-        spec.set_ssh_multiplexing(true);
+        spec.set_ssh_multiplexing(Some(SHARED_SSH_COPY_BYTES + 1));
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker
@@ -3766,7 +3771,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
+    fn persistent_reuse_shares_only_bounded_small_copies() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let base = directory.path().join("scope");
@@ -3818,12 +3823,24 @@ mod tests {
         assert!(control
             .iter()
             .any(|arg| arg == &format!("ControlPersist={REUSE_PERSIST_SECONDS}")));
-        // Worker data channels never ride a cross-run master, even when the
-        // small-file path asks for in-run multiplexing.
-        spec.set_ssh_multiplexing(true);
+        // No worker shares the login until the complete small-file plan is
+        // known. Larger trees and a refused channel keep independent SSH.
         let worker = args(spec.ssh_connection(true));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+        spec.set_ssh_multiplexing(Some(SHARED_SSH_COPY_BYTES));
+        let worker = args(spec.ssh_connection(true));
+        assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
+        assert!(worker
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+        assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
+        for bytes in [Some(SHARED_SSH_COPY_BYTES + 1), None] {
+            spec.set_ssh_multiplexing(bytes);
+            assert!(args(spec.ssh_connection(true))
+                .iter()
+                .any(|arg| arg == "ControlPath=none"));
+        }
     }
 
     #[test]

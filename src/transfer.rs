@@ -1805,7 +1805,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver), opts.tuning.pipeline_depth(), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
-            opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
+            opts.tuning.batch_bytes(), opts.tuning.split_min_size(block, opts.same_host),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
@@ -1828,7 +1828,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
-    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
+    let sched = Arc::new(Sched::new(
+        block,
+        opts.tuning.split_min_size(block, opts.same_host),
+    ));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -3125,7 +3128,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .filter_map(real_remote_spec)
                         .filter(|spec| spec.data_transport() == DataTransport::Ssh)
                     {
-                        spec.set_ssh_multiplexing(true);
+                        spec.set_ssh_multiplexing(Some(file_bytes));
                     }
                 }
                 if !workers_started {
@@ -3157,6 +3160,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     } else {
                         args.connections
                     };
+                    // A bounded SSH tree can finish on one reused channel.
+                    // Extra logins and channels cost more than the filesystem
+                    // overlap on a short copy. Explicit counts stay explicit,
+                    // and the tuner can still grow when enough work remains.
+                    if autotune
+                        && multiplex_small_files
+                        && file_bytes <= crate::conn::SHARED_SSH_COPY_BYTES
+                        && !opts.same_host
+                        && [&src_ep, &dst_ep]
+                            .into_iter()
+                            .filter_map(real_remote_spec)
+                            .any(|spec| spec.data_transport() == DataTransport::Ssh)
+                    {
+                        initial = 1;
+                    }
                     if single_direct_candidate {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;

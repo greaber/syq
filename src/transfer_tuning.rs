@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges: default auto; ranges bypasses whole-file and small-file copy shortcuts.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each request's full byte budget before issuing it. Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges: default auto; ranges bypasses whole-file and small-file copy shortcuts.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 8M between hosts, 32M on the same host; raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each request's full byte budget before issuing it. Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -96,9 +96,13 @@ impl TransferTuning {
     pub fn batch_override(self) -> bool {
         self.batch_files.is_some() || self.batch_bytes.is_some()
     }
-    pub fn split_min_size(self, hash_block: u64) -> u64 {
+    pub fn split_min_size(self, hash_block: u64, same_host: bool) -> u64 {
         self.split_min_size
-            .unwrap_or(DEFAULT_SPLIT_BYTES)
+            .unwrap_or(if same_host {
+                DEFAULT_SPLIT_BYTES
+            } else {
+                8 << 20
+            })
             .max(2 * hash_block)
     }
     pub fn validate(self, rate: u64) -> Result<()> {
@@ -287,7 +291,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(average.request_size(4 << 20, Some(&limit), false), 8 << 20);
-        assert_eq!(average.split_min_size(4 << 20), 8 << 20);
+        assert_eq!(average.split_min_size(4 << 20, true), 8 << 20);
         let interval: TransferTuning = "bw-pacing=250ms".parse().unwrap();
         assert_eq!(
             interval.request_size(4 << 20, Some(&limit), false),
