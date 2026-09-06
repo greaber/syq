@@ -93,7 +93,7 @@ impl Summary {
         })
     }
     pub(crate) fn description(&self) -> String {
-        format!("From: {}\nDestination: {}\n{}\nLimits: {} bytes, {} entries; at most {} deletions.\nPreserve permissions: {}.\nSource contents have not been inspected by this laptop.\n\nAllow this copy once?\nLocal command: syq recv approve {}", self.from, self.destination, self.permission,
+        format!("From: {}\nDestination: {}\n{}\nLimits: {} bytes, {} entries; at most {} deletions.\nPreserve permissions: {}.\nSource contents have not been inspected by this machine.\n\nAllow this copy once?\nLocal command: syq recv approve {}", self.from, self.destination, self.permission,
             self.max_bytes, self.max_entries, self.max_delete, self.preserve_permissions, self.id)
     }
 }
@@ -336,7 +336,9 @@ struct Notification {
 }
 impl Notification {
     fn spawn(description: &str, lifetime: Duration) -> Result<Self> {
-        let mut command = notification_command(description, lifetime);
+        Self::spawn_command(notification_command(description, lifetime))
+    }
+    fn spawn_command(mut command: std::process::Command) -> Result<Self> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -357,23 +359,39 @@ impl Notification {
             errors,
         })
     }
-    fn close(&mut self) {
-        if self.closed {
-            return;
+    fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if !self.closed {
+            self.closed = true;
+            // Keep the leader unreaped until after killing its process group.
+            // Its PID therefore cannot name an unrelated, newly created group.
+            unsafe {
+                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            }
         }
-        self.closed = true;
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        self.child.wait()
     }
     fn poll(&mut self) -> Option<Result<Option<bool>>> {
-        let status = match self.child.try_wait() {
-            Ok(Some(status)) => status,
-            Ok(None) => return None,
-            Err(e) => return Some(Err(e.into())),
+        // Observe exit without reaping: descendants may still hold our output
+        // pipes, and close must kill them before joining the capture threads.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
         };
-        self.close();
+        if result < 0 {
+            return Some(Err(std::io::Error::last_os_error().into()));
+        }
+        if info.si_signo == 0 {
+            return None;
+        }
+        let status = match self.close() {
+            Ok(status) => status,
+            Err(error) => return Some(Err(error.into())),
+        };
         let output = self.output.take().unwrap().join().unwrap_or_default();
         let errors = self.errors.take().unwrap().join().unwrap_or_default();
         Some(if !status.success() {
@@ -392,7 +410,7 @@ impl Notification {
 }
 impl Drop for Notification {
     fn drop(&mut self) {
-        self.close();
+        let _ = self.close();
         if let Some(reader) = self.output.take() {
             let _ = reader.join();
         }
@@ -425,6 +443,22 @@ mod tests {
             assert!(Instant::now() < deadline, "approval did not become pending");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn exited_prompt_closes_descendant_output_before_reaping() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30 & printf 'allow\\n'"]);
+        let mut prompt = Notification::spawn_command(command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(result) = prompt.poll() {
+                assert_eq!(result.unwrap(), Some(true));
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(prompt.closed);
     }
     #[test]
     fn decisions_are_local_one_use_and_expire() {

@@ -65,8 +65,7 @@ transport, and stopping receiving with persistence. Approval cases cover local
 allow/deny, one-use IDs, disconnect and settings cancellation, and explicit
 automatic approval. An isolated D-Bus notification service exercises the real
 Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
-service failure;
-only Allow starts a copy. This does not exercise a particular desktop's visual
+service failure; only Allow starts a copy. This does not exercise a particular desktop's visual
 layout or the macOS dialog.
 
 The smoke suite also checks that pooled helpers keep the spawning command’s
