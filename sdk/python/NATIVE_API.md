@@ -1,789 +1,666 @@
-# Python native API
+<a id="python-native-api"></a>
 
-The Python package pins a matching syq executable. To use a custom development
-build, pass executable= explicitly; see the [Python guide](https://greaber.github.io/syq/python-guide.html).
+<a id="positioning"></a>
 
-This document describes the Python interface to syq's native filesystem
-commands.
+<a id="scope"></a>
 
-## Positioning
+<a id="product-readiness"></a>
 
-Direct subprocess execution remains a good syq API:
+# API reference
 
-```python
-import subprocess
+Module functions `syq.cp`, `syq.rm`, and `syq.map` use a default `Client`.
+`AsyncClient` has the same arguments and result types; await its operations
+except `map`, which returns an async context manager.
 
-subprocess.run(
-    ["syq", "cp", "project", "--to", "server", "--into", "/backup"],
-    check=True,
-)
-```
-
-A caller that only needs to start one command and fail when it fails does not
-need a Python abstraction. The Python package is for callers that need one or
-more of these additional guarantees:
-
-- a verified syq executable pinned to the Python package;
-- lossless structured mapping input and output;
-- typed, streaming operation events and terminal results;
-- detection of malformed, unsupported, or incomplete machine output;
-- safe process cancellation and cleanup; or
-- composition of map, transform, copy, and retry workflows in Python.
-
-The library invokes the syq executable. It does not reimplement copying, path
-resolution, conflict detection, remote access, or retry policy in Python.
-
-## The native vocabulary is the Python vocabulary
-
-The typed API mirrors the native command grammar. It must not require users to
-learn a second set of names for concepts that syq already names.
-
-| Native spelling | Python spelling |
-|---|---|
-| `syq cp` | `syq.cp()` or `Client.cp()` |
-| `syq cp --verify-only` | `syq.cp(verify_only=True)` |
-| `--ignore-existing` | `ignore_existing=True` |
-| `--existing` | `existing=True` |
-| `--update` | `update=True` |
-| `syq cp --prune` | `syq.cp(prune=True)` or `Client.cp(prune=True)` |
-| `syq rm` | `syq.rm()` or `Client.rm()` |
-| `syq map` | `syq.map()` or `Client.map()` |
-| `--root` | `root=` |
-| `--srcs-in` | `srcs_in=` |
-| `--follow-src` | `follow_src=` |
-| `--follow-dst` | `follow_dst=` |
-| `--into-existing` | `into_existing=` |
-| `--no-compress` | `no_compress=` |
-| `--max-delete` | `max_delete=` |
-| `--auth-from @laptop` | `auth_from="@laptop"` |
-| `--auth-from ssh` | `auth_from="ssh"` |
-| `--via @laptop` (alias) | `via="@laptop"` (alias) |
-| `--from` | `from_=` |
-| `--as` | `as_=` |
-| `class` event field | `class_` attribute |
-
-The only spelling transformations are mechanical:
-
-1. Replace hyphens with underscores because Python identifiers cannot contain
-   hyphens.
-2. Add a trailing underscore when the result is a Python keyword.
-
-This rule excludes semantic aliases such as `copy`, `remove`, `mapping`,
-`Sources`, `Remote`, `Into`, `Exact`, `comparison`, `compression`, and
-`bandwidth_limit`. Those names may read naturally in isolation, but they make
-every caller translate between two APIs.
-
-SDK-only controls have Python names because they have no native spelling. The
-initial ones are `on_event`, `timeout`, and `check`; their documentation must
-identify them as process- or library-level behavior rather than syq options.
-The typed `results=` parameter keeps the native concept and spelling, but
-accepts a Python binary file-like object instead of a path so applications can
-choose files, in-memory buffers, and their own stream adapters naturally.
-
-Not every command-line parsing convenience needs another Python parameter.
-The plural options `--srcs`, `--src-files`, and `--src-dirs`
-only batch values on a command line. Python passes a sequence to the matching
-singular keyword instead. This removes redundant syntax without renaming a
-product concept:
-
-```python
-syq.cp(src=["a", "b"], src_dir=["assets", "fonts"], into="archive")
-```
-
-The implementation serializes this as repeated `--src` and `--src-dir`
-options. When a path begins with `-`, it uses the native attached spelling such
-as `--src-dir=-`; callers still pass the path itself. A keyword accepts either
-one path or an iterable of paths; `str`, `bytes`, and path-like objects are
-always treated as scalar paths rather than iterables.
-
-## Scope
-
-The typed interface covers native `cp`, including its `--prune` mode, `rm`,
-and `map`. It does not wrap `syq rsync`, which remains available through
-`Client.run` and the module-level `syq.run` function. Enrollment and other
-administrative commands also remain raw operations until they have a stable
-machine contract that benefits from Python types.
-
-Module functions and client methods have the same operation names and
-signatures. A module function uses a default `Client`; applications that need
-shared configuration or an explicit executable construct a client.
-
-## A normal copy
-
-```python
-import syq
-
-result = syq.cp(
-    "project",
-    to="server",
-    into="/backup",
-)
-
-print(result.files_transferred, result.bytes_transferred)
-```
-
-The corresponding native command is:
-
-```text
-syq cp project --to server --into /backup
-```
-
-There are no endpoint or placement wrapper objects. Endpoint strings use the
-native `[USER@]HOST` grammar, paths remain separate arguments, and omission of
-`from_` or `to` means local exactly as it does on the command line:
-
-```python
-syq.cp(
-    src=["a", "b"],
-    from_="grant@server",
-    cwd="/data",
-    into="./data",
-)
-
-syq.cp(
-    "report",
-    to="grant@[2001:db8::1]",
-    as_new="/reports/final",
-    hash=True,
-)
-```
-
-`cp` returns only after it has received and validated the terminal result and
-reaped the process. By default, a non-successful terminal result raises
-`SyqOperationError`; the exception retains the same typed result. Pass
-`check=False` when a partial or refused outcome is expected program logic.
+<a id="synchrony-asyncio-and-resource-ownership"></a>
 
 ## Client and executable selection
 
-```python
-client = syq.Client(
-    cache_dir="/var/cache/my-application",
-    process_cwd="/srv/jobs",
-    timeout=3600,
-)
+`Client(*, executable=None, cache_dir=None, process_cwd=None, env=None, timeout=None)`
+and `AsyncClient(...)` accept:
 
-result = client.cp("project", to="server", into="/backup")
-```
+| Argument | Meaning |
+|---|---|
+| `executable` | Custom executable path, or name to find on `PATH`; default: managed syq |
+| `cache_dir` | Managed executable cache root |
+| `process_cwd` | Local subprocess working directory; default: inherit |
+| `env` | Subprocess environment mapping; default: inherit |
+| `timeout` | Operation timeout in seconds; default: no limit |
 
-`Client()` lazily installs and uses the exact official syq release pinned by
-the Python package. Each operation verifies the cached executable according to
-the package's existing complete-byte manifest policy before it starts. A
-`Client` may reuse configuration and safe validation metadata, but it does not
-turn path reuse into a weaker executable check.
+`client.version()` returns the executable version as text.
+`syq.version(executable=None)` does the same without a client.
+`syq.managed_executable(cache_dir=None)` returns the verified executable path,
+downloading it if needed. See [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility) for version selection and caching.
 
-An explicit executable opts out of the supported binary pairing:
-
-```python
-client = syq.Client(executable="/opt/syq/bin/syq")
-```
-
-Typed operations still validate the automation schema they receive, but the
-package makes no behavioral compatibility or provenance guarantee for an
-override. It never silently falls back from an override to the managed binary
-or from the managed binary to `PATH`.
-
-Client defaults may be overridden for one operation. A client is safe to use
-for independent sequential calls. Concurrent-call and thread-safety promises
-must be decided from the implementation rather than implied by this document.
-
-`process_cwd` is the local subprocess working directory. It is deliberately
-not called `cwd`: on typed commands, `cwd` always means native `--cwd`.
-The existing raw `run(cwd=...)` spelling retains its subprocess meaning for
-backward compatibility.
+<a id="the-native-vocabulary-is-the-python-vocabulary"></a>
 
 ## Arguments and validation
 
-The conceptual `cp` signature is:
+Options use CLI names with hyphens replaced by underscores. Python keywords
+get a trailing underscore: `from_`, `as_`. Paths accept `str`, `bytes`, or
+`os.PathLike`; selector keywords accept one path or an iterable of paths.
+Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_file` and `src_dir`.
 
-```python
-syq.cp(
-    *sources,
-    src=None,
-    srcs_in=None,
-    src_file=None,
-    src_dir=None,
-    from_=None,
-    cwd=None,
-    root=None,
-    follow=False,
-    follow_src=False,
-    follow_dst=False,
-    to=None,
-    into=None,
-    into_new=None,
-    into_existing=None,
-    as_=None,
-    as_new=None,
-    as_existing=None,
-    mapping=None,
-    results=None,
-    prune=False,
-    dry_run=False,
-    hash=False,
-    no_compress=False,
-    bwlimit=None,
-    connections=None,
-    coordinate_at=None,
-    rsh=None,
-    pscope=None,
-    syq_path=None,
-    no_bootstrap=False,
-    tcp_plain=False,
-    no_tcp=False,
-    tcp_ports=None,
-    tcp_congestion=None,
-    peer_auth=None,
-    receiver_max_entries=None,
-    receiver_max_bytes=None,
-    receiver_receipt=None,
-    ignore=None,
-    ignore_from=None,
-    preserve=None,
-    inplace=False,
-    max_size=None,
-    min_size=None,
-    max_delete=None,
-    on_event=None,
-    timeout=None,
-    check=True,
-)
-```
+| Shared by `cp`, `rm`, and `map` | Meaning |
+|---|---|
+| `*sources`, `src` | Select named objects |
+| `srcs_in` | Select a directory's contents |
+| `src_file`, `src_dir` | Require non-directory objects or directories |
+| `cwd` | Source resolution base; may be remote for `cp` and `rm` |
+| `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
+| `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
+| `timeout` | Omitted: use client default; `None`: no timeout; number: timeout in seconds |
 
-The conceptual `rm` signature keeps the subset of that grammar which native
-removal accepts:
+Boolean flags default to `False`; other optional arguments default to `None`,
+except `check=True` and `timeout`, whose omitted value inherits the client default.
+Invalid argument combinations raise `SyqInvocationError`;
+filesystem and remote checks happen in syq.
 
-```python
-syq.rm(
-    *sources,
-    src=None,
-    srcs_in=None,
-    src_file=None,
-    src_dir=None,
-    from_=None,
-    cwd=None,
-    root=None,
-    follow=False,
-    follow_src=False,
-    results=None,
-    dry_run=False,
-    connections=None,
-    syq_path=None,
-    no_bootstrap=False,
-    pscope=None,
-    on_event=None,
-    timeout=None,
-    check=True,
-)
-```
+<a id="a-normal-copy"></a>
 
-Bare positional paths have the native bare-source meaning. Selector keywords
-retain the native meanings:
+<a id="copy-and-prune"></a>
 
-| Python keyword | Native option | Meaning |
+<a id="dry-runs"></a>
+
+## cp
+
+`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-reference.html#cpresult) copies files. Choose one placement option.
+In addition to the shared arguments above, it accepts:
+
+| Options | Values / purpose |
+|---|---|
+| `from_`, `to` | SSH endpoint strings; omitted endpoints are local |
+| `into`, `into_new`, `into_existing` | Destination directory paths |
+| `as_`, `as_new`, `as_existing` | Exact destination paths |
+| `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
+| `follow_dst` | Boolean: follow destination symlinks |
+| `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
+| `ignore_existing`, `existing`, `update` | Boolean: skip existing, require existing, or skip newer destination files |
+| `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
+| `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
+| `preserve` | Preservation string or iterable of strings |
+| `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
+| `bwlimit`, `min_size`, `max_size` | Native rate/size strings or integers |
+| `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
+| `connections` | Positive integer connection count |
+| `auth_from`, `via` | Credential source string; aliases, so use only one |
+| `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
+| `pscope`, `syq_path` | SSH persistence scope path and remote executable path |
+| `no_bootstrap`, `tcp_plain`, `no_tcp` | Boolean remote/transport controls |
+| `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
+| `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
+| `receiver_receipt` | `"sizes"` or `"digests"` |
+| `on_event`, `results`, `check` | See events and failures below |
+
+Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
+and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
+Typed remote-to-remote copies require an enrolled receiver or
+`coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
+`coordinate_at="local"`. Use `run` for detached commands and human output options.
+
+`IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
+`bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
+`ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
+
+<a id="removal"></a>
+
+## rm
+
+`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
+arguments, it accepts `from_`, `dry_run`, `connections`, `syq_path`,
+`no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
+It supports local and ordinary SSH endpoints. Command-restricted receivers
+reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
+
+<a id="complete-input-guarantee"></a>
+
+<a id="mapping-transformation-and-copy"></a>
+
+## map
+
+`map(*sources, **options) → MapStream` lists local mapping entries without
+copying. Besides the shared arguments, it accepts `as_` to rename a selected
+object. `srcs_in` must be the sole selector when used.
+
+`MapStream` is a `Mapping` and an iterable context manager; use `with`.
+`AsyncMapStream` is an `AsyncMapping` and an async context manager; use
+`async with`. Streams must be consumed inside their context and cannot be reused
+after completion or closure. Async streams capture the producer directory,
+environment, and timeout when created, even though execution starts later.
+
+### Mapping and AsyncMapping
+
+A mapping combines entries with their local source context. Pass it directly
+to `cp(mapping=...)`, even on a client with a different `process_cwd`.
+
+`Mapping(entries, *, cwd=None, root=None, follow_src=False)` accepts an iterable
+of `MappingEntry`. `AsyncMapping(...)` accepts an async iterable. If both `cwd`
+and `root` are omitted, the source base is the current directory at construction.
+Otherwise exactly one may be supplied. Relative `cwd` and `root` paths resolve
+against the Python process directory at construction, not a client's
+`process_cwd`. `root` confines source resolution.
+
+| Member | Type | Meaning |
 |---|---|---|
-| `src` | `--src` | Select a named object |
-| `srcs_in` | `--srcs-in` | Select a directory's contents |
-| `src_file` | `--src-file` | Require a non-directory object |
-| `src_dir` | `--src-dir` | Require a directory |
+| `cwd` | `pathlib.Path` | Absolute source-base spelling, preserving symlinks and `..` |
+| `root` | `pathlib.Path` or `None` | Confinement base, when created with `root` |
+| `follow_src` | `bool` | Whether the copy should follow source symlinks |
+| `transform(function)` | `Mapping` or `AsyncMapping` | Lazy transformation that keeps the source context |
 
-Placement is expressed by exactly one of the six native placement keywords:
-`into`, `into_new`, `into_existing`, `as_`, `as_new`, or `as_existing`.
-Their behavior, including the `new` and `existing` pathname checks, is the
-native behavior. The Python package does not strengthen them into locks or
-compare-and-swap operations.
+The context properties are read-only. A transform receives each `MappingEntry`
+and returns a replacement entry, or `None` to omit it. Transformations can be
+chained. Async transforms also accept awaitable callbacks and await them in
+entry order. Neither form caches entries; reuse depends on the supplied iterable.
 
-Python performs structural validation that requires no filesystem or network
-access, such as conflicting placement parameters, `as_` with multiple
-sources, and selectors or `prune=True` combined with `mapping`. The executable
-remains authoritative for path resolution, type checks, endpoint behavior,
-and filesystem state. Errors use native option names so they remain searchable
-in `syq --help` and the README.
+A context-carrying mapping rejects `from_`, `cwd`, and `root` overrides on `cp`.
+It automatically enables the source-following policy used by `map`; enabling
+`follow` or `follow_src` on the copy is also permitted. The destination options
+remain independent. `map(root=..., srcs_in=...)` carries the selected directory
+as the consuming copy's root. The copy resolves that root again; it does not
+inherit an open directory handle or a snapshot of the source tree.
 
-`cwd` and `root` are mutually exclusive and retain the native source-base
-meanings for `cp`, `rm`, and `map`. `cwd` is a resolution base rather than a
-containment boundary; relative selectors may leave it through `..`, and
-absolute selectors ignore it. `root` confines component-by-component
-resolution beneath the pinned directory, so its selectors must be relative.
-Directly supplied selectors may otherwise contain `.` and `..`; mapping-entry
-paths retain their separate strict relative grammar. Input paths accept text
-and byte path-like objects on supported Unix systems; byte paths are not
-decoded merely to build argv.
+### MappingEntry
 
-`follow`, `follow_src`, `follow_dst`, `hash`, `no_compress`, `bwlimit`,
-`connections`, `ignore`, `ignore_from`, `preserve`, `inplace`, `max_size`,
-`min_size`, and `dry_run` retain the exact native meanings. `receiver_max_entries` and
-`receiver_max_bytes` expose the native command-restricted receiver ceilings and are
-therefore accepted only for a direct remote-to-remote copy using an enrolled
-receiver. Rate, size, and duration values accept the native spellings; the
-Python API does not replace them with differently defined unit types.
-`pscope` selects an ephemeral SSH persistence scope created by
-`syq persist on --ephemeral` for `cp` or `rm`. It cannot be combined with
-`rsh`, and the executable remains authoritative for whether the selected
-topology can use the scope. `receiver_receipt` accepts `"sizes"` or `"digests"` and has
-the native receiver-only meaning; `"digests"` asks the receiver to include
-closure-time BLAKE3 file digests.
+Frozen dataclass describing one source-to-destination mapping. Pass an iterable
+of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 
-Native ignore rules form one ordered stream: `--ignore` and `--ignore-from`
-take effect in command-line order, and the last matching rule wins. A simple
-`ignore_from=` value follows every pattern supplied through `ignore=`. When
-the two option kinds must be interleaved, put `syq.IgnoreFrom(path)` values in
-the ordered `ignore=` sequence:
+| Attribute | Type | Meaning |
+|---|---|---|
+| `src` | `RelativePath` | Path relative to the copy's source base |
+| `dst` | `RelativePath` | Path relative to the destination container |
+| `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
+| `size` | `int` or `None` | Informational size in bytes; default `None` |
+| `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
 
-```python
-syq.cp(
-    "source",
-    into="destination",
-    ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"],
-)
-```
+`MappingEntry(src, dst, kind=None, size=None, mtime=None)` also accepts text or
+byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
+`mtime` do not impose preconditions on the copy.
 
-This serializes as `--ignore-from rules --ignore '!keep.tmp'`. Python cannot
-recover the order in which separately named keyword arguments appeared in a
-call, so `IgnoreFrom` is the native `--ignore-from` occurrence used inside the
-single ordered stream rather than a new filtering concept.
+### RelativePath and PathValue
 
-Native remote controls keep their command names mechanically (a
-remote-to-remote copy needs either a command-restricted receiver
-enrollment — its verified receipt becomes the receiver-attested
-results stream — or an explicit `coordinate_at="local"`; syq refuses the
-combination at runtime otherwise): `coordinate_at`, `rsh`,
-`syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, and `peer_auth`. Endpoint strings passed through `from_` and `to` include
-the native optional port syntax. The executable remains authoritative for
-topology, transport, platform, enrollment, and credential-policy constraints.
+`RelativePath(value)` accepts text, bytes, or `os.PathLike`. It rejects empty
+paths, absolute paths, NUL bytes, and empty, `.` or `..` components. Join paths
+with `/`, for example `syq.RelativePath("archive") / entry.dst`.
 
-Human presentation options such as `verbose`, `quiet`, `stats`, `progress`,
-`no_progress`, and `progress_json` are initially omitted from typed methods.
-Typed methods consume structured results and applications render their own
-presentation. Callers that specifically want native human output use `run`.
-If a presentation option is later useful on a typed method, it must appear
-under its native name rather than under a Python synonym.
+`PathValue(raw: bytes)` holds a path received in an event, which may be absolute.
+Both types are immutable and provide:
 
-Typed `cp` and `rm` always consume the automation stream to produce their
-`CpResult` and `RmResult`.
-Passing `results=` also copies the validated NDJSON records to a caller-owned
-binary file-like object:
+| Member | Type | Meaning |
+|---|---|---|
+| `raw` | `bytes` | Original filename bytes; also returned by `bytes(path)` |
+| `text` | `str` | UTF-8 decoding; raises `UnicodeDecodeError` for invalid UTF-8 |
+| `str(path)` | `str` | Filesystem decoding with `os.fsdecode` |
+| `PathValue.display` | `str` | Same as `str(path)` |
 
-```python
-with open("run.ndjson", "wb") as records:
-    result = syq.cp("source", into="destination", results=records)
-```
+`RelativePath` also implements `os.PathLike`, returning bytes.
 
-The object must provide `write(bytes)` and may provide `flush()`. The SDK
-flushes it after a complete stream but never closes it. A valid `partial` or
-`refused` terminal record is written before `SyqOperationError` is raised, so
-the saved stream and the exception's result agree. The terminal record is
-withheld if the stream, process exit, or callback does not complete
-consistently. Sink failures abort the operation rather than making an
-incomplete saved stream look successful.
+Normal end of stream iteration checks the mapping process status. Leaving its
+context early stops the process. An exhausted or closed stream cannot be copied
+as an empty mapping.
 
-Internally, each typed operation creates a dedicated pipe and passes its write end using
-native `--results-fd`. It never asks syq to put machine output on stdout and
-never parses stdout as automation data. `--results-fd` is an implementation
-detail rather than a caller parameter. Callers that specifically need native
-`--results FILE` path behavior use `run`. Native and Python typed results both
-remain attached operations, so `detach` remains available only through raw
-`run`. A live direct remote-to-remote copy may coordinate remotely: the
-receiver's verified receipt returns as receiver-attested records in the same
-local stream. A remote-to-remote dry run has no such receipt stream and must
-use `coordinate_at="local"`. The SDK mirrors that refusal rather than silently
-opting into a local relay.
+For `cp(mapping=iterable)`, the entire iterable is saved to a temporary manifest
+before copying starts. An iteration, transformation, or serialization failure
+starts no copy. Plain iterables and manifest paths have no source context; pass
+`cwd`, `root`, or `from_` explicitly as needed. See
+[mapping rules](https://greaber.github.io/syq/mappings.html).
 
-## Mapping, transformation, and copy
-
-A mapping entry is a frozen dataclass. It represents the native NDJSON record,
-not a replacement command vocabulary:
-
-```python
-@dataclass(frozen=True, slots=True)
-class MappingEntry:
-    src: RelativePath
-    dst: RelativePath
-    kind: EntryKind | None = None
-    size: int | None = None
-    mtime: int | None = None
-```
-
-`size` and `mtime` are informational when emitted by `syq map`; `syq cp` does
-not turn them into preconditions. `kind` retains the manifest's current
-disambiguation semantics.
-
-`RelativePath` stores raw path bytes, validates mapping-relative syntax, and
-provides explicit text access plus byte-preserving joins. A valid UTF-8 path is
-convenient to construct from `str`; a non-UTF-8 path is constructed from
-`bytes`. Callers do not encode or inspect the NDJSON `{encoding, value}` form.
-
-`map` returns a context-managed `MapStream`:
-
-```python
-from dataclasses import replace
-
-import syq
-
-prefix = syq.RelativePath("by-year")
-
-with syq.map(srcs_in="photos") as mapping:
-    entries = (
-        replace(entry, dst=prefix / entry.dst)
-        for entry in mapping
-        if entry.kind is syq.EntryKind.FILE
-    )
-    result = syq.cp(
-        mapping=entries,
-        cwd=mapping.cwd,
-        to="storage",
-        into="/archive",
-    )
-```
-
-This corresponds to `syq map --srcs-in photos` followed by a transformed
-manifest and `syq cp --mapping ... -C photos --to storage --into /archive`.
-`MapStream.cwd` is the absolute, unresolved spelling of the source base needed
-to execute its emitted `src` paths. Keeping that property named `cwd` makes it
-directly usable as the native `cwd=` parameter. If `map(root=...)` was used,
-that root confines the mapping producer. The separate consumer process cannot
-inherit the producer's pinned descriptor, so it resolves this spelling again
-under its own source follow policy. If the spelling contains a symlink that the
-producer followed, pass `follow_src=True` to the consumer too; use `realpath`
-explicitly when a stable referent spelling is preferable.
-
-`MapStream` yields entries as `syq map` emits them. Reaching normal EOF
-verifies the producer's process status. Leaving the context early kills and
-reaps the owned process. A parse error, nonzero producer status, timeout, or
-interruption raises instead of presenting the yielded prefix as a complete
-mapping.
-
-The method retains `syq map`'s native limits for the pinned binary, including
-`follow_src=True` (or the `follow=True` umbrella) for resolving explicitly
-selected symlink paths. Initially,
-mapping emission is local and read-only, and the accepted selector and
-placement combinations are the ones documented for the executable. The
-client may reject a known-invalid combination before launch, but it does not
-invent a broader mapping operation.
-
-### Complete-input guarantee
-
-When `mapping` is a Python iterable, `cp` consumes and serializes the entire
-iterable into a secure temporary manifest before launching the mutating syq
-command. If iteration, transformation, serialization, or the `syq map`
-producer fails, no copy process has started and the destination is untouched.
-
-This is load-bearing. A pipe cannot distinguish a producer that cleanly
-finished from one that failed after writing a valid prefix. Launching the copy
-first could therefore apply an incomplete mapping. Materializing the complete
-mapping matches syq's whole-manifest conflict preflight and scales on disk
-rather than retaining another complete Python object graph.
-
-After successful materialization, syq performs its own authoritative manifest
-validation and conflict checks. The temporary file remains available until the
-child exits and is then removed. Its SDK-generated path is canonicalized before
-launch so a symlink in the system temporary-directory path does not require
-`follow=True`; this does not alter the treatment of caller-supplied paths.
-Passing a manifest path to `mapping` skips Python materialization and passes
-that file to syq unchanged.
-
-Callers that intentionally want raw stdin behavior can use:
-
-```python
-client.run(["cp", "--mapping", "-", "--into", "dst"], input=manifest)
-```
-
-That low-level call does not acquire typed `cp`'s complete-generator guarantee.
-The typed API does not initially expose a `stream=True` switch.
-
-## Copy and prune
-
-```python
-result = syq.cp(
-    srcs_in="build",
-    to="server",
-    into_existing="/srv/app",
-    prune=True,
-    max_delete=100,
-)
-```
-
-There is no `cp_prune` Python method because there is no `cp-prune` native
-command. `prune=True` serializes as `--prune` on `cp`; `max_delete` serializes
-as `--max-delete` and is valid only with `prune=True`. Prune does not accept
-`mapping`, because native mappings do not define deletion scopes. The library
-does not infer a deletion scope or retry a refused prune.
-
-## Removal
-
-Typed removal uses the native selector and endpoint grammar and returns a
-validated `RmResult`:
-
-```python
-result = client.rm(
-    src_dir="old-output",
-    from_="server",
-    root="/srv",
-)
-print(result.entries_removed, result.selectors_missing)
-```
-
-`SelectionResult` attributes every explicit selector by its zero-based order
-and records whether it resolved or was already missing. A live removal emits
-`RemovalResult` for each settled entry; a preview emits `RemovalTrace` for each
-entry it could inspect and a failed `RemovalResult` for an inspection failure.
-Duplicate and overlapping selectors remain distinct, and an entry removed by
-one before another reaches it has `ALREADY_ABSENT` disposition rather than
-being silently lost from the account.
-
-Local and ordinary SSH endpoints support typed removal. A command-restricted
-receiver rejects native `rm`: the current signed receiver grants authorize
-copy mutations, not arbitrary deletion, and the SDK does not weaken that
-boundary or fall back to parsing human output. Designing an explicit signed
-delete scope and safety ceiling is separate product work.
-
-## Dry runs
-
-`--dry-run` remains `dry_run=True` on the same operation:
-
-```python
-preview = syq.cp(srcs_in="build", into="staging", dry_run=True)
-preview = syq.cp(
-    srcs_in="build",
-    into_existing="staging",
-    prune=True,
-    max_delete=100,
-    dry_run=True,
-)
-removal_preview = syq.rm(src_dir="old-output", root="/srv", dry_run=True)
-```
-
-There are no `preview_copy` or `preview_copy_prune` commands. Those would
-rename the native operation and make flags change the Python verb. `CpResult`
-or `RmResult` carries `dry_run=True`; copy uses `TraceEvent` while removal uses
-`RemovalTrace` to describe planned mutations. Live runs use their corresponding
-`OperationResult` or `RemovalResult` records.
-
-A dry run describes what syq observed and would have done. It is not an
-executable transaction, authorization token, or promise that the filesystem
-will remain unchanged before a later operation. The automation results stream
-supplies the shared execution trace and terminal result.
+<a id="retry-data-not-automatic-retry-policy"></a>
 
 ## Events and terminal results
 
-Typed operations consume the stable automation stream. `on_event` receives
-frozen dataclasses corresponding to its known records: `RunEvent`, sampled
-`ProgressEvent`, copy `TraceEvent` or `OperationResult`, removal
-`SelectionResult`, `RemovalTrace`, or `RemovalResult` (including inspection
-failures during a preview), `ErrorEvent`,
-receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
-Additive unknown record types are validated for a well-formed envelope and
-sequence position, then ignored.
+`cp` and `rm` return frozen dataclasses after validating the complete results
+stream and process exit status. A truncated stream raises even if the process
+exits successfully. Dry runs return the same types, with planned totals.
 
-The product's [automation results contract](https://greaber.github.io/syq/automation.html) and
-[JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json), not this document, own
-their exact fields and enum members. The Python types expose every stable
-schema field without parsing display text.
+### CpResult
 
-The client validates at least these stream invariants:
+Returned by `cp()`, or available as `SyqOperationError.result` after an
+unsuccessful copy. Read attributes directly, for example
+`result.files_transferred`. It includes the common result fields below plus:
 
-- the schema identifier and supported major version;
-- the required first record;
-- strictly increasing sequence numbers starting at zero;
-- path tags and unsigned 64-bit integer ranges;
-- required fields and documented enum values;
-- the final-state object's per-state field variants and the
-  receiver-attested terminal shape (receipt status vocabulary, required
-  bookkeeping, and `deletions_completed`);
-- agreement between the invocation and the run's `mode`, command-specific
-  fields, and `dry_run` flag;
-- agreement between removal selector, per-path, and error records and every
-  corresponding terminal counter;
-- exactly one terminal result, with nothing after it; and
-- agreement between the terminal exit code and the reaped process status.
+| Attribute | Type | Meaning |
+|---|---|---|
+| `files_transferred` | `int` | Regular files transferred |
+| `files_unchanged` | `int` | Regular files skipped as unchanged |
+| `files_excluded` | `int` | Files excluded from copying |
+| `directories_created` | `int` | Directories created |
+| `symlinks_created` | `int` | Symbolic links created |
+| `specials_created` | `int` | Special filesystem objects created |
+| `bytes_transferred` | `int` | File-content bytes transferred, not compressed network traffic |
+| `bytes_unchanged` | `int` | Bytes in unchanged files |
+| `deletions_planned` | `int` or `None` | Entries selected for pruning |
+| `deletions_completed` | `int` or `None` | Entries pruned |
+| `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
+| `receipt` | `ReceiptSummary` or `None` | Verified receiver receipt details; `None` for ordinary copies |
 
-EOF without a terminal result is never success, even if every observed
-operation succeeded or the process status is zero.
+With `dry_run=True`, mutation totals describe planned changes. With
+`verify_only=True`, matching files count as unchanged; transfer and creation
+totals are zero. A failed call reports work completed before it stopped.
 
-Successful operation events are not retained by default. A copy or removal
-may contain millions of entries; callers that need a ledger consume `on_event`
-and write one. Terminal aggregates are retained in the returned command-specific
-result. `RmResult` separates selector resolution from planned, removed,
-already-absent, and failed entry totals. Prune-only
-deletion totals are optional fields on that same type. An ordinary terminal
-carries all three exactly when the run has `prune=True`; a receiver-attested
-terminal carries only `deletions_completed` (planning and `--max-delete`
-blocking are coordinator concepts a receipt cannot attest).
+Ordinary copies have all three deletion fields only with `prune=True`;
+otherwise they are `None`. Receiver-attested results have only
+`deletions_completed`, and their unchanged/excluded totals are always zero
+because the receiver cannot observe source-side skips. `receipt` is
+`None` for ordinary copies.
+
+### RmResult
+
+Returned by `rm()`, or available as `SyqOperationError.result` after an
+unsuccessful removal. It includes the common result fields below plus:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `selectors_total` | `int` | Explicit source selectors supplied |
+| `selectors_resolved` | `int` | Selectors that resolved to an object |
+| `selectors_missing` | `int` | Selectors already missing; this is not an error |
+| `entries_planned` | `int` | Entries a dry run would remove; zero in live runs |
+| `entries_removed` | `int` | Entries removed; zero in dry runs |
+| `entries_already_absent` | `int` | Entries gone by removal time; zero in dry runs |
+| `entries_failed` | `int` | Removal or inspection failures, including during dry runs |
+| `mode` | `str` | Always `"rm"` |
+
+Selectors identify requests; entries count individual filesystem objects. One
+directory selector can account for many entries. Duplicate and overlapping
+selectors have separate indexes.
+
+### Common result fields
+
+Both `CpResult` and `RmResult` include:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `status` | `OperationStatus` | Outcome from the table below |
+| `exit_code` | `int` | syq process exit code |
+| `dry_run` | `bool` | Whether this was a preview |
+| `errors` | `int` | Counted errors |
+| `elapsed_ms` | `int` | Run duration in milliseconds |
+| `protocol` | `ProtocolMetadata` | Automation envelope; also present on every event |
+
+### ProtocolMetadata
+
+Frozen dataclass accessed through `result.protocol` or `event.protocol`.
+The SDK checks these fields; applications normally only need them when recording
+or diagnosing a stream.
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `schema` | `str` | `"syq.automation"` |
+| `schema_version` | `int` | `1` |
+| `seq` | `int` | Record sequence number, starting at zero |
+| `type` | `str` | Wire record type; `"result"` for terminal totals |
+
+### ReceiptSummary
+
+Frozen dataclass accessed through `CpResult.receipt` for receiver-attested copies.
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `status` | `ReceiptStatus` | Receiver receipt outcome |
+| `operations` | `int` | Attested operation record count |
+| `final_states` | `int` | Attested final-state record count |
+| `records` | `int` | Total receipt record count |
+| `provenance` | `str` | `"receiver_attested"` |
+
+### OperationStatus
+
+String enum: compare with `syq.OperationStatus.SUCCESS`, or use `.value` for
+`"success"`.
+
+| Member | Value | Exit code | Meaning |
+|---|---|---|---|
+| `SUCCESS` | `"success"` | `0` | Requested operation succeeded |
+| `PARTIAL` | `"partial"` | `23` | Per-entry failures; independent work finished |
+| `REFUSED` | `"refused"` | `25` | A safety cap refused deletions; copy only |
+| `ABORTED` | `"aborted"` | `1` | Operation aborted; copy only |
+| `FAILED` | `"failed"` | `1` | Fatal failure |
+
+### Event callbacks
+
+`on_event(event)` receives an `AutomationEvent` in stream order. Events are not
+stored in the result. `AsyncClient` accepts synchronous or awaitable callbacks;
+awaitable callbacks count toward the timeout.
+
+`AutomationEvent` is the union of the event classes below and `CpResult` and
+`RmResult`. Each event is a frozen dataclass. Its fields are listed below;
+all events also carry `protocol: ProtocolMetadata`, just like results.
+`event.protocol.type` identifies the wire record type. Optional fields use `None` when unavailable.
+
+See [Automation results](https://greaber.github.io/syq/automation.html) for stream
+semantics. Python exposes `class` as `class_` and paths as `PathValue`.
+
+`results=` accepts a binary file-like object with `write(bytes)` returning a
+positive byte count for nonempty writes, and optional `flush()`. The client
+copies validated NDJSON records, flushes after completion, and leaves it open.
+It withholds the terminal record if stream validation, process completion, or
+a callback fails. Sink failures raise and abort the operation.
+
+`OperationResult.is_retryable` identifies retryable failures; `retry_entry()`
+returns a `MappingEntry` when a complete mapping identity is available, otherwise
+`None`. Only use collected entries after the call returns a validated `success`
+or `partial` result. A terminal callback alone does not establish completion.
+The client does not retry automatically.
+
+
+## Event types
+
+### RunEvent
+
+Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
+`prune` and `mapping` are `None` for removal; `verify_only` defaults to `False`.
+
+`protocol.type = "run"`. Fields in addition to the common envelope:
+
+```python
+run_id: str
+started_at: int
+syq_version: str
+mode: str
+prune: bool | None
+mapping: bool | None
+dry_run: bool
+endpoints: tuple[Endpoint, ...]
+verify_only: bool
+```
+
+### ProgressEvent
+
+Sampled progress for displays; use the terminal result for final totals.
+Byte fields measure file content (comparison work with `verify_only=True`),
+`scanned` counts scanned entries, and `elapsed_ms` is milliseconds.
+
+`protocol.type = "progress"`. Fields in addition to the common envelope:
+
+```python
+bytes_done: int
+bytes_total: int
+bytes_unchanged: int
+files_done: int
+files_total: int
+files_unchanged: int
+files_excluded: int
+scanned: int
+scan_done: bool
+elapsed_ms: int
+```
+
+### TraceEvent
+
+One planned copy change. `dst` is relative to the destination container;
+`src` is the mapping source when available. `bytes` is the planned file size,
+and `reason` describes why the change is needed.
+
+`protocol.type = "trace"`. Fields in addition to the common envelope:
+
+```python
+action: OperationAction
+dst: PathValue
+src: PathValue | None
+kind: EntryKind
+bytes: int | None
+reason: TraceReason
+```
+
+### OperationResult
+
+One copy outcome. `dst` is destination-relative, or relative to the signed
+destination `scope` for a receiver receipt. `src` is present for mapping entries
+when available. `bytes` and `attempts` give transfer information. Error details
+are present when known; `message` is display text. `provenance`, `scope`, and
+`code` apply to receiver-attested outcomes.
+
+`protocol.type = "operation_result"`. Fields in addition to the common envelope:
+
+```python
+action: OperationAction
+dst: PathValue
+src: PathValue | None
+kind: EntryKind | None
+disposition: Disposition
+bytes: int | None
+attempts: int | None
+retryable: Retryability | None
+class_: ErrorClass | None
+os_kind: OsKind | None
+message: str | None
+provenance: str | None
+scope: int | None
+code: ReceiptCode | None
+```
+
+### SelectionResult
+
+One removal selector, indexed from zero. `path` is the original selector;
+`status` says whether it resolved. `kind` is `None` for a missing selector.
+
+`protocol.type = "selection_result"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+status: SelectionStatus
+kind: EntryKind | None
+```
+
+### RemovalTrace
+
+One entry a preview would remove. `selector` identifies its source selector;
+`path` identifies the entry. `disposition` is always `WOULD_REMOVE`.
+
+`protocol.type = "removal_trace"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+kind: EntryKind
+disposition: RemovalDisposition
+```
+
+### RemovalResult
+
+One removal outcome or preview inspection failure. `selector` identifies its
+source selector; `path` identifies the entry. `attempts` counts attempts;
+`retryable`, `class_`, `os_kind`, and `message` describe failures when available.
+
+`protocol.type = "removal_result"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+kind: EntryKind | None
+disposition: RemovalDisposition
+attempts: int
+retryable: Retryability | None
+class_: ErrorClass | None
+os_kind: OsKind | None
+message: str | None
+```
+
+### ErrorEvent
+
+One counted error. `message` is display text; `class_` and `os_kind` classify
+it when known. Receiver errors can also carry `provenance` and `code`.
+
+`protocol.type = "error"`. Fields in addition to the common envelope:
+
+```python
+message: str
+class_: ErrorClass | None
+os_kind: OsKind | None
+provenance: str | None
+code: ReceiptCode | None
+```
+
+### FinalStateEvent
+
+Receiver-attested destination state. `dst` is relative to the signed `scope`.
+`provenance` is `"receiver_attested"`. Present objects have `kind` and byte
+`size`; `metadata`, `digest`, and `symlink_target` are present where available.
+`observation_error` describes a partial observation. Absent objects have no
+object details; failed observations have `code` and optional `message`.
+
+`protocol.type = "final_state"`. Fields in addition to the common envelope:
+
+```python
+provenance: str
+scope: int
+dst: PathValue
+state: FinalObjectState
+kind: FinalObjectKind | None
+size: int | None
+metadata: ObjectMetadata | None
+digest: AttestedDigest | None
+symlink_target: PathValue | None
+observation_error: str | None
+code: ReceiptCode | None
+message: str | None
+```
+
+### Endpoint, ObjectMetadata, and AttestedDigest
+
+Nested frozen dataclasses used by events:
+
+| Type | Fields | Meaning |
+|---|---|---|
+| `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH identity; host and user are optional |
+| `ObjectMetadata` | `mode: int`, `uid: int`, `gid: int`, `mtime: int`, `mtime_nsec: int`, `rdev: int` | Unix mode, owner/group IDs, modification time (seconds plus nanoseconds), and device ID |
+| `AttestedDigest` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal digest characters |
+
+## Enums
+
+All enums are string enums exported by `syq`. Members use uppercase names;
+values use lowercase, for example `EntryKind.FILE.value == "file"`.
+`OperationStatus` is defined with the result types above.
+
+| Type | Members |
+|---|---|
+| `EntryKind` | `FILE`, `DIR`, `SYMLINK`, `SPECIAL` |
+| `EndpointKind` | `LOCAL`, `SSH` |
+| `EndpointRole` | `SOURCE`, `DESTINATION` |
+| `OperationAction` | `TRANSFER_FILE`, `CREATE_DIRECTORY`, `CREATE_SYMLINK`, `CREATE_SPECIAL`, `DELETE`, `SET_METADATA`, `OBSERVE_HASH` |
+| `Disposition` | `SUCCEEDED`, `FAILED`, `BLOCKED`, `INCOMPLETE`, `OBSERVED` |
+| `ReceiptCode` | `NONE`, `EXECUTION_FAILED`, `AUTHORIZATION_REFUSED`, `FILE_LIFECYCLE_INCOMPLETE`, `OBSERVATION_FAILED` |
+| `FinalObjectState` | `PRESENT`, `ABSENT`, `OBSERVATION_FAILED` |
+| `FinalObjectKind` | `DIR`, `FILE`, `SYMLINK`, `FIFO`, `SOCKET`, `CHARACTER_DEVICE`, `BLOCK_DEVICE`, `OTHER` |
+| `ReceiptStatus` | `CLEAN`, `FAILED`, `INCOMPLETE` |
+| `Retryability` | `YES`, `NO`, `UNKNOWN` |
+| `ErrorClass` | `IO`, `TRANSPORT`, `CONFLICT`, `INTEGRITY`, `SAFETY_LIMIT`, `USAGE`, `INTERNAL` |
+| `OsKind` | `NOT_FOUND`, `PERMISSION_DENIED`, `ALREADY_EXISTS`, `INVALID_INPUT`, `NO_SPACE`, `QUOTA_EXCEEDED`, `READ_ONLY`, `OTHER` |
+| `TraceReason` | `DESTINATION_MISSING`, `TYPE_DIFFERS`, `CONTENT_DIFFERS`, `METADATA_DIFFERS`, `DESTINATION_ONLY` |
+| `SelectionStatus` | `RESOLVED`, `MISSING` |
+| `RemovalDisposition` | `WOULD_REMOVE`, `REMOVED`, `ALREADY_ABSENT`, `FAILED` |
+
+`ReceiptStatus.CLEAN` means a clean receipt, `FAILED` reports receiver failures,
+and `INCOMPLETE` reports an incomplete lifecycle. `Retryability.YES`, `NO`, and
+`UNKNOWN` state whether a failed entry can be retried.
 
 ## Failure model
 
-The exception families have distinct meanings:
+`SyqError` is the base class for every SDK-defined exception below. Specific
+subclasses retain their details so callers can distinguish an unsuccessful
+operation from a broken results stream.
 
-| Exception | Meaning |
+| Exception | Meaning / useful attributes |
 |---|---|
-| `SyqInstallError` | The managed executable could not be installed or verified |
-| `SyqInvocationError` | Python inputs cannot form a valid native operation |
-| `SyqProcessError` | Raw `run` completed with a nonzero status, preserving its current meaning |
-| `SyqOutputError` | A raw helper such as `version()` could not interpret its expected output |
-| `SyqProtocolError` | Machine output was malformed, unsupported, inconsistent, or incomplete |
-| `SyqOperationError` | A valid terminal result reports a non-successful operation |
+| `SyqInstallError` | Managed executable installation or verification failed |
+| `SyqInvocationError` | Invalid Python arguments |
+| `SyqOperationError` | Typed operation was unsuccessful; `.result` and `.stderr` (last 8 KiB) |
+| `SyqProtocolError` | Invalid, unsupported, inconsistent, or incomplete results; `.returncode`, `.stderr` |
+| `SyqProcessError` | Raw `run` exited nonzero; `.result` contains complete output |
+| `SyqOutputError` | A helper such as `version()` received unexpected output |
 
-`SyqOperationError.result` contains the typed terminal result and its `stderr`
-attribute retains up to the final 8 KiB of diagnostic output.
-`SyqProtocolError` retains the raw process status and bounded diagnostic
-context needed to investigate. Typed streaming calls drain stderr concurrently
-into that bounded in-memory tail rather than spooling the complete stream to
-temporary storage. Process spawn failures and timeouts retain the existing
-standard Python exception behavior of the raw adapter.
+For `cp` and `rm`, `check=False` returns unsuccessful typed results; for `run`,
+it returns nonzero process results. It does not suppress other errors.
+Spawn failures, timeouts, and ordinary Python type/value errors use standard
+Python exceptions. Exceptions from application callbacks or mapping iterators
+are re-raised unchanged. Async cancellation remains `asyncio.CancelledError`.
+These exceptions are not wrapped in `SyqError`.
 
-`check=False` affects only `SyqOperationError`. It cannot turn install,
-invocation, process, or protocol failures into successful return values.
+Timeout, cancellation, early mapping exit, and streaming failures terminate and
+reap the local process group, including SSH children. Filesystem changes already
+completed are not rolled back.
 
-If an event callback raises, the client stops scheduling through process
-termination, kills and reaps the owned process group, and re-raises the
-callback exception. Filesystem operations already committed by syq are not
-rolled back.
+<a id="deliberate-exclusions"></a>
 
-## Retry data, not automatic retry policy
+<a id="raw-execution"></a>
 
-A failed `OperationResult` exposes its structured retryability and can produce
-a `MappingEntry` only when it contains a complete mapping identity:
+## run
+
+`client.run(args, *, check=True, cwd=None, env=None, timeout=CLIENT_DEFAULT, input=None)`
+returns [Result](https://greaber.github.io/syq/python-reference.html#result). `input` accepts bytes. `args` is a sequence of arguments
+after the executable name, passed without a shell.
+
+Here, `cwd` is the local subprocess directory. `cwd` and `env` use client
+defaults when omitted or `None`. `timeout` uses the client default only when
+omitted; explicit `None` disables it. Module-level `syq.run` takes the same
+arguments plus `executable=None` and defaults to no timeout.
+
+Wrappers can forward `syq.CLIENT_DEFAULT` to preserve client inheritance.
+`syq.Timeout` is the type alias for a number, `None`, or that sentinel:
 
 ```python
-retryable = []
-
-def collect_retryable(event: syq.AutomationEvent) -> None:
-    if isinstance(event, syq.OperationResult) and event.is_retryable:
-        entry = event.retry_entry()
-        if entry is not None:
-            retryable.append(entry)
+def copy_data(client: syq.Client, *, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
+    return client.cp("data", into="backup", timeout=timeout)
 ```
 
-The package may provide a disk-backed `RetryManifest` convenience, but it does
-not automatically rerun operations. Retry timing, attempt limits, and whether
-the source/destination state is still appropriate belong to the application.
+`CLIENT_DEFAULT` applies to client methods (including module-level `cp`, `rm`,
+and `map`); client constructors and module-level `run` have no client default
+to inherit.
 
-An incomplete stream cannot produce a complete retry manifest: unobserved
-operations may exist. Collected entries must not be used until the terminal
-result arrives with status `success` or `partial`, the two statuses for which
-the automation contract guarantees that every queued operation settled.
+Timeouts cover subprocess execution. Managed installation and mapping-input
+materialization happen before the copy process starts and are not covered by
+its timeout. Async cancellation still stops mapping-input preparation.
 
-## Raw execution
-
-The existing escape hatch remains small and transparent:
+`syq exec` is also available through `run`; its command output and exit status
+are a process result:
 
 ```python
-result = client.run(
-    ["receiver", "list"],
-    check=True,
-    timeout=30,
+result = syq.run(
+    ["exec", "--on", "@mac", "--cwd", "work/project", "--", "cargo", "test"],
+    executable="/path/to/syq",
 )
 ```
 
-`Client.run` and `syq.run` accept only arguments after the executable name and
-never construct a shell command. The process layer also supports:
+For `exec`, pass `--cwd` in the argument list to select the receiving working
+directory. The SDK's `cwd=` parameter selects the local working directory of
+the requesting syq process.
 
-- `input=` for bounded bytes;
-- text and byte path-like argv entries on Unix; and
-- complete byte stdout and stderr capture for callers that deliberately need
-  the raw process output.
+### Result
 
-Raw execution returns raw bytes and a process status. It does not parse human
-output, infer native objects from argv, or claim the structured completion
-guarantees of typed methods.
+Frozen dataclass returned by `run()` and held in `SyqProcessError.result`:
 
-## Synchrony, asyncio, and resource ownership
-
-`Client` and `AsyncClient` both expose `run`, `version`, typed `cp` (including
-`prune=True`), `rm`, and `map`. Their public method names, parameter names,
-defaults, result objects, validation, and failure types match. `AsyncClient`
-uses native asyncio subprocesses rather than wrapping the synchronous client
-in a thread.
-
-```python
-client = syq.AsyncClient(process_cwd="/srv/jobs")
-result = await client.cp("project", to="server", into="/backup")
-removed = await client.rm("old-project", from_="server")
-
-async with client.map(srcs_in="photos") as mapping:
-    result = await client.cp(mapping=mapping, cwd=mapping.cwd, into="photos")
-```
-
-`AsyncClient.map()` returns `AsyncMapStream` directly; the subprocess starts
-lazily on context entry or first iteration, so there is no extra `await`
-before `async with`. Its `on_event` accepts either an ordinary callback or an
-awaitable callback. Awaitable callbacks run in record order and count toward
-the operation timeout. An ordinary callback runs on the event-loop thread and
-should return quickly.
-
-The deliberately asynchronous additions are support for async mapping
-iterables, awaitable event callbacks, and async iteration/context management.
-Writes to a synchronous `results=` object are buffered to a bounded size and
-performed off the event-loop thread. Both clients preserve record order and
-leave the object open.
-
-Normal method calls reap before returning. Early mapping-context exit,
-timeout, cancellation, callback failure, or decoder failure kills and reaps
-the whole owned process group so SSH transports and other descendants cannot
-survive as stale work. Python mapping iterables are fully materialized in a
-worker thread before `cp` starts. Async iterables are consumed incrementally
-and flushed in bounded chunks, also before process launch. Cancellation asks
-synchronous materialization to stop between iterator and temporary-file
-operations, then waits only for an in-flight operation before removing the
-file.
-
-## Compatibility and versioning
-
-Every published Python package has the same version as the exact syq release it
-pins. That is the tested default pairing, and a published Python version never
-changes its pin. Python-only changes ship with the next syq release rather than
-creating an independently numbered package.
-
-The automation schema has its own version. The Python package supports stated
-schema major versions rather than guessing compatibility from the executable's
-marketing version. Additive fields and enum values follow the automation
-schema's compatibility policy.
-
-Mapping entries are supported at the exact SDK/binary pairing. A separately
-versioned mapping schema can broaden that compatibility boundary later.
-
-The Python package does not maintain a compatibility version separate from the
-syq product release. Python API and native changes still follow their documented
-compatibility contracts; sharing a release number does not make the executable
-version a substitute for the automation schema version.
-
-The naming rule is part of compatibility. A new native command `foo-bar`
-reserves `foo_bar`; a new semantic `--some-option` reserves `some_option`.
-SDK-only concepts must not occupy names that are the mechanical Python form of
-current or planned native grammar. A parsing-only alias may be omitted, as with
-the plural selector options, but must not be exposed under a different name.
-
-## Deliberate exclusions
-
-The initial typed API does not provide:
-
-- a Python implementation of the transfer engine;
-- FFI or an in-process Rust runtime;
-- a typed mirror of `syq rsync`;
-- semantic aliases for native commands or options;
-- a generic `extra_args` hole in typed methods—use `run` instead;
-- automatic retries or rollback;
-- an unbounded in-memory operation ledger;
-- implicit confirmation for destructive operations;
-- implicit selection of a newer syq from `PATH`; or
-- API promises for human stdout, stderr, or progress formatting.
-
-## Product readiness
-
-| Layer | Product dependency | Current readiness |
+| Attribute | Type | Meaning |
 |---|---|---|
-| Managed executable and raw `run` | Released binary manifest | Implemented |
-| Raw stdin and safe streaming | Process behavior only | Implemented |
-| `RelativePath` and mapping codecs | Exact binary pairing | Implemented |
-| `map` and safe `cp(mapping=...)` input | Native mapping commands | Implemented |
-| Typed `cp`, including `prune=True` | Automation results stream | Implemented |
-| Typed `rm` | Native `rm` result stream | Implemented for local and ordinary SSH endpoints |
-| Typed `dry_run=True` | Automation trace records | Implemented |
-| Asyncio native commands and mapping stream | Same contracts as `Client` | Implemented |
+| `argv` | `tuple[str \| bytes, ...]` | Executed argument list, including the executable |
+| `returncode` | `int` | Process exit status |
+| `stdout` | `bytes` | Complete captured standard output |
+| `stderr` | `bytes` | Complete captured standard error |
 
-The source inventory `native-api.json` records the disposition of every native
-option. Rust tests require new options to appear there. A feature PR may put an
-option in `follow_up` instead of implementing Python immediately, but the syq
-release workflow rejects any remaining follow-up. A post-merge workflow keeps
-one GitHub tracking issue open while follow-ups exist. Python signature tests
-and candidate execution tests verify the other side of the contract.
+<a id="compatibility-and-versioning"></a>
+<a id="syq-language-sdks"></a>
+
+## Compatibility
+
+Python 3.10+ on Linux and macOS; no runtime Python dependencies. Each Python
+package uses the matching syq release. `syq.__version__` and
+`syq.PINNED_SYQ_VERSION` report those versions. Pin the package in your dependency
+file to keep the pairing.
+
+### Managed executable
+
+The default client downloads the matching executable on first use and verifies
+it against the package's embedded release manifest. It checks the cached binary
+before every use and replaces missing or corrupt entries. It does not search
+`PATH`.
+
+The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
+`XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
+Use `Client(cache_dir=...)` to change the cache root, or
+`syq.managed_executable()` to download ahead of time and get the path.
+
+### Custom executable
+
+`Client(executable="/opt/bin/syq")` uses that binary;
+`Client(executable="syq")` searches `PATH`. Overrides bypass managed download
+and verification, so you are responsible for compatibility and origin. Typed
+calls still validate automation output. A failed executable selection does not
+fall back to another binary.

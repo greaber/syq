@@ -26,6 +26,7 @@ fn short_and_long_help_spellings_are_identical_at_every_public_level() {
     for path in [
         vec![],
         vec!["cp"],
+        vec!["exec"],
         vec!["rm"],
         vec!["map"],
         vec!["--self-update"],
@@ -116,6 +117,7 @@ fn lifecycle_and_root_help_describe_the_real_commands() {
     assert!(!run(&["--self-update", "unexpected"]).status.success());
     for path in [
         vec!["cp"],
+        vec!["exec"],
         vec!["receiver", "enroll"],
         vec!["persist", "on"],
         vec!["completion", "cache", "forget"],

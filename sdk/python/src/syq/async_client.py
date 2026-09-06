@@ -20,6 +20,8 @@ from collections.abc import (
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
+from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
+from ._mapping import AsyncMapping, _ContextMapping, _source_options
 from .managed import managed_executable
 from .client import (
     Argument,
@@ -379,7 +381,7 @@ class _AsyncLineProcess:
             self._output_transport = None
 
 
-class AsyncMapStream(AsyncIterator[MappingEntry]):
+class AsyncMapStream(AsyncMapping):
     """A lazy, context-managed, streaming ``syq map`` result."""
 
     def __init__(
@@ -388,10 +390,17 @@ class AsyncMapStream(AsyncIterator[MappingEntry]):
         argv: list[Argument],
         cwd: Path,
         timeout: float | None,
+        *,
+        confined: bool = False,
+        follow_src: bool = False,
     ) -> None:
+        # Initialize only source context: this stream supplies its own iterator.
+        _ContextMapping.__init__(
+            self, cwd=None if confined else cwd,
+            root=cwd if confined else None, follow_src=follow_src,
+        )
         self._client = client
         self._argv = argv
-        self.cwd = cwd
         self._timeout = timeout
         self._process: _AsyncLineProcess | None = None
         self._start_lock = asyncio.Lock()
@@ -406,6 +415,8 @@ class AsyncMapStream(AsyncIterator[MappingEntry]):
         return self._process
 
     def __aiter__(self) -> AsyncMapStream:
+        if self._complete:
+            raise SyqInvocationError("mapping stream is closed or exhausted")
         return self
 
     async def __anext__(self) -> MappingEntry:
@@ -488,7 +499,7 @@ class AsyncClient:
         check: bool = True,
         cwd: PathArgument | None = None,
         env: Mapping[str, str] | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         input: bytes | None = None,
     ) -> Result:
         return await _run(
@@ -497,7 +508,7 @@ class AsyncClient:
             check=check,
             cwd=self.process_cwd if cwd is None else cwd,
             env=self.env if env is None else env,
-            timeout=self.timeout if timeout is None else timeout,
+            timeout=resolve_timeout(timeout, self.timeout),
             input=input,
         )
 
@@ -507,25 +518,25 @@ class AsyncClient:
         return _version_from_result(await self.run(["--version"]))
 
     async def _start_line(
-        self, argv: list[Argument], *, timeout: float | None
+        self, argv: list[Argument], *, timeout: Timeout
     ) -> _AsyncLineProcess:
         command = (await self._executable_value(), *argv)
         return await _AsyncLineProcess.start(
             command,
             cwd=self.process_cwd,
             env=self.env,
-            timeout=self.timeout if timeout is None else timeout,
+            timeout=resolve_timeout(timeout, self.timeout),
         )
 
     async def _start_results(
-        self, argv: list[Argument], *, timeout: float | None
+        self, argv: list[Argument], *, timeout: Timeout
     ) -> _AsyncLineProcess:
         command = (await self._executable_value(), *argv)
         return await _AsyncLineProcess.start_results(
             command,
             cwd=self.process_cwd,
             env=self.env,
-            timeout=self.timeout if timeout is None else timeout,
+            timeout=resolve_timeout(timeout, self.timeout),
         )
 
     async def _typed(
@@ -539,7 +550,7 @@ class AsyncClient:
         selectors_total: int | None,
         on_event: AsyncEventCallback | None,
         results: BinaryIO | None,
-        timeout: float | None,
+        timeout: Timeout,
         check: bool,
     ) -> OperationSummary:
         process = await self._start_results(argv, timeout=timeout)
@@ -649,7 +660,7 @@ class AsyncClient:
         min_size: str | int | None = None,
         max_delete: int | None = None,
         on_event: AsyncEventCallback | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
         if (
@@ -664,6 +675,9 @@ class AsyncClient:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        cwd, root, follow_src = _source_options(
+            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+        )
         results = await _complete_task(
             asyncio.create_task(asyncio.to_thread(_prepare_results_file, results))
         )
@@ -821,7 +835,7 @@ class AsyncClient:
         no_bootstrap: bool = False,
         pscope: PathArgument | None = None,
         on_event: AsyncEventCallback | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> RmResult:
         results = await _complete_task(
@@ -871,8 +885,18 @@ class AsyncClient:
         follow: bool = False,
         follow_src: bool = False,
         as_: PathArgument | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
     ) -> AsyncMapStream:
+        # Keep lazy execution tied to the same cwd and environment used to
+        # derive the mapping's source context, even if the caller changes them.
+        environment = dict(os.environ if self.env is None else self.env)
+        producer = AsyncClient(
+            executable=self._executable,
+            cache_dir=self._cache_dir,
+            process_cwd=_map_stream_cwd(self.process_cwd, environment, None, None),
+            env=environment,
+            timeout=resolve_timeout(timeout, self.timeout),
+        )
         src_values = _values(src, label="--src")
         srcs_in_values = _values(srcs_in, label="--srcs-in")
         src_file_values = _values(src_file, label="--src-file")
@@ -929,9 +953,12 @@ class AsyncClient:
                 )
             contents_selector = srcs_in_values[0]
         effective_cwd = _map_stream_cwd(
-            self.process_cwd,
-            self.env,
+            producer.process_cwd,
+            producer.env,
             selected_base,
             contents_selector,
         )
-        return AsyncMapStream(self, argv, effective_cwd, timeout)
+        return AsyncMapStream(
+            producer, argv, effective_cwd, producer.timeout,
+            confined=root is not None, follow_src=follow or follow_src,
+        )

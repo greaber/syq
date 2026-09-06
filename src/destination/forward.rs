@@ -199,7 +199,7 @@ impl Receiver {
             let _sessions = self.sessions.lock().unwrap();
             (
                 self.generation.load(Ordering::Acquire),
-                self.forwarded.track(stream.try_clone()?)?,
+                self.active_streams.track(stream.try_clone()?)?,
             )
         };
         let socket = stream.try_clone()?;
@@ -914,13 +914,17 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             };
-            assert!(pending.destination.contains("backup"));
-            assert!(pending.destination.contains("output"));
-            assert!(pending.permission.contains("SSH access"));
+            let description = pending.description();
+            assert!(description.contains("backup"));
+            assert!(description.contains("output"));
+            assert!(description.contains("SSH access"));
             if revoke {
                 receiver.revoke_all();
             } else {
-                receiver.approvals.decide(&pending.id, false).unwrap();
+                receiver
+                    .approvals
+                    .decide(&pending.id, false, crate::receive_approval::Kind::Copy)
+                    .unwrap();
             }
             assert!(task.join().unwrap().is_err());
             let deadline = Instant::now() + Duration::from_secs(2);

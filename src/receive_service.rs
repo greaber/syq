@@ -55,7 +55,7 @@ struct ReceiveCommand {
 }
 #[derive(Subcommand)]
 enum Action {
-    /// Show incoming copies awaiting approval on this machine
+    /// Show incoming copy and command requests awaiting approval on this machine
     Pending {
         #[arg(long)]
         json: bool,
@@ -330,6 +330,11 @@ struct LocalRequest {
 struct Decision {
     id: String,
     allow: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::receive_approval::Kind::is_copy"
+    )]
+    kind: crate::receive_approval::Kind,
 }
 fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
@@ -641,7 +646,7 @@ fn run(control: &Path) -> Result<()> {
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 approvals
-                                    .decide(&decision.id, decision.allow)
+                                    .decide(&decision.id, decision.allow, decision.kind)
                                     .err()
                                     .map(|e| e.to_string())
                             });
@@ -764,7 +769,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&requests)?);
             } else if requests.is_empty() {
-                println!("No copies awaiting approval");
+                println!("No requests awaiting approval");
             } else {
                 for request in requests {
                     println!(
@@ -781,7 +786,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             bail!("timed out waiting for approval requests: none pending");
         }
         if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!("syq: waiting for incoming copies: none pending");
+            crate::output::diagnostic!("syq: waiting for incoming requests: none pending");
             progress = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -795,13 +800,14 @@ fn decide(id: &str, allow: bool) -> Result<()> {
         let Ok(state) = status(&control, false) else {
             continue;
         };
-        if state.pending.iter().any(|request| request.id == id) {
+        if let Some(request) = state.pending.iter().find(|request| request.id == id) {
             let response = query(
                 &control,
                 false,
                 Some(Decision {
                     id: id.into(),
                     allow,
+                    kind: request.kind(),
                 }),
             )?;
             if let Some(error) = response.decision_error {
@@ -934,6 +940,18 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_copy_decision_remains_copy_only() {
+        // Actual v0.4.0 client bytes checked by tests/receive-control-compat.py.
+        let old = include_str!("../tests/fixtures/receive-copy-decision-v0.4.0.json").trim();
+        let request: LocalRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            request.decision.as_ref().unwrap().kind,
+            crate::receive_approval::Kind::Copy
+        );
+        assert_eq!(serde_json::to_string(&request).unwrap(), old);
+    }
 
     #[test]
     fn stop_and_status_preserve_the_previous_daemon_request_format() {

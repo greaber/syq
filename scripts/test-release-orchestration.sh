@@ -225,6 +225,27 @@ for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
 
+# Generated Python SDK validation passes an exact checked-out commit, retaining
+# normal path selection instead of treating its workflow dispatch as a manual
+# full-suite request.
+mkdir -p "$scope_repo/sdk/python"
+printf 'release manifest\n' >"$scope_repo/sdk/python/syq-release-manifest.json"
+git -C "$scope_repo" add sdk/python/syq-release-manifest.json
+git -C "$scope_repo" commit -qm generated-python-sdk
+scoped_dispatch_head=$(git -C "$scope_repo" rev-parse HEAD)
+scope=$(cd "$scope_repo" && \
+  SYQ_CI_SCOPE_COMMIT="$scoped_dispatch_head" \
+  "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
+assert_scope "$scope" native false
+assert_scope "$scope" sdks true
+assert_scope "$scope" python_sdk true
+for key in javascript_sdk go_sdk tooling shellcheck mapping_docs conformance macos linux_arm64 full_suite; do
+  assert_scope "$scope" "$key" false
+done
+expect_failure 'is not checked out' env \
+  SYQ_CI_SCOPE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
+  bash -c "cd '$scope_repo' && '$script_dir/ci-scope.sh' '$work/workflow-dispatch-event.json'"
+
 # The generated SDK follow-up dispatches CI on a branch pinned to the exact
 # merge commit, binds the returned run to that commit, and requires its SDK job.
 post_merge_bin="$work/post-merge-bin"
@@ -241,13 +262,23 @@ case "$1:$2" in
           '{object:{sha:$sha}}'
         ;;
       *'/actions/workflows/ci.yml/dispatches '*)
+        case " $* " in
+          *" inputs[scope_commit]=$SYQ_TEST_MERGE_SHA "*) ;;
+          *) echo "scoped dispatch omitted merge commit: $*" >&2; exit 2 ;;
+        esac
         printf '{"workflow_run_id":501}\n'
         ;;
-      *'/actions/workflows/rsync-compat.yml/dispatches '*)
-        printf '{"workflow_run_id":502}\n'
+      *'/actions/workflows/ci.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:501,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
         ;;
-      *'/actions/workflows/macos.yml/dispatches '*)
-        printf '{"workflow_run_id":503}\n'
+      *'/actions/workflows/rsync-compat.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:502,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
+        ;;
+      *'/actions/workflows/macos.yml/runs?'*)
+        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
+          '{workflow_runs:[{id:503,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
         ;;
       *'/actions/runs/501/jobs?per_page=100 '*)
         jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
@@ -273,7 +304,7 @@ SYQ_TEST_MERGE_SHA="$post_merge_sha" PATH="$post_merge_bin:$PATH" \
   "$script_dir/run-generated-sdk-post-merge-ci.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha" \
   >"$work/post-merge.out"
-grep -F "Post-merge workflows passed for $post_merge_sha" \
+grep -F "Post-merge Python SDK validation passed for $post_merge_sha" \
   "$work/post-merge.out" >/dev/null
 expect_failure 'does not point to expected merge commit' env \
   SYQ_TEST_MERGE_SHA="$post_merge_sha" \
@@ -281,9 +312,10 @@ expect_failure 'does not point to expected merge commit' env \
   PATH="$post_merge_bin:$PATH" \
   "$script_dir/run-generated-sdk-post-merge-ci.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml run 501 targets' env \
+expect_failure 'ci.yml dispatch did not create' env \
   SYQ_TEST_MERGE_SHA="$post_merge_sha" \
   SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  SYQ_POST_MERGE_POLL_ATTEMPTS=1 \
   PATH="$post_merge_bin:$PATH" \
   "$script_dir/run-generated-sdk-post-merge-ci.sh" \
   greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"

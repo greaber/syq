@@ -2,10 +2,13 @@
 
 from importlib.metadata import version as distribution_version
 
+from ._defaults import CLIENT_DEFAULT, Timeout
+from ._mapping import Mapping, AsyncMapping
 from .async_client import AsyncClient, AsyncMapStream
 from .managed import PINNED_SYQ_VERSION, SyqInstallError, managed_executable
 from .client import Client, MapStream, Result, run, version
 from .errors import (
+    SyqError,
     SyqInvocationError,
     SyqOperationError,
     SyqOutputError,
@@ -14,6 +17,8 @@ from .errors import (
 )
 from .models import (
     AutomationEvent,
+    ProtocolMetadata,
+    ReceiptSummary,
     CpResult,
     Disposition,
     AttestedDigest,
@@ -56,10 +61,15 @@ rm = _default_client.rm
 map = _default_client.map
 
 __all__ = [
+    "CLIENT_DEFAULT",
+    "Timeout",
     "PINNED_SYQ_VERSION",
     "AsyncClient",
     "AsyncMapStream",
     "AutomationEvent",
+    "ProtocolMetadata",
+    "ReceiptSummary",
+    "SyqError",
     "Client",
     "CpResult",
     "Disposition",
@@ -75,6 +85,8 @@ __all__ = [
     "ErrorClass",
     "ErrorEvent",
     "IgnoreFrom",
+    "Mapping",
+    "AsyncMapping",
     "MapStream",
     "MappingEntry",
     "OperationAction",

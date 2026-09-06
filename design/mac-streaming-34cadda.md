@@ -178,8 +178,10 @@ the main results. The main matrix contains 59 verified copies and one cap.
 
 Before remote timing, 36 local copies passed SHA-256 verification. The 32 MiB
 local file completes in 0.058–0.097 s and the small tree in 0.125–0.274 s.
-The hybrid path preserves local whole-file operations; APFS offload or cloning
-can dominate these timings. No streaming gain is inferred from them.
+These local large-file copies report eight range requests in ordinary mode
+and one streaming range in hybrid mode, with zero whole-file shortcut calls.
+No global cache flush was used, and no cloning benefit is assumed. The short
+local times do not establish a streaming gain for the WAN route.
 
 The pinned streaming revision predates master's newer copying-interval field.
 These diagnostics use its phase timestamps and tuning counters; they do not

@@ -11,6 +11,8 @@ from .errors import SyqProtocolError
 from .models import (
     AutomationEvent,
     CpResult,
+    ProtocolMetadata,
+    ReceiptSummary,
     Disposition,
     Endpoint,
     EndpointKind,
@@ -262,7 +264,9 @@ class AutomationDecoder:
             )
         self._next_seq += 1
         record_type = _string(record, "type")
-        common = {"schema": SCHEMA, "schema_version": SCHEMA_VERSION, "seq": seq}
+        common = {
+            "protocol": ProtocolMetadata(SCHEMA, SCHEMA_VERSION, seq, record_type)
+        }
 
         if self.run is None:
             if record_type != "run":
@@ -841,16 +845,14 @@ class AutomationDecoder:
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],
-                provenance=provenance,
-                receipt_status=(
-                    _enum(record, "receipt_status", ReceiptStatus)
-                    if attested
-                    else None
-                ),
-                operations=_integer(record, "operations") if attested else None,
-                final_states=_integer(record, "final_states") if attested else None,
-                receipt_records=(
-                    _integer(record, "receipt_records") if attested else None
+                receipt=(
+                    ReceiptSummary(
+                        status=_enum(record, "receipt_status", ReceiptStatus),
+                        operations=_integer(record, "operations"),
+                        final_states=_integer(record, "final_states"),
+                        records=_integer(record, "receipt_records"),
+                    )
+                    if attested else None
                 ),
             )
             self.result = result
