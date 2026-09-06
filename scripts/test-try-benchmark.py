@@ -35,6 +35,7 @@ if mode == 'hang':
     pathlib.Path(os.environ['BENCH_TEST_PID']).write_text(str(child.pid))
     child.wait(); sys.exit(1)
 shutil.copytree(src,dst,dirs_exist_ok=True)
+if '--quiet' not in args: print('test double: copy statistics')
 if mode == 'corrupt':
     next(dst.iterdir()).write_bytes(b'bad')
 '''
@@ -90,6 +91,9 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual([line.split()[1].rstrip(',') for line in lines],
                          ['syq', 'rsync', 'cp', 'rsync', 'cp', 'syq', 'cp', 'syq', 'rsync'])
         self.assertIn('small cp', result.stdout)
+        self.assertEqual(result.stdout.count('Preparing syq with a 14-byte setup copy'), 1)
+        self.assertEqual(result.stdout.count('test double: copy statistics'), 6)
+        self.assertIn('Setup complete.', result.stdout)
         self.assert_clean()
 
     def test_push_and_pull_quoted_paths(self):

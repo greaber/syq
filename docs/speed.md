@@ -43,8 +43,9 @@ These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem
 optimizations. Syq prints its transfer statistics.
 
-Generation, a small syq helper warm-up, and POSIX `cksum` comparisons are
-outside the timer. A failed command or content check stops the comparison.
+Generation, a single 14-byte syq setup copy, and POSIX `cksum` comparisons are
+outside the timer. The setup copy prepares the helper and exercises transfer
+setup; it is labeled separately and does not print a throughput result. A failed command or content check stops the comparison.
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;

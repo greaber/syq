@@ -128,12 +128,14 @@ make_data() {
 }
 copy_with() {
     local tool=$1 source=$2 destination=$3
+    local syq_options=(--stats)
+    [[ ${4:-} != setup ]] || syq_options+=(--quiet)
     case $tool in
         syq)
             case $mode in
-                local) syq cp --preserve=permissions --srcs-in "$source" --into "$destination" --stats ;;
-                push) syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into "$destination" --stats ;;
-                pull) syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into "$destination" --stats ;;
+                local) syq cp --preserve=permissions --srcs-in "$source" --into "$destination" "${syq_options[@]}" ;;
+                push) syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into "$destination" "${syq_options[@]}" ;;
+                pull) syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into "$destination" "${syq_options[@]}" ;;
             esac ;;
         rsync)
             case $mode in
@@ -262,22 +264,27 @@ main() {
             remote_manifest "$source" > "$local_root/actual"
             cmp "$local_root/expected" "$local_root/actual" || fail 'Remote staging verification failed.'
         fi
-        # Prime helpers/connections outside measurements with a tiny independent copy.
-        mkdir "$local_root/probe"
-        printf 'syq benchmark\n' > "$local_root/probe/data"
-        if [[ $mode == pull ]]; then
-            run rsync -rpt -- "$local_root/probe/" "$host:$(quote "$remote_root/probe/")"
-            run copy_with syq "$remote_root/probe" "$dest_root/probe"
-            rm -rf -- "$dest_root/probe"
-        elif [[ $mode == push ]]; then
-            run copy_with syq "$local_root/probe" "$remote_root/probe"
-            remote "rm -rf $(quote "$remote_root/probe")"
-        else
-            mkdir "$dest_root/probe"
-            run copy_with syq "$local_root/probe" "$dest_root/probe"
-            rm -rf -- "$dest_root/probe"
+        if [[ $case_name == "${workloads[0]}" ]]; then
+            # Do this once, not once per workload. Keep the measured copy's full
+            # transport path, but suppress meaningless throughput for the 14-byte probe.
+            printf 'Preparing syq with a 14-byte setup copy (not timed as a benchmark)...\n'
+            mkdir "$local_root/probe"
+            printf 'syq benchmark\n' > "$local_root/probe/data"
+            if [[ $mode == pull ]]; then
+                run rsync -rpt -- "$local_root/probe/" "$host:$(quote "$remote_root/probe/")"
+                run copy_with syq "$remote_root/probe" "$dest_root/probe" setup
+                rm -rf -- "$dest_root/probe"
+            elif [[ $mode == push ]]; then
+                run copy_with syq "$local_root/probe" "$remote_root/probe" setup
+                remote "rm -rf $(quote "$remote_root/probe")"
+            else
+                mkdir "$dest_root/probe"
+                run copy_with syq "$local_root/probe" "$dest_root/probe" setup
+                rm -rf -- "$dest_root/probe"
+            fi
+            rm -rf -- "$local_root/probe"
+            printf 'Setup complete.\n'
         fi
-        rm -rf -- "$local_root/probe"
         for ((round=1; round<=rounds; round++)); do
             for ((offset=0; offset<${#tools[@]}; offset++)); do
                 index=$(((round - 1 + offset) % ${#tools[@]}))
