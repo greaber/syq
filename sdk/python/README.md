@@ -184,10 +184,10 @@ for local development, controlled offline provisioning, or when deliberately
 testing a different syq release.
 
 The package targets Python 3.10 or newer on Linux and macOS and has no runtime
-Python dependencies. See the [SDK compatibility policy](../README.md) for the
+Python dependencies. See the [SDK compatibility policy](https://greaber.github.io/syq/sdk-compatibility.html) for the
 release mapping.
 
 ## Native API reference
 
-See [Python native API](NATIVE_API.md) for command signatures, mappings,
+See [Python native API](https://greaber.github.io/syq/python-reference.html) for command signatures, mappings,
 failure behavior, resource ownership, and the CLI/SDK synchronization policy.
