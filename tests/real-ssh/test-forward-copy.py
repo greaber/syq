@@ -113,6 +113,69 @@ remote("rm " + helper)
 copy("/tmp/syq-real-ssh/forward/installed")
 assert remote("sha256sum /tmp/syq-real-ssh/forward/installed").split()[0] == expected
 
+print("case: an unexecutable cached helper gets one bootstrap retry", flush=True)
+# A malformed ELF passes the launcher's executable-bit check but exec fails
+# with 126. This is an actual exec failure, not a helper returning that code.
+remote("python3 -c " + shlex.quote(
+    "from pathlib import Path; p = Path(" + repr(helpers[0] + ".fixture") + "); "
+    "p.write_bytes(b'\\x7fELF' + b'\\x00' * 64); p.chmod(0o700); p.replace(" + repr(helpers[0]) + ")"))
+remote("sh -c " + shlex.quote("exec " + helper) + " 2>/dev/null; test \"$?\" -eq 126")
+try:
+    copy("/tmp/syq-real-ssh/forward/reinstalled")
+    assert remote("sha256sum /tmp/syq-real-ssh/forward/reinstalled").split()[0] == expected
+finally:
+    remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
+
+print("case: tilde paths use the destination home and ./~ stays literal", flush=True)
+remote("mkdir -p ~/syq-real-ssh-forward-home './~/syq-real-ssh-forward-home'")
+copy("~/syq-real-ssh-forward-home/expanded")
+assert remote("sha256sum ~/syq-real-ssh-forward-home/expanded").split()[0] == expected
+remote("test ! -e './~/syq-real-ssh-forward-home/expanded'")
+copy("./~/syq-real-ssh-forward-home/literal")
+assert remote("sha256sum './~/syq-real-ssh-forward-home/literal'").split()[0] == expected
+remote("test ! -e ~/syq-real-ssh-forward-home/literal")
+
+print("case: a delayed approval relay leaves time for the source to begin Hello", flush=True)
+# Start the real helper, then hold its Approved reply for longer than the old
+# 10-second deadline. Stream every subsequent control chunk without buffering.
+delayed_helper = r'''#!/usr/bin/python3
+import json
+import os
+import subprocess
+import sys
+import time
+
+# The helper reads the SSH stream directly; this wrapper only delays its reply.
+child = subprocess.Popen(['/usr/local/bin/syq', *sys.argv[1:]], stdout=subprocess.PIPE)
+def pump(reader, writer):
+    while True:
+        # Preserve any preamble bytes buffered while reading Approved, while
+        # returning available control bytes without waiting for a full chunk.
+        data = reader.read1(16384)
+        if not data:
+            break
+        while data:
+            count = os.write(writer, data)
+            data = data[count:]
+header = child.stdout.read(4)
+assert len(header) == 4
+length = int.from_bytes(header, 'big')
+assert 0 < length <= 256 * 1024
+reply = child.stdout.read(length)
+assert 'Approved' in json.loads(reply)
+time.sleep(12)
+sys.stdout.buffer.write(header + reply)
+sys.stdout.buffer.flush()
+pump(child.stdout, 1)
+sys.exit(child.wait())
+'''
+remote("printf %s " + shlex.quote(delayed_helper) + " > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
+try:
+    copy("/tmp/syq-real-ssh/forward/delayed-hello")
+    assert remote("sha256sum /tmp/syq-real-ssh/forward/delayed-hello").split()[0] == expected
+finally:
+    remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
+
 print("case: an approved copy's slow SSH setup does not block the next approval", flush=True)
 def deny_during_setup():
     command = "exec timeout 15 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as during-forward-setup"
