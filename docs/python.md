@@ -30,11 +30,11 @@ rather than treating a truncated stream as success.
 
 ## Guide and reference
 
-- [Python guide and examples](https://github.com/greaber/syq/blob/master/sdk/python/README.md):
+- [Python guide and examples](python-guide.md):
   event callbacks, asyncio, mapping transformations, errors and custom binaries.
-- [Native API reference](https://github.com/greaber/syq/blob/master/sdk/python/NATIVE_API.md):
+- [Native API reference](python-reference.md):
   signatures, option mappings and result types.
-- [SDK compatibility](https://github.com/greaber/syq/blob/master/sdk/README.md):
+- [SDK compatibility](sdk-compatibility.md):
   package versions and their pinned executables.
 - [Rename and reorganize](mappings.md) and [Automation results](automation.md):
   the underlying CLI interfaces.

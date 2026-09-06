@@ -5,7 +5,7 @@ Transform that list with a script, then give it to `syq cp --mapping`.
 The copy checks for destination collisions and supports normal resume.
 
 For Python scripts, see the [Python SDK](python.md) and its
-[mapping examples](https://github.com/greaber/syq/blob/master/sdk/python/README.md).
+[mapping examples](python-guide.md).
 
 ## Lowercase destination names
 

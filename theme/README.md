@@ -54,3 +54,11 @@ description of copying, reorganizing, removing, resuming and automation.
 Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.
+
+## SDK documentation
+
+The SDK guide, API reference and compatibility pages in docs/ use mdBook
+includes to render the sources in sdk/. Edit those source files so the web
+pages and packaged SDK documentation stay in sync. Links in included sources
+use full documentation URLs so they also work on GitHub and PyPI. book.toml
+watches sdk/ when serving the book locally.

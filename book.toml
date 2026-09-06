@@ -7,7 +7,7 @@ src = "docs"
 [build]
 build-dir = "target/book"
 create-missing = false
-extra-watch-dirs = ["theme"]
+extra-watch-dirs = ["theme", "sdk"]
 
 [output.html]
 site-url = "/syq/"

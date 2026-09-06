@@ -1,7 +1,7 @@
 # Python native API
 
 The Python package pins a matching syq executable. To use a custom development
-build, pass executable= explicitly; see the [Python guide](README.md).
+build, pass executable= explicitly; see the [Python guide](https://greaber.github.io/syq/python-guide.html).
 
 This document describes the Python interface to syq's native filesystem
 commands.
@@ -573,8 +573,8 @@ receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
 Additive unknown record types are validated for a well-formed envelope and
 sequence position, then ignored.
 
-The product's [automation results contract](../../docs/automation.md) and
-[JSON Schema](../../schemas/automation.schema.json), not this document, own
+The product's [automation results contract](https://greaber.github.io/syq/automation.html) and
+[JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 
