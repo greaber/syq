@@ -74,8 +74,15 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         cwd: command.cwd.as_bytes().to_vec(),
     };
     request.validate()?;
-    let registration = load_registration(name)?;
-    crate::output::diagnostic!("syq: requesting command permission from @{name}; approve on that machine with its desktop prompt or syq recv pending");
+    let selection = handoff::Selection::new(
+        name.into(),
+        load_registration(name)?,
+        handoff::Kind::Command,
+        None,
+    );
+    handoff::maybe_exec(&selection)?;
+    let registration = selection.registration;
+    crate::output::diagnostic!("syq: requesting command permission from @{name}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (mut stream, reply) = exchange(
         &registration,
         Message::Exec(request),

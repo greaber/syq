@@ -6,10 +6,16 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY schemas ./schemas
 COPY src ./src
+# The second PATH fixture has a real distinct identity and return wire version.
+# It must hand off before making anything beyond a stable readiness probe.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --locked --bin syq \
-    && cp target/debug/syq /tmp/syq
+    && cp target/debug/syq /tmp/syq \
+    && printf '%s\n' '{"git":{"sha1":"1234567890abcdef1234567890abcdef12345678"}}' > .cargo_vcs_info.json \
+    && sed -i 's/^const VERSION: u16 = 2;/const VERSION: u16 = 65500;/' src/destination.rs \
+    && cargo build --locked --bin syq \
+    && cp target/debug/syq /tmp/syq-other-build
 
 FROM debian:bookworm-slim
 
@@ -41,6 +47,7 @@ RUN apt-get update \
     && install -d -m 0755 /run/sshd
 
 COPY --from=builder /tmp/syq /usr/local/bin/syq
+COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build
 COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
 COPY --chmod=0755 tests/real-ssh/entrypoint.sh /usr/local/libexec/syq-real-ssh-entrypoint
 COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-scenarios
@@ -54,5 +61,7 @@ COPY tests/real-ssh/test-receive-notifications.py /usr/local/libexec/syq-test-re
 COPY tests/real-ssh/test-forward-copy.py /usr/local/libexec/syq-test-forward-copy.py
 
 COPY tests/real-ssh/test-return-exec.py /usr/local/libexec/syq-test-return-exec.py
+
+COPY tests/real-ssh/test-return-handoff.py /usr/local/libexec/syq-test-return-handoff.py
 
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

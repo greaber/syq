@@ -66,6 +66,8 @@ pub enum CoordinateAt {
 )]
 pub struct Args {
     #[arg(skip)]
+    pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
+    #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
     pub(crate) auth_from: AuthFrom,
@@ -419,8 +421,7 @@ impl Args {
     /// Parse the command line and read ignore files, keeping command-line and
     /// file patterns in the order they were given (later lines win, as in
     /// a .gitignore file).
-    pub fn parse_args() -> Result<Args> {
-        let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
+    pub fn parse_args(argv: &[OsString]) -> Result<Args> {
         let Some(command) = argv.first().and_then(|arg| arg.to_str()) else {
             if argv.is_empty() {
                 print_root_help();
@@ -445,7 +446,7 @@ impl Args {
             // helper switches are handled in main.
             "--self-update" | "--register-standalone-install" => {
                 let matches = crate::help::lifecycle().try_get_matches_from(
-                    std::iter::once(OsString::from("syq")).chain(argv)
+                    std::iter::once(OsString::from("syq")).chain(argv.iter().cloned())
                 ).unwrap_or_else(|error| error.exit());
                 let mut args = native_engine_defaults();
                 args.self_update = matches.get_flag("self_update");

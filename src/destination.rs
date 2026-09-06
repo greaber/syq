@@ -5,7 +5,7 @@
 //! and jobs under that account intentionally share access to its registrations.
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -29,8 +29,13 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
 pub(crate) mod exec;
 mod forward;
+pub(crate) mod handoff;
 
+// Discovery is independent of the build-pinned request protocol. Keep the
+// Ping/Ready JSON envelope and this version stable across helper wire changes.
+const DISCOVERY_VERSION: u16 = 2;
 const VERSION: u16 = 2;
+const REGISTRATION_VERSION: u16 = 3;
 const MAX_MESSAGE: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -45,16 +50,16 @@ enum Approval {
     Always,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
-    name = "syq destination",
+    name = "destinations",
     about = "Inspect named destinations available to this server account"
 )]
-struct Destinations {
+pub(crate) struct Destinations {
     #[command(subcommand)]
     action: DestinationAction,
 }
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum DestinationAction {
     /// Print registrations and whether their receiving laptop responds
     List,
@@ -68,8 +73,8 @@ enum DestinationAction {
     },
 }
 
-pub(crate) fn destination_help() -> clap::Command {
-    crate::help::configure(Destinations::command())
+pub(crate) fn run_command(command: Destinations) -> Result<i32> {
+    destinations(command.action)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +150,7 @@ struct Registration {
     identity: String,
     socket: PathBuf,
     secret: String,
+    program: Vec<u8>,
 }
 #[derive(Serialize, Deserialize)]
 struct Route {
@@ -226,7 +232,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 }
 
 fn registry() -> Result<PathBuf> {
-    private_directory(".syq-destinations-v2")
+    private_directory(".syq-destinations-v3")
 }
 fn private_directory(name: &str) -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
@@ -251,7 +257,7 @@ pub(crate) fn registered_names() -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    let directory = PathBuf::from(home).join(".syq-destinations-v2");
+    let directory = PathBuf::from(home).join(".syq-destinations-v3");
     let Ok(metadata) = fs::symlink_metadata(&directory) else {
         return Vec::new();
     };
@@ -288,8 +294,14 @@ fn load_registration(name: &str) -> Result<Registration> {
             format!("destination @{name} is unavailable; connect from the laptop with syq while persist is on")
         })?;
     let registration: Registration = serde_json::from_slice(&encoded)?;
-    if registration.version != VERSION || registration.identity != crate::identity::build() {
-        bail!("named destination build differs; use matching syq builds and restart receiving");
+    if registration.version != REGISTRATION_VERSION {
+        bail!("unsupported destination registration; reconnect from the receiving machine");
+    }
+    if !Path::new(std::ffi::OsStr::from_bytes(&registration.program)).is_absolute()
+        || registration.program.contains(&0)
+        || registration.identity.is_empty()
+    {
+        bail!("invalid destination helper registration; reconnect from the receiving machine");
     }
     Ok(registration)
 }
@@ -298,6 +310,11 @@ fn exchange(
     message: Message,
     timeout: Duration,
 ) -> Result<(UnixStream, Reply)> {
+    if !matches!(message, Message::Ping) && registration.identity != crate::identity::build() {
+        bail!(
+            "named destination requires its matching helper; reconnect from the receiving machine"
+        );
+    }
     let mut stream = UnixStream::connect(&registration.socket).context(
         "receiving machine is offline; it must reconnect before this transfer can start",
     )?;
@@ -306,8 +323,14 @@ fn exchange(
     write_message(
         &mut stream,
         &Envelope {
-            version: VERSION,
-            identity: crate::identity::build().into(),
+            version: if matches!(message, Message::Ping) {
+                DISCOVERY_VERSION
+            } else {
+                VERSION
+            },
+            // Ping is the fixed discovery contract. All authoritative requests
+            // above still require this executable to match the receiving build.
+            identity: registration.identity.clone(),
             secret: registration.secret.clone(),
             message,
         },
@@ -462,9 +485,9 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
 
-pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     match &args.auth_from {
-        crate::cli::AuthFrom::Return(_) => return forward::prepare(args),
+        crate::cli::AuthFrom::Return(_) => return forward::select(args),
         crate::cli::AuthFrom::Ssh => {
             let (destination, sources) = args
                 .locations
@@ -484,15 +507,15 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             }
             // This explicit choice also disambiguates an SSH host whose name
             // happens to match a receiving machine's advertisement.
-            return Ok(());
+            return Ok(None);
         }
         crate::cli::AuthFrom::Auto => {}
     }
     let Some(destination) = args.locations.last() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(host) = destination.host.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let explicit = host.starts_with('@');
     let name = host.strip_prefix('@').unwrap_or(host).to_owned();
@@ -509,11 +532,13 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
                 .any(|l| l.is_remote())
             || !registered_names().contains(&name)
         {
-            return forward::prepare(args);
+            return forward::select(args);
         }
         let registration = load_registration(&name)?;
-        if exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err() {
-            return forward::prepare(args);
+        if handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
+            && exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err()
+        {
+            return forward::select(args);
         }
         registration
     };
@@ -537,6 +562,29 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     if args.connections_opt.is_some() && args.connections > 32 {
         bail!("named destinations support at most 32 workers per transfer");
     }
+    Ok(Some(handoff::Selection::new(
+        name,
+        registration,
+        handoff::Kind::Copy,
+        None,
+    )))
+}
+
+pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    let selection = match args.return_selection.take() {
+        Some(selection) => selection,
+        None => select_copy(args)?,
+    };
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    handoff::check_selection(&selection)?;
+    if selection.kind == handoff::Kind::Forward {
+        return forward::prepare(args, selection);
+    }
+    let handoff::Selection {
+        name, registration, ..
+    } = selection;
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
@@ -549,7 +597,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         },
     };
     let request = crate::restricted::named_request(args, policy.clone())?;
-    crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq recv pending)");
+    crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
         &registration,
         Message::Request(Box::new(request)),
@@ -728,7 +776,12 @@ impl Receiver {
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let envelope: Envelope =
             read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
-        if envelope.version != VERSION || envelope.identity != crate::identity::build() {
+        let version = if matches!(envelope.message, Message::Ping) {
+            DISCOVERY_VERSION
+        } else {
+            VERSION
+        };
+        if envelope.version != version || envelope.identity != crate::identity::build() {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
         if envelope.secret != self.secret {
@@ -1052,7 +1105,7 @@ pub(crate) fn serve_background(
                 .and_then(|s| s.code())
                 .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
             {
-                bail!("server rejected return connection: {error}; reconnect with syq or change recv settings to retry");
+                bail!("server rejected return connection: {error}; reconnect with syq or change receiving settings with syq persist receive on to retry");
             }
             *state.lock().unwrap() = crate::receive_service::ConnectionState {
                 phase: "reconnecting".into(),
@@ -1136,7 +1189,8 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         record: None,
     };
     let registration = Registration {
-        version: VERSION,
+        version: REGISTRATION_VERSION,
+        program: std::env::current_exe()?.as_os_str().as_bytes().to_vec(),
         identity: crate::identity::build().into(),
         socket: socket.into(),
         secret: secret.into(),
@@ -1275,12 +1329,6 @@ fn destinations(action: DestinationAction) -> Result<i32> {
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|s| s.to_str())? {
-        "destination" => Some((|| {
-            let matches = destination_help()
-                .try_get_matches_from(&argv[1..])
-                .unwrap_or_else(|e| e.exit());
-            destinations(Destinations::from_arg_matches(&matches)?.action)
-        })()),
         "--destination-register" => Some((|| {
             if argv.len() != 5 {
                 bail!("invalid destination registration arguments");
@@ -1426,7 +1474,12 @@ mod tests {
         )
         .unwrap();
         let registration = Registration {
-            version: VERSION,
+            version: REGISTRATION_VERSION,
+            program: std::env::current_exe()
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
             identity: crate::identity::build().into(),
             socket: broker.socket_path().into(),
             secret: receiver.secret.clone(),

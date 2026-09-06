@@ -20,20 +20,21 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=()):
-    argv = ["syq", "cp", "-vv", source, "--to", "destination",
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq"):
+
+    argv = [binary, "cp", "-vv", source, "--to", "destination",
             *auth, "--as", path, "--connections", "2", *extra]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output, start_new_session=True)
         try:
-            pending = json.loads(run("syq", "recv", "pending", "--json", "--wait", "--timeout", "15"))
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
             request = pending[0]
             assert 'SSH "destination"' in request["destination"], request
             assert "SSH access" in request["permission"], request
-            run("syq", "recv", "approve" if allow else "deny", request["id"])
-            run("syq", "recv", "approve", request["id"], success=False)
+            run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
+            run("syq", "persist", "receive", "approve", request["id"], success=False)
             if after_approval is not None:
                 after_approval()
             if cancel:
@@ -53,7 +54,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                         progress += 5
                     time.sleep(.1)
                 assert state == prefix, ("no complete resumable prefix before deadline", state)
-                run("syq", "recv", "on", "--notify", "off")
+                run("syq", "persist", "receive", "on", "--notify", "off")
             deadline = time.monotonic() + 65
             last_output = 0
             while True:
@@ -86,13 +87,13 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
 
 
 print("case: automatic authorization requires approval even with automatic local receiving", flush=True)
-run("syq", "recv", "on", "--approve", "always", "--notify", "off")
-run("syq", "recv", "wait", "source", "--timeout", "30")
+run("syq", "persist", "receive", "on", "--approve", "always", "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
 print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
 run("ssh", "source", "timeout 15 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
     "--to destination --as /tmp/syq-real-ssh/forward/direct-ssh --auth-from ssh", success=False)
-assert json.loads(run("syq", "recv", "pending", "--json")) == []
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 remote("test ! -e /tmp/syq-real-ssh/forward/direct-ssh")
 copy("/tmp/syq-real-ssh/forward/denied", allow=False, success=False)
 remote("test ! -e /tmp/syq-real-ssh/forward/denied")
@@ -113,6 +114,12 @@ assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expe
 print("case: explicit authorizer and released --via spelling use the same restricted route", flush=True)
 for option, name in [("--auth-from", "selected"), ("--via", "legacy")]:
     copy("/tmp/syq-real-ssh/forward/" + name, auth=(option, "@laptop"))
+    assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
+
+print("case: another source build hands off automatic and explicit authorization", flush=True)
+for auth in [(), ("--auth-from", "@laptop")]:
+    name = "skew-explicit" if auth else "skew-auto"
+    copy("/tmp/syq-real-ssh/forward/" + name, auth=auth, binary="syq-other-build")
     assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
 
 print("case: a missing helper is installed once after its launcher reports the cache miss", flush=True)
@@ -191,9 +198,9 @@ def deny_during_setup():
     command = "exec timeout 15 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as during-forward-setup"
     process = subprocess.Popen(["ssh", "source", command], start_new_session=True)
     try:
-        pending = json.loads(run("syq", "recv", "pending", "--json", "--wait", "--timeout", "3"))
+        pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "3"))
         assert len(pending) == 1 and "during-forward-setup" in pending[0]["destination"], pending
-        run("syq", "recv", "deny", pending[0]["id"])
+        run("syq", "persist", "receive", "deny", pending[0]["id"])
         assert process.wait(timeout=5) not in (0, 124)
     finally:
         if process.poll() is None:
@@ -204,8 +211,8 @@ def deny_during_setup():
 # open long enough to exercise another request on the same return connection.
 remote("printf '%s\\n' '#!/bin/sh' 'sleep 10' 'exec /usr/local/bin/syq \"$@\"' > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
 try:
-    run("syq", "recv", "on", "--approve", "ask", "--notify", "off")
-    run("syq", "recv", "wait", "source", "--timeout", "30")
+    run("syq", "persist", "receive", "on", "--approve", "ask", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
     copy("/tmp/syq-real-ssh/forward/slow-setup", after_approval=deny_during_setup)
 finally:
     remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
@@ -233,7 +240,7 @@ expected = run("ssh", "source", f"sha256sum {source}").split()[0]
 copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
      extra=("--bwlimit", "512"), cancel=True, success=False)
 remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
-run("syq", "recv", "wait", "source", "--timeout", "30")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 results = "/tmp/syq-real-ssh/forward-resume.ndjson"
 copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--results", results))
 records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").splitlines()]

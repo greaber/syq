@@ -14828,8 +14828,6 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "persist",
             "completion",
             "receiver",
-            "recv",
-            "destination",
             "--self-update",
         ],
     );
@@ -14840,6 +14838,9 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["list", "forget", "clear", "help"],
     );
     assert_completion_candidates(&t, &["syq", "persist", "o"], &["on", "off"]);
+    assert_completion_candidates(&t, &["syq", "persist", "r"], &["receive"]);
+    assert_completion_candidates(&t, &["syq", "persist", "receive", "p"], &["pending"]);
+    assert_completion_candidates(&t, &["syq", "persist", "destinations", "w"], &["wait"]);
     for action in ["off", "status"] {
         assert_completion_candidates(
             &t,
@@ -17719,7 +17720,7 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
     assert_eq!(records.last().unwrap()["status"], "failed");
     // The completion route uses private local registration names only, without
     // attempting SSH or contacting the receiving laptop.
-    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    write(&t.path(".syq-destinations-v3/laptop.json"), b"{}");
     let completion = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "completion",
@@ -17758,7 +17759,7 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             .unwrap()
     };
     let status = || {
-        let output = run(&["recv", "status", "--json"]);
+        let output = run(&["persist", "receive", "status", "--json"]);
         assert_output_ok(&output);
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
@@ -17777,7 +17778,8 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
         "status created a runtime scope"
     );
     assert_output_ok(&run(&[
-        "recv",
+        "persist",
+        "receive",
         "on",
         "--name",
         "laptop",
@@ -17785,11 +17787,12 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
         "downloads",
     ]));
     assert_eq!(status()["settings"]["root"], t.s("downloads"));
-    assert_output_ok(&run(&["recv", "on", "--cwd", "."]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--cwd", "."]));
     assert!(status()["settings"]["root"].is_null());
     assert_eq!(status()["settings"]["name"], "laptop");
     assert_output_ok(&run(&[
-        "recv",
+        "persist",
+        "receive",
         "on",
         "--approve",
         "always",
@@ -17798,11 +17801,11 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     ]));
     assert_eq!(status()["settings"]["approval"], "always");
     assert_eq!(status()["settings"]["notifications"], "off");
-    assert_output_ok(&run(&["recv", "on", "--max-entries", "500"]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--max-entries", "500"]));
     assert_eq!(status()["settings"]["approval"], "always");
-    assert_output_ok(&run(&["recv", "on", "--approve", "ask"]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--approve", "ask"]));
     assert_eq!(status()["settings"]["approval"], "ask");
-    assert_output_ok(&run(&["recv", "off"]));
+    assert_output_ok(&run(&["persist", "receive", "off"]));
     assert_eq!(status()["settings"]["enabled"], false);
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_eq!(
@@ -17812,9 +17815,17 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             & 0o777,
         0o600
     );
-    assert!(!run(&["recv", "on", "--cwd", ".", "--root", "downloads"])
-        .status
-        .success());
+    assert!(!run(&[
+        "persist",
+        "receive",
+        "on",
+        "--cwd",
+        ".",
+        "--root",
+        "downloads"
+    ])
+    .status
+    .success());
 }
 
 #[test]
@@ -17843,11 +17854,11 @@ fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
-    let registry = t.path(".syq-destinations-v2");
+    let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = t.path("return.sock");
-    let registration = serde_json::json!({"version":2,"identity":identity.trim(),"socket":socket_path,"secret":"test"});
+    let registration = serde_json::json!({"version":3,"identity":identity.trim(),"socket":socket_path,"secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes()});
     write(
         &registry.join("laptop.json"),
         &serde_json::to_vec(&registration).unwrap(),
@@ -18001,7 +18012,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
             .output()
             .unwrap()
     };
-    let output = run(&["recv", "status", "--json"]);
+    let output = run(&["persist", "receive", "status", "--json"]);
     assert_output_ok(&output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["settings"]["approval"], "ask");
@@ -18010,7 +18021,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
         old,
         "read-only status mutated old state"
     );
-    assert_output_ok(&run(&["recv", "on"]));
+    assert_output_ok(&run(&["persist", "receive", "on"]));
     let migrated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let original: serde_json::Value = serde_json::from_slice(old).unwrap();
     for field in [
@@ -18028,15 +18039,15 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     assert_eq!(migrated["approval"], "ask");
     assert_eq!(migrated["notifications"], "desktop");
     assert!(!t.path("config/syq/persistence.json").exists());
-    assert_output_ok(&run(&["recv", "off"]));
+    assert_output_ok(&run(&["persist", "receive", "off"]));
 }
 
 #[test]
 fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
     let t = Tmp::new();
-    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    write(&t.path(".syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(
-        t.path(".syq-destinations-v2"),
+        t.path(".syq-destinations-v3"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -18131,7 +18142,7 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
     write(&path, old);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["recv", "status", "--json"])
+        .args(["persist", "receive", "status", "--json"])
         .env("HOME", t.path(""))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.path("runtime"))
@@ -18172,14 +18183,15 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
-    let registry = t.path(".syq-destinations-v2");
+    let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = t.path("return.sock");
-    for name in ["a-offline", "b-old-build", "laptop", "ssh", "z-other"] {
+    for name in ["a-offline", "b-invalid", "laptop", "ssh", "z-other"] {
         let registration = serde_json::json!({
-            "version": 2,
-            "identity": if name == "b-old-build" { "another-build" } else { identity.trim() },
+            "version": if name == "b-invalid" { 0 } else { 3 },
+            "identity": identity.trim(),
+            "program": env!("CARGO_BIN_EXE_syq").as_bytes(),
             "socket": if name == "a-offline" { t.path("absent.sock") } else { socket_path.clone() },
             "secret": name,
         });
@@ -18317,12 +18329,12 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
     write(&t.path("local-folder/file"), b"payload");
     for name in ["laptop", "ssh"] {
         write(
-            &t.path(&format!("home/.syq-destinations-v2/{name}.json")),
+            &t.path(&format!("home/.syq-destinations-v3/{name}.json")),
             b"{}",
         );
     }
     fs::set_permissions(
-        t.path("home/.syq-destinations-v2"),
+        t.path("home/.syq-destinations-v3"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -18370,9 +18382,9 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
 #[test]
 fn return_exec_completion_and_offline_selection_never_contact_ssh() {
     let t = Tmp::new();
-    write(&t.path("home/.syq-destinations-v2/laptop.json"), b"{}");
+    write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(
-        t.path("home/.syq-destinations-v2"),
+        t.path("home/.syq-destinations-v3"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();

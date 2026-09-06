@@ -17,27 +17,29 @@ syq. No SSH server or incoming network port is needed on the receiving machine.
 Requests work from independent server shells, including existing tmux sessions.
 
 `--on` selects a receiving name. Both `laptop` and `@laptop` require a live
-return connection; neither falls back to DNS or an SSH connection. Both ends
-must run the same syq build. Names and options complete from local information;
-completion does not contact the receiving machine or request approval.
+return connection; neither falls back to DNS or an SSH connection. If the server
+command is a different build, it automatically invokes the matching helper
+registered by the receiving machine before requesting approval. Names and
+options complete from local information; completion does not contact the
+receiving machine or request approval.
 
 ## Approve each command locally
 
 Each command waits for approval on the receiving machine. Its desktop prompt
 shows the server account, program and literal arguments, working directory,
 and the permission being granted. Desktop notifications may truncate long
-commands and hide trailing arguments. Use `syq recv pending` on the receiving
+commands and hide trailing arguments. Use `syq persist receive pending` on the receiving
 machine to inspect the complete request before approving a command whose full
 text is not visible. You can inspect and decide requests from a terminal there:
 
 ```sh
-syq recv pending
-syq recv approve REQUEST_ID
-syq recv deny REQUEST_ID
+syq persist receive pending
+syq persist receive approve REQUEST_ID
+syq persist receive deny REQUEST_ID
 ```
 
 Command requests are available whenever receiving is enabled. Every command
-requires its own decision, even with `syq recv on --approve always` for copies.
+requires its own decision, even with `syq persist receive on --approve always` for copies.
 Approving a copy does not approve commands. A missing or dismissed desktop
 prompt never grants permission; use the local terminal commands. Pending
 requests expire after five minutes and are cancelled when the requester
@@ -47,7 +49,7 @@ An approved command runs with your local user's permissions, including access
 to files and credentials. **The receiving `--root` and copy limits do not
 contain commands.** Build tools and scripts can execute code from their input
 files; approving a displayed command does not establish that those files are
-safe. Commands have a separate approval type in `recv pending --json`, with
+safe. Commands have a separate approval type in `persist receive pending --json`, with
 `kind: "command"`, `argv`, `cwd`, and `permission` fields. Argument and directory
 strings in that summary are escaped for display.
 
@@ -66,8 +68,8 @@ expansion on the receiving machine. To use shell syntax, request a shell:
 syq exec --on @laptop --cwd work/project -- sh -c 'cargo build && ./target/debug/demo'
 ```
 
-`--cwd DIR` (or `-C DIR`) is relative to the directory selected by `recv on
---cwd` or `recv on --root`. Its default is that directory. Absolute paths and
+`--cwd DIR` (or `-C DIR`) is relative to the directory selected by `persist receive on
+--cwd` or `persist receive on --root`. Its default is that directory. Absolute paths and
 `..` can select elsewhere. The directory must exist. Syq does not expand `~`
 on the receiving machine; use a relative path or an absolute path instead.
 
@@ -90,7 +92,7 @@ nonzero result. A connection that closes before delivering the exit status is
 an error even if some output arrived successfully.
 
 Interrupting the requesting syq process, losing the connection, changing
-receiving settings, `recv off`, or `persist off` cancels execution. Syq kills
+receiving settings, `persist receive off`, or `persist off` cancels execution. Syq kills
 the command's process group with `SIGKILL` and reaps its leader. It also kills
 remaining processes in that group when the foreground program exits, without
 giving them time to run cleanup handlers. A program that deliberately creates a

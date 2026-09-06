@@ -136,3 +136,11 @@ programs, sender interruption, receiving shutdown, process-group cleanup, and
 execution after reconnect. The D-Bus fixture also verifies separate command
 notification titles and Allow/Deny behavior. macOS UI rendering is not tested
 by this Linux container suite.
+
+The default lab also builds a second executable with a distinct development
+identity from synthetic Cargo package metadata and a different return wire
+version. It checks return copies, commands, and automatic or explicit remote
+authorization from that different PATH build.
+The receiving connection still uses its own pinned helper. Mapping stdin, raw
+path arguments, inherited result descriptors, output bytes, and exit status
+are checked across the handoff.

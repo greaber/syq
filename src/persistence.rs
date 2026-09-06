@@ -24,8 +24,8 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[derive(Parser, Debug)]
 #[command(
     name = "syq persist",
-    about = "Manage reusable SSH connections and helper sessions",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq recv. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
+    about = "Manage persistent SSH connections, receiving, and return destinations",
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -34,6 +34,10 @@ struct PersistCommand {
 
 #[derive(Subcommand, Debug)]
 enum PersistAction {
+    /// Configure receiving and decide incoming copy or command requests
+    Receive(crate::receive_service::ReceiveCommand),
+    /// Inspect named return destinations available to this server account
+    Destinations(crate::destination::Destinations),
     /// Enable reusable SSH control connections
     On {
         /// Create an ephemeral scope and print its path instead of changing the user setting
@@ -129,6 +133,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         .unwrap_or_else(|error| error.exit());
     let command = PersistCommand::from_arg_matches(&matches)?;
     match command.action {
+        PersistAction::Receive(command) => return crate::receive_service::run_command(command),
+        PersistAction::Destinations(command) => return crate::destination::run_command(command),
         PersistAction::On { ephemeral: true } => {
             let scope = create_ephemeral_scope()?;
             // This is a scripting contract: stdout is exactly the native path
@@ -795,7 +801,7 @@ fn master_exit_command(socket: &Path, record: &EndpointRecord) -> Command {
 }
 
 pub(crate) fn command_for_help() -> clap::Command {
-    crate::help::configure(PersistCommand::command())
+    crate::help::configure(PersistCommand::command().bin_name("syq persist"))
 }
 
 #[cfg(test)]

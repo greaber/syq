@@ -80,7 +80,7 @@ your agent as `ssh -A` would.
 A [named destination](receive.md) lets a server account request copies through
 an outbound connection maintained by your laptop. `persist on` enables this
 for syq's SSH connections by default. Each request requires approval on the
-receiving machine through a desktop prompt or `recv approve`. Paths and limits
+receiving machine through a desktop prompt or `persist receive approve`. Paths and limits
 are validated before prompting; the restricted filesystem executor checks
 every operation after approval. The server receives no SSH agent or
 command-execution interface.
@@ -90,11 +90,11 @@ It does not authenticate what you typed on a remote server or attest to source
 contents. The receiving user and desktop session remain trusted. Request IDs
 are local, expire after five minutes, and cannot be reused. Disconnecting or
 stopping receiving cancels pending decisions. Desktop failure never approves a
-copy. `syq recv on --approve always` explicitly removes the per-copy decision
+copy. `syq persist receive on --approve always` explicitly removes the per-copy decision
 and trusts connected server accounts for repeated copies.
 
 The default starting directory is your home directory, with no containment.
-`syq recv on --root DIRECTORY` contains copies; `syq recv off` disables receiving
+`syq persist receive on --root DIRECTORY` contains copies; `syq persist receive off` disables receiving
 while keeping ordinary persistence. A compromised connected server account can
 request more copies and invent their content. Once approved, it can inspect
 destination entries during copy planning and consume disk space within the

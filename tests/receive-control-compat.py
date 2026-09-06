@@ -109,6 +109,8 @@ with tempfile.TemporaryDirectory(prefix="syq-old-") as tmp:
            "XDG_CONFIG_HOME": str(home / "config"), "SYQ_NO_UPDATE_CHECK": "1"}
 
     def run(binary, *args, success=True):
+        if binary == candidate and args[:1] == ("recv",):
+            args = ("persist", "receive", *args[1:])
         result = subprocess.run([binary, *args], env=env, cwd=home, capture_output=True, timeout=5)
         assert (result.returncode == 0) == success, (args, result)
         return result
