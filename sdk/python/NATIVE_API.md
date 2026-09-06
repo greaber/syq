@@ -123,7 +123,7 @@ object. `srcs_in` must be the sole selector when used.
 
 `MapStream` is an iterable context manager yielding [MappingEntry](https://greaber.github.io/syq/python-reference.html#mappingentry); use `with`.
 `AsyncMapStream` is its async equivalent; use `async with`. Both expose `cwd`
-(`str | bytes`), the absolute source-base spelling to pass to `cp(cwd=...)`.
+(`pathlib.Path`), the absolute source-base spelling to pass to `cp(cwd=...)`.
 
 ### MappingEntry
 
