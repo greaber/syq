@@ -99,3 +99,80 @@ Keep copies short with an external deadline. Measure whole-copy time as well
 as sustained throughput, memory and CPU; include short files, multiworker
 large files, delayed links, interruption/resume and receiver failures. Store
 measured numbers as result data, not assumed improvements in this document.
+
+## macOS handoff
+
+The implementation is pushed to `greaber/syq`, branch `experimental-streaming`.
+The tested early-shrink implementation is commit
+`34cadda23adfddaba587acb45e859d121f5556dd`. Later documentation-only commits do
+not need to be included in a build intended to reproduce that revision.
+Streaming is still opt-in. Linux correctness and performance checks exist;
+this revision has not yet been validated on a Mac.
+
+Read `AGENTS.md` first. From your existing syq coordination checkout, preserve
+any changes and create a separate task worktree (choose unused names):
+
+```sh
+git status --short
+git worktree list
+git fetch origin experimental-streaming
+git worktree add -b mac-streaming .worktrees/mac-streaming \
+  34cadda23adfddaba587acb45e859d121f5556dd
+ln -s ../../current-plans .worktrees/mac-streaming/current-plans
+cd .worktrees/mac-streaming
+cargo build --locked --release
+./target/release/syq --build-identity
+```
+
+Do not set `SYQ_RELEASE_BUILD`. A clean build should identify itself as
+`v0.4.0+dev.34cadda23adf`. Use the built executable explicitly, not the installed
+release on `PATH`. Run the Rust baseline and focused streaming integration
+tests from `AGENTS.md`; `cargo test --test local streaming` selects the latter.
+Debug test timings are not performance measurements.
+
+For a Mac-to-Linux test, also build this exact commit in a private checkout on
+the user-authorized Linux endpoint. A Mac executable cannot be uploaded and
+run as its Linux helper. Both native builds must print the same
+`--build-identity`; their executable file hashes will differ across platforms.
+Select the matching Linux executable with `--syq-path /absolute/path/to/syq`
+in native copy mode, or `--rsync-path /absolute/path/to/syq` in rsync mode.
+Do not replace a normal remote installation or bypass build-identity checks.
+See [cross-platform development](../docs/development.md#another-platform).
+
+Compare these tuning values using the same candidate binary and workload:
+
+| Comparison | `--tuning-options` value |
+|---|---|
+| Ordinary pipeline | `copy-path=auto,request-size=4M,pipeline-depth=4` |
+| Hybrid streaming, the candidate of interest | `copy-path=auto-streaming,request-size=4M` |
+| Deeper ordinary pipeline | `copy-path=auto,request-size=4M,pipeline-depth=16` |
+
+Try fixed connection counts of 1 and 8 (`--connections` in native copy mode,
+`--syq-connections` in rsync mode). Keep compression settings equal; the Linux
+screening comparisons used `--no-compress`. Use `-v --stats` and `SYQ_DEBUG=1`
+to retain actual transport evidence, copy-path counters, discarded source
+payload and shrink-notification counts. A local whole-file or small-batch path
+can legitimately report zero streaming ranges under `auto-streaming`.
+
+Start with a generated large file and a small-file tree, then test remote push
+and pull when a named endpoint is available. Separately compare
+`copy-path=ranges` against `auto` to investigate local parallel-range gains;
+those are not gains provided by streaming itself. `copy-path=streaming` forces
+ranges and disables unrelated fast paths, so it is not the hybrid candidate.
+
+Use fresh, empty, task-owned destinations; check free space before generation;
+verify every complete copy outside the timer; remove only generated scratch.
+Use three interleaved repeats and a 25-second per-copy deadline, reducing the
+fixture size if necessary. Terminate the whole owned process group on a cap
+and check for surviving local/remote workers. Do not assume GNU `timeout`, GNU
+`time`, `/proc`, or the private Linux experiment adapters exist on macOS.
+Record cache policy and filesystem behavior (including possible APFS cloning),
+and never apply a global cache purge or add a final disk flush to these timings.
+
+The syq-bench run data and host-specific Linux adapters remain gitignored on
+the original machine; they are not distributed by this branch. No credentials
+or infrastructure identifiers are needed in git. The implementation and this
+handoff are sufficient to run fresh comparisons using the laptop's harness or
+a small bounded driver. Keep new environment-specific configs and measurements
+in ignored artifacts, and report exact revisions, verification, transport,
+throughput and any unavailable controls alongside the results.
