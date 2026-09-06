@@ -6100,6 +6100,9 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
 fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    // Exercise the SSH arrival address even where Linux interface discovery
+    // could otherwise mask a missing address in the fake SSH session.
+    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     let data = prng(9 * 1024 * 1024 + 123, 904);
     write(&t.path("source"), &data);
     for tcp in [false, true] {
@@ -6139,6 +6142,7 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                     .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
                     .env("XDG_CONFIG_HOME", t.path("config"))
                     .env("XDG_CACHE_HOME", t.path("cache"));
                 let out = command.run().unwrap();
