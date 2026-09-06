@@ -79,9 +79,7 @@ eval "$(syq completion bash)"
 
 # Zsh (~/.zshrc), after autoload -Uz compinit && compinit
 source <(syq completion zsh)
-```
 
-```fish
 # fish (~/.config/fish/config.fish)
 syq completion fish | source
 ```
