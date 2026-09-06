@@ -58,10 +58,6 @@ if syq is missing, it offers to install it.
 <figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
 </figure>
 
-Syq persistence is off for the benchmark, and rsync opens a fresh SSH
-connection for each trial. Connection startup is included in the measured
-time. Your normal persistence setting and open sessions are unchanged.
-
 For requirements, options and how to read the results, see
 [the benchmark guide](speed.md#quick-comparison).
 

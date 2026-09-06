@@ -70,21 +70,14 @@ is unavailable, it reports the remote path for later cleanup. The script rotates
 tool order and reports speeds in decimal MB/s (1 MB = 1,000,000 bytes):
 each trial’s copied bytes divided by its elapsed time, followed by the mean,
 minimum and maximum trial speeds. Higher is faster. It uses
-syq's defaults with persistence off and permissions preserved, `rsync -rpt`,
-and local `cp -pR`.
+syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
 These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem
 optimizations.
 
-The script disables syq persistence in private configuration and runtime
-directories, leaving your normal setting and open sessions untouched. Rsync
-also opens a fresh SSH connection for each trial, even if your SSH config
-enables multiplexing. Every timed copy includes connection startup.
-
 Generation, preparation, calibration, and POSIX `cksum` comparisons are
 outside the scored timers. Preparation shows helper installation messages without
-a throughput result. Preparation and calibration connections close before
-scored trials begin. A failed command or content check stops the comparison.
+a throughput result. A failed command or content check stops the comparison.
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;

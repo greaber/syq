@@ -1,3 +1,0 @@
-workload,build,persistence,elapsed_ms,copying_elapsed_ms,outside_copying_interval_ms,bytes_transferred,verified
-large,4a9372e,off,30245,21970,8275,67108864,true
-small,4a9372e,off,9261,3346,5915,8388608,true

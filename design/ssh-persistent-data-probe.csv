@@ -1,3 +1,0 @@
-variant,revision,persistence,workers,files,bytes,elapsed_seconds,control_ready_seconds,data_worker_ready_seconds,verified
-before,f4aee996,on,1,300,307200,5.478527165949345,0.0,3.34,True
-reuse,1f6a12c,on,1,300,307200,2.8616724582388997,0.0,0.6,True
