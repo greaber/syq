@@ -173,18 +173,18 @@ make_data() {
 }
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=()
+    local command=() syq_options=(--preserve=permissions)
     # This repository-owned caller suppresses only the tiny copy's summary,
     # keeping bootstrap diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
-    [[ ${4:-} != setup ]] || syq_options=(--suppress-summary --no-progress)
-    [[ ${4:-} != calibration ]] || syq_options=(--suppress-summary --results "$local_root/calibration.json")
+    [[ ${4:-} != setup ]] || syq_options=(--preserve=permissions --suppress-summary --no-progress)
+    [[ ${4:-} != calibration ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/calibration.json")
     case $tool in
         syq)
             case $mode in
-                local) command=(syq cp --preserve=permissions --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}") ;;
-                push) command=(syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into-existing "$destination" "${syq_options[@]}") ;;
-                pull) command=(syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}") ;;
+                local) command=(syq cp "${syq_options[@]}" --srcs-in "$source" --into-existing "$destination") ;;
+                push) command=(syq cp "${syq_options[@]}" --srcs-in "$source" --to "$host" --into-existing "$destination") ;;
+                pull) command=(syq cp "${syq_options[@]}" --from "$host" --srcs-in "$source" --into-existing "$destination") ;;
             esac ;;
         rsync)
             case $mode in
