@@ -49,10 +49,11 @@ Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_file` and `src_dir`
 | `cwd` | Source resolution base; may be remote for `cp` and `rm` |
 | `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
 | `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
-| `timeout` | Override the client timeout in seconds; `None` uses the client default |
+| `timeout` | Omitted: use client default; `None`: no timeout; number: timeout in seconds |
 
 Boolean flags default to `False`; other optional arguments default to `None`,
-except `check=True`. Invalid argument combinations raise `SyqInvocationError`;
+except `check=True` and `timeout`, whose omitted value inherits the client default.
+Invalid argument combinations raise `SyqInvocationError`;
 filesystem and remote checks happen in syq.
 
 <a id="a-normal-copy"></a>
@@ -71,7 +72,7 @@ In addition to the shared arguments above, it accepts:
 | `from_`, `to` | SSH endpoint strings; omitted endpoints are local |
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
-| `mapping` | Manifest path or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune` |
+| `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
 | `ignore_existing`, `existing`, `update` | Boolean: skip existing, require existing, or skip newer destination files |
@@ -121,9 +122,42 @@ reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
 copying. Besides the shared arguments, it accepts `as_` to rename a selected
 object. `srcs_in` must be the sole selector when used.
 
-`MapStream` is an iterable context manager yielding [MappingEntry](https://greaber.github.io/syq/python-reference.html#mappingentry); use `with`.
-`AsyncMapStream` is its async equivalent; use `async with`. Both expose `cwd`
-(`pathlib.Path`), the absolute source-base spelling to pass to `cp(cwd=...)`.
+`MapStream` is a `Mapping` and an iterable context manager; use `with`.
+`AsyncMapStream` is an `AsyncMapping` and an async context manager; use
+`async with`. Streams must be consumed inside their context and cannot be reused
+after completion or closure. Async streams capture the producer directory,
+environment, and timeout when created, even though execution starts later.
+
+### Mapping and AsyncMapping
+
+A mapping combines entries with their local source context. Pass it directly
+to `cp(mapping=...)`, even on a client with a different `process_cwd`.
+
+`Mapping(entries, *, cwd=None, root=None, follow_src=False)` accepts an iterable
+of `MappingEntry`. `AsyncMapping(...)` accepts an async iterable. If both `cwd`
+and `root` are omitted, the source base is the current directory at construction.
+Otherwise exactly one may be supplied. Relative `cwd` and `root` paths resolve
+against the Python process directory at construction, not a client's
+`process_cwd`. `root` confines source resolution.
+
+| Member | Type | Meaning |
+|---|---|---|
+| `cwd` | `pathlib.Path` | Absolute source-base spelling, preserving symlinks and `..` |
+| `root` | `pathlib.Path` or `None` | Confinement base, when created with `root` |
+| `follow_src` | `bool` | Whether the copy should follow source symlinks |
+| `transform(function)` | `Mapping` or `AsyncMapping` | Lazy transformation that keeps the source context |
+
+The context properties are read-only. A transform receives each `MappingEntry`
+and returns a replacement entry, or `None` to omit it. Transformations can be
+chained. Async transforms also accept awaitable callbacks and await them in
+entry order. Neither form caches entries; reuse depends on the supplied iterable.
+
+A context-carrying mapping rejects `from_`, `cwd`, and `root` overrides on `cp`.
+It automatically enables the source-following policy used by `map`; enabling
+`follow` or `follow_src` on the copy is also permitted. The destination options
+remain independent. `map(root=..., srcs_in=...)` carries the selected directory
+as the consuming copy's root. The copy resolves that root again; it does not
+inherit an open directory handle or a snapshot of the source tree.
 
 ### MappingEntry
 
@@ -160,16 +194,15 @@ Both types are immutable and provide:
 
 `RelativePath` also implements `os.PathLike`, returning bytes.
 
-Normal end of iteration checks the mapping process status. Leaving the context
-early stops the process. Pass `mapping.cwd` through without normalizing it.
-A consuming copy resolves that path again; `map(root=...)` does not transfer its
-confinement to the copy. Pass `follow_src=True` to both calls when the source
-base requires following symlinks.
+Normal end of stream iteration checks the mapping process status. Leaving its
+context early stops the process. An exhausted or closed stream cannot be copied
+as an empty mapping.
 
 For `cp(mapping=iterable)`, the entire iterable is saved to a temporary manifest
-before copying starts. An iteration or serialization failure starts no copy.
-`AsyncClient.cp` also accepts async iterables. Passing a manifest path uses that
-file directly. See [mapping rules](https://greaber.github.io/syq/mappings.html).
+before copying starts. An iteration, transformation, or serialization failure
+starts no copy. Plain iterables and manifest paths have no source context; pass
+`cwd`, `root`, or `from_` explicitly as needed. See
+[mapping rules](https://greaber.github.io/syq/mappings.html).
 
 <a id="retry-data-not-automatic-retry-policy"></a>
 
@@ -198,11 +231,7 @@ unsuccessful copy. Read attributes directly, for example
 | `deletions_planned` | `int` or `None` | Entries selected for pruning |
 | `deletions_completed` | `int` or `None` | Entries pruned |
 | `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
-| `provenance` | `str` or `None` | `"receiver_attested"` for results from a verified receiver receipt |
-| `receipt_status` | `ReceiptStatus` or `None` | Receiver receipt outcome |
-| `operations` | `int` or `None` | Attested operation record count |
-| `final_states` | `int` or `None` | Attested final-state record count |
-| `receipt_records` | `int` or `None` | Total receipt record count |
+| `receipt` | `ReceiptSummary` or `None` | Verified receiver receipt details; `None` for ordinary copies |
 
 With `dry_run=True`, mutation totals describe planned changes. With
 `verify_only=True`, matching files count as unchanged; transfer and creation
@@ -211,7 +240,7 @@ totals are zero. A failed call reports work completed before it stopped.
 Ordinary copies have all three deletion fields only with `prune=True`;
 otherwise they are `None`. Receiver-attested results have only
 `deletions_completed`, and their unchanged/excluded totals are always zero
-because the receiver cannot observe source-side skips. The receipt fields are
+because the receiver cannot observe source-side skips. `receipt` is
 `None` for ordinary copies.
 
 ### RmResult
@@ -245,10 +274,32 @@ Both `CpResult` and `RmResult` include:
 | `dry_run` | `bool` | Whether this was a preview |
 | `errors` | `int` | Counted errors |
 | `elapsed_ms` | `int` | Run duration in milliseconds |
+| `protocol` | `ProtocolMetadata` | Automation envelope; also present on every event |
+
+### ProtocolMetadata
+
+Frozen dataclass accessed through `result.protocol` or `event.protocol`.
+The SDK checks these fields; applications normally only need them when recording
+or diagnosing a stream.
+
+| Attribute | Type | Meaning |
+|---|---|---|
 | `schema` | `str` | `"syq.automation"` |
 | `schema_version` | `int` | `1` |
 | `seq` | `int` | Record sequence number, starting at zero |
-| `type` | `str` | `"result"` |
+| `type` | `str` | Wire record type; `"result"` for terminal totals |
+
+### ReceiptSummary
+
+Frozen dataclass accessed through `CpResult.receipt` for receiver-attested copies.
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `status` | `ReceiptStatus` | Receiver receipt outcome |
+| `operations` | `int` | Attested operation record count |
+| `final_states` | `int` | Attested final-state record count |
+| `records` | `int` | Total receipt record count |
+| `provenance` | `str` | `"receiver_attested"` |
 
 ### OperationStatus
 
@@ -271,9 +322,8 @@ awaitable callbacks count toward the timeout.
 
 `AutomationEvent` is the union of the event classes below and `CpResult` and
 `RmResult`. Each event is a frozen dataclass. Its fields are listed below;
-all events also carry `schema: str`, `schema_version: int`, `seq: int`, and
-`type: str`. The envelope has the same meaning as on results, with `type`
-identifying the event. Optional fields use `None` when unavailable.
+all events also carry `protocol: ProtocolMetadata`, just like results.
+`event.protocol.type` identifies the wire record type. Optional fields use `None` when unavailable.
 
 See [Automation results](https://greaber.github.io/syq/automation.html) for stream
 semantics. Python exposes `class` as `class_` and paths as `PathValue`.
@@ -298,7 +348,7 @@ The client does not retry automatically.
 Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
 `prune` and `mapping` are `None` for removal; `verify_only` defaults to `False`.
 
-`type = "run"`. Fields in addition to the common envelope:
+`protocol.type = "run"`. Fields in addition to the common envelope:
 
 ```python
 run_id: str
@@ -318,7 +368,7 @@ Sampled progress for displays; use the terminal result for final totals.
 Byte fields measure file content (comparison work with `verify_only=True`),
 `scanned` counts scanned entries, and `elapsed_ms` is milliseconds.
 
-`type = "progress"`. Fields in addition to the common envelope:
+`protocol.type = "progress"`. Fields in addition to the common envelope:
 
 ```python
 bytes_done: int
@@ -339,7 +389,7 @@ One planned copy change. `dst` is relative to the destination container;
 `src` is the mapping source when available. `bytes` is the planned file size,
 and `reason` describes why the change is needed.
 
-`type = "trace"`. Fields in addition to the common envelope:
+`protocol.type = "trace"`. Fields in addition to the common envelope:
 
 ```python
 action: OperationAction
@@ -358,7 +408,7 @@ when available. `bytes` and `attempts` give transfer information. Error details
 are present when known; `message` is display text. `provenance`, `scope`, and
 `code` apply to receiver-attested outcomes.
 
-`type = "operation_result"`. Fields in addition to the common envelope:
+`protocol.type = "operation_result"`. Fields in addition to the common envelope:
 
 ```python
 action: OperationAction
@@ -382,7 +432,7 @@ code: ReceiptCode | None
 One removal selector, indexed from zero. `path` is the original selector;
 `status` says whether it resolved. `kind` is `None` for a missing selector.
 
-`type = "selection_result"`. Fields in addition to the common envelope:
+`protocol.type = "selection_result"`. Fields in addition to the common envelope:
 
 ```python
 selector: int
@@ -396,7 +446,7 @@ kind: EntryKind | None
 One entry a preview would remove. `selector` identifies its source selector;
 `path` identifies the entry. `disposition` is always `WOULD_REMOVE`.
 
-`type = "removal_trace"`. Fields in addition to the common envelope:
+`protocol.type = "removal_trace"`. Fields in addition to the common envelope:
 
 ```python
 selector: int
@@ -411,7 +461,7 @@ One removal outcome or preview inspection failure. `selector` identifies its
 source selector; `path` identifies the entry. `attempts` counts attempts;
 `retryable`, `class_`, `os_kind`, and `message` describe failures when available.
 
-`type = "removal_result"`. Fields in addition to the common envelope:
+`protocol.type = "removal_result"`. Fields in addition to the common envelope:
 
 ```python
 selector: int
@@ -430,7 +480,7 @@ message: str | None
 One counted error. `message` is display text; `class_` and `os_kind` classify
 it when known. Receiver errors can also carry `provenance` and `code`.
 
-`type = "error"`. Fields in addition to the common envelope:
+`protocol.type = "error"`. Fields in addition to the common envelope:
 
 ```python
 message: str
@@ -448,7 +498,7 @@ Receiver-attested destination state. `dst` is relative to the signed `scope`.
 `observation_error` describes a partial observation. Absent objects have no
 object details; failed observations have `code` and optional `message`.
 
-`type = "final_state"`. Fields in addition to the common envelope:
+`protocol.type = "final_state"`. Fields in addition to the common envelope:
 
 ```python
 provenance: str
@@ -505,6 +555,10 @@ and `INCOMPLETE` reports an incomplete lifecycle. `Retryability.YES`, `NO`, and
 
 ## Failure model
 
+`SyqError` is the base class for every SDK-defined exception below. Specific
+subclasses retain their details so callers can distinguish an unsuccessful
+operation from a broken results stream.
+
 | Exception | Meaning / useful attributes |
 |---|---|
 | `SyqInstallError` | Managed executable installation or verification failed |
@@ -516,8 +570,10 @@ and `INCOMPLETE` reports an incomplete lifecycle. `Retryability.YES`, `NO`, and
 
 For `cp` and `rm`, `check=False` returns unsuccessful typed results; for `run`,
 it returns nonzero process results. It does not suppress other errors.
-Spawn failures and timeouts use standard Python exceptions. Callback exceptions
-are re-raised after stopping the operation.
+Spawn failures, timeouts, and ordinary Python type/value errors use standard
+Python exceptions. Exceptions from application callbacks or mapping iterators
+are re-raised unchanged. Async cancellation remains `asyncio.CancelledError`.
+These exceptions are not wrapped in `SyqError`.
 
 Timeout, cancellation, early mapping exit, and streaming failures terminate and
 reap the local process group, including SSH children. Filesystem changes already
@@ -529,13 +585,30 @@ completed are not rolled back.
 
 ## run
 
-`client.run(args, *, check=True, cwd=None, env=None, timeout=None, input=None)`
+`client.run(args, *, check=True, cwd=None, env=None, timeout=CLIENT_DEFAULT, input=None)`
 returns [Result](https://greaber.github.io/syq/python-reference.html#result). `input` accepts bytes. `args` is a sequence of arguments
 after the executable name, passed without a shell.
 
-Here, `cwd` is the local subprocess directory. `cwd`, `env`, and `timeout`
-use the client defaults when omitted or `None`. Module-level `syq.run` takes
-the same arguments plus `executable=None`.
+Here, `cwd` is the local subprocess directory. `cwd` and `env` use client
+defaults when omitted or `None`. `timeout` uses the client default only when
+omitted; explicit `None` disables it. Module-level `syq.run` takes the same
+arguments plus `executable=None` and defaults to no timeout.
+
+Wrappers can forward `syq.CLIENT_DEFAULT` to preserve client inheritance.
+`syq.Timeout` is the type alias for a number, `None`, or that sentinel:
+
+```python
+def copy_data(client: syq.Client, *, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
+    return client.cp("data", into="backup", timeout=timeout)
+```
+
+`CLIENT_DEFAULT` applies to client methods (including module-level `cp`, `rm`,
+and `map`); client constructors and module-level `run` have no client default
+to inherit.
+
+Timeouts cover subprocess execution. Managed installation and mapping-input
+materialization happen before the copy process starts and are not covered by
+its timeout. Async cancellation still stops mapping-input preparation.
 
 ### Result
 

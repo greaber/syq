@@ -20,13 +20,15 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .errors import SyqError
+
 
 _DOWNLOAD_TIMEOUT_SECONDS = 30
 _CHUNK_SIZE = 1024 * 1024
 _EXPECTED_REPOSITORY = "https://github.com/greaber/syq"
 
 
-class SyqInstallError(RuntimeError):
+class SyqInstallError(SyqError, RuntimeError):
     """The SDK could not install or validate its pinned syq executable."""
 
 

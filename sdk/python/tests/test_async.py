@@ -174,7 +174,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(records[-2]["type"], "final_state")
         self.assertEqual(records[-1]["provenance"], "receiver_attested")
-        self.assertEqual(result.receipt_status, syq.ReceiptStatus.CLEAN)
+        self.assertEqual(result.receipt.status, syq.ReceiptStatus.CLEAN)
 
     async def test_version_matches_synchronous_client(self) -> None:
         self.assertEqual(await self.client.version(), "9.8.7")
@@ -197,7 +197,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--follow-src", self.argv())
             self.assertIn("--root", self.argv())
             copied = await self.client.cp(
-                mapping=stream, cwd=stream.cwd, into="target"
+                mapping=stream, into="target"
             )
         self.assertEqual(copied.files_transferred, 1)
         self.assertEqual(stream.cwd, Path.cwd() / "source-root" / "source")
