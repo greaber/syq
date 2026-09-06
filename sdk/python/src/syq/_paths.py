@@ -49,4 +49,3 @@ def _map_stream_cwd(
     # Path preserves `..` components. In particular, do not use abspath or
     # resolve here: the native walker must encounter symlinks before `..`.
     return Path(effective)
-

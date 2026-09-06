@@ -55,6 +55,36 @@ impl RequestReader {
             .as_ref()
             .and_then(crate::conn::tcp_socket_stats)
     }
+
+    /// Process one-way limit updates before the next read. Return to the
+    /// writer when a shrink exhausts the range so it can send Done before
+    /// waiting for Stop. Once Done is sent, consume late controls through Stop
+    /// before accepting another operation on this connection.
+    fn stream_stopped(&self, off: u64, limit: &mut u64, done_sent: bool) -> Result<bool> {
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            if off >= *limit && !done_sent {
+                return Ok(false);
+            }
+            let request = if off >= *limit {
+                self.recv()
+                    .context("read stream control channel closed")??
+            } else {
+                match self.rx.as_ref().unwrap().try_recv() {
+                    Ok(request) => request?,
+                    Err(TryRecvError::Empty) => return Ok(false),
+                    Err(TryRecvError::Disconnected) => bail!("read stream control channel closed"),
+                }
+            };
+            match request.value {
+                Request::StopReadStream => return Ok(true),
+                Request::ShrinkReadStream { end } => {
+                    crate::streaming::shrink_limit(limit, end)?;
+                }
+                _ => bail!("only stop and shrink requests are valid during a read stream"),
+            }
+        }
+    }
 }
 
 impl Drop for RequestReader {
@@ -457,6 +487,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
             ))?;
             continue;
         }
+        // A fence performs no filesystem operation and grants no authority.
+        // It must work after expiration/revocation too: preceding writes have
+        // already received their individual authorization/error responses.
+        if matches!(req, Request::WriteStreamFence) {
+            w.write_msg(&Response::WriteStreamDone)?;
+            continue;
+        }
         let settlement = match &authority {
             Some(authority) => match authority.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
@@ -492,6 +529,59 @@ fn serve<R: Read + Send + 'static, W: Write>(
         }
         match req {
             Request::Shutdown => break,
+            Request::ReadStream(mut stream) => {
+                if !is_source_worker {
+                    w.write_msg(&Response::Err(
+                        "read stream requires a source worker".into(),
+                    ))?;
+                    continue;
+                }
+                if let Err(error) = stream.validate() {
+                    w.write_msg(&Response::Err(error.to_string()))?;
+                    continue;
+                }
+                w.write_msg(&Response::Ok)?;
+                let mut limit = stream.end;
+                let mut done_sent = false;
+                loop {
+                    // Once all payload (or a read error) is sent, advertise
+                    // the data boundary without waiting another network RTT
+                    // for Stop. Still consume Stop before leaving this mode:
+                    // the client's later commands follow it on the same
+                    // ordered connection, including late shrink notifications.
+                    if stream.off >= limit && !done_sent {
+                        w.write_msg(&Response::ReadStreamDone)?;
+                        done_sent = true;
+                    }
+                    if reader.stream_stopped(stream.off, &mut limit, done_sent)? {
+                        break;
+                    }
+                    if stream.off >= limit {
+                        // A late shrink crossed the current offset: send Done
+                        // on the next iteration, without another read or RTT.
+                        continue;
+                    }
+                    let t0 = std::time::Instant::now();
+                    let response = ops.handle(&stream.next_request());
+                    t[1] += t0.elapsed().as_secs_f64();
+                    if let Response::Block { data, .. } = &response {
+                        stream.off += data.len() as u64;
+                        blocks += 1;
+                        bytes += data.len() as u64;
+                    } else {
+                        stream.off = stream.end;
+                    }
+                    let t0 = std::time::Instant::now();
+                    w.write_msg(&response)?;
+                    t[2] += t0.elapsed().as_secs_f64();
+                }
+                if !done_sent {
+                    w.write_msg(&Response::ReadStreamDone)?;
+                }
+            }
+            Request::StopReadStream | Request::ShrinkReadStream { .. } => {
+                w.write_msg(&Response::Err("no read stream is active".into()))?;
+            }
             Request::TcpListen {
                 key,
                 token,
@@ -1239,9 +1329,138 @@ impl Read for TcpHandshakeReader {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let reader = super::RequestReader {
+            rx: Some(rx),
+            thread: None,
+            tcp_socket: None,
+            named_socket: None,
+        };
+        let send = |value| {
+            tx.send(Ok(crate::wire_budget::Budgeted {
+                value,
+                hold: crate::wire_budget::Hold::new(),
+            }))
+            .unwrap();
+        };
+        let mut limit = 4096;
+        send(super::Request::ShrinkReadStream { end: 2048 });
+        send(super::Request::ShrinkReadStream { end: 1024 });
+        assert!(!reader.stream_stopped(0, &mut limit, false).unwrap());
+        assert_eq!(limit, 1024);
+
+        // Even if a block straddled the new end, consume subsequent shrink
+        // commands and wait for Stop; never issue another read or consume
+        // the next stream's command. A zero limit cancels all future reads.
+        send(super::Request::ShrinkReadStream { end: 0 });
+        send(super::Request::StopReadStream);
+        send(super::Request::Shutdown);
+        assert!(reader.stream_stopped(2048, &mut limit, true).unwrap());
+        assert_eq!(limit, 0);
+        assert!(matches!(
+            reader.recv().unwrap().unwrap().value,
+            super::Request::Shutdown
+        ));
+
+        // Increasing a limit is a protocol error, not new read authority.
+        send(super::Request::ShrinkReadStream { end: u64::MAX });
+        assert!(reader.stream_stopped(2048, &mut limit, true).is_err());
+        assert_eq!(limit, 0);
+        drop(tx);
+        assert!(reader.stream_stopped(2048, &mut limit, true).is_err());
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
+        let root = crate::test_support::tempdir().unwrap();
+        let authority = Arc::new(crate::restricted::tests::tcp_test_authority(root.path()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_authority = authority.clone();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            serve(
+                socket.try_clone().unwrap(),
+                socket.try_clone().unwrap(),
+                false,
+                None,
+                None,
+                Some(socket),
+                ServeSession {
+                    handshake_pending: None,
+                    allow_tcp: true,
+                    named_socket: None,
+                    authority: Some(server_authority),
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
+            )
+            .unwrap();
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = FrameReader::new(socket.try_clone().unwrap());
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: true,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::DestinationWorker {
+                    destination: None,
+                    copy_sources: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::HelloOk { .. }
+        ));
+        authority.close_control();
+        for _ in 0..2 {
+            writer
+                .write_msg(&Request::WriteRange {
+                    path: b"file".to_vec(),
+                    inplace: false,
+                    copy_id: CopyId::default(),
+                    attempt: 0,
+                    off: 0,
+                    hash: fsops::content_digest(b"data"),
+                    data: b"data".to_vec(),
+                    guard: None,
+                })
+                .unwrap();
+            assert!(
+                matches!(reader.read_msg::<Response>().unwrap(), Response::Err(error) if error.contains("closed"))
+            );
+            writer.write_msg(&Request::WriteStreamFence).unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::WriteStreamDone
+            ));
+        }
+        socket.shutdown(std::net::Shutdown::Both).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     const IP_ADDR_SHOW: &str = "\
 1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
@@ -1357,6 +1576,10 @@ mod tests {
         let selected = crate::test_support::tempdir().unwrap();
         let marker = selected.path().join("marker");
         std::fs::write(&marker, b"marker").unwrap();
+        std::fs::File::create(selected.path().join("stream-large"))
+            .unwrap()
+            .set_len(8 << 20)
+            .unwrap();
         let descriptor_session = DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(selected.path()).unwrap())
@@ -1396,6 +1619,9 @@ mod tests {
         });
 
         let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
         let mut reader = FrameReader::new(socket);
         writer
@@ -1490,6 +1716,112 @@ mod tests {
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::EndpointError(error) if error.message.contains("omitted")
+        ));
+        // Streaming must retain the same source capability checks, including
+        // after an error and after stopping an interval early.
+        for (source, end, expected_error) in [
+            (Some(selection.join(b"marker").unwrap()), 6, false),
+            (None, 6, true),
+            (Some(selection.join(b"marker").unwrap()), 4096, true),
+        ] {
+            writer
+                .write_msg(&Request::ReadStream(ReadStreamRequest {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                    source,
+                    attempt: 0,
+                    off: 0,
+                    end,
+                    block: 512,
+                }))
+                .unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::Ok
+            ));
+            let response = reader.read_msg::<Response>().unwrap();
+            if expected_error {
+                assert!(
+                    matches!(response, Response::EndpointError(_)),
+                    "{response:?}"
+                );
+            } else {
+                assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+            }
+            // Completion arrives before Stop, including after a read error.
+            // The socket's read deadline makes waiting for Stop fail this test.
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::ReadStreamDone
+            ));
+            // A shrink can arrive after the final block or an error. It has
+            // no reply, does not restart reading, and cannot cross the fence.
+            writer
+                .write_msg(&Request::ShrinkReadStream { end: 0 })
+                .unwrap();
+            writer.write_msg(&Request::StopReadStream).unwrap();
+            // The next iteration's request must not consume a second Done
+            // or a response to the late shrink/stop.
+            writer
+                .write_msg(&Request::ShrinkReadStream { end: 0 })
+                .unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::Err(error) if error == "no read stream is active"
+            ));
+        }
+        // A late shrink can exhaust a still-active stream after read-ahead
+        // crossed its new boundary. It must produce Done before Stop, just
+        // like natural EOF. Small frames keep the stream in flight until the
+        // client sends the shrink; the read deadline catches a stop-RTT stall.
+        writer
+            .write_msg(&Request::ReadStream(ReadStreamRequest {
+                path: Vec::new(),
+                source: Some(selection.join(b"stream-large").unwrap()),
+                attempt: 0,
+                off: 0,
+                end: 8 << 20,
+                block: 512,
+            }))
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Ok
+        ));
+        let mut received = match reader.read_msg::<Response>().unwrap() {
+            Response::Block { data, .. } => data.len(),
+            other => panic!("expected first streamed block, got {other:?}"),
+        };
+        writer
+            .write_msg(&Request::ShrinkReadStream { end: 0 })
+            .unwrap();
+        loop {
+            match reader.read_msg::<Response>().unwrap() {
+                Response::Block { data, .. } => received += data.len(),
+                Response::ReadStreamDone => break,
+                other => panic!("unexpected late-shrink response: {other:?}"),
+            }
+        }
+        assert!(
+            received < 8 << 20,
+            "stream ended naturally before the shrink"
+        );
+        writer
+            .write_msg(&Request::ShrinkReadStream { end: 0 })
+            .unwrap();
+        writer.write_msg(&Request::StopReadStream).unwrap();
+        writer
+            .write_msg(&Request::ReadStream(ReadStreamRequest {
+                path: Vec::new(),
+                source: Some(selection.join(b"marker").unwrap()),
+                attempt: 0,
+                off: 0,
+                end: 6,
+                block: 0,
+            }))
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(_)
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {

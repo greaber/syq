@@ -1788,7 +1788,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let opts = Arc::new(Opts {
         block,
         tuning: args.tuning_options.unwrap_or_default(),
-        benchmark: (args.tuning_options.is_some()
+        benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
             && (args.stats || args.verbose > 0 || debug()))
         .then(|| Mutex::new(crate::transfer_tuning::BenchmarkStats::default())),
@@ -1824,7 +1824,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (after pacing and receiver limits), pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
-            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver), opts.tuning.pipeline_depth(), block,
+            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
@@ -8212,6 +8213,17 @@ impl Worker {
     }
 
     fn transfer_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
+        let bytes = {
+            let range = h.lock().unwrap();
+            range.end - range.pos
+        };
+        if self
+            .opts
+            .tuning
+            .stream_range(self.opts.same_host, bytes, self.transfer_block())
+        {
+            return self.transfer_streaming_range(h, credited);
+        }
         let idx = {
             let g = h.lock().unwrap();
             g.idx
@@ -8235,75 +8247,213 @@ impl Worker {
         let inplace = job.inplace;
         let mut pending_reads = std::collections::VecDeque::new();
         let mut writes_out = 0usize;
-        loop {
-            if !self.gate.allowed(self.id) {
-                // Being parked: give the rest of this range back so an active
-                // worker picks it up; what's already requested still completes.
-                self.sched.release_rest(h);
-            }
-            while pending_reads.len() < read_window {
-                let (off, n) = {
-                    let mut g = h.lock().unwrap();
-                    if g.pos >= g.end {
-                        break;
-                    }
-                    let n = (g.end - g.pos).min(block);
-                    let off = g.pos;
-                    g.pos += n;
-                    (off, n)
+        let result = (|| -> Result<()> {
+            loop {
+                if self.sched.is_failed(idx) || self.sched.is_aborted() {
+                    self.sched.release_rest(h);
+                    break;
+                }
+                if !self.gate.allowed(self.id) {
+                    // Being parked: give the rest of this range back so an active
+                    // worker picks it up; what's already requested still completes.
+                    self.sched.release_rest(h);
+                }
+                while pending_reads.len() < read_window {
+                    let (off, n) = {
+                        let mut g = h.lock().unwrap();
+                        if g.pos >= g.end {
+                            break;
+                        }
+                        let n = (g.end - g.pos).min(block);
+                        let off = g.pos;
+                        g.pos += n;
+                        (off, n)
+                    };
+                    self.limit(n);
+                    self.src.send(Request::ReadRange {
+                        path: job.src.clone(),
+                        source: self.source_reference(&job),
+                        attempt: job.attempt,
+                        off,
+                        len: n as u32,
+                    })?;
+                    self.benchmark.range_requests += 1;
+                    self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
+                    pending_reads.push_back((off, n));
+                }
+                if pending_reads.is_empty() {
+                    break;
+                }
+                let t0 = std::time::Instant::now();
+                let response = self.src.recv();
+                let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
+                self.t[0] += t0.elapsed().as_secs_f64();
+                let (off, hash, data) = match ok(response?, "read")? {
+                    Response::Block { off, hash, data } => (off, hash, data),
+                    other => bail!("unexpected response {other:?}"),
                 };
-                self.limit(n);
-                self.src.send(Request::ReadRange {
-                    path: job.src.clone(),
-                    source: self.source_reference(&job),
+                validate_range_reply(expected_off, expected_len, off, data.len())?;
+                let n = data.len() as u64;
+                let t0 = std::time::Instant::now();
+                self.dst.send(Request::WriteRange {
+                    path: job.dst.clone(),
+                    inplace,
+                    copy_id: self.copy_id(),
                     attempt: job.attempt,
                     off,
-                    len: n as u32,
+                    hash,
+                    data,
+                    guard: job.container_guard.clone(),
                 })?;
-                self.benchmark.range_requests += 1;
-                self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
-                pending_reads.push_back((off, n));
+                self.t[1] += t0.elapsed().as_secs_f64();
+                writes_out += 1;
+                if writes_out >= write_window {
+                    let t0 = std::time::Instant::now();
+                    let response = self.dst.recv();
+                    writes_out -= 1;
+                    self.t[2] += t0.elapsed().as_secs_f64();
+                    ok(response?, "write")?;
+                }
+                self.progress.add_bytes(n);
+                job.done.fetch_add(n, Relaxed);
+                *credited += n;
             }
-            if pending_reads.is_empty() {
-                break;
-            }
-            let t0 = std::time::Instant::now();
-            let (off, hash, data) = match ok(self.src.recv()?, "read")? {
-                Response::Block { off, hash, data } => (off, hash, data),
-                other => bail!("unexpected response {other:?}"),
-            };
-            self.t[0] += t0.elapsed().as_secs_f64();
-            let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
-            validate_range_reply(expected_off, expected_len, off, data.len())?;
-            let n = data.len() as u64;
-            let t0 = std::time::Instant::now();
-            self.dst.send(Request::WriteRange {
-                path: job.dst.clone(),
-                inplace,
-                copy_id: self.copy_id(),
-                attempt: job.attempt,
-                off,
-                hash,
-                data,
-                guard: job.container_guard.clone(),
-            })?;
-            self.t[1] += t0.elapsed().as_secs_f64();
-            writes_out += 1;
-            if writes_out >= write_window {
+            Ok(())
+        })();
+        // A malformed source is not an ordinary endpoint error. Preserve
+        // master's fail-closed behavior: never drain or reuse this worker's
+        // connections, and let the caller abort the whole copy.
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>())
+        {
+            return result;
+        }
+        // Ordinary endpoint errors consume one response but do not break the
+        // connection. Drain all previously issued reads and writes before any
+        // later file (including an automatically streamed range) can use it.
+        // Evaluate both drains even if the operation or first drain failed.
+        let t0 = std::time::Instant::now();
+        let source_end =
+            crate::conn::drain_range_replies(&mut *self.src, pending_reads.len(), "read");
+        self.t[0] += t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let destination_end = crate::conn::drain_range_replies(&mut *self.dst, writes_out, "write");
+        self.t[2] += t0.elapsed().as_secs_f64();
+        result.and(source_end).and(destination_end)
+    }
+
+    fn transfer_streaming_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
+        let (idx, start, end) = {
+            let range = h.lock().unwrap();
+            (range.idx, range.pos, range.end)
+        };
+        if start == end || self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        let job = self.job(idx);
+        let block = self.transfer_block();
+        // Do not advance the scheduler's claimed position when opening the
+        // stream. Other workers may still steal the unread suffix. At a split
+        // we notify the source at the next consumer block boundary, then
+        // stop/drain after consuming our prefix. Queued frames can still arrive.
+        let stream = ReadStreamRequest {
+            path: job.src.clone(),
+            source: self.source_reference(&job),
+            attempt: job.attempt,
+            off: start,
+            end,
+            block: block as u32,
+        };
+        stream.validate()?;
+        match ok(
+            self.src.call(Request::ReadStream(stream))?,
+            "start read stream",
+        )? {
+            Response::Ok => {}
+            _ => bail!("unexpected response starting read stream"),
+        }
+        self.benchmark.streaming_ranges += 1;
+        let begin = self.dst.begin_streaming_writes();
+        if let Err(error) = begin {
+            let _ = self.src.stop_read_stream();
+            return Err(error);
+        }
+        let mut sent = 0;
+        let result = (|| -> Result<()> {
+            let mut expected = start;
+            let mut announced_end = end;
+            loop {
+                if !self.gate.allowed(self.id)
+                    || self.sched.is_failed(idx)
+                    || self.sched.is_aborted()
+                {
+                    self.sched.release_rest(h);
+                }
+                {
+                    let range = h.lock().unwrap();
+                    if range.pos == range.end {
+                        break;
+                    }
+                }
+                if crate::streaming::notify_shrunk_range(h, &mut announced_end, &mut *self.src)? {
+                    self.benchmark.stream_shrink_requests += 1;
+                }
+                self.dst.check_streaming_writes()?;
                 let t0 = std::time::Instant::now();
-                ok(self.dst.recv()?, "write")?;
-                self.t[2] += t0.elapsed().as_secs_f64();
-                writes_out -= 1;
+                let (off, mut hash, mut data) = match ok(self.src.recv()?, "read stream")? {
+                    Response::Block { off, hash, data } => (off, hash, data),
+                    _ => bail!("unexpected response in read stream"),
+                };
+                self.t[0] += t0.elapsed().as_secs_f64();
+                let requested = (end - expected).min(block);
+                validate_range_reply(expected, requested, off, data.len())?;
+                expected += requested;
+                let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
+                self.benchmark.stream_discarded_bytes += requested - claimed;
+                if claimed == 0 {
+                    break;
+                }
+                self.limit(claimed);
+                let t0 = std::time::Instant::now();
+                self.dst.send(Request::WriteRange {
+                    path: job.dst.clone(),
+                    inplace: job.inplace,
+                    copy_id: self.copy_id(),
+                    attempt: job.attempt,
+                    off,
+                    hash,
+                    data,
+                    guard: job.container_guard.clone(),
+                })?;
+                self.t[1] += t0.elapsed().as_secs_f64();
+                sent += 1;
+                self.benchmark.streamed_blocks += 1;
+                self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
+                self.progress.add_bytes(claimed);
+                job.done.fetch_add(claimed, Relaxed);
+                *credited += claimed;
             }
-            self.progress.add_bytes(n);
-            job.done.fetch_add(n, Relaxed);
-            *credited += n;
+            Ok(())
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>())
+        {
+            // As with ordinary ranges, do not wait for more messages from a
+            // source that violated the protocol. Dropping the connections
+            // cancels the collector; the caller aborts rather than reconnects.
+            return result;
         }
-        while writes_out > 0 {
-            ok(self.dst.recv()?, "write")?;
-            writes_out -= 1;
-        }
-        Ok(())
+        // Always restore both protocol boundaries, even after a local write
+        // error. No following file can consume this one's data or late errors.
+        let (source_end, destination_end, destination_wait) =
+            crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
+        let source_end = source_end.map(|discarded| {
+            self.benchmark.stream_discarded_bytes += discarded;
+        });
+        self.t[2] += destination_wait.as_secs_f64();
+        result.and(source_end).and(destination_end)
     }
 
     fn undo_progress(&self, idx: usize, credited: u64) {
@@ -8583,6 +8733,12 @@ mod tests {
     struct PipelineConn(Arc<Mutex<PipelineState>>);
 
     impl Conn for PipelineConn {
+        fn begin_streaming_writes(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn check_streaming_writes(&mut self) -> Result<()> {
+            Ok(())
+        }
         fn send(&mut self, request: Request) -> Result<()> {
             self.0.lock().unwrap().requests.push(request);
             Ok(())
@@ -8624,145 +8780,158 @@ mod tests {
     fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
         // Exercise both callers of transfer_range: initial file work and a
         // queued range. Another file is ready when the malicious reply arrives.
-        for queued_range in [false, true] {
-            for wrong_length in [false, true] {
-                let directory = tempfile::tempdir().unwrap();
-                let path = directory.path().join("source");
-                std::fs::write(&path, vec![0; 4096]).unwrap();
-                let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
-                let sched = Arc::new(Sched::new(512, 8192));
-                let job = FileJob {
-                    src: b"first".to_vec(),
-                    source: RegisteredPath {
-                        root: serde_json::from_str("0").unwrap(),
-                        relative: b"first".to_vec(),
-                    },
-                    dst: b"first-dst".to_vec(),
-                    rel: "first".into(),
-                    entry,
-                    dst_entry: None,
-                    target_condition: TargetCondition::Any,
-                    container_guard: None,
-                    attempt: 0,
-                    done: Arc::new(AtomicU64::new(0)),
-                    inplace: false,
-                    rel_bytes: b"first".to_vec(),
-                    src_rel: None,
-                };
-                sched.push_file(job.clone());
-                let mut next = job;
-                next.src = b"second".to_vec();
-                next.dst = b"second-dst".to_vec();
-                sched.push_file(next);
-                sched.scan_done();
-                if queued_range {
-                    assert!(matches!(sched.next(), Item::File(0)));
-                    let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
-                    sched.retry_range(&range, 0);
-                }
-                let src = Arc::new(Mutex::new(PipelineState::default()));
-                for i in 0..5 {
-                    let data = vec![0; if i == 1 && wrong_length { 511 } else { 512 }];
-                    src.lock().unwrap().replies.push_back(Response::Block {
-                        off: if i == 1 && !wrong_length {
-                            999
-                        } else {
-                            i * 512
+        for streaming in [false, true] {
+            for queued_range in [false, true] {
+                for wrong_length in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("source");
+                    std::fs::write(&path, vec![0; 4096]).unwrap();
+                    let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+                    let sched = Arc::new(Sched::new(512, 8192));
+                    let job = FileJob {
+                        src: b"first".to_vec(),
+                        source: RegisteredPath {
+                            root: serde_json::from_str("0").unwrap(),
+                            relative: b"first".to_vec(),
                         },
-                        hash: content_digest(&data),
-                        data,
+                        dst: b"first-dst".to_vec(),
+                        rel: "first".into(),
+                        entry,
+                        dst_entry: None,
+                        target_condition: TargetCondition::Any,
+                        container_guard: None,
+                        attempt: 0,
+                        done: Arc::new(AtomicU64::new(0)),
+                        inplace: false,
+                        rel_bytes: b"first".to_vec(),
+                        src_rel: None,
+                    };
+                    sched.push_file(job.clone());
+                    let mut next = job;
+                    next.src = b"second".to_vec();
+                    next.dst = b"second-dst".to_vec();
+                    sched.push_file(next);
+                    sched.scan_done();
+                    if queued_range {
+                        assert!(matches!(sched.next(), Item::File(0)));
+                        let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+                        sched.retry_range(&range, 0);
+                    }
+                    let src = Arc::new(Mutex::new(PipelineState::default()));
+                    if streaming {
+                        src.lock().unwrap().replies.push_back(Response::Ok);
+                    }
+                    for i in 0..5 {
+                        let data = vec![0; if i == 1 && wrong_length { 511 } else { 512 }];
+                        src.lock().unwrap().replies.push_back(Response::Block {
+                            off: if i == 1 && !wrong_length {
+                                999
+                            } else {
+                                i * 512
+                            },
+                            hash: content_digest(&data),
+                            data,
+                        });
+                    }
+                    let dst = Arc::new(Mutex::new(PipelineState::default()));
+                    if !queued_range {
+                        dst.lock()
+                            .unwrap()
+                            .replies
+                            .push_back(Response::PartialSize(None));
+                    }
+                    dst.lock().unwrap().replies.push_back(Response::Ok);
+                    let opts = Arc::new(Opts {
+                        block: 512,
+                        tuning: crate::transfer_tuning::TransferTuning {
+                            copy_path: (!streaming)
+                                .then_some(crate::transfer_tuning::CopyPath::Ranges),
+                            pipeline_depth: (!streaming).then_some(4),
+                            ..Default::default()
+                        },
+                        benchmark: None,
+                        flags: 0,
+                        recursive: true,
+                        links: false,
+                        perms: false,
+                        devices: false,
+                        checksum: false,
+                        verify_only: false,
+                        inplace: false,
+                        same_host: false,
+                        allow_sequential_nfs_fallback: false,
+                        dst_remote: true,
+                        restricted_receiver: false,
+                        dry_run: false,
+                        quiet: true,
+                        verbose: 0,
+                        umask: 0,
+                        copy_id: std::sync::OnceLock::from([0; 16]),
+                        ignore: Vec::new(),
+                        delete: false,
+                        delete_excluded: false,
+                        max_delete: None,
+                        update: false,
+                        ignore_existing: false,
+                        existing: false,
+                        insecure_links: false,
+                        operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+                        max_size: None,
+                        min_size: None,
                     });
+                    let mut worker = Worker {
+                        id: 0,
+                        src: Box::new(PipelineConn(src.clone())),
+                        dst: Box::new(PipelineConn(dst.clone())),
+                        sched: sched.clone(),
+                        progress: Progress::new(false, false, None, false),
+                        opts,
+                        bwlimit: None,
+                        gate: Gate::new(1),
+                        t: [0.0; 4],
+                        fast: FastTiming::default(),
+                        benchmark: Default::default(),
+                        fast_batch_files: 1,
+                    };
+                    let error = worker.run().unwrap_err();
+                    assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
+                    assert!(sched.is_aborted());
+                    assert!(
+                        !worker.transport_dead(),
+                        "protocol failure, not a lost socket"
+                    );
+                    let source = src.lock().unwrap();
+                    assert_eq!(source.received, 2 + usize::from(streaming));
+                    assert_eq!(source.replies.len(), 3);
+                    if streaming {
+                        assert_eq!(source.requests.len(), 1);
+                        assert!(
+                            matches!(&source.requests[0], Request::ReadStream(stream) if stream.path == b"first")
+                        );
+                    } else {
+                        assert_eq!(source.requests.len(), 5);
+                        assert!(source.requests.iter().all(|request| matches!(
+                            request, Request::ReadRange { path, .. } if path == b"first"
+                        )));
+                    }
+                    let destination = dst.lock().unwrap();
+                    assert_eq!(destination.received, usize::from(!queued_range));
+                    assert_eq!(
+                        destination.replies.len(),
+                        1,
+                        "write ack remains outstanding"
+                    );
+                    let writes: Vec<_> = destination
+                        .requests
+                        .iter()
+                        .filter(|request| matches!(request, Request::WriteRange { .. }))
+                        .collect();
+                    assert_eq!(writes.len(), 1);
+                    assert!(
+                        matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
+                    );
+                    assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
                 }
-                let dst = Arc::new(Mutex::new(PipelineState::default()));
-                if !queued_range {
-                    dst.lock()
-                        .unwrap()
-                        .replies
-                        .push_back(Response::PartialSize(None));
-                }
-                dst.lock().unwrap().replies.push_back(Response::Ok);
-                let opts = Arc::new(Opts {
-                    block: 512,
-                    tuning: crate::transfer_tuning::TransferTuning {
-                        copy_path: Some(crate::transfer_tuning::CopyPath::Ranges),
-                        pipeline_depth: Some(4),
-                        ..Default::default()
-                    },
-                    benchmark: None,
-                    flags: 0,
-                    recursive: true,
-                    links: false,
-                    perms: false,
-                    devices: false,
-                    checksum: false,
-                    verify_only: false,
-                    inplace: false,
-                    same_host: false,
-                    allow_sequential_nfs_fallback: false,
-                    dst_remote: true,
-                    restricted_receiver: false,
-                    dry_run: false,
-                    quiet: true,
-                    verbose: 0,
-                    umask: 0,
-                    copy_id: std::sync::OnceLock::from([0; 16]),
-                    ignore: Vec::new(),
-                    delete: false,
-                    delete_excluded: false,
-                    max_delete: None,
-                    update: false,
-                    ignore_existing: false,
-                    existing: false,
-                    insecure_links: false,
-                    operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
-                    max_size: None,
-                    min_size: None,
-                });
-                let mut worker = Worker {
-                    id: 0,
-                    src: Box::new(PipelineConn(src.clone())),
-                    dst: Box::new(PipelineConn(dst.clone())),
-                    sched: sched.clone(),
-                    progress: Progress::new(false, false, None, false),
-                    opts,
-                    bwlimit: None,
-                    gate: Gate::new(1),
-                    t: [0.0; 4],
-                    fast: FastTiming::default(),
-                    benchmark: Default::default(),
-                    fast_batch_files: 1,
-                };
-                let error = worker.run().unwrap_err();
-                assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
-                assert!(sched.is_aborted());
-                assert!(
-                    !worker.transport_dead(),
-                    "protocol failure, not a lost socket"
-                );
-                let source = src.lock().unwrap();
-                assert_eq!(source.received, 2);
-                assert_eq!(source.replies.len(), 3);
-                assert_eq!(source.requests.len(), 5);
-                assert!(source.requests.iter().all(|request| matches!(
-                    request, Request::ReadRange { path, .. } if path == b"first"
-                )));
-                let destination = dst.lock().unwrap();
-                assert_eq!(destination.received, usize::from(!queued_range));
-                assert_eq!(
-                    destination.replies.len(),
-                    1,
-                    "write ack remains outstanding"
-                );
-                let writes: Vec<_> = destination
-                    .requests
-                    .iter()
-                    .filter(|request| matches!(request, Request::WriteRange { .. }))
-                    .collect();
-                assert_eq!(writes.len(), 1);
-                assert!(
-                    matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
-                );
-                assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
             }
         }
     }
