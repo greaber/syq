@@ -5934,6 +5934,69 @@ fn tuning_observed(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    for (name, size) in [("large", (17 << 20) + 123), ("small", 777), ("empty", 0)] {
+        write(&t.path(&format!("source/{name}")), &prng(size, 943));
+    }
+    for route in ["local", "push", "pull"] {
+        for mode in ["auto", "auto-streaming"] {
+            let destination = t.s(&format!("dst-{route}-{mode}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--connections",
+                "2",
+                "--no-progress",
+                "--no-tcp",
+                "--stats",
+                "--preserve=permissions",
+                "-v",
+                "--tuning-options",
+                &format!("copy-path={mode},request-size=1M"),
+            ]);
+            if route == "pull" {
+                command.args(["--from", "host"]);
+            }
+            command.args(["--srcs-in", &t.s("source")]);
+            if route == "push" {
+                command.args(["--to", "host"]);
+            }
+            let out = command
+                .args(["--into", &destination])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert_same_tree(&t.path("source"), Path::new(&destination));
+            let observed = tuning_observed(&out);
+            assert!(
+                observed["small_batches"].as_u64().unwrap() > 0,
+                "{route}/{mode}: {out:?}"
+            );
+            if mode == "auto" {
+                assert_eq!(observed["streaming_ranges"], 0);
+            } else {
+                assert_eq!(observed["range_requests"], 0);
+                if route != "local" {
+                    assert!(
+                        observed["streaming_ranges"].as_u64().unwrap() > 0,
+                        "{out:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn streaming_copies_local_trees_and_remote_ranges() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -6144,6 +6207,7 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
     write(&t.path("source"), b"native small copy");
     for options in [
         "copy-path=auto",
+        "copy-path=auto-streaming",
         "copy-path=ranges",
         "batch-files=2,batch-bytes=512",
     ] {
@@ -6178,7 +6242,7 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
         assert_output_ok(&out);
         let observed = tuning_observed(&out);
         let counter = match options {
-            "copy-path=auto" => "native_small_copies",
+            "copy-path=auto" | "copy-path=auto-streaming" => "native_small_copies",
             "copy-path=ranges" => "range_requests",
             _ => "small_batches",
         };

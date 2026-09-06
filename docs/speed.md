@@ -117,7 +117,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 |---|---|---|
 | `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` |
+| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
@@ -156,6 +156,10 @@ block hashes, checks all write errors before completion, and supports resume
 and parallel workers on different parts of one large file. It does not add
 a disk flush. It bypasses the same copy shortcuts as `copy-path=ranges`.
 
+`copy-path=auto-streaming` keeps the normal whole-file and small-file shortcuts,
+and streams only transfers that would otherwise use range requests. It does
+not change how syq chooses those shortcuts. Both streaming modes are opt-in.
+
 For a controlled comparison, use fresh scratch destinations:
 
 ```sh
@@ -165,7 +169,9 @@ syq cp data.bin --to host --as /scratch/streaming.bin --connections 1 -v \
   --tuning-options copy-path=streaming,request-size=1M
 ```
 
-Streaming rejects `pipeline-depth` and batch controls. Its data queues remain
+Both streaming modes reject `pipeline-depth`. Forced `streaming` also rejects
+batch controls; `auto-streaming` allows them, with the usual effect on small
+copies. Their data queues remain
 bounded, but memory also depends on request size, worker count, compression
 and transport buffering. It may be slower on short or CPU-limited copies:
 starting/stopping streams and collecting replies add work. Work-stealing can

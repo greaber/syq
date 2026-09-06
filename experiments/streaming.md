@@ -6,6 +6,13 @@ default. `--tuning-options copy-path=streaming` selects the experiment and
 bypasses small-file/whole-file shortcuts, just as `copy-path=ranges` does.
 Neither performance superiority nor a default change is assumed.
 
+`copy-path=auto-streaming` keeps the same eligibility rules for native small
+copies, worker batches, and whole-file copies as `auto`, and selects streaming
+only when the scheduler reaches range transfer. This isolates the streaming
+mechanism from bypassing unrelated optimizations. It rejects pipeline depth
+but permits explicit batch controls. No default or automatic selection policy
+changes, no new wire messages, and no persistent state changes are involved.
+
 ## Protocol and scheduling
 
 An authenticated source worker receives one bounded-block `ReadStream` command
