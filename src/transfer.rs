@@ -1814,7 +1814,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (after pacing and receiver limits), pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
-            if opts.tuning.streaming() { "unused(streaming)".to_string() } else { opts.tuning.pipeline_depth().to_string() }, block,
+            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
@@ -8235,74 +8235,89 @@ impl Worker {
         let inplace = job.inplace;
         let mut reads_out = 0usize;
         let mut writes_out = 0usize;
-        loop {
-            if !self.gate.allowed(self.id) {
-                // Being parked: give the rest of this range back so an active
-                // worker picks it up; what's already requested still completes.
-                self.sched.release_rest(h);
-            }
-            while reads_out < read_window {
-                let (off, n) = {
-                    let mut g = h.lock().unwrap();
-                    if g.pos >= g.end {
-                        break;
-                    }
-                    let n = (g.end - g.pos).min(block);
-                    let off = g.pos;
-                    g.pos += n;
-                    (off, n)
+        let result = (|| -> Result<()> {
+            loop {
+                if self.sched.is_failed(idx) || self.sched.is_aborted() {
+                    self.sched.release_rest(h);
+                    break;
+                }
+                if !self.gate.allowed(self.id) {
+                    // Being parked: give the rest of this range back so an active
+                    // worker picks it up; what's already requested still completes.
+                    self.sched.release_rest(h);
+                }
+                while reads_out < read_window {
+                    let (off, n) = {
+                        let mut g = h.lock().unwrap();
+                        if g.pos >= g.end {
+                            break;
+                        }
+                        let n = (g.end - g.pos).min(block);
+                        let off = g.pos;
+                        g.pos += n;
+                        (off, n)
+                    };
+                    self.limit(n);
+                    self.src.send(Request::ReadRange {
+                        path: job.src.clone(),
+                        source: self.source_reference(&job),
+                        attempt: job.attempt,
+                        off,
+                        len: n as u32,
+                    })?;
+                    self.benchmark.range_requests += 1;
+                    self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
+                    reads_out += 1;
+                }
+                if reads_out == 0 {
+                    break;
+                }
+                let t0 = std::time::Instant::now();
+                let response = self.src.recv();
+                reads_out -= 1;
+                self.t[0] += t0.elapsed().as_secs_f64();
+                let (off, hash, data) = match ok(response?, "read")? {
+                    Response::Block { off, hash, data } => (off, hash, data),
+                    other => bail!("unexpected response {other:?}"),
                 };
-                self.limit(n);
-                self.src.send(Request::ReadRange {
-                    path: job.src.clone(),
-                    source: self.source_reference(&job),
+                let n = data.len() as u64;
+                let t0 = std::time::Instant::now();
+                self.dst.send(Request::WriteRange {
+                    path: job.dst.clone(),
+                    inplace,
+                    copy_id: self.copy_id(),
                     attempt: job.attempt,
                     off,
-                    len: n as u32,
+                    hash,
+                    data,
+                    guard: job.container_guard.clone(),
                 })?;
-                self.benchmark.range_requests += 1;
-                self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
-                reads_out += 1;
+                self.t[1] += t0.elapsed().as_secs_f64();
+                writes_out += 1;
+                if writes_out >= write_window {
+                    let t0 = std::time::Instant::now();
+                    let response = self.dst.recv();
+                    writes_out -= 1;
+                    self.t[2] += t0.elapsed().as_secs_f64();
+                    ok(response?, "write")?;
+                }
+                self.progress.add_bytes(n);
+                job.done.fetch_add(n, Relaxed);
+                *credited += n;
             }
-            if reads_out == 0 {
-                break;
-            }
-            let t0 = std::time::Instant::now();
-            let (off, hash, data) = match ok(self.src.recv()?, "read")? {
-                Response::Block { off, hash, data } => (off, hash, data),
-                other => bail!("unexpected response {other:?}"),
-            };
-            self.t[0] += t0.elapsed().as_secs_f64();
-            reads_out -= 1;
-            let n = data.len() as u64;
-            let t0 = std::time::Instant::now();
-            self.dst.send(Request::WriteRange {
-                path: job.dst.clone(),
-                inplace,
-                copy_id: self.copy_id(),
-                attempt: job.attempt,
-                off,
-                hash,
-                data,
-                guard: job.container_guard.clone(),
-            })?;
-            self.t[1] += t0.elapsed().as_secs_f64();
-            writes_out += 1;
-            if writes_out >= write_window {
-                let t0 = std::time::Instant::now();
-                ok(self.dst.recv()?, "write")?;
-                self.t[2] += t0.elapsed().as_secs_f64();
-                writes_out -= 1;
-            }
-            self.progress.add_bytes(n);
-            job.done.fetch_add(n, Relaxed);
-            *credited += n;
-        }
-        while writes_out > 0 {
-            ok(self.dst.recv()?, "write")?;
-            writes_out -= 1;
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Ordinary endpoint errors consume one response but do not break the
+        // connection. Drain all previously issued reads and writes before any
+        // later file (including an automatically streamed range) can use it.
+        // Evaluate both drains even if the operation or first drain failed.
+        let t0 = std::time::Instant::now();
+        let source_end = crate::conn::drain_range_replies(&mut *self.src, reads_out, "read");
+        self.t[0] += t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let destination_end = crate::conn::drain_range_replies(&mut *self.dst, writes_out, "write");
+        self.t[2] += t0.elapsed().as_secs_f64();
+        result.and(source_end).and(destination_end)
     }
 
     fn transfer_streaming_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {

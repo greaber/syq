@@ -113,6 +113,22 @@ impl TransferTuning {
         }
         bytes > block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
     }
+    /// This line describes selection policy before ranges have been planned,
+    /// not an observed engine. Use the actual range predicate at its bounds
+    /// so mixed automatic selection cannot be mislabeled as a fixed window.
+    pub fn pipeline_label(self, same_host: bool, block: u64) -> String {
+        if self.stream_range(same_host, 0, block) {
+            "unused(streaming)".into()
+        } else if self.stream_range(same_host, u64::MAX, block) {
+            format!(
+                "{}(ordinary ranges only; streaming above {} bytes)",
+                self.pipeline_depth(),
+                block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
+            )
+        } else {
+            format!("{}(ordinary ranges only)", self.pipeline_depth())
+        }
+    }
     pub fn batch_bytes(self) -> u64 {
         self.batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES)
     }
@@ -445,5 +461,40 @@ mod tests {
             let tuning: TransferTuning = control.parse().unwrap();
             assert!(tuning.stream_range(true, block, block));
         }
+    }
+
+    #[test]
+    fn pipeline_labels_distinguish_policy_from_observed_paths() {
+        let automatic = TransferTuning::default();
+        assert_eq!(
+            automatic.pipeline_label(false, 4 << 20),
+            "4(ordinary ranges only; streaming above 16777216 bytes)"
+        );
+        assert_eq!(
+            automatic.pipeline_label(false, 64 << 10),
+            "4(ordinary ranges only; streaming above 262144 bytes)"
+        );
+        assert_eq!(
+            automatic.pipeline_label(true, 4 << 20),
+            "4(ordinary ranges only)"
+        );
+        assert_eq!(
+            automatic.pipeline_label(false, u64::MAX),
+            "4(ordinary ranges only)"
+        );
+        for mode in ["copy-path=streaming", "copy-path=auto-streaming"] {
+            let tuning: TransferTuning = mode.parse().unwrap();
+            for same_host in [false, true] {
+                assert_eq!(
+                    tuning.pipeline_label(same_host, 4 << 20),
+                    "unused(streaming)"
+                );
+            }
+        }
+        let ordinary: TransferTuning = "pipeline-depth=16".parse().unwrap();
+        assert_eq!(
+            ordinary.pipeline_label(false, 4 << 20),
+            "16(ordinary ranges only)"
+        );
     }
 }

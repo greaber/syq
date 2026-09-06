@@ -1727,6 +1727,13 @@ mod tests {
             writer.write_msg(&Request::StopReadStream).unwrap();
             // The next iteration's request must not consume a second Done
             // or a response to the late shrink/stop.
+            writer
+                .write_msg(&Request::ShrinkReadStream { end: 0 })
+                .unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::Err(error) if error == "no read stream is active"
+            ));
         }
         // A late shrink can exhaust a still-active stream after read-ahead
         // crossed its new boundary. It must produce Done before Stop, just

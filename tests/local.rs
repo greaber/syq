@@ -6041,6 +6041,14 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 fs::read(&destination).unwrap()
             );
             let observed = tuning_observed(&out);
+            assert!(
+                stderr_of(&out).contains(if route == "local" {
+                    "pipeline-depth=4(ordinary ranges only)"
+                } else {
+                    "pipeline-depth=4(ordinary ranges only; streaming above 16777216 bytes)"
+                }),
+                "{out:?}"
+            );
             assert_eq!(
                 observed["streaming_ranges"].as_u64().unwrap() > 0,
                 label == "long" && route != "local",
@@ -6050,6 +6058,73 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 assert!(observed["range_requests"].as_u64().unwrap() > 0, "{out:?}");
             }
         }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
+    for tcp in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let data = prng(1 << 20, 967);
+        write(&t.path("source"), &data);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "-v",
+                "--stats",
+                "--no-compress",
+                "--bwlimit=512K",
+                "--connections=1",
+                "--no-progress",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--results",
+                &t.s("result.jsonl"),
+                "--from",
+                "host",
+                &t.s("source"),
+                "--as",
+                &t.s("destination"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"));
+        if tcp {
+            command.env("SYQ_TEST_REQUIRE_TCP", "1");
+        } else {
+            command.arg("--no-tcp");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("destination")), data);
+        let results = fs::read_to_string(t.path("result.jsonl")).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(results.lines().last().unwrap()).unwrap();
+        assert!(
+            terminal["copying_elapsed_ms"].as_u64().unwrap() >= 1800,
+            "{terminal}"
+        );
+        let observed = tuning_observed(&out);
+        assert!(
+            observed["streaming_ranges"].as_u64().unwrap() > 0,
+            "{out:?}"
+        );
+        assert_eq!(observed["range_requests"], 0, "{out:?}");
+        assert_eq!(observed["max_request_bytes"], 64 << 10, "{out:?}");
+        assert!(
+            stderr_of(&out).contains("streaming above 262144 bytes"),
+            "{out:?}"
+        );
+        // This verifies the whole-copy average, not a socket-ingress burst cap:
+        // the source streams ahead while this worker paces destination writes.
     }
 }
 
@@ -6196,6 +6271,87 @@ fn streaming_reopens_a_dropped_write_connection() {
         stderr_of(&out).contains("connection dropped; reopening"),
         "{out:?}"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn ordinary_range_errors_do_not_poison_the_next_auto_streamed_file() {
+    for failure in ["read", "write"] {
+        for blocks in [2, 4] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            let original = prng(2 << 20, 968);
+            let mut changed = original.clone();
+            changed[..blocks * (64 << 10)].fill(b'x');
+            write(&t.path("source/bad"), &changed);
+            write(&t.path("destination/bad"), &original);
+            let good = prng(1 << 20, 969);
+            write(&t.path("source/good"), &good);
+            // Largest-first scheduling gives bad a short ordinary delta before
+            // good's fresh, automatically streamed range on the SAME worker.
+            // Cover both a tail drain and an error at the full write window.
+            let source = if failure == "read" {
+                format!("fake:{}/", t.s("source"))
+            } else {
+                t.s("source/")
+            };
+            let destination = if failure == "write" {
+                format!("fake:{}/", t.s("destination"))
+            } else {
+                t.s("destination/")
+            };
+            let out = remote_syq_command(
+                &t,
+                &rsh,
+                &[
+                    "-ac",
+                    "-B64K",
+                    "-v",
+                    "--stats",
+                    "--no-compress",
+                    &source,
+                    &destination,
+                ],
+            )
+            .env("SYQ_DEBUG", "1")
+            .env(
+                if failure == "read" {
+                    "SYQ_TEST_FAIL_READ_RANGE_NAME"
+                } else {
+                    "SYQ_TEST_FAIL_WRITE_RANGE_NAME"
+                },
+                "bad",
+            )
+            .run()
+            .unwrap();
+            assert_eq!(out.status.code(), Some(23), "{out:?}");
+            assert!(
+                stderr_of(&out).contains(if failure == "read" {
+                    "test read-range failure"
+                } else {
+                    "test range write failure"
+                }),
+                "{out:?}"
+            );
+            assert!(
+                !stderr_of(&out).contains("connection dropped; reopening"),
+                "{out:?}"
+            );
+            assert!(!stderr_of(&out).contains("unexpected response"), "{out:?}");
+            assert!(
+                !stderr_of(&out).contains("completion fence/count mismatch"),
+                "{out:?}"
+            );
+            assert_eq!(read(&t.path("destination/bad")), original);
+            assert_eq!(read(&t.path("destination/good")), good);
+            let observed = tuning_observed(&out);
+            assert!(observed["range_requests"].as_u64().unwrap() > 0, "{out:?}");
+            assert!(
+                observed["streaming_ranges"].as_u64().unwrap() > 0,
+                "{out:?}"
+            );
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

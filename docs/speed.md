@@ -186,6 +186,10 @@ Syq automatically streams remote ranges larger than one normal request
 window (usually 16 MiB). Local ranges and shorter remote ranges use ordinary
 requests. Whole-file and small-file shortcuts keep their usual eligibility.
 No streaming or pipeline setting is needed for ordinary copies.
+The `syq: tuning:` diagnostic describes the selection policy: a pipeline depth
+applies only to ordinary ranges, and automatic remote selection also reports
+the size above which ranges stream. It does not claim which paths ran; use
+the observed range and streaming counters for that.
 
 Streaming sends
 checked source blocks and collects destination write replies concurrently,
@@ -218,8 +222,12 @@ and transport buffering. It may be slower on short or CPU-limited copies:
 starting/stopping streams and collecting replies add work. Work-stealing can
 also discard already-read source data when another worker takes a suffix.
 With `--bwlimit`, pacing happens before destination writes; a remote source
-can send ahead into bounded buffers. This is not a strict source-side burst
-limit. Restricted receivers still enforce their signed limits.
+can send ahead into bounded buffers. This also applies to automatically selected
+streaming, without any tuning override. On pulls, initial incoming traffic can
+include the response-reader queue and in-flight frames and socket buffers;
+it is not limited to one paced block or one request window. The limit controls
+the average accepted copy rate, not a strict source-side burst limit.
+Restricted receivers still enforce their signed limits.
 
 ### Batch size and splitting
 
@@ -262,7 +270,8 @@ syq cp large-file --to server --as /scratch/benchmark-capped \
 ```
 
 Neither mode promises a maximum network burst or uninterrupted service for
-other traffic. They pace source requests; helper processing, queues,
+other traffic. Ordinary ranges pace source requests, while streamed ranges pace
+destination writes after receiving the source block; helper processing, queues,
 compression, and transport buffering affect when bytes actually cross a link.
 A deeper pipeline can accumulate more data before forwarding it. A restricted
 receiver also enforces its signed rate ceiling independently, including its

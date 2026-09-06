@@ -5717,7 +5717,10 @@ impl FsOps {
         len: u32,
     ) -> Result<Response> {
         #[cfg(debug_assertions)]
-        if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some() {
+        if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
+            || std::env::var_os("SYQ_TEST_FAIL_READ_RANGE_NAME")
+                .is_some_and(|name| resolve(path).file_name() == Some(name.as_os_str()))
+        {
             bail!("test read-range failure");
         }
         let target = self.source_content_target(source)?;
@@ -5748,6 +5751,12 @@ impl FsOps {
         hash: ContentDigest,
         data: &[u8],
     ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_WRITE_RANGE_NAME")
+            .is_some_and(|name| resolve(target.path).file_name() == Some(name.as_os_str()))
+        {
+            bail!("test range write failure");
+        }
         if content_digest(data) != hash {
             bail!("block hash mismatch on receive @{off}");
         }

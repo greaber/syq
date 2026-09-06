@@ -59,6 +59,9 @@ Exhausting a reduced limit also emits Done before waiting for Stop, including
 when a late shrink moves the end behind read-ahead's current offset. The source
 still consumes all late controls through Stop before the next operation.
 In-process sources produce one block per receive, without preloading a range.
+They expose the same early Done and late-Stop boundary, including after a read
+error or shrink, and reject an inactive shrink with an ordinary error response.
+Local and real-server tests cover those boundaries independently.
 
 Writes use unchanged `WriteRange` requests, with unchanged destination
 authorization, hashing and error checks. A separate reply collector consumes
@@ -71,6 +74,10 @@ The destination fence is sent before draining the source, allowing their
 independent remote round trips to overlap. Both endpoints are drained and the
 write collector is joined even after a fence-send or source error, before
 connection reuse. Both completion boundaries must succeed.
+Ordinary ranges likewise drain all outstanding source and destination replies
+after an endpoint error before reusing either connection. A failed short range
+cannot leave stale responses for a later automatically streamed file. Both
+engines stop claiming more work after file failure or transfer cancellation.
 
 The initial experiment adds a reply-drain thread per remote destination range.
 It can lose on short/CPU-bound work through startup, synchronization, source
