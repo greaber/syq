@@ -181,7 +181,7 @@ base, which may be on a remote host.
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
 This bypasses the managed version; see
-[Compatibility](https://greaber.github.io/syq/sdk-compatibility.html).
+[Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility).
 
 <a id="native-api-reference"></a>
 

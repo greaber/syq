@@ -14,8 +14,6 @@ except `map`, which returns an async context manager.
 
 <a id="synchrony-asyncio-and-resource-ownership"></a>
 
-<a id="compatibility-and-versioning"></a>
-
 ## Client and executable selection
 
 `Client(*, executable=None, cache_dir=None, process_cwd=None, env=None, timeout=None)`
@@ -32,9 +30,7 @@ and `AsyncClient(...)` accept:
 `client.version()` returns the executable version as text.
 `syq.version(executable=None)` does the same without a client.
 `syq.managed_executable(cache_dir=None)` returns the verified executable path,
-downloading it if needed. See
-[Compatibility](https://greaber.github.io/syq/sdk-compatibility.html) for version
-selection and caching.
+downloading it if needed. See [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility) for version selection and caching.
 
 <a id="the-native-vocabulary-is-the-python-vocabulary"></a>
 
@@ -67,7 +63,7 @@ filesystem and remote checks happen in syq.
 
 ## cp
 
-`cp(*sources, **options) → CpResult` copies files. Choose one placement option.
+`cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-reference.html#cpresult) copies files. Choose one placement option.
 In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
@@ -101,12 +97,15 @@ Typed remote-to-remote copies require an enrolled receiver or
 `coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
-To interleave rule files and inline patterns:
+`IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
+`bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
-## Removal
+<a id="removal"></a>
 
-`rm(*sources, **options) → RmResult` removes selected entries. Besides the shared
+## rm
+
+`rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
 arguments, it accepts `from_`, `dry_run`, `connections`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local and ordinary SSH endpoints. Command-restricted receivers
@@ -114,21 +113,52 @@ reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
 
 <a id="complete-input-guarantee"></a>
 
-## Mapping, transformation, and copy
+<a id="mapping-transformation-and-copy"></a>
+
+## map
 
 `map(*sources, **options) → MapStream` lists local mapping entries without
 copying. Besides the shared arguments, it accepts `as_` to rename a selected
 object. `srcs_in` must be the sole selector when used.
 
-| Type / member | Meaning |
-|---|---|
-| `MapStream` | Iterable context manager yielding `MappingEntry`; use `with` |
-| `AsyncMapStream` | Async iterable context manager; use `async with` |
-| `mapping.cwd` | Absolute source-base spelling to pass unchanged to `cp(cwd=...)` |
-| `MappingEntry(src, dst, kind=None, size=None, mtime=None)` | Frozen dataclass; `src` and `dst` are `RelativePath`; size and mtime are informational |
-| `EntryKind` | `FILE`, `DIR`, `SYMLINK`, or `SPECIAL` |
-| `RelativePath(value)` | Mapping-relative path from text, bytes, or a path-like object; `/` joins components; `.raw` gives bytes; `.text` decodes UTF-8 strictly |
-| `PathValue` | Event path; `.raw` gives bytes, `.text` decodes UTF-8 strictly, `.display` provides readable text |
+`MapStream` is an iterable context manager yielding [MappingEntry](https://greaber.github.io/syq/python-reference.html#mappingentry); use `with`.
+`AsyncMapStream` is its async equivalent; use `async with`. Both expose `cwd`
+(`str | bytes`), the absolute source-base spelling to pass to `cp(cwd=...)`.
+
+### MappingEntry
+
+Frozen dataclass describing one source-to-destination mapping. Pass an iterable
+of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `src` | `RelativePath` | Path relative to the copy's source base |
+| `dst` | `RelativePath` | Path relative to the destination container |
+| `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
+| `size` | `int` or `None` | Informational size in bytes; default `None` |
+| `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
+
+`MappingEntry(src, dst, kind=None, size=None, mtime=None)` also accepts text or
+byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
+`mtime` do not impose preconditions on the copy.
+
+### RelativePath and PathValue
+
+`RelativePath(value)` accepts text, bytes, or `os.PathLike`. It rejects empty
+paths, absolute paths, NUL bytes, and empty, `.` or `..` components. Join paths
+with `/`, for example `syq.RelativePath("archive") / entry.dst`.
+
+`PathValue(raw: bytes)` holds a path received in an event, which may be absolute.
+Both types are immutable and provide:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `raw` | `bytes` | Original filename bytes; also returned by `bytes(path)` |
+| `text` | `str` | UTF-8 decoding; raises `UnicodeDecodeError` for invalid UTF-8 |
+| `str(path)` | `str` | Filesystem decoding with `os.fsdecode` |
+| `PathValue.display` | `str` | Same as `str(path)` |
+
+`RelativePath` also implements `os.PathLike`, returning bytes.
 
 Normal end of iteration checks the mapping process status. Leaving the context
 early stops the process. Pass `mapping.cwd` through without normalizing it.
@@ -149,35 +179,104 @@ file directly. See [mapping rules](https://greaber.github.io/syq/mappings.html).
 stream and process exit status. A truncated stream raises even if the process
 exits successfully. Dry runs return the same types, with planned totals.
 
-| Result | Attributes |
-|---|---|
-| Both | `status`, `exit_code`, `dry_run`, `errors`, `elapsed_ms`, `schema`, `schema_version`, `seq`, `type` |
-| `CpResult` | `files_transferred`, `files_unchanged`, `files_excluded`, `directories_created`, `symlinks_created`, `specials_created`, `bytes_transferred`, `bytes_unchanged` |
-| Copy deletion totals | `deletions_planned`, `deletions_completed`, `deletions_blocked`; `None` when inapplicable |
-| Receiver-attested copy fields | `provenance`, `receipt_status`, `operations`, `final_states`, `receipt_records`; `None` on ordinary results |
-| `RmResult` | `selectors_total`, `selectors_resolved`, `selectors_missing`, `entries_planned`, `entries_removed`, `entries_already_absent`, `entries_failed`, `mode` |
+### CpResult
 
-`status` is `OperationStatus.SUCCESS`, `PARTIAL`, `REFUSED`, `ABORTED`, or `FAILED`.
-Ordinary prune results have all three deletion totals; receiver-attested
-results have only `deletions_completed`.
+Returned by `cp()`, or available as `SyqOperationError.result` after an
+unsuccessful copy. Read attributes directly, for example
+`result.files_transferred`. It includes the common result fields below plus:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `files_transferred` | `int` | Regular files transferred |
+| `files_unchanged` | `int` | Regular files skipped as unchanged |
+| `files_excluded` | `int` | Files excluded from copying |
+| `directories_created` | `int` | Directories created |
+| `symlinks_created` | `int` | Symbolic links created |
+| `specials_created` | `int` | Special filesystem objects created |
+| `bytes_transferred` | `int` | File-content bytes transferred, not compressed network traffic |
+| `bytes_unchanged` | `int` | Bytes in unchanged files |
+| `deletions_planned` | `int` or `None` | Entries selected for pruning |
+| `deletions_completed` | `int` or `None` | Entries pruned |
+| `deletions_blocked` | `int` or `None` | Pruning deletions blocked by a safety limit |
+| `provenance` | `str` or `None` | `"receiver_attested"` for results from a verified receiver receipt |
+| `receipt_status` | `ReceiptStatus` or `None` | Receiver receipt outcome |
+| `operations` | `int` or `None` | Attested operation record count |
+| `final_states` | `int` or `None` | Attested final-state record count |
+| `receipt_records` | `int` or `None` | Total receipt record count |
+
+With `dry_run=True`, mutation totals describe planned changes. With
+`verify_only=True`, matching files count as unchanged; transfer and creation
+totals are zero. A failed call reports work completed before it stopped.
+
+Ordinary copies have all three deletion fields only with `prune=True`;
+otherwise they are `None`. Receiver-attested results have only
+`deletions_completed`, and their unchanged/excluded totals are always zero
+because the receiver cannot observe source-side skips. The receipt fields are
+`None` for ordinary copies.
+
+### RmResult
+
+Returned by `rm()`, or available as `SyqOperationError.result` after an
+unsuccessful removal. It includes the common result fields below plus:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `selectors_total` | `int` | Explicit source selectors supplied |
+| `selectors_resolved` | `int` | Selectors that resolved to an object |
+| `selectors_missing` | `int` | Selectors already missing; this is not an error |
+| `entries_planned` | `int` | Entries a dry run would remove; zero in live runs |
+| `entries_removed` | `int` | Entries removed; zero in dry runs |
+| `entries_already_absent` | `int` | Entries gone by removal time; zero in dry runs |
+| `entries_failed` | `int` | Removal or inspection failures, including during dry runs |
+| `mode` | `str` | Always `"rm"` |
+
+Selectors identify requests; entries count individual filesystem objects. One
+directory selector can account for many entries. Duplicate and overlapping
+selectors have separate indexes.
+
+### Common result fields
+
+Both `CpResult` and `RmResult` include:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `status` | `OperationStatus` | Outcome from the table below |
+| `exit_code` | `int` | syq process exit code |
+| `dry_run` | `bool` | Whether this was a preview |
+| `errors` | `int` | Counted errors |
+| `elapsed_ms` | `int` | Run duration in milliseconds |
+| `schema` | `str` | `"syq.automation"` |
+| `schema_version` | `int` | `1` |
+| `seq` | `int` | Record sequence number, starting at zero |
+| `type` | `str` | `"result"` |
+
+### OperationStatus
+
+String enum: compare with `syq.OperationStatus.SUCCESS`, or use `.value` for
+`"success"`.
+
+| Member | Value | Exit code | Meaning |
+|---|---|---|---|
+| `SUCCESS` | `"success"` | `0` | Requested operation succeeded |
+| `PARTIAL` | `"partial"` | `23` | Per-entry failures; independent work finished |
+| `REFUSED` | `"refused"` | `25` | A safety cap refused deletions; copy only |
+| `ABORTED` | `"aborted"` | `1` | Operation aborted; copy only |
+| `FAILED` | `"failed"` | `1` | Fatal failure |
+
+### Event callbacks
 
 `on_event(event)` receives an `AutomationEvent` in stream order. Events are not
 stored in the result. `AsyncClient` accepts synchronous or awaitable callbacks;
 awaitable callbacks count toward the timeout.
 
-| Event types | Content |
-|---|---|
-| `RunEvent`, `ProgressEvent` | Run description and sampled progress |
-| `TraceEvent`, `OperationResult` | Planned or completed copy operation |
-| `SelectionResult` | Removal selector resolution |
-| `RemovalTrace`, `RemovalResult` | Planned removal or settled entry, including preview inspection failures |
-| `ErrorEvent` | Diagnostic |
-| `FinalStateEvent` | Receiver-attested final object state |
-| `CpResult`, `RmResult` | Terminal totals |
+`AutomationEvent` is the union of the event classes below and `CpResult` and
+`RmResult`. Each event is a frozen dataclass. Its fields are listed below;
+all events also carry `schema: str`, `schema_version: int`, `seq: int`, and
+`type: str`. The envelope has the same meaning as on results, with `type`
+identifying the event. Optional fields use `None` when unavailable.
 
-See [Automation results](https://greaber.github.io/syq/automation.html) for field
-meanings. Python exposes `class` as `class_`, paths as `PathValue`, and enum
-values as string enums.
+See [Automation results](https://greaber.github.io/syq/automation.html) for stream
+semantics. Python exposes `class` as `class_` and paths as `PathValue`.
 
 `results=` accepts a binary file-like object with `write(bytes)` returning a
 positive byte count for nonempty writes, and optional `flush()`. The client
@@ -190,6 +289,219 @@ returns a `MappingEntry` when a complete mapping identity is available, otherwis
 `None`. Only use collected entries after the call returns a validated `success`
 or `partial` result. A terminal callback alone does not establish completion.
 The client does not retry automatically.
+
+
+## Event types
+
+### RunEvent
+
+Invocation details. `started_at` is Unix seconds; `mode` is `"cp"` or `"rm"`.
+`prune` and `mapping` are `None` for removal; `verify_only` defaults to `False`.
+
+`type = "run"`. Fields in addition to the common envelope:
+
+```python
+run_id: str
+started_at: int
+syq_version: str
+mode: str
+prune: bool | None
+mapping: bool | None
+dry_run: bool
+endpoints: tuple[Endpoint, ...]
+verify_only: bool
+```
+
+### ProgressEvent
+
+Sampled progress for displays; use the terminal result for final totals.
+Byte fields measure file content (comparison work with `verify_only=True`),
+`scanned` counts scanned entries, and `elapsed_ms` is milliseconds.
+
+`type = "progress"`. Fields in addition to the common envelope:
+
+```python
+bytes_done: int
+bytes_total: int
+bytes_unchanged: int
+files_done: int
+files_total: int
+files_unchanged: int
+files_excluded: int
+scanned: int
+scan_done: bool
+elapsed_ms: int
+```
+
+### TraceEvent
+
+One planned copy change. `dst` is relative to the destination container;
+`src` is the mapping source when available. `bytes` is the planned file size,
+and `reason` describes why the change is needed.
+
+`type = "trace"`. Fields in addition to the common envelope:
+
+```python
+action: OperationAction
+dst: PathValue
+src: PathValue | None
+kind: EntryKind
+bytes: int | None
+reason: TraceReason
+```
+
+### OperationResult
+
+One copy outcome. `dst` is destination-relative, or relative to the signed
+destination `scope` for a receiver receipt. `src` is present for mapping entries
+when available. `bytes` and `attempts` give transfer information. Error details
+are present when known; `message` is display text. `provenance`, `scope`, and
+`code` apply to receiver-attested outcomes.
+
+`type = "operation_result"`. Fields in addition to the common envelope:
+
+```python
+action: OperationAction
+dst: PathValue
+src: PathValue | None
+kind: EntryKind | None
+disposition: Disposition
+bytes: int | None
+attempts: int | None
+retryable: Retryability | None
+class_: ErrorClass | None
+os_kind: OsKind | None
+message: str | None
+provenance: str | None
+scope: int | None
+code: ReceiptCode | None
+```
+
+### SelectionResult
+
+One removal selector, indexed from zero. `path` is the original selector;
+`status` says whether it resolved. `kind` is `None` for a missing selector.
+
+`type = "selection_result"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+status: SelectionStatus
+kind: EntryKind | None
+```
+
+### RemovalTrace
+
+One entry a preview would remove. `selector` identifies its source selector;
+`path` identifies the entry. `disposition` is always `WOULD_REMOVE`.
+
+`type = "removal_trace"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+kind: EntryKind
+disposition: RemovalDisposition
+```
+
+### RemovalResult
+
+One removal outcome or preview inspection failure. `selector` identifies its
+source selector; `path` identifies the entry. `attempts` counts attempts;
+`retryable`, `class_`, `os_kind`, and `message` describe failures when available.
+
+`type = "removal_result"`. Fields in addition to the common envelope:
+
+```python
+selector: int
+path: PathValue
+kind: EntryKind | None
+disposition: RemovalDisposition
+attempts: int
+retryable: Retryability | None
+class_: ErrorClass | None
+os_kind: OsKind | None
+message: str | None
+```
+
+### ErrorEvent
+
+One counted error. `message` is display text; `class_` and `os_kind` classify
+it when known. Receiver errors can also carry `provenance` and `code`.
+
+`type = "error"`. Fields in addition to the common envelope:
+
+```python
+message: str
+class_: ErrorClass | None
+os_kind: OsKind | None
+provenance: str | None
+code: ReceiptCode | None
+```
+
+### FinalStateEvent
+
+Receiver-attested destination state. `dst` is relative to the signed `scope`.
+`provenance` is `"receiver_attested"`. Present objects have `kind` and byte
+`size`; `metadata`, `digest`, and `symlink_target` are present where available.
+`observation_error` describes a partial observation. Absent objects have no
+object details; failed observations have `code` and optional `message`.
+
+`type = "final_state"`. Fields in addition to the common envelope:
+
+```python
+provenance: str
+scope: int
+dst: PathValue
+state: FinalObjectState
+kind: FinalObjectKind | None
+size: int | None
+metadata: ObjectMetadata | None
+digest: AttestedDigest | None
+symlink_target: PathValue | None
+observation_error: str | None
+code: ReceiptCode | None
+message: str | None
+```
+
+### Endpoint, ObjectMetadata, and AttestedDigest
+
+Nested frozen dataclasses used by events:
+
+| Type | Fields | Meaning |
+|---|---|---|
+| `Endpoint` | `role: EndpointRole`, `kind: EndpointKind`, `host: str \| None`, `user: str \| None` | Source/destination and local/SSH identity; host and user are optional |
+| `ObjectMetadata` | `mode: int`, `uid: int`, `gid: int`, `mtime: int`, `mtime_nsec: int`, `rdev: int` | Unix mode, owner/group IDs, modification time (seconds plus nanoseconds), and device ID |
+| `AttestedDigest` | `algorithm: str`, `value: str` | `"blake3"` and its 64 lowercase hexadecimal digest characters |
+
+## Enums
+
+All enums are string enums exported by `syq`. Members use uppercase names;
+values use lowercase, for example `EntryKind.FILE.value == "file"`.
+`OperationStatus` is defined with the result types above.
+
+| Type | Members |
+|---|---|
+| `EntryKind` | `FILE`, `DIR`, `SYMLINK`, `SPECIAL` |
+| `EndpointKind` | `LOCAL`, `SSH` |
+| `EndpointRole` | `SOURCE`, `DESTINATION` |
+| `OperationAction` | `TRANSFER_FILE`, `CREATE_DIRECTORY`, `CREATE_SYMLINK`, `CREATE_SPECIAL`, `DELETE`, `SET_METADATA`, `OBSERVE_HASH` |
+| `Disposition` | `SUCCEEDED`, `FAILED`, `BLOCKED`, `INCOMPLETE`, `OBSERVED` |
+| `ReceiptCode` | `NONE`, `EXECUTION_FAILED`, `AUTHORIZATION_REFUSED`, `FILE_LIFECYCLE_INCOMPLETE`, `OBSERVATION_FAILED` |
+| `FinalObjectState` | `PRESENT`, `ABSENT`, `OBSERVATION_FAILED` |
+| `FinalObjectKind` | `DIR`, `FILE`, `SYMLINK`, `FIFO`, `SOCKET`, `CHARACTER_DEVICE`, `BLOCK_DEVICE`, `OTHER` |
+| `ReceiptStatus` | `CLEAN`, `FAILED`, `INCOMPLETE` |
+| `Retryability` | `YES`, `NO`, `UNKNOWN` |
+| `ErrorClass` | `IO`, `TRANSPORT`, `CONFLICT`, `INTEGRITY`, `SAFETY_LIMIT`, `USAGE`, `INTERNAL` |
+| `OsKind` | `NOT_FOUND`, `PERMISSION_DENIED`, `ALREADY_EXISTS`, `INVALID_INPUT`, `NO_SPACE`, `QUOTA_EXCEEDED`, `READ_ONLY`, `OTHER` |
+| `TraceReason` | `DESTINATION_MISSING`, `TYPE_DIFFERS`, `CONTENT_DIFFERS`, `METADATA_DIFFERS`, `DESTINATION_ONLY` |
+| `SelectionStatus` | `RESOLVED`, `MISSING` |
+| `RemovalDisposition` | `WOULD_REMOVE`, `REMOVED`, `ALREADY_ABSENT`, `FAILED` |
+
+`ReceiptStatus.CLEAN` means a clean receipt, `FAILED` reports receiver failures,
+and `INCOMPLETE` reports an incomplete lifecycle. `Retryability.YES`, `NO`, and
+`UNKNOWN` state whether a failed entry can be retried.
 
 ## Failure model
 
@@ -213,13 +525,55 @@ completed are not rolled back.
 
 <a id="deliberate-exclusions"></a>
 
-## Raw execution
+<a id="raw-execution"></a>
+
+## run
 
 `client.run(args, *, check=True, cwd=None, env=None, timeout=None, input=None)`
-returns `Result(argv, returncode, stdout, stderr)`. `stdout` and `stderr` are
-fully captured bytes; `input` accepts bytes. `args` is a sequence of arguments
+returns [Result](https://greaber.github.io/syq/python-reference.html#result). `input` accepts bytes. `args` is a sequence of arguments
 after the executable name, passed without a shell.
 
 Here, `cwd` is the local subprocess directory. `cwd`, `env`, and `timeout`
 use the client defaults when omitted or `None`. Module-level `syq.run` takes
 the same arguments plus `executable=None`.
+
+### Result
+
+Frozen dataclass returned by `run()` and held in `SyqProcessError.result`:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `argv` | `tuple[str \| bytes, ...]` | Executed argument list, including the executable |
+| `returncode` | `int` | Process exit status |
+| `stdout` | `bytes` | Complete captured standard output |
+| `stderr` | `bytes` | Complete captured standard error |
+
+<a id="compatibility-and-versioning"></a>
+<a id="syq-language-sdks"></a>
+
+## Compatibility
+
+Python 3.10+ on Linux and macOS; no runtime Python dependencies. Each Python
+package uses the matching syq release. `syq.__version__` and
+`syq.PINNED_SYQ_VERSION` report those versions. Pin the package in your dependency
+file to keep the pairing.
+
+### Managed executable
+
+The default client downloads the matching executable on first use and verifies
+it against the package's embedded release manifest. It checks the cached binary
+before every use and replaces missing or corrupt entries. It does not search
+`PATH`.
+
+The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
+`XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
+Use `Client(cache_dir=...)` to change the cache root, or
+`syq.managed_executable()` to download ahead of time and get the path.
+
+### Custom executable
+
+`Client(executable="/opt/bin/syq")` uses that binary;
+`Client(executable="syq")` searches `PATH`. Overrides bypass managed download
+and verification, so you are responsible for compatibility and origin. Typed
+calls still validate automation output. A failed executable selection does not
+fall back to another binary.

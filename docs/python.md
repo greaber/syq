@@ -18,6 +18,3 @@ python -m pip install syq
 
 On first use, it downloads and verifies the matching syq executable, then caches
 it for later calls. You do not need to install the command-line tool separately.
-
-Start with [Guide and examples](python-guide.md), or look up arguments and
-return values in the [API reference](python-reference.md).
