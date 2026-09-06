@@ -1605,9 +1605,39 @@ mod tests {
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
         let (request, _) = request(&args(Path::new("source"), "."));
         let approved = approve(&registration, request);
+        let (stream, reply) = exchange(
+            &registration,
+            Message::Open {
+                token: approved.token,
+                control: true,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(matches!(reply, Reply::Ready));
+        // Ready confirms the receiver consumed Open. Closing sooner can discard
+        // the envelope on macOS, leaving an unused token to expire normally.
+        // Abandon before Hello; the consumed session must still be revoked.
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(receiver.sessions.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn named_failed_open_reply_releases_its_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        fs::create_dir(&root).unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let (request, _) = request(&args(Path::new("source"), "."));
+        let approved = approve(&registration, request);
         let mut stream = UnixStream::connect(&registration.socket).unwrap();
-        // Refuse the reply and abandon the stream. SHUT_RD alone causes a
-        // failed peer write on Linux, but may still accept that write on macOS.
+        // Linux SHUT_RD reliably refuses the opening reply while the client
+        // remains connected, exercising the failed-reply cleanup specifically.
         stream.shutdown(std::net::Shutdown::Read).unwrap();
         write_message(
             &mut stream,
@@ -1622,7 +1652,6 @@ mod tests {
             },
         )
         .unwrap();
-        drop(stream);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
