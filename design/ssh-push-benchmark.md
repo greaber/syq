@@ -1,8 +1,13 @@
-# Mac to j5 SSH push investigation
+# Mac to j5 SSH push investigation (persist mode)
 
 2026-09-06. Grant's interactive quick benchmark reported these means over
 three trials: a 64 MiB file, syq 29.269 seconds versus rsync 22.397; 1,024
 files of 8 KiB, syq 9.640 versus rsync 6.172.
+
+**Benchmark profile: syq persist mode with an untimed connection warmup;
+rsync opens a fresh SSH connection for each timed trial.** These results
+describe repeated copies with syq persistence enabled. They do not establish
+that syq beats rsync when both start without an existing SSH connection.
 
 The investigation found avoidable SSH startup work for small trees, plus
 large variations in the network and an SSH keepalive policy that terminated
@@ -16,7 +21,9 @@ win over rsync.
 The sender is an Apple M4 Pro Mac running macOS 26.5.2, OpenSSH 10.2p1 and
 rsync 3.4.1. Installed syq reports `v0.4.0` (release commit `f4aee996`). The task
 starts at `7d5062d`; its transfer, connection and tuning code matches that
-release. SSH persistence was already enabled on the Mac.
+release. SSH persistence was already enabled on the Mac. The original mini
+benchmark script does not explicitly enable it; it inherits that setting, and
+its untimed 14-byte setup copy can warm an enabled persistent connection.
 
 The comparison uses a dense random 64 MiB file and 1,024 random 8 KiB files,
 reused across all tools. Every destination starts empty. Syq uses
@@ -27,15 +34,23 @@ copy is verified. Failed copies are recorded as failures, without a speed.
 
 The candidate Mac and Linux helpers are release-profile builds at `57abd37`;
 the experimental streaming builds are at `f629e09`. Each family has its own
-temporary persistence scope, an untimed warmup and an explicit matching helper
-path, including the released baseline. XDG configuration and cache locations
-are isolated from the user's settings. The repeated comparisons rotate tool
+temporary persistence scope, an untimed connection warmup and an explicit
+matching helper path, including the released baseline. Rsync has no connection
+warmup or connection reuse between timed trials. Its SSH login is timed; syq
+can reuse its authenticated control login and helpers from setup. Additional
+syq data logins and recovery from a lost connection are timed. This difference
+in startup costs must accompany any comparison of the elapsed times. XDG
+configuration and cache locations are isolated from the user's settings. The repeated comparisons rotate tool
 order. Compilation and large downloads do not run alongside timed copies.
 
 [The trial records](ssh-push-benchmark-results.csv) preserve 80 trials, including
 five failures, across six comparison phases and the interrupted route change.
-Early diagnostic runs described below are separate from that table. The last
-two phases also capture SSH debug logs and run helpers through wrappers that
+The CSV labels each row with `ssh_connection_policy` (`persist-mode` for syq,
+`fresh-per-trial` for rsync) and `untimed_connection_warmup`. These fields record
+the configured procedure, not a guarantee that a warmed connection survived
+until the trial; timeout recovery is described below. Persistence applies to
+the SSH control connection even when the payload uses TCP. Early diagnostic
+runs described below are separate from that table. The last two phases also capture SSH debug logs and run helpers through wrappers that
 record process exits; the wrappers forward the same helper protocol unchanged.
 
 ## Network and disconnects
@@ -95,21 +110,33 @@ shared channels always win. Existing per-copy multiplexing without persistence
 is unchanged.
 
 In the final three-round comparison, both tools used the longer SSH keepalive
-setting and syq used `--no-tcp`:
+setting. Syq used **persist mode with an untimed warmup** and `--no-tcp`;
+rsync opened a **fresh SSH connection per trial**:
 
 | Small-tree variant | Mean seconds | Min | Max | Completed |
 | --- | ---: | ---: | ---: | ---: |
-| Released syq, explicit `-j 1` | 12.037 | 9.657 | 14.041 | 3 |
-| Candidate, automatic count | 7.314 | 6.828 | 8.063 | 3 |
-| rsync | 8.059 | 7.559 | 8.435 | 3 |
+| Released syq, persist mode, explicit `-j 1` | 12.037 | 9.657 | 14.041 | 3 |
+| Candidate syq, persist mode, automatic count | 7.314 | 6.828 | 8.063 | 3 |
+| rsync, fresh SSH connection | 8.059 | 7.559 | 8.435 | 3 |
 
 The released `-j 1` row includes control recovery after the failed TCP trial;
 it is not an estimate of purely warm startup. Candidate data-worker startup was
-about 0.6–0.7 seconds. The candidate beat rsync in two of these three trials,
-and averaged about 9% less time. The earlier 60-second stall and the small
-sample size rule out an unconditional performance claim. These measurements
+about 0.6–0.7 seconds. With persist mode enabled and its initial connection
+warmup untimed, the candidate took less time than fresh-connection rsync in two of three trials,
+and averaged about 9% less time. That result includes the benefit of connection
+reuse; it is not evidence of an advantage with fresh connections for both tools.
+The earlier 60-second stall and the small sample size rule out an unconditional performance claim. These measurements
 use `57abd37`; the later narrowing only restores large-file range splitting,
 which does not affect this small-file path.
+
+The final mini-script smoke test used the same asymmetric startup profile with
+the narrowed runtime at `1f6a12c`, forced SSH and the longer keepalive setting.
+These are one trial each, with every completed copy checked using POSIX cksum:
+
+| Workload | syq, persist mode with untimed warmup | rsync, fresh SSH connection |
+| --- | ---: | ---: |
+| 64 MiB file | 25.771 s | 26.612 s |
+| 1,024 files of 8 KiB | 7.971 s | 9.051 s |
 
 ## Large files, pipeline depth and streaming
 
@@ -121,15 +148,17 @@ the old threshold can already allow two of them to share the file.
 
 The initial candidate lowered the remote split minimum to 8 MiB. This allowed
 more workers to help, and some exploratory SSH trials improved substantially.
-The repeated results did not support changing the default:
+The repeated results did not support changing the default. All syq rows below
+use persist mode with an untimed connection warmup; rsync starts a fresh SSH
+connection for each trial:
 
 | 64 MiB, original keepalive settings | Mean seconds | Min | Max | Completed |
 | --- | ---: | ---: | ---: | ---: |
-| Released syq, forced SSH | 25.873 | 25.059 | 27.495 | 3 |
-| Candidate with 8 MiB splitting, forced SSH | 27.735 | 23.376 | 33.930 | 3 |
-| Streaming, 1 MiB blocks, one SSH worker | 33.280 | 24.206 | 39.870 | 3 |
-| Ranges, 1 MiB requests, depth 16, one SSH worker | 28.886 | 28.034 | 30.230 | 3 |
-| rsync | 26.165 | 22.684 | 29.302 | 3 |
+| Released syq, persist mode, forced SSH | 25.873 | 25.059 | 27.495 | 3 |
+| Candidate syq, persist mode, 8 MiB splitting, forced SSH | 27.735 | 23.376 | 33.930 | 3 |
+| Streaming syq, persist mode, 1 MiB blocks, one SSH worker | 33.280 | 24.206 | 39.870 | 3 |
+| Ranges syq, persist mode, 1 MiB requests, depth 16, one SSH worker | 28.886 | 28.034 | 30.230 | 3 |
+| rsync, fresh SSH connection | 26.165 | 22.684 | 29.302 | 3 |
 
 The final longer-keepalive TCP comparison also favored the old split threshold:
 the candidate completed in 28.839, 31.941 and 37.224 seconds; the release
