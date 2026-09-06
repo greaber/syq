@@ -21,11 +21,11 @@ SHA, then act without repeated permission questions. Do not merge unrelated
 features. Authorization persists through retries and continuations of this
 release and ends on completion or cancellation.
 
-Default destinations are the syq GitHub release, crates.io, and Homebrew.
-SDK publication is separate unless requested; the automated Python SDK
-preparation PR is a normal follow-up. Preserve protections and secret
-boundaries. Report concrete credential, required-review, or product-decision
-blockers; do not bypass them.
+Default destinations are the syq GitHub release, crates.io, Homebrew, and the
+matching Python SDK on PyPI. Python preparation and publication are required
+phases of the same release; JavaScript and Go SDK releases remain separate.
+Preserve protections and secret boundaries. Report concrete credential,
+required-review, or product-decision blockers; do not bypass them.
 
 ## Choose the next action from readiness
 
@@ -69,9 +69,23 @@ signing is unavailable. Sign and push the matching annotated tag after preflight
 
 Use `scripts/release-status.sh v<version>` to follow the exact release run,
 approve its eligible deployment, and verify every configured destination.
+After the immutable syq release triggers Python preparation, wait for its
+generated pull request, merge, and exact-commit post-merge checks. Repair a
+failed preparation or certification under this release authorization. Then use
+the maintainer's forwarded SSH signing agent to create and push the annotated
+`sdk-python-v<version>` tag at that verified master commit, approve the `pypi`
+environment, and wait for `publish-sdks.yml`. A PyPI outage leaves the release
+incomplete: rerun the idempotent workflow from the same permanent SDK tag and
+verify the registry rather than moving the tag or requiring a new release.
 Exercise the documented installation paths in disposable locations. A partial
-publication is incomplete. Apply the provisional/permanent tag rules in
-`AGENTS.md`; never move a permanent tag, including any pushed Go module tag.
+publication is incomplete, including a missing matching PyPI version. Apply the
+provisional/permanent tag rules in `AGENTS.md`; never move a permanent tag,
+including any pushed Go module tag.
+
+Run `scripts/release-timings.py v<version>` at completion and include its
+observable GitHub window and slowest phases in the release report. The phases
+can overlap, so use the window as wall time and job durations as optimization
+evidence rather than adding job durations together.
 
 Finish with the version, exact commit, release URL, verified destinations,
 checks, remaining failures, and branch-status/cleanliness. Keep interrupted

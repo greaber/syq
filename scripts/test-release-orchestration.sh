@@ -483,8 +483,12 @@ cat >"$status_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1:$2" in
-  run:list) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" '[
-    {conclusion:null,databaseId:303,event:"push",headSha:$sha,status:"in_progress",url:"https://example.test/303",workflowName:"release"}]' ;;
+  run:list) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" \
+    --arg status "${SYQ_TEST_STATUS_RUN_STATUS:-in_progress}" \
+    --arg conclusion "${SYQ_TEST_STATUS_RUN_CONCLUSION:-}" '[
+    {conclusion:($conclusion | if length == 0 then null else . end),
+     databaseId:303,event:"push",headSha:$sha,status:$status,
+     url:"https://example.test/303",workflowName:"release"}]' ;;
   api:*)
     case " $* " in
       *"/git/matching-refs/tags/$SYQ_TEST_STATUS_TAG "*) jq -cn \
@@ -526,7 +530,7 @@ jq -e --arg commit "$status_commit" '
   .tag_state == "verified" and .tag_commit == $commit and
   .github_release.state == "published" and .github_release.immutable == true and
   .release_runs[0].databaseId == 303 and
-  .release_runs[0].pending_environments == ["release"] and
+  .release_runs[0].pending_environments == ["release"] and .complete == false and
   .publications.crates_io.state == "published" and
   .publications.pypi.state == "published" and
   .publications.homebrew.state == "published"
@@ -535,6 +539,17 @@ jq -e --arg commit "$status_commit" '
   jq . "$work/status.json" >&2
   exit 1
 }
+
+PATH="$status_bin:$PATH" \
+SYQ_TEST_STATUS_COMMIT="$status_commit" \
+SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
+SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
+SYQ_TEST_STATUS_RUN_STATUS=completed \
+SYQ_TEST_STATUS_RUN_CONCLUSION=success \
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-complete.json"
+jq -e '.complete == true' "$work/status-complete.json" >/dev/null
 
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \
@@ -559,5 +574,6 @@ jq -e '.tag_state == "invalid-target" and .tag_commit == null' \
   "$work/status-nested-tag.json" >/dev/null
 
 python3 "$script_dir/test-release-readiness.py"
+python3 "$script_dir/test-release-timings.py"
 
 echo 'release orchestration tests passed'
