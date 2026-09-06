@@ -145,26 +145,7 @@ def prepare(root: Path, manifest_path: Path) -> bool:
         label="Python package version",
     )
 
-    python_readme_path = root / "sdk/python/README.md"
-    python_readme = python_readme_path.read_text(encoding="utf-8")
-    python_readme = replace_once(
-        python_readme,
-        f"package `{current_python_version}`\nmanages syq `{current_syq_version}`.",
-        f"package `{new_python_version}`\nmanages syq `{new_syq_version}`.",
-        label="Python README release mapping",
-    )
-    old_cache_path = f"syq/sdk/python/v{current_syq_version}/"
-    if python_readme.count(old_cache_path) != 2:
-        raise ValueError("expected two Python README cache-version markers")
-    python_readme = python_readme.replace(
-        old_cache_path,
-        f"syq/sdk/python/v{new_syq_version}/",
-    )
-    if old_cache_path in python_readme:
-        raise ValueError("the Python README retained the old cache version")
-
     pyproject_path.write_text(pyproject, encoding="utf-8")
-    python_readme_path.write_text(python_readme, encoding="utf-8")
     packaged_manifest.write_bytes(raw_manifest)
     print(
         f"prepared Python SDK {new_python_version} for syq {new_syq_version}"

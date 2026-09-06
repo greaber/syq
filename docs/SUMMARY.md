@@ -31,7 +31,7 @@
 
 # SDKs
 
-- [Python SDK](python.md)
+- [Python](python.md)
   - [Guide and examples](python-guide.md)
   - [API reference](python-reference.md)
   - [Compatibility](sdk-compatibility.md)

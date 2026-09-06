@@ -42,12 +42,7 @@ python3 "$script_dir/prepare-python-sdk-release.py" \
 
 grep -Fx "version = \"$next_python_version\"" \
   "$work/sdk/python/pyproject.toml" >/dev/null
-grep -F "package \`$next_python_version\`" \
-  "$work/sdk/python/README.md" >/dev/null
-grep -F "manages syq \`$next_syq_version\`." \
-  "$work/sdk/python/README.md" >/dev/null
-test "$(grep -Fc "syq/sdk/python/v$next_syq_version/" \
-  "$work/sdk/python/README.md")" -eq 2
+cmp "$repo_dir/sdk/python/README.md" "$work/sdk/python/README.md"
 cmp "$candidate" "$work/sdk/python/src/syq/syq-release-manifest.json"
 
 # Portable tree fingerprint: GNU coreutils on Linux, Perl shasum on macOS.

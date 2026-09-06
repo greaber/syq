@@ -1,29 +1,23 @@
-# Python SDK
+<a id="python-sdk"></a>
 
-Use syq from Python to copy, remove or reorganize files, with typed results
-and streaming events. Synchronous and asyncio clients are available.
+# Python
+
+Copy, remove, and reorganize files from Python, with typed results and streaming
+events. Synchronous and asyncio clients are available.
+
+<a id="preview-a-copy"></a>
 
 ## Install
 
 The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.10+
 on Linux and macOS:
 
-    python -m pip install syq
+```sh
+python -m pip install syq
+```
 
-On first use, the default client downloads and verifies the matching syq
-executable, then caches it. It does not use an unrelated syq from your PATH.
+On first use, it downloads and verifies the matching syq executable, then caches
+it for later calls. You do not need to install the command-line tool separately.
 
-## Preview a copy
-
-    import syq
-
-    plan = syq.cp("data", into="backup", dry_run=True)
-    print(plan.files_transferred, plan.bytes_transferred)
-
-Remove `dry_run=True` to perform the copy. Use `to="server"` for an SSH destination;
-the same placement options are described in [Copy files](reference.md).
-
-The typed API includes `syq.cp()`, `syq.rm()` and `syq.map()`. Call `syq.run([...])`
-for other commands. Asyncio programs use `await syq.AsyncClient().cp(...)`.
-Failures raise exceptions; typed calls also check the complete results stream
-rather than treating a truncated stream as success.
+Start with [Guide and examples](python-guide.md), or look up arguments and
+return values in the [API reference](python-reference.md).

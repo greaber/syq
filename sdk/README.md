@@ -1,44 +1,38 @@
-# syq language SDKs
+<a id="syq-language-sdks"></a>
 
-This directory contains the Python client for syq. It invokes the syq
-executable rather than inventing a second transfer implementation, and it
-implements synchronous and asyncio clients for typed
-`cp` (including `prune=True`), `rm`, and `map` against syq's machine
-interfaces. Other commands and modes, such as a detached remote-to-remote
-copy, remain available through raw `run`. The executable remains authoritative
-for argument semantics, filesystem behavior, exit status, and safety checks.
+# Compatibility
 
-The Python-native surface is documented in
-[`python/NATIVE_API.md`](https://greaber.github.io/syq/python-reference.html).
+The Python package supports Python 3.10+ on Linux and macOS and has no runtime
+Python dependencies.
 
-| Ecosystem | Package/module | Source |
-|---|---|---|
-| Python | `syq` | [`python/`](https://github.com/greaber/syq/tree/master/sdk/python) |
+## Managed executable
 
-Every SDK release pins one exact, tested syq release. The default client does
-not search `PATH` or adopt a separately installed syq. On first use it downloads
-the pinned official binary for the current platform into an SDK-owned cache,
-verifies its archive and decompressed bytes against the release manifest
-embedded in the package, checks its version and release identity, and then
-always invokes that cached binary.
+Each package version uses the same version of syq. Pin the Python package in
+your dependency file to keep that pairing.
+`syq.__version__` and `syq.PINNED_SYQ_VERSION` report these versions.
 
-The Python package uses the same version as the syq release it manages. Its
-package version, `syq.__version__`, and `syq.PINNED_SYQ_VERSION` therefore agree.
-The embedded mapping remains immutable for a published package. Every
-successful official syq release automatically prepares the matching Python SDK
-release pull request with its exact signed manifest. Maintainers review and
-merge that release before creating the signed Python SDK tag.
+The default client downloads the matching official executable on first use,
+verifies it against the release manifest embedded in the package, and caches it.
+It checks the cached binary before each use and replaces a missing or corrupt
+entry. It does not search `PATH`.
 
-Callers that need a local build, a newer syq, or an offline-provisioned binary
-may pass `executable=` explicitly. That opts out of the tested pairing; the
-caller owns compatibility and provenance for the override.
+The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
+`XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
+Set `Client(cache_dir=...)` to choose a different cache root. Call
+`syq.managed_executable()` to download ahead of time and get the executable path.
 
-This makes the supported SDK/runtime combination hermetic. SDK consumers can
-pin the Python package version in their own lockfile and choose when to adopt a
-new SDK-plus-syq release. The supported subprocess behavior is never exposed
-to untested executable drift.
+## Custom executable
 
-The Python package implements this model.
+Pass `executable=` to use a local build or an offline-provisioned executable:
 
-See [`RELEASING.md`](https://github.com/greaber/syq/blob/master/sdk/RELEASING.md) for the one-time registry setup and exact
-tag conventions.
+```python
+import syq
+
+client = syq.Client(executable="/opt/bin/syq")
+print(client.version())
+```
+
+`executable="syq"` explicitly selects syq from `PATH`. An override bypasses the
+managed download and verification; you are responsible for its compatibility
+and origin. Typed calls still reject unsupported or invalid automation output.
+The client does not fall back to another executable if the selected one fails.
