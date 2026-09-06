@@ -594,7 +594,7 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: Option<std::sync::mpsc::Receiver<std::io::Result<Response>>>,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
@@ -613,14 +613,14 @@ fn spawn_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
 ) -> (
-    std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
 ) {
     let (tx, rx) = std::sync::mpsc::sync_channel(read_ahead);
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         loop {
-            let msg = r.read_msg::<Response>();
+            let msg = r.read_budgeted::<Response>();
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
                 break;
@@ -631,16 +631,23 @@ fn spawn_reader(
 }
 
 fn receive_transport_stats(
-    rx: &std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    rx: &std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     timeout: std::time::Duration,
 ) -> Option<TcpSocketStats> {
-    match rx.recv_timeout(timeout) {
+    match rx
+        .recv_timeout(timeout)
+        .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
+    {
         Ok(Ok(Response::TransportStats(stats))) => stats,
         _ => None,
     }
 }
 
-fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()> {
+fn validate_remote_scan_batch(
+    batch: &[Entry],
+    saw_root: &mut bool,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+) -> Result<()> {
     for entry in batch {
         if !*saw_root {
             if !entry.path.is_empty() {
@@ -661,6 +668,14 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
         {
             bail!(
                 "scan response contained unsafe relative path {:?}",
+                String::from_utf8_lossy(&entry.path)
+            );
+        }
+        if matcher.is_some_and(|matcher| {
+            crate::scan::path_is_ignored(matcher, &entry.path, entry.kind == Kind::Dir)
+        }) {
+            bail!(
+                "scan response contained excluded path {:?}",
                 String::from_utf8_lossy(&entry.path)
             );
         }
@@ -787,7 +802,13 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
-        match self.rx.as_ref().expect("reader receiver present").recv() {
+        match self
+            .rx
+            .as_ref()
+            .expect("reader receiver present")
+            .recv()
+            .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
+        {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
             Err(_) => Err(self.io_err(
@@ -826,11 +847,12 @@ impl Conn for RemoteConn {
             report_ignored,
             guard: None,
         })?;
+        let matcher = crate::scan::build_ignore(ignore)?;
         let mut saw_root = false;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => {
-                    validate_remote_scan_batch(&b, &mut saw_root)
+                    validate_remote_scan_batch(&b, &mut saw_root, matcher.as_ref())
                         .with_context(|| format!("{}: unsafe remote scan", self.label))?;
                     sink(b)?;
                 }
@@ -3448,7 +3470,11 @@ mod tests {
                 .unwrap();
         }
         for i in 0..depth {
-            let response = responses.recv_timeout(timeout).unwrap().unwrap();
+            let response = responses
+                .recv_timeout(timeout)
+                .unwrap()
+                .unwrap()
+                .into_inner();
             assert!(matches!(response, Response::Block { off, data, .. }
                 if off == i as u64 * (64 << 10) && data == vec![7; 64 << 10]));
         }
@@ -3539,9 +3565,69 @@ mod tests {
     }
 
     #[test]
+    fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
+        for (path, patterns, allowed) in [
+            (b".env".as_slice(), vec![".env"], false),
+            (
+                b"ignored/keep/file",
+                vec!["ignored/", "!ignored/keep/file"],
+                false,
+            ),
+            (b"logs/keep/file", vec!["logs/*", "!logs/keep/"], true),
+            (b"nested/.env", vec!["/.env"], true),
+        ] {
+            let mut wire = Vec::new();
+            let mut writer = FrameWriter::new(&mut wire, false);
+            let mut root = entry(b"");
+            root.kind = Kind::Dir;
+            writer.write_msg(&Response::ScanBatch(vec![root])).unwrap();
+            // No excluded ancestor is sent. Filtering must not depend on the
+            // source's claimed tree order or on previous batches.
+            writer
+                .write_msg(&Response::ScanBatch(vec![entry(path)]))
+                .unwrap();
+            writer.write_msg(&Response::ScanDone).unwrap();
+            drop(writer);
+            let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+            let mut remote = RemoteConn {
+                child: None,
+                w: FrameWriter::new(Box::new(Vec::new()), false),
+                rx: Some(rx),
+                reader: Some(reader),
+                label: "hostile source".into(),
+                dead: false,
+                peer: None,
+                tcp_socket: None,
+                named_socket: None,
+                multiplexed_ssh: false,
+                detached: false,
+            };
+            let mut planned = Vec::new();
+            let result = remote.scan(
+                b"source",
+                None,
+                false,
+                &patterns.into_iter().map(String::from).collect::<Vec<_>>(),
+                false,
+                &mut |entries| {
+                    planned.extend(entries.into_iter().map(|e| e.path));
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+                &mut |_| {},
+            );
+            assert_eq!(result.is_ok(), allowed, "{path:?}: {result:?}");
+            assert_eq!(planned.contains(&path.to_vec()), allowed);
+            if !allowed {
+                assert!(format!("{:#}", result.unwrap_err()).contains("excluded path"));
+            }
+        }
+    }
+
+    #[test]
     fn remote_scan_paths_are_rooted_and_normalized() {
         let mut saw_root = false;
-        validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root).unwrap();
+        validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root, None).unwrap();
         assert!(saw_root);
 
         for bad in [
@@ -3554,17 +3640,17 @@ mod tests {
             &b"nul\0byte"[..],
         ] {
             let mut saw_root = true;
-            assert!(validate_remote_scan_batch(&[entry(bad)], &mut saw_root).is_err());
+            assert!(validate_remote_scan_batch(&[entry(bad)], &mut saw_root, None).is_err());
         }
     }
 
     #[test]
     fn remote_scan_requires_exactly_one_leading_root() {
         let mut saw_root = false;
-        assert!(validate_remote_scan_batch(&[entry(b"file")], &mut saw_root).is_err());
+        assert!(validate_remote_scan_batch(&[entry(b"file")], &mut saw_root, None).is_err());
 
         let mut saw_root = true;
-        assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root).is_err());
+        assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root, None).is_err());
     }
 
     #[test]

@@ -139,8 +139,7 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Explicit rsync compatibility escape hatch for unconfined source
-    /// discovery through symlinked descendant components.
+    /// Record the local rsync operator-path opt-out in the resume identity.
     pub insecure_links: bool,
     /// Symlink policy for the operator-selected destination path.
     pub operator_symlink_policy: OperatorSymlinkPolicy,
@@ -1940,10 +1939,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone())
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux")
-                                && opts.same_host
-                                && !opts.insecure_links
-                            {
+                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
                                 initial_sources.clone()
                             } else {
                                 Vec::new()
@@ -2129,12 +2125,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // source capabilities from the source endpoint's broker before reporting
     // ready. These are foreign-session claims even when both logical endpoints
     // are local to the coordinator process.
-    let copy_local_claim_workers =
-        if cfg!(target_os = "linux") && opts.same_host && !opts.insecure_links {
-            maximum_workers
-        } else {
-            0
-        };
+    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
+        maximum_workers
+    } else {
+        0
+    };
     let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;
@@ -3830,7 +3825,7 @@ fn register_source_roots(
             base,
             selections,
             symlink_policy: source_operator_symlink_policy(args, source_is_local),
-            allow_unconfined_paths: rsync_insecure_links(args, source_is_local),
+            allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,
         })?,
@@ -4149,7 +4144,7 @@ fn follow_container_symlink(
 }
 
 fn display(p: &[u8]) -> String {
-    String::from_utf8_lossy(p).into_owned()
+    crate::completion_details::display_bytes(p)
 }
 
 fn display_directory(p: &[u8]) -> String {
@@ -4850,11 +4845,7 @@ impl Planner<'_> {
             self,
             src,
             src_root,
-            if self.opts.insecure_links {
-                None
-            } else {
-                Some(&source)
-            },
+            Some(&source),
             follow_root,
             &ignore,
             |pl, batch| {
@@ -4925,9 +4916,8 @@ impl Planner<'_> {
 
     /// --files-from: instead of walking the source, stat each listed path (and
     /// the directories leading to it) and feed them to the planner as if a scan
-    /// had produced them. By default, implied parents are descriptor-relative
-    /// and never traversed through symlinks. `--insecure-links` selects the
-    /// legacy unconfined pathname behavior explicitly. Listed directories —
+    /// had produced them. Implied parents are descriptor-relative and never
+    /// traversed through symlinks, including with `--insecure-links`. Listed directories —
     /// only those, not implied parents — are walked with an explicit -r.
     fn scan_files_from(
         &mut self,
@@ -4944,16 +4934,12 @@ impl Planner<'_> {
             .context("registered source reference was not initialized")?;
         // Validate the root but never plan it: it isn't in the list, so an
         // existing destination is not stamped with source-root metadata.
-        let mut source_root_stat = if self.opts.insecure_links {
-            stat_many(src, vec![src_root.to_vec()], true)?
-        } else {
-            stat_many_registered(
-                src,
-                vec![src_root.to_vec()],
-                Some(vec![source_base.clone()]),
-                true,
-            )?
-        };
+        let mut source_root_stat = stat_many_registered(
+            src,
+            vec![src_root.to_vec()],
+            Some(vec![source_base.clone()]),
+            true,
+        )?;
         match source_root_stat.pop().flatten() {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
@@ -4966,8 +4952,7 @@ impl Planner<'_> {
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
         // Implied ancestors must be directories. Registered stats never follow
-        // descendant symlinks; only --insecure-links uses legacy followed
-        // pathname stats. Results are kept for the whole list, since a later
+        // descendant symlinks. Results are kept for the whole list, since a later
         // line may repeat a path or name one first seen as a parent.
         let mut leaves: HashMap<PathBytes, Option<Entry>> = HashMap::new();
         let mut parents: HashMap<PathBytes, Option<Entry>> = HashMap::new();
@@ -4983,9 +4968,6 @@ impl Planner<'_> {
         };
         let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| -> Result<_> {
             let legacy_paths = paths.iter().map(|r| join(src_root, r)).collect();
-            if self.opts.insecure_links {
-                return stat_many(src, legacy_paths, follow);
-            }
             let registered = paths
                 .iter()
                 .map(|relative| source_base.join(relative))
@@ -5324,11 +5306,7 @@ impl Planner<'_> {
             self,
             src,
             &join(src_root, rel),
-            if self.opts.insecure_links {
-                None
-            } else {
-                Some(&source)
-            },
+            Some(&source),
             false,
             &[],
             |pl, batch| {
@@ -7325,11 +7303,10 @@ struct BlockDiff {
 }
 
 impl Worker {
-    /// Confined source sessions carry the registered capability on every
-    /// content request. Only rsync's explicit --insecure-links compatibility
-    /// mode intentionally asks the endpoint to use its legacy pathname.
+    /// Every content request carries the source capability, including when
+    /// the operator allowed a foreign-owned symlink in the typed root path.
     fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
-        (!self.opts.insecure_links).then(|| job.source.clone())
+        Some(job.source.clone())
     }
 
     fn run(&mut self) -> Result<()> {
@@ -7660,12 +7637,8 @@ impl Worker {
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
         let phase = std::time::Instant::now();
-        let now = if self.opts.insecure_links {
-            stat_many(&mut *self.src, paths, false)?
-        } else {
-            let registered = jobs.iter().map(|job| job.source.clone()).collect();
-            stat_many_registered(&mut *self.src, paths, Some(registered), false)?
-        };
+        let registered = jobs.iter().map(|job| job.source.clone()).collect();
+        let now = stat_many_registered(&mut *self.src, paths, Some(registered), false)?;
         self.fast.restat += phase.elapsed().as_secs_f64();
         let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
@@ -7838,7 +7811,6 @@ impl Worker {
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
             && !self.opts.tuning.force_ranges()
-            && !self.opts.insecure_links
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
@@ -8417,11 +8389,7 @@ impl Worker {
     /// the source changed during that work.
     fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
         // Did the source change under us?
-        let now = if self.opts.insecure_links {
-            stat_one(&mut *self.src, &job.src, false)?
-        } else {
-            stat_one_registered(&mut *self.src, &job.src, &job.source, false)?
-        };
+        let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
         let changed = match &now {
             Some(e) => {
                 e.kind != Kind::File

@@ -51,6 +51,17 @@ pub fn build_ignore(lines: &[String]) -> Result<Option<Gitignore>> {
     Ok(Some(b.build()?))
 }
 
+/// Match the same pruned tree as a source walk, even when a peer omits or
+/// reorders excluded ancestors. A negation cannot reopen a pruned parent.
+pub(crate) fn path_is_ignored(matcher: &Gitignore, path: &[u8], is_dir: bool) -> bool {
+    let path = Path::new(std::ffi::OsStr::from_bytes(path));
+    !path.as_os_str().is_empty()
+        && (matcher.matched(path, is_dir).is_ignore()
+            || path.ancestors().skip(1).any(|ancestor| {
+                !ancestor.as_os_str().is_empty() && matcher.matched(ancestor, true).is_ignore()
+            }))
+}
+
 enum ScanEvent {
     Entry(Entry),
     Ignored(PathBytes),

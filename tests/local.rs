@@ -585,58 +585,61 @@ fn confinement_matrix_tcp_requirement_refuses_ssh_transport() {
 #[cfg(debug_assertions)]
 #[test]
 fn source_scan_uses_registered_root_after_operator_path_replacement() {
-    let t = Tmp::new();
-    write(&t.path("src/original"), b"original");
-    write(&t.path("outside/replacement"), b"replacement");
-    let ready = t.path("source-ready");
+    for insecure in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/original"), b"original");
+        write(&t.path("outside/replacement"), b"replacement");
+        let ready = t.path("source-ready");
 
-    let mut child = compat_command()
-        .args([
-            "-anv",
-            "--syq-connections",
-            "1",
-            &t.s("src/"),
-            &t.s("dst/"),
-            "--no-progress",
-        ])
-        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
+        let mut child = compat_command()
+            .args(insecure.then_some("--insecure-links"))
+            .args([
+                "-anv",
+                "--syq-connections",
+                "1",
+                &t.s("src/"),
+                &t.s("dst/"),
+                "--no-progress",
+            ])
+            .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before registering the source root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
+            ready.exists(),
+            "source root was not registered before timeout"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("/original (destination missing)"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("/replacement (destination missing)"),
+            "{stdout}"
+        );
+        assert!(
+            !t.path("dst").exists(),
+            "dry run unexpectedly created output"
+        );
     }
-    assert!(
-        ready.exists(),
-        "source root was not registered before timeout"
-    );
-
-    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
-    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
-
-    let output = child.wait_with_output().unwrap();
-    assert_output_ok(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("/original (destination missing)"),
-        "{stdout}"
-    );
-    assert!(
-        !stdout.contains("/replacement (destination missing)"),
-        "{stdout}"
-    );
-    assert!(
-        !t.path("dst").exists(),
-        "dry run unexpectedly created output"
-    );
 }
 
 #[cfg(debug_assertions)]
@@ -825,53 +828,56 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
 #[cfg(debug_assertions)]
 #[test]
 fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
-    let t = Tmp::new();
-    let original_large = vec![b'o'; 5 << 20];
-    write(&t.path("src/small"), b"original");
-    write(&t.path("src/large"), &original_large);
-    write(&t.path("outside/small"), b"replaced");
-    write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
-    let ready = t.path("source-content-ready");
+    for insecure in [false, true] {
+        let t = Tmp::new();
+        let original_large = vec![b'o'; 5 << 20];
+        write(&t.path("src/small"), b"original");
+        write(&t.path("src/large"), &original_large);
+        write(&t.path("outside/small"), b"replaced");
+        write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
+        let ready = t.path("source-content-ready");
 
-    let mut child = compat_command()
-        .args([
-            "-a",
-            "--syq-connections",
-            "1",
-            &t.s("src/"),
-            &t.s("dst/"),
-            "--no-progress",
-        ])
-        // Keep the test on the ranged transport path instead of the excluded
-        // same-machine CopyLocal optimization.
-        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
-        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
+        let mut child = compat_command()
+            .args(insecure.then_some("--insecure-links"))
+            .args([
+                "-a",
+                "--syq-connections",
+                "1",
+                &t.s("src/"),
+                &t.s("dst/"),
+                "--no-progress",
+            ])
+            // Keep the test on the ranged transport path instead of the excluded
+            // same-machine CopyLocal optimization.
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before registering the source root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
+            ready.exists(),
+            "source root was not registered before timeout"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/small")), b"original");
+        assert_eq!(read(&t.path("dst/large")), original_large);
     }
-    assert!(
-        ready.exists(),
-        "source root was not registered before timeout"
-    );
-
-    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
-    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
-
-    let output = child.wait_with_output().unwrap();
-    assert_output_ok(&output);
-    assert_eq!(read(&t.path("dst/small")), b"original");
-    assert_eq!(read(&t.path("dst/large")), original_large);
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -1044,9 +1050,23 @@ fn insecure_links_does_not_delegate_unconfined_names_to_copy_local() {
         .run()
         .unwrap();
 
-    assert_output_ok(&output);
+    assert_eq!(output.status.code(), Some(23));
     assert!(!copy_local_ready.exists());
-    assert_eq!(read(&t.path("dst/link/secret")), contents);
+    assert!(!t.path("dst/link/secret").exists());
+}
+
+#[test]
+fn verbose_copy_escapes_peer_filename_control_characters() {
+    let t = Tmp::new();
+    let name = "file\x1b]52;c;ZXZpbA==\x07\nline\r";
+    write(&t.path(&format!("src/{name}")), b"payload");
+    let out = syq(&["-av", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path(&format!("dst/{name}"))), b"payload");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains('\x1b'));
+    assert!(!stdout.contains('\x07'));
+    assert!(stdout.contains("\\nline\\r"), "{stdout}");
 }
 
 fn run_native_ok(args: &[&str]) -> String {
@@ -9520,9 +9540,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
     assert!(!t.path("dst/link/secret").exists());
 
-    // The compatibility escape hatch is explicit and unconfined. It restores
-    // the old followed-ancestor behavior; implied parents are materialized as
-    // real destination directories. `a` is still not recursively walked.
+    // The ownership opt-out keeps descendant traversal confined too.
     let out = syq(&[
         "-a",
         "-r",
@@ -9532,17 +9550,9 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
         &t.s("src"),
         &t.s("dst-insecure"),
     ]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(
-        listing(&t.path("dst-insecure")),
-        ["a", "a/listed", "link", "link/secret"]
-    );
-    assert!(t
-        .path("dst-insecure/link")
-        .symlink_metadata()
-        .unwrap()
-        .is_dir());
-    assert_eq!(read(&t.path("dst-insecure/link/secret")), b"secret");
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(listing(&t.path("dst-insecure")), ["a", "a/listed"]);
+    assert!(!t.path("dst-insecure/link/secret").exists());
 
     // An ancestor that resolves to a file, or dangles, is an error.
     std::os::unix::fs::symlink("a/listed", t.path("src/tofile")).unwrap();
@@ -9559,7 +9569,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     assert_eq!(out.status.code(), Some(23));
     let se = stderr_of(&out);
     assert!(
-        se.contains("tofile is not a directory") && se.contains("dangling/y: no such file"),
+        se.contains("tofile is not a directory") && se.contains("dangling is not a directory"),
         "{se}"
     );
     assert_eq!(listing(&t.path("dst2")), Vec::<String>::new());
@@ -9576,7 +9586,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
         &t.s("dst3"),
     ]);
     assert_eq!(out.status.code(), Some(23));
-    assert!(stderr_of(&out).contains("listed as a non-directory"));
+    assert!(stderr_of(&out).contains("link is not a directory"));
     assert!(t.path("dst3/link").symlink_metadata().unwrap().is_symlink());
     assert!(!t.path("outside/secret2").exists());
 }
@@ -9622,8 +9632,7 @@ fn insecure_links_never_reaches_a_remote_endpoint() {
     assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
     assert!(!t.path("dst/link").exists());
 
-    // Local source, remote destination: the local opt-out still applies and
-    // the remote receiver is unaffected by it.
+    // Local source, remote destination: descendant traversal stays refused.
     let remote_dst = format!("fake:{}", t.s("dst-remote"));
     let out = remote_syq(
         &t,
@@ -9639,12 +9648,9 @@ fn insecure_links_never_reaches_a_remote_endpoint() {
             &remote_dst,
         ],
     );
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(
-        listing(&t.path("dst-remote")),
-        ["a", "a/listed", "link", "link/secret"]
-    );
-    assert_eq!(read(&t.path("dst-remote/link/secret")), b"secret");
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert_eq!(listing(&t.path("dst-remote")), ["a", "a/listed"]);
+    assert!(!t.path("dst-remote/link/secret").exists());
 }
 
 #[test]

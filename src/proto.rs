@@ -12,7 +12,10 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-pub const MAX_FRAME: usize = 256 * 1024 * 1024;
+// 64 MiB data/batch tuning remains supported, with room for its metadata.
+pub const MAX_FRAME: usize = 65 * 1024 * 1024;
+pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
+const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
@@ -1104,9 +1107,19 @@ pub struct DirectoryAnchor {
 /// Rough serialized size, so big blocks are encoded without reallocation.
 pub trait SizeHint {
     fn size_hint(&self) -> usize;
+    fn frame_limit(&self) -> usize;
 }
 
 impl SizeHint for Request {
+    fn frame_limit(&self) -> usize {
+        match self {
+            Request::Hello { .. } => MAX_HANDSHAKE_FRAME,
+            Request::WriteRange { .. } | Request::PutSmallBatch(_) | Request::CopySmallFiles(_) => {
+                MAX_FRAME
+            }
+            _ => MAX_METADATA_FRAME,
+        }
+    }
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
@@ -1159,6 +1172,16 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
+    fn frame_limit(&self) -> usize {
+        match self {
+            Response::HelloOk { .. } => MAX_HANDSHAKE_FRAME,
+            Response::Block { .. }
+            | Response::SmallBlocks(_)
+            | Response::Hashes(_)
+            | Response::HeldHashes { .. } => MAX_FRAME,
+            _ => MAX_METADATA_FRAME,
+        }
+    }
     fn size_hint(&self) -> usize {
         match self {
             Response::Block { data, .. } => data.len() + 64,
@@ -1264,6 +1287,12 @@ impl<W: Write> FrameWriter<W> {
         self.write_preamble()?;
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if payload.len() >= msg.frame_limit() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "outgoing message exceeds its size limit",
+            ));
+        }
         let mut flag = 0u8;
         let mut body = payload;
         if self.compress && body.len() > COMPRESS_MIN {
@@ -1292,14 +1321,20 @@ impl<W: Write> FrameWriter<W> {
 pub struct FrameReader<R: Read> {
     r: BufReader<R>,
     preamble_read: bool,
+    limit: usize,
 }
 
 impl<R: Read> FrameReader<R> {
     pub fn new(r: R) -> Self {
         FrameReader {
-            r: BufReader::with_capacity(1 << 20, r),
+            r: BufReader::with_capacity(16 << 10, r),
             preamble_read: false,
+            limit: MAX_FRAME,
         }
+    }
+
+    pub(crate) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(MAX_FRAME);
     }
 
     fn read_preamble(&mut self) -> io::Result<()> {
@@ -1366,41 +1401,77 @@ impl<R: Read> FrameReader<R> {
         Ok(())
     }
 
-    pub fn read_msg<T: for<'de> Deserialize<'de>>(&mut self) -> io::Result<T> {
+    #[cfg(test)]
+    pub fn read_msg<T: for<'de> Deserialize<'de> + SizeHint>(&mut self) -> io::Result<T> {
+        self.read_budgeted()
+            .map(crate::wire_budget::Budgeted::into_inner)
+    }
+
+    pub(crate) fn read_budgeted<T: for<'de> Deserialize<'de> + SizeHint>(
+        &mut self,
+    ) -> io::Result<crate::wire_budget::Budgeted<T>> {
         self.read_preamble()?;
         let mut hdr = [0u8; 4];
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;
-        if len == 0 || len > MAX_FRAME {
+        if len == 0 || len > self.limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad frame length {len}"),
+                format!("bad frame length {len}; limit {}", self.limit),
             ));
         }
         let mut flag = [0u8; 1];
         self.r.read_exact(&mut flag)?;
+        if flag[0] > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown frame flags",
+            ));
+        }
+        // Reserve before allocating or reading, not after decoding has already
+        // consumed the memory. Failed/closed streams release both holds.
+        let mut input_hold = crate::wire_budget::Hold::new();
+        input_hold.grow(len - 1)?;
         let mut body = vec![0u8; len - 1];
         self.r.read_exact(&mut body)?;
-        let payload = if flag[0] & 1 != 0 {
-            {
-                use std::io::Read as _;
-                let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
-                let mut out = Vec::new();
-                dec.by_ref()
-                    .take(MAX_FRAME as u64 + 1)
-                    .read_to_end(&mut out)?;
-                if out.len() > MAX_FRAME {
+        let payload = if flag[0] == 1 {
+            // Bound zstd's advertised window as well as its output. Level-1
+            // frames from the released writer use windows below this ceiling.
+            input_hold.grow(16 << 20)?;
+            let mut decoder = zstd::stream::read::Decoder::new(&body[..])?;
+            decoder.window_log_max(23)?;
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 16 << 10];
+            loop {
+                let n = decoder.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                if output.len() + n >= self.limit {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "decompressed frame exceeds limit",
                     ));
                 }
-                out
+                // Vec growth is explicit so no uncharged geometric capacity
+                // appears while decompressing an attacker-controlled stream.
+                // Cover old and new allocations during a realloc too.
+                input_hold.grow(n * 2)?;
+                output.try_reserve_exact(n).map_err(io::Error::other)?;
+                output.extend_from_slice(&chunk[..n]);
             }
+            output
         } else {
             body
         };
-        postcard::from_bytes(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let decoded = crate::wire_budget::decode::<T>(&payload)?;
+        if payload.len() >= decoded.value.frame_limit() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incoming message exceeds its size limit",
+            ));
+        }
+        Ok(decoded)
     }
 }
 
@@ -1422,6 +1493,70 @@ mod tests {
             })
             .unwrap();
         frame
+    }
+
+    fn raw_frame(body: &[u8], flag: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        FrameWriter::new(&mut bytes, false)
+            .write_preamble()
+            .unwrap();
+        bytes.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        bytes.push(flag);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn oversized_handshake_is_rejected_before_reading_its_body() {
+        let mut bytes = Vec::new();
+        FrameWriter::new(&mut bytes, false)
+            .write_preamble()
+            .unwrap();
+        bytes.extend_from_slice(&((MAX_HANDSHAKE_FRAME + 1) as u32).to_le_bytes());
+        let mut reader = FrameReader::new(bytes.as_slice());
+        reader.set_limit(MAX_HANDSHAKE_FRAME);
+        let error = reader.read_msg::<Request>().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("bad frame length"));
+    }
+
+    #[test]
+    fn compressed_handshake_cannot_expand_past_its_limit() {
+        let payload = postcard::to_stdvec(&Response::Err("x".repeat(4096))).unwrap();
+        let compressed = zstd::bulk::compress(&payload, 1).unwrap();
+        let bytes = raw_frame(&compressed, 1);
+        let mut reader = FrameReader::new(bytes.as_slice());
+        reader.set_limit(1024);
+        assert!(reader
+            .read_msg::<Response>()
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed frame exceeds"));
+    }
+
+    #[test]
+    fn compressed_metadata_still_obeys_its_message_limit() {
+        let payload = postcard::to_stdvec(&Response::Err("x".repeat(MAX_METADATA_FRAME))).unwrap();
+        let compressed = zstd::bulk::compress(&payload, 1).unwrap();
+        let bytes = raw_frame(&compressed, 1);
+        let error = FrameReader::new(bytes.as_slice())
+            .read_msg::<Response>()
+            .unwrap_err();
+        assert!(error.to_string().contains("message exceeds its size limit"));
+    }
+
+    #[test]
+    fn bounded_decoder_preserves_released_completion_payloads() {
+        let request = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
+        let response = include_bytes!("../tests/fixtures/completion/directory-entries-v0.3.2.bin");
+        let decoded = crate::wire_budget::decode::<Request>(request)
+            .unwrap()
+            .into_inner();
+        assert_eq!(postcard::to_stdvec(&decoded).unwrap(), request);
+        let decoded = crate::wire_budget::decode::<Response>(response)
+            .unwrap()
+            .into_inner();
+        assert_eq!(postcard::to_stdvec(&decoded).unwrap(), response);
     }
 
     #[test]

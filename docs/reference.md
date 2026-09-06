@@ -240,7 +240,10 @@ Ignored directories are not scanned. To keep part of one, include the parent:
 syq cp --ignore 'logs/*' --ignore '!logs/keep/' --srcs-in project --into backup
 ```
 
-Ignored paths are also protected from pruning.
+Ignored paths are also protected from pruning. When pulling from another
+machine, syq independently checks the returned names and their ancestors.
+A source that returns an excluded path causes the copy to fail before that
+entry is planned.
 
 ## Resume an interrupted copy
 

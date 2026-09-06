@@ -55,4 +55,6 @@ COPY tests/real-ssh/test-forward-copy.py /usr/local/libexec/syq-test-forward-cop
 
 COPY tests/real-ssh/test-return-exec.py /usr/local/libexec/syq-test-return-exec.py
 
+COPY tests/real-ssh/test-root-security.py /usr/local/libexec/syq-test-root-security.py
+
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]
