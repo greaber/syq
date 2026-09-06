@@ -51,25 +51,31 @@ impl RequestReader {
             .and_then(crate::conn::tcp_socket_stats)
     }
 
-    /// A read stream accepts only its stop marker. The client drains through
-    /// ReadStreamDone before issuing any following command on this connection.
-    fn stream_stopped(&self, wait: bool) -> Result<bool> {
+    /// Process one-way limit updates before the next read. At the reduced end
+    /// (including a late update behind `off`), keep waiting for the stop marker.
+    /// Only that marker fences the stream, so late updates cannot leak into
+    /// the next operation on a reused connection.
+    fn stream_stopped(&self, off: u64, limit: &mut u64) -> Result<bool> {
         use std::sync::mpsc::TryRecvError;
-        let request = if wait {
-            self.recv()
-                .context("read stream control channel closed")??
-        } else {
-            match self.rx.as_ref().unwrap().try_recv() {
-                Ok(request) => request?,
-                Err(TryRecvError::Empty) => return Ok(false),
-                Err(TryRecvError::Disconnected) => bail!("read stream control channel closed"),
+        loop {
+            let request = if off >= *limit {
+                self.recv()
+                    .context("read stream control channel closed")??
+            } else {
+                match self.rx.as_ref().unwrap().try_recv() {
+                    Ok(request) => request?,
+                    Err(TryRecvError::Empty) => return Ok(false),
+                    Err(TryRecvError::Disconnected) => bail!("read stream control channel closed"),
+                }
+            };
+            match request {
+                Request::StopReadStream => return Ok(true),
+                Request::ShrinkReadStream { end } => {
+                    crate::streaming::shrink_limit(limit, end)?;
+                }
+                _ => bail!("only stop and shrink requests are valid during a read stream"),
             }
-        };
-        anyhow::ensure!(
-            matches!(request, Request::StopReadStream),
-            "only StopReadStream is valid during a read stream"
-        );
-        Ok(true)
+        }
     }
 }
 
@@ -519,11 +525,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     continue;
                 }
                 w.write_msg(&Response::Ok)?;
+                let mut limit = stream.end;
                 loop {
                     // The idle/end/error state waits for the same stop marker
                     // as an interrupted stream, avoiding a late cancellation
                     // being mistaken for the next operation's request.
-                    if reader.stream_stopped(stream.off == stream.end)? {
+                    if reader.stream_stopped(stream.off, &mut limit)? {
                         break;
                     }
                     let t0 = std::time::Instant::now();
@@ -542,7 +549,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
                 w.write_msg(&Response::ReadStreamDone)?;
             }
-            Request::StopReadStream => {
+            Request::StopReadStream | Request::ShrinkReadStream { .. } => {
                 w.write_msg(&Response::Err("no read stream is active".into()))?;
             }
             Request::TcpListen {
@@ -1274,6 +1281,47 @@ impl<R: Read> Read for TimeoutOnce<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let reader = super::RequestReader {
+            rx: Some(rx),
+            thread: None,
+            tcp_socket: None,
+            named_socket: None,
+        };
+        let mut limit = 4096;
+        tx.send(Ok(super::Request::ShrinkReadStream { end: 2048 }))
+            .unwrap();
+        tx.send(Ok(super::Request::ShrinkReadStream { end: 1024 }))
+            .unwrap();
+        assert!(!reader.stream_stopped(0, &mut limit).unwrap());
+        assert_eq!(limit, 1024);
+
+        // Even if a block straddled the new end, consume subsequent shrink
+        // commands and wait for Stop; never issue another read or consume
+        // the next stream's command. A zero limit cancels all future reads.
+        tx.send(Ok(super::Request::ShrinkReadStream { end: 0 }))
+            .unwrap();
+        tx.send(Ok(super::Request::StopReadStream)).unwrap();
+        tx.send(Ok(super::Request::Shutdown)).unwrap();
+        assert!(reader.stream_stopped(2048, &mut limit).unwrap());
+        assert_eq!(limit, 0);
+        assert!(matches!(
+            reader.recv().unwrap().unwrap(),
+            super::Request::Shutdown
+        ));
+
+        // Increasing a limit is a protocol error, not new read authority.
+        tx.send(Ok(super::Request::ShrinkReadStream { end: u64::MAX }))
+            .unwrap();
+        assert!(reader.stream_stopped(2048, &mut limit).is_err());
+        assert_eq!(limit, 0);
+        drop(tx);
+        assert!(reader.stream_stopped(2048, &mut limit).is_err());
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -1641,6 +1689,11 @@ mod tests {
             } else {
                 assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
             }
+            // A shrink can arrive after the final block or an error. It has
+            // no reply, does not restart reading, and cannot cross the fence.
+            writer
+                .write_msg(&Request::ShrinkReadStream { end: 0 })
+                .unwrap();
             writer.write_msg(&Request::StopReadStream).unwrap();
             assert!(matches!(
                 reader.read_msg::<Response>().unwrap(),

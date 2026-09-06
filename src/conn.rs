@@ -453,6 +453,7 @@ pub struct LocalConn {
     pending: VecDeque<Response>,
     role: LocalConnectionRole,
     read_stream: Option<ReadStreamRequest>,
+    read_stream_limit: u64,
     write_stream: Option<crate::streaming::Completions>,
 }
 
@@ -483,6 +484,7 @@ impl LocalConn {
             pending: VecDeque::new(),
             role: role.into(),
             read_stream: None,
+            read_stream_limit: 0,
             write_stream: None,
         }
     }
@@ -495,8 +497,12 @@ impl Conn for LocalConn {
             "only range writes are valid during streaming writes"
         );
         anyhow::ensure!(
-            self.read_stream.is_none() || matches!(req, Request::StopReadStream),
-            "only a stop request is valid during a read stream"
+            self.read_stream.is_none()
+                || matches!(
+                    req,
+                    Request::StopReadStream | Request::ShrinkReadStream { .. }
+                ),
+            "only stop and shrink requests are valid during a read stream"
         );
         if self.role != LocalConnectionRole::Control
             && matches!(
@@ -534,10 +540,15 @@ impl Conn for LocalConn {
                 } else if let Err(error) = stream.validate() {
                     self.pending.push_back(Response::Err(error.to_string()));
                 } else {
+                    self.read_stream_limit = stream.end;
                     self.read_stream = Some(stream);
                     self.pending.push_back(Response::Ok);
                 }
                 return Ok(());
+            }
+            Request::ShrinkReadStream { end } => {
+                anyhow::ensure!(self.read_stream.is_some(), "no read stream is active");
+                return crate::streaming::shrink_limit(&mut self.read_stream_limit, end);
             }
             Request::StopReadStream => {
                 self.pending
@@ -561,7 +572,7 @@ impl Conn for LocalConn {
     fn recv(&mut self) -> Result<Response> {
         if self.pending.is_empty() {
             if let Some(stream) = &mut self.read_stream {
-                if stream.off < stream.end {
+                if stream.off < self.read_stream_limit {
                     let response = self.ops.handle(&stream.next_request());
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
@@ -3149,6 +3160,52 @@ mod tests {
                 assert!(matches!(response, Response::EndpointError(_)));
             }
             source.stop_read_stream().unwrap();
+        }
+
+        // One-way shrinking does not insert a response before the next block.
+        // Preserve the original frame boundary even if the new limit cuts it.
+        for end in [3, 0] {
+            assert!(matches!(
+                source
+                    .call(Request::ReadStream(ReadStreamRequest {
+                        path: marker.as_os_str().as_bytes().to_vec(),
+                        source: Some(source_marker.clone()),
+                        attempt: 0,
+                        off: 0,
+                        end: 6,
+                        block: 512,
+                    }))
+                    .unwrap(),
+                Response::Ok
+            ));
+            let range = std::sync::Arc::new(std::sync::Mutex::new(crate::sched::RangeState {
+                idx: 0,
+                pos: 0,
+                end,
+            }));
+            let mut announced = 6;
+            assert!(
+                crate::streaming::notify_shrunk_range(&range, &mut announced, &mut *source)
+                    .unwrap()
+            );
+            assert_eq!(announced, end);
+            assert!(
+                !crate::streaming::notify_shrunk_range(&range, &mut announced, &mut *source)
+                    .unwrap()
+            );
+            if end > 0 {
+                assert!(
+                    matches!(source.recv().unwrap(), Response::Block { data, .. } if data == b"marker")
+                );
+            }
+            assert_eq!(source.stop_read_stream().unwrap(), 0);
+            // A failed send must not mark a notification as delivered.
+            announced = 6;
+            assert!(
+                crate::streaming::notify_shrunk_range(&range, &mut announced, &mut *source)
+                    .is_err()
+            );
+            assert_eq!(announced, 6);
         }
 
         let response = source

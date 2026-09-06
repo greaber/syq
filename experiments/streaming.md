@@ -11,7 +11,7 @@ copies, worker batches, and whole-file copies as `auto`, and selects streaming
 only when the scheduler reaches range transfer. This isolates the streaming
 mechanism from bypassing unrelated optimizations. It rejects pipeline depth
 but permits explicit batch controls. No default or automatic selection policy
-changes, no new wire messages, and no persistent state changes are involved.
+changes are involved in this selector.
 
 ## Protocol and scheduling
 
@@ -20,7 +20,21 @@ for its current interval. It emits ordinary checked `Block` frames, without
 waiting for per-block read requests. Its existing bounded response queue and
 transport backpressure limit read-ahead. The scheduler advances its claimed
 position only as the coordinator accepts blocks, so idle workers may still
-steal the suffix. `StopReadStream` cancels unused read-ahead, and the client
+steal the suffix. Before each consumer block the worker checks its assigned
+end and sends a one-way `ShrinkReadStream` if it decreased. This is a
+block-boundary observation, not an immediate scheduler callback: a blocked
+receive or destination write can delay it. The scheduler never does network
+I/O, and unchanged boundaries require no messages or acknowledgements.
+
+The source processes reductions before its next read and never starts another
+block at or beyond the new end. It preserves the original frame boundaries,
+so the final block may straddle the new limit. Already queued/in-flight blocks
+can also arrive; this is not a zero-waste guarantee. Limits may only decrease,
+including to zero or behind the current source offset. At the reduced end,
+the source still waits for `StopReadStream`, consuming any late reductions.
+No reduction produces a response or can leak past the stop fence.
+
+`StopReadStream` cancels unused read-ahead, and the client
 drains through `ReadStreamDone` before another operation. A split through a
 frame validates the whole frame's hash before truncating/re-hashing its prefix.
 In-process sources produce one block per receive, without preloading a range.
@@ -72,6 +86,9 @@ work-stealing or cancellation, including drained read-ahead and trimmed frame
 suffixes. It excludes transport framing/retransmissions; failed drains may
 leave this count incomplete. It diagnoses redundant payload, not network
 utilization or peak buffering.
+`stream_shrink_requests` counts successfully sent limit reductions, not source
+acknowledgements or bytes saved. The shrink experiment adds one appended
+request variant; existing frame layouts and all persisted state stay unchanged.
 
 ## Comparing
 

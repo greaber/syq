@@ -8279,7 +8279,8 @@ impl Worker {
         let block = self.transfer_block();
         // Do not advance the scheduler's claimed position when opening the
         // stream. Other workers may still steal the unread suffix. At a split
-        // we stop/drain this source, discarding only bounded read-ahead data.
+        // we notify the source at the next consumer block boundary, then
+        // stop/drain after consuming our prefix. Queued frames can still arrive.
         let stream = ReadStreamRequest {
             path: job.src.clone(),
             source: self.source_reference(&job),
@@ -8305,6 +8306,7 @@ impl Worker {
         let mut sent = 0;
         let result = (|| -> Result<()> {
             let mut expected = start;
+            let mut announced_end = end;
             loop {
                 if !self.gate.allowed(self.id)
                     || self.sched.is_failed(idx)
@@ -8317,6 +8319,9 @@ impl Worker {
                     if range.pos == range.end {
                         break;
                     }
+                }
+                if crate::streaming::notify_shrunk_range(h, &mut announced_end, &mut *self.src)? {
+                    self.benchmark.stream_shrink_requests += 1;
                 }
                 self.dst.check_streaming_writes()?;
                 let t0 = std::time::Instant::now();

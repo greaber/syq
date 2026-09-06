@@ -247,6 +247,7 @@ pub(crate) struct BenchmarkStats {
     pub streaming_ranges: u64,
     pub streamed_blocks: u64,
     pub stream_discarded_bytes: u64,
+    pub stream_shrink_requests: u64,
     pub max_request_bytes: u64,
     pub small_batches: u64,
     pub max_batch_files: u64,
@@ -261,6 +262,7 @@ impl BenchmarkStats {
         self.streaming_ranges += other.streaming_ranges;
         self.streamed_blocks += other.streamed_blocks;
         self.stream_discarded_bytes += other.stream_discarded_bytes;
+        self.stream_shrink_requests += other.stream_shrink_requests;
         self.small_batches += other.small_batches;
         self.max_request_bytes = self.max_request_bytes.max(other.max_request_bytes);
         self.max_batch_files = self.max_batch_files.max(other.max_batch_files);

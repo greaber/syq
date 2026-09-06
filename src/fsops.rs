@@ -2801,6 +2801,7 @@ impl FsOps {
             | Request::CopySmallFiles(_)
             | Request::ReadStream(_)
             | Request::WriteStreamFence
+            | Request::ShrinkReadStream { .. }
             | Request::StopReadStream => {}
         }
         Ok(req)
@@ -6339,6 +6340,7 @@ impl FsOps {
             | Request::TcpListen { .. }
             | Request::ReadStream(_)
             | Request::WriteStreamFence
+            | Request::ShrinkReadStream { .. }
             | Request::StopReadStream => Err(anyhow!("unexpected request")),
         };
         match r {

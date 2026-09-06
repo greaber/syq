@@ -2411,6 +2411,7 @@ impl RestrictedAuthority {
             Request::CopyLocal { .. }
             | Request::ReadRange { .. }
             | Request::ReadStream(_)
+            | Request::ShrinkReadStream { .. }
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
             | Request::CopySmallFiles(_) => {

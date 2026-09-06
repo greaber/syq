@@ -838,6 +838,12 @@ pub enum Request {
     StopReadStream,
     /// No filesystem operation: fence replies to preceding streaming writes.
     WriteStreamFence,
+    /// One-way, monotonic reduction of an active source stream's read limit.
+    /// Keep original frame boundaries: a final block may straddle this limit.
+    /// StopReadStream is still required, even if the source has passed `end`.
+    ShrinkReadStream {
+        end: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -976,6 +982,7 @@ impl Request {
                 | Request::ReadRange { .. }
                 | Request::ReadStream(_)
                 | Request::StopReadStream
+                | Request::ShrinkReadStream { .. }
                 | Request::ReadSmallBatch(_)
                 | Request::FileHash { .. }
                 | Request::TransportStats

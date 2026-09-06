@@ -9,6 +9,30 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Only reduce the read limit. A late update can be behind the source's
+/// current offset; it stops future reads but cannot recall queued frames.
+pub(crate) fn shrink_limit(limit: &mut u64, end: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(end <= *limit, "read stream limit cannot increase");
+    *limit = end;
+    Ok(())
+}
+
+/// Observe a steal at the next consumer block boundary, without doing network
+/// I/O under the scheduler lock. No per-block message or reply is required.
+pub(crate) fn notify_shrunk_range(
+    range: &crate::sched::RangeHandle,
+    announced_end: &mut u64,
+    source: &mut dyn crate::conn::Conn,
+) -> anyhow::Result<bool> {
+    let end = range.lock().unwrap().end;
+    if end >= *announced_end {
+        return Ok(false);
+    }
+    source.send(crate::proto::Request::ShrinkReadStream { end })?;
+    *announced_end = end;
+    Ok(true)
+}
+
 /// Drain source payload through the stop fence. These bytes were received but
 /// not written, not a count of transport headers or retries.
 pub(crate) fn drain_reads(
@@ -157,6 +181,19 @@ impl Drop for WriteReplies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_limit_accepts_repeated_and_zero_limits_but_never_grows() {
+        let mut limit = 4096;
+        for end in [4096, 2048, 2048, 1, 0] {
+            shrink_limit(&mut limit, end).unwrap();
+            assert_eq!(limit, end);
+        }
+        for end in [1, u64::MAX] {
+            assert!(shrink_limit(&mut limit, end).is_err());
+            assert_eq!(limit, 0);
+        }
+    }
 
     #[test]
     fn draining_counts_discarded_payload_and_preserves_the_next_response() {
