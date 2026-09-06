@@ -128,6 +128,13 @@ copying interval remains much longer. These single-trial diagnostics explain
 where to look; they do not establish an optimization or replace total elapsed
 time as the comparison metric.
 
+## Follow-up with persistence on
+
+A [separate tiny-copy probe](ssh-persistent-data-probe.md) fixes one worker and
+warms both variants' persistent control logins. It measures the data login reuse
+change under the setting where it applies. Its result does not alter the
+persistence-off comparison or restore the withdrawn runtime changes.
+
 ## Standalone benchmark correction
 
 The standalone script runs `syq persist off` with private `XDG_CONFIG_HOME` and
