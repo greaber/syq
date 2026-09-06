@@ -162,7 +162,10 @@ make_data() {
 copy_with() {
     local tool=$1 source=$2 destination=$3
     local command=() syq_options=(--stats)
-    [[ ${4:-} != setup ]] || syq_options+=(--quiet)
+    # This repository-owned caller suppresses only the tiny copy's summary,
+    # keeping bootstrap diagnostics and authentication prompts live. Supported
+    # by the released v0.3.2 CLI as well as current builds.
+    [[ ${4:-} != setup ]] || syq_options=(--suppress-summary --no-progress)
     case $tool in
         syq)
             case $mode in
@@ -193,10 +196,31 @@ timed_copy() {
     { time copy_with "$@" 1>&4 2>&5; } 2> "$local_root/time"
 }
 
+summarize_results() {
+    awk '{key=$1 " " $2;
+          if (!(key in n)) order[++count]=key;
+          n[key]++;
+          if ($3 <= 0) {unmeasurable[key]=1; next}
+          speed=$4 / $3 / 1000000;
+          if (!(key in total)) {low[key]=speed; high[key]=speed}
+          total[key]+=speed;
+          if (speed < low[key]) low[key]=speed; if (speed > high[key]) high[key]=speed}
+         END {printf "%-18s %10s %10s %10s %8s\n", "Workload / tool", "Mean", "Min", "Max", "Trials";
+              for (i=1; i<=count; i++) {
+                  key=order[i];
+                  if (unmeasurable[key]) {
+                      printf "%-18s %10s %10s %10s %8d\n", key, "n/a", "n/a", "n/a", n[key];
+                      note=1;
+                  } else printf "%-18s %10.3f %10.3f %10.3f %8d\n", key, total[key]/n[key], low[key], high[key], n[key];
+              }
+              if (note) print "n/a: a copy finished below timer resolution; try a larger test.";
+         }' "$1"
+}
+
 main() {
     local mode='' workload='' size='' source_dir='' dest_dir='' rounds=3 yes=false install=false
-    local option tool round index offset source destination case_name bytes seconds local_parent remote_parent
-    local large_mib small_files
+    local option tool round index offset source destination case_name bytes seconds speed local_parent remote_parent
+    local large_mib small_files syq_identity
     local key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     local iv=000102030405060708090a0b0c0d0e0f
     while [[ $# -gt 0 ]]; do
@@ -277,8 +301,8 @@ main() {
         need syq
     fi
     printf '\nVersions:\n'
-    printf 'syq: '
-    syq --build-identity
+    syq_identity=$(syq --build-identity)
+    printf 'syq: %s\n' "$syq_identity"
     rsync --version | sed -n '1p'
     if [[ $mode == local ]]; then
         dest_dir=$(cd -- "$dest_dir" && pwd -P) || fail 'Destination scratch parent must exist.'
@@ -298,10 +322,7 @@ main() {
     printf 'Local scratch: %s\n' "$local_root"
     if [[ $mode == local ]]; then printf 'Destination scratch: %s\n' "$dest_root"
     else printf 'Remote scratch: %s\n' "$remote_root"; fi
-    printf 'Each trial uses an empty destination; order rotates. Setup and checksum verification are untimed.\n'
-    printf 'Caches are NOT flushed; times include startup and buffered writes, not durable disk flushes.\n'
-    printf 'Allow roughly twice the selected data size locally, plus one copy remotely for SSH tests.\n'
-    printf 'Using syq defaults with permissions preserved, rsync -rpt, and local cp -pR.\n\n'
+    printf 'Each trial copies fresh test data and checks the result. Setup and checks are not timed.\n'
     exec 4>&1 5>&2
     local tools=(syq rsync) workloads=(large small)
     [[ $mode != local ]] || tools+=(cp)
@@ -324,7 +345,12 @@ main() {
         if [[ $case_name == "${workloads[0]}" ]]; then
             # Do this once, not once per workload. Keep the measured copy's full
             # transport path, but suppress meaningless throughput for the 14-byte probe.
-            printf 'Preparing syq with a 14-byte setup copy (not timed as a benchmark)...\n'
+            if [[ $mode != local ]]; then
+                printf 'Preparing syq %s on %s to match this machine (untimed)...\n' "$syq_identity" "$host"
+                printf 'A matching remote helper is reused, or installed if needed.\n'
+            else
+                printf 'Preparing the benchmark (untimed)...\n'
+            fi
             mkdir "$local_root/probe"
             printf 'syq benchmark\n' > "$local_root/probe/data"
             if [[ $mode == pull ]]; then
@@ -342,7 +368,11 @@ main() {
                 rm -rf -- "$dest_root/probe"
             fi
             rm -rf -- "$local_root/probe"
-            printf 'Setup complete.\n'
+            if [[ $mode != local ]]; then
+                printf 'Setup complete: syq %s is ready on %s. Benchmark trials start next.\n' "$syq_identity" "$host"
+            else
+                printf 'Setup complete. Benchmark trials start next.\n'
+            fi
         fi
         for ((round=1; round<=rounds; round++)); do
             for ((offset=0; offset<${#tools[@]}; offset++)); do
@@ -358,7 +388,11 @@ main() {
                 else manifest "$destination" > "$local_root/actual"; fi
                 cmp "$local_root/expected" "$local_root/actual" || fail "$tool destination content check failed."
                 printf '%s %s %s %s\n' "$case_name" "$tool" "$seconds" "$bytes" >> "$local_root/results"
-                printf 'Verified contents; elapsed %s seconds.\n' "$seconds"
+                speed=$(awk -v bytes="$bytes" -v seconds="$seconds" 'BEGIN {
+                    if (seconds > 0) printf "%.3f", bytes / seconds / 1000000;
+                    else printf "n/a";
+                }')
+                printf 'Verified contents; speed %s MB/s.\n' "$speed"
                 if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
                 else rm -rf -- "$destination"; fi
             done
@@ -366,16 +400,10 @@ main() {
         rm -rf -- "${local_root:?}/$case_name"
         [[ $mode != pull ]] || remote "rm -rf $(quote "$source") $(quote "$remote_root/probe")"
     done
-    printf '\nResults (mean elapsed seconds; all completed copies checked with POSIX cksum):\n'
-    awk '{key=$1 " " $2;
-          if (!(key in n)) {order[++count]=key; low[key]=$3; high[key]=$3}
-          total[key]+=$3; n[key]++;
-          if ($3 < low[key]) low[key]=$3; if ($3 > high[key]) high[key]=$3}
-         END {printf "%-18s %10s %10s %10s %8s\n", "Workload / tool", "Mean", "Min", "Max", "Trials";
-              for (i=1; i<=count; i++) {key=order[i]; printf "%-18s %10.3f %10.3f %10.3f %8d\n", key, total[key]/n[key], low[key], high[key], n[key]}}' "$local_root/results"
-    printf '\nA quick synthetic comparison, not a prediction for every workload.\n'
-    printf 'Filesystem caching, cloning, network conditions and startup costs affect results.\n'
-    printf 'Try larger data and your real workloads too. Resume and direct server copies are other reasons to use syq.\n'
+    printf '\nResults (MB/s; higher is faster; all copies checked):\n'
+    summarize_results "$local_root/results"
+    printf '\nCompare the trial range as well as the mean; small differences may be noise.\n'
+    printf 'Results depend on your machines and workload.\n'
 }
 # Keep execution last: a script downloaded through a pipe is parsed before prompts run.
 main "$@"

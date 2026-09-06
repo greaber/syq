@@ -9,11 +9,12 @@ authorizes the copy and shows the results; the file data bypasses it.
 syq cp --from hostA --srcs-in big --to hostB --into big
 ```
 
-```text
-Your machine ── authorizes the copy and displays results
-                       │
-                    hostA ───── file data ─────▶ hostB
-```
+<figure class="transfer-flow" aria-label="Your machine authorizes the copy and displays results. File data goes directly from hostA to hostB.">
+<div class="flow-machine"><strong>Your machine</strong><span>Authorize · see results</span></div>
+<div class="flow-control" aria-hidden="true">│</div>
+<div class="flow-data"><div class="flow-machine"><strong>hostA</strong><span>Source</span></div><div class="flow-arrow"><span>File data</span><b aria-hidden="true">⟶</b></div><div class="flow-machine"><strong>hostB</strong><span>Destination</span></div></div>
+<figcaption>The files travel directly between the servers.</figcaption>
+</figure>
 
 HostA gets permission for this transfer only. HostB checks that permission
 and reports what it changed. See [Security](security.md#a-compromised-source-server)
