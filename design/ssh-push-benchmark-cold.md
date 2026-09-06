@@ -135,6 +135,14 @@ warms both variants' persistent control logins. It measures the data login reuse
 change under the setting where it applies. Its result does not alter the
 persistence-off comparison or restore the withdrawn runtime changes.
 
+## Follow-up with experimental streaming
+
+A [matched-build comparison at 34cadda](mac-streaming-34cadda.md) tests ordinary
+pipeline depths 4 and 16, hybrid streaming, and an 8 MiB split threshold, all
+with persistence off. It records capped attempts and includes rsync push
+controls. The remote-source shrink mechanism runs successfully, but these
+measurements do not establish a reliable speedup on this route.
+
 ## Standalone benchmark correction
 
 The standalone script runs `syq persist off` with private `XDG_CONFIG_HOME` and
