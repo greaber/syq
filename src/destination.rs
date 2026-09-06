@@ -1499,6 +1499,10 @@ mod tests {
         let approved = approve(&registration, request);
         let conn = control(registration.clone(), &approved);
         let mut worker = worker_stream(&registration, &approved);
+        // macOS may reject SO_RCVTIMEO after the peer has shut down.
+        worker
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let authority = receiver
             .sessions
             .lock()
@@ -1513,9 +1517,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(receiver.sessions.lock().unwrap().is_empty());
-        worker
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         assert_eq!(
             worker.read(&mut [0u8; 1]).unwrap(),
             0,
@@ -1621,7 +1622,7 @@ mod tests {
             },
         )
         .unwrap();
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(stream);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
