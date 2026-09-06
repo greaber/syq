@@ -1,4 +1,7 @@
-# Copy files with syq
+<h1 class="landing-title" id="copy-files-with-syq" aria-label="Copy files with syq">
+<span class="landing-wordmark">syq</span>
+<span class="landing-subtitle">Copy files</span>
+</h1>
 
 Syq (pronounced "sick") copies and removes files in parallel, on one machine
 or over SSH. It can resume interrupted copies and transfer directly between

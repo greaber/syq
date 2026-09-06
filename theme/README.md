@@ -57,3 +57,8 @@ Anchor navigation scrolls smoothly, matching benchmarks. The reduced-motion
 preference disables this animation. Both sites use 20px Open Sans main prose
 and compact 14px Open Sans navigation with a 300px default sidebar width;
 their content layouts remain independent.
+
+The docs and benchmark homepages use the shared landing-title styles: a large
+blue Manrope wordmark above an Open Sans title. This adds character to the
+homepages while retaining the compact navigation and normal article headings.
+The docs homepage preserves its copy-files-with-syq fragment for existing links.

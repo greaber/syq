@@ -40,3 +40,16 @@ html{font-family:var(--sans);background:var(--bg);color:var(--ink)}
 body{font:400 20px/1.65 var(--sans);background:var(--bg);color:var(--ink)}
 h1,h2,h3,h4{font-family:var(--display);letter-spacing:-.025em}
 code{font-family:var(--mono);font-size:.8em}
+
+/* Shared homepage title: keep the wordmark prominent without changing prose. */
+.hero h1.landing-title,.content h1.landing-title{
+ font:700 clamp(38px,4.1vw,58px)/1.12 var(--display);
+ letter-spacing:-.045em;margin:0 0 24px;text-wrap:balance}
+.landing-title .landing-wordmark{
+ display:block;color:var(--syq);font:800 clamp(64px,6vw,80px)/1 "Manrope",sans-serif;
+ letter-spacing:-.06em;margin-bottom:10px}
+.landing-title .landing-subtitle{display:block}
+@media print{
+ .hero h1.landing-title,.content h1.landing-title{font-size:36px}
+ .landing-title .landing-wordmark{font-size:48px}
+}

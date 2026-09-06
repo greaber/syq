@@ -129,3 +129,7 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
   .docs-compact-header .site-nav {font-size:14px;gap:8px}
 }
 @media print {.docs-page-actions{display:none}}
+
+/* Align the homepage title's top spacing with the benchmark introduction. */
+.content h1.landing-title{margin-top:44px}
+@media(max-width:820px){.content h1.landing-title{margin-top:32px}}
