@@ -1090,6 +1090,33 @@ impl Drop for RegistrationGuard {
     }
 }
 fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
+    match register_inner(name, socket, secret) {
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotConnected
+                )
+            }) =>
+        {
+            // Socket timeouts are WouldBlock on Unix. A failed handshake or
+            // heartbeat is a transport interruption, not a policy rejection.
+            // Reuse the retry status understood by existing return clients.
+            crate::output::diagnostic!("syq: return connection interrupted: {error:#}");
+            Ok(RECONNECT_PENDING)
+        }
+        result => result,
+    }
+}
+
+fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     validate_name(name)?;
     let metadata = fs::symlink_metadata(socket)?;
     if !metadata.file_type().is_socket()
@@ -1269,6 +1296,47 @@ mod tests {
     use crate::cli::{Args, Interface, Location, Placement};
     use crate::conn::Conn;
     use crate::proto::{Request, Response};
+
+    #[test]
+    fn registration_retries_socket_timeout_but_not_peer_rejection() {
+        for reject in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("return.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let (stop, stopped) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let _: Envelope = read_message(&mut stream).unwrap();
+                if reject {
+                    write_message(
+                        &mut stream,
+                        &Reply::Error(
+                            "Resource temporarily unavailable is a rejection here".into(),
+                        ),
+                    )
+                    .unwrap();
+                } else {
+                    // Leave the connection open without a reply: read_exact
+                    // must hit the real Unix socket timeout (EAGAIN/EWOULDBLOCK).
+                    let _ = stopped.recv_timeout(Duration::from_secs(15));
+                }
+            });
+            let result = register("laptop", &path, "test-credential");
+            let _ = stop.send(());
+            peer.join().unwrap();
+            if reject {
+                assert!(format!("{:#}", result.unwrap_err()).contains("receiving machine:"));
+            } else {
+                assert_eq!(result.unwrap(), RECONNECT_PENDING);
+            }
+            assert!(!path.exists(), "failed registration must remove its socket");
+        }
+    }
 
     pub(super) fn args(source: &Path, destination: &str) -> Args {
         let mut args =
