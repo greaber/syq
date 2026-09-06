@@ -3560,6 +3560,13 @@ fn stat_many(
     stat_many_registered(conn, paths, None, follow)
 }
 
+fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usize) -> Result<()> {
+    if off != expected_off || len as u64 != expected_len || off.checked_add(len as u64).is_none() {
+        bail!("source block range ({off}, {len}) does not match requested range ({expected_off}, {expected_len})");
+    }
+    Ok(())
+}
+
 fn stat_many_registered(
     conn: &mut dyn Conn,
     paths: Vec<PathBytes>,
@@ -8193,7 +8200,7 @@ impl Worker {
             1
         };
         let inplace = job.inplace;
-        let mut reads_out = 0usize;
+        let mut pending_reads = std::collections::VecDeque::new();
         let mut writes_out = 0usize;
         loop {
             if !self.gate.allowed(self.id) {
@@ -8201,7 +8208,7 @@ impl Worker {
                 // worker picks it up; what's already requested still completes.
                 self.sched.release_rest(h);
             }
-            while reads_out < read_window {
+            while pending_reads.len() < read_window {
                 let (off, n) = {
                     let mut g = h.lock().unwrap();
                     if g.pos >= g.end {
@@ -8222,9 +8229,9 @@ impl Worker {
                 })?;
                 self.benchmark.range_requests += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
-                reads_out += 1;
+                pending_reads.push_back((off, n));
             }
-            if reads_out == 0 {
+            if pending_reads.is_empty() {
                 break;
             }
             let t0 = std::time::Instant::now();
@@ -8233,7 +8240,8 @@ impl Worker {
                 other => bail!("unexpected response {other:?}"),
             };
             self.t[0] += t0.elapsed().as_secs_f64();
-            reads_out -= 1;
+            let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
+            validate_range_reply(expected_off, expected_len, off, data.len())?;
             let n = data.len() as u64;
             let t0 = std::time::Instant::now();
             self.dst.send(Request::WriteRange {
@@ -8515,6 +8523,22 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_block_must_match_the_requested_range() {
+        assert!(validate_range_reply(4096, 1024, 4096, 1024).is_ok());
+        for (off, len) in [
+            (0, 1024),
+            (8192, 1024),
+            (4096, 0),
+            (4096, 1023),
+            (4096, 1025),
+            (u64::MAX, 1024),
+        ] {
+            assert!(validate_range_reply(4096, 1024, off, len).is_err());
+        }
+        assert!(validate_range_reply(u64::MAX, 1, u64::MAX, 1).is_err());
+    }
 
     /// Enforce send-before-receive ordering while exercising the real local
     /// receiver. Inject response failures to check that every reply is drained.
