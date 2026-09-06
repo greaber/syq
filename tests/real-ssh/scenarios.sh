@@ -458,7 +458,7 @@ assert_same_tree \
     relay
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
-tuning=request-size=64K,pipeline-depth=64
+tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
 for transport in tcp ssh; do
     if [ "$transport" = ssh ]; then
@@ -468,10 +468,10 @@ for transport in tcp ssh; do
     fi
     syq cp /tmp/syq-real-ssh-tuning.bin --to source \
         --as "/tmp/syq-real-ssh/tuning-$transport" -j 1 --no-progress \
-        --tuning-options "$tuning" "$@"
+        --bwlimit 8M --tuning-options "$tuning" "$@"
     syq cp --from source "/tmp/syq-real-ssh/tuning-$transport" \
         --as "/tmp/syq-real-ssh-tuning-$transport-download" -j 1 --no-progress \
-        --tuning-options "$tuning" "$@"
+        --bwlimit 8M --tuning-options "$tuning" "$@"
     cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-tuning-$transport-download"
 done
 for coordinator in src dst local; do
@@ -482,12 +482,20 @@ for coordinator in src dst local; do
     esac
     syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
         --as "/tmp/syq-real-ssh/tuning-$coordinator" --coordinate-at "$coordinator" \
-        -j 1 --no-progress --tuning-options "$tuning" "$@"
+        -j 1 --no-progress --bwlimit 8M --tuning-options "$tuning" "$@"
     ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-tuning-check <<'EOF'
 cat "/tmp/syq-real-ssh/tuning-$1"
 EOF
     cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
 done
+
+printf 'case: batch overrides through a command-restricted receiver\n'
+ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'
+syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
+    --to destination --into /tmp/syq-real-ssh/tuning-batches -j 1 --no-progress \
+    --tuning-options batch-files=3,batch-bytes=1M
+assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
+    destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2

@@ -1,5 +1,5 @@
-//! Explicit, per-command transfer experiments. These settings are never part
-//! of hash grids, resume identities, signed grants, or remembered tuning.
+//! Per-command transfer experiments. Settings never enter resume identities,
+//! signed grants, or the remembered connection-count cache.
 
 use anyhow::{bail, Context, Result};
 use std::str::FromStr;
@@ -7,64 +7,195 @@ use std::str::FromStr;
 pub(crate) const DEFAULT_PIPELINE_DEPTH: usize = 4;
 const MAX_PIPELINE_DEPTH: usize = 64;
 const MAX_REQUEST_BYTES: u64 = 64 << 20;
+pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
+pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override transfer internals for benchmarking: request-size=SIZE,pipeline-depth=N. Use one or both keys, separated by a comma. request-size accepts 512 bytes through 64M (K/M/G are binary units); its default is the hash block size, normally 4M. --bwlimit may reduce it further. pipeline-depth accepts 1 through 64 outstanding requests per endpoint per worker (default: 4); in-process endpoints remain synchronous. These options affect range transfers; whole-file optimizations can bypass them. Hash/resume blocks are unchanged. Overrides are not saved, and runs with overrides do not read or update the remembered connection count. Use a fixed connection count for comparisons.";
+pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges: default auto; ranges bypasses whole-file and small-file copy shortcuts.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each request's full byte budget before issuing it. Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CopyPath {
+    #[default]
+    Auto,
+    Ranges,
+}
+
+impl std::fmt::Display for CopyPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Ranges => "ranges",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BwPacing {
+    Average,
+    IntervalMs(u64),
+}
+
+impl Default for BwPacing {
+    fn default() -> Self {
+        Self::IntervalMs(125)
+    }
+}
+
+impl std::fmt::Display for BwPacing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Average => f.write_str("average"),
+            Self::IntervalMs(ms) => write!(f, "{ms}ms"),
+        }
+    }
+}
+
+impl FromStr for BwPacing {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "average" {
+            return Ok(Self::Average);
+        }
+        let (n, scale) = if let Some(n) = value.strip_suffix("ms") {
+            (n, 1)
+        } else if let Some(n) = value.strip_suffix('s') {
+            (n, 1000)
+        } else {
+            bail!("bw-pacing needs average or an integer interval with ms or s units");
+        };
+        let ms = n
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(scale))
+            .filter(|ms| (1..=10_000).contains(ms))
+            .ok_or_else(|| anyhow::anyhow!("bw-pacing interval must be between 1ms and 10s"))?;
+        Ok(Self::IntervalMs(ms))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransferTuning {
     pub request_size: Option<u64>,
     pub pipeline_depth: Option<usize>,
+    pub copy_path: Option<CopyPath>,
+    pub batch_files: Option<usize>,
+    pub batch_bytes: Option<u64>,
+    pub split_min_size: Option<u64>,
+    pub bw_pacing: Option<BwPacing>,
 }
 
 impl TransferTuning {
     pub fn pipeline_depth(self) -> usize {
         self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH)
     }
-
+    pub fn force_ranges(self) -> bool {
+        self.copy_path == Some(CopyPath::Ranges)
+    }
+    pub fn batch_bytes(self) -> u64 {
+        self.batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES)
+    }
+    pub fn batch_override(self) -> bool {
+        self.batch_files.is_some() || self.batch_bytes.is_some()
+    }
+    pub fn split_min_size(self, hash_block: u64) -> u64 {
+        self.split_min_size
+            .unwrap_or(DEFAULT_SPLIT_BYTES)
+            .max(2 * hash_block)
+    }
+    pub fn validate(self, rate: u64) -> Result<()> {
+        if self.bw_pacing.is_some() && rate == 0 {
+            bail!("--tuning-options bw-pacing requires a nonzero --bwlimit");
+        }
+        if self.force_ranges() && self.batch_override() {
+            bail!("--tuning-options copy-path=ranges cannot be combined with batch controls");
+        }
+        Ok(())
+    }
     pub fn request_size(
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
+        restricted_receiver: bool,
     ) -> u64 {
         let size = self.request_size.unwrap_or(hash_block);
-        limit.map_or(size, |limit| size.min(limit.burst_bytes()))
+        let size = match (limit, self.bw_pacing.unwrap_or_default()) {
+            (Some(limit), BwPacing::IntervalMs(ms)) => size.min(limit.bytes_for_interval(ms)),
+            _ => size,
+        };
+        // The signed receiver independently refuses larger writes. Tuning
+        // cannot enlarge that authority; retain its released request ceiling.
+        match limit {
+            Some(limit) if restricted_receiver => size.min(limit.burst_bytes()),
+            _ => size,
+        }
     }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
+    if slot.replace(value).is_some() {
+        bail!("duplicate tuning option {key}");
+    }
+    Ok(())
+}
+
+fn size(value: &str, key: &str, min: u64, max: u64) -> Result<u64> {
+    let bytes = crate::cli::parse_size(value).with_context(|| key.to_string())?;
+    if !(min..=max).contains(&bytes) {
+        bail!("{key} must be between {min} and {max} bytes");
+    }
+    Ok(bytes)
+}
+
+fn count(value: &str, key: &str, max: usize) -> Result<usize> {
+    let n: usize = value
+        .parse()
+        .with_context(|| format!("{key} must be an integer"))?;
+    if !(1..=max).contains(&n) {
+        bail!("{key} must be between 1 and {max}");
+    }
+    Ok(n)
 }
 
 impl FromStr for TransferTuning {
     type Err = anyhow::Error;
-
     fn from_str(value: &str) -> Result<Self> {
         let mut tuning = Self::default();
         for pair in value.split(',') {
             let Some((key, value)) = pair.split_once('=') else {
-                bail!("expected request-size=SIZE or pipeline-depth=N, got {pair:?}");
+                bail!("expected a tuning KEY=VALUE pair, got {pair:?}; see --help-all");
             };
             match key {
-                "request-size" => {
-                    if tuning.request_size.is_some() {
-                        bail!("duplicate tuning option request-size");
-                    }
-                    let size = crate::cli::parse_size(value).context("request-size")?;
-                    if !(512..=MAX_REQUEST_BYTES).contains(&size) {
-                        bail!("request-size must be between 512 bytes and 64M");
-                    }
-                    tuning.request_size = Some(size);
-                }
-                "pipeline-depth" => {
-                    if tuning.pipeline_depth.is_some() {
-                        bail!("duplicate tuning option pipeline-depth");
-                    }
-                    let depth: usize =
-                        value.parse().context("pipeline-depth must be an integer")?;
-                    if !(1..=MAX_PIPELINE_DEPTH).contains(&depth) {
-                        bail!("pipeline-depth must be between 1 and 64");
-                    }
-                    tuning.pipeline_depth = Some(depth);
-                }
-                _ => {
-                    bail!("unknown tuning option {key:?}; expected request-size or pipeline-depth")
-                }
+                "request-size" => set_once(
+                    &mut tuning.request_size,
+                    size(value, key, 512, MAX_REQUEST_BYTES)?,
+                    key,
+                )?,
+                "pipeline-depth" => set_once(
+                    &mut tuning.pipeline_depth,
+                    count(value, key, MAX_PIPELINE_DEPTH)?,
+                    key,
+                )?,
+                "copy-path" => set_once(
+                    &mut tuning.copy_path,
+                    match value {
+                        "auto" => CopyPath::Auto,
+                        "ranges" => CopyPath::Ranges,
+                        _ => bail!("copy-path must be auto or ranges"),
+                    },
+                    key,
+                )?,
+                "batch-files" => set_once(&mut tuning.batch_files, count(value, key, 4096)?, key)?,
+                "batch-bytes" => set_once(
+                    &mut tuning.batch_bytes,
+                    size(value, key, 512, 64 << 20)?,
+                    key,
+                )?,
+                "split-min-size" => set_once(
+                    &mut tuning.split_min_size,
+                    size(value, key, 1, 1 << 30)?,
+                    key,
+                )?,
+                "bw-pacing" => set_once(&mut tuning.bw_pacing, value.parse()?, key)?,
+                _ => bail!("unknown tuning option {key:?}; see --help-all"),
             }
         }
         Ok(tuning)
@@ -73,16 +204,46 @@ impl FromStr for TransferTuning {
 
 impl std::fmt::Display for TransferTuning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(size) = self.request_size {
-            write!(f, "request-size={size}")?;
+        let mut pairs = Vec::new();
+        macro_rules! pair {
+            ($key:literal, $value:expr) => {
+                if let Some(value) = $value {
+                    pairs.push(format!("{}={value}", $key));
+                }
+            };
         }
-        if let Some(depth) = self.pipeline_depth {
-            if self.request_size.is_some() {
-                write!(f, ",")?;
-            }
-            write!(f, "pipeline-depth={depth}")?;
-        }
-        Ok(())
+        pair!("request-size", self.request_size);
+        pair!("pipeline-depth", self.pipeline_depth);
+        pair!("copy-path", self.copy_path);
+        pair!("batch-files", self.batch_files);
+        pair!("batch-bytes", self.batch_bytes);
+        pair!("split-min-size", self.split_min_size);
+        pair!("bw-pacing", self.bw_pacing);
+        f.write_str(&pairs.join(","))
+    }
+}
+
+/// Diagnostic counters for attempted work, independent of completion records.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub(crate) struct BenchmarkStats {
+    pub native_small_copies: u64,
+    pub local_whole_files: u64,
+    pub range_requests: u64,
+    pub max_request_bytes: u64,
+    pub small_batches: u64,
+    pub max_batch_files: u64,
+    pub max_batch_bytes: u64,
+}
+
+impl BenchmarkStats {
+    pub fn add(&mut self, other: Self) {
+        self.native_small_copies += other.native_small_copies;
+        self.local_whole_files += other.local_whole_files;
+        self.range_requests += other.range_requests;
+        self.small_batches += other.small_batches;
+        self.max_request_bytes = self.max_request_bytes.max(other.max_request_bytes);
+        self.max_batch_files = self.max_batch_files.max(other.max_batch_files);
+        self.max_batch_bytes = self.max_batch_bytes.max(other.max_batch_bytes);
     }
 }
 
@@ -94,18 +255,65 @@ mod tests {
     fn tuning_preserves_defaults_and_bandwidth_burst_bound() {
         let hash_block = 4 << 20;
         let default = TransferTuning::default();
-        assert_eq!(default.request_size(hash_block, None), hash_block);
+        assert_eq!(default.request_size(hash_block, None, false), hash_block);
         assert_eq!(default.pipeline_depth(), 4);
         let override_: TransferTuning = "request-size=8M,pipeline-depth=16".parse().unwrap();
-        assert_eq!(override_.request_size(hash_block, None), 8 << 20);
+        assert_eq!(override_.request_size(hash_block, None, false), 8 << 20);
         let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
-        assert_eq!(override_.request_size(hash_block, Some(&limit)), 128 << 10);
+        assert_eq!(
+            override_.request_size(hash_block, Some(&limit), false),
+            128 << 10
+        );
         let small: TransferTuning = "request-size=512".parse().unwrap();
-        assert_eq!(small.request_size(hash_block, Some(&limit)), 512);
+        assert_eq!(small.request_size(hash_block, Some(&limit), false), 512);
         assert_eq!(
             override_.to_string().parse::<TransferTuning>().unwrap(),
             override_
         );
+    }
+
+    #[test]
+    fn tuning_round_trips_every_key_for_remote_coordinators() {
+        for value in [
+            "request-size=8M,pipeline-depth=16,copy-path=ranges,split-min-size=1M,bw-pacing=average",
+            "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G,bw-pacing=2s",
+        ] {
+            let tuning: TransferTuning = value.parse().unwrap();
+            tuning.validate(1 << 20).unwrap();
+            assert_eq!(tuning.to_string().parse::<TransferTuning>().unwrap(), tuning);
+        }
+        let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
+        let average: TransferTuning = "request-size=8M,bw-pacing=average,split-min-size=1M"
+            .parse()
+            .unwrap();
+        assert_eq!(average.request_size(4 << 20, Some(&limit), false), 8 << 20);
+        assert_eq!(average.split_min_size(4 << 20), 8 << 20);
+        let interval: TransferTuning = "bw-pacing=250ms".parse().unwrap();
+        assert_eq!(
+            interval.request_size(4 << 20, Some(&limit), false),
+            256 << 10
+        );
+        assert!(average.validate(0).is_err());
+        assert!("copy-path=ranges,batch-files=1"
+            .parse::<TransferTuning>()
+            .unwrap()
+            .validate(0)
+            .is_err());
+    }
+
+    #[test]
+    fn tuning_preserves_the_signed_receiver_request_ceiling() {
+        let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
+        for pacing in ["average", "1s"] {
+            let tuning: TransferTuning = format!("request-size=8M,bw-pacing={pacing}")
+                .parse()
+                .unwrap();
+            assert_eq!(tuning.request_size(4 << 20, Some(&limit), true), 128 << 10);
+        }
+        let tighter: TransferTuning = "bw-pacing=25ms".parse().unwrap();
+        assert_eq!(tighter.request_size(4 << 20, Some(&limit), true), 26_214);
+        let uncapped: TransferTuning = "request-size=8M".parse().unwrap();
+        assert_eq!(uncapped.request_size(4 << 20, None, true), 8 << 20);
     }
 
     #[test]
@@ -126,6 +334,19 @@ mod tests {
             "request-size=1M,",
             "request-size=1M,request-size=2M",
             "pipeline-depth=1,pipeline-depth=2",
+            "copy-path=magic",
+            "copy-path=auto,copy-path=ranges",
+            "batch-files=0",
+            "batch-files=4097",
+            "batch-bytes=511",
+            "batch-bytes=65M",
+            "split-min-size=0",
+            "split-min-size=2G",
+            "bw-pacing=0ms",
+            "bw-pacing=11s",
+            "bw-pacing=125",
+            "bw-pacing=0.1s",
+            "bw-pacing=18446744073709551615s",
         ] {
             assert!(
                 value.parse::<TransferTuning>().is_err(),

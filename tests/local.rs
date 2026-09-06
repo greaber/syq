@@ -5893,6 +5893,168 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
 }
 
 #[test]
+fn tuning_options_force_ranges_for_small_and_whole_local_files() {
+    let t = Tmp::new();
+    for (file, size) in [("small", 1024), ("large", 6 << 20), ("empty", 0)] {
+        write(&t.path(&format!("source/{file}")), &prng(size, 909));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("source"),
+            "--into",
+            &t.s("destination"),
+            "--tuning-options=copy-path=ranges,request-size=1M,split-min-size=1M",
+            "-j",
+            "2",
+            "-v",
+            "--no-progress",
+            "--preserve=permissions",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    let observed = tuning_observed(&out);
+    assert!(observed["range_requests"].as_u64().unwrap() >= 7);
+    assert_eq!(observed["max_request_bytes"], 1 << 20);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["small_batches"], 0);
+    assert!(stderr_of(&out).contains("split-min-size=8388608"));
+    assert_same_tree(&t.path("source"), &t.path("destination"));
+}
+
+fn tuning_observed(out: &Output) -> serde_json::Value {
+    let diagnostic = stderr_of(out);
+    let line = diagnostic
+        .lines()
+        .find_map(|line| line.strip_prefix("syq: tuning observed: "))
+        .unwrap_or_else(|| panic!("missing benchmark observations: {diagnostic}"));
+    serde_json::from_str(line).unwrap()
+}
+
+#[test]
+fn tuning_options_batch_limits_include_the_first_file() {
+    let t = Tmp::new();
+    for i in 0..7 {
+        write(&t.path(&format!("source/{i}")), &prng(600 << 10, i));
+    }
+    for (files, bytes, expected_files) in [(3, 2 << 20, 3), (10, 1 << 20, 1)] {
+        let destination = t.s(&format!("destination-{files}"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("source"),
+                "--into",
+                &destination,
+                "--tuning-options",
+                &format!("batch-files={files},batch-bytes={bytes}"),
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--preserve=permissions",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["max_batch_files"], expected_files, "{observed}");
+        assert!(observed["max_batch_bytes"].as_u64().unwrap() <= bytes);
+        assert_eq!(observed["range_requests"], 0);
+        assert_same_tree(&t.path("source"), Path::new(&destination));
+    }
+}
+
+#[test]
+fn tuning_options_control_the_native_small_copy_shortcut() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("source"), b"native small copy");
+    for options in [
+        "copy-path=auto",
+        "copy-path=ranges",
+        "batch-files=2,batch-bytes=512",
+    ] {
+        let destination = t.s(&format!("destination-{}", options.len()));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "host",
+                "--as",
+                &destination,
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-tcp",
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--tuning-options",
+                options,
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let observed = tuning_observed(&out);
+        let counter = match options {
+            "copy-path=auto" => "native_small_copies",
+            "copy-path=ranges" => "range_requests",
+            _ => "small_batches",
+        };
+        assert_eq!(observed[counter], 1, "{observed}");
+        assert_eq!(read(Path::new(&destination)), b"native small copy");
+    }
+}
+
+#[test]
+fn tuning_options_average_pacing_pays_for_one_large_request() {
+    let t = Tmp::new();
+    let data = prng(2 << 20, 910);
+    write(&t.path("source"), &data);
+    for (pacing, expected_max) in [("average", 2 << 20), ("25ms", 52_428)] {
+        let start = std::time::Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--as",
+                &t.s(pacing),
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--bwlimit=2M",
+                "--tuning-options",
+                &format!("copy-path=ranges,request-size=2M,bw-pacing={pacing}"),
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "{out:?}"
+        );
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["max_request_bytes"], expected_max, "{observed}");
+        if pacing == "average" {
+            assert_eq!(observed["range_requests"], 1);
+        }
+        assert_eq!(read(&t.path(pacing)), data);
+    }
+}
+
+#[test]
 fn tuning_options_are_in_full_help_and_validate_before_copying() {
     let t = Tmp::new();
     write(&t.path("source"), b"source");
@@ -5918,6 +6080,8 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             "pipeline-depth=0",
             "request-size=65M",
             "pipeline-depth=4,pipeline-depth=8",
+            "copy-path=ranges,batch-files=1",
+            "bw-pacing=average",
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([interface, "--tuning-options", options, &t.s("source")]);
@@ -6017,7 +6181,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
         "-a",
         "--block-size=1M",
         "--bwlimit=1G",
-        "--tuning-options=request-size=128K,pipeline-depth=8",
+        "--tuning-options=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
         &src,
         &dst,
     ]);

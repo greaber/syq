@@ -33,12 +33,7 @@ const FAST_BATCH_FILES: usize = 128;
 // does not, but needs the same amortization and remains bounded by bytes below.
 const HIGH_RTT_FAST_BATCH_FILES: usize = 512;
 const HIGH_RTT_US: u64 = 100_000;
-const FAST_BATCH_BYTES: u64 = 16 << 20;
 const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
-// Range splitting is a scheduler implementation detail, not a public transfer
-// policy. Keep a conservative floor that avoids turning small tails into
-// separately scheduled work.
-const DEFAULT_MIN_SPLIT_BYTES: u64 = 32 << 20;
 
 fn fast_batch_file_limit(
     src_rtt_us: Option<u64>,
@@ -57,18 +52,25 @@ fn fast_batch_file_limit(
     }
 }
 
-fn initial_fast_workers(max_connections: usize, file_jobs: usize, file_bytes: u64) -> usize {
+fn initial_fast_workers(
+    max_connections: usize,
+    file_jobs: usize,
+    file_bytes: u64,
+    batch_files: usize,
+    batch_bytes: u64,
+) -> usize {
     // A batch is independently bounded by its entry count and its payload.
     // Provision enough fixed workers for whichever ceiling yields more work;
     // automatic runs may still tune from this bounded starting point.
-    let file_batches = file_jobs.div_ceil(FAST_BATCH_FILES);
-    let byte_batches = usize::try_from(file_bytes.div_ceil(FAST_BATCH_BYTES)).unwrap_or(usize::MAX);
+    let file_batches = file_jobs.div_ceil(batch_files);
+    let byte_batches = usize::try_from(file_bytes.div_ceil(batch_bytes)).unwrap_or(usize::MAX);
     max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
 pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
+    benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -110,6 +112,16 @@ pub struct Opts {
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+}
+
+fn print_benchmark_observations(opts: &Opts) {
+    if let Some(benchmark) = &opts.benchmark {
+        crate::output::diagnostic!(
+            "syq: tuning observed: {}",
+            serde_json::to_string(&*benchmark.lock().unwrap())
+                .expect("benchmark counters serialize")
+        );
+    }
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
@@ -840,6 +852,8 @@ fn small_copy_eligible(
         return false;
     }
     args.interface == Interface::NativeCp
+        && !args.tuning_options.unwrap_or_default().force_ranges()
+        && !args.tuning_options.unwrap_or_default().batch_override()
         && matches!(args.placement, Placement::Into | Placement::As)
         && args.target_existence == Existence::Any
         && dst.is_remote()
@@ -1510,6 +1524,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut args = args;
     // A block becomes one WriteRange frame, so it must stay well under MAX_FRAME.
     let block = parse_size(&args.block_size)?.clamp(MIN_HASH_BLOCK_BYTES, MAX_HASH_BLOCK_BYTES);
+    args.tuning_options
+        .unwrap_or_default()
+        .validate(args.bwlimit_bytes)?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
     let bwlimit = (args.bwlimit_bytes > 0)
@@ -1702,6 +1719,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let opts = Arc::new(Opts {
         block,
         tuning: args.tuning_options.unwrap_or_default(),
+        benchmark: (args.tuning_options.is_some()
+            && !args.quiet
+            && (args.stats || args.verbose > 0 || debug()))
+        .then(|| Mutex::new(crate::transfer_tuning::BenchmarkStats::default())),
         flags: args.meta_flags(),
         recursive: args.recursive,
         links: args.links,
@@ -1731,10 +1752,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_size,
         min_size,
     });
-    if args.tuning_options.is_some() && !args.quiet && (args.stats || args.verbose > 0 || debug()) {
+    if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (after bandwidth limit), pipeline-depth={}, hash-block-size={} bytes",
-            opts.tuning.request_size(block, bwlimit.as_deref()), opts.tuning.pipeline_depth(), block
+            "syq: tuning: request-size={} bytes (after pacing and receiver limits), pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver), opts.tuning.pipeline_depth(), block,
+            opts.tuning.copy_path.unwrap_or_default(),
+            opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
+            opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
+            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
     // Acquire the entire mapping through its retained selection before any
@@ -1756,7 +1781,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
-    let sched = Arc::new(Sched::new(block, DEFAULT_MIN_SPLIT_BYTES));
+    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -1905,8 +1930,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .into_iter()
                         .filter_map(real_remote_spec)
                         .any(|spec| spec.data_transport() == DataTransport::Ssh);
-                    let fast_batch_files =
-                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data);
+                    let fast_batch_files = opts.tuning.batch_files.unwrap_or_else(|| {
+                        fast_batch_file_limit(src.tcp_rtt_us(), dst.tcp_rtt_us(), remote_ssh_data)
+                    });
                     let mut worker = Worker {
                         id,
                         src,
@@ -1918,6 +1944,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         gate: gate.clone(),
                         t: [0.0; 4],
                         fast: FastTiming::default(),
+                        benchmark: Default::default(),
                         fast_batch_files,
                     };
                     if debug() {
@@ -1927,6 +1954,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         );
                     }
                     let result = worker.run();
+                    if let Some(benchmark) = &opts.benchmark {
+                        benchmark.lock().unwrap().add(worker.benchmark);
+                    }
                     if collect_tcp_stats {
                         let stats = worker.collect_transport_stats();
                         transport_stats.lock().unwrap().extend(stats);
@@ -2077,7 +2107,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &progress,
             t0,
         )? {
-            SmallCopy::Done(code) => return Ok(code),
+            SmallCopy::Done(code) => {
+                if let Some(benchmark) = &opts.benchmark {
+                    benchmark.lock().unwrap().native_small_copies += 1;
+                }
+                print_benchmark_observations(&opts);
+                return Ok(code);
+            }
             SmallCopy::Declined => {}
             SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
         }
@@ -2909,9 +2945,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let jobs = sched.jobs.lock().unwrap();
                     (
                         !opts.verify_only
+                            && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().all(|job| {
-                                job.entry.size <= opts.block
+                                job.entry.size
+                                    <= opts.block.min(opts.tuning.batch_bytes()).min(
+                                        opts.tuning.request_size(
+                                            opts.block,
+                                            None,
+                                            opts.restricted_receiver,
+                                        ),
+                                    )
                                     && job.dst_entry.is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any
@@ -2940,6 +2984,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
                     let single_direct_candidate = autotune
+                        && !opts.tuning.force_ranges()
                         && opts.same_host
                         && !opts.checksum
                         && !opts.verify_only
@@ -2949,7 +2994,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
                     let mut initial = if multiplex_small_files {
-                        initial_fast_workers(args.connections, file_jobs, file_bytes)
+                        initial_fast_workers(
+                            args.connections,
+                            file_jobs,
+                            file_bytes,
+                            opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                            opts.tuning.batch_bytes(),
+                        )
                     } else {
                         args.connections
                     };
@@ -3259,6 +3310,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
+    print_benchmark_observations(&opts);
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
     if !args.quiet && (!aborted || capacity_only_dry_run_abort) && args.stats {
@@ -7015,6 +7067,7 @@ struct Worker {
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
     t: [f64; 4],
     fast: FastTiming,
+    benchmark: crate::transfer_tuning::BenchmarkStats,
     fast_batch_files: usize,
 }
 
@@ -7113,11 +7166,17 @@ impl Worker {
                         // Keep rate-limited batches to one file so a push can't
                         // accumulate locally and then hit the network in a burst.
                         if self.bwlimit.is_none() {
-                            batch.extend(self.sched.take_small(
-                                self.opts.block,
-                                target - batch.len(),
-                                FAST_BATCH_BYTES,
-                            ));
+                            let first_bytes = self.job(idx).entry.size;
+                            batch.extend(
+                                self.sched.take_small(
+                                    self.opts
+                                        .block
+                                        .min(self.transfer_block())
+                                        .min(self.opts.tuning.batch_bytes()),
+                                    target - batch.len(),
+                                    self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
+                                ),
+                            );
                         }
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
@@ -7212,7 +7271,13 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
-            && j.entry.size <= self.opts.block.min(self.transfer_block())
+            && !self.opts.tuning.force_ranges()
+            && j.entry.size
+                <= self
+                    .opts
+                    .block
+                    .min(self.transfer_block())
+                    .min(self.opts.tuning.batch_bytes())
             && j.dst_entry.is_none()
             && (!self.opts.inplace
                 || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
@@ -7225,6 +7290,12 @@ impl Worker {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all[i].clone()).collect()
         };
+        self.benchmark.small_batches += 1;
+        self.benchmark.max_batch_files = self.benchmark.max_batch_files.max(jobs.len() as u64);
+        self.benchmark.max_batch_bytes = self
+            .benchmark
+            .max_batch_bytes
+            .max(jobs.iter().map(|j| j.entry.size).sum());
         // Reads.
         let phase = std::time::Instant::now();
         for j in &jobs {
@@ -7521,6 +7592,7 @@ impl Worker {
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
+            && !self.opts.tuning.force_ranges()
             && !self.opts.insecure_links
             && !self.opts.checksum
             && self.bwlimit.is_none()
@@ -7723,6 +7795,7 @@ impl Worker {
         })?;
         match resp {
             Response::Ok => {
+                self.benchmark.local_whole_files += 1;
                 self.progress.add_bytes(job.entry.size);
                 job.done.store(job.entry.size, Relaxed);
                 if let Err(e) = self.finish_file(idx) {
@@ -7930,6 +8003,8 @@ impl Worker {
                     off,
                     len: n as u32,
                 })?;
+                self.benchmark.range_requests += 1;
+                self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
                 reads_out += 1;
             }
             if reads_out == 0 {
@@ -7984,14 +8059,20 @@ impl Worker {
     }
 
     fn transfer_block(&self) -> u64 {
-        self.opts
-            .tuning
-            .request_size(self.opts.block, self.bwlimit.as_deref())
+        self.opts.tuning.request_size(
+            self.opts.block,
+            self.bwlimit.as_deref(),
+            self.opts.restricted_receiver,
+        )
     }
 
     fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
-            limit.wait(bytes);
+            if self.opts.tuning.bw_pacing == Some(crate::transfer_tuning::BwPacing::Average) {
+                limit.wait_prepaid(bytes);
+            } else {
+                limit.wait(bytes);
+            }
         }
     }
 
@@ -8356,9 +8437,36 @@ mod tests {
 
     #[test]
     fn initial_fast_workers_respect_file_and_byte_batch_limits() {
-        assert_eq!(initial_fast_workers(32, 100, 100 * (4 << 20)), 25);
-        assert_eq!(initial_fast_workers(8, 100, 100 * (4 << 20)), 8);
-        assert_eq!(initial_fast_workers(32, 300, 300), 3);
+        assert_eq!(
+            initial_fast_workers(
+                32,
+                100,
+                100 * (4 << 20),
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
+            25
+        );
+        assert_eq!(
+            initial_fast_workers(
+                8,
+                100,
+                100 * (4 << 20),
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
+            8
+        );
+        assert_eq!(
+            initial_fast_workers(
+                32,
+                300,
+                300,
+                FAST_BATCH_FILES,
+                crate::transfer_tuning::DEFAULT_BATCH_BYTES
+            ),
+            3
+        );
     }
 
     #[test]

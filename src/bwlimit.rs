@@ -97,7 +97,31 @@ impl BandwidthLimit {
     /// low limits. The floor permits the minimum 1 KiB/s rate without tiny
     /// protocol frames.
     pub fn burst_bytes(&self) -> u64 {
-        (self.bytes_per_sec / 8).max(512)
+        self.bytes_for_interval(125)
+    }
+
+    /// Request-sizing budget only, not a bound on bytes on the network.
+    pub fn bytes_for_interval(&self, milliseconds: u64) -> u64 {
+        ((self.bytes_per_sec as u128 * milliseconds as u128 / 1000).min(u64::MAX as u128) as u64)
+            .max(512)
+    }
+
+    /// Pay the entire reservation before admitting the request. With no
+    /// request-size cap, this avoids a free, arbitrarily large first chunk.
+    pub fn wait_prepaid(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let at = self.reserve_prepaid_at(now, bytes);
+        if at > now {
+            std::thread::sleep(at - now);
+        }
+    }
+
+    fn reserve_prepaid_at(&self, now: Instant, bytes: u64) -> Instant {
+        self.reserve_at(now, bytes)
+            + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64)
     }
 
     pub fn wait(&self, bytes: u64) {
@@ -143,6 +167,35 @@ mod tests {
         for value in ["", "-1", "1XB", "511B", "nan", "1M/s", "1M+2", "0-1"] {
             assert!(parse_rate(value).is_err(), "accepted {value:?}");
         }
+    }
+
+    #[test]
+    fn prepaid_reservations_cover_the_first_request_and_share_one_budget() {
+        let limit = BandwidthLimit::new(1 << 20);
+        let now = Instant::now();
+        assert_eq!(
+            limit.reserve_prepaid_at(now, 4 << 20),
+            now + Duration::from_secs(4)
+        );
+        assert_eq!(
+            limit.reserve_prepaid_at(now, 1 << 19),
+            now + Duration::from_millis(4500)
+        );
+        let later = now + Duration::from_secs(10);
+        assert_eq!(
+            limit.reserve_prepaid_at(later, 1 << 20),
+            later + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn interval_budget_handles_rounding_and_large_rates() {
+        assert_eq!(BandwidthLimit::new(1024).bytes_for_interval(1), 512);
+        assert_eq!(BandwidthLimit::new(2 << 20).bytes_for_interval(25), 52_428);
+        assert_eq!(
+            BandwidthLimit::new(u64::MAX).bytes_for_interval(10_000),
+            u64::MAX
+        );
     }
 
     #[test]
