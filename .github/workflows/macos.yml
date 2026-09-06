@@ -124,6 +124,8 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+      - name: Test interactive benchmark with system Bash
+        run: python3 scripts/test-try-benchmark.py
       - name: Release shell suites
         run: |
           status=0
