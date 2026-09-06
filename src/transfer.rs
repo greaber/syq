@@ -80,6 +80,19 @@ fn record_worker_event_for_test(event: &str, worker: usize, files: usize) -> Res
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn record_setup_event_for_test(event: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("SYQ_TEST_SETUP_EVENTS") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{event}")?;
+    }
+    Ok(())
+}
+
 fn fast_file_size_limit(opts: &Opts) -> u64 {
     opts.block
         .min(opts.tuning.batch_bytes())
@@ -2692,91 +2705,110 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    for (spec, pending) in pending_tcp_setups {
-        if let Err(error) = spec.finish_tcp_setup(pending) {
-            handle_tcp_setup_error(
-                &args,
-                &spec,
-                tcp_ports.expect("pending TCP setup has a port range"),
-                error,
-                &sched,
-                &progress,
-            )?;
-        }
-        if debug() {
-            crate::output::diagnostic!(
-                "syq: {}: tcp data port {:?}",
-                spec.label(),
-                spec.tcp
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|info| (info.addrs.clone(), info.port))
-            );
-        }
-    }
-    #[cfg(debug_assertions)]
-    if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
-        let remote_specs: Vec<_> = [&src_ep, &dst_ep]
-            .into_iter()
-            .filter_map(real_remote_spec)
-            .collect();
-        if remote_specs.is_empty()
-            || remote_specs
-                .iter()
-                .any(|spec| spec.data_transport() == DataTransport::Ssh)
-        {
-            sched.abort();
-            progress.stop();
-            bail!("TCP data transport required by test");
-        }
-    }
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: data transport setup complete at {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-    }
-    announce_detached_ready()?;
-    let all_remote_endpoints_use_tcp = use_tcp
-        && [&src_ep, &dst_ep]
-            .into_iter()
-            .all(|endpoint| match endpoint {
-                Endpoint::Local { .. } => true,
-                Endpoint::Remote(spec) => spec
-                    .tcp
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|info| !info.failed),
-            });
-    if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
-        args.connections = tune::START_TCP;
-        gate.set_active(args.connections);
-    }
-    let tuning_key = (autotune && args.tuning_options.is_none())
-        .then(|| tune::path_key(&src_ep, &dst_ep))
-        .flatten();
-    let remembered_start = tuning_key.as_deref().and_then(tune::cached);
-    if let Some(remembered) = remembered_start {
-        args.connections = remembered;
-        gate.set_active(remembered);
-    }
-    print_transport_diagnostics(&args, &src_ep, &dst_ep);
-    if args.verbose >= 2 {
-        if let Some(remembered) = remembered_start {
-            crate::output::diagnostic!(
-                "syq: auto-tuning: starting with {remembered} connections remembered for this path"
-            );
-        }
-    }
     let destination_tree_known_missing = dst.is_remote()
         && dst_initially_missing
         && !opts.ignore_existing
         && !opts.update
         && !opts.checksum;
+    // Buffered planning performs no destination mutations and starts no
+    // workers. Let route probes overlap that scan, while preserving the early
+    // worker startup used for initially missing destination trees. Restricted
+    // receivers already settled their probes before destination creation.
+    // Detached copies keep their readiness notification ahead of the scan.
+    let defer_transport_setup = defer_destination_mutations
+        && !destination_tree_known_missing
+        && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
+        && !pending_tcp_setups.is_empty();
+    let mut finish_transport_setup = |args: &mut Args| -> Result<(bool, Option<String>)> {
+        for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
+            if let Err(error) = spec.finish_tcp_setup(pending) {
+                handle_tcp_setup_error(
+                    args,
+                    &spec,
+                    tcp_ports.expect("pending TCP setup has a port range"),
+                    error,
+                    &sched,
+                    &progress,
+                )?;
+            }
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: {}: tcp data port {:?}",
+                    spec.label(),
+                    spec.tcp
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|info| (info.addrs.clone(), info.port))
+                );
+            }
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
+            let remote_specs: Vec<_> = [&src_ep, &dst_ep]
+                .into_iter()
+                .filter_map(real_remote_spec)
+                .collect();
+            if remote_specs.is_empty()
+                || remote_specs
+                    .iter()
+                    .any(|spec| spec.data_transport() == DataTransport::Ssh)
+            {
+                sched.abort();
+                progress.stop();
+                bail!("TCP data transport required by test");
+            }
+        }
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: data transport setup complete at {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        #[cfg(debug_assertions)]
+        record_setup_event_for_test("transport_ready")?;
+        announce_detached_ready()?;
+        let all_remote_endpoints_use_tcp = use_tcp
+            && [&src_ep, &dst_ep]
+                .into_iter()
+                .all(|endpoint| match endpoint {
+                    Endpoint::Local { .. } => true,
+                    Endpoint::Remote(spec) => spec
+                        .tcp
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|info| !info.failed),
+                });
+        if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
+            args.connections = tune::START_TCP;
+            gate.set_active(args.connections);
+        }
+        let tuning_key = (autotune && args.tuning_options.is_none())
+            .then(|| tune::path_key(&src_ep, &dst_ep))
+            .flatten();
+        let remembered_start = tuning_key.as_deref().and_then(tune::cached);
+        if let Some(remembered) = remembered_start {
+            args.connections = remembered;
+            gate.set_active(remembered);
+        }
+        print_transport_diagnostics(args, &src_ep, &dst_ep);
+        if args.verbose >= 2 {
+            if let Some(remembered) = remembered_start {
+                crate::output::diagnostic!(
+                    "syq: auto-tuning: starting with {remembered} connections remembered for this path"
+                );
+            }
+        }
+        Ok((all_remote_endpoints_use_tcp, tuning_key))
+    };
+    let mut transport_setup = if defer_transport_setup {
+        None
+    } else {
+        Some(finish_transport_setup(&mut args)?)
+    };
     let mut workers_started = false;
-    if all_remote_endpoints_use_tcp
+    if transport_setup.as_ref().is_some_and(|(tcp, _)| *tcp)
         && destination_tree_known_missing
         && !opts.dry_run
         && !opts.inplace
@@ -2949,6 +2981,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             scan_err = Some(e);
         }
     }
+    #[cfg(debug_assertions)]
+    record_setup_event_for_test("scan_complete")?;
+    if transport_setup.is_none() {
+        transport_setup = Some(finish_transport_setup(&mut args)?);
+    }
+    let (all_remote_endpoints_use_tcp, tuning_key) =
+        transport_setup.expect("transport setup completed before releasing planned work");
     // The complete buffered scan lets small trees keep the same bounded
     // starting count as normal scheduling. Open TCP workers while the control
     // connection rechecks capacity and inspects the destination; no jobs are

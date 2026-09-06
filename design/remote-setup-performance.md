@@ -23,6 +23,31 @@ preflights pass; planning failure aborts the idle workers. This overlap excludes
 same-machine copies, dry runs, verification, in-place copying, checksumming,
 update/ignore-existing, forced ranges, and bandwidth-limited copies.
 
+## Overlapping route probes with buffered planning
+
+For buffered planning into an existing destination, the coordinator settles
+pending TCP address probes after the source scan and sidecar namespace checks.
+Those checks use the control connection and do not mutate the destination.
+The complete probe window and bandwidth-based address selection are unchanged;
+only the point at which the coordinator joins the probe thread moves.
+Transport selection, the tuning cache lookup, and initial connection counts
+still settle before any worker starts or the buffered plan is replayed.
+Unreachable ordinary TCP routes still fall back to SSH.
+
+Initially missing destination trees retain their earlier worker startup during
+scanning. Unbuffered planning retains its previous setup order, since it can
+release work while scanning. Signed receivers settle TCP before destination
+creation because their one-time grants cannot be replayed for SSH fallback.
+Detached copies also retain their earlier setup order so readiness notification
+does not wait for a potentially long source scan. No extra scan or buffering
+is introduced to obtain the overlap.
+
+The regression test records coordinator setup events separately from helper
+stderr. It checks scan-before-transport ordering for an empty existing remote
+directory, the previous ordering for missing destinations, forced SSH and
+detached copies, successful fallback when advertised TCP is unreachable, and
+an empty destination when a required TCP probe fails after scanning.
+
 ## Compatibility
 
 No messages, state formats, resume identities, CLI options, or output fields
@@ -82,3 +107,35 @@ probing delayed transport readiness until 6.12 seconds, matching the baseline.
 Workers connected during subsequent candidate planning; the baseline waited
 until planning completed to start them. The probing wait limits how much of
 the reduced setup latency reaches the TCP elapsed result.
+
+## Probe-overlap measurement, 2026-09-06
+
+A follow-up compares clean `e6dc071` (the setup and early-worker changes above)
+with clean `9e73649` (buffered planning overlaps route probes). Both use the
+same static release build flags, 1,024-file source, copy command, stats/debug
+output and verification method above. Each binary receives an untimed full-copy
+warmup to install its exact helper; three measured rounds reverse case order
+in the middle round. This task's builds and test suites finished before timing.
+The source and OS caches remain warm, the machines and public route are shared,
+and copies do not request durable disk writes. Every destination passed the
+checksum comparison, and the disposable remote root was removed afterward.
+
+| Transport | Baseline seconds | Candidate seconds | Mean baseline → candidate |
+|---|---|---|---|
+| Encrypted TCP | 10.251, 10.263, 10.303 | 10.019, 10.204, 10.437 | 10.272 → 10.220 |
+| SSH control comparison | 10.522, 11.112, 10.965 | 11.111, 10.639, 10.903 | 10.866 → 10.884 |
+
+The total TCP difference is only 0.052 seconds (0.5%), well within the observed
+variation; these trials do not establish an end-to-end speedup. The internal
+stages do show the intended overlap consistently. Time from control connection
+readiness to completed payload planning was 2.36/2.39/2.33 seconds before and
+2.09/2.10/2.12 seconds afterward: roughly one 260 ms round trip is covered by
+the probe window. Remaining planning after transport readiness shrinks from
+1.09/1.11/1.06 to 0.81/0.82/0.84 seconds. TCP worker authentication still overlaps
+the later destination checks, and each trial starts eight workers.
+
+This workload's scan covers only part of the roughly half-second probe wait
+remaining after destination preflight. The bounded probe window still finishes
+about one second after it starts. SSH connection setup and payload processing
+remain larger costs; a wider performance claim needs controlled latency and
+more repetitions rather than extrapolating from the stage improvement.
