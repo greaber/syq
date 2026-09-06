@@ -3,7 +3,9 @@
 The user authorized a breaking Python API cleanup before SDK adoption on
 2026-09-06. This exception applies to the four changes below; it is not a
 standing exemption from compatibility checks. The released baseline inspected
-for this work is `sdk-python-v0.4.0`, paired with syq `v0.4.0`.
+for this work is Python SDK 0.4.1 (release preparation merged at `2c80e73`),
+paired with syq `v0.4.1`. This supersedes the initial 0.4.0 baseline; 0.4.1
+still has the old flattened API.
 
 ## Mapping source context
 
@@ -43,8 +45,9 @@ catch must not accidentally intercept an application's own callback failure.
 
 On client methods that accept a timeout, omission inherits the client default;
 explicit `None` disables the timeout for that call. Numeric values override it.
-A shared internal sentinel keeps sync and async signatures consistent. Mapping
-streams snapshot the chosen timeout when constructed. The timeout covers the
+The public `syq.CLIENT_DEFAULT` sentinel and `syq.Timeout` alias let wrappers
+forward inheritance without private imports. Sync and async signatures
+match. Mapping streams snapshot the chosen timeout when constructed. The timeout covers the
 subprocess, not installation or full mapping materialization.
 
 Migration: callers previously passing `timeout=None` to mean inheritance should
@@ -78,7 +81,7 @@ URLs remain unchanged. Python objects are process-local and have no promised
 pickle/storage format.
 
 The new Python consumer is tested against the unchanged old automation fixtures
-and the actual managed syq 0.4.0 binary, as well as the current candidate binary.
+and the actual managed syq 0.4.1 binary.
 `results=` still writes the native NDJSON shape rather than serializing the new
 Python objects. An old Python package continues to use its own embedded pin and
 read the same saved files. Both packages can share the existing managed cache

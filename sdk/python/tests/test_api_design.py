@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 
 import syq
@@ -41,8 +42,12 @@ class ErrorAndTimeoutTests(unittest.TestCase):
             with self.subTest(command=command):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     self.call(client, command)
-                self.call(client, command, timeout=None)
-                self.call(client, command, timeout=5)
+                def forward(*, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
+                    return self.call(client, command, timeout=timeout)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    forward()
+                forward(timeout=None)
+                forward(timeout=5)
                 self.assertEqual(client.timeout, 0)
 
     def test_common_error_base_preserves_specific_error_types(self):
@@ -99,6 +104,12 @@ class ErrorAndTimeoutTests(unittest.TestCase):
 
 
 class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unstarted_stream_has_no_self_reference_cycle(self):
+        stream = syq.AsyncClient().map("source")
+        reference = weakref.ref(stream)
+        del stream
+        self.assertIsNone(reference())
+
     async def test_timeout_overrides_for_all_async_operations(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "syq"
@@ -119,8 +130,12 @@ class AsyncTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(command=command):
                     with self.assertRaises(asyncio.TimeoutError):
                         await call(command)
-                    await call(command, timeout=None)
-                    await call(command, timeout=5)
+                    async def forward(*, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
+                        return await call(command, timeout=timeout)
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await forward()
+                    await forward(timeout=None)
+                    await forward(timeout=5)
                     self.assertEqual(client.timeout, 0)
 
 

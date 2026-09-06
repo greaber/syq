@@ -136,7 +136,9 @@ to `cp(mapping=...)`, even on a client with a different `process_cwd`.
 `Mapping(entries, *, cwd=None, root=None, follow_src=False)` accepts an iterable
 of `MappingEntry`. `AsyncMapping(...)` accepts an async iterable. If both `cwd`
 and `root` are omitted, the source base is the current directory at construction.
-Otherwise exactly one may be supplied. `root` confines source resolution.
+Otherwise exactly one may be supplied. Relative `cwd` and `root` paths resolve
+against the Python process directory at construction, not a client's
+`process_cwd`. `root` confines source resolution.
 
 | Member | Type | Meaning |
 |---|---|---|
@@ -589,9 +591,20 @@ after the executable name, passed without a shell.
 
 Here, `cwd` is the local subprocess directory. `cwd` and `env` use client
 defaults when omitted or `None`. `timeout` uses the client default only when
-omitted; explicit `None` disables it. `CLIENT_DEFAULT` denotes omission in the
-signature; callers do not need to import a sentinel. Module-level `syq.run`
-takes the same arguments plus `executable=None` and defaults to no timeout.
+omitted; explicit `None` disables it. Module-level `syq.run` takes the same
+arguments plus `executable=None` and defaults to no timeout.
+
+Wrappers can forward `syq.CLIENT_DEFAULT` to preserve client inheritance.
+`syq.Timeout` is the type alias for a number, `None`, or that sentinel:
+
+```python
+def copy_data(client: syq.Client, *, timeout: syq.Timeout = syq.CLIENT_DEFAULT):
+    return client.cp("data", into="backup", timeout=timeout)
+```
+
+`CLIENT_DEFAULT` applies to client methods (including module-level `cp`, `rm`,
+and `map`); client constructors and module-level `run` have no client default
+to inherit.
 
 Timeouts cover subprocess execution. Managed installation and mapping-input
 materialization happen before the copy process starts and are not covered by

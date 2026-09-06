@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import BinaryIO, TypeVar
 
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
-from ._mapping import AsyncMapping, _source_options
+from ._mapping import AsyncMapping, _ContextMapping, _source_options
 from .managed import managed_executable
 from .client import (
     Argument,
@@ -394,8 +394,8 @@ class AsyncMapStream(AsyncMapping):
         confined: bool = False,
         follow_src: bool = False,
     ) -> None:
-        # This stream supplies its own iteration.
-        super().__init__(
+        # Initialize only source context: this stream supplies its own iterator.
+        _ContextMapping.__init__(
             self, cwd=None if confined else cwd,
             root=cwd if confined else None, follow_src=follow_src,
         )
