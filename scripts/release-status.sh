@@ -137,7 +137,14 @@ result=$(jq -n \
    release_runs:$runs,
    publications:{crates_io:{version:($tag | ltrimstr("v")), state:$crates},
      pypi:{version:($pypi_version | if length > 0 then . else null end), state:$pypi},
-     homebrew:{tag:$tag, state:$homebrew}}}
+     homebrew:{tag:$tag, state:$homebrew}}} |
+   . + {complete:(
+     .tag_state == "verified" and
+     .github_release.state == "published" and .github_release.immutable and
+     (.release_runs | length > 0 and all(.[]; .status == "completed" and .conclusion == "success")) and
+     .publications.crates_io.state == "published" and
+     .publications.pypi.state == "published" and
+     .publications.homebrew.state == "published")}
   ')
 
 if [ "$json" = true ]; then
@@ -151,6 +158,7 @@ jq -r '
   "  crates.io: \(.publications.crates_io.state)",
   "  PyPI SDK:  \(.publications.pypi.state)\(if .publications.pypi.version then " (" + .publications.pypi.version + ")" else "" end)",
   "  Homebrew:  \(.publications.homebrew.state)",
+  "  complete:  \(if .complete then "yes" else "no" end)",
   (if (.release_runs | length) == 0 then "  runs:       none"
    else .release_runs[] | "  run \(.databaseId): \(.status)\(if .conclusion then "/" + .conclusion else "" end), pending environments: \(if .pending_environments == null then "unknown" else (.pending_environments | join(", ") | if length == 0 then "none" else . end) end)\n    \(.url)" end)
 ' <<<"$result"

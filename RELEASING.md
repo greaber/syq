@@ -258,19 +258,26 @@ release request does not require another preparation PR or another test run.
    every uploaded byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
    Once the entire release workflow succeeds, the Python SDK preparation
-   workflow opens a pull request for the matching SDK release using this
-   immutable syq manifest. PyPI publication remains a separate signed-tag and
-   protected-environment action, so a registry outage cannot block syq.
+   workflow opens and merges a pull request for the matching SDK release using
+   this immutable syq manifest. The `$syq-release` flow waits for the exact
+   merge-commit checks, signs the Python tag, approves its protected environment,
+   and verifies PyPI as required phases of the same release. A PyPI outage does
+   not roll back already-published syq artifacts; it leaves the release
+   incomplete and the idempotent Python workflow is retried from the same tag.
    Track the complete state at any time with:
 
    ```sh
    scripts/release-status.sh v0.1.9
    scripts/release-status.sh --json v0.1.9
+   scripts/release-timings.py v0.1.9
    ```
 
    The report correlates the exact tag commit, release runs and pending
    environments, GitHub release state, crates.io, the matching PyPI SDK version,
-   and the Homebrew formula without modifying any of them.
+   and the Homebrew formula without modifying any of them. The timing report
+   reconstructs the observable GitHub wall-clock window and the duration of
+   each workflow, job, and (in JSON) step. Workflow and job times can overlap
+   and should not be added together.
 4. Verify one or more downloaded artifacts and exercise all install paths:
 
    ```sh

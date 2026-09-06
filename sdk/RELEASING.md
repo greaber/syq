@@ -148,14 +148,18 @@ Actions, contents, and pull-request write scopes only inside this preparation
 workflow.
 
 The generated pull request does not have a pending review or cancellation
-window. The final publication remains a deliberate release-authority action:
-create the signed annotated `sdk-python-v<version>` tag and approve the
-protected `pypi` environment. The tag then publishes through OIDC without a
-local upload or long-lived PyPI credential. Keeping the tag signature manual
-avoids placing maintainer signing authority in CI. The additional PyPI
-environment approval is intentionally retained as defense in depth for a
-separate package registry; PyPI availability cannot block publication of syq
-itself.
+window. The `$syq-release` flow waits for its exact-commit checks, creates the
+signed annotated `sdk-python-v<version>` tag with the maintainer's forwarded
+signing agent, approves the protected `pypi` environment, and verifies PyPI.
+These are normal phases of the same release rather than a separately requested
+SDK release. The tag publishes through OIDC without a local upload or long-lived
+PyPI credential, while keeping maintainer signing authority out of CI.
+
+Publication across GitHub, crates.io, Homebrew, and PyPI is sequential rather
+than atomic. If PyPI is unavailable, the already-published syq artifacts remain
+valid and the release remains incomplete. Rerun `publish-sdks.yml` from the
+same permanent SDK tag until PyPI contains the exact reproducible distributions;
+never move the tag or substitute a new package version merely to retry.
 
 Python distributions use a pinned interpreter and the tagged commit timestamp
 as `SOURCE_DATE_EPOCH`, and the source archive is repacked with normalized

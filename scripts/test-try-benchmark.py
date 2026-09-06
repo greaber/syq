@@ -73,7 +73,8 @@ class BenchmarkTests(unittest.TestCase):
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
             (self.bin / name).symlink_to(executable)
-        self.env = dict(os.environ, PATH=str(self.bin))
+        self.env = dict(os.environ, PATH=str(self.bin),
+                        SYQ_BENCHMARK_TEST_SMALL_FIXTURES='1')
 
     def invoke(self, *args, env=None):
         return subprocess.run(

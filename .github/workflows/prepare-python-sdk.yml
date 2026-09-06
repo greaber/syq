@@ -115,7 +115,7 @@ jobs:
             "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the managed executable cache documentation" \
-            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await the post-merge workflows on the exact merge commit. Publication still requires the maintainer-signed tag sdk-python-v$PYTHON_VERSION and approval of the protected pypi environment.")
+            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await the post-merge workflows on the exact merge commit. The release orchestrator will then sign sdk-python-v$PYTHON_VERSION, approve the protected pypi environment, and verify publication.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
