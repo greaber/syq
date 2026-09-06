@@ -252,7 +252,7 @@ with its exact name. Keep partials belonging to copies still running.
 ## Check file contents
 
 Syq normally skips files whose size and modification time match.
-`-H` / `--hash` checks contents even when those two attributes match:
+`--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
