@@ -91,6 +91,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(self.sentinel.read_text(), 'existing user data')
         self.assertEqual(list(self.scratch.iterdir()), [self.sentinel])
 
+    def test_speed_summary_uses_decimal_bytes_and_mean_trial_speeds(self):
+        records = self.root / 'results'
+        records.write_text('large syq 1.000 1000000\nlarge syq 2.000 1000000\n'
+                           'small cp 0.000 1000000\nsmall cp 1.000 1000000\n')
+        # Load the real functions without starting the interactive main.
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        result = subprocess.run(['/bin/bash', '-c', definitions + '\nsummarize_results "$1"',
+                                 'summary-test', str(records)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split() for line in result.stdout.splitlines()]
+        self.assertIn(['large', 'syq', '0.750', '0.500', '1.000', '2'], rows)
+        self.assertIn(['small', 'cp', 'n/a', 'n/a', 'n/a', '2'], rows)
+        self.assertIn('below timer resolution', result.stdout)
+
     def test_local_both_and_rotation(self):
         result = self.invoke('--workload', 'both', '--rounds', '3')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -110,7 +125,7 @@ class BenchmarkTests(unittest.TestCase):
             match = re.match(r'(large|small): (syq|rsync|cp), trial', line)
             if match:
                 current = tuple(match.groups())
-            match = re.match(r'Verified contents; elapsed ([0-9.]+) seconds', line)
+            match = re.match(r'Verified contents; speed ([0-9.]+) MB/s', line)
             if match:
                 trials.setdefault(current, []).append(float(match[1]))
         summaries = 0
@@ -119,7 +134,7 @@ class BenchmarkTests(unittest.TestCase):
             if len(fields) == 6 and tuple(fields[:2]) in trials:
                 summaries += 1
                 values = trials[tuple(fields[:2])]
-                self.assertAlmostEqual(float(fields[2]), sum(values)/len(values), delta=0.00051)
+                self.assertAlmostEqual(float(fields[2]), sum(values)/len(values), delta=0.00101)
                 self.assertEqual(float(fields[3]), min(values))
                 self.assertEqual(float(fields[4]), max(values))
                 self.assertEqual(int(fields[5]), len(values))
@@ -158,7 +173,7 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(failure=failure):
                 result = self.invoke(env=dict(self.env, BENCH_TEST_FAILURE=failure))
                 self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn('Results (mean', result.stdout)
+                self.assertNotIn('Results (MB/s', result.stdout)
                 self.assert_clean()
 
     def test_remote_failure_cleans_owned_scratch(self):
@@ -326,7 +341,7 @@ class BenchmarkTests(unittest.TestCase):
                 self.fail(f'Interactive run timed out; last output: {output[-2000:]!r}')
             _, status = os.waitpid(pid, 0)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0, output.decode())
-            self.assertIn(b'Results (mean', output)
+            self.assertIn(b'Results (MB/s', output)
             self.assert_clean()
         finally:
             os.close(fd)

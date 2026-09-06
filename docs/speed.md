@@ -47,7 +47,9 @@ hard to compress. Every trial has an empty, pre-created destination; interrupted
 never resumed. On Ctrl-C the script stops its local workers, moves remote
 scratch out of the transfer path, and deletes its temporary data. If SSH
 is unavailable, it reports the remote path for later cleanup. The script rotates
-tool order and reports each elapsed time and the mean for each tool. It uses
+tool order and reports speeds in decimal MB/s (1 MB = 1,000,000 bytes):
+each trial’s copied bytes divided by its elapsed time, followed by the mean,
+minimum and maximum trial speeds. Higher is faster. It uses
 syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
 These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem

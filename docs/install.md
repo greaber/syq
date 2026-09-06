@@ -44,12 +44,12 @@ if syq is missing, it offers to install it.
 <section aria-label="Example benchmark results">
 <div class="visual-step">2 <span>Compare the results</span></div>
 <table>
-<caption>Mean seconds · 3 trials</caption>
+<caption>Mean MB/s · higher is faster · 3 trials</caption>
 <thead><tr><th scope="col">Tool</th><th scope="col">Large file</th><th scope="col">Small files</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>0.095</td><td>0.167</td></tr>
-<tr><th scope="row">rsync</th><td>0.118</td><td>0.118</td></tr>
-<tr><th scope="row">cp</th><td>0.049</td><td>0.052</td></tr>
+<tr><th scope="row">syq</th><td>710.0</td><td>50.1</td></tr>
+<tr><th scope="row">rsync</th><td>567.3</td><td>71.1</td></tr>
+<tr><th scope="row">cp</th><td>1379.1</td><td>160.4</td></tr>
 </tbody>
 </table>
 <p class="visual-note">✓ Copied contents checked</p>
