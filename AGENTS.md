@@ -65,13 +65,14 @@ command with this restoration when necessary.
 
 ## Documentation over agent memory
 
-Prefer durable, committed documentation over private memory. Facts worth
-keeping (behavior, measured performance, design rationale, and invariants) go
-in the appropriate committed documentation; guidance every session needs goes
-here in `AGENTS.md`. Plans and handoff notes that change too fast for git or do
-not belong to a branch go in `current-plans/` (gitignored by design; check it
-before starting work on a topic it covers). Use memory only for what fits none
-of those.
+Keep documentation focused on current user-facing behavior. Do not create or
+restore `design/`, or add investigation reports, benchmark dumps, or experiment
+diaries to this repository. PR descriptions should explain the actual change
+and relevant checks, without histories of abandoned work.
+
+Keep `current-plans/` limited to brief current task state and next actions;
+remove obsolete notes instead of archiving them. Guidance every session needs
+belongs here in `AGENTS.md`.
 
 When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
@@ -235,8 +236,9 @@ report actual access or decision blockers instead of bypassing them.
 - `README.md` and `docs/` are written for users. They describe what the code
   on `master` does. Plans, roadmap items, design directions, internal status,
   unreleased or unvetted components, and notes to future maintainers do not
-  belong there; they go in `current-plans/` or a design note. State a
-  limitation as a fact about today's behavior, not as an intention.
+  belong there. Keep only brief `current-plans/` notes needed to continue
+  active work. State a limitation as a fact about today's behavior, not as
+  an intention.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable
