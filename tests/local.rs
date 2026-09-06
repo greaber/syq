@@ -7257,6 +7257,7 @@ fn small_inplace_files_use_one_batched_worker() {
             format!("contents-{i}").as_bytes(),
         );
     }
+    let events = t.path("worker-events");
     let output = compat_command()
         .args([
             "-a",
@@ -7267,14 +7268,16 @@ fn small_inplace_files_use_one_batched_worker() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_WORKER_EVENTS", &events)
         .run()
         .unwrap();
     assert!(output.status.success(), "{}", stderr_of(&output));
-    let stderr = stderr_of(&output);
-    assert!(stderr.contains("small: 3 files in 1 batches"), "{stderr}");
-    assert!(stderr.contains("worker 0 connected"), "{stderr}");
-    assert!(!stderr.contains("worker 1 connected"), "{stderr}");
+    // Worker events are separate from inherited helper stderr, where debug
+    // messages from TCP probes can interleave with coordinator diagnostics.
+    assert_eq!(
+        fs::read_to_string(events).unwrap(),
+        "connected 0 0\nbatch 0 3\n"
+    );
     assert_eq!(read(&t.path("dst/f2")), b"contents-2");
     assert!(partial_files(&t.path("dst")).is_empty());
 }
