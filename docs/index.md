@@ -1,20 +1,20 @@
-<h1 class="landing-title" id="copy-files-with-syq" aria-label="Copy files with syq">
+<h1 class="landing-title" id="copy-files-with-syq" aria-label="syq: Fast, programmable file operations">
 <span class="landing-wordmark">syq</span>
-<span class="landing-subtitle">Copy files</span>
+<span class="landing-subtitle">Fast, programmable file operations.</span>
 </h1>
 
-Syq (pronounced "sick") copies and removes files in parallel, on one machine
-or over SSH. It can resume interrupted copies and transfer directly between
-servers without forwarding your SSH agent.
+Copy, reorganize and remove files—locally or across machines. Resume interrupted
+transfers, send files home from a remote shell, and automate with JSON.
 
-In published tests, syq copied a folder from Amsterdam to Tokyo
-[5.2× faster than rsync](https://greaber.github.io/syq-bench/#fly-cross-region-memory),
-and 20,000 small files to NFS
-[4.6× faster than cp](https://greaber.github.io/syq-bench/#nfs-directory-trees).
-These are workload-specific results; the benchmarks include cases where other
-tools win.
+<nav class="landing-actions" aria-label="Explore syq">
+<a class="landing-primary" href="install.html">Install syq</a>
+<a href="https://greaber.github.io/syq-bench/">Benchmarks ↗</a>
+<a href="receive.html">Send files home</a>
+<a href="remote-to-remote.html">Copy between servers</a>
+<a href="mappings.html">Script file placement</a>
+</nav>
 
-[Install syq](install.md), then try a copy:
+## Try a copy
 
 ```sh
 syq cp project --to server --into /backup
