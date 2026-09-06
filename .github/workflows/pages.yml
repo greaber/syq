@@ -5,6 +5,9 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
+      - 'sdk/README.md'
+      - 'sdk/python/README.md'
+      - 'sdk/python/NATIVE_API.md'
       - 'theme/**'
       - 'book.toml'
       - 'scripts/check-doc-links.py'

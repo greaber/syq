@@ -28,14 +28,31 @@ you can inspect files in any server shell and send them to another SSH host:
 ```sh
 # Run on hostA, including in an existing tmux shell.
 ls -lh results
-syq cp results --to hostB --via @laptop --into /archive
+syq cp results --to hostB --into /archive
 ```
 
-The laptop asks for approval before contacting hostB. Approve with the desktop
+Syq looks for a live receiving machine automatically before trying SSH from
+hostA. It checks names in alphabetical order, allowing up to two seconds for
+each readiness reply, and uses the first available matching build. Offline or
+incompatible registrations are skipped. With none available, it uses ordinary
+SSH. Options this route cannot support also use ordinary SSH automatically.
+A copy addressed to a live receiving name still goes to that machine itself.
+
+These choices apply to `syq cp` with local sources and an SSH destination.
+To choose explicitly, use `--auth-from @laptop` (or `--auth-from laptop`).
+`--auth-from ssh` uses hostA's SSH access and interprets `--to` as an SSH
+endpoint, even if its bare name matches a receiving name. `--auth-from auto`
+is the default. Names `ssh` and `auto` need `@` with this option.
+The older `--via NAME` spelling remains an alias for `--auth-from @NAME`;
+every bare `--via` value is still a receiving name.
+
+The selected laptop asks for approval before contacting hostB. Approve with the desktop
 prompt or `syq recv pending` and `syq recv approve REQUEST_ID` on the laptop.
 These requests require a decision even when `recv --approve always` permits
-automatic copies onto the laptop itself. `--via laptop` also works; both forms
-require a live return connection and never fall back to an SSH host named laptop.
+automatic copies onto the laptop itself. Once an approval request is sent,
+a refusal, interrupted connection, setup failure, or copy failure ends that
+attempt; syq does not try another authorizer or SSH. Explicit receiving names
+require a live return connection and never fall back to DNS lookup.
 
 The laptop uses its own SSH configuration, credentials, and trusted host keys
 to connect to hostB and install the matching syq helper. Connect to hostB with
@@ -46,21 +63,28 @@ encrypted TCP. HostB must expose a [reachable data port](server-tuning.md#make-t
 to hostA. Failure to reach it fails the copy without switching to SSH data.
 
 The prompt shows the requested SSH endpoint and destination path. Relative
-destination paths start in that account's home directory on hostB. Receiving
-`--cwd` and `--root` govern copies onto the laptop; they do not describe hostB's
-filesystem. Receiving byte, entry, and deletion ceilings still apply. The
-helper on hostB checks the approved copy permissions and protects its own
+destination paths start in that account's home directory on hostB. A quoted
+`~` or `~/archive` also uses hostB's home directory; use `./~/archive` to name a
+literal directory called `~`. On this route, `~//archive` also stays under that
+home directory. Automatic selection leaves `~//archive` on ordinary SSH,
+where that spelling resolves to `/archive`. Receiving `--cwd` and `--root` govern copies onto the laptop;
+they do not describe hostB's filesystem. Receiving byte, entry, and deletion
+ceilings still apply. The helper on hostB checks the approved copy permissions and protects its own
 control and SSH authority files. The source verifies its signed receipt before
 reporting success. No durable receiver enrollment or reusable grant is created.
 
 All three machines must use the same syq build. Keep the source command and
 the laptop's return connection alive until completion. Stopping receiving or
-losing that connection cancels the copy. Retry with a new approval to resume
-eligible partial files. This route accepts local sources and an ordinary SSH
-`--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
+losing that connection cancels the copy. After hostB approves setup, the source
+has 60 seconds to start its handshake and then 10 seconds to complete it.
+Retry with a new approval to resume eligible partial files. This route accepts
+local sources and an ordinary SSH `--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
 `--no-bootstrap`, `--pscope`, alternative `--peer-auth`/`--coordinate-at`,
 `--no-tcp`, or `--tcp-plain`. Copy permissions and supported filesystem options
-match [return copies](receive.md#copy-permissions-and-limits).
+match [return copies](receive.md#copy-permissions-and-limits). These restrictions
+also determine whether automatic selection can use a receiving machine.
+Destination path completion never asks a receiving machine for authorization;
+use `--auth-from ssh` for completion through hostA's own SSH access.
 
 ## What you need
 

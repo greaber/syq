@@ -21,10 +21,32 @@ def main():
         root = Path(temporary)
         (root / 'alpha').write_bytes(b'x' * 2048)
         (root / 'alpine').mkdir()
+        (root / 'go' / 'local-only').mkdir(parents=True)
+        remote = root / 'remote'
+        (remote / 'go' / 'remote-only').mkdir(parents=True)
+        bindir = root / 'bin'
+        bindir.mkdir()
+        ssh = bindir / 'ssh'
+        ssh.write_text("""#!/bin/sh
+if [ "$1" = -V ]; then echo OpenSSH_9.9p1 >&2; exit 0; fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|-l|-p|-S) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+cd "$SYQ_TEST_REMOTE_HOME" || exit 1
+HOME="$SYQ_TEST_REMOTE_HOME" exec /bin/sh -c "$1"
+""")
+        ssh.chmod(0o700)
         pid, terminal = pty.fork()
         if pid == 0:
             os.chdir(root)
-            os.environ['PATH'] = str(binary.parent) + os.pathsep + os.environ['PATH']
+            os.environ['PATH'] = str(bindir) + os.pathsep + str(binary.parent) + os.pathsep + os.environ['PATH']
+            os.environ['SYQ_TEST_REMOTE_HOME'] = str(remote)
             os.environ['TERM'] = 'xterm'
             os.environ['HOME'] = temporary
             os.environ['XDG_CONFIG_HOME'] = str(root / 'config')
@@ -83,6 +105,11 @@ def main():
             output = send(b'\n')
             assert b'ARG=<alpha>' in output, output
             assert b'KiB' not in output and b'UTC' not in output, output
+            print(f'{args.shell}: checking remote destination insertion', flush=True)
+            send(b'syq cp --src AGENTS.md --to j5 --into go/\t')
+            output = send(b'\n')
+            assert b'ARG=<go/remote-only/>' in output, output
+            assert b'local-only' not in output, output
             print(f'{args.shell}: detailed display and path-only insertion passed', flush=True)
         finally:
             # The PTY shell owns a separate process group, including its helpers.

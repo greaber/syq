@@ -82,7 +82,9 @@ limits. The server receives neither your SSH agent nor an interface for running
 arbitrary laptop commands.
 
 To send files from that server to another SSH host using this machine's
-permission, use `syq cp results --to hostB --via @laptop`. These requests always
+permission, use `syq cp results --to hostB`. Eligible copies discover a live
+receiving machine automatically; `--auth-from @laptop` selects one explicitly
+and `--auth-from ssh` uses the server's own SSH access. These requests always
 need a local decision. See [Start a copy from the source server](remote-to-remote.md#start-a-copy-from-the-source-server).
 
 ## Names and paths
@@ -157,12 +159,18 @@ syq persist off
 persistence scopes also own return connections and end them when closed.
 
 Return connections have no idle expiry. After a network interruption or laptop
-sleep, the laptop reconnects with delays of one to thirty seconds. Ordinary
+sleep, the laptop reconnects with delays of one to thirty seconds, including
+when a return-connection heartbeat times out. Ordinary
 reusable SSH logins still expire after ten idle minutes. An interrupted copy
 fails: rerun it after reconnection to reuse eligible partial files. Copies are
 not queued while offline. A copy must open its control channel within sixty
 seconds of authorization and finish within seven days. Closing that control
 channel revokes its workers and prevents further requests.
+
+If `syq persist status` reports a failed return connection, fix the reported
+configuration or permission problem and run `syq recv on` to retry previously
+connected endpoints. This keeps ordinary SSH persistence enabled; there is no
+need to toggle `persist off` and `persist on`.
 
 On the server, `syq destination list` shows availability and
 `syq destination wait laptop --timeout 30` waits with a deadline. Stale records

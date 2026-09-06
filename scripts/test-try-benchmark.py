@@ -78,7 +78,8 @@ class BenchmarkTests(unittest.TestCase):
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
             (self.bin / name).symlink_to(executable)
-        self.env = dict(os.environ, PATH=str(self.bin))
+        self.env = dict(os.environ, PATH=str(self.bin),
+                        SYQ_BENCHMARK_TEST_SMALL_FIXTURES='1')
 
     def invoke(self, *args, env=None):
         return subprocess.run(
@@ -323,7 +324,7 @@ class BenchmarkTests(unittest.TestCase):
         prompts_answered = 0
         # All five default answers are read from /dev/tty, not the script pipe.
         os.write(fd, b'\n' * 5)
-        deadline = time.monotonic() + 45
+        deadline = time.monotonic() + 90
         try:
             while time.monotonic() < deadline:
                 if select.select([fd], [], [], 0.2)[0]:

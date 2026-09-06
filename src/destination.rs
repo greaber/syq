@@ -296,8 +296,9 @@ fn exchange(
     message: Message,
     timeout: Duration,
 ) -> Result<(UnixStream, Reply)> {
-    let mut stream = UnixStream::connect(&registration.socket)
-        .context("receiving laptop is offline; it must reconnect before this transfer can start")?;
+    let mut stream = UnixStream::connect(&registration.socket).context(
+        "receiving machine is offline; it must reconnect before this transfer can start",
+    )?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     write_message(
@@ -311,7 +312,7 @@ fn exchange(
     )?;
     let reply = read_message(&mut stream)?;
     if let Reply::Error(error) = &reply {
-        bail!("receiving laptop: {error}");
+        bail!("receiving machine: {error}");
     }
     Ok((stream, reply))
 }
@@ -460,8 +461,30 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
-    if args.via.is_some() {
-        return forward::prepare(args);
+    match &args.auth_from {
+        crate::cli::AuthFrom::Return(_) => return forward::prepare(args),
+        crate::cli::AuthFrom::Ssh => {
+            let (destination, sources) = args
+                .locations
+                .split_last()
+                .context("copy endpoints missing")?;
+            if args.interface != crate::cli::Interface::NativeCp
+                || sources.iter().any(|source| source.is_remote())
+                || !destination.is_remote()
+                || destination
+                    .host
+                    .as_deref()
+                    .is_some_and(|host| host.starts_with('@'))
+            {
+                bail!(
+                    "--auth-from ssh requires local sources and an ordinary SSH --to destination"
+                );
+            }
+            // This explicit choice also disambiguates an SSH host whose name
+            // happens to match a receiving machine's advertisement.
+            return Ok(());
+        }
+        crate::cli::AuthFrom::Auto => {}
     }
     let Some(destination) = args.locations.last() else {
         return Ok(());
@@ -484,11 +507,11 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
                 .any(|l| l.is_remote())
             || !registered_names().contains(&name)
         {
-            return Ok(());
+            return forward::prepare(args);
         }
         let registration = load_registration(&name)?;
         if exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err() {
-            return Ok(());
+            return forward::prepare(args);
         }
         registration
     };
@@ -617,7 +640,7 @@ pub(crate) fn finish_receipt(
         &expected.policy,
     )?;
     if receipt.terminal.status != crate::receipt::ReceiptStatus::Clean {
-        bail!("receiving laptop reports {:?}", receipt.terminal.status);
+        bail!("receiving machine reports {:?}", receipt.terminal.status);
     }
     Ok(())
 }
@@ -876,7 +899,7 @@ const RETURN_SSH_OPTIONS: &[&str] = &[
 fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     let mut cmd = Command::new("ssh");
     // This connection installs a remote forward and follows the user's host-key
-    // policy. The outbound --via connection adds stricter options of its own.
+    // policy. The outbound return-authorized connection adds stricter options of its own.
     cmd.args(RETURN_SSH_OPTIONS)
         .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
     if let Some(user) = &endpoint.user {
@@ -1067,6 +1090,33 @@ impl Drop for RegistrationGuard {
     }
 }
 fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
+    match register_inner(name, socket, secret) {
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotConnected
+                )
+            }) =>
+        {
+            // Socket timeouts are WouldBlock on Unix. A failed handshake or
+            // heartbeat is a transport interruption, not a policy rejection.
+            // Reuse the retry status understood by existing return clients.
+            crate::output::diagnostic!("syq: return connection interrupted: {error:#}");
+            Ok(RECONNECT_PENDING)
+        }
+        result => result,
+    }
+}
+
+fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     validate_name(name)?;
     let metadata = fs::symlink_metadata(socket)?;
     if !metadata.file_type().is_socket()
@@ -1246,6 +1296,47 @@ mod tests {
     use crate::cli::{Args, Interface, Location, Placement};
     use crate::conn::Conn;
     use crate::proto::{Request, Response};
+
+    #[test]
+    fn registration_retries_socket_timeout_but_not_peer_rejection() {
+        for reject in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("return.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let (stop, stopped) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let _: Envelope = read_message(&mut stream).unwrap();
+                if reject {
+                    write_message(
+                        &mut stream,
+                        &Reply::Error(
+                            "Resource temporarily unavailable is a rejection here".into(),
+                        ),
+                    )
+                    .unwrap();
+                } else {
+                    // Leave the connection open without a reply: read_exact
+                    // must hit the real Unix socket timeout (EAGAIN/EWOULDBLOCK).
+                    let _ = stopped.recv_timeout(Duration::from_secs(15));
+                }
+            });
+            let result = register("laptop", &path, "test-credential");
+            let _ = stop.send(());
+            peer.join().unwrap();
+            if reject {
+                assert!(format!("{:#}", result.unwrap_err()).contains("receiving machine:"));
+            } else {
+                assert_eq!(result.unwrap(), RECONNECT_PENDING);
+            }
+            assert!(!path.exists(), "failed registration must remove its socket");
+        }
+    }
 
     pub(super) fn args(source: &Path, destination: &str) -> Args {
         let mut args =

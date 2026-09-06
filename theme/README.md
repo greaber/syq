@@ -5,50 +5,36 @@ a blue Manrope syq wordmark, IBM Plex Mono commands and numbers, and white/dark
 palettes. Main text is 20px. The same top navigation links both sites, while
 the docs retain mdBook's compact sidebar and benchmarks keep their own layout.
 
-The shared source lives in syq-bench. Keep these copies byte-for-byte identical:
+The shared UI toolkit is inventoried in site-ui.json. Every mapped file must
+remain byte-for-byte identical to the syq-bench copy, including fonts/licenses.
+It owns branding, homepage buttons, sidebars, and Contents/Theme/Search controls.
+Both sidebars use 15px links, 16px headings, 24px left and 12px right padding.
 
-| syq-bench | syq |
-| --- | --- |
-| `src/syq_bench/brand.css` | `theme/brand.css` |
-| `src/syq_bench/site-nav.html` | `theme/header.hbs` |
-| `src/syq_bench/fonts/` including licenses | `theme/fonts/` |
+Compare from either repo before review (arguments are toolkit directories):
 
-See `site/BRANDING.md` in syq-bench for the copy and comparison commands.
-Prepare paired task worktrees and pull requests for shared edits. Each repo
-keeps its own committed assets and builds independently; neither site fetches
-styles or fonts from the other at build time or in the browser.
+    python3 theme/check-site-ui.py /path/to/syq-bench-task/src/syq_bench theme
 
-`docs.css` is the mdBook adapter: prose, code, tables, sidebar, toolbar and
-anchor offsets. `docs.js` adds the current-site marker and moves the existing search, theme and
-sidebar controls into the shared header, preserving mdBook listeners and shortcuts.
-Print and edit links appear below the article; the duplicate title and GitHub
-shortcut no longer need a separate toolbar row. Search opens only when requested.
-The header is a supported partial; the full mdBook template and scripts remain
-upstream so search, chapter navigation, keyboard shortcuts and code copying
-continue to receive mdBook fixes. The built-in light/rust preferences use the
-white palette; navy/coal/ayu use the matching dark palette. Auto follows the OS.
+See site/BRANDING.md in syq-bench for the inventory and copy workflow.
+Each site builds independently from its committed toolkit.
 
-Use the mdBook version pinned in `.github/workflows/pages.yml`, run
-`mdbook build` and `python3 scripts/check-doc-links.py`, and check rendered
-fonts, desktop/phone layouts, both color schemes, search, mobile chapter menus,
-code copying, anchor offsets and JavaScript-disabled navigation. Theme assets
-are included in the Pages trigger and mdBook's preview watch list.
+docs.css and docs.js adapt mdBook. Native search and theme handlers remain
+behind the shared controls. Print/edit actions stay below the article. The
+toolkit replaces the toggle and resize handle and reconciles native touch
+gestures; mdBook still generates chapters, in-page links and search results.
+Widths and desktop visibility persist when storage is available. Drag or use
+arrow keys to resize; Home/double-click resets width. Mobile drawer behavior
+and animations match benchmarks, including reduced-motion support.
+System/Light/Dark replace the redundant mdBook palette names in the visible UI.
+The native toolbar remains available when JavaScript is disabled.
+
+Build with pinned mdBook and run the source link checker. Check both sites at
+320/390/620/760/820/1440px: resizing, persistence, navigation, keyboard controls,
+search hits/misses, themes, code copying, reduced motion and no-JS fallback.
+Resize arrow keys must not trigger mdBook chapter navigation.
 
 The font stylesheet uses mdBook's resource helper to resolve hashed font
 filenames. syq-bench embeds the same resources as data URIs. Do not replace the
 resource placeholders with literal paths: those break mdBook's asset hashing.
-
-With JavaScript enabled, the original toolbar and hover placeholder are hidden,
-and the page margin no longer compensates for that placeholder. Header controls
-remain fixed while scrolling. Without JavaScript, the native toolbar remains
-available below the header for sidebar and page links; its sticky offset still
-overrides mdBook's default. Mobile chapter drawers start below the shared header.
-
-When upgrading mdBook, check 320/390/620/760/820/1440px layouts, navigation and
-control overlap, initial headings and fragment offsets, search via click and `/`,
-themes via mouse/keyboard, chapter toggling, scrolled reload, print/edit links,
-and navigation without JavaScript. The adapter moves upstream nodes rather than
-forking the book template or replacing the control implementations.
 
 The oversized side-of-page chapter arrows are hidden; sidebar links and the
 end-of-page navigation provide the chapter routes.
@@ -64,3 +50,27 @@ The figure shows arithmetic mean trial speeds in decimal MB/s, calculated
 from the individual recorded durations rather than those rounded mean times. It illustrates
 the workflow, not comparative performance evidence: the run shared the machine
 with other work. Preserve the example caption if updating its presentation.
+
+Anchor navigation scrolls smoothly, matching benchmarks. The reduced-motion
+preference disables this animation. Both sites use 20px Open Sans main prose
+and compact 15px Open Sans navigation with a 300px default sidebar width;
+their content layouts remain independent.
+
+The docs and benchmark homepages use the shared landing-title styles: a large
+blue Manrope wordmark above an Open Sans title. This adds character to the
+homepages while retaining the compact navigation and normal article headings.
+The docs homepage preserves its copy-files-with-syq fragment for existing links.
+
+The homepage leads with fast, programmable file operations and a short
+description of copying, reorganizing, removing, resuming and automation.
+Shared landing-actions buttons offer installation, benchmarks, sending files
+home, server-to-server copies and programmable file placement. Quickstart
+examples follow under Try a copy.
+
+## SDK documentation
+
+The SDK guide, API reference and compatibility pages in docs/ use mdBook
+includes to render the sources in sdk/. Edit those source files so the web
+pages and packaged SDK documentation stay in sync. Links in included sources
+use full documentation URLs so they also work on GitHub and PyPI. book.toml
+watches sdk/ when serving the book locally.

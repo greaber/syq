@@ -36,16 +36,13 @@ fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         })
     {
-        bail!("--via requires an ordinary SSH destination with a plain host and login name");
+        bail!("--auth-from requires an ordinary SSH destination with a plain host and login name");
     }
     Ok(endpoint)
 }
 
-pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     use crate::cli::{CoordinateAt, Interface, PeerAuth};
-    let name = args.via.as_deref().unwrap();
-    let name = name.strip_prefix('@').unwrap_or(name).to_owned();
-    validate_name(&name)?;
     let (destination, sources) = args
         .locations
         .split_last()
@@ -54,7 +51,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         || sources.iter().any(|s| s.is_remote())
         || !destination.is_remote()
     {
-        bail!("--via requires syq cp with local sources and an SSH --to destination");
+        bail!("--auth-from requires syq cp with local sources and an SSH --to destination");
     }
     if args.rsh.is_some()
         || args.syq_path.is_some()
@@ -67,14 +64,48 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("--via owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
     }
     if args.connections_opt.is_some() && args.connections > 32 {
-        bail!("--via supports at most 32 workers per copy");
+        bail!("return authorization supports at most 32 workers per copy");
     }
+    if args.owner || args.group || args.devices || args.inplace {
+        bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
+    }
+    crate::restricted::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
-    let registration = load_registration(&name)?;
+    Ok(target)
+}
+
+pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    let explicit = match &args.auth_from {
+        crate::cli::AuthFrom::Return(name) => Some(name.clone()),
+        _ => None,
+    };
+    let target = match eligible_target(args) {
+        Ok(target) => target,
+        Err(_) if explicit.is_none() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if explicit.is_none() && args.locations.last().unwrap().path.starts_with(b"~//") {
+        // Ordinary SSH interprets ~// as absolute. Do not change the copy's
+        // destination just because a return authorizer became available.
+        return Ok(());
+    }
+    let (name, registration) = if let Some(name) = explicit {
+        let registration = load_registration(&name)?;
+        (name, registration)
+    } else {
+        let Some(found) = registered_names().into_iter().find_map(|name| {
+            let registration = load_registration(&name).ok()?;
+            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(2)).ok()?;
+            matches!(reply, Reply::Ready).then_some((name, registration))
+        }) else {
+            return Ok(());
+        };
+        found
+    };
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
@@ -105,6 +136,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.auth_from = crate::cli::AuthFrom::Return(name);
     // The actual authority never leaves the destination helper. This internal
     // marker makes the engine require TCP and suppress ordinary SSH fallback.
     args.restricted_grant = Some("return-control-v1".into());
@@ -259,8 +291,8 @@ impl ForwardChild {
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
                 Ok(Reply::Ready) => bail!("invalid destination setup response"),
                 Err(error) => {
-                    // The exact-build launcher returns this code before starting
-                    // a helper. Only that cache miss may replay the setup request.
+                    // Match ordinary bootstrap: a missing helper or an exec
+                    // failure may retry setup once, before a copy is approved.
                     let closed = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
                         matches!(
                             e.kind(),
@@ -275,9 +307,9 @@ impl ForwardChild {
                         child.close().map_err(Into::into)
                     };
                     if !install
-                        && status.as_ref().is_ok_and(|s| {
-                            s.code() == Some(crate::remote_helper::HELPER_MISSING_EXIT)
-                        })
+                        && status
+                            .as_ref()
+                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
                         continue;
                     }
@@ -509,21 +541,66 @@ impl<T: Write + AsRawFd, F: Fn() -> bool> Write for DeadlineIo<'_, T, F> {
     }
 }
 
-pub(crate) struct HandshakeInput {
-    inner: File,
+struct HandshakeInput<R> {
+    inner: R,
     pending: Arc<AtomicBool>,
     deadline: Instant,
+    hello_timeout: Duration,
+    started: bool,
 }
-impl Read for HandshakeInput {
+impl<R> HandshakeInput<R> {
+    fn new(
+        inner: R,
+        pending: Arc<AtomicBool>,
+        start_timeout: Duration,
+        hello_timeout: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            pending,
+            deadline: Instant::now() + start_timeout,
+            hello_timeout,
+            started: false,
+        }
+    }
+}
+impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
         if self.pending.load(Ordering::Acquire) {
             wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, &|| {
                 false
             })?;
         }
-        self.inner.read(bytes)
+        let count = self.inner.read(bytes)?;
+        if count > 0 && !self.started {
+            // Preparing the source and reaching us through the return relay is
+            // separate from completing Hello. Neither phase can wait forever,
+            // and subsequent partial bytes never extend the Hello deadline.
+            self.started = true;
+            self.deadline = Instant::now() + self.hello_timeout;
+        }
+        Ok(count)
     }
 }
+
+fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf)> {
+    let relative;
+    let path = if path == b"~" {
+        b"."
+    } else if let Some(rest) = path.strip_prefix(b"~/") {
+        // Keep even ~//path relative to the destination home. ./~/path still
+        // names a literal directory, and named receivers keep their cwd/root.
+        relative = [b"./".as_slice(), rest].concat();
+        &relative
+    } else {
+        path
+    };
+    resolve_destination(home, None, path)
+}
+
 fn receive() -> Result<i32> {
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -540,8 +617,7 @@ fn receive() -> Result<i32> {
             bail!("return helper build mismatch");
         }
         let cwd = fs::canonicalize(std::env::var_os("HOME").context("HOME is unset")?)?;
-        let (destination, container) =
-            resolve_destination(&cwd, None, &request.request.destination)?;
+        let (destination, container) = resolve_ssh_destination(&cwd, &request.request.destination)?;
         let request = constrain(
             request.request,
             &destination,
@@ -562,11 +638,12 @@ fn receive() -> Result<i32> {
     let pending = Arc::new(AtomicBool::new(true));
     crate::server::run_forwarded(
         authority,
-        HandshakeInput {
-            inner: input,
-            pending: pending.clone(),
-            deadline: Instant::now() + Duration::from_secs(10),
-        },
+        HandshakeInput::new(
+            input,
+            pending.clone(),
+            START_TIMEOUT,
+            Duration::from_secs(10),
+        ),
         pending,
     )?;
     Ok(0)
@@ -630,6 +707,85 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker, request};
+
+    #[test]
+    fn hello_has_a_separate_start_budget_and_partial_bytes_do_not_extend_it() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let pending = Arc::new(AtomicBool::new(true));
+        let mut input = HandshakeInput::new(
+            reader,
+            pending,
+            Duration::from_secs(2),
+            Duration::from_millis(150),
+        );
+        // Source preparation may exceed the entire Hello budget.
+        std::thread::sleep(Duration::from_millis(200));
+        writer.write_all(b"a").unwrap();
+        let mut byte = [0];
+        input.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"a");
+        let sender = std::thread::spawn(move || {
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(40));
+                if writer.write_all(b"b").is_err() {
+                    break;
+                }
+            }
+        });
+        let error = input.read_exact(&mut [0; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(input);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn an_idle_hello_expires_but_completed_transfers_have_no_hello_deadline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let pending = Arc::new(AtomicBool::new(true));
+        let mut input = HandshakeInput::new(
+            reader,
+            pending.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        assert_eq!(input.read(&mut []).unwrap(), 0);
+        let error = input.read(&mut [0]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        // Once the server has accepted Hello, the reader belongs to the copy.
+        pending.store(false, Ordering::Release);
+        writer.write_all(b"data").unwrap();
+        let mut bytes = [0; 4];
+        input.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"data");
+    }
+
+    #[test]
+    fn ssh_destinations_expand_only_a_leading_home_tilde() {
+        let root = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(root.path()).unwrap();
+        for path in [b"~/archive".as_slice(), b"~//archive", b"archive"] {
+            assert_eq!(
+                resolve_ssh_destination(&home, path).unwrap().0,
+                home.join("archive")
+            );
+        }
+        assert_eq!(resolve_ssh_destination(&home, b"~").unwrap().0, home);
+        assert_eq!(
+            resolve_ssh_destination(&home, b"./~/archive").unwrap().0,
+            home.join("~/archive")
+        );
+        assert_eq!(
+            resolve_ssh_destination(&home, b"~someone/archive")
+                .unwrap()
+                .0,
+            home.join("~someone/archive")
+        );
+        // The shared named resolver still interprets paths relative to cwd.
+        assert_eq!(
+            resolve_destination(&home, None, b"~/archive").unwrap().0,
+            home.join("~/archive")
+        );
+    }
 
     #[test]
     fn helper_exit_status_and_stderr_survive_group_cleanup() {

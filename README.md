@@ -10,8 +10,7 @@ It is built for large files, large trees, and fast networks.
 - **Gitignore-style filters**, programmable file placement, and JSON results.
 
 [Documentation](https://greaber.github.io/syq/) ·
-[Benchmarks](https://greaber.github.io/syq-bench/) ·
-[Discussions](https://github.com/greaber/syq/discussions)
+[Benchmarks](https://greaber.github.io/syq-bench/)
 
 ## Developing syq
 

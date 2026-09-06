@@ -1,4 +1,5 @@
 /* mdBook adapter; the shared palette, fonts and site header live in brand.css. */
+html {scroll-behavior:smooth}
 :root {
   --sidebar-target-width: 300px;
   --content-max-width: 820px;
@@ -48,13 +49,7 @@ h1,h2,h3,h4,h5,h6 {font-family:var(--display);font-weight:700;letter-spacing:-.0
 .content table {font-family:var(--display);font-size:16px;line-height:1.6}
 .content th,.content td {padding:10px 14px}
 .content blockquote {margin-inline:0;padding:12px 20px;border-left:2px solid var(--syq)}
-/* Preserve mdBook's compact sidebar rather than restyling it as benchmark navigation. */
-.sidebar {top:var(--site-header-height);font:14px var(--display)}
-.sidebar .sidebar-scrollbox {padding:10px}
-.chapter {font:14px/2.2em var(--display);margin:1em 0;padding:0}
-.chapter li a {display:block}
-.chapter li a strong {font-weight:700}
-.chapter-link-wrapper>a {flex:1;min-width:0}
+.sidebar {top:var(--site-header-height)}
 .copy-demo {padding:22px;border-radius:2px}
 .copy-demo legend {font-family:var(--display)}
 .copy-demo-choices {font:500 17px/1.4 var(--display)}
@@ -162,3 +157,7 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
   .benchmark-example section{padding:18px}
   .transfer-flow{padding:16px 10px}.flow-data{gap:6px}.flow-machine{padding:12px 6px}
 }
+
+/* Align the homepage title's top spacing with the benchmark introduction. */
+.content h1.landing-title{margin-top:44px}
+@media(max-width:820px){.content h1.landing-title{margin-top:32px}}

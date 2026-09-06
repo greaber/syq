@@ -34,7 +34,7 @@ Only newly created syq-bench.* directories are used. Existing data is not copied
 HELP
 }
 fail() { printf 'Benchmark: %s\n' "$*" >&2; exit 1; }
-quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+quote() { printf '%s\n' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/"; }
 ask() {
     local answer
     printf '%s [%s]: ' "$1" "$2" >&2
@@ -264,6 +264,13 @@ main() {
     case $mode in local|push|pull) ;; *) fail 'Mode must be local, push or pull.' ;; esac
     case $workload in large|small|both) ;; *) fail 'Workload must be large, small or both.' ;; esac
     case $size in quick) large_mib=64; small_files=1024 ;; medium) large_mib=1024; small_files=4096 ;; large) large_mib=8192; small_files=16384 ;; *) fail 'Size must be quick, medium or large.' ;; esac
+    # The script tests exercise real generation, copies, checksums, ordering,
+    # and cleanup. Smaller private fixtures keep that coverage without making
+    # prompt-routing tests copy the full user-facing benchmark workload.
+    if [[ ${SYQ_BENCHMARK_TEST_SMALL_FIXTURES:-} == 1 ]]; then
+        large_mib=1
+        small_files=8
+    fi
     [[ $rounds =~ ^[1-9]$ ]] || fail 'Rounds must be between 1 and 9.'
     for tool in bash rsync openssl dd split cksum cmp awk mktemp mkdir rm cat ps sleep sed; do need "$tool"; done
     [[ $mode != local ]] || need cp
