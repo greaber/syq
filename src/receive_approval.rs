@@ -8,9 +8,10 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
@@ -187,7 +188,7 @@ impl Queue {
         let mut notification = if notifications == Notifications::Desktop {
             match Notification::spawn(&summary.description(), lifetime) {
                 Ok(notification) => {
-                    self.notification_status(&id, "desktop prompt opened".into());
+                    self.notification_status(&id, "desktop prompt requested; use local recv approve/deny if it is not visible".into());
                     Some(notification)
                 }
                 Err(error) => {
@@ -226,6 +227,15 @@ impl Queue {
                 return Ok(());
             }
             if let Some(process) = notification.as_mut() {
+                // Some notify-send versions keep waiting after reporting a
+                // desktop error. Surface it without granting permission or
+                // waiting for that process to exit.
+                if process.error_seen.load(Ordering::Acquire) {
+                    self.notification_status(
+                        &id,
+                        "desktop reported an error; use local recv approve/deny".into(),
+                    );
+                }
                 if let Some(result) = process.poll() {
                     notification.take();
                     match result {
@@ -250,7 +260,10 @@ impl Queue {
 
 #[cfg(not(target_os = "macos"))]
 fn escape_markup(text: &str) -> String {
-    text.replace('&', "&amp;")
+    // notify-send applies g_strcompress to its body argument before passing
+    // it to D-Bus. Preserve escaped filename bytes through that extra parser.
+    text.replace('\\', "\\\\")
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
@@ -294,13 +307,19 @@ fn notification_command(description: &str, lifetime: Duration) -> Command {
         cmd
     }
 }
-fn capture(mut input: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+fn capture(
+    mut input: impl Read + Send + 'static,
+    seen: Option<Arc<AtomicBool>>,
+) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut output = Vec::new();
         let mut buffer = [0; 1024];
         while let Ok(count) = input.read(&mut buffer) {
             if count == 0 {
                 break;
+            }
+            if let Some(seen) = &seen {
+                seen.store(true, Ordering::Release);
             }
             let keep = count.min(4096_usize.saturating_sub(output.len()));
             output.extend_from_slice(&buffer[..keep]);
@@ -311,6 +330,7 @@ fn capture(mut input: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec
 struct Notification {
     child: Child,
     closed: bool,
+    error_seen: Arc<AtomicBool>,
     output: Option<std::thread::JoinHandle<Vec<u8>>>,
     errors: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
@@ -323,11 +343,16 @@ impl Notification {
             .stderr(Stdio::piped())
             .process_group(0);
         let mut child = command.spawn().context("start desktop approval prompt")?;
-        let output = Some(capture(child.stdout.take().unwrap()));
-        let errors = Some(capture(child.stderr.take().unwrap()));
+        let error_seen = Arc::new(AtomicBool::new(false));
+        let output = Some(capture(child.stdout.take().unwrap(), None));
+        let errors = Some(capture(
+            child.stderr.take().unwrap(),
+            Some(error_seen.clone()),
+        ));
         Ok(Self {
             child,
             closed: false,
+            error_seen,
             output,
             errors,
         })

@@ -92,7 +92,7 @@ def tests():
         run("syq", "recv", "on", "--approve", "ask", "--notify", "desktop")
         run("syq", "recv", "wait", "source", "--timeout", "30")
         for choice in ["allow", "deny", "dismiss", "unexpected", "unavailable"]:
-            destination = Path("/tmp/syq-real-ssh-receive") / f"desktop-{choice}-<b>&"
+            destination = Path("/tmp/syq-real-ssh-receive") / f"desktop-{choice}-<b>&\nFrom: fake"
             command = shlex.join([
                 "syq", "cp", "/tmp/syq-real-ssh/return-source/message.txt",
                 "--to", "@laptop", "--as", destination.name,
@@ -100,7 +100,7 @@ def tests():
             copy = subprocess.Popen(["ssh", "source", command], start_new_session=True)
             try:
                 if choice in ["dismiss", "unexpected", "unavailable"]:
-                    pending = wait_notification_status("unavailable" if choice == "unavailable" else "dismissed")
+                    pending = wait_notification_status("desktop reported an error" if choice == "unavailable" else "dismissed")
                     assert not destination.exists()
                     assert copy.poll() is None, "dismissal completed the copy"
                     run("syq", "recv", "deny", pending["id"])
@@ -111,6 +111,7 @@ def tests():
                 app, summary, body, actions, expiry = observed[-1]
                 assert app == "syq" and summary == "syq: incoming copy"
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
+                assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "source" in body and "May create and overwrite" in body, body
                 assert "at most 0 deletions" in body and "not been inspected" in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
