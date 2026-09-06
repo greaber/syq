@@ -17936,9 +17936,14 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
 fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
     let t = Tmp::new();
     write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    fs::set_permissions(
+        t.path(".syq-destinations-v2"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 99\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     for (prefix, expected) in [
