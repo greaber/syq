@@ -117,11 +117,12 @@ measured numbers as result data, not assumed improvements in this document.
 ## macOS handoff
 
 The implementation is pushed to `greaber/syq`, branch `experimental-streaming`.
-The tested early-shrink implementation is commit
-`34cadda23adfddaba587acb45e859d121f5556dd`. Later documentation-only commits do
-not need to be included in a build intended to reproduce that revision.
-Streaming is still opt-in. Linux correctness and performance checks exist;
-this revision has not yet been validated on a Mac.
+The automatic candidate is commit `6d0c1efa20583a8972446087f55ea1365eb3ae2c`,
+including early completion of exhausted reads. It selects streaming without
+tuning flags while keeping the local/short-range exclusions described above.
+Linux correctness and performance checks exist; this revision has not yet
+been validated on a Mac. The earlier opt-in checkpoint `34cadda` remains in
+history for reproducing the first early-shrink measurements.
 
 Read `AGENTS.md` first. From your existing syq coordination checkout, preserve
 any changes and create a separate task worktree (choose unused names):
@@ -131,7 +132,7 @@ git status --short
 git worktree list
 git fetch origin experimental-streaming
 git worktree add -b mac-streaming .worktrees/mac-streaming \
-  34cadda23adfddaba587acb45e859d121f5556dd
+  6d0c1efa20583a8972446087f55ea1365eb3ae2c
 ln -s ../../current-plans .worktrees/mac-streaming/current-plans
 cd .worktrees/mac-streaming
 cargo build --locked --release
@@ -139,7 +140,7 @@ cargo build --locked --release
 ```
 
 Do not set `SYQ_RELEASE_BUILD`. A clean build should identify itself as
-`v0.4.0+dev.34cadda23adf`. Use the built executable explicitly, not the installed
+`v0.4.1+dev.6d0c1efa2058`. Use the built executable explicitly, not the installed
 release on `PATH`. Run the Rust baseline and focused streaming integration
 tests from `AGENTS.md`; `cargo test --test local streaming` selects the latter.
 Debug test timings are not performance measurements.
@@ -153,15 +154,21 @@ in native copy mode, or `--rsync-path /absolute/path/to/syq` in rsync mode.
 Do not replace a normal remote installation or bypass build-identity checks.
 See [cross-platform development](../docs/development.md#another-platform).
 
-Compare these tuning values using the same candidate binary and workload:
+First compare normal copies against a separately built master baseline,
+without tuning or connection-count overrides. Record the baseline commit too;
+the current Linux comparison uses `79a126a`. Each baseline/candidate must use
+its own matching remote helper.
+
+For diagnosis, compare these settings using the same candidate and workload:
 
 | Comparison | `--tuning-options` value |
 |---|---|
 | Ordinary pipeline | `copy-path=auto,request-size=4M,pipeline-depth=4` |
-| Hybrid streaming, the candidate of interest | `copy-path=auto-streaming,request-size=4M` |
+| Automatic candidate | Omit `--tuning-options` |
+| Streaming every remaining range | `copy-path=auto-streaming,request-size=4M` |
 | Deeper ordinary pipeline | `copy-path=auto,request-size=4M,pipeline-depth=16` |
 
-Try fixed connection counts of 1 and 8 (`--connections` in native copy mode,
+Also try fixed connection counts of 1 and 8 (`--connections` in native copy mode,
 `--syq-connections` in rsync mode). Keep compression settings equal; the Linux
 screening comparisons used `--no-compress`. Use `-v --stats` and `SYQ_DEBUG=1`
 to retain actual transport evidence, copy-path counters, discarded source
