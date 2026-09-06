@@ -18,7 +18,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().with_name('try-benchmark.sh')
 FAKE_SYQ = r'''#!/usr/bin/env python3
-import os, pathlib, shutil, subprocess, sys, time
+import json, os, pathlib, shutil, subprocess, sys, time
 args=sys.argv[1:]
 if args in (['--version'], ['--build-identity']):
     print('syq test double'); sys.exit(0)
@@ -38,6 +38,11 @@ if mode == 'hang':
     pathlib.Path(os.environ['BENCH_TEST_PID']).write_text(str(child.pid))
     child.wait(); sys.exit(1)
 shutil.copytree(src,dst,dirs_exist_ok=True)
+if '--results' in args:
+    result={'type': 'result', 'status': 'success'}
+    if not os.environ.get('BENCH_TEST_OLD'):
+        result['copying_elapsed_ms']=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
+    pathlib.Path(args[args.index('--results')+1]).write_text(json.dumps(result)+'\n')
 if '--quiet' not in args and src.name == 'probe':
     print('test double: preparing matching remote helper', flush=True)
 if '--quiet' not in args and '--suppress-summary' not in args:
@@ -73,7 +78,7 @@ class BenchmarkTests(unittest.TestCase):
         # missing-install test. All other commands use the host's real tools.
         for name in ['bash', 'rsync', 'openssl', 'dd', 'split', 'cksum', 'cmp',
                      'awk', 'mktemp', 'mkdir', 'rm', 'cat', 'ps', 'sleep', 'sed',
-                     'cp', 'mv', 'python3', 'sh', 'perl']:
+                     'cp', 'mv', 'python3', 'sh', 'perl', 'df']:
             executable = shutil.which(name)
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
@@ -83,13 +88,65 @@ class BenchmarkTests(unittest.TestCase):
     def invoke(self, *args, env=None):
         return subprocess.run(
             ['/bin/bash', str(SCRIPT), '--yes', '--source-dir', str(self.scratch),
-             '--dest-dir', str(self.scratch), '--rounds', '1', '--workload', 'large', *args],
+             '--dest-dir', str(self.scratch), '--rounds', '1', '--workload', 'large', '--size', 'quick', *args],
             env=env or self.env, capture_output=True, text=True, timeout=60,
         )
 
     def assert_clean(self):
         self.assertEqual(self.sentinel.read_text(), 'existing user data')
         self.assertEqual(list(self.scratch.iterdir()), [self.sentinel])
+
+    def test_auto_sizes_with_syq_for_each_direction(self):
+        for mode in ['local', 'push', 'pull']:
+            with self.subTest(mode=mode):
+                result = self.invoke('--mode', mode, '--host', 'test-host',
+                                     '--workload', 'small', '--size', 'auto',
+                                     env=dict(self.env, BENCH_TEST_GROW='1'))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('Generating 2048 files', result.stdout)
+                self.assertEqual(result.stdout.count('Verified sizing copy'), 2)
+                self.assertIn('small: 16777216 bytes per trial', result.stdout)
+                self.assertEqual(result.stdout.count('trial 1/1'), 3 if mode == 'local' else 2)
+                self.assert_clean()
+
+    def test_auto_rejects_missing_timing_with_fixed_size_recovery(self):
+        result = self.invoke('--size', 'auto', '--workload', 'small',
+                             env=dict(self.env, BENCH_TEST_OLD='1'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--size quick', result.stderr)
+        self.assertNotIn('Results (', result.stdout)
+        self.assert_clean()
+
+    def test_auto_stops_at_available_space(self):
+        (self.bin / 'df').unlink()
+        (self.bin / 'df').write_text('#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"\necho "test 36409 0 36409 0% /"\n')
+        (self.bin / 'df').chmod(0o755)
+        result = self.invoke('--size', 'auto', '--workload', 'small',
+                             env=dict(self.env, BENCH_TEST_GROW='1'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('WARNING: available scratch space', result.stderr)
+        self.assertEqual(result.stdout.count('Verified sizing copy'), 1)
+        self.assert_clean()
+
+    def test_sizing_math_caps_growth_and_handles_timer_resolution(self):
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        for current, ms, capacity, expected in [(64, 0, 10000, 640),
+                (64, 2500, 10000, 128), (64, 2500, 100, 100),
+                (64, 4999, 10000, 80), (64, 1, 32, 32)]:
+            result = subprocess.run(['/bin/bash', '-c', definitions +
+                                     '\nnext_amount "$1" "$2" "$3"', 'sizing-test',
+                                     str(current), str(ms), str(capacity)],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(int(result.stdout), expected)
+
+    def test_auto_corruption_is_not_used_for_sizing(self):
+        result = self.invoke('--size', 'auto', '--workload', 'small',
+                             env=dict(self.env, BENCH_TEST_FAILURE='corrupt'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Sizing copy content check failed', result.stderr)
+        self.assertNotIn('Increasing', result.stdout)
+        self.assert_clean()
 
     def test_speed_summary_uses_decimal_bytes_and_mean_trial_speeds(self):
         records = self.root / 'results'
@@ -109,7 +166,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_local_both_and_rotation(self):
         result = self.invoke('--workload', 'both', '--rounds', '3')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        lines = [line for line in result.stdout.splitlines() if line.startswith('large: ')]
+        lines = [line for line in result.stdout.splitlines() if line.startswith('large: ') and ', trial ' in line]
         self.assertEqual([line.split()[1].rstrip(',') for line in lines],
                          ['syq', 'rsync', 'cp', 'rsync', 'cp', 'syq', 'cp', 'syq', 'rsync'])
         self.assertIn('small cp', result.stdout)
@@ -321,8 +378,8 @@ class BenchmarkTests(unittest.TestCase):
             os.execvpe('/bin/bash', ['/bin/bash', '-c', f'cat {shlex.quote(str(SCRIPT))} | /bin/bash'], dict(self.env, BENCH_TEST_ASK='1'))
         output = b''
         prompts_answered = 0
-        # All five default answers are read from /dev/tty, not the script pipe.
-        os.write(fd, b'\n' * 5)
+        # All four default answers are read from /dev/tty, not the script pipe.
+        os.write(fd, b'\n' * 4)
         deadline = time.monotonic() + 45
         try:
             while time.monotonic() < deadline:

@@ -883,6 +883,9 @@
         },
         "receipt_records": {
           "$ref": "#/$defs/u64"
+        },
+        "copying_elapsed_ms": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [

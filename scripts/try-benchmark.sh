@@ -16,7 +16,9 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --mode local|push|pull    Copy locally, to an SSH host, or from an SSH host
   --host USER@HOST          SSH host or config alias (configure ports in ~/.ssh/config)
   --workload large|small|both
-  --size quick|medium|large Quick: 64 MiB + 1,024 files; medium: 1 GiB + 4,096;
+  --size auto|quick|medium|large
+                           Auto sizes with syq (default). Quick: 64 MiB + 1,024 files;
+                           medium: 1 GiB + 4,096;
                            large: 8 GiB + 16,384. Small files are 8 KiB each.
   --source-dir DIR         Local scratch parent (default: current directory)
   --dest-dir DIR           Destination scratch parent (default: current directory)
@@ -27,8 +29,8 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
 
-Requires Bash, rsync, OpenSSL, and standard Unix utilities locally; terminal runs
-also need Perl (for terminal process-group control). Remote tests
+Requires Bash, rsync, OpenSSL, and standard Unix utilities locally. Automatic
+sizing needs Perl with its core JSON::PP module; terminal runs also need Perl. Remote tests
 also need SSH locally and rsync plus standard utilities on the remote host.
 Only newly created syq-bench.* directories are used. Existing data is not copied.
 HELP
@@ -161,11 +163,12 @@ make_data() {
 }
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--stats)
+    local command=() syq_options=()
     # This repository-owned caller suppresses only the tiny copy's summary,
     # keeping bootstrap diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
     [[ ${4:-} != setup ]] || syq_options=(--suppress-summary --no-progress)
+    [[ ${4:-} != calibration ]] || syq_options=(--suppress-summary --results "$local_root/calibration.json")
     case $tool in
         syq)
             case $mode in
@@ -194,6 +197,51 @@ timed_copy() {
     copy_with "$@" show
     TIMEFORMAT='%R'
     { time copy_with "$@" 1>&4 2>&5; } 2> "$local_root/time"
+}
+
+# Allow two copies on each filesystem and leave 10% free. For small files,
+# allow extra allocation for metadata. Rechecking with the current source still
+# present is conservative: it may stop growth slightly before the disk limit.
+space_capacity() {
+    local workload=$1 local_free destination_free unit
+    local_free=$(df -Pk "$local_root" | available_kib) || fail 'Cannot determine local free space.'
+    if [[ $mode == local ]]; then
+        destination_free=$(df -Pk "$dest_root" | available_kib) || fail 'Cannot determine destination free space.'
+    else
+        destination_free=$(remote "df -Pk $(quote "$remote_root")" | available_kib) || fail 'Cannot determine remote free space.'
+    fi
+    if [[ $workload == large ]]; then unit=1024; else unit=16; fi
+    awk -v a="$local_free" -v b="$destination_free" -v unit="$unit" \
+        'BEGIN {free=(a < b ? a : b); printf "%.0f\n", int(free * 0.45 / unit)}'
+}
+available_kib() {
+    awk 'NR > 1 && $4 ~ /^[0-9]+$/ {available=$4; found=1}
+         END {if (!found) exit 1; print available}'
+}
+next_amount() {
+    awk -v current="$1" -v ms="$2" -v capacity="$3" 'BEGIN {
+        estimate=current * 5000 / (ms > 0 ? ms : 1);
+        amount=int(estimate); if (amount < estimate) amount++;
+        minimum=int(current * 1.25); if (minimum < current * 1.25) minimum++;
+        if (amount < minimum) amount=minimum;
+        if (amount > current*10) amount=current*10;
+        if (amount > capacity) amount=capacity;
+        printf "%.0f\n", amount;
+    }'
+}
+calibration_interval() {
+    perl -MJSON::PP -e '
+        my $result;
+        while (<>) {
+            my $record=decode_json($_);
+            $result=$record if ($record->{type} // "") eq "result";
+        }
+        die "Missing successful copying timing\n" unless
+            $result && $result->{status} eq "success" &&
+            defined($result->{copying_elapsed_ms}) &&
+            $result->{copying_elapsed_ms} =~ /^\d+$/;
+        print $result->{copying_elapsed_ms}, "\n";
+    ' "$1"
 }
 
 summarize_results() {
@@ -251,7 +299,6 @@ main() {
         if [[ -z $mode ]]; then ask 'Copy where? local / push / pull' local; mode=$REPLY; fi
         if [[ $mode != local && -z $host ]]; then ask 'SSH host or config alias' ''; host=$REPLY; fi
         if [[ -z $workload ]]; then ask 'Workloads? large / small / both' both; workload=$REPLY; fi
-        if [[ -z $size ]]; then ask 'Size? quick (64 MiB + 8 MiB) / medium (1 GiB + 32 MiB) / large (8 GiB + 128 MiB)' quick; size=$REPLY; fi
         if [[ -z $source_dir ]]; then ask 'Local scratch parent' "$PWD"; source_dir=$REPLY; fi
         if [[ -z $dest_dir ]]; then
             if [[ $mode == local ]]; then ask 'Destination scratch parent (can be another disk or NFS mount)' "$source_dir"
@@ -259,14 +306,18 @@ main() {
             dest_dir=$REPLY
         fi
     fi
-    mode=${mode:-local}; workload=${workload:-both}; size=${size:-quick}
+    mode=${mode:-local}; workload=${workload:-both}; size=${size:-auto}
     source_dir=${source_dir:-$PWD}; dest_dir=${dest_dir:-.}
     case $mode in local|push|pull) ;; *) fail 'Mode must be local, push or pull.' ;; esac
     case $workload in large|small|both) ;; *) fail 'Workload must be large, small or both.' ;; esac
-    case $size in quick) large_mib=64; small_files=1024 ;; medium) large_mib=1024; small_files=4096 ;; large) large_mib=8192; small_files=16384 ;; *) fail 'Size must be quick, medium or large.' ;; esac
+    case $size in auto|quick) large_mib=64; small_files=1024 ;; medium) large_mib=1024; small_files=4096 ;; large) large_mib=8192; small_files=16384 ;; *) fail 'Size must be auto, quick, medium or large.' ;; esac
     [[ $rounds =~ ^[1-9]$ ]] || fail 'Rounds must be between 1 and 9.'
     for tool in bash rsync openssl dd split cksum cmp awk mktemp mkdir rm cat ps sleep sed; do need "$tool"; done
     [[ $mode != local ]] || need cp
+    if [[ $size == auto ]]; then
+        need df; need perl
+        perl -MJSON::PP -e 1 || fail 'Automatic sizing needs Perl with JSON::PP.'
+    fi
     if [[ $mode != local ]]; then
         need ssh
         [[ $host =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] || fail 'Use an SSH config alias or USER@HOST; configure ports/IPv6 in ~/.ssh/config.'
@@ -322,19 +373,6 @@ main() {
     [[ $workload == both ]] || workloads=("$workload")
     : > "$local_root/results"
     for case_name in "${workloads[@]}"; do
-        if [[ $case_name == large ]]; then printf 'Generating one %s MiB file...\n' "$large_mib"
-        else printf 'Generating %s files of 8 KiB each...\n' "$small_files"; fi
-        if [[ $case_name == large ]]; then run make_data large "$large_mib"; bytes=$((large_mib * 1048576))
-        else run make_data small "$small_files"; bytes=$((small_files * 8192)); fi
-        manifest "$local_root/$case_name" > "$local_root/expected"
-        source=$local_root/$case_name
-        if [[ $mode == pull ]]; then
-            printf 'Staging source on remote host (untimed)...\n'
-            run rsync -rpt -- "$source/" "$host:$(quote "$remote_root/$case_name/")"
-            source=$remote_root/$case_name
-            remote_manifest "$source" > "$local_root/actual"
-            cmp "$local_root/expected" "$local_root/actual" || fail 'Remote staging verification failed.'
-        fi
         if [[ $case_name == "${workloads[0]}" ]]; then
             # Do this once, not once per workload. Keep the measured copy's full
             # transport path, but suppress meaningless throughput for the 14-byte probe.
@@ -362,11 +400,66 @@ main() {
             fi
             rm -rf -- "$local_root/probe"
             if [[ $mode != local ]]; then
-                printf 'Setup complete: syq %s is ready on %s. Benchmark trials start next.\n' "$syq_identity" "$host"
+                printf 'Setup complete: syq %s is ready on %s.\n' "$syq_identity" "$host"
             else
-                printf 'Setup complete. Benchmark trials start next.\n'
+                printf 'Setup complete.\n'
             fi
         fi
+        local amount capacity next copying_ms
+        if [[ $case_name == large ]]; then amount=$large_mib; else amount=$small_files; fi
+        if [[ $size == auto ]]; then
+            capacity=$(space_capacity "$case_name")
+            [[ $capacity -ge 1 ]] || fail 'Not enough scratch space for a test dataset.'
+            [[ $amount -le $capacity ]] || amount=$capacity
+            printf '\nChoosing the %s workload size with syq (aiming for 5 seconds of copying)...\n' "$case_name"
+        fi
+        while :; do
+            if [[ $case_name == large ]]; then
+                printf 'Generating one %s MiB file...\n' "$amount"
+                bytes=$((amount * 1048576))
+            else
+                printf 'Generating %s files of 8 KiB each...\n' "$amount"
+                bytes=$((amount * 8192))
+            fi
+            run make_data "$case_name" "$amount"
+            printf 'Preparing content checks...\n'
+            manifest "$local_root/$case_name" > "$local_root/expected"
+            source=$local_root/$case_name
+            if [[ $mode == pull ]]; then
+                printf 'Staging source on remote host (untimed)...\n'
+                run rsync -rpt -- "$source/" "$host:$(quote "$remote_root/$case_name/")"
+                source=$remote_root/$case_name
+                remote_manifest "$source" > "$local_root/actual"
+                cmp "$local_root/expected" "$local_root/actual" || fail 'Remote staging verification failed.'
+            fi
+            [[ $size == auto ]] || break
+            destination=$dest_root/calibration
+            if [[ $mode == push ]]; then destination=$remote_root/calibration; remote "mkdir $(quote "$destination")"
+            else mkdir "$destination"; fi
+            rm -f -- "$local_root/calibration.json"
+            run copy_with syq "$source" "$destination" calibration || fail 'syq sizing copy failed.'
+            printf 'Checking copied data...\n'
+            if [[ $mode == push ]]; then remote_manifest "$destination" > "$local_root/actual"
+            else manifest "$destination" > "$local_root/actual"; fi
+            cmp "$local_root/expected" "$local_root/actual" || fail 'Sizing copy content check failed.'
+            copying_ms=$(calibration_interval "$local_root/calibration.json") ||
+                fail 'Automatic sizing needs syq with copying-interval timing. Update syq, or use --size quick for a fixed-size comparison.'
+            if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
+            else rm -rf -- "$destination"; fi
+            awk -v ms="$copying_ms" 'BEGIN {printf "Verified sizing copy; copying interval %.3f seconds.\n", ms / 1000}'
+            [[ $copying_ms -lt 5000 ]] || break
+            capacity=$(space_capacity "$case_name")
+            next=$(next_amount "$amount" "$copying_ms" "$capacity")
+            if [[ $next -le $amount ]]; then
+                printf 'WARNING: available scratch space limits test size. Short copies may mostly measure startup; interpret speeds cautiously.\n' >&2
+                break
+            fi
+            rm -rf -- "$local_root/$case_name"
+            [[ $mode != pull ]] || remote "rm -rf $(quote "$source")"
+            amount=$next
+            printf 'Increasing the dataset automatically...\n'
+        done
+        printf '%s: %s bytes per trial, %s tools × %s rounds.\n' "$case_name" "$bytes" "${#tools[@]}" "$rounds"
         for ((round=1; round<=rounds; round++)); do
             for ((offset=0; offset<${#tools[@]}; offset++)); do
                 index=$(((round - 1 + offset) % ${#tools[@]}))
@@ -377,6 +470,7 @@ main() {
                 printf '\n%s: %s, trial %s/%s (%s bytes)\n' "$case_name" "$tool" "$round" "$rounds" "$bytes"
                 run timed_copy "$tool" "$source" "$destination" || fail "$tool failed; no successful result recorded for this trial."
                 seconds=$(cat "$local_root/time")
+                printf 'Checking copied data...\n'
                 if [[ $mode == push ]]; then remote_manifest "$destination" > "$local_root/actual"
                 else manifest "$destination" > "$local_root/actual"; fi
                 cmp "$local_root/expected" "$local_root/actual" || fail "$tool destination content check failed."

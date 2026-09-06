@@ -747,6 +747,12 @@ for benchmark_mode in push pull; do
         --mode "$benchmark_mode" --host destination --workload both --size quick \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
+# Automatic sizing uses the real terminal timing from each remote direction.
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small \
+        --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
+done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
 rmdir "$benchmark_parent"
@@ -759,7 +765,7 @@ cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
-    --workload large --rounds 1 --source-dir "$cancel_parent" \
+    --workload large --size quick --rounds 1 --source-dir "$cancel_parent" \
     --dest-dir /tmp/benchmark-cancel &
 benchmark_pid=$!
 attempt=0

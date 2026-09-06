@@ -197,6 +197,14 @@ This observes destination state; it does not attest source completeness.
 Exactly one terminal record, always last when the stream completes. Common
 fields are `status`, `exit_code`, `dry_run`, `errors`, and `elapsed_ms`.
 
+Copy terminals may also include `copying_elapsed_ms`: the wall-clock span from
+first file work to last completed file work across workers, including per-file
+checks, finalization and gaps. Initial setup before file work is excluded;
+planning and connections can overlap this interval. It is not a sum of worker
+times or pure network time. The field is absent when no bytes moved or the
+coordinator does not supply it, including older releases and attested terminals.
+Use `elapsed_ms` for end-to-end throughput comparisons.
+
 Copy totals include transferred/unchanged/excluded files, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
 `deletions_planned`, `deletions_completed`, and `deletions_blocked`. A fatal

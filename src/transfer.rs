@@ -1028,6 +1028,7 @@ fn attempt_small_copy(
             len: entry.size as u32,
         })
         .collect();
+    let copying = progress.copying_interval();
     let mut blocks = if reads.is_empty() {
         Vec::new()
     } else {
@@ -1265,6 +1266,7 @@ fn attempt_small_copy(
     } else {
         ("success", 0)
     };
+    drop(copying);
     let terminal = crate::results::ResultRecord {
         status,
         exit_code,
@@ -1278,6 +1280,7 @@ fn attempt_small_copy(
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
+        copying_elapsed_ms: progress.copying_elapsed_ms(),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned: None,
         deletions_completed: None,
@@ -1486,6 +1489,11 @@ pub fn run(args: Args) -> Result<i32> {
                     progress.bytes_done.load(Relaxed)
                 },
                 bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
+                copying_elapsed_ms: if verify_only || dry_run {
+                    None
+                } else {
+                    progress.copying_elapsed_ms()
+                },
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
                 // What the deletion pass did before the run died; zeros
                 // mean it never got that far, and status "failed" already
@@ -3396,6 +3404,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             progress.bytes_done.load(Relaxed)
         },
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
+        copying_elapsed_ms: if opts.verify_only || opts.dry_run {
+            None
+        } else {
+            progress.copying_elapsed_ms()
+        },
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
         deletions_planned,
         deletions_completed,
@@ -3464,6 +3477,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &terminal,
                 elapsed,
                 &deletion_summary(delete_plan, deleted, opts.max_delete),
+            );
+        }
+    }
+    if args.stats && !args.quiet && !opts.verify_only && !opts.dry_run {
+        if let Some(ms) = progress.copying_elapsed_ms() {
+            crate::output::human_stdout!(
+                "  copying interval: {:.3}s (may overlap planning)",
+                ms as f64 / 1000.0
             );
         }
     }
@@ -7370,6 +7391,8 @@ impl Worker {
                     return Ok(());
                 }
                 Item::File(idx) => {
+                    let progress = self.progress.clone();
+                    let _copying = progress.copying_interval();
                     if self.fast_eligible(idx) {
                         let target = self
                             .sched
@@ -7434,6 +7457,8 @@ impl Worker {
                     }
                 }
                 Item::Range(h) => {
+                    let progress = self.progress.clone();
+                    let _copying = progress.copying_interval();
                     let (idx, start) = {
                         let range = h.lock().unwrap();
                         (range.idx, range.pos)
@@ -7461,6 +7486,8 @@ impl Worker {
                     }
                 }
                 Item::Finish { idx, matched } => {
+                    let progress = self.progress.clone();
+                    let _copying = progress.copying_interval();
                     let result = if matched {
                         self.finish_matched_file(idx)
                     } else {
