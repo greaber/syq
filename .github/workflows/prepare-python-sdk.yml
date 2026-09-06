@@ -115,7 +115,7 @@ jobs:
             "- sets the Python SDK version to match syq $SYQ_VERSION" \
             "- embeds the exact signed v$SYQ_VERSION release manifest" \
             "- updates the managed executable cache documentation" \
-            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await the post-merge workflows on the exact merge commit. The release orchestrator will then sign sdk-python-v$PYTHON_VERSION, approve the protected pypi environment, and verify publication.")
+            "The preparation workflow ran the pinned SDK release-tool and unit-test suites before opening this pull request. It will explicitly run and await post-merge Python SDK validation on the exact merge commit. The release orchestrator will then sign sdk-python-v$PYTHON_VERSION, approve the protected pypi environment, and verify publication.")
           pr_url=$(gh pr create \
             --base master \
             --head "$branch" \
@@ -131,8 +131,8 @@ jobs:
           git merge-base --is-ancestor "$head_sha" "$merge_sha"
           git merge-base --is-ancestor "$merge_sha" origin/master
           git push origin "$merge_sha:refs/heads/$branch"
-          echo "Merged $pr_url at $merge_sha; running post-merge workflows"
+          echo "Merged $pr_url at $merge_sha; running post-merge Python SDK validation"
           scripts/run-generated-sdk-post-merge-ci.sh \
             "$GITHUB_REPOSITORY" "$branch" "$merge_sha"
           git push origin --delete "$branch"
-          echo "Post-merge workflows passed for $merge_sha"
+          echo "Post-merge Python SDK validation passed for $merge_sha"

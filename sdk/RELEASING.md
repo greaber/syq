@@ -138,9 +138,11 @@ immediately without starting pull-request CI.
 GitHub suppresses ordinary push-triggered workflows when a merge uses the
 repository's `GITHUB_TOKEN`. To preserve post-merge validation, the preparation
 workflow advances the automation branch to the exact merge commit and
-explicitly dispatches `ci.yml`, `rsync-compat.yml`, and `macos.yml` on that ref.
-It verifies that each returned run targets the merge commit, waits for all three
-runs, and requires the CI run's substantive `sdks` job to succeed before
+explicitly dispatches `ci.yml` with that commit as its scope. The CI selector
+then runs the substantive `sdks` job for the generated Python-only change and
+does not repeat the native, rsync, or macOS checks already certified for the
+immutable syq release. The workflow verifies that the returned run targets the
+merge commit, waits for it, and requires its `sdks` job to succeed before
 deleting the automation branch. A failure leaves the generated SDK changes
 merged and the branch available for diagnosis; it does not block unrelated
 merges. The repository keeps the default workflow token read only and grants

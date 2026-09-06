@@ -44,9 +44,26 @@ elif [ -n "$event_path" ] && [ -f "$event_path" ]; then
       diff_range="$base..$head"
       ;;
     workflow_dispatch)
-      run_everything
-      echo 'CI scope: manual run; running every check' >&2
-      exit 0
+      # A generated SDK follow-up uses a workflow dispatch because GitHub does
+      # not trigger push workflows for merges made with GITHUB_TOKEN. It passes
+      # the checked-out merge commit so this path has the same precise scope as
+      # a normal push. Other manual runs retain the full-suite default.
+      if [ -z "${SYQ_CI_SCOPE_COMMIT:-}" ]; then
+        run_everything
+        echo 'CI scope: manual run; running every check' >&2
+        exit 0
+      fi
+      [[ "$SYQ_CI_SCOPE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "invalid CI scope commit: $SYQ_CI_SCOPE_COMMIT" >&2
+        exit 2
+      }
+      head=$(git rev-parse HEAD)
+      [ "$head" = "$SYQ_CI_SCOPE_COMMIT" ] || {
+        echo "CI scope commit $SYQ_CI_SCOPE_COMMIT is not checked out (found $head)" >&2
+        exit 1
+      }
+      base=$(git rev-parse "$head^")
+      diff_range="$base..$head"
       ;;
     *)
       echo "unsupported GitHub event in $event_path" >&2
