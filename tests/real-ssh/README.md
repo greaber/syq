@@ -108,7 +108,8 @@ The shell dependencies are installed only in the test image.
 
 The source-shell remote-copy checks use `--via @laptop` without a source key or
 agent. They cover local approval despite automatic local receiving, denial,
-direct TCP, preview/verification, protected destination authority files,
+direct TCP, cached and missing helper startup, a second approval during slow
+SSH setup, preview/verification, protected destination authority files,
 unreachable data ports, and revocation followed by an approved retry.
 
 The suite also runs the standalone interactive benchmark in noninteractive

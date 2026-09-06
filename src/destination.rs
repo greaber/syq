@@ -854,31 +854,31 @@ impl Drop for OwnedSsh {
         let _ = self.0.wait();
     }
 }
+const RETURN_SSH_OPTIONS: &[&str] = &[
+    "-a",
+    "-x",
+    "-T",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
 fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-a",
-        "-x",
-        "-T",
-        "-o",
-        "ForwardAgent=no",
-        "-o",
-        "ForwardX11=no",
-        "-o",
-        "PermitLocalCommand=no",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        "ControlPath=none",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=10",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-    ]);
+    // This connection installs a remote forward and follows the user's host-key
+    // policy. The outbound --via connection adds stricter options of its own.
+    cmd.args(RETURN_SSH_OPTIONS)
+        .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
     if let Some(user) = &endpoint.user {
         cmd.arg("-l").arg(user);
     }

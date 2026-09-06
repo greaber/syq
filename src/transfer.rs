@@ -330,7 +330,9 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
 }
 
 fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
-    if spec.bootstrap_helper {
+    if spec.forwarded.is_some() {
+        "approved return connection"
+    } else if spec.bootstrap_helper {
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {
@@ -1384,10 +1386,12 @@ fn handle_tcp_setup_error(
         sched.abort();
         progress.stop();
         return Err(error).with_context(|| {
-            format!(
-                "{}: a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required",
-                spec.label()
-            )
+            let reason = if spec.forwarded.is_some() {
+                "--via requires direct encrypted TCP data connections"
+            } else {
+                "a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required"
+            };
+            format!("{}: {reason}", spec.label())
         });
     }
     if !args.quiet || debug() {

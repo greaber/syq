@@ -333,6 +333,16 @@ pub(crate) struct FilterPolicy {
 }
 
 impl FilterPolicy {
+    fn normalize(&mut self) {
+        // With no filters, --delete-excluded has no observable effect.
+        if self.ignore.is_empty() {
+            self.delete_excluded = false;
+            self.destination_roots.clear();
+        } else {
+            self.destination_roots.sort();
+            self.destination_roots.dedup();
+        }
+    }
     fn validate(&self, grant: &Grant) -> Result<()> {
         if self.ignore.len() > MAX_FILTER_RULES {
             bail!("signed filter-rule count exceeds the supported range");
@@ -549,13 +559,7 @@ pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest)
         operation: GrantOperation::Copy(request.copy.clone()),
     };
     let mut policy = request.constraints.clone();
-    if policy.filters.ignore.is_empty() {
-        policy.filters.destination_roots.clear();
-        policy.filters.delete_excluded = false;
-    } else {
-        policy.filters.destination_roots.sort();
-        policy.filters.destination_roots.dedup();
-    }
+    policy.filters.normalize();
     signing_payload(
         &grant,
         policy.max_file_data_bytes_per_second,
@@ -580,14 +584,7 @@ pub(crate) fn sign_grant(
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted enrollment key");
     }
-    // With no filters, --delete-excluded has no observable effect.
-    if filters.ignore.is_empty() {
-        filters.delete_excluded = false;
-        filters.destination_roots.clear();
-    } else {
-        filters.destination_roots.sort();
-        filters.destination_roots.dedup();
-    }
+    filters.normalize();
     filters.validate(&grant)?;
     let payload = signing_payload(
         &grant,

@@ -676,7 +676,7 @@ fn delegated_operand(path: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(path)
 }
 
-fn endpoint_arg(
+pub(crate) fn endpoint_arg(
     location: &Location,
     login_user: Option<&str>,
     connection_host: Option<&str>,

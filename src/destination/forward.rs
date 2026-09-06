@@ -72,25 +72,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     if args.connections_opt.is_some() && args.connections > 32 {
         bail!("--via supports at most 32 workers per copy");
     }
-    let host = destination.host.as_deref().unwrap();
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.into()
-    };
-    let target = format!(
-        "{}{}{}",
-        destination
-            .user
-            .as_ref()
-            .map(|u| format!("{u}@"))
-            .unwrap_or_default(),
-        host,
-        destination
-            .port
-            .map(|p| format!(":{p}"))
-            .unwrap_or_default()
-    );
+    let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
     let registration = load_registration(&name)?;
     let (secret, public) = crate::receipt::generate_recipient()?;
@@ -206,37 +188,23 @@ impl Receiver {
         if setup_cancelled() {
             bail!("remote copy disconnected before setup");
         }
+        // This lock only serializes decisions, not SSH setup or active copies.
+        drop(request_lock);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let mut child = ForwardChild::spawn(&encoded)?;
+        let (mut child, approved) = ForwardChild::connect(
+            &encoded,
+            &HelperRequest {
+                version: HELPER_VERSION,
+                identity: crate::identity::build().into(),
+                request,
+            },
+            Instant::now() + SETUP_TIMEOUT,
+            &setup_cancelled,
+        )?;
         let result = (|| {
-            let deadline = Instant::now() + SETUP_TIMEOUT;
-            let mut input = child.child.stdin.take().unwrap();
-            let mut output = child.child.stdout.take().unwrap();
-            write_message(
-                &mut DeadlineIo {
-                    inner: &mut input,
-                    deadline,
-                    cancelled: &setup_cancelled,
-                },
-                &HelperRequest {
-                    version: HELPER_VERSION,
-                    identity: crate::identity::build().into(),
-                    request,
-                },
-            )?;
-            let reply: Reply = read_message(&mut DeadlineIo {
-                inner: &mut output,
-                deadline,
-                cancelled: &setup_cancelled,
-            })?;
-            match reply {
-                Reply::Approved(approved) => {
-                    write_message(&mut stream, &Reply::Approved(approved))?
-                }
-                Reply::Error(error) => bail!("destination refused the copy: {error}"),
-                Reply::Ready => bail!("invalid destination setup response"),
-            }
-            drop(request_lock);
+            let input = child.child.stdin.take().unwrap();
+            let output = child.child.stdout.take().unwrap();
+            write_message(&mut stream, &Reply::Approved(approved))?;
             socket.set_read_timeout(None)?;
             socket.set_write_timeout(None)?;
             relay(socket.try_clone()?, input, output, cancelled, &mut child)
@@ -254,10 +222,109 @@ struct ForwardChild {
     closed: bool,
 }
 impl ForwardChild {
-    fn spawn(target: &str) -> Result<Self> {
-        let mut command = Command::new(std::env::current_exe()?);
-        command.args(["--return-connect", target]);
-        Self::spawn_command(command)
+    fn connect(
+        target: &str,
+        request: &HelperRequest,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Self, Approved)> {
+        for install in [false, true] {
+            let mut command = Command::new(std::env::current_exe()?);
+            command.args([
+                if install {
+                    "--return-connect-install"
+                } else {
+                    "--return-connect"
+                },
+                target,
+            ]);
+            let mut child = Self::spawn_command(command)?;
+            let reply = (|| {
+                write_message(
+                    &mut DeadlineIo {
+                        inner: child.child.stdin.as_mut().unwrap(),
+                        deadline,
+                        cancelled,
+                    },
+                    request,
+                )?;
+                read_message::<Reply>(&mut DeadlineIo {
+                    inner: child.child.stdout.as_mut().unwrap(),
+                    deadline,
+                    cancelled,
+                })
+            })();
+            match reply {
+                Ok(Reply::Approved(approved)) => return Ok((child, approved)),
+                Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
+                Ok(Reply::Ready) => bail!("invalid destination setup response"),
+                Err(error) => {
+                    // The exact-build launcher returns this code before starting
+                    // a helper. Only that cache miss may replay the setup request.
+                    let closed = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                        )
+                    });
+                    let status = if closed {
+                        child.wait_for_exit(deadline, cancelled)
+                    } else {
+                        child.close().map_err(Into::into)
+                    };
+                    if !install
+                        && status.as_ref().is_ok_and(|s| {
+                            s.code() == Some(crate::remote_helper::HELPER_MISSING_EXIT)
+                        })
+                    {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "return helper setup failed ({status:?}): {}",
+                            child.errors()
+                        )
+                    });
+                }
+            }
+        }
+        unreachable!("the second helper attempt returns its result")
+    }
+    fn wait_for_exit(
+        &mut self,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<std::process::ExitStatus> {
+        loop {
+            // Observe without reaping, so cleanup can still kill descendants
+            // without allowing the leader's PID to be reused for another group.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if info.si_signo != 0 {
+                return Ok(self.close()?);
+            }
+            if cancelled() || Instant::now() >= deadline {
+                let _ = self.close();
+                bail!("return helper stopped while waiting for its exit status");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command
@@ -290,17 +357,18 @@ impl ForwardChild {
             closed: false,
         })
     }
-    fn close(&mut self) {
+    fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
         if !self.closed {
             self.closed = true;
             unsafe {
                 libc::kill(-(self.child.id() as i32), libc::SIGKILL);
             }
-            let _ = self.child.wait();
         }
+        let status = self.child.wait();
         if let Some(capture) = self.capture.take() {
             let _ = capture.join();
         }
+        status
     }
     fn errors(&self) -> String {
         format!(
@@ -311,7 +379,7 @@ impl ForwardChild {
 }
 impl Drop for ForwardChild {
     fn drop(&mut self) {
-        self.close();
+        let _ = self.close();
     }
 }
 
@@ -367,7 +435,7 @@ fn relay(
         }
     };
     let _ = shutdown.shutdown(std::net::Shutdown::Both);
-    child.close();
+    let _ = child.close();
     let _ = upload.join();
     let _ = download.join();
     result
@@ -503,7 +571,7 @@ fn receive() -> Result<i32> {
     )?;
     Ok(0)
 }
-fn connect(target: &str) -> Result<i32> {
+fn connect(target: &str, install: bool) -> Result<i32> {
     let target =
         String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
     let endpoint = target_endpoint(&target)?;
@@ -512,33 +580,19 @@ fn connect(target: &str) -> Result<i32> {
         user: endpoint.user,
         host: endpoint.host,
         port: endpoint.port,
-        rsh: [
-            "ssh",
-            "-a",
-            "-x",
-            "-T",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "ForwardX11=no",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "PermitLocalCommand=no",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        // A return connection needs its explicit remote forwarding. This
+        // outbound copy needs no forwarding and must not ask about host keys
+        // from the background service. RemoteSpec disables multiplexing.
+        rsh: std::iter::once("ssh")
+            .chain(RETURN_SSH_OPTIONS.iter().copied())
+            .chain([
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+            ])
+            .map(str::to_owned)
+            .collect(),
         syq_path: None,
         bootstrap_helper: true,
         restricted_grant: None,
@@ -551,7 +605,9 @@ fn connect(target: &str) -> Result<i32> {
         forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
-    spec.install_helper()?;
+    if install {
+        spec.install_helper()?;
+    }
     Err(spec
         .helper_command(&["--return-receiver".into()])
         .exec()
@@ -560,11 +616,11 @@ fn connect(target: &str) -> Result<i32> {
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
         "--return-receiver" if argv.len() == 2 => Some(receive()),
-        "--return-connect" if argv.len() == 3 => Some(
+        "--return-connect" | "--return-connect-install" if argv.len() == 3 => Some(
             argv[2]
                 .to_str()
                 .context("invalid return target")
-                .and_then(connect),
+                .and_then(|target| connect(target, argv[1] == "--return-connect-install")),
         ),
         _ => None,
     }
@@ -574,6 +630,38 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker, request};
+
+    #[test]
+    fn helper_exit_status_and_stderr_survive_group_cleanup() {
+        let mut command = Command::new("sh");
+        // A descendant keeps stderr open after the launcher has exited.
+        command.args(["-c", "sleep 30 & printf missing >&2; exit 125"]);
+        let mut child = ForwardChild::spawn_command(command).unwrap();
+        let status = child
+            .wait_for_exit(Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(crate::remote_helper::HELPER_MISSING_EXIT)
+        );
+        assert_eq!(child.errors(), "\"missing\"");
+        assert_eq!(child.close().unwrap(), status);
+    }
+
+    #[test]
+    fn helper_exit_wait_remains_bounded_and_cancellable() {
+        for cancel in [false, true] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            let mut child = ForwardChild::spawn_command(command).unwrap();
+            let started = Instant::now();
+            assert!(child
+                .wait_for_exit(started + Duration::from_millis(20), &|| cancel)
+                .is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(child.child.try_wait().unwrap().is_some());
+        }
+    }
 
     #[test]
     fn duplex_control_relay_delivers_small_messages_without_waiting_for_eof() {

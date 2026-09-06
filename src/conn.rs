@@ -2821,10 +2821,12 @@ impl Endpoint {
                         Err(e) => {
                             if spec.restricted_grant.is_some() {
                                 return Err(e).with_context(|| {
-                                    format!(
-                                        "{}: signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback",
-                                        spec.label()
-                                    )
+                                    let reason = if spec.forwarded.is_some() {
+                                        "TCP data connection failed; --via requires direct encrypted TCP and cannot fall back to SSH data"
+                                    } else {
+                                        "signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback"
+                                    };
+                                    format!("{}: {reason}", spec.label())
                                 });
                             }
                             #[cfg(debug_assertions)]
@@ -2855,10 +2857,12 @@ impl Endpoint {
                 if spec.restricted_grant.is_some()
                     && !crate::destination::is_named(&spec.restricted_grant)
                 {
-                    bail!(
-                        "{}: signed receiver has no authorized TCP data connection",
-                        spec.label()
-                    );
+                    let reason = if spec.forwarded.is_some() {
+                        "--via has no authorized encrypted TCP data connection"
+                    } else {
+                        "signed receiver has no authorized TCP data connection"
+                    };
+                    bail!("{}: {reason}", spec.label());
                 }
                 Ok(Box::new(spec.connect_with_role(compress, true, role)?))
             }
