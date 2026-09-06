@@ -138,6 +138,7 @@ def tests():
                 assert title == "syq: Run this command?", title
                 assert body.startswith('"touch" '), body
                 assert "From:" in body and "In:" in body and "Runs with your permissions" in body, body
+                assert "Copy root and limits do not apply" in body, body
                 assert "Details: syq persist receive pending" in body and "Limits:" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)
             finally:

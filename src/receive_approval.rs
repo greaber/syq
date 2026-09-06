@@ -146,26 +146,34 @@ impl Summary {
             Details::Copy { destination, permission, max_delete, .. } => {
                 let mut body = format!("To: {destination}\nFrom: {}\n\n{permission}", self.from);
                 if *max_delete > 0 {
-                    body.push_str(&format!("\nDeletion limit: {max_delete} files or folders."));
+                    body.push_str(&format!("\nDeletion limit (files or folders): {max_delete}."));
                 }
                 body
             }
             Details::Command { argv, cwd, .. } => format!(
-                "{}\n\nFrom: {}\nIn: {cwd}\n\nRuns with your permissions, including access to your files.",
+                "{}\n\nFrom: {}\nIn: {cwd}\n\nRuns with your permissions. Copy root and limits do not apply.",
                 argv.join(" "), self.from
             ),
         }
     }
-    pub(crate) fn description(&self) -> String {
+    fn details_description(&self) -> String {
         let body = match &self.details {
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
-                format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine.\n\nAllow this copy once?"),
+                format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine."),
             Details::Command { argv, cwd, permission, .. } =>
-                format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.\n\nRun this command once?", argv.join(" ")),
+                format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.", argv.join(" ")),
+        };
+        format!("From: {}\n{body}", self.from)
+    }
+    pub(crate) fn description(&self) -> String {
+        let question = match self.kind() {
+            Kind::Copy => "Allow this copy once?",
+            Kind::Command => "Run this command once?",
         };
         format!(
-            "From: {}\n{body}\nLocal command: syq persist receive approve {}",
-            self.from, self.id
+            "{}\n\n{question}\nLocal command: syq persist receive approve {}",
+            self.details_description(),
+            self.id
         )
     }
 }
@@ -402,10 +410,13 @@ fn escape_markup(text: &str) -> String {
 #[cfg(target_os = "macos")]
 const APPLESCRIPT: &str = r#"on run argv
     try
+        set expiresAt to (current date) + (item 2 of argv as integer)
         set body to item 1 of argv
         set choices to {"Deny", "Details", "Allow once"}
         repeat
-            set answer to display dialog body with title (item 3 of argv) buttons choices default button "Deny" cancel button "Deny" giving up after (item 2 of argv as integer)
+            set remainingSeconds to (expiresAt - (current date)) as integer
+            if remainingSeconds <= 0 then return "expired"
+            set answer to display dialog body with title (item 3 of argv) buttons choices default button "Deny" cancel button "Deny" giving up after remainingSeconds
             if gave up of answer then return "expired"
             set choice to button returned of answer
             if choice is "Details" then
@@ -437,7 +448,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             &description,
             &lifetime.as_secs().max(1).to_string(),
             title,
-            &summary.description(),
+            &summary.details_description(),
         ]);
         cmd
     }
@@ -575,13 +586,19 @@ mod tests {
     #[test]
     fn compact_copy_prompt_keeps_deletion_limits_visible() {
         let mut summary = summary();
-        if let Details::Copy { max_delete, .. } = &mut summary.details {
-            *max_delete = 2;
+        for limit in [1, 2] {
+            if let Details::Copy { max_delete, .. } = &mut summary.details {
+                *max_delete = limit;
+            }
+            let compact = summary.desktop_description();
+            assert!(compact.contains("May create and overwrite"));
+            assert!(compact.contains(&format!("Deletion limit (files or folders): {limit}.")));
+            assert!(!compact.contains("100 bytes"));
         }
-        let compact = summary.desktop_description();
-        assert!(compact.contains("May create and overwrite"));
-        assert!(compact.contains("Deletion limit: 2 files or folders."));
-        assert!(!compact.contains("100 bytes"));
+        let desktop_details = summary.details_description();
+        assert!(desktop_details.contains("not been inspected"));
+        assert!(!desktop_details.contains("Allow this copy once?"));
+        assert!(!desktop_details.contains("Local command:"));
         let details = summary.description();
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
@@ -688,7 +705,9 @@ mod tests {
             assert_eq!(args[0], "-e");
             assert_eq!(args[1], APPLESCRIPT);
             assert_eq!(args[3], summary.desktop_description());
-            assert_eq!(args[6], summary.description());
+            assert_eq!(args[6], summary.details_description());
+            assert!(args[3].contains(text));
+            assert!(args[6].contains(text));
             assert!(!APPLESCRIPT.contains(text));
         }
     }

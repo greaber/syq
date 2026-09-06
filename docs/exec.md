@@ -27,7 +27,8 @@ receiving machine or request approval.
 
 Each command waits for approval on the receiving machine. Its desktop prompt
 puts the program and literal arguments first, followed by the requesting server,
-working directory, and a short reminder that it runs with your permissions. On
+working directory, and a reminder that it runs with your permissions outside the
+copy root and limits. On
 macOS, **Details** shows the fuller permission explanation and **Back** returns
 to the short view. Opening Details does not approve or extend the request.
 Desktop notifications may truncate long commands and hide trailing arguments.
