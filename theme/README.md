@@ -9,6 +9,9 @@ The shared UI toolkit is inventoried in site-ui.json. Every mapped file must
 remain byte-for-byte identical to the syq-bench copy, including fonts/licenses.
 It owns branding, homepage buttons, sidebars, and Contents/Theme/Search controls.
 Both sidebars use 15px links, 16px headings, 24px left and 12px right padding.
+The shared heading selector matches mdBook's element specificity so native
+styles cannot override its 18px/4px top/bottom margins. Benchmark page links
+occupy separate block rows so those margins also affect their layout.
 
 Compare from either repo before review (arguments are toolkit directories):
 
@@ -16,6 +19,12 @@ Compare from either repo before review (arguments are toolkit directories):
 
 See site/BRANDING.md in syq-bench for the inventory and copy workflow.
 Each site builds independently from its committed toolkit.
+
+File equality alone does not catch renderer overrides. After building both
+sites, run syq-bench's scripts/check-sidebar-layout.cjs with target/book as its
+argument; it checks rendered heading spacing and rows across desktop/phone,
+light/dark, resizing and the no-JS iframe fallback. See the benchmark branding
+guide for the Node/Playwright prerequisites and command.
 
 docs.css and docs.js adapt mdBook. Native search and theme handlers remain
 behind the shared controls. Print/edit actions stay below the article. The

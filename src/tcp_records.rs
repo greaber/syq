@@ -9,6 +9,8 @@ use std::io::{self, Read, Write};
 
 pub const RECORD_MAX: usize = 256 * 1024;
 pub const KEY_LEN: usize = 32;
+/// The wire ID is four bytes, but only three bytes enter the nonce.
+pub const CONNECTION_ID_MAX: u32 = 0x00ff_ffff;
 
 pub struct Cipher {
     aead: Aes256Gcm,
@@ -19,6 +21,10 @@ pub struct Cipher {
 
 impl Cipher {
     pub fn new(key: &[u8], conn_id: u32, dir: u8) -> Cipher {
+        assert!(
+            conn_id <= CONNECTION_ID_MAX,
+            "TCP connection id exceeds nonce space"
+        );
         Cipher {
             aead: Aes256Gcm::new_from_slice(key).expect("key length"),
             conn_id,
@@ -171,6 +177,36 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn encrypted_records_preserve_v041_wire_bytes() {
+        // Generated with the unchanged src/tcp_records.rs from tag v0.4.1:
+        // key [7; 32], ID 0x123456, direction 1, first record.
+        let fixture = [
+            35, 0, 0, 0, 198, 164, 119, 78, 242, 66, 129, 200, 51, 63, 3, 50, 75, 180, 63, 56, 117,
+            145, 62, 157, 157, 91, 122, 238, 3, 197, 253, 74, 74, 210, 26, 155, 127, 220, 156,
+        ];
+        let plain = b"released TCP record";
+        let mut reader = RecordReader::new(
+            Cursor::new(fixture),
+            Some(Cipher::new(&[7; KEY_LEN], 0x123456, 1)),
+        );
+        let mut decoded = [0; 19];
+        reader.read_exact(&mut decoded).unwrap();
+        assert_eq!(&decoded, plain);
+        let mut encoded = Vec::new();
+        let mut writer =
+            RecordWriter::new(&mut encoded, Some(Cipher::new(&[7; KEY_LEN], 0x123456, 1)));
+        writer.write_all(plain).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(encoded, fixture);
+    }
+
+    #[test]
+    #[should_panic(expected = "TCP connection id exceeds nonce space")]
+    fn cipher_rejects_connection_id_aliases() {
+        Cipher::new(&[7; KEY_LEN], 0x0100_0001, 1);
+    }
 
     #[test]
     fn encrypted_records_round_trip_across_nonce_counters() {

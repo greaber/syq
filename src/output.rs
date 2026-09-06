@@ -6,6 +6,22 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Mutex;
 
+/// Escape text from names or peer diagnostics without allowing terminal control.
+/// Human messages may contain our own line breaks and tabs for layout.
+fn safe_message(args: Arguments<'_>) -> String {
+    let mut result = String::new();
+    for ch in args.to_string().chars() {
+        if (ch.is_control() && !matches!(ch, '\n' | '\t'))
+            || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            result.extend(ch.escape_default());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// One lock owns both the live row and writes that can disturb it. Diagnostic
 /// writers never take a Progress lock, so worker warnings cannot invert the
 /// ticker's lock order. Redirected stdout stays outside this lock.
@@ -37,7 +53,7 @@ impl Terminal {
     fn diagnostic(&mut self, out: &mut impl Write, args: Arguments<'_>) -> io::Result<()> {
         let line = self.line.clone();
         self.clear(out)?;
-        writeln!(out, "{args}")?;
+        writeln!(out, "{}", safe_message(args))?;
         if let Some(line) = line {
             self.draw(out, line)?;
         }
@@ -71,7 +87,7 @@ pub(crate) fn emit_diagnostic(args: Arguments<'_>) {
 }
 
 pub(crate) fn emit_human_stdout(args: Arguments<'_>) {
-    if let Err(error) = write_stdout(args) {
+    if let Err(error) = write_stdout(format_args!("{}", safe_message(args))) {
         warn_stdout(&error);
     }
 }
@@ -112,6 +128,23 @@ pub(crate) use human_stdout;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_diagnostics_cannot_control_the_terminal() {
+        let mut output = Vec::new();
+        Terminal::default()
+            .diagnostic(
+                &mut output,
+                format_args!("name: \x1b]52;c;ZXZpbA==\x07\r\u{202e}"),
+            )
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\x07'));
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("\\u{1b}]52"));
+    }
 
     #[test]
     fn diagnostics_get_a_clean_row_and_restore_the_bar() {

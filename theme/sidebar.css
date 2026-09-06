@@ -17,8 +17,10 @@
 .chapter li a:hover,#benchmark-sidebar a:hover{color:var(--syq);text-decoration:underline}
 .chapter li a.active,.chapter a.current-header,
 #benchmark-sidebar a[aria-current]{color:var(--syq)}
-.chapter .part-title,#benchmark-sidebar .page-link{
+/* Match mdBook's element specificity so its native margins cannot win. */
+.chapter li.part-title,#benchmark-sidebar .page-link{
  font:700 16px/1.5 var(--display);margin:18px 0 4px;padding:0}
+#benchmark-sidebar .page-link{display:block}
 #benchmark-sidebar .page-link:first-child{margin-top:0}
 .chapter .section,#benchmark-sidebar .scenario-links{padding-left:16px}
 .chapter .on-this-page{
