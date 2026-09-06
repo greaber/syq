@@ -17,12 +17,15 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         diffutils \
+        fish \
         iptables \
         iproute2 \
         netcat-openbsd \
         openssh-client \
         openssh-server \
         procps \
+        python3 \
+        zsh \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 syq \
     && useradd --uid 1000 --gid syq --create-home --shell /bin/sh syq \
@@ -35,5 +38,7 @@ COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
 COPY --chmod=0755 tests/real-ssh/entrypoint.sh /usr/local/libexec/syq-real-ssh-entrypoint
 COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-scenarios
 COPY tests/real-ssh/sshd_config /etc/ssh/sshd_config
+
+COPY tests/real-ssh/test-completion-display.py /usr/local/libexec/syq-test-completion-display.py
 
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

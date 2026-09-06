@@ -29,12 +29,13 @@ const MAX_CACHED_ENDPOINTS: usize = 100;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024;
 const MAX_DIRECTORY_CANDIDATES: u16 = 1_000;
 const REMOTE_COMPLETION_DEADLINE: Duration = Duration::from_secs(40);
+const COMPLETION_DETAILS_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 #[command(
     name = "syq completion",
     about = "Generate shell completion and manage its disposable local cache",
-    long_about = "Generate dynamic shell completion and manage its disposable local endpoint cache. The cache contains suggestions learned from successful SSH connections. It is safe to clear and never contains paths, credentials, or transfer history."
+    long_about = "Generate dynamic shell completion and manage its disposable local endpoint cache. Path completion includes permissions, ownership, size and modification time in match lists. The cache contains suggestions learned from successful SSH connections. It is safe to clear and never contains paths, credentials, or transfer history."
 )]
 struct CompletionCommand {
     #[command(subcommand)]
@@ -143,6 +144,7 @@ struct Candidate {
     /// Completing this value should leave the cursor attached. Directories
     /// already end in `/`; rsync endpoints already end in `:`.
     no_space: bool,
+    detail: Option<String>,
 }
 
 impl Candidate {
@@ -150,6 +152,7 @@ impl Candidate {
         Self {
             value: value.into(),
             no_space: false,
+            detail: None,
         }
     }
 
@@ -157,6 +160,7 @@ impl Candidate {
         Self {
             value: value.into(),
             no_space: true,
+            detail: None,
         }
     }
 }
@@ -479,6 +483,10 @@ fn update_cache(mut update: impl FnMut(&mut CompletionCache) -> bool) -> Result<
     Ok(true)
 }
 
+fn details_requested() -> bool {
+    std::env::var_os("SYQ_COMPLETION_DETAILS").is_some_and(|value| value == "1")
+}
+
 fn write_candidates(shell: CompletionShell, candidates: Vec<Candidate>) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let mut seen = HashSet::new();
@@ -486,10 +494,39 @@ fn write_candidates(shell: CompletionShell, candidates: Vec<Candidate>) -> Resul
         if candidate.value.contains(&0) || !seen.insert(candidate.value.clone()) {
             continue;
         }
-        if !matches!(shell, CompletionShell::Fish) {
-            stdout.write_all(if candidate.no_space { b"p" } else { b"f" })?;
+        if details_requested() && matches!(shell, CompletionShell::Bash) {
+            // Bash asks for display-only matches with COMP_TYPE=63. These
+            // records must never be returned to an insertion request.
+            stdout.write_all(b"d")?;
+            let name = crate::completion_details::display_bytes(&candidate.value);
+            let row = candidate.detail.as_ref().map_or(name.clone(), |detail| {
+                crate::completion_details::display_row(detail, &candidate.value)
+            });
+            stdout.write_all(row.as_bytes())?;
+        } else {
+            if !matches!(shell, CompletionShell::Fish) {
+                stdout.write_all(if candidate.no_space { b"p" } else { b"f" })?;
+            }
+            stdout.write_all(&candidate.value)?;
+            if details_requested() {
+                if matches!(shell, CompletionShell::Fish) {
+                    if let Some(detail) = &candidate.detail {
+                        // Fish reserves tabs/newlines in its description protocol.
+                        if !candidate.value.contains(&b'\t') && !candidate.value.contains(&b'\n') {
+                            stdout.write_all(b"\t")?;
+                            stdout.write_all(detail.as_bytes())?;
+                        }
+                    }
+                } else {
+                    stdout.write_all(&[0])?;
+                    let name = crate::completion_details::display_bytes(&candidate.value);
+                    let row = candidate.detail.as_ref().map_or(name.clone(), |detail| {
+                        crate::completion_details::display_row(detail, &candidate.value)
+                    });
+                    stdout.write_all(row.as_bytes())?;
+                }
+            }
         }
-        stdout.write_all(&candidate.value)?;
         stdout.write_all(&[0])?;
     }
     Ok(())
@@ -1491,36 +1528,52 @@ fn remote_path_candidates(
             syq_path,
             no_bootstrap,
         );
-        let (result, connection) = match connection {
+        match connection {
             Ok(mut connection) => {
                 let result = list_remote_entries(
                     &mut connection,
-                    directory_for_thread,
-                    root_for_thread,
-                    prefix_for_thread,
+                    directory_for_thread.clone(),
+                    root_for_thread.clone(),
+                    prefix_for_thread.clone(),
                     symlink_policy,
+                    false,
                 );
-                (result, Some(connection))
+                let names_available = result.is_ok();
+                let _ = sender.send(result);
+                if names_available && details_requested() {
+                    let result = list_remote_entries(
+                        &mut connection,
+                        directory_for_thread,
+                        root_for_thread,
+                        prefix_for_thread,
+                        symlink_policy,
+                        true,
+                    );
+                    let _ = sender.send(result);
+                }
+                // Return entries before connection teardown, which can cost
+                // another network round trip. Process exit retires this worker.
+                drop(connection);
             }
-            Err(error) => (Err(error), None),
-        };
-        // Hand the entries back before closing the connection. Closing it
-        // sends Shutdown and then waits for the remote helper's exit status,
-        // a whole network round trip that must not delay the candidates. The
-        // process exits once they are printed; the ssh child finishes on its
-        // own.
-        let _ = sender.send(result);
-        drop(connection);
+            Err(error) => {
+                let _ = sender.send(Err(error));
+            }
+        }
     });
-    let entries = receiver
+    let (mut entries, mut details) = receiver
         .recv_timeout(REMOTE_COMPLETION_DEADLINE)
         .map_err(|_| anyhow!("remote completion timed out after 40 seconds"))??;
-    Ok(path_candidates_from_entries(
-        &wrapper,
-        &typed_directory,
-        &prefix,
-        entries,
-    ))
+    if details_requested() {
+        match receiver.recv_timeout(COMPLETION_DETAILS_DEADLINE) {
+            Ok(Ok(result)) => (entries, details) = result,
+            _ => details = vec!["[metadata unavailable]".into(); entries.len()],
+        }
+    }
+    let mut candidates = path_candidates_from_entries(&wrapper, &typed_directory, &prefix, entries);
+    for (candidate, detail) in candidates.iter_mut().zip(details) {
+        candidate.detail = Some(detail);
+    }
+    Ok(candidates)
 }
 
 fn connect_completion_endpoint(
@@ -1576,15 +1629,49 @@ fn list_remote_entries(
     confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
     symlink_policy: OperatorSymlinkPolicy,
-) -> Result<Vec<CompletionEntry>> {
-    match connection.call(Request::ListDir {
-        directory,
-        confined_root,
-        prefix: prefix.clone(),
-        limit: MAX_DIRECTORY_CANDIDATES,
-        symlink_policy,
-    })? {
-        Response::DirectoryEntries { entries, .. } => validate_completion_entries(entries, &prefix),
+    detailed: bool,
+) -> Result<(Vec<CompletionEntry>, Vec<String>)> {
+    let request = if detailed {
+        Request::ListDirDetails {
+            directory,
+            confined_root,
+            prefix: prefix.clone(),
+            limit: MAX_DIRECTORY_CANDIDATES,
+            symlink_policy,
+        }
+    } else {
+        Request::ListDir {
+            directory,
+            confined_root,
+            prefix: prefix.clone(),
+            limit: MAX_DIRECTORY_CANDIDATES,
+            symlink_policy,
+        }
+    };
+    match connection.call(request)? {
+        Response::DirectoryEntries { entries, .. } => {
+            Ok((validate_completion_entries(entries, &prefix)?, Vec::new()))
+        }
+        Response::DetailedDirectoryEntries {
+            entries,
+            mut details,
+            truncated,
+        } => {
+            if entries.len() != details.len() || details.iter().any(|detail| detail.len() > 16384) {
+                bail!("invalid remote completion details");
+            }
+            let entries = validate_completion_entries(entries, &prefix)?;
+            if truncated {
+                if let Some(last) = details.last_mut() {
+                    last.push_str(" [listing limited; narrow the prefix]");
+                }
+            }
+            let details = details
+                .iter()
+                .map(|detail| crate::completion_details::display_bytes(detail.as_bytes()))
+                .collect();
+            Ok((entries, details))
+        }
         Response::EndpointError(error) => Err(crate::conn::endpoint_error(error)),
         Response::Err(error) => bail!("list remote directory: {error}"),
         response => bail!("unexpected remote completion response: {response:?}"),
@@ -1677,7 +1764,24 @@ fn local_path_candidates_at(
         });
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    path_candidates_from_entries(&[], &typed_directory, &prefix, entries)
+    let details = if details_requested() {
+        let path = crate::fsops::resolve(&directory.path);
+        let detail_entries = entries.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::completion_details::describe(&path, &detail_entries));
+        });
+        receiver
+            .recv_timeout(COMPLETION_DETAILS_DEADLINE)
+            .unwrap_or_else(|_| vec!["[metadata unavailable]".into(); entries.len()])
+    } else {
+        Vec::new()
+    };
+    let mut candidates = path_candidates_from_entries(&[], &typed_directory, &prefix, entries);
+    for (candidate, detail) in candidates.iter_mut().zip(details) {
+        candidate.detail = Some(detail);
+    }
+    candidates
 }
 
 fn apply_path_base(base: Option<SourceBase<'_>>, directory: &[u8]) -> Option<CompletionDirectory> {
@@ -2022,14 +2126,26 @@ fn option_arguments(args: &[Vec<u8>]) -> impl Iterator<Item = &[u8]> {
 
 const BASH_ADAPTER: &str = r#"# syq dynamic completion
 _syq_complete() {
-    local record kind no_space=0
+    local record kind no_space=0 details=0 width
+    [[ ${COMP_TYPE-} == 63 ]] && details=1
     COMPREPLY=()
     while IFS= read -r -d '' record; do
         kind=${record:0:1}
-        COMPREPLY+=("${record:1}")
+        if [[ $kind == d && $details == 1 ]]; then
+            # A row wider than half the terminal forces one match per line.
+            width=$(( ${COLUMNS:-80} / 2 + 1 ))
+            printf -v record '%-*s' "$width" "${record:1}"
+            COMPREPLY+=("$record")
+        elif [[ $kind != d ]]; then
+            COMPREPLY+=("${record:1}")
+        fi
         [[ $kind == p ]] && no_space=1
-    done < <(command syq completion __complete-bash "${COMP_WORDS[COMP_CWORD]-}" -- "${COMP_LINE:0:COMP_POINT}")
-    compopt -o filenames 2>/dev/null || true
+    done < <(SYQ_COMPLETION_DETAILS=$details command syq completion __complete-bash "${COMP_WORDS[COMP_CWORD]-}" -- "${COMP_LINE:0:COMP_POINT}")
+    if (( details )); then
+        compopt +o filenames -o nosort 2>/dev/null || true
+    else
+        compopt -o filenames 2>/dev/null || true
+    fi
     (( no_space )) && compopt -o nospace 2>/dev/null || true
 }
 complete -F _syq_complete syq
@@ -2037,18 +2153,21 @@ complete -F _syq_complete syq
 
 const ZSH_ADAPTER: &str = r#"#compdef syq
 _syq_complete() {
-    local record kind
-    local -a values prefixes
+    local record kind description
+    local -a values prefixes descriptions prefix_descriptions
     while IFS= read -r -d $'\0' record; do
         kind=${record[1]}
+        IFS= read -r -d $'\0' description || break
         if [[ $kind == p ]]; then
             prefixes+=("${record[2,-1]}")
+            prefix_descriptions+=("$description")
         else
             values+=("${record[2,-1]}")
+            descriptions+=("$description")
         fi
-    done < <(command syq completion __complete zsh "$((CURRENT - 1))" -- "${words[@]}")
-    (( ${#values} )) && compadd -- "${values[@]}"
-    (( ${#prefixes} )) && compadd -S '' -- "${prefixes[@]}"
+    done < <(SYQ_COMPLETION_DETAILS=1 command syq completion __complete zsh "$((CURRENT - 1))" -- "${words[@]}")
+    (( ${#values} )) && compadd -l -d descriptions -- "${values[@]}"
+    (( ${#prefixes} )) && compadd -l -d prefix_descriptions -S '' -- "${prefixes[@]}"
 }
 compdef _syq_complete syq
 "#;
@@ -2058,7 +2177,7 @@ function __syq_complete
     set -l words (commandline -opc)
     set -l index (count $words)
     set -l current (commandline -ct)
-    command syq completion __complete fish $index -- $words "$current" | string split0
+    SYQ_COMPLETION_DETAILS=1 command syq completion __complete fish $index -- $words "$current" | string split0
 end
 complete -c syq -f -a '(__syq_complete)'
 "#;

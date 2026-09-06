@@ -118,6 +118,21 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: shell completion adapters parse and keep descriptions separate\n'
+for completion_shell in bash zsh fish; do
+    python3 /usr/local/libexec/syq-test-completion-display.py --syq /usr/local/bin/syq --shell "$completion_shell"
+done
+syq completion bash > /tmp/syq-completion.bash
+bash -n /tmp/syq-completion.bash
+syq completion zsh > /tmp/syq-completion.zsh
+zsh -n /tmp/syq-completion.zsh
+syq completion fish > /tmp/syq-completion.fish
+fish -n /tmp/syq-completion.fish
+mkdir -p /tmp/syq-real-ssh/completion-adapters
+printf 'hello' > /tmp/syq-real-ssh/completion-adapters/alpha
+fish -c 'source /tmp/syq-completion.fish; complete -C "syq cp /tmp/syq-real-ssh/completion-adapters/al"' > /tmp/syq-fish-details
+awk -F '\t' '$1 == "/tmp/syq-real-ssh/completion-adapters/alpha" && $2 ~ /^-rw/ && $2 ~ /5 B/ && $2 ~ /UTC/ { found=1 } END { exit !found }' /tmp/syq-fish-details
+
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
 # Observe the environment at the remote helper, after real SendEnv/AcceptEnv
@@ -231,6 +246,16 @@ awk '
 ' /tmp/syq-real-ssh-completion-env.out
 unset SYQ_REAL_SSH_SENT_ENV
 syq completion cache clear >/dev/null
+
+printf 'case: remote completion details use remote metadata without persistence\n'
+SYQ_COMPLETION_DETAILS=1 syq completion __complete fish 4 -- syq cp --from source /tmp/syq-real-ssh/completion/al > /tmp/syq-completion-details
+tr '\000' '\n' < /tmp/syq-completion-details > /tmp/syq-completion-details-lines
+awk -F '\t' '
+    $1 == "/tmp/syq-real-ssh/completion/alpha file" && $2 ~ /^-rw/ && $2 ~ /syq +syq/ && $2 ~ /0 B/ && $2 ~ /UTC/ { file=1 }
+    $1 == "/tmp/syq-real-ssh/completion/alpine/" && $2 ~ /^d/ && $2 ~ /UTC/ { directory=1 }
+    END { exit !(file && directory) }
+' /tmp/syq-completion-details-lines
+
 
 printf 'case: small native push to an ordinary SSH destination takes one turn\n'
 small_source=/tmp/syq-real-ssh-small.bin

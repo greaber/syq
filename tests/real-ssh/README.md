@@ -82,3 +82,13 @@ successful default-profile validation for the complete clean tree, reusable
 across an identical-tree merge. See `RELEASING.md` for the evidence rules.
 A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
+
+The default suite also runs interactive Bash, Zsh, and fish completion checks
+in disposable PTYs. They verify that the detail view shows metadata while
+completion inserts only the pathname. To run the Bash check locally:
+
+```sh
+python3 tests/real-ssh/test-completion-display.py --syq target/debug/syq
+```
+
+The shell dependencies are installed only in the test image.
