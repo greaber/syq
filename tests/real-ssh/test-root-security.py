@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Privileged-copy checks confined to the disposable OpenSSH runner container."""
+import ctypes
 import os
 from pathlib import Path
 import signal
@@ -18,15 +19,30 @@ def stop_group(process):
     except ProcessLookupError:
         pass
     process.wait(timeout=5)
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        return
-    raise AssertionError("copy process group survived cancellation")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        # The test is a subreaper, so helpers orphaned by the killed copier
+        # become our children. Reap them before checking group disappearance.
+        try:
+            while os.waitpid(-process.pid, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            pass
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        print(f"Waiting for killed copy process group {process.pid} to exit", flush=True)
+        time.sleep(0.1)
+    raise AssertionError(f"copy process group {process.pid} survived cancellation deadline")
 
 
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER, Linux lab only
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
     with tempfile.TemporaryDirectory(prefix="syq-root-security-") as temporary:
         root = Path(temporary)
         for interface in ["native", "native-owner", "rsync"]:
