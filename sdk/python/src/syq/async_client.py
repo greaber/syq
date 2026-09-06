@@ -626,6 +626,7 @@ class AsyncClient:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
+        auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
         rsh: str | None = None,
@@ -707,6 +708,10 @@ class AsyncClient:
             min_size=min_size,
             max_delete=max_delete,
         )
+        if auth_from is not None and via is not None:
+            raise SyqInvocationError("auth_from conflicts with via")
+        if auth_from is not None:
+            argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
         if via is not None:
             argv.extend(("--via", _text_arg(via, label="via")))
         _append_remote_arguments(

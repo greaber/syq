@@ -17946,34 +17946,36 @@ fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 99\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    for (prefix, expected) in [
-        ("lap", b"laptop\0".as_slice()),
-        ("@lap", b"@laptop\0"),
-        ("absent", b""),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args([
-                "completion",
-                "__complete",
-                "fish",
-                "6",
-                "--",
-                "syq",
-                "cp",
-                "source",
-                "--to",
-                "backup",
-                "--via",
-                prefix,
-            ])
-            .env("HOME", t.path(""))
-            .env("PATH", t.path("bin"))
-            .env("SYQ_NO_UPDATE_CHECK", "1")
-            .current_dir(t.path(""))
-            .output()
-            .unwrap();
-        assert_output_ok(&output);
-        assert_eq!(output.stdout, expected, "{prefix}");
+    for option in ["--via", "--auth-from"] {
+        for (prefix, expected) in [
+            ("lap", b"laptop\0".as_slice()),
+            ("@lap", b"@laptop\0"),
+            ("absent", b""),
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "completion",
+                    "__complete",
+                    "fish",
+                    "6",
+                    "--",
+                    "syq",
+                    "cp",
+                    "source",
+                    "--to",
+                    "backup",
+                    option,
+                    prefix,
+                ])
+                .env("HOME", t.path(""))
+                .env("PATH", t.path("bin"))
+                .env("SYQ_NO_UPDATE_CHECK", "1")
+                .current_dir(t.path(""))
+                .output()
+                .unwrap();
+            assert_output_ok(&output);
+            assert_eq!(output.stdout, expected, "{prefix}");
+        }
     }
     assert!(!t.path("ssh-used").exists());
 }
@@ -17987,34 +17989,36 @@ fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
         b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    for extra in [
-        vec![],
-        vec!["--no-tcp"],
-        vec!["--tcp-plain"],
-        vec!["--detach"],
-        vec!["--rsh", "ssh"],
-        vec!["--syq-path", "/opt/syq"],
-        vec!["--no-bootstrap"],
-        vec!["--coordinate-at", "dst"],
-        vec!["--peer-auth", "full-agent"],
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["cp", "source", "--to", "backup", "--via", "@laptop"])
-            .args(extra)
-            .current_dir(t.path(""))
-            .env("HOME", t.path(""))
-            .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
-            .env("PATH", t.path("bin"))
-            .env("SYQ_NO_UPDATE_CHECK", "1")
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "{:?}", output);
-        assert!(
-            !t.path("ssh-used").exists(),
-            "--via attempted ordinary SSH: {:?}",
-            output
-        );
+    for option in ["--via", "--auth-from"] {
+        for extra in [
+            vec![],
+            vec!["--no-tcp"],
+            vec!["--tcp-plain"],
+            vec!["--detach"],
+            vec!["--rsh", "ssh"],
+            vec!["--syq-path", "/opt/syq"],
+            vec!["--no-bootstrap"],
+            vec!["--coordinate-at", "dst"],
+            vec!["--peer-auth", "full-agent"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["cp", "source", "--to", "backup", option, "@laptop"])
+                .args(extra)
+                .current_dir(t.path(""))
+                .env("HOME", t.path(""))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_RUNTIME_DIR", t.path("runtime"))
+                .env("PATH", t.path("bin"))
+                .env("SYQ_NO_UPDATE_CHECK", "1")
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{:?}", output);
+            assert!(
+                !t.path("ssh-used").exists(),
+                "--via attempted ordinary SSH: {:?}",
+                output
+            );
+        }
     }
     assert_eq!(fs::read(t.path("source")).unwrap(), b"payload");
 }
@@ -18040,4 +18044,226 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
     let previous: serde_json::Value = serde_json::from_slice(old).unwrap();
     assert_eq!(status["settings"], previous);
     assert_eq!(fs::read(path).unwrap(), old);
+}
+
+#[test]
+fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
+    let registry = t.path(".syq-destinations-v2");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("return.sock");
+    for name in ["a-offline", "b-old-build", "laptop", "ssh", "z-other"] {
+        let registration = serde_json::json!({
+            "version": 2,
+            "identity": if name == "b-old-build" { "another-build" } else { identity.trim() },
+            "socket": if name == "a-offline" { t.path("absent.sock") } else { socket_path.clone() },
+            "secret": name,
+        });
+        let file = registry.join(format!("{name}.json"));
+        write(&file, &serde_json::to_vec(&registration).unwrap());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let responder = std::thread::spawn(move || {
+        let mut messages = Vec::new();
+        for _ in 0..4 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut progress = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "authorizer expected another request; saw {messages:?}"
+                        );
+                        if Instant::now() >= progress {
+                            eprintln!("Waiting for authorization request; saw {messages:?}");
+                            progress += Duration::from_secs(5);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let response = if envelope["message"] == "Ping" {
+                serde_json::json!("Ready")
+            } else {
+                assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
+                serde_json::json!({"Error": "copy denied by fixture"})
+            };
+            messages.push(envelope);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            socket
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&bytes).unwrap();
+        }
+        messages
+    });
+    let refused = run(&[
+        "cp",
+        "source",
+        "--to",
+        "backup",
+        "--results",
+        "result.ndjson",
+    ]);
+    assert!(
+        stderr_of(&refused).contains("copy denied by fixture"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!refused.status.success());
+    assert!(!t.path("ssh-used").exists());
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["status"], "failed");
+
+    // Unsupported options and explicit SSH never ask a receiving machine.
+    for extra in [
+        vec!["--auth-from", "ssh"],
+        vec!["--no-tcp"],
+        vec!["--update"],
+        vec!["--preserve", "ownership"],
+        vec!["--inplace"],
+        vec!["--min-size", "1"],
+        vec!["--prune", "--into", "out"],
+        vec!["--into", "~//archive"],
+    ] {
+        let mut args = vec!["cp", "source", "--to", "backup"];
+        args.extend(extra);
+        let output = run(&args);
+        assert!(!output.status.success());
+        assert!(
+            t.path("ssh-used").exists(),
+            "{args:?}: {}",
+            stderr_of(&output)
+        );
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    let selected = run(&["cp", "source", "--to", "backup", "--auth-from", "@z-other"]);
+    assert!(stderr_of(&selected).contains("copy denied by fixture"));
+    assert!(!t.path("ssh-used").exists());
+
+    // Captured from the unchanged released v0.4.0 SDK, not this CLI/SDK writer.
+    let old: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/copy-via-v0.4.0.json")).unwrap();
+    let argv: Vec<_> = old["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let legacy = run(&argv);
+    assert!(
+        stderr_of(&legacy).contains("copy denied by fixture"),
+        "{}",
+        stderr_of(&legacy)
+    );
+    assert!(!t.path("ssh-used").exists());
+    let messages = responder.join().unwrap();
+    assert_eq!(messages[0]["secret"], "laptop");
+    assert_eq!(messages[0]["message"], "Ping");
+    assert_eq!(messages[1]["secret"], "laptop");
+    assert_eq!(messages[2]["secret"], "z-other");
+    assert_eq!(messages[3]["secret"], "ssh");
+    // The registry remains, but every socket is now unavailable. Discovery
+    // must allow ordinary SSH instead of treating stale names as reservations.
+    let offline = run(&["cp", "source", "--to", "backup"]);
+    assert!(!offline.status.success());
+    assert!(t.path("ssh-used").exists(), "{}", stderr_of(&offline));
+}
+
+#[test]
+fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
+    let t = Tmp::new();
+    write(&t.path("local-folder/file"), b"payload");
+    for name in ["laptop", "ssh"] {
+        write(
+            &t.path(&format!("home/.syq-destinations-v2/{name}.json")),
+            b"{}",
+        );
+    }
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v2"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-f"], &["--auth-from"]);
+    assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "ss"], &["ssh"]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "source", "--auth-from", "@ss"],
+        &["@ssh"],
+    );
+    assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "au"], &["auto"]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "source", "--into", "local-f"],
+        &["local-folder/"],
+    );
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    for selector in [
+        vec![],
+        vec!["--auth-from", "@laptop"],
+        vec!["--auth-from", "auto"],
+        vec!["--via", "laptop"],
+    ] {
+        let mut words = vec!["syq", "cp", "source", "--to", "backup"];
+        words.extend(selector);
+        words.extend(["--into", "anything"]);
+        let index = (words.len() - 1).to_string();
+        let mut args = vec!["__complete", "fish", &index, "--"];
+        args.extend(words);
+        let output = completion_command(&t, &args)
+            .current_dir(t.path(""))
+            .env("PATH", t.path("bin"))
+            .output()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(!t.path("home/ssh-used").exists());
+    }
 }

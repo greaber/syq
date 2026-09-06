@@ -57,7 +57,9 @@ learn a second set of names for concepts that syq already names.
 | `--into-existing` | `into_existing=` |
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
-| `--via @laptop` | `via="@laptop"` |
+| `--auth-from @laptop` | `auth_from="@laptop"` |
+| `--auth-from ssh` | `auth_from="ssh"` |
+| `--via @laptop` (alias) | `via="@laptop"` (alias) |
 | `--from` | `from_=` |
 | `--as` | `as_=` |
 | `class` event field | `class_` attribute |
