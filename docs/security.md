@@ -64,6 +64,12 @@ reads still use its directory handles and refuse descendant symlink traversal.
 TCP workers authenticate with a token delivered through the control connection.
 Their ten-second Hello deadline remains active across partial reads, including
 when encryption is off. After Hello succeeds, it does not limit copy duration.
+There is no general coordinator I/O deadline: a stalled peer can leave a copy
+waiting until you cancel it.
+
+TCP discovery accepts at most 64 advertised addresses plus the SSH target,
+and at most 128 resolved socket addresses in total. Excessive replies fail
+TCP setup visibly; ordinary copies can still fall back to SSH data.
 
 Encrypted TCP rejects reused connection IDs and IDs outside its 24-bit nonce
 space. If a copying process exhausts those IDs, it reports an error; restart the
@@ -85,6 +91,14 @@ those settings to use less memory. The collection allowance is not a limit on
 total process memory or disk usage.
 
 ## A compromised source server
+
+The coordinator rejects stat, apply, and partial-path replies whose entry
+counts differ from their requests. It also checks each source data block's
+offset and length against the outstanding read before forwarding it to the
+destination. An offset or length mismatch fails the copy and closes that
+worker's connections without reusing them for another file. These checks expose
+malformed replies; they cannot establish that a source's file listing or contents
+are truthful.
 
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The

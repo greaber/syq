@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, IsTerminal, Read, Write};
+use std::io::{BufReader, BufWriter, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -271,7 +271,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
         helper.tag,
         helper.archive.name
     );
-    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    fetch(&url, &archive, FetchMode::Interactive)?;
     verify_file_as(
         archive.path(),
         &helper.archive,
@@ -280,11 +280,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
 
     let input = File::open(archive.path()).context("open downloaded remote helper archive")?;
     let decoder = GzDecoder::new(BufReader::new(input));
-    let output = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(binary.path())
-        .context("open temporary remote helper")?;
+    let output = binary.writer()?;
     let mut output = BufWriter::new(output);
     std::io::copy(&mut decoder.take(helper.binary.size + 1), &mut output)
         .context("decompress the remote helper")?;
@@ -295,7 +291,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
         .context("sync the remote helper")?;
     drop(output);
     verify_file_as(binary.path(), &helper.binary, "downloaded remote helper")?;
-    set_executable(binary.path())?;
+    let binary = binary.seal_executable()?;
     fs::rename(binary.path(), &cache_path)
         .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
     sync_parent(parent)?;
@@ -316,11 +312,7 @@ fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
     let temp_dir = config_dir()?;
     create_private_dir(&temp_dir)?;
     let manifest_temp = TempFile::new(&temp_dir, ".json")?;
-    fetch(
-        &format!("{base_url}/{MANIFEST_NAME}"),
-        manifest_temp.path(),
-        mode,
-    )?;
+    fetch(&format!("{base_url}/{MANIFEST_NAME}"), &manifest_temp, mode)?;
     let manifest_bytes = fs::read(manifest_temp.path()).context("read release manifest")?;
     let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
@@ -461,7 +453,7 @@ fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> R
         .parent()
         .ok_or_else(|| anyhow!("the syq executable has no parent directory"))?;
     let binary = download_artifact(release, artifact, parent)?;
-    set_executable(binary.path())?;
+    let binary = binary.seal_executable()?;
     verify_executable(binary.path(), release)?;
 
     fs::rename(binary.path(), &executable).with_context(|| {
@@ -529,7 +521,7 @@ fn download_artifact(
         release.manifest.tag,
         artifact.archive.name
     );
-    fetch(&url, archive.path(), FetchMode::Interactive)?;
+    fetch(&url, &archive, FetchMode::Interactive)?;
     verify_file_as(
         archive.path(),
         &artifact.archive,
@@ -538,11 +530,7 @@ fn download_artifact(
 
     let input = File::open(archive.path()).context("open downloaded release archive")?;
     let decoder = GzDecoder::new(BufReader::new(input));
-    let output = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(binary.path())
-        .context("open temporary release executable")?;
+    let output = binary.writer()?;
     let mut output = BufWriter::new(output);
     std::io::copy(&mut decoder.take(artifact.binary.size + 1), &mut output)
         .context("decompress the syq release executable")?;
@@ -618,7 +606,7 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
     Ok(())
 }
 
-fn fetch(url: &str, destination: &Path, mode: FetchMode) -> Result<()> {
+fn fetch(url: &str, destination: &TempFile, mode: FetchMode) -> Result<()> {
     #[cfg(debug_assertions)]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
@@ -626,8 +614,11 @@ fn fetch(url: &str, destination: &Path, mode: FetchMode) -> Result<()> {
             .next()
             .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
             .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
-        fs::copy(PathBuf::from(root).join(name), destination)
-            .with_context(|| format!("copy test release fixture {name}"))?;
+        std::io::copy(
+            &mut File::open(PathBuf::from(root).join(name))?,
+            &mut destination.writer()?,
+        )
+        .with_context(|| format!("copy test release fixture {name}"))?;
         return Ok(());
     }
 
@@ -650,16 +641,13 @@ fn fetch(url: &str, destination: &Path, mode: FetchMode) -> Result<()> {
                 .get(url)
                 .call()
                 .with_context(|| format!("request {url}"))?;
-            let file = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(destination)
-                .with_context(|| format!("open {} for download", destination.display()))?;
+            let file = destination.writer()?;
             let mut file = BufWriter::new(file);
             std::io::copy(&mut response.body_mut().as_reader(), &mut file)
                 .with_context(|| format!("download {url}"))?;
-            file.flush()
-                .with_context(|| format!("flush downloaded file {}", destination.display()))?;
+            file.flush().with_context(|| {
+                format!("flush downloaded file {}", destination.path().display())
+            })?;
             Ok(())
         })();
         match result {
@@ -709,17 +697,13 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
         .ok_or_else(|| anyhow!("install receipt has no parent directory"))?;
     create_private_dir(parent)?;
     let temporary = TempFile::new(parent, ".receipt")?;
-    let file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(temporary.path())
-        .context("open temporary install receipt")?;
+    let file = temporary.writer()?;
     let mut file = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut file, receipt).context("serialize install receipt")?;
     file.write_all(b"\n").context("write install receipt")?;
     file.flush().context("flush install receipt")?;
     file.get_ref().sync_all().context("sync install receipt")?;
-    set_private_file(temporary.path())?;
+    temporary.check_path()?;
     fs::rename(temporary.path(), path).context("replace install receipt")?;
     sync_parent(parent)
 }
@@ -814,16 +798,6 @@ fn set_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_executable(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("make {} executable", path.display()))?;
-    }
-    Ok(())
-}
-
 fn sync_parent(parent: &Path) -> Result<()> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -832,6 +806,7 @@ fn sync_parent(parent: &Path) -> Result<()> {
 
 struct TempFile {
     path: PathBuf,
+    file: File,
 }
 
 impl TempFile {
@@ -842,11 +817,15 @@ impl TempFile {
                 .map_err(|e| anyhow!("generate a temporary file name: {e}"))?;
             let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             let path = parent.join(format!(".syq-{}-{token}{suffix}", std::process::id()));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => {
-                    set_private_file(&path)?;
-                    return Ok(Self { path });
-                }
+            use std::os::unix::fs::OpenOptionsExt;
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     return Err(e)
@@ -863,11 +842,51 @@ impl TempFile {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn check_path(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(&self.path)?;
+        let held = self.file.metadata()?;
+        if !current.is_file() || current.dev() != held.dev() || current.ino() != held.ino() {
+            bail!("temporary update file was replaced");
+        }
+        Ok(())
+    }
+
+    fn writer(&self) -> Result<File> {
+        self.check_path()?;
+        let mut file = self.file.try_clone()?;
+        file.set_len(0)?;
+        file.rewind()?;
+        Ok(file)
+    }
+
+    fn seal_executable(mut self) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        self.check_path()?;
+        self.file
+            .set_permissions(fs::Permissions::from_mode(0o755))?;
+        // Linux refuses to execute an inode while a writable handle is open.
+        // Reopen only for reading, verify identity, then close our writer.
+        let read_only = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.path)?;
+        let held = self.file.metadata()?;
+        let reopened = read_only.metadata()?;
+        if held.dev() != reopened.dev() || held.ino() != reopened.ino() {
+            bail!("temporary update file was replaced");
+        }
+        self.file = read_only;
+        Ok(self)
+    }
 }
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.check_path().is_ok() {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -974,12 +993,28 @@ mod tests {
     }
 
     #[test]
+    fn replaced_update_temp_cannot_truncate_or_remove_another_file() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let temporary = TempFile::new(dir.path(), ".bin").unwrap();
+        temporary.writer().unwrap().write_all(b"original").unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        fs::remove_file(temporary.path()).unwrap();
+        std::os::unix::fs::symlink(&victim, temporary.path()).unwrap();
+        let path = temporary.path().to_owned();
+        assert!(temporary.writer().is_err());
+        drop(temporary);
+        assert!(path.is_symlink());
+        assert_eq!(fs::read(victim).unwrap(), b"untouched");
+    }
+
+    #[test]
     fn release_fetches_reject_plain_http() {
         let parent = crate::test_support::temp_dir();
         let destination = TempFile::new(&parent, ".http-test").unwrap();
         let error = fetch(
             "http://127.0.0.1:1/release",
-            destination.path(),
+            &destination,
             FetchMode::BackgroundCheck,
         )
         .unwrap_err();
