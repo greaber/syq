@@ -1432,10 +1432,22 @@ fn announce_detached_ready() -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: Args) -> Result<i32> {
-    // The results stream and progress exist before anything else can fail,
-    // so every run that got past argument parsing settles with a terminal
-    // record — fatal setup failures included (spec: automation results).
+pub fn run(mut args: Args) -> Result<i32> {
+    // Re-exec before consuming stdin or opening results. A failed handoff still
+    // settles the normal automation stream below.
+    let handoff = crate::destination::handoff::copy(&mut args);
+    if handoff.is_ok() {
+        // Finish input validation in the executing build, before opening results.
+        // Preserve the argument-error exit status and absence of an automation
+        // stream when reading an input fails.
+        if let Err(error) = args.read_copy_inputs() {
+            crate::output::diagnostic!("syq: {error:#}");
+            return Ok(2);
+        }
+    }
+    // Create results and progress before reporting any setup failure, so a
+    // failure in this process settles with a terminal record (spec: automation
+    // results). A successful exec hands that responsibility to the helper.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         show_progress,
@@ -1458,7 +1470,7 @@ pub fn run(args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let verify_only = args.verify_only;
     let prune = args.delete;
-    let outcome = run_transfer(args, Arc::clone(&progress));
+    let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if outcome.is_err() {
         // run_transfer's ticker guard has stopped and joined on every return,
         // including failures in deferred metadata and deletion finalization.

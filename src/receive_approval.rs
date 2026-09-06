@@ -147,7 +147,7 @@ impl Summary {
                 format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.\n\nRun this command once?", argv.join(" ")),
         };
         format!(
-            "From: {}\n{body}\nLocal command: syq recv approve {}",
+            "From: {}\n{body}\nLocal command: syq persist receive approve {}",
             self.from, self.id
         )
     }
@@ -294,19 +294,24 @@ impl Queue {
         let mut notification = if notifications == Notifications::Desktop {
             match Notification::spawn(&summary.description(), lifetime, summary.kind().title()) {
                 Ok(notification) => {
-                    self.notification_status(&id, "desktop prompt requested; use local recv approve/deny if it is not visible".into());
+                    self.notification_status(&id, "desktop prompt requested; use local syq persist receive approve/deny if it is not visible".into());
                     Some(notification)
                 }
                 Err(error) => {
                     self.notification_status(
                         &id,
-                        format!("unavailable: {error:#}; use local recv approve/deny"),
+                        format!(
+                            "unavailable: {error:#}; use local syq persist receive approve/deny"
+                        ),
                     );
                     None
                 }
             }
         } else {
-            self.notification_status(&id, "disabled; use local recv approve/deny".into());
+            self.notification_status(
+                &id,
+                "disabled; use local syq persist receive approve/deny".into(),
+            );
             None
         };
         loop {
@@ -342,7 +347,8 @@ impl Queue {
                 if process.error_seen.load(Ordering::Acquire) {
                     self.notification_status(
                         &id,
-                        "desktop reported an error; use local recv approve/deny".into(),
+                        "desktop reported an error; use local syq persist receive approve/deny"
+                            .into(),
                     );
                 }
                 if let Some(result) = process.poll() {
@@ -353,11 +359,11 @@ impl Queue {
                         }
                         Ok(None) => self.notification_status(
                             &id,
-                            "dismissed; use local recv approve/deny".into(),
+                            "dismissed; use local syq persist receive approve/deny".into(),
                         ),
                         Err(error) => self.notification_status(
                             &id,
-                            format!("unavailable: {error:#}; use local recv approve/deny"),
+                            format!("unavailable: {error:#}; use local syq persist receive approve/deny"),
                         ),
                     }
                 }

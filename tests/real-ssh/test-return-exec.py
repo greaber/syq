@@ -14,7 +14,7 @@ def run(*args):
 
 
 def ready():
-    run("syq", "recv", "wait", "source", "--timeout", "30")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 
 
 def wait_for(description, predicate, timeout=5):
@@ -31,27 +31,27 @@ root.mkdir()
 client_pid = "/tmp/syq-real-ssh/exec-client-pid"
 
 
-def execute(argv, *, cwd="exec-fixture", allow=True, status=0, cancel=None):
+def execute(argv, *, cwd="exec-fixture", allow=True, status=0, cancel=None, binary="syq"):
     command = ('test -z "${SSH_AUTH_SOCK:-}" && test ! -e ~/.ssh/id_ed25519 && '
                'echo $$ > ' + client_pid + ' && exec ' + shlex.join([
-                   "syq", "exec", "--on", "@laptop", "--cwd", cwd, "--", *argv]))
+                   binary, "exec", "--on", "@laptop", "--cwd", cwd, "--", *argv]))
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         process = subprocess.Popen(["ssh", "source", command], stdout=stdout, stderr=stderr, start_new_session=True)
         try:
-            pending = json.loads(run("syq", "recv", "pending", "--json", "--wait", "--timeout", "15"))
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
             summary = pending[0]
             assert summary["kind"] == "command" and "destination" not in summary, summary
             assert "source" in summary["from"] and "local user" in summary["permission"], summary
             assert argv[0] in summary["argv"][0], summary
             assert process.poll() is None
-            run("syq", "recv", "approve" if allow else "deny", summary["id"])
+            run("syq", "persist", "receive", "approve" if allow else "deny", summary["id"])
             if cancel:
                 wait_for("running command", lambda: (root / "ready").exists())
                 if cancel == "interrupt":
                     run("ssh", "source", "kill -INT $(cat " + client_pid + ")")
                 else:
-                    run("syq", "recv", "off")
+                    run("syq", "persist", "receive", "off")
             deadline = time.monotonic() + 30
             while True:
                 try:
@@ -64,7 +64,7 @@ def execute(argv, *, cwd="exec-fixture", allow=True, status=0, cancel=None):
             stderr.seek(0)
             out, err = stdout.read(), stderr.read()
             assert actual == status, (actual, status, out, err)
-            assert json.loads(run("syq", "recv", "pending", "--json")) == []
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
             return out, err
         finally:
             if process.poll() is None:
@@ -73,7 +73,7 @@ def execute(argv, *, cwd="exec-fixture", allow=True, status=0, cancel=None):
 
 
 print("case: exec always needs command approval, even with automatic copies", flush=True)
-run("syq", "recv", "on", "--approve", "always", "--notify", "off")
+run("syq", "persist", "receive", "on", "--approve", "always", "--notify", "off")
 ready()
 execute(["sh", "-c", "touch denied"], allow=False, status=1)
 assert not (root / "denied").exists()
@@ -85,6 +85,12 @@ out, err = execute(["python3", "-c", script, argument], status=17)
 assert out == os.fsencode(root) + b"\n" + argument.encode() + b"\x00\xff", out
 assert err.endswith(b"error\x00\xff"), err
 assert not (root / "injected").exists()
+
+print("case: command from another source build preserves arguments, output and status", flush=True)
+other_out, other_err = execute(["python3", "-c", script, argument], status=17, binary="syq-other-build")
+assert other_out == out and other_err.endswith(b"error\x00\xff"), (other_out, other_err)
+execute(["sh", "-c", "touch skew-denied"], allow=False, status=1, binary="syq-other-build")
+assert not (root / "skew-denied").exists()
 
 print("case: approved commands may run beyond the copy root", flush=True)
 out, _ = execute(["pwd"], cwd="/tmp")
@@ -121,7 +127,7 @@ for cancellation in ["interrupt", "stop"]:
     assert not (root / "survived").exists()
     (root / "ready").unlink()
     if cancellation == "stop":
-        run("syq", "recv", "on", "--notify", "off")
+        run("syq", "persist", "receive", "on", "--notify", "off")
         ready()
 
 print("case: exec works again after receiving restarts", flush=True)

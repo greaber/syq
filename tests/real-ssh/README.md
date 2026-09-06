@@ -137,6 +137,20 @@ execution after reconnect. The D-Bus fixture also verifies separate command
 notification titles and Allow/Deny behavior. macOS UI rendering is not tested
 by this Linux container suite.
 
+The default lab also builds a second executable with a distinct development
+identity from synthetic Cargo package metadata and a different return wire
+version. It checks return copies, commands, and automatic or explicit remote
+authorization from that different PATH build.
+The receiving connection still uses its own pinned helper. Raw path arguments,
+inherited result descriptors, output bytes, and exit status are checked across
+the handoff. Unsupported mapping copies still fail with a terminal result;
+the local handoff test separately checks that stdin is not consumed before exec.
+
+Ignore-source regressions compare copies from matching and different builds
+using piped rules and a named FIFO with a single writer. They check ordered
+patterns, reinclusion, and protection of ignored destination entries during
+pruning, plus piped filters with automatic and explicit remote authorization.
+
 The disposable runner also checks privileged copies before dropping to its
 normal test user: foreign-owned partials are replaced without modifying their
 inodes, requested final ownership still works, and `--insecure-links` permits

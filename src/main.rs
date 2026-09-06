@@ -125,7 +125,13 @@ fn main() {
     tune_allocator();
     raise_nofile();
     fsops::capture_process_umask();
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let argv = match destination::handoff::enter(std::env::args_os().collect()) {
+        Ok(argv) => argv,
+        Err(error) => {
+            crate::output::diagnostic!("syq: {error:#}");
+            std::process::exit(1);
+        }
+    };
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
             crate::output::diagnostic!("syq: {error:#}");
@@ -264,7 +270,7 @@ fn main() {
             }
         }
     }
-    let mut args = match cli::Args::parse_args() {
+    let mut args = match cli::Args::parse_args(&argv[1..]) {
         Ok(a) => a,
         Err(e) => {
             crate::output::diagnostic!("syq: {e:#}");

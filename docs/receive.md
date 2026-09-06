@@ -17,9 +17,9 @@ To choose a name and a different starting directory:
 
 ```sh
 mkdir -p ~/Downloads/server
-syq recv on --name laptop --cwd ~/Downloads/server
+syq persist receive on --name laptop --cwd ~/Downloads/server
 syq cp --from server report.pdf
-syq recv wait server --timeout 30
+syq persist receive wait server --timeout 30
 ```
 
 On the server, use the name from any shell, including an existing tmux session:
@@ -46,16 +46,16 @@ On Linux, desktop prompts use `/usr/bin/notify-send` with action support
 (libnotify 0.7.10 or later) and your desktop notification service. On macOS,
 syq opens a native dialog through `/usr/bin/osascript`; Deny is the default
 button. The background connection inherits the desktop session in which you
-start it. After changing desktop sessions, run `syq recv on` from a terminal
+start it. After changing desktop sessions, run `syq persist receive on` from a terminal
 in the current session to restart it.
 
 You can also decide from any local terminal:
 
 ```sh
-syq recv pending
-syq recv pending --wait --timeout 30 --json
-syq recv approve REQUEST_ID
-syq recv deny REQUEST_ID
+syq persist receive pending
+syq persist receive pending --wait --timeout 30 --json
+syq persist receive approve REQUEST_ID
+syq persist receive deny REQUEST_ID
 ```
 
 Use the complete ID printed by `pending`. Each ID works once for that request.
@@ -65,17 +65,17 @@ requests. An approval cannot carry over to a reconnected or retried copy.
 One request may await approval per server connection; other senders must retry.
 
 If a desktop prompt is unavailable or dismissed without a decision, the copy
-stays pending for a local command until it expires. `recv pending` shows prompt
+stays pending for a local command until it expires. `persist receive pending` shows prompt
 errors. A missing notification service never grants permission. To use only
-terminal approval, set `syq recv on --notify off`; `--notify desktop` restores
+terminal approval, set `syq persist receive on --notify off`; `--notify desktop` restores
 prompts.
 
 For unattended copies from trusted server accounts, explicitly enable automatic
 approval:
 
 ```sh
-syq recv on --approve always
-syq recv on --approve ask   # require approval again
+syq persist receive on --approve always
+syq persist receive on --approve ask   # require approval again
 ```
 
 Automatic approval trusts every process running as those server accounts,
@@ -111,7 +111,7 @@ With no placement, `--to laptop` means `--into .` there.
 To contain copies within a directory instead:
 
 ```sh
-syq recv on --name laptop --root ~/Downloads/server
+syq persist receive on --name laptop --root ~/Downloads/server
 ```
 
 `--root` sets both the starting directory and the boundary. It rejects absolute
@@ -136,7 +136,7 @@ are refused. `--update` depends on timestamps supplied by the source that the
 laptop cannot independently verify.
 
 Each copy is limited to 100 GiB and one million touched entries by default.
-Change these ceilings with `syq recv on --max-bytes 20G --max-entries 100000`.
+Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries 100000`.
 Lower limits requested by the sender also apply. Limits are per copy; repeated
 copies can fill the disk. Copies support at most 32 workers each.
 
@@ -149,16 +149,16 @@ The sender verifies a signed receipt before reporting success.
 ## Background connections
 
 ```sh
-syq recv status
-syq recv status --json
-syq recv wait server --timeout 30
-syq recv off
-syq recv on
+syq persist receive status
+syq persist receive status --json
+syq persist receive wait server --timeout 30
+syq persist receive off
+syq persist receive on
 syq persist off
 ```
 
-`recv off` stops receiving while keeping ordinary SSH persistence enabled.
-`recv on` enables it again and can restart previously connected endpoints.
+`persist receive off` stops receiving while keeping ordinary SSH persistence enabled.
+`persist receive on` enables it again and can restart previously connected endpoints.
 `persist off` stops both kinds of connection in its scope. Explicit ephemeral
 persistence scopes also own return connections and end them when closed.
 
@@ -172,13 +172,13 @@ seconds of authorization and finish within seven days. Closing that control
 channel revokes its workers and prevents further requests.
 
 If `syq persist status` reports a failed return connection, fix the reported
-configuration or permission problem and run `syq recv on` to retry previously
+configuration or permission problem and run `syq persist receive on` to retry previously
 connected endpoints. This keeps ordinary SSH persistence enabled; there is no
 need to toggle `persist off` and `persist on`.
 
-On the server, `syq destination list` shows availability and
-`syq destination wait laptop --timeout 30` waits with a deadline. Stale records
-left by a crash do not reserve a name; `syq destination forget laptop` removes
+On the server, `syq persist destinations list` shows availability and
+`syq persist destinations wait laptop --timeout 30` waits with a deadline. Stale records
+left by a crash do not reserve a name; `syq persist destinations forget laptop` removes
 one while its connection is stopped.
 
 ## SSH setup
@@ -190,26 +190,39 @@ does not automatically carry the laptop's destination through to another host.
 Reconnects require an available SSH key or agent and a trusted server host key.
 No agent is forwarded. The server must permit remote Unix socket forwarding;
 OpenSSH 9.2 also requires remote TCP forwarding permission. Syq does not change
-server configuration. `recv status` reports setup errors; after correcting one,
-connect with syq again or run `recv on` to retry. A failed return setup does not
+server configuration. `persist receive status` reports setup errors; after correcting one,
+connect with syq again or run `persist receive on` to retry. A failed return setup does not
 invalidate an ordinary copy.
 
-Both machines must use the same syq build. The return connection uses the
-helper selected by the ordinary connection, including an explicit `--syq-path`.
-The server's `syq cp` executable must match it too.
+The server command can be a different syq build from the receiving machine.
+It automatically hands the command to the matching helper already installed
+by the receiving machine's connection, including an explicit `--syq-path`.
+Arguments, working directory, stdin, and output streams are preserved.
+`--ignore-from` inputs are read once by the executing build after handoff,
+before requesting approval or opening result files. Inline patterns and input
+files keep their command-line order. The helper then requests approval and runs
+the copy using the receiving machine's build. A missing or replaced helper produces an error; reconnect with syq from
+the receiving machine to refresh it. An option unknown to that helper is
+rejected before approval.
+
+Handoff requires support in both installations. When upgrading from a build
+that required matching server and client commands, run `syq persist off` on
+the receiving machine before replacing the binaries on both machines. Then
+run `syq persist on` and connect to the server with syq again. This refreshes
+the helper and return registration without deleting preferences or enrollments.
 
 Receiving preferences live in `receive.json` beside the ordinary persistence
 preferences, under `$XDG_CONFIG_HOME/syq` or `~/.config/syq`. Runtime services
 belong to their persistence scope. Transient server advertisements live in the
-private directory `~/.syq-destinations-v2`. These files do not change restricted
+private directory `~/.syq-destinations-v3`. These files do not change restricted
 receiver enrollments or signed-grant replay records.
 
 Receiving settings from the earlier automatic-only format keep their name,
 directory, and limits when upgraded, but require approval. Syq saves the new
 format before starting or reusing a return service. After upgrading, run
-`syq recv on` to stop old receiving services, then connect to each server with
+`syq persist receive on` to stop old receiving services, then connect to each server with
 the new syq build. Merely replacing the executable or inspecting status does
 not change a service that is already running. Older binaries reject the new
-preferences; use the newer binary to manage receiving, including `recv off`, before
+preferences; use the newer binary to manage receiving, including `persist receive off`, before
 switching versions. Pending requests and approval decisions exist only in the
 running service, never in preference files.
