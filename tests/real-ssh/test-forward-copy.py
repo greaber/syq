@@ -93,6 +93,7 @@ print("case: preview, verification, and protected paths remain restricted", flus
 copy("/tmp/syq-real-ssh/forward/preview", extra=("--dry-run",))
 remote("test ! -e /tmp/syq-real-ssh/forward/preview")
 copy("/tmp/syq-real-ssh/forward/approved", extra=("--verify-only",))
+remote("printf '%s\\n' '# protected syq test fixture' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys")
 authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)
 assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
