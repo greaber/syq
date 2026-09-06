@@ -57,6 +57,16 @@ for this case, not a claim that syq is more secure overall. `syq rsync`
 keeps the ownership-based policy for compatibility. Its local-only
 `--insecure-links` option relaxes source, destination, and control-path checks.
 
+## TCP data connections
+
+TCP workers authenticate with a token delivered through the control connection.
+Their ten-second Hello deadline remains active across partial reads, including
+when encryption is off. After Hello succeeds, it does not limit copy duration.
+
+Encrypted TCP rejects reused connection IDs and IDs outside its 24-bit nonce
+space. If a copying process exhausts those IDs, it reports an error; restart the
+copy to continue with a fresh session.
+
 ## A compromised source server
 
 For a default direct remote-to-remote copy, the source gets permission for one

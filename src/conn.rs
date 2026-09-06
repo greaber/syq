@@ -2019,7 +2019,7 @@ impl RemoteSpec {
                 );
             }
             stream.set_nodelay(true)?;
-            let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let conn_id = next_tcp_connection_id(&TCP_CONN_ID)?;
             (&stream).write_all(&conn_id.to_be_bytes())?;
             let (wc, rc) = match &info.key {
                 Some(k) => (
@@ -2152,6 +2152,15 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
 }
 
 static TCP_CONN_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_tcp_connection_id(next: &std::sync::atomic::AtomicU32) -> Result<u32> {
+    next.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |id| (id <= crate::tcp_records::CONNECTION_ID_MAX).then(|| id + 1),
+    )
+    .map_err(|_| anyhow!("TCP connection IDs exhausted; restart the copy"))
+}
 
 #[derive(Clone)]
 pub struct TcpInfo {
@@ -2872,6 +2881,19 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tcp_connection_ids_fail_at_nonce_space_exhaustion() {
+        let next = std::sync::atomic::AtomicU32::new(crate::tcp_records::CONNECTION_ID_MAX);
+        assert_eq!(super::next_tcp_connection_id(&next).unwrap(), 0x00ff_ffff);
+        for _ in 0..3 {
+            assert!(super::next_tcp_connection_id(&next)
+                .unwrap_err()
+                .to_string()
+                .contains("restart the copy"));
+        }
+        assert_eq!(next.load(std::sync::atomic::Ordering::Relaxed), 0x0100_0000);
+    }
+
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
