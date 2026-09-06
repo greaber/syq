@@ -1632,7 +1632,7 @@ impl RemoteSpec {
                 self.restricted_grant.as_deref().unwrap(),
                 matches!(role, ConnectionRole::Control),
             )?;
-            let (rx, reader) = spawn_reader(Box::new(stream.try_clone()?));
+            let (rx, reader) = spawn_reader(Box::new(stream.try_clone()?), self.read_ahead);
             let conn = RemoteConn {
                 child: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
