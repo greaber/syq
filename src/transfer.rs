@@ -8332,6 +8332,7 @@ impl Worker {
                 );
                 expected += requested;
                 let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
+                self.benchmark.stream_discarded_bytes += requested - claimed;
                 if claimed == 0 {
                     break;
                 }
@@ -8359,7 +8360,9 @@ impl Worker {
         })();
         // Always restore both protocol boundaries, even after a local write
         // error. No following file can consume this one's data or late errors.
-        let source_end = self.src.stop_read_stream();
+        let source_end = self.src.stop_read_stream().map(|discarded| {
+            self.benchmark.stream_discarded_bytes += discarded;
+        });
         let t0 = std::time::Instant::now();
         let destination_end = self.dst.finish_streaming_writes(sent);
         self.t[2] += t0.elapsed().as_secs_f64();

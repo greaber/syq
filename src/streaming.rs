@@ -9,6 +9,28 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Drain source payload through the stop fence. These bytes were received but
+/// not written, not a count of transport headers or retries.
+pub(crate) fn drain_reads(
+    mut receive: impl FnMut() -> anyhow::Result<Response>,
+) -> anyhow::Result<u64> {
+    let mut discarded = 0u64;
+    let mut error = None;
+    loop {
+        match receive()? {
+            Response::ReadStreamDone => return error.map_or(Ok(discarded), Err),
+            Response::Block { data, .. } => discarded += data.len() as u64,
+            Response::EndpointError(e) => {
+                error.get_or_insert_with(|| crate::conn::endpoint_error(e));
+            }
+            Response::Err(e) => {
+                error.get_or_insert_with(|| anyhow::anyhow!(e));
+            }
+            _ => anyhow::bail!("unexpected response while stopping a read stream"),
+        }
+    }
+}
+
 /// Accept only the prefix still assigned to this worker. A concurrently
 /// stolen suffix may already be in flight, but must never be written twice.
 pub(crate) fn claim_block(
@@ -135,6 +157,35 @@ impl Drop for WriteReplies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draining_counts_discarded_payload_and_preserves_the_next_response() {
+        let mut responses = [
+            Response::Block {
+                off: 0,
+                hash: [0; 32],
+                data: vec![0; 7],
+            },
+            Response::Block {
+                off: 7,
+                hash: [0; 32],
+                data: vec![0; 11],
+            },
+            Response::ReadStreamDone,
+            Response::Ok,
+        ]
+        .into_iter();
+        assert_eq!(drain_reads(|| Ok(responses.next().unwrap())).unwrap(), 18);
+        assert!(matches!(responses.next(), Some(Response::Ok)));
+        let mut responses = [
+            Response::Err("read failed".into()),
+            Response::ReadStreamDone,
+            Response::Ok,
+        ]
+        .into_iter();
+        assert!(drain_reads(|| Ok(responses.next().unwrap())).is_err());
+        assert!(matches!(responses.next(), Some(Response::Ok)));
+    }
 
     #[test]
     fn streaming_claim_preserves_a_stolen_suffix_and_checks_its_hash() {

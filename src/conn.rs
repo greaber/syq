@@ -28,22 +28,9 @@ pub trait Conn: Send {
     fn finish_streaming_writes(&mut self, _sent: u64) -> Result<()> {
         bail!("no streaming writes are active")
     }
-    fn stop_read_stream(&mut self) -> Result<()> {
+    fn stop_read_stream(&mut self) -> Result<u64> {
         self.send(Request::StopReadStream)?;
-        let mut error = None;
-        loop {
-            match self.recv()? {
-                Response::ReadStreamDone => return error.map_or(Ok(()), Err),
-                Response::Block { .. } => {}
-                Response::EndpointError(e) => {
-                    error.get_or_insert_with(|| endpoint_error(e));
-                }
-                Response::Err(e) => {
-                    error.get_or_insert_with(|| anyhow!(e));
-                }
-                _ => bail!("unexpected response while stopping a read stream"),
-            }
-        }
+        crate::streaming::drain_reads(|| self.recv())
     }
     fn call(&mut self, req: Request) -> Result<Response> {
         self.send(req)?;

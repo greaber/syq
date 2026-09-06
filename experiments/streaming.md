@@ -67,6 +67,12 @@ sharing a host retain their separate build-identified helpers and compatible
 resume state. Diagnostic JSON adds attempted streaming-range/block counts;
 those are not completion or wire-byte measurements.
 
+`stream_discarded_bytes` counts received source block payload discarded after
+work-stealing or cancellation, including drained read-ahead and trimmed frame
+suffixes. It excludes transport framing/retransmissions; failed drains may
+leave this count incomplete. It diagnoses redundant payload, not network
+utilization or peak buffering.
+
 ## Comparing
 
 Use the same candidate binary, explicit worker count, data, transport, cache
