@@ -110,8 +110,11 @@ python3 tests/real-ssh/test-completion-display.py --syq target/debug/syq
 
 The shell dependencies are installed only in the test image.
 
-The source-shell remote-copy checks use `--via @laptop` without a source key or
-agent. They cover local approval despite automatic local receiving, denial,
+The source-shell remote-copy checks discover the authorizer automatically
+without a source key or agent. Explicit `--auth-from @laptop` and the released
+`--via @laptop` spelling exercise the same route; `--auth-from ssh` fails without
+those source credentials and creates no approval request. The automatic cached
+helper case still needs just one destination SSH connection. The checks cover local approval despite automatic local receiving, denial,
 direct TCP, cached and missing helper startup, a second approval during slow
 SSH setup, preview/verification, protected destination authority files,
 unreachable data ports, and revocation followed by an approved retry.

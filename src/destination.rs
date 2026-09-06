@@ -461,8 +461,30 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
-    if args.via.is_some() {
-        return forward::prepare(args);
+    match &args.auth_from {
+        crate::cli::AuthFrom::Return(_) => return forward::prepare(args),
+        crate::cli::AuthFrom::Ssh => {
+            let (destination, sources) = args
+                .locations
+                .split_last()
+                .context("copy endpoints missing")?;
+            if args.interface != crate::cli::Interface::NativeCp
+                || sources.iter().any(|source| source.is_remote())
+                || !destination.is_remote()
+                || destination
+                    .host
+                    .as_deref()
+                    .is_some_and(|host| host.starts_with('@'))
+            {
+                bail!(
+                    "--auth-from ssh requires local sources and an ordinary SSH --to destination"
+                );
+            }
+            // This explicit choice also disambiguates an SSH host whose name
+            // happens to match a receiving machine's advertisement.
+            return Ok(());
+        }
+        crate::cli::AuthFrom::Auto => {}
     }
     let Some(destination) = args.locations.last() else {
         return Ok(());
@@ -485,11 +507,11 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
                 .any(|l| l.is_remote())
             || !registered_names().contains(&name)
         {
-            return Ok(());
+            return forward::prepare(args);
         }
         let registration = load_registration(&name)?;
         if exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err() {
-            return Ok(());
+            return forward::prepare(args);
         }
         registration
     };
@@ -877,7 +899,7 @@ const RETURN_SSH_OPTIONS: &[&str] = &[
 fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     let mut cmd = Command::new("ssh");
     // This connection installs a remote forward and follows the user's host-key
-    // policy. The outbound --via connection adds stricter options of its own.
+    // policy. The outbound return-authorized connection adds stricter options of its own.
     cmd.args(RETURN_SSH_OPTIONS)
         .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
     if let Some(user) = &endpoint.user {

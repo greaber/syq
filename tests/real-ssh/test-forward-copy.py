@@ -20,9 +20,9 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None):
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=()):
     argv = ["syq", "cp", "-vv", source, "--to", "destination",
-            "--via", "@laptop", "--as", path, "--connections", "2", *extra]
+            *auth, "--as", path, "--connections", "2", *extra]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output, start_new_session=True)
@@ -85,10 +85,15 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                     process.wait(timeout=3)
 
 
-print("case: source-shell remote copy requires approval even with automatic local receiving", flush=True)
+print("case: automatic authorization requires approval even with automatic local receiving", flush=True)
 run("syq", "recv", "on", "--approve", "always", "--notify", "off")
 run("syq", "recv", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
+print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
+run("ssh", "source", "timeout 15 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
+    "--to destination --as /tmp/syq-real-ssh/forward/direct-ssh --auth-from ssh", success=False)
+assert json.loads(run("syq", "recv", "pending", "--json")) == []
+remote("test ! -e /tmp/syq-real-ssh/forward/direct-ssh")
 copy("/tmp/syq-real-ssh/forward/denied", allow=False, success=False)
 remote("test ! -e /tmp/syq-real-ssh/forward/denied")
 
@@ -104,6 +109,11 @@ copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",))
 assert destination_connections() - before == 1, "a cached helper must need only the copy's SSH connection"
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
+
+print("case: explicit authorizer and released --via spelling use the same restricted route", flush=True)
+for option, name in [("--auth-from", "selected"), ("--via", "legacy")]:
+    copy("/tmp/syq-real-ssh/forward/" + name, auth=(option, "@laptop"))
+    assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
 
 print("case: a missing helper is installed once after its launcher reports the cache miss", flush=True)
 helpers = remote('find "$HOME/.cache/syq/helpers" -type f -name syq').splitlines()

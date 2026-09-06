@@ -36,16 +36,13 @@ fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         })
     {
-        bail!("--via requires an ordinary SSH destination with a plain host and login name");
+        bail!("--auth-from requires an ordinary SSH destination with a plain host and login name");
     }
     Ok(endpoint)
 }
 
-pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     use crate::cli::{CoordinateAt, Interface, PeerAuth};
-    let name = args.via.as_deref().unwrap();
-    let name = name.strip_prefix('@').unwrap_or(name).to_owned();
-    validate_name(&name)?;
     let (destination, sources) = args
         .locations
         .split_last()
@@ -54,7 +51,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         || sources.iter().any(|s| s.is_remote())
         || !destination.is_remote()
     {
-        bail!("--via requires syq cp with local sources and an SSH --to destination");
+        bail!("--auth-from requires syq cp with local sources and an SSH --to destination");
     }
     if args.rsh.is_some()
         || args.syq_path.is_some()
@@ -67,14 +64,48 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("--via owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
     }
     if args.connections_opt.is_some() && args.connections > 32 {
-        bail!("--via supports at most 32 workers per copy");
+        bail!("return authorization supports at most 32 workers per copy");
     }
+    if args.owner || args.group || args.devices || args.inplace {
+        bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
+    }
+    crate::restricted::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
-    let registration = load_registration(&name)?;
+    Ok(target)
+}
+
+pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    let explicit = match &args.auth_from {
+        crate::cli::AuthFrom::Return(name) => Some(name.clone()),
+        _ => None,
+    };
+    let target = match eligible_target(args) {
+        Ok(target) => target,
+        Err(_) if explicit.is_none() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if explicit.is_none() && args.locations.last().unwrap().path.starts_with(b"~//") {
+        // Ordinary SSH interprets ~// as absolute. Do not change the copy's
+        // destination just because a return authorizer became available.
+        return Ok(());
+    }
+    let (name, registration) = if let Some(name) = explicit {
+        let registration = load_registration(&name)?;
+        (name, registration)
+    } else {
+        let Some(found) = registered_names().into_iter().find_map(|name| {
+            let registration = load_registration(&name).ok()?;
+            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(2)).ok()?;
+            matches!(reply, Reply::Ready).then_some((name, registration))
+        }) else {
+            return Ok(());
+        };
+        found
+    };
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
@@ -105,6 +136,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.auth_from = crate::cli::AuthFrom::Return(name);
     // The actual authority never leaves the destination helper. This internal
     // marker makes the engine require TCP and suppress ordinary SSH fallback.
     args.restricted_grant = Some("return-control-v1".into());

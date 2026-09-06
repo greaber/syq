@@ -82,7 +82,9 @@ limits. The server receives neither your SSH agent nor an interface for running
 arbitrary laptop commands.
 
 To send files from that server to another SSH host using this machine's
-permission, use `syq cp results --to hostB --via @laptop`. These requests always
+permission, use `syq cp results --to hostB`. Eligible copies discover a live
+receiving machine automatically; `--auth-from @laptop` selects one explicitly
+and `--auth-from ssh` uses the server's own SSH access. These requests always
 need a local decision. See [Start a copy from the source server](remote-to-remote.md#start-a-copy-from-the-source-server).
 
 ## Names and paths
