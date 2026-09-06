@@ -35,6 +35,7 @@ mod scan;
 mod sched;
 mod server;
 mod session_pool;
+mod streaming;
 mod tcp_records;
 #[cfg(test)]
 mod test_support;

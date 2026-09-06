@@ -117,7 +117,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 |---|---|---|
 | `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto` or `ranges` |
+| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
@@ -145,7 +145,36 @@ native small-copy shortcut. Files larger than the batch byte limit use another
 copy path. File and byte limits are ceilings, and the scheduler can choose a
 smaller batch to share work among workers. With `--bwlimit`, worker batches
 contain at most one file. Batch controls cannot be combined with
-`copy-path=ranges`.
+`copy-path=ranges` or `copy-path=streaming`.
+
+### Experimental streaming
+
+`--tuning-options copy-path=streaming` is disabled by default. It streams
+checked source blocks and collects destination write replies concurrently,
+instead of limiting the number of blocks awaiting replies. It still verifies
+block hashes, checks all write errors before completion, and supports resume
+and parallel workers on different parts of one large file. It does not add
+a disk flush. It bypasses the same copy shortcuts as `copy-path=ranges`.
+
+For a controlled comparison, use fresh scratch destinations:
+
+```sh
+syq cp data.bin --to host --as /scratch/pipeline.bin --connections 1 -v \
+  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
+syq cp data.bin --to host --as /scratch/streaming.bin --connections 1 -v \
+  --tuning-options copy-path=streaming,request-size=1M
+```
+
+Streaming rejects `pipeline-depth` and batch controls. Its data queues remain
+bounded, but memory also depends on request size, worker count, compression
+and transport buffering. It may be slower on short or CPU-limited copies:
+starting/stopping streams and collecting replies add work. Work-stealing can
+also discard already-read source data when another worker takes a suffix.
+With `--bwlimit`, pacing happens before destination writes; a remote source
+can send ahead into bounded buffers. This is not a strict source-side burst
+limit. Restricted receivers still enforce their signed limits.
+
+### Batch size and splitting
 
 For example, compare small-file batches with:
 
@@ -201,6 +230,7 @@ capped runs.
 With overrides, `-v` reports effective settings, including any reduction in
 request size or increase in the split threshold. A final `syq: tuning observed:`
 line contains diagnostic JSON with copy-path counts, range request count,
+streaming-range and streamed-block counts,
 largest requested range, and largest worker batch by file count and content
 bytes. These are observations of attempted work, so retries can contribute
 more than once. They are experimental diagnostics, separate from completion

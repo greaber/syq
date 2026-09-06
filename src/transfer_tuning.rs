@@ -10,13 +10,14 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges: default auto; ranges bypasses whole-file and small-file copy shortcuts.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each request's full byte budget before issuing it. Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. Disabled by default; incompatible with pipeline-depth and batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
     #[default]
     Auto,
     Ranges,
+    Streaming,
 }
 
 impl std::fmt::Display for CopyPath {
@@ -24,6 +25,7 @@ impl std::fmt::Display for CopyPath {
         f.write_str(match self {
             Self::Auto => "auto",
             Self::Ranges => "ranges",
+            Self::Streaming => "streaming",
         })
     }
 }
@@ -88,7 +90,10 @@ impl TransferTuning {
         self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH)
     }
     pub fn force_ranges(self) -> bool {
-        self.copy_path == Some(CopyPath::Ranges)
+        matches!(self.copy_path, Some(CopyPath::Ranges | CopyPath::Streaming))
+    }
+    pub fn streaming(self) -> bool {
+        self.copy_path == Some(CopyPath::Streaming)
     }
     pub fn batch_bytes(self) -> u64 {
         self.batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES)
@@ -102,11 +107,14 @@ impl TransferTuning {
             .max(2 * hash_block)
     }
     pub fn validate(self, rate: u64) -> Result<()> {
+        if self.streaming() && self.pipeline_depth.is_some() {
+            bail!("--tuning-options copy-path=streaming cannot be combined with pipeline-depth");
+        }
         if self.bw_pacing.is_some() && rate == 0 {
             bail!("--tuning-options bw-pacing requires a nonzero --bwlimit");
         }
         if self.force_ranges() && self.batch_override() {
-            bail!("--tuning-options copy-path=ranges cannot be combined with batch controls");
+            bail!("--tuning-options range copy paths cannot be combined with batch controls");
         }
         Ok(())
     }
@@ -179,7 +187,8 @@ impl FromStr for TransferTuning {
                     match value {
                         "auto" => CopyPath::Auto,
                         "ranges" => CopyPath::Ranges,
-                        _ => bail!("copy-path must be auto or ranges"),
+                        "streaming" => CopyPath::Streaming,
+                        _ => bail!("copy-path must be auto, ranges or streaming"),
                     },
                     key,
                 )?,
@@ -229,6 +238,8 @@ pub(crate) struct BenchmarkStats {
     pub native_small_copies: u64,
     pub local_whole_files: u64,
     pub range_requests: u64,
+    pub streaming_ranges: u64,
+    pub streamed_blocks: u64,
     pub max_request_bytes: u64,
     pub small_batches: u64,
     pub max_batch_files: u64,
@@ -240,6 +251,8 @@ impl BenchmarkStats {
         self.native_small_copies += other.native_small_copies;
         self.local_whole_files += other.local_whole_files;
         self.range_requests += other.range_requests;
+        self.streaming_ranges += other.streaming_ranges;
+        self.streamed_blocks += other.streamed_blocks;
         self.small_batches += other.small_batches;
         self.max_request_bytes = self.max_request_bytes.max(other.max_request_bytes);
         self.max_batch_files = self.max_batch_files.max(other.max_batch_files);
@@ -257,6 +270,7 @@ mod tests {
         let default = TransferTuning::default();
         assert_eq!(default.request_size(hash_block, None, false), hash_block);
         assert_eq!(default.pipeline_depth(), 4);
+        assert!(!default.streaming());
         let override_: TransferTuning = "request-size=8M,pipeline-depth=16".parse().unwrap();
         assert_eq!(override_.request_size(hash_block, None, false), 8 << 20);
         let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
@@ -275,6 +289,7 @@ mod tests {
     #[test]
     fn tuning_round_trips_every_key_for_remote_coordinators() {
         for value in [
+            "copy-path=streaming,request-size=1M,split-min-size=1M,bw-pacing=average",
             "request-size=8M,pipeline-depth=16,copy-path=ranges,split-min-size=1M,bw-pacing=average",
             "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G,bw-pacing=2s",
         ] {
@@ -352,6 +367,24 @@ mod tests {
                 value.parse::<TransferTuning>().is_err(),
                 "accepted {value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn streaming_is_explicit_and_rejects_irrelevant_controls() {
+        let streaming: TransferTuning = "copy-path=streaming".parse().unwrap();
+        streaming.validate(0).unwrap();
+        assert!(streaming.streaming() && streaming.force_ranges());
+        for value in [
+            "copy-path=streaming,pipeline-depth=4",
+            "copy-path=streaming,batch-files=1",
+            "copy-path=streaming,batch-bytes=1M",
+        ] {
+            assert!(value
+                .parse::<TransferTuning>()
+                .unwrap()
+                .validate(0)
+                .is_err());
         }
     }
 }

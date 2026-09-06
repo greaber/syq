@@ -1802,7 +1802,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (after pacing and receiver limits), pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
-            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver), opts.tuning.pipeline_depth(), block,
+            opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            if opts.tuning.streaming() { "unused(streaming)".to_string() } else { opts.tuning.pipeline_depth().to_string() }, block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
@@ -8170,6 +8171,9 @@ impl Worker {
     }
 
     fn transfer_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
+        if self.opts.tuning.streaming() {
+            return self.transfer_streaming_range(h, credited);
+        }
         let idx = {
             let g = h.lock().unwrap();
             g.idx
@@ -8261,6 +8265,105 @@ impl Worker {
             writes_out -= 1;
         }
         Ok(())
+    }
+
+    fn transfer_streaming_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
+        let (idx, start, end) = {
+            let range = h.lock().unwrap();
+            (range.idx, range.pos, range.end)
+        };
+        if start == end || self.sched.is_failed(idx) {
+            return Ok(());
+        }
+        let job = self.job(idx);
+        let block = self.transfer_block();
+        // Do not advance the scheduler's claimed position when opening the
+        // stream. Other workers may still steal the unread suffix. At a split
+        // we stop/drain this source, discarding only bounded read-ahead data.
+        let stream = ReadStreamRequest {
+            path: job.src.clone(),
+            source: self.source_reference(&job),
+            attempt: job.attempt,
+            off: start,
+            end,
+            block: block as u32,
+        };
+        stream.validate()?;
+        match ok(
+            self.src.call(Request::ReadStream(stream))?,
+            "start read stream",
+        )? {
+            Response::Ok => {}
+            _ => bail!("unexpected response starting read stream"),
+        }
+        self.benchmark.streaming_ranges += 1;
+        let begin = self.dst.begin_streaming_writes();
+        if let Err(error) = begin {
+            let _ = self.src.stop_read_stream();
+            return Err(error);
+        }
+        let mut sent = 0;
+        let result = (|| -> Result<()> {
+            let mut expected = start;
+            loop {
+                if !self.gate.allowed(self.id)
+                    || self.sched.is_failed(idx)
+                    || self.sched.is_aborted()
+                {
+                    self.sched.release_rest(h);
+                }
+                {
+                    let range = h.lock().unwrap();
+                    if range.pos == range.end {
+                        break;
+                    }
+                }
+                self.dst.check_streaming_writes()?;
+                let t0 = std::time::Instant::now();
+                let (off, mut hash, mut data) = match ok(self.src.recv()?, "read stream")? {
+                    Response::Block { off, hash, data } => (off, hash, data),
+                    _ => bail!("unexpected response in read stream"),
+                };
+                self.t[0] += t0.elapsed().as_secs_f64();
+                let requested = (end - expected).min(block);
+                anyhow::ensure!(
+                    off == expected && data.len() as u64 == requested,
+                    "read stream returned an incorrect offset or block length"
+                );
+                expected += requested;
+                let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
+                if claimed == 0 {
+                    break;
+                }
+                self.limit(claimed);
+                let t0 = std::time::Instant::now();
+                self.dst.send(Request::WriteRange {
+                    path: job.dst.clone(),
+                    inplace: job.inplace,
+                    copy_id: self.copy_id(),
+                    attempt: job.attempt,
+                    off,
+                    hash,
+                    data,
+                    guard: job.container_guard.clone(),
+                })?;
+                self.t[1] += t0.elapsed().as_secs_f64();
+                sent += 1;
+                self.benchmark.streamed_blocks += 1;
+                self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
+                self.progress.add_bytes(claimed);
+                job.done.fetch_add(claimed, Relaxed);
+                *credited += claimed;
+            }
+            Ok(())
+        })();
+        // Always restore both protocol boundaries, even after a local write
+        // error. No following file can consume this one's data or late errors.
+        let source_end = self.src.stop_read_stream();
+        let t0 = std::time::Instant::now();
+        let destination_end = self.dst.finish_streaming_writes(sent);
+        self.t[2] += t0.elapsed().as_secs_f64();
+        result.and(source_end).and(destination_end)
     }
 
     fn undo_progress(&self, idx: usize, credited: u64) {

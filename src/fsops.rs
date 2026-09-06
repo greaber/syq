@@ -2798,7 +2798,10 @@ impl FsOps {
             | Request::TransportStats
             | Request::Receipt
             | Request::Shutdown
-            | Request::CopySmallFiles(_) => {}
+            | Request::CopySmallFiles(_)
+            | Request::ReadStream(_)
+            | Request::WriteStreamFence
+            | Request::StopReadStream => {}
         }
         Ok(req)
     }
@@ -6333,7 +6336,10 @@ impl FsOps {
             | Request::TransportStats
             | Request::Receipt
             | Request::Shutdown
-            | Request::TcpListen { .. } => Err(anyhow!("unexpected request")),
+            | Request::TcpListen { .. }
+            | Request::ReadStream(_)
+            | Request::WriteStreamFence
+            | Request::StopReadStream => Err(anyhow!("unexpected request")),
         };
         match r {
             Ok(resp) => self.rebase_response(resp),

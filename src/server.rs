@@ -50,6 +50,27 @@ impl RequestReader {
             .as_ref()
             .and_then(crate::conn::tcp_socket_stats)
     }
+
+    /// A read stream accepts only its stop marker. The client drains through
+    /// ReadStreamDone before issuing any following command on this connection.
+    fn stream_stopped(&self, wait: bool) -> Result<bool> {
+        use std::sync::mpsc::TryRecvError;
+        let request = if wait {
+            self.recv()
+                .context("read stream control channel closed")??
+        } else {
+            match self.rx.as_ref().unwrap().try_recv() {
+                Ok(request) => request?,
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => bail!("read stream control channel closed"),
+            }
+        };
+        anyhow::ensure!(
+            matches!(request, Request::StopReadStream),
+            "only StopReadStream is valid during a read stream"
+        );
+        Ok(true)
+    }
 }
 
 impl Drop for RequestReader {
@@ -444,6 +465,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
             ))?;
             continue;
         }
+        // A fence performs no filesystem operation and grants no authority.
+        // It must work after expiration/revocation too: preceding writes have
+        // already received their individual authorization/error responses.
+        if matches!(req, Request::WriteStreamFence) {
+            w.write_msg(&Response::WriteStreamDone)?;
+            continue;
+        }
         let settlement = match &authority {
             Some(authority) => match authority.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
@@ -479,6 +507,44 @@ fn serve<R: Read + Send + 'static, W: Write>(
         }
         match req {
             Request::Shutdown => break,
+            Request::ReadStream(mut stream) => {
+                if !is_source_worker {
+                    w.write_msg(&Response::Err(
+                        "read stream requires a source worker".into(),
+                    ))?;
+                    continue;
+                }
+                if let Err(error) = stream.validate() {
+                    w.write_msg(&Response::Err(error.to_string()))?;
+                    continue;
+                }
+                w.write_msg(&Response::Ok)?;
+                loop {
+                    // The idle/end/error state waits for the same stop marker
+                    // as an interrupted stream, avoiding a late cancellation
+                    // being mistaken for the next operation's request.
+                    if reader.stream_stopped(stream.off == stream.end)? {
+                        break;
+                    }
+                    let t0 = std::time::Instant::now();
+                    let response = ops.handle(&stream.next_request());
+                    t[1] += t0.elapsed().as_secs_f64();
+                    if let Response::Block { data, .. } = &response {
+                        stream.off += data.len() as u64;
+                        blocks += 1;
+                        bytes += data.len() as u64;
+                    } else {
+                        stream.off = stream.end;
+                    }
+                    let t0 = std::time::Instant::now();
+                    w.write_msg(&response)?;
+                    t[2] += t0.elapsed().as_secs_f64();
+                }
+                w.write_msg(&Response::ReadStreamDone)?;
+            }
+            Request::StopReadStream => {
+                w.write_msg(&Response::Err("no read stream is active".into()))?;
+            }
             Request::TcpListen {
                 key,
                 token,
@@ -1212,6 +1278,91 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
+    #[test]
+    fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
+        let root = crate::test_support::tempdir().unwrap();
+        let authority = Arc::new(crate::restricted::tests::tcp_test_authority(root.path()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_authority = authority.clone();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            serve(
+                socket.try_clone().unwrap(),
+                socket.try_clone().unwrap(),
+                false,
+                None,
+                None,
+                Some(socket),
+                ServeSession {
+                    handshake_pending: None,
+                    allow_tcp: true,
+                    named_socket: None,
+                    authority: Some(server_authority),
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
+            )
+            .unwrap();
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = FrameReader::new(socket.try_clone().unwrap());
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: true,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::DestinationWorker {
+                    destination: None,
+                    copy_sources: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::HelloOk { .. }
+        ));
+        authority.close_control();
+        for _ in 0..2 {
+            writer
+                .write_msg(&Request::WriteRange {
+                    path: b"file".to_vec(),
+                    inplace: false,
+                    copy_id: CopyId::default(),
+                    attempt: 0,
+                    off: 0,
+                    hash: fsops::content_digest(b"data"),
+                    data: b"data".to_vec(),
+                    guard: None,
+                })
+                .unwrap();
+            assert!(
+                matches!(reader.read_msg::<Response>().unwrap(), Response::Err(error) if error.contains("closed"))
+            );
+            writer.write_msg(&Request::WriteStreamFence).unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::WriteStreamDone
+            ));
+        }
+        socket.shutdown(std::net::Shutdown::Both).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
     const IP_ADDR_SHOW: &str = "\
 1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
 1: lo    inet6 ::1/128 scope host noprefixroute \\       valid_lft forever preferred_lft forever
@@ -1459,6 +1610,56 @@ mod tests {
         assert!(matches!(
             reader.read_msg::<Response>().unwrap(),
             Response::EndpointError(error) if error.message.contains("omitted")
+        ));
+        // Streaming must retain the same source capability checks, including
+        // after an error and after stopping an interval early.
+        for (source, end, expected_error) in [
+            (Some(selection.join(b"marker").unwrap()), 6, false),
+            (None, 6, true),
+            (Some(selection.join(b"marker").unwrap()), 4096, true),
+        ] {
+            writer
+                .write_msg(&Request::ReadStream(ReadStreamRequest {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                    source,
+                    attempt: 0,
+                    off: 0,
+                    end,
+                    block: 512,
+                }))
+                .unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::Ok
+            ));
+            let response = reader.read_msg::<Response>().unwrap();
+            if expected_error {
+                assert!(
+                    matches!(response, Response::EndpointError(_)),
+                    "{response:?}"
+                );
+            } else {
+                assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+            }
+            writer.write_msg(&Request::StopReadStream).unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::ReadStreamDone
+            ));
+        }
+        writer
+            .write_msg(&Request::ReadStream(ReadStreamRequest {
+                path: Vec::new(),
+                source: Some(selection.join(b"marker").unwrap()),
+                attempt: 0,
+                off: 0,
+                end: 6,
+                block: 0,
+            }))
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(_)
         ));
         writer
             .write_msg(&Request::RegisterSourceRoots {

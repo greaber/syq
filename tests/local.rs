@@ -5934,6 +5934,176 @@ fn tuning_observed(out: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn streaming_copies_local_trees_and_remote_ranges() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
+    for (name, size) in [("large", (17 << 20) + 123), ("small", 777), ("empty", 0)] {
+        write(&t.path(&format!("source/{name}")), &prng(size, 941));
+    }
+    for route in ["local", "ssh-push", "ssh-pull", "tcp-push", "tcp-pull"] {
+        for (workers, request) in [(1, "128K"), (4, "3M")] {
+            let destination = t.s(&format!("dst-{route}-{workers}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--connections",
+                &workers.to_string(),
+                "--no-progress",
+                "--preserve=permissions",
+                "-v",
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--tuning-options",
+                &format!("copy-path=streaming,request-size={request},split-min-size=1M"),
+            ]);
+            if route.starts_with("ssh") {
+                command.arg("--no-tcp");
+            }
+            if route.starts_with("tcp") {
+                command.env("SYQ_TEST_REQUIRE_TCP", "1");
+            }
+            if route.ends_with("pull") {
+                command.args(["--from", "host"]);
+            }
+            command.args(["--srcs-in", &t.s("source")]);
+            if route.ends_with("push") {
+                command.args(["--to", "host"]);
+            }
+            command
+                .args(["--into", &destination])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"));
+            let out = command.run().unwrap();
+            assert_output_ok(&out);
+            let observed = tuning_observed(&out);
+            assert!(
+                observed["streaming_ranges"].as_u64().unwrap() >= 2,
+                "{route}: {out:?}"
+            );
+            assert!(
+                observed["streamed_blocks"].as_u64().unwrap() >= 7,
+                "{route}: {out:?}"
+            );
+            assert_eq!(observed["range_requests"], 0);
+            assert_eq!(observed["small_batches"], 0);
+            assert_eq!(observed["local_whole_files"], 0);
+            assert!(stderr_of(&out).contains("pipeline-depth=unused(streaming)"));
+            assert_same_tree(&t.path("source"), Path::new(&destination));
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn streaming_and_default_copies_share_resume_partials() {
+    for (before, after) in [("ranges", "streaming"), ("streaming", "auto")] {
+        let t = Tmp::new();
+        let data = prng(6 << 20, 945);
+        write(&t.path("source"), &data);
+        set_mtime(&t.path("source"), 1_600_000_000);
+        let (src, dst) = (t.s("source"), t.s("destination"));
+        let partial = interrupted_partial(
+            &[
+                "-a",
+                "--block-size=1M",
+                "--bwlimit=1G",
+                &format!("--tuning-options=copy-path={before}"),
+                &src,
+                &dst,
+            ],
+            &t.0,
+        );
+        let file = File::create(&partial).unwrap();
+        (&file).write_all(&data[..3 << 20]).unwrap();
+        file.set_len(data.len() as u64).unwrap();
+        drop(file);
+        let out = run_ok(&[
+            "-a",
+            "--block-size=1M",
+            "--bwlimit=1G",
+            &format!("--tuning-options=copy-path={after},request-size=128K,bw-pacing=average"),
+            &src,
+            &dst,
+        ]);
+        assert_eq!(read(&t.path("destination")), data);
+        assert!(!partial.exists(), "switching mode stranded a partial");
+        assert!(
+            out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
+            "{out}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn streaming_reopens_a_dropped_write_connection() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let data = prng(2 << 20, 953);
+    write(&t.path("src"), &data);
+    let marker = t.path("drop-streaming-write-once");
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--syq-no-bootstrap",
+            "--tuning-options=copy-path=streaming,request-size=64K",
+            &t.s("src"),
+            &format!("fake:{}", t.s("dst")),
+        ],
+    )
+    .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
+    .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "3")
+    .env("SYQ_TEST_DROP_MARKER", &marker)
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert!(marker.exists());
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(
+        stderr_of(&out).contains("connection dropped; reopening"),
+        "{out:?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn streaming_read_errors_do_not_publish_a_file() {
+    let t = Tmp::new();
+    let data = prng(1 << 20, 954);
+    write(&t.path("src"), &data);
+    let args = [
+        "-a",
+        "--syq-connections=1",
+        "--tuning-options=copy-path=streaming,request-size=64K",
+        &t.s("src"),
+        &t.s("dst"),
+    ];
+    let failed = compat_command()
+        .args(args)
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .run()
+        .unwrap();
+    assert!(!failed.status.success(), "{failed:?}");
+    assert!(!t.path("dst").exists());
+    let recovered = compat_command().args(args).run().unwrap();
+    assert_output_ok(&recovered);
+    assert_eq!(read(&t.path("dst")), data);
+}
+
+#[test]
 fn tuning_options_batch_limits_include_the_first_file() {
     let t = Tmp::new();
     for i in 0..7 {
@@ -6081,6 +6251,8 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             "request-size=65M",
             "pipeline-depth=4,pipeline-depth=8",
             "copy-path=ranges,batch-files=1",
+            "copy-path=streaming,batch-files=1",
+            "copy-path=streaming,pipeline-depth=4",
             "bw-pacing=average",
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
