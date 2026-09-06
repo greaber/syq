@@ -10,10 +10,6 @@
 - [Send files home from a server](receive.md)
 - [Copy between servers](remote-to-remote.md)
 - [Rename and reorganize](mappings.md)
-# SDKs
-
-- [Python SDK](python.md)
-
 # Performance
 
 - [Speed](speed.md)
@@ -32,3 +28,7 @@
 # Development
 
 - [Developing syq](development.md)
+
+# SDKs
+
+- [Python SDK](python.md)
