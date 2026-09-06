@@ -4,7 +4,11 @@ Start with the defaults. Syq copies files in parallel, splits large files
 between workers, and adjusts connection count during the transfer. If a TCP
 data port is reachable, it sends data through separate encrypted connections.
 Otherwise, ordinary copies send their data over SSH. Small copies can stay
-on the SSH control connection to avoid extra setup.
+on the SSH control connection to avoid extra setup. When pushing into an
+existing directory, syq pipelines destination setup checks to reduce network
+round trips. For eligible small-file trees in an empty destination, TCP workers
+connect while destination planning finishes. These overlap setup work without
+skipping destination checks.
 
 ## Benchmarks
 
@@ -13,6 +17,44 @@ for comparisons with rsync, cp, and other tools, including the workloads,
 commands, and measured limitations. Use
 [syq-bench on your own machines](https://greaber.github.io/syq-bench/reproduce.html)
 to compare settings and track performance over time.
+
+## Quick comparison
+
+The [interactive benchmark](install.md#try-a-benchmark) gives you a small
+comparison without installing a benchmark package. After downloading the
+script, you can repeat the same choices explicitly:
+
+```sh
+bash try-benchmark.sh --yes --mode push --host server --workload both --size medium --rounds 3
+bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
+```
+
+Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
+scratch parent, including when pulling; `--source-dir` is always the local
+scratch parent. Budget roughly twice the selected data size locally and one
+copy remotely. Sizes are quick (64 MiB and 8 MiB), medium (1 GiB and 32 MiB),
+and large (8 GiB and 128 MiB), for the large-file and small-file workloads.
+
+Data comes from a fixed AES-CTR byte stream, making it reproducible and
+hard to compress. Every trial has an empty, pre-created destination; interrupted trials are
+never resumed. On Ctrl-C the script stops its local workers, moves remote
+scratch out of the transfer path, and deletes its temporary data. If SSH
+is unavailable, it reports the remote path for later cleanup. The script rotates
+tool order and reports each elapsed time and the mean for each tool. It uses
+syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
+These copy the same regular files and request permissions and modification
+times; the tools still differ in compression, integrity checks, and filesystem
+optimizations. Syq prints its transfer statistics.
+
+Generation, a single 14-byte syq setup copy, and POSIX `cksum` comparisons are
+outside the timer. The setup copy prepares the helper and exercises transfer
+setup; it is labeled separately and does not print a throughput result. A failed command or content check stops the comparison.
+Caches are not flushed, so this is a cache-friendly test rather than a cold
+disk benchmark. Times include process startup and buffered writes, without
+waiting for durable storage. Small tests can mostly measure startup costs;
+local filesystem cloning can favor cp. Results do not predict every workload,
+and syq may be slower. Use the full published benchmark methodology for more
+controlled measurements.
 
 ## When rsync or cp is faster
 

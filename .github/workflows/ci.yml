@@ -122,6 +122,12 @@ jobs:
           (needs.scope.outputs.native == 'true' &&
            needs.scope.outputs.full_suite == 'true')
         run: scripts/test-installer.sh
+      - name: Test interactive benchmark
+        if: >-
+          needs.scope.outputs.tooling == 'true' ||
+          (needs.scope.outputs.native == 'true' &&
+           needs.scope.outputs.full_suite == 'true')
+        run: python3 scripts/test-try-benchmark.py
       - name: Test release tooling
         if: >-
           needs.scope.outputs.tooling == 'true' ||
