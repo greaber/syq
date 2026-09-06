@@ -28,36 +28,38 @@ for name in ("laptop", "@laptop"):
     ]))
     assert (root / target).read_bytes() == expected
 
-print("case: handoff preserves mapping stdin, inherited results fd and raw path bytes", flush=True)
+print("case: handoff preserves inherited results fd and raw path bytes", flush=True)
 script = r'''
 import json, os, subprocess, tempfile
 base = b'/tmp/syq-real-ssh/handoff-source'
 os.mkdir(base)
-name = b'mapped-\n$(false)'
+name = b'raw-\xff\n$(false)'
 source = base + b'/' + name
 with open(source, 'wb') as f:
     f.write(b'raw handoff\x00\xff')
-mapping = subprocess.check_output([b'syq-other-build', b'map', b'-C', base, name], timeout=10)
 with tempfile.TemporaryFile() as results:
-    argv = ['syq-other-build', 'cp', '-C', os.fsdecode(base), '--mapping', '-', '--to', '@laptop',
-            '--into', 'skew-mapping', '--results-fd', str(results.fileno())]
-    result = subprocess.run(argv, input=mapping, capture_output=True,
+    argv = ['syq-other-build', 'cp', os.fsdecode(source), '--to', '@laptop',
+            '--as', 'skew-argv', '--results-fd', str(results.fileno())]
+    result = subprocess.run(argv, capture_output=True,
                             pass_fds=(results.fileno(),), timeout=30)
     assert result.returncode == 0, result
     results.seek(0)
     records = [json.loads(line) for line in results]
     assert sum(record.get('type') == 'result' for record in records) == 1, records
     assert records[-1]['status'] == 'success', records
-    # Maps use UTF-8 names; cp argv separately supports arbitrary Unix bytes.
-    raw = base + b'/raw-\xff\n$(false)'
-    os.rename(source, raw)
-    result = subprocess.run([b'syq-other-build', b'cp', raw, b'--to', b'@laptop',
-                             b'--as', b'skew-argv'], capture_output=True, timeout=30)
-    assert result.returncode == 0, result
+
+print('case: unsupported return mappings still settle results after handoff', flush=True)
+with tempfile.TemporaryFile() as results:
+    result = subprocess.run(['syq-other-build', 'cp', '--mapping', '-', '--to', '@laptop',
+                             '--into', 'skew-mapping', '--results-fd', str(results.fileno())],
+                            input=b'', capture_output=True, pass_fds=(results.fileno(),), timeout=30)
+    assert result.returncode != 0 and b'not yet independently enforceable' in result.stderr, result
+    results.seek(0)
+    records = [json.loads(line) for line in results]
+    assert records[-1]['status'] == 'failed', records
 '''
 run("ssh", "source", "python3 -c " + shlex.quote(script))
 assert (root / "skew-argv").read_bytes() == b"raw handoff\x00\xff"
-files = list((root / "skew-mapping").iterdir())
-assert len(files) == 1 and files[0].read_bytes() == b"raw handoff\x00\xff", files
+assert not (root / "skew-mapping").exists()
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 print("Return build handoff passed", flush=True)

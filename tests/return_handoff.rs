@@ -1,7 +1,8 @@
 //! Failures at the local build handoff must precede approval and SSH fallback.
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 struct Fixture {
     temp: tempfile::TempDir,
@@ -144,4 +145,46 @@ fn pre_handoff_registry_is_ignored_without_rewriting_it() {
         &fixture.run(&["cp", "source", "--to", "@laptop"]),
         "unavailable",
     );
+}
+
+#[test]
+fn handoff_precedes_stdin_consumption_and_result_file_opening() {
+    let fixture = Fixture::new();
+    let helper = fixture.script(
+        r#"
+import json, pathlib, sys
+assert sys.argv[1] == '--return-handoff-v1', sys.argv
+guard = json.loads(sys.argv[2])
+assert guard['name'] == 'laptop' and 'secret' not in guard, guard
+assert sys.argv[3:] == ['cp', '--mapping', '-', '--to', '@laptop', '--results', 'results'], sys.argv
+assert pathlib.Path('results').read_bytes() == b'untouched'
+sys.stdout.buffer.write(sys.stdin.buffer.read())
+sys.exit(23)
+"#,
+    );
+    fixture.registration(&helper, "another-build");
+    fs::write(fixture.temp.path().join("results"), b"untouched").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--mapping",
+            "-",
+            "--to",
+            "@laptop",
+            "--results",
+            "results",
+        ])
+        .current_dir(fixture.temp.path())
+        .env("HOME", fixture.temp.path())
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = b"original stdin\n\x00\xff";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert_eq!(output.stdout, input);
 }
