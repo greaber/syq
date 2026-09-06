@@ -25,7 +25,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage reusable SSH connections and helper sessions",
-    long_about = "Manage reusable SSH connections and helper sessions. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving accepts copies automatically from connected server accounts by default; configure or disable it with syq recv. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -279,6 +279,9 @@ pub(crate) fn prepare_endpoint(
     port: Option<u16>,
 ) -> Result<PathBuf> {
     validate_scope(scope)?;
+    if scope.join(crate::receive_service::CLOSING).exists() {
+        bail!("persistence scope is closing");
+    }
     let key = endpoint_key(user, host, port);
     let socket = scope.join(&key);
     validate_openssh_socket_path(&socket)?;
@@ -323,7 +326,7 @@ pub(crate) fn prepare_endpoint(
     Ok(socket)
 }
 
-fn config_path() -> Option<PathBuf> {
+pub(crate) fn config_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -371,7 +374,7 @@ fn read_global_config() -> Result<Option<PersistenceConfig>> {
     Ok(Some(config))
 }
 
-fn global_enabled() -> Result<bool> {
+pub(crate) fn global_enabled() -> Result<bool> {
     Ok(read_global_config()?.is_some_and(|config| config.enabled))
 }
 
@@ -393,7 +396,7 @@ fn write_global_config(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn runtime_parent_path() -> PathBuf {
+pub(crate) fn runtime_parent_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -414,7 +417,7 @@ fn global_scope_path() -> Result<PathBuf> {
     Ok(runtime_parent_path().join("global"))
 }
 
-fn is_global_scope(scope: &Path) -> Result<bool> {
+pub(crate) fn is_global_scope(scope: &Path) -> Result<bool> {
     let global = global_scope_path()?;
     let global = match std::fs::canonicalize(&global) {
         Ok(global) => global,
@@ -635,6 +638,29 @@ fn scope_records(scope: &Path) -> Result<Vec<(String, EndpointRecord)>> {
     Ok(records)
 }
 
+/// Inspect only existing, owned scopes; status must not enable persistence.
+pub(crate) fn receiving_controls() -> Result<Vec<PathBuf>> {
+    let parent = runtime_parent_path();
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    secure_directory(&parent, false, true)?;
+    let mut controls = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "global" || name.to_str().is_some_and(|name| name.starts_with("scope-")) {
+            let scope = entry.path();
+            for (key, _) in scope_records(&scope)? {
+                controls.push(scope.join(key));
+            }
+        }
+    }
+    Ok(controls)
+}
+
 fn socket_is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
@@ -659,19 +685,31 @@ fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
         } else {
             ""
         };
-        println!("  {}  {state}{pool}", record.label());
+        let receiving = crate::receive_service::summary(&control);
+        println!("  {}  {state}{pool}{receiving}", record.label());
     }
     Ok(())
 }
 
 fn close_scope(scope: &Path) -> Result<()> {
     let records = scope_records(scope)?;
+    let closing = scope.join(crate::receive_service::CLOSING);
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&closing)?;
     let record_keys: std::collections::HashSet<&str> =
         records.iter().map(|(key, _)| key.as_str()).collect();
     for entry in std::fs::read_dir(scope)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == OsStr::new(SCOPE_MARKER) || record_key(&name).is_some() {
+        if name == OsStr::new(SCOPE_MARKER)
+            || name == OsStr::new(crate::receive_service::CLOSING)
+            || record_key(&name).is_some()
+        {
             continue;
         }
         if let Some(name) = name.to_str() {
@@ -680,6 +718,7 @@ fn close_scope(scope: &Path) -> Result<()> {
             }
         }
         if let Some(owner) = crate::session_pool::owned_name(name.as_bytes())
+            .or_else(|| crate::receive_service::owned_name(name.as_bytes()))
             .and_then(|owner| std::str::from_utf8(owner).ok())
         {
             if valid_endpoint_key(owner) && record_keys.contains(owner) {
@@ -695,6 +734,7 @@ fn close_scope(scope: &Path) -> Result<()> {
 
     for (key, record) in records {
         let socket = scope.join(&key);
+        crate::receive_service::stop(&socket)?;
         // The pool holds live sessions on the master, so it goes first.
         crate::session_pool::stop(&socket)?;
         if socket_is_live(&socket) {
@@ -714,6 +754,7 @@ fn close_scope(scope: &Path) -> Result<()> {
         std::fs::remove_file(&record_path)
             .with_context(|| format!("remove endpoint record {}", record_path.display()))?;
     }
+    std::fs::remove_file(closing)?;
     std::fs::remove_file(scope.join(SCOPE_MARKER))
         .with_context(|| format!("remove persistence marker from {}", scope.display()))?;
     std::fs::remove_dir(scope)

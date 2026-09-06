@@ -75,6 +75,25 @@ have different boundaries: broker-only authentication permits that destination
 account's full authority during the session; full agent forwarding exposes
 your agent as `ssh -A` would.
 
+## Named receiving destinations
+
+A [named destination](receive.md) lets a server account request copies through
+an outbound connection maintained by your laptop. `persist on` enables this
+for syq's SSH connections by default. Requests are accepted automatically;
+there is no approval prompt. Each request's paths and limits are validated
+before its authority is issued, and the restricted filesystem executor checks
+every operation. The server receives no SSH agent or command-execution interface.
+
+The default starting directory is your home directory, with no containment.
+`syq recv on --root DIRECTORY` contains copies; `syq recv off` disables receiving
+while keeping ordinary persistence. A compromised connected server account can
+invent content, request more copies, inspect destination entries during copy
+planning, and consume disk space. The laptop's receiving account is trusted.
+
+Bare destination names fall back to ordinary SSH while the laptop is offline.
+Use `@name` when you require a return connection and want failure instead of
+host resolution. A copy never switches routes after selecting its destination.
+
 ## Limits to keep in mind
 
 - **Privileged copies need trusted destination directories.** Resume uses

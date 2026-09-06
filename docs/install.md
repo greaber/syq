@@ -72,6 +72,12 @@ syq persist status
 syq persist off
 ```
 
-Connections can stay reusable for up to ten minutes after your last command.
+Persistence also enables [background receiving](receive.md) from the server
+accounts syq connects to. Those accounts can send files to your home directory
+automatically. Use `syq recv off` to keep only ordinary connection reuse, or
+`syq recv on --root DIRECTORY` to contain receiving in an existing directory.
+
+Ordinary SSH connections can stay reusable for up to ten minutes after your last command.
 During that window, other processes running as your user can reuse the login
-without another key touch or agent approval. `off` closes the connections.
+without another key touch or agent approval. Return connections stay available
+until stopped. `persist off` closes both.

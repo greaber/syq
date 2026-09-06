@@ -25,6 +25,7 @@ RUN apt-get update \
         openssh-server \
         procps \
         python3 \
+
         zsh \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 syq \

@@ -16,12 +16,14 @@ struct RequestReader {
     rx: Option<std::sync::mpsc::Receiver<io::Result<Request>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
+    named_socket: Option<std::os::unix::net::UnixStream>,
 }
 
 impl RequestReader {
     fn spawn<R: Read + Send + 'static>(
         mut reader: FrameReader<R>,
         tcp_socket: Option<TcpStream>,
+        named_socket: Option<std::os::unix::net::UnixStream>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::spawn(move || loop {
@@ -35,6 +37,7 @@ impl RequestReader {
             rx: Some(rx),
             thread: Some(thread),
             tcp_socket,
+            named_socket,
         }
     }
 
@@ -51,7 +54,10 @@ impl RequestReader {
 
 impl Drop for RequestReader {
     fn drop(&mut self) {
-        let tcp = self.tcp_socket.is_some();
+        let joinable = self.tcp_socket.is_some() || self.named_socket.is_some();
+        if let Some(socket) = &self.named_socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(socket) = &self.tcp_socket {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
@@ -60,7 +66,7 @@ impl Drop for RequestReader {
         // stdin reader here would deadlock while the client waits for process
         // exit before closing stdin. A TCP socket can be woken explicitly, so
         // its reader is joined deterministically on every return path.
-        if tcp {
+        if joinable {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -69,6 +75,8 @@ impl Drop for RequestReader {
 }
 
 struct ServeSession {
+    allow_tcp: bool,
+    named_socket: Option<std::os::unix::net::UnixStream>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 }
@@ -81,7 +89,37 @@ const MAX_LIVE_TCP_CONNECTIONS: u32 = 256;
 
 /// One authenticated worker's share of a signed grant's connection allowance,
 /// returned when the connection ends.
-struct ConnectionPermit(Arc<crate::restricted::RestrictedAuthority>);
+pub(crate) struct ConnectionPermit(Arc<crate::restricted::RestrictedAuthority>);
+
+impl ConnectionPermit {
+    pub(crate) fn acquire(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<Self> {
+        authority.acquire_connection()?;
+        Ok(Self(authority))
+    }
+}
+
+/// Absolute Hello deadline. Socket clones share the timeout; serve clears it
+/// only after validating Hello and sending HelloOk.
+struct NamedHandshakeReader {
+    inner: crate::private_broker::TrackedStream,
+    socket: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+impl Read for NamedHandshakeReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.socket.read_timeout()?.is_some() {
+            let remaining = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(ErrorKind::TimedOut, "named channel Hello timed out")
+                })?;
+            self.socket.set_read_timeout(Some(remaining))?;
+        }
+        self.inner.read(bytes)
+    }
+}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
@@ -99,6 +137,8 @@ pub fn run() -> Result<()> {
         None,
         None,
         ServeSession {
+            allow_tcp: true,
+            named_socket: None,
             authority: None,
             descriptor_session: descriptor_session.clone(),
         },
@@ -117,12 +157,53 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         None,
         ServeSession {
+            allow_tcp: true,
+            named_socket: None,
             authority: Some(Arc::clone(&authority)),
             descriptor_session: descriptor_session.clone(),
         },
     );
     descriptor_session.close();
     authority.close_control();
+    result
+}
+
+/// An authenticated named-destination channel. Worker admission and path
+/// checks are identical to restricted TCP workers; SSH encrypts these streams.
+pub(crate) fn run_named(
+    r: crate::private_broker::TrackedStream,
+    w: std::os::unix::net::UnixStream,
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    control: bool,
+) -> Result<()> {
+    let descriptor_session = DescriptorSessionSlot::default();
+    let socket = w.try_clone()?;
+    let timeout = socket
+        .read_timeout()?
+        .context("named handshake requires a timeout")?;
+    let reader = NamedHandshakeReader {
+        inner: r,
+        socket: socket.try_clone()?,
+        deadline: std::time::Instant::now() + timeout,
+    };
+    let result = serve(
+        reader,
+        w,
+        control,
+        None,
+        None,
+        None,
+        ServeSession {
+            allow_tcp: false,
+            named_socket: Some(socket),
+            authority: Some(Arc::clone(&authority)),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    descriptor_session.close();
+    if control {
+        authority.close_control();
+    }
     result
 }
 
@@ -138,6 +219,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
     session: ServeSession,
 ) -> Result<()> {
     let ServeSession {
+        allow_tcp,
+        named_socket,
         authority,
         descriptor_session,
     } = session;
@@ -177,9 +260,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             // grant's worker allowance. The control connection arrives over
             // ssh and is not a worker.
             _permit = match (&authority, over_ssh) {
-                (Some(authority), false) => {
-                    authority.acquire_connection()?;
-                    Some(ConnectionPermit(authority.clone()))
+                (Some(authority), false) if named_socket.is_none() => {
+                    Some(ConnectionPermit::acquire(authority.clone())?)
                 }
                 _ => None,
             };
@@ -278,10 +360,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
     })?;
 
+    if let Some(socket) = &named_socket {
+        socket.set_read_timeout(None)?;
+        socket.set_write_timeout(None)?;
+    }
+
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
-    let reader = RequestReader::spawn(r, tcp_socket);
+    let reader = RequestReader::spawn(r, tcp_socket, named_socket);
 
     let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
@@ -363,6 +450,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 port_hi,
                 congestion_control,
             } => {
+                if !allow_tcp {
+                    w.write_msg(&Response::Err(
+                        "named destinations carry data through SSH; TCP listeners are disabled"
+                            .into(),
+                    ))?;
+                    continue;
+                }
                 if !is_control {
                     w.write_msg(&Response::Err(
                         "TcpListen only allowed on the control connection".into(),
@@ -1007,6 +1101,8 @@ fn serve_tcp(
         Some(&authed),
         Some(stream.try_clone()?),
         ServeSession {
+            allow_tcp: true,
+            named_socket: None,
             authority,
             descriptor_session,
         },
@@ -1221,6 +1317,8 @@ mod tests {
                 None,
                 Some(socket),
                 ServeSession {
+                    allow_tcp: true,
+                    named_socket: None,
                     authority: None,
                     descriptor_session: server_session,
                 },
@@ -1368,6 +1466,8 @@ mod tests {
                 None,
                 None,
                 ServeSession {
+                    allow_tcp: true,
+                    named_socket: None,
                     authority: None,
                     descriptor_session: DescriptorSessionSlot::default(),
                 },
@@ -1428,6 +1528,8 @@ mod tests {
                 None,
                 None,
                 ServeSession {
+                    allow_tcp: true,
+                    named_socket: None,
                     authority: None,
                     descriptor_session: DescriptorSessionSlot::default(),
                 },
