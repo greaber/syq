@@ -19,8 +19,9 @@ def remote(command, *, success=True):
     return run("ssh", "destination", command, success=success)
 
 
-def copy(path, *, allow=True, success=True, extra=(), cancel=False):
-    argv = ["syq", "cp", "-vv", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
+def copy(path, *, allow=True, success=True, extra=(), cancel=False,
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None):
+    argv = ["syq", "cp", "-vv", source, "--to", "destination",
             "--via", "@laptop", "--as", path, "--connections", "2", *extra]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
@@ -38,15 +39,18 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False):
                 progress = time.monotonic() + 5
                 state = ""
                 while time.monotonic() < deadline:
-                    state = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'")
-                    if state:
-                        break
+                    partials = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'").splitlines()
+                    state = repr(partials)
+                    if len(partials) == 1:
+                        state = remote("dd if=" + shlex.quote(partials[0]) + " bs=1M count=4 status=none | sha256sum")
+                        if state == prefix:
+                            break
                     assert process.poll() is None, "copy exited before cancellation"
                     if time.monotonic() >= progress:
                         print("Waiting for remote copy partial:", repr(state), flush=True)
                         progress += 5
                     time.sleep(.1)
-                assert state, ("no copy partial before deadline", state)
+                assert state == prefix, ("no complete resumable prefix before deadline", state)
                 run("syq", "recv", "on", "--notify", "off")
             deadline = time.monotonic() + 65
             last_output = 0
@@ -104,8 +108,20 @@ copy("/tmp/syq-real-ssh/forward/blocked", extra=("--tcp-ports", f"{port}-{port}"
 remote("test ! -e /tmp/syq-real-ssh/forward/blocked")
 
 print("case: receiver restart revokes an active remote copy; a new approval can resume", flush=True)
-copy("/tmp/syq-real-ssh/forward/cancelled", extra=("--bwlimit", "128"), cancel=True, success=False)
+source = "/tmp/syq-real-ssh/return-source/forward-resume.bin"
+run("ssh", "source", f"dd if=/dev/urandom of={source} bs=1M count=16 status=none")
+prefix = run("ssh", "source", f"dd if={source} bs=1M count=4 status=none | sha256sum")
+expected = run("ssh", "source", f"sha256sum {source}").split()[0]
+# Wait for a complete hash block, so the retry must actually reuse copied data.
+copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
+     extra=("--bwlimit", "512"), cancel=True, success=False)
+remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
 run("syq", "recv", "wait", "source", "--timeout", "30")
-copy("/tmp/syq-real-ssh/forward/cancelled")
+results = "/tmp/syq-real-ssh/forward-resume.ndjson"
+copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--results", results))
+records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").splitlines()]
+assert records[-1]["type"] == "result", records
+assert records[-1]["bytes_unchanged"] >= 4 * 1024 * 1024, records[-1]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
+assert not remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'")
 print("source-shell remote copy checks passed", flush=True)
