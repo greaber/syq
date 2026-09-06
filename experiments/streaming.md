@@ -50,6 +50,11 @@ This avoids waiting an extra round trip for an already-finished read. Stop
 and subsequent commands remain ordered on the same connection; there is
 exactly one Done, including on early cancellation. A split through a
 frame validates the whole frame's hash before truncating/re-hashing its prefix.
+Both hashes run outside the range mutex, so stealing cannot hold the global
+scheduler mutex while waiting for payload hashing. The worker revalidates its
+position and boundary before claiming the prefix, and retries the prefix hash
+if another steal shortened it. Hash failure does not advance the position or
+alter the received payload.
 Exhausting a reduced limit also emits Done before waiting for Stop, including
 when a late shrink moves the end behind read-ahead's current offset. The source
 still consumes all late controls through Stop before the next operation.

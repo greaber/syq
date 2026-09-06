@@ -81,22 +81,57 @@ pub(crate) fn claim_block(
     hash: &mut crate::proto::ContentDigest,
     data: &mut Vec<u8>,
 ) -> anyhow::Result<u64> {
-    let mut range = range.lock().unwrap();
-    anyhow::ensure!(
-        range.pos == off,
-        "streamed block does not match the scheduler position"
-    );
-    let claimed = (data.len() as u64).min(range.end - range.pos);
-    if claimed > 0 && claimed < data.len() as u64 {
+    claim_block_with_digest(range, off, hash, data, crate::fsops::content_digest)
+}
+
+fn claim_block_with_digest(
+    range: &crate::sched::RangeHandle,
+    off: u64,
+    hash: &mut crate::proto::ContentDigest,
+    data: &mut Vec<u8>,
+    mut digest: impl FnMut(&[u8]) -> crate::proto::ContentDigest,
+) -> anyhow::Result<u64> {
+    let mut assigned = range.lock().unwrap();
+    let mut verified = false;
+    loop {
         anyhow::ensure!(
-            crate::fsops::content_digest(data) == *hash,
-            "streamed block hash mismatch before splitting"
+            assigned.pos == off,
+            "streamed block does not match the scheduler position"
         );
+        let claimed = (data.len() as u64).min(assigned.end - assigned.pos);
+        if claimed == 0 || claimed == data.len() as u64 {
+            assigned.pos += claimed;
+            return Ok(claimed);
+        }
+
+        // Steal holds the scheduler mutex while taking this range mutex.
+        // Hash neither the full frame nor its prefix in that critical section.
+        // Keep the original payload intact until the boundary is revalidated.
+        drop(assigned);
+        if !verified {
+            anyhow::ensure!(
+                digest(data) == *hash,
+                "streamed block hash mismatch before splitting"
+            );
+            verified = true;
+        }
+        let prefix_hash = digest(&data[..claimed as usize]);
+        assigned = range.lock().unwrap();
+        anyhow::ensure!(
+            assigned.pos == off,
+            "streamed block does not match the scheduler position"
+        );
+        if claimed != (data.len() as u64).min(assigned.end - assigned.pos) {
+            // A further steal or cancellation won the race with hashing.
+            // Recompute only the smaller prefix, not the validated full frame.
+            continue;
+        }
+        assigned.pos += claimed;
+        drop(assigned);
         data.truncate(claimed as usize);
-        *hash = crate::fsops::content_digest(data);
+        *hash = prefix_hash;
+        return Ok(claimed);
     }
-    range.pos += claimed;
-    Ok(claimed)
 }
 
 pub(crate) type Responses = mpsc::Receiver<io::Result<Response>>;
@@ -357,6 +392,8 @@ mod tests {
         let mut bad_hash = [0; 32];
         assert!(claim_block(&range, 0, &mut bad_hash, &mut data).is_err());
         assert_eq!(range.lock().unwrap().pos, 0);
+        assert_eq!(data, b"abcdefgh");
+        assert_eq!(bad_hash, [0; 32]);
         let mut hash = crate::fsops::content_digest(&data);
         assert_eq!(claim_block(&range, 0, &mut hash, &mut data).unwrap(), 5);
         assert_eq!(data, b"abcde");
@@ -364,6 +401,85 @@ mod tests {
         assert_eq!(range.lock().unwrap().pos, 5);
         assert_eq!(claim_block(&range, 5, &mut hash, &mut data).unwrap(), 0);
         assert!(claim_block(&range, 6, &mut hash, &mut data).is_err());
+    }
+
+    #[test]
+    fn split_hashing_unlocks_the_range_and_revalidates_a_further_steal() {
+        let range = Arc::new(Mutex::new(crate::sched::RangeState {
+            idx: 0,
+            pos: 0,
+            end: 5,
+        }));
+        let mut data = b"abcdefgh".to_vec();
+        let mut hash = crate::fsops::content_digest(&data);
+        let mut hashed_lengths = Vec::new();
+        let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |bytes| {
+            let mut assigned = range.try_lock().expect("hashing held the range mutex");
+            assert_eq!(assigned.pos, 0);
+            hashed_lengths.push(bytes.len());
+            assigned.end = 3;
+            crate::fsops::content_digest(bytes)
+        })
+        .unwrap();
+        assert_eq!(hashed_lengths, [8, 5, 3]);
+        assert_eq!(claimed, 3);
+        assert_eq!(range.lock().unwrap().pos, 3);
+        assert_eq!(data, b"abc");
+        assert_eq!(hash, crate::fsops::content_digest(b"abc"));
+    }
+
+    #[test]
+    fn split_hashing_preserves_payload_when_cancelled_or_position_changes() {
+        for changed_position in [false, true] {
+            let range = Arc::new(Mutex::new(crate::sched::RangeState {
+                idx: 0,
+                pos: 0,
+                end: 5,
+            }));
+            let mut data = b"abcdefgh".to_vec();
+            let original_hash = crate::fsops::content_digest(&data);
+            let mut hash = original_hash;
+            let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |bytes| {
+                let mut assigned = range.try_lock().expect("hashing held the range mutex");
+                if bytes.len() == 5 {
+                    if changed_position {
+                        assigned.pos = 2;
+                    } else {
+                        assigned.end = 0;
+                    }
+                }
+                crate::fsops::content_digest(bytes)
+            });
+            if changed_position {
+                assert!(claimed.is_err());
+                assert_eq!(range.lock().unwrap().pos, 2);
+            } else {
+                assert_eq!(claimed.unwrap(), 0);
+                assert_eq!(range.lock().unwrap().pos, 0);
+            }
+            assert_eq!(data, b"abcdefgh");
+            assert_eq!(hash, original_hash);
+        }
+    }
+
+    #[test]
+    fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
+        for end in [0, 8, 16] {
+            let range = Arc::new(Mutex::new(crate::sched::RangeState {
+                idx: 0,
+                pos: 0,
+                end,
+            }));
+            let mut data = b"abcdefgh".to_vec();
+            let mut hash = crate::fsops::content_digest(&data);
+            let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |_| {
+                panic!("only split frames need a coordinator-side hash")
+            })
+            .unwrap();
+            assert_eq!(claimed, end.min(8));
+            assert_eq!(range.lock().unwrap().pos, claimed);
+            assert_eq!(data, b"abcdefgh");
+        }
     }
 
     #[test]
