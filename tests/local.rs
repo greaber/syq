@@ -5981,16 +5981,73 @@ fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
                 observed["small_batches"].as_u64().unwrap() > 0,
                 "{route}/{mode}: {out:?}"
             );
-            if mode == "auto" {
+            if mode == "auto" && route == "local" {
                 assert_eq!(observed["streaming_ranges"], 0);
             } else {
-                assert_eq!(observed["range_requests"], 0);
+                if mode == "auto-streaming" {
+                    assert_eq!(observed["range_requests"], 0);
+                }
                 if route != "local" {
                     assert!(
                         observed["streaming_ranges"].as_u64().unwrap() > 0,
                         "{out:?}"
                     );
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    for (label, size) in [("short", 8 << 20), ("long", 20 << 20)] {
+        write(&t.path(label), &prng(size, 947));
+        for route in ["local", "push", "pull"] {
+            let destination = t.s(&format!("dst-{label}-{route}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--connections",
+                "1",
+                "--no-progress",
+                "--no-tcp",
+                "--stats",
+                "-v",
+            ]);
+            if route == "pull" {
+                command.args(["--from", "host"]);
+            }
+            command.arg(t.s(label));
+            if route == "push" {
+                command.args(["--to", "host"]);
+            }
+            let out = command
+                .args(["--as", &destination])
+                .env("SYQ_DEBUG", "1")
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert_eq!(
+                fs::read(t.path(label)).unwrap(),
+                fs::read(&destination).unwrap()
+            );
+            let observed = tuning_observed(&out);
+            assert_eq!(
+                observed["streaming_ranges"].as_u64().unwrap() > 0,
+                label == "long" && route != "local",
+                "{out:?}"
+            );
+            if label == "short" && route != "local" {
+                assert!(observed["range_requests"].as_u64().unwrap() > 0, "{out:?}");
             }
         }
     }

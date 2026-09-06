@@ -180,18 +180,26 @@ smaller batch to share work among workers. With `--bwlimit`, worker batches
 contain at most one file. Batch controls cannot be combined with
 `copy-path=ranges` or `copy-path=streaming`.
 
-### Experimental streaming
+### Streaming and request windows
 
-`--tuning-options copy-path=streaming` is disabled by default. It streams
+Syq automatically streams remote ranges larger than one normal request
+window (usually 16 MiB). Local ranges and shorter remote ranges use ordinary
+requests. Whole-file and small-file shortcuts keep their usual eligibility.
+No streaming or pipeline setting is needed for ordinary copies.
+
+Streaming sends
 checked source blocks and collects destination write replies concurrently,
 instead of limiting the number of blocks awaiting replies. It still verifies
 block hashes, checks all write errors before completion, and supports resume
 and parallel workers on different parts of one large file. It does not add
-a disk flush. It bypasses the same copy shortcuts as `copy-path=ranges`.
+a disk flush.
 
+For experiments, `copy-path=streaming` forces streaming even for local and
+short ranges, bypassing the same copy shortcuts as `copy-path=ranges`.
 `copy-path=auto-streaming` keeps the normal whole-file and small-file shortcuts,
-and streams only transfers that would otherwise use range requests. It does
-not change how syq chooses those shortcuts. Both streaming modes are opt-in.
+but forces streaming for all remaining ranges, including local and short ones.
+An explicit `pipeline-depth` uses ordinary requests instead of automatic
+streaming, allowing comparisons with the credit-window implementation.
 
 For a controlled comparison, use fresh scratch destinations:
 

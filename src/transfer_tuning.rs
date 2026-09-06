@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Both are disabled by default and incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for benchmarks with comma-separated KEY=VALUE pairs. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; default is the hash block size, normally 4M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -99,6 +99,19 @@ impl TransferTuning {
             self.copy_path,
             Some(CopyPath::Streaming | CopyPath::AutoStreaming)
         )
+    }
+    /// Select the range engine without asking users to size a credit window.
+    /// Local copies have no network credit latency to hide. A short remote
+    /// range fits in one ordinary window, so streaming would only add fences.
+    /// Explicit depth/range controls retain the old engine for experiments.
+    pub fn stream_range(self, same_host: bool, bytes: u64, block: u64) -> bool {
+        if self.streaming() {
+            return true;
+        }
+        if same_host || self.copy_path == Some(CopyPath::Ranges) || self.pipeline_depth.is_some() {
+            return false;
+        }
+        bytes > block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
     }
     pub fn batch_bytes(self) -> u64 {
         self.batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES)
@@ -382,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_is_explicit_and_rejects_irrelevant_controls() {
+    fn forced_streaming_rejects_irrelevant_controls() {
         let streaming: TransferTuning = "copy-path=streaming".parse().unwrap();
         streaming.validate(0).unwrap();
         assert!(streaming.streaming() && streaming.force_ranges());
@@ -405,6 +418,32 @@ mod tests {
                 .unwrap()
                 .validate(0)
                 .is_err());
+        }
+    }
+
+    #[test]
+    fn automatic_streaming_skips_local_and_single_window_ranges() {
+        let automatic = TransferTuning::default();
+        let block = 4 << 20;
+        for size in [0, 1, block, 4 * block] {
+            assert!(!automatic.stream_range(false, size, block));
+        }
+        for size in [4 * block + 1, 8 * block, u64::MAX] {
+            assert!(automatic.stream_range(false, size, block));
+            assert!(!automatic.stream_range(true, size, block));
+        }
+        assert!(!automatic.stream_range(false, u64::MAX, u64::MAX));
+        for control in [
+            "copy-path=ranges",
+            "pipeline-depth=4",
+            "copy-path=auto,pipeline-depth=16",
+        ] {
+            let tuning: TransferTuning = control.parse().unwrap();
+            assert!(!tuning.stream_range(false, 64 * block, block));
+        }
+        for control in ["copy-path=streaming", "copy-path=auto-streaming"] {
+            let tuning: TransferTuning = control.parse().unwrap();
+            assert!(tuning.stream_range(true, block, block));
         }
     }
 }

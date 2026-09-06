@@ -1,17 +1,25 @@
 # Experimental range streaming
 
-2026-09-06. This opt-in experiment compares continuous checked block streaming
-with the existing request/ack credit window. `copy-path=auto` remains the
-default. `--tuning-options copy-path=streaming` selects the experiment and
-bypasses small-file/whole-file shortcuts, just as `copy-path=ranges` does.
-Neither performance superiority nor a default change is assumed.
+2026-09-06. The current candidate makes streaming automatic for remote ranges
+larger than one ordinary request window (normally four 4 MiB blocks). Local
+ranges and shorter remote ranges retain ordinary requests: local operations
+have no network credit latency, and short ranges fit in the existing window
+without waiting to refill it. This selection is based on the work remaining,
+not a provider, measured RTT threshold, or user-supplied budget. It is a
+candidate under measurement, not a universal performance guarantee.
+
+Whole-file, native small-copy and batching eligibility remain unchanged.
+An explicit pipeline depth or `copy-path=ranges` retains ordinary requests
+for diagnostic comparisons. `copy-path=streaming` still forces streaming
+and bypasses small-file/whole-file shortcuts, just as `copy-path=ranges` does.
 
 `copy-path=auto-streaming` keeps the same eligibility rules for native small
 copies, worker batches, and whole-file copies as `auto`, and selects streaming
 only when the scheduler reaches range transfer. This isolates the streaming
 mechanism from bypassing unrelated optimizations. It rejects pipeline depth
-but permits explicit batch controls. No default or automatic selection policy
-changes are involved in this selector.
+but permits explicit batch controls. Unlike `auto`, this diagnostic selector
+also streams short and local ranges, allowing the automatic exclusions to be
+tested independently.
 
 ## Protocol and scheduling
 
@@ -70,8 +78,9 @@ existing frame tags or payload layouts change. The source stream is protected
 by the existing build-identity preamble before any frames are decoded. Both
 old-to-new and new-to-old build mismatches fail explicitly; managed helpers
 select/upload the matching executable. A manually selected old helper must be
-updated, and an old coordinator rejects the new tuning value. Default copies
-never issue stream commands.
+updated, and an old coordinator rejects the new tuning value. The automatic
+candidate can issue stream commands, but only after the same identity check.
+The subsequent v0.4.1 baseline retains these pre-streaming wire definitions.
 
 There is no new persisted state, grant/receipt field, resume grid, enrollment
 format, updater setting or automation schema. Tuning remains raw CLI in SDKs

@@ -1777,7 +1777,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let opts = Arc::new(Opts {
         block,
         tuning: args.tuning_options.unwrap_or_default(),
-        benchmark: (args.tuning_options.is_some()
+        benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
             && (args.stats || args.verbose > 0 || debug()))
         .then(|| Mutex::new(crate::transfer_tuning::BenchmarkStats::default())),
@@ -8201,7 +8201,15 @@ impl Worker {
     }
 
     fn transfer_range(&mut self, h: &RangeHandle, credited: &mut u64) -> Result<()> {
-        if self.opts.tuning.streaming() {
+        let bytes = {
+            let range = h.lock().unwrap();
+            range.end - range.pos
+        };
+        if self
+            .opts
+            .tuning
+            .stream_range(self.opts.same_host, bytes, self.transfer_block())
+        {
             return self.transfer_streaming_range(h, credited);
         }
         let idx = {
