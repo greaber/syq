@@ -211,6 +211,7 @@ sys.exit(23)
             "source",
             "--ignore",
             "!keep.tmp",
+            "--follow",
             "--ignore-from",
             "/dev/stdin",
             "--ignore",

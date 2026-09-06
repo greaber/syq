@@ -102,6 +102,8 @@ try:
             '--ignore-from', base + '/extra-rules', '--ignore', '!keep.cache',
             '--to', 'laptop' if kind == 'stdin' else '@laptop', '--into', target,
             '--prune', '--max-delete', '1']
+    if kind == 'stdin':
+        args.append('--follow')  # /dev/stdin is a symlink on Linux.
     result = subprocess.run(args, input=patterns if kind == 'stdin' else None,
                             capture_output=True, timeout=15)
     assert result.returncode == 0, result

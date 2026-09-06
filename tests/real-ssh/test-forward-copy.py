@@ -131,7 +131,7 @@ for auth in [(), ("--auth-from", "@laptop")]:
     name = "filtered-explicit" if auth else "filtered-auto"
     path = "/tmp/syq-real-ssh/forward/" + name
     copy(path, auth=auth, binary="syq-other-build", source="/tmp/syq-real-ssh/return-source",
-         extra=("--ignore-from", "/dev/stdin"), stdin=b"*.bin\n")
+         extra=("--follow", "--ignore-from", "/dev/stdin"), stdin=b"*.bin\n")
     assert remote("cat " + path + "/message.txt") == "return\n"
     remote("test ! -e " + path + "/subdir/chunks.bin")
 
