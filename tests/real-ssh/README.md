@@ -136,3 +136,8 @@ programs, sender interruption, receiving shutdown, process-group cleanup, and
 execution after reconnect. The D-Bus fixture also verifies separate command
 notification titles and Allow/Deny behavior. macOS UI rendering is not tested
 by this Linux container suite.
+
+The disposable runner also checks privileged copies before dropping to its
+normal test user: foreign-owned partials are replaced without modifying their
+inodes, requested final ownership still works, and `--insecure-links` permits
+foreign-owned symlinks in typed local paths. No host files are used.

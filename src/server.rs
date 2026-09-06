@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 struct RequestReader {
-    rx: Option<std::sync::mpsc::Receiver<io::Result<Request>>>,
+    rx: Option<std::sync::mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Request>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
     named_socket: Option<std::os::unix::net::UnixStream>,
@@ -27,7 +27,7 @@ impl RequestReader {
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::spawn(move || loop {
-            let msg = reader.read_msg::<Request>();
+            let msg = reader.read_budgeted::<Request>();
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
                 break;
@@ -41,7 +41,12 @@ impl RequestReader {
         }
     }
 
-    fn recv(&self) -> std::result::Result<io::Result<Request>, std::sync::mpsc::RecvError> {
+    fn recv(
+        &self,
+    ) -> std::result::Result<
+        io::Result<crate::wire_budget::Budgeted<Request>>,
+        std::sync::mpsc::RecvError,
+    > {
         self.rx.as_ref().expect("request receiver present").recv()
     }
 
@@ -257,6 +262,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         descriptor_session,
     } = session;
     let mut r = FrameReader::new(r);
+    r.set_limit(MAX_HANDSHAKE_FRAME);
     let mut w = FrameWriter::new(w, false);
     // Send our build identity before waiting for the client's first postcard
     // frame. Both peers can therefore diagnose version skew even when their
@@ -268,7 +274,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // Held for the life of the connection; dropping it releases the worker
     // permit even when a later request fails.
     let _permit: Option<ConnectionPermit>;
-    match r.read_msg::<Request>()? {
+    let (hello, _hello_hold) = r.read_budgeted::<Request>()?.into_parts();
+    match hello {
         Request::Hello {
             identity,
             compress,
@@ -408,18 +415,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
+    r.set_limit(MAX_FRAME);
     let reader = RequestReader::spawn(r, tcp_socket, named_socket);
 
     let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let t0 = std::time::Instant::now();
-        let mut req: Request = match reader.recv() {
+        let queued = match reader.recv() {
             Ok(Ok(req)) => req,
             Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break,
         };
+        let (mut req, _request_hold) = queued.into_parts();
         t[0] += t0.elapsed().as_secs_f64();
         if !is_control
             && matches!(
@@ -1044,6 +1053,7 @@ fn accept_data_connections(
             }
             Err(_) => continue,
         };
+        let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let id = next_id.fetch_add(1, Relaxed);
         // Reserve a slot atomically: both family listeners charge one bound.
         if live.fetch_add(1, Relaxed) >= max_live {
@@ -1074,7 +1084,7 @@ fn accept_data_connections(
                 &seen,
                 authority.clone(),
                 descriptor_session,
-                Duration::from_secs(10),
+                handshake_deadline,
             ) {
                 if debug {
                     crate::output::diagnostic!("syq server (tcp {id}): {e:#}");
@@ -1096,7 +1106,7 @@ fn serve_tcp(
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
-    handshake_timeout: Duration,
+    handshake_deadline: std::time::Instant,
 ) -> Result<()> {
     // The listening socket is nonblocking so its owner can notice session
     // shutdown. Darwin propagates that status flag to accepted sockets, while
@@ -1104,13 +1114,17 @@ fn serve_tcp(
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
+    let handshake_timeout = handshake_deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("TCP Hello deadline expired before the handler started")?;
     stream.set_read_timeout(Some(handshake_timeout))?;
     stream.set_write_timeout(Some(handshake_timeout))?;
     let handshake_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut handshake_reader = TcpHandshakeReader {
         stream: stream.try_clone()?,
         pending: handshake_pending.clone(),
-        deadline: std::time::Instant::now() + handshake_timeout,
+        deadline: handshake_deadline,
     };
     // The client tells us its connection id first (plaintext), so both sides
     // derive the same nonces.
@@ -1676,7 +1690,7 @@ mod tests {
                 &seen,
                 Some(authority.clone()),
                 DescriptorSessionSlot::default(),
-                Duration::from_secs(1),
+                std::time::Instant::now() + Duration::from_secs(1),
             );
             if high != 0 {
                 assert!(result
@@ -1749,7 +1763,7 @@ mod tests {
                         &seen,
                         None,
                         DescriptorSessionSlot::default(),
-                        Duration::from_millis(100),
+                        std::time::Instant::now() + Duration::from_millis(100),
                     );
                     tx.send((result, seen.into_inner().unwrap())).unwrap();
                 });
@@ -1789,7 +1803,7 @@ mod tests {
                     &seen,
                     Some(authority),
                     DescriptorSessionSlot::default(),
-                    Duration::from_millis(100),
+                    std::time::Instant::now() + Duration::from_millis(100),
                 )
             });
             (&client).write_all(&44u32.to_be_bytes()).unwrap();
