@@ -34,26 +34,26 @@ reference_sha=$(jq -er .object.sha <<<"$reference")
 }
 
 workflows=(ci.yml rsync-compat.yml macos.yml)
+poll_attempts=${SYQ_POST_MERGE_POLL_ATTEMPTS:-30}
+[[ "$poll_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "invalid poll attempt count" >&2; exit 2; }
 run_ids=()
 for workflow in "${workflows[@]}"; do
-  dispatch=$(gh api --method POST \
+  gh api --method POST \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
     "repos/$repository/actions/workflows/$workflow/dispatches" \
-    -f ref="$branch")
-  run_id=$(jq -er .workflow_run_id <<<"$dispatch")
+    -f ref="$branch" >/dev/null
+  run_id=
+  for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
+    runs=$(gh api "repos/$repository/actions/workflows/$workflow/runs?event=workflow_dispatch&branch=$branch&per_page=100")
+    run_id=$(jq -r --arg sha "$merge_sha" '
+      [.workflow_runs[] | select(.event == "workflow_dispatch" and .head_sha == $sha)]
+      | sort_by(.created_at) | last | .id // empty
+    ' <<<"$runs")
+    [[ "$run_id" =~ ^[0-9]+$ ]] && break
+    sleep 1
+  done
   [[ "$run_id" =~ ^[0-9]+$ ]] || {
-    echo "$workflow dispatch returned invalid workflow run ID: $run_id" >&2
-    exit 1
-  }
-  run=$(gh api "repos/$repository/actions/runs/$run_id")
-  run_event=$(jq -er .event <<<"$run")
-  run_sha=$(jq -er .head_sha <<<"$run")
-  [ "$run_event" = workflow_dispatch ] || {
-    echo "$workflow run $run_id has event $run_event, expected workflow_dispatch" >&2
-    exit 1
-  }
-  [ "$run_sha" = "$merge_sha" ] || {
-    echo "$workflow run $run_id targets $run_sha, expected $merge_sha" >&2
+    echo "$workflow dispatch did not create a workflow_dispatch run for $merge_sha within $poll_attempts seconds" >&2
     exit 1
   }
   run_ids+=("$run_id")
