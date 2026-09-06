@@ -47,9 +47,10 @@ to hostA. Failure to reach it fails the copy without switching to SSH data.
 The prompt shows the requested SSH endpoint and destination path. Relative
 destination paths start in that account's home directory on hostB. A quoted
 `~` or `~/archive` also uses hostB's home directory; use `./~/archive` to name a
-literal directory called `~`. Receiving `--cwd` and `--root` govern copies onto
-the laptop; they do not describe hostB's filesystem. Receiving byte, entry, and deletion ceilings still apply. The
-helper on hostB checks the approved copy permissions and protects its own
+literal directory called `~`. On this route, `~//archive` also stays under that
+home directory. Receiving `--cwd` and `--root` govern copies onto the laptop;
+they do not describe hostB's filesystem. Receiving byte, entry, and deletion
+ceilings still apply. The helper on hostB checks the approved copy permissions and protects its own
 control and SSH authority files. The source verifies its signed receipt before
 reporting success. No durable receiver enrollment or reusable grant is created.
 
@@ -58,8 +59,7 @@ the laptop's return connection alive until completion. Stopping receiving or
 losing that connection cancels the copy. After hostB approves setup, the source
 has 60 seconds to start its handshake and then 10 seconds to complete it.
 Retry with a new approval to resume eligible partial files. This route accepts
-local sources and an ordinary SSH
-`--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
+local sources and an ordinary SSH `--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
 `--no-bootstrap`, `--pscope`, alternative `--peer-auth`/`--coordinate-at`,
 `--no-tcp`, or `--tcp-plain`. Copy permissions and supported filesystem options
 match [return copies](receive.md#copy-permissions-and-limits).

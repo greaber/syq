@@ -275,13 +275,9 @@ impl ForwardChild {
                         child.close().map_err(Into::into)
                     };
                     if !install
-                        && status.as_ref().is_ok_and(|s| {
-                            matches!(
-                                s.code(),
-                                Some(crate::remote_helper::HELPER_MISSING_EXIT)
-                                    | Some(crate::remote_helper::HELPER_NOT_EXECUTABLE_EXIT)
-                            )
-                        })
+                        && status
+                            .as_ref()
+                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
                         continue;
                     }

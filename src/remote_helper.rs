@@ -17,6 +17,11 @@ pub const REMOTE_DOWNLOAD_INTEGRITY_EXIT: i32 = 76;
 pub const INSTALL_FAILED_EXIT: i32 = 77;
 const DOWNLOAD_CACHE_GENERATION: &str = "release";
 
+/// Launcher failures for which installing the matching helper can repair the cache.
+pub fn needs_install(code: Option<i32>) -> bool {
+    matches!(code, Some(HELPER_MISSING_EXIT | HELPER_NOT_EXECUTABLE_EXIT))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub key: &'static str,

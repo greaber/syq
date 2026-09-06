@@ -143,10 +143,10 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
 
-child = subprocess.Popen(['/usr/local/bin/syq', *sys.argv[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+# The helper reads the SSH stream directly; this wrapper only delays its reply.
+child = subprocess.Popen(['/usr/local/bin/syq', *sys.argv[1:]], stdout=subprocess.PIPE)
 def pump(reader, writer):
     while True:
         # Preserve any preamble bytes buffered while reading Approved, while
@@ -157,14 +157,6 @@ def pump(reader, writer):
         while data:
             count = os.write(writer, data)
             data = data[count:]
-def send_input():
-    try:
-        pump(sys.stdin.buffer, child.stdin.fileno())
-    except BrokenPipeError:
-        pass
-    finally:
-        child.stdin.close()
-threading.Thread(target=send_input, daemon=True).start()
 header = child.stdout.read(4)
 assert len(header) == 4
 length = int.from_bytes(header, 'big')

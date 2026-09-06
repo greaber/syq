@@ -296,8 +296,9 @@ fn exchange(
     message: Message,
     timeout: Duration,
 ) -> Result<(UnixStream, Reply)> {
-    let mut stream = UnixStream::connect(&registration.socket)
-        .context("receiving laptop is offline; it must reconnect before this transfer can start")?;
+    let mut stream = UnixStream::connect(&registration.socket).context(
+        "receiving machine is offline; it must reconnect before this transfer can start",
+    )?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     write_message(
@@ -311,7 +312,7 @@ fn exchange(
     )?;
     let reply = read_message(&mut stream)?;
     if let Reply::Error(error) = &reply {
-        bail!("receiving laptop: {error}");
+        bail!("receiving machine: {error}");
     }
     Ok((stream, reply))
 }

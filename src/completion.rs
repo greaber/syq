@@ -1293,6 +1293,14 @@ fn option_takes_value(command: &clap::Command, option: &[u8]) -> bool {
     })
 }
 
+fn return_name_candidates(current: &[u8]) -> impl Iterator<Item = Candidate> + '_ {
+    crate::destination::registered_names()
+        .into_iter()
+        .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
+        .filter(move |name| name.starts_with(current))
+        .map(Candidate::text)
+}
+
 fn complete_value(
     command: &str,
     args: &[Vec<u8>],
@@ -1300,25 +1308,14 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
-        ValueCompletion::ReturnName => Ok(crate::destination::registered_names()
-            .into_iter()
-            .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
-            .filter(|name| name.starts_with(current))
-            .map(Candidate::text)
-            .collect()),
+        ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
                 current,
                 EndpointSyntax::Native,
                 pscope_from_args(command, args),
             );
-            candidates.extend(
-                crate::destination::registered_names()
-                    .into_iter()
-                    .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
-                    .filter(|name| name.starts_with(current))
-                    .map(Candidate::text),
-            );
+            candidates.extend(return_name_candidates(current));
             Ok(candidates)
         }
         ValueCompletion::Endpoint(syntax) => Ok(endpoint_candidates(
