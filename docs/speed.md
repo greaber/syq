@@ -29,6 +29,13 @@ bash try-benchmark.sh --yes --mode push --host server --workload both --size med
 bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
 ```
 
+The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
+terminal runs also use Perl to keep SSH prompts interruptible. Remote tests
+need SSH access and rsync on the other machine. Syq prepares a helper matching
+your local build and shows installation progress when one is needed.
+Use an SSH config alias for custom ports or IPv6. `--install` installs syq
+locally if missing; `--help` lists the choices.
+
 Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
 scratch parent, including when pulling; `--source-dir` is always the local
 scratch parent. Budget roughly twice the selected data size locally and one
@@ -48,7 +55,7 @@ optimizations. Syq prints its transfer statistics.
 
 Generation, a single 14-byte syq setup copy, and POSIX `cksum` comparisons are
 outside the timer. The setup copy prepares the helper and exercises transfer
-setup; it is labeled separately and does not print a throughput result. A failed command or content check stops the comparison.
+setup; it is labeled separately and shows helper installation messages without a throughput result. A failed command or content check stops the comparison.
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;
