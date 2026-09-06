@@ -1302,7 +1302,7 @@ fn complete_value(
     match kind {
         ValueCompletion::ReturnName => Ok(crate::destination::registered_names()
             .into_iter()
-            .map(|name| format!("@{name}").into_bytes())
+            .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
             .filter(|name| name.starts_with(current))
             .map(Candidate::text)
             .collect()),

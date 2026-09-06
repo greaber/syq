@@ -617,7 +617,7 @@ pub(crate) fn finish_receipt(
         &expected.policy,
     )?;
     if receipt.terminal.status != crate::receipt::ReceiptStatus::Clean {
-        bail!("receiving laptop reports {:?}", receipt.terminal.status);
+        bail!("receiving machine reports {:?}", receipt.terminal.status);
     }
     Ok(())
 }

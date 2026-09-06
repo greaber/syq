@@ -17933,6 +17933,47 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
 }
 
 #[test]
+fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
+    let t = Tmp::new();
+    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    for (prefix, expected) in [
+        ("lap", b"laptop\0".as_slice()),
+        ("@lap", b"@laptop\0"),
+        ("absent", b""),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "completion",
+                "__complete",
+                "fish",
+                "6",
+                "--",
+                "syq",
+                "cp",
+                "source",
+                "--to",
+                "backup",
+                "--via",
+                prefix,
+            ])
+            .env("HOME", t.path(""))
+            .env("PATH", t.path("bin"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(output.stdout, expected, "{prefix}");
+    }
+    assert!(!t.path("ssh-used").exists());
+}
+
+#[test]
 fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");

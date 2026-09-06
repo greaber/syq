@@ -156,7 +156,7 @@ impl Queue {
     ) -> Result<()> {
         let mut summary = Summary::new(from, request, TIMEOUT)?;
         summary.destination = format!(
-            "SSH {target:?}, path {:?} (relative paths start in the destination login home)",
+            "SSH {target:?}, path {:?} (relative paths and ~ refer to the destination login home)",
             std::ffi::OsStr::from_bytes(&request.destination)
         );
         summary.permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");

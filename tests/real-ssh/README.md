@@ -68,6 +68,10 @@ Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
 service failure; only Allow starts a copy. This does not exercise a particular desktop's visual
 layout or the macOS dialog.
 
+Source-shell remote copies also cover cached helper reuse, bootstrap after a
+missing or unexecutable helper, a delayed approval relay before Hello, and
+remote-home tilde paths alongside literal `./~` paths.
+
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new
 values. A remote wrapper records one test variable and executes the candidate
