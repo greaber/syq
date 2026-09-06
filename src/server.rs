@@ -526,10 +526,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
                 w.write_msg(&Response::Ok)?;
                 let mut limit = stream.end;
+                let mut done_sent = false;
                 loop {
-                    // The idle/end/error state waits for the same stop marker
-                    // as an interrupted stream, avoiding a late cancellation
-                    // being mistaken for the next operation's request.
+                    // Once all payload (or a read error) is sent, advertise
+                    // the data boundary without waiting another network RTT
+                    // for Stop. Still consume Stop before leaving this mode:
+                    // the client's later commands follow it on the same
+                    // ordered connection, including late shrink notifications.
+                    if stream.off >= limit && !done_sent {
+                        w.write_msg(&Response::ReadStreamDone)?;
+                        done_sent = true;
+                    }
                     if reader.stream_stopped(stream.off, &mut limit)? {
                         break;
                     }
@@ -547,7 +554,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     w.write_msg(&response)?;
                     t[2] += t0.elapsed().as_secs_f64();
                 }
-                w.write_msg(&Response::ReadStreamDone)?;
+                if !done_sent {
+                    w.write_msg(&Response::ReadStreamDone)?;
+                }
             }
             Request::StopReadStream | Request::ShrinkReadStream { .. } => {
                 w.write_msg(&Response::Err("no read stream is active".into()))?;
@@ -1564,6 +1573,9 @@ mod tests {
         });
 
         let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut writer = FrameWriter::new(socket.try_clone().unwrap(), false);
         let mut reader = FrameReader::new(socket);
         writer
@@ -1689,16 +1701,20 @@ mod tests {
             } else {
                 assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
             }
+            // Completion arrives before Stop, including after a read error.
+            // The socket's read deadline makes waiting for Stop fail this test.
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::ReadStreamDone
+            ));
             // A shrink can arrive after the final block or an error. It has
             // no reply, does not restart reading, and cannot cross the fence.
             writer
                 .write_msg(&Request::ShrinkReadStream { end: 0 })
                 .unwrap();
             writer.write_msg(&Request::StopReadStream).unwrap();
-            assert!(matches!(
-                reader.read_msg::<Response>().unwrap(),
-                Response::ReadStreamDone
-            ));
+            // The next iteration's request must not consume a second Done
+            // or a response to the late shrink/stop.
         }
         writer
             .write_msg(&Request::ReadStream(ReadStreamRequest {

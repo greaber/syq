@@ -283,6 +283,8 @@ bytes. These are observations of attempted work, so retries can contribute
 more than once. They are experimental diagnostics, separate from completion
 records. `--stats` also enables them, but currently bypasses the native
 small-copy shortcut; use `-v` to compare that shortcut with other paths.
+`SYQ_DEBUG=1` also records path counts without any tuning override, allowing
+automatic selection to be inspected without changing the tuning-cache policy.
 
 Use the same reporting options for every comparison, a fresh disposable
 destination, and explicit defaults for the baseline, such as

@@ -42,8 +42,13 @@ including to zero or behind the current source offset. At the reduced end,
 the source still waits for `StopReadStream`, consuming any late reductions.
 No reduction produces a response or can leak past the stop fence.
 
-`StopReadStream` cancels unused read-ahead, and the client
-drains through `ReadStreamDone` before another operation. A split through a
+`StopReadStream` cancels unused read-ahead, and the client sends it and
+drains through `ReadStreamDone` before another operation. On natural completion
+or a read error, the source emits Done immediately after its last data/error
+frame, then consumes late shrinks and Stop before accepting another operation.
+This avoids waiting an extra round trip for an already-finished read. Stop
+and subsequent commands remain ordered on the same connection; there is
+exactly one Done, including on early cancellation. A split through a
 frame validates the whole frame's hash before truncating/re-hashing its prefix.
 In-process sources produce one block per receive, without preloading a range.
 
