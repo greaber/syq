@@ -127,6 +127,7 @@ finally:
     remote("cp /usr/local/bin/syq " + helper + ".fixture && mv " + helper + ".fixture " + helper)
 
 print("case: tilde paths use the destination home and ./~ stays literal", flush=True)
+remote("mkdir -p ~/syq-real-ssh-forward-home './~/syq-real-ssh-forward-home'")
 copy("~/syq-real-ssh-forward-home/expanded")
 assert remote("sha256sum ~/syq-real-ssh-forward-home/expanded").split()[0] == expected
 remote("test ! -e './~/syq-real-ssh-forward-home/expanded'")
