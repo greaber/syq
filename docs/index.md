@@ -12,6 +12,7 @@ transfers, send files home from a remote shell, and automate with JSON.
 <a href="receive.html">Send files home</a>
 <a href="remote-to-remote.html">Copy between servers</a>
 <a href="mappings.html">Script file placement</a>
+<a href="python.html">Python SDK</a>
 </nav>
 
 ## Try a copy
@@ -57,5 +58,6 @@ substituting it in an existing script.
 | Remove files in parallel | [Removal](remove.md) |
 | Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
 | Rename or reorganize files during a copy | [Mappings](mappings.md) |
+| Use syq from Python | [Python SDK](python.md) |
 | Read results from a script | [Automation results](automation.md) |
 | Make copies faster | [Speed](speed.md) |

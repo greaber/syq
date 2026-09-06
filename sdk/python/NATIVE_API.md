@@ -1,9 +1,7 @@
 # Python native API
 
-Status: implemented for the upcoming syq release that ships the automation
-results stream. Until such a release exists, source-tree users must select the candidate
-binary explicitly; the next Python SDK release updates its managed pin after
-conformance tests pass.
+The Python package pins a matching syq executable. To use a custom development
+build, pass executable= explicitly; see the [Python guide](README.md).
 
 This document describes the Python interface to syq's native filesystem
 commands.
