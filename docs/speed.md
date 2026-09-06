@@ -12,8 +12,8 @@ skipping destination checks.
 
 Fresh small-file copies totaling at most 16 MiB start with one SSH data worker
 when connection count is automatic. With persistence enabled, these bounded
-copies can also reuse the existing login for data. With persistence enabled,
-larger trees use independent SSH data connections. If the server refuses a shared channel, syq retries with
+copies can also reuse the existing login for data; larger trees use independent
+SSH data connections. If the server refuses a shared channel, syq retries with
 a separate login. An explicit `--connections` still sets the worker count.
 
 ## Benchmarks
@@ -126,7 +126,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `copy-path` | `auto` | `auto` or `ranges` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
-| `split-min-size` | 8 MiB between hosts, 32 MiB on the same host; at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
+| `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated

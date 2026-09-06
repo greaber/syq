@@ -1805,7 +1805,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver), opts.tuning.pipeline_depth(), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
-            opts.tuning.batch_bytes(), opts.tuning.split_min_size(block, opts.same_host),
+            opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
@@ -1828,10 +1828,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
-    let sched = Arc::new(Sched::new(
-        block,
-        opts.tuning.split_min_size(block, opts.same_host),
-    ));
+    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
