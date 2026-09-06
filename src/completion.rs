@@ -523,7 +523,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "receive" | "destination" => {
+        "completion" | "persist" | "receiver" | "recv" | "destination" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -673,7 +673,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "map",
         "rsync",
         "persist",
-        "receive",
+        "recv",
         "destination",
         "completion",
         "receiver",
@@ -694,7 +694,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "completion" => Some(command_for_help()),
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
-        "receive" => Some(crate::destination::receive_help()),
+        "recv" => Some(crate::receive_service::command_for_help()),
         "destination" => Some(crate::destination::destination_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         _ => crate::cli::command_for_completion(name),
@@ -1216,9 +1216,8 @@ fn value_completion(
             }),
             _ => None,
         },
-        "receive" => match option {
-            b"--via" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
-            b"--into" => Some(ValueCompletion::LocalPath {
+        "recv" => match option {
+            b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
             _ => None,
@@ -1271,7 +1270,7 @@ fn complete_value(
             candidates.extend(
                 crate::destination::registered_names()
                     .into_iter()
-                    .map(|name| format!("@{name}").into_bytes())
+                    .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
                     .filter(|name| name.starts_with(current))
                     .map(Candidate::text),
             );
@@ -1360,7 +1359,9 @@ fn complete_path_for(
             path_policy(command, args, false),
         ));
     };
-    if endpoint.host.starts_with('@') {
+    if endpoint.host.starts_with('@')
+        || crate::destination::registered_names().contains(&endpoint.host)
+    {
         return Ok(Vec::new());
     }
     remote_path_candidates(

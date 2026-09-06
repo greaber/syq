@@ -36,7 +36,9 @@ See [diagnosing a slow copy](speed.md#diagnose-a-slow-copy) for interpreting
 transport and performance details.
 
 To initiate a copy from a server to your laptop, use a [named receiving
-destination](receive.md), such as `syq cp results --to @laptop`.
+destination](receive.md), such as `syq cp results --to laptop`. `persist on`
+enables background receiving automatically. Bare names prefer live return
+connections; `@laptop` requires one and fails while offline.
 
 ## See where files go
 

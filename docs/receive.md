@@ -4,129 +4,142 @@ Inspect files on your server, then copy them to your laptop from the same shell.
 The laptop opens and maintains the connection. It needs no SSH server, public
 address, or incoming network port.
 
-On your laptop, choose an existing receiving directory:
+On your laptop, turn on persistence:
+
+```sh
+syq persist on
+```
+
+When syq connects to an SSH server, it also starts a background return
+connection. The default destination name is your laptop's short hostname,
+and files go into your home directory. No receiving terminal needs to stay open.
+To choose a name and a different starting directory:
 
 ```sh
 mkdir -p ~/Downloads/server
-syq receive --via server --name laptop --into ~/Downloads/server
+syq recv on --name laptop --cwd ~/Downloads/server
+syq cp --from server report.pdf
+syq recv wait server --timeout 30
 ```
 
-Leave this command running. On the server, use the destination from any shell,
-including a tmux session that was already open:
+On the server, use the name from any shell, including an existing tmux session:
 
 ```sh
 ls -lh results
-syq cp results --to @laptop
-syq cp report.pdf --to @laptop --as reports/latest.pdf
+syq cp results --to laptop
+syq cp report.pdf --to laptop --as reports/latest.pdf
 ```
 
-The laptop asks in the terminal running `syq receive` whether to allow each
-copy. Type `y` or `yes` to allow it once; any other answer denies it. Requests
-expire after five minutes. The prompt describes the destination and enforced
-permissions and limits. It does not claim to have inspected the server's files.
+Receiving is enabled by default with persistence, and copies are accepted
+**automatically**, including overwrites. This trusts every process running as
+the server account you connect to. There is no notification or approval prompt.
+A compromised server can send unwanted content, inspect destination entries
+needed for copying, or fill the disk through repeated transfers. It receives
+neither your SSH agent nor an interface for running arbitrary laptop commands.
 
-`@laptop` is a name registered on that server account, independent of your
-login shell. Use a different name for each laptop. Ordinary `--to server`
-continues to mean an SSH host.
+## Names and paths
 
-## Paths and permissions
+A bare name uses a live return connection before trying an SSH host of the same
+name. When the laptop is offline, the name falls back to ordinary SSH resolution
+and authentication. Use `--to @laptop` to require a return connection: that form
+fails while offline and never tries SSH. After selecting a return connection,
+a denied or interrupted copy fails; it does not switch destinations.
 
-Destination paths are relative to the receiving directory. With no placement,
-`--to @laptop` means `--into .` there. Absolute paths and `..` are refused.
-Copies cannot traverse destination symlinks to escape the receiving directory.
-The receiving directory itself cannot be replaced with `--as .`.
+Names belong to live connections, not permanent registrations. A second live
+connection cannot advertise the same name on the same server account. When a
+connection closes, its name becomes available again. Choose distinct names for
+different laptops.
 
-An approved copy may create files and overwrite matching files within its
-approved scopes. Standard directory recursion, symlinks, modification times,
-filters, hashing, and staged publication use the same copy engine as other
-syq copies. `--preserve=permissions` requests permission preservation as well.
-`--verify-only`, `--ignore-existing`, and `--existing` keep their usual meanings.
-Ownership, special-file preservation, `--inplace`, `--update`, mappings, and
-`--min-size` are not accepted by named destinations. The receiver cannot
-independently enforce `--update`, which relies on source-reported timestamps.
+`--cwd` chooses the starting directory. Destination `--into` and `--as` paths
+are relative to it, but absolute paths and `..` can select other locations.
+With no placement, `--to laptop` means `--into .` there.
 
-To permit copies automatically, including overwrites:
+To contain copies within a directory instead:
 
 ```sh
-syq receive --via server --name laptop --into ~/Downloads/server --approve always
+syq recv on --name laptop --root ~/Downloads/server
 ```
 
-This authorizes requests from any process running as that server account.
-Use a directory whose contents that account may change. A compromised server
-can send unwanted files or invented data, and copy planning exposes information
-about existing destination entries. It receives neither your SSH agent nor
-permission to run arbitrary commands on the laptop.
+`--root` sets both the starting directory and the boundary. It rejects absolute
+paths and `..`, and copies cannot traverse symlinks to escape that directory.
+The root itself cannot be replaced with `--as .`. Changing to `--cwd` removes
+containment. Settings apply globally to receiving connections; changing them
+closes existing return copies before restarting with the new settings.
 
-Each transfer is limited to 100 GiB and one million touched entries by default.
-These are permission ceilings, not estimates of the selected files' size.
-Use `--max-bytes` and `--max-entries` on `syq receive` to change them. Lower
-limits requested by the sending command also apply. Limits are per transfer;
-repeated approved copies can fill the receiving disk.
+The receiving directory must exist and have a UTF-8 path. Names inside it may
+use normal Unix filename bytes. Syq protects its own receiving control files,
+executable, and SSH authority files from return copies even without `--root`.
 
-Deletion is disabled unless the laptop permits a positive `--max-delete`.
+## Copy permissions and limits
+
+Each request is checked on the laptop before syq issues permission for that
+copy. The restricted filesystem executor then checks individual operations.
+Directory recursion, symlinks, modification times, filters, hashing, resume,
+and staged publication work as in other syq copies. `--preserve=permissions`,
+`--verify-only`, `--ignore-existing`, and `--existing` are supported. Ownership,
+special-file preservation, `--inplace`, `--update`, mappings, and `--min-size`
+are refused. `--update` depends on timestamps supplied by the source that the
+laptop cannot independently verify.
+
+Each copy is limited to 100 GiB and one million touched entries by default.
+Change these ceilings with `syq recv on --max-bytes 20G --max-entries 100000`.
+Lower limits requested by the sender also apply. Limits are per copy; repeated
+copies can fill the disk. Copies support at most 32 workers each.
+
+Pruning is disabled unless the laptop sets a positive `--max-delete`.
 A sending `--prune` command must also supply its own `--max-delete` ceiling,
-no higher than the laptop's. Denial and validation errors leave the requested
-copy unstarted. Errors during a copy are reported as failures; incomplete
-files can remain for a later retry. The sending command verifies the laptop's
-signed receipt before reporting successful completion.
+no higher than the laptop's. Validation failures leave the copy unstarted.
+Errors during copying fail visibly and may leave partial files for retry.
+The sender verifies a signed receipt before reporting success.
 
-## Connections and reconnects
-
-The connection has no idle expiry while `syq receive` is running. It is separate
-from `syq persist`; enabling or disabling ordinary persistence does not control
-this receiver. Data and control channels both travel through encrypted SSH.
-Named transfers do not open TCP data listeners on the laptop.
-
-After a network interruption or laptop sleep, the laptop reconnects with delays
-of one to thirty seconds. An interrupted copy fails visibly: rerun it after
-reconnection to reuse eligible partial files through normal resume checks.
-Copies are not queued while the laptop is offline. Approval allows the control
-channel to open once within sixty seconds; the transfer must finish within
-seven days. Closing the control channel ends that copy's authority.
-
-Press Ctrl-C in the receiving terminal to close its connection and stop
-availability. The server keeps an offline name record so another receiving
-setup cannot silently take over the name. Restarting the same receiving
-command on the laptop reuses its saved identity.
-
-On the server:
+## Background connections
 
 ```sh
-syq destination list
-syq destination wait laptop --timeout 30
-syq destination forget laptop
+syq recv status
+syq recv status --json
+syq recv wait server --timeout 30
+syq recv off
+syq recv on
+syq persist off
 ```
 
-`wait` exits successfully when the destination responds, or fails at its
-deadline. `forget` requires the registration's SSH session to have ended. Use
-it deliberately when replacing a laptop, changing the receiving configuration,
-or recovering after losing the laptop's saved identity. A running registration
-cannot be displaced by another receiver.
+`recv off` stops receiving while keeping ordinary SSH persistence enabled.
+`recv on` enables it again and can restart previously connected endpoints.
+`persist off` stops both kinds of connection in its scope. Explicit ephemeral
+persistence scopes also own return connections and end them when closed.
+
+Return connections have no idle expiry. After a network interruption or laptop
+sleep, the laptop reconnects with delays of one to thirty seconds. Ordinary
+reusable SSH logins still expire after ten idle minutes. An interrupted copy
+fails: rerun it after reconnection to reuse eligible partial files. Copies are
+not queued while offline. A copy must open its control channel within sixty
+seconds of authorization and finish within seven days. Closing that control
+channel revokes its workers and prevents further requests.
+
+On the server, `syq destination list` shows availability and
+`syq destination wait laptop --timeout 30` waits with a deadline. Stale records
+left by a crash do not reserve a name; `syq destination forget laptop` removes
+one while its connection is stopped.
 
 ## SSH setup
 
-The laptop needs ordinary SSH access to the server, with a trusted host key and
-an available key or agent for noninteractive reconnects. Connect with ordinary
-SSH first if authentication or host trust is not configured. No agent is
-forwarded to the server.
+Automatic receiving applies to syq's managed persistent SSH connections.
+Opening an unrelated plain `ssh` session does not start it. A second SSH hop
+does not automatically carry the laptop's destination through to another host.
 
-The SSH server must permit remote Unix socket forwarding. OpenSSH 9.2 also
-requires remote TCP forwarding permission for these requests. Administrators
-control those settings; syq does not change SSH server configuration. A rejected
-forward produces an SSH error and the receiver retries until stopped.
+Reconnects require an available SSH key or agent and a trusted server host key.
+No agent is forwarded. The server must permit remote Unix socket forwarding;
+OpenSSH 9.2 also requires remote TCP forwarding permission. Syq does not change
+server configuration. `recv status` reports setup errors; after correcting one,
+connect with syq again or run `recv on` to retry. A failed return setup does not
+invalidate an ordinary copy.
 
-The configured receiving directory must have a UTF-8 path; filenames inside
-it can use the normal Unix path bytes syq supports. Copies support at most
-32 workers each.
+Both machines must use the same syq build. The return connection uses the
+helper selected by the ordinary connection, including an explicit `--syq-path`.
+The server's `syq cp` executable must match it too.
 
-Both machines must use the same syq build. The receiver uses syq's normal managed
-helper setup; `--syq-path` selects an exact helper on the server. The server-side
-`syq cp` executable must match it too. Upgrade both sides and restart the
-receiver after an upgrade.
-
-Private laptop identities live in `~/.syq-receive-v1`; server registrations live
-in `~/.syq-destinations-v1`. Both directories must be owned by their user and
-have mode 0700. These are separate from ordinary persistence preferences and
-restricted receiver enrollments. Processes with access to the trusted laptop
-account can change its authority; processes under the authorized server account
-share that account's destination registrations.
+Receiving preferences live in `receive.json` beside the ordinary persistence
+preferences, under `$XDG_CONFIG_HOME/syq` or `~/.config/syq`. Runtime services
+belong to their persistence scope. Transient server advertisements live in the
+private directory `~/.syq-destinations-v2`. These files do not change restricted
+receiver enrollments or signed-grant replay records.

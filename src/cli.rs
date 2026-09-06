@@ -913,7 +913,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination SSH endpoint ([USER@]HOST[:PORT]) or @NAME registered by syq receive; placement defaults to --into .
+    /// Destination SSH endpoint or live receiving name; @NAME requires a return connection; placement defaults to --into .
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths

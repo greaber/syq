@@ -1,18 +1,18 @@
 //! Named, permission-checked return channels over laptop-initiated SSH.
 //!
-//! This v1 protocol and registry are independent of SSH persistence and durable
-//! receiver enrollments. The remote account is the requester identity: shells
+//! This protocol uses transient advertisements maintained by persistence,
+//! independent of durable receiver enrollments. The remote account is the requester identity: shells
 //! and jobs under that account intentionally share access to its registrations.
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -27,49 +27,19 @@ use std::time::{Duration, Instant};
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const MAX_MESSAGE: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
-const PREFIX: &str = "named-v1:";
+const PREFIX: &str = "named-v2:";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
+const RECONNECT_PENDING: i32 = 75;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
 enum Approval {
     Ask,
     Always,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "syq receive",
-    about = "Make a directory available to copies initiated on a server. Keep running to maintain and reconnect the outbound SSH connection."
-)]
-struct Receive {
-    /// SSH server account whose shells and jobs can request transfers
-    #[arg(long)]
-    via: String,
-    /// Destination name on that server; send with syq cp ... --to @NAME
-    #[arg(long)]
-    name: String,
-    /// Existing laptop directory that may receive files
-    #[arg(long)]
-    into: PathBuf,
-    /// Ask in this terminal for each copy, or authorize copies automatically (including overwrites)
-    #[arg(long, value_enum, default_value = "ask")]
-    approve: Approval,
-    /// Maximum bytes a single transfer may reserve/write, including partial files
-    #[arg(long, default_value = "100G")]
-    max_bytes: String,
-    /// Maximum entries one transfer may touch
-    #[arg(long, default_value_t = 1_000_000)]
-    max_entries: u64,
-    /// Permit pruning up to this many destination entries per transfer; default forbids deletion
-    #[arg(long, default_value_t = 0)]
-    max_delete: u64,
-    /// Exact syq helper on the server (otherwise use the managed helper)
-    #[arg(long)]
-    syq_path: Option<String>,
 }
 
 #[derive(Parser)]
@@ -95,9 +65,6 @@ enum DestinationAction {
     },
 }
 
-pub(crate) fn receive_help() -> clap::Command {
-    crate::help::configure(Receive::command())
-}
 pub(crate) fn destination_help() -> clap::Command {
     crate::help::configure(Destinations::command())
 }
@@ -105,6 +72,7 @@ pub(crate) fn destination_help() -> clap::Command {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CopyRequest {
+    pub destination: Vec<u8>,
     pub copy: CopyOperation,
     pub constraints: GrantConstraints,
 }
@@ -162,7 +130,7 @@ struct Route {
     token: String,
 }
 
-fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
+pub(crate) fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec(message)?;
     if bytes.len() > MAX_MESSAGE {
         bail!("named destination message exceeds size limit");
@@ -172,7 +140,7 @@ fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()
     writer.flush()?;
     Ok(())
 }
-fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -183,6 +151,41 @@ fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+/// A complete incoming envelope has an absolute deadline, including clients
+/// trickling bytes. Timeout budgets cannot be renewed by partial progress.
+pub(crate) fn read_socket_message<T: DeserializeOwned>(
+    socket: &mut UnixStream,
+    timeout: Duration,
+) -> Result<T> {
+    struct DeadlineReader<'a> {
+        socket: &'a mut UnixStream,
+        deadline: Instant,
+    }
+    impl Read for DeadlineReader<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "return channel handshake timed out",
+                    )
+                })?;
+            self.socket.set_read_timeout(Some(remaining))?;
+            self.socket.read(bytes)
+        }
+    }
+    let previous = socket.read_timeout()?;
+    let result = read_message(&mut DeadlineReader {
+        socket,
+        deadline: Instant::now() + timeout,
+    });
+    socket.set_read_timeout(previous)?;
+    result
+}
+
 fn random_token() -> Result<String> {
     let mut bytes = [0; 32];
     getrandom::fill(&mut bytes)?;
@@ -201,7 +204,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 }
 
 fn registry() -> Result<PathBuf> {
-    private_directory(".syq-destinations-v1")
+    private_directory(".syq-destinations-v2")
 }
 fn private_directory(name: &str) -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
@@ -220,42 +223,13 @@ fn private_directory(name: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn receiving_identity(config: &Receive, root: &Path) -> Result<String> {
-    let key = serde_json::to_vec(&(VERSION, &config.via, &config.name, root))?;
-    let name = format!("{}.key", blake3::hash(&key).to_hex());
-    let path = private_directory(".syq-receive-v1")?.join(name);
-    let secret = random_token()?;
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(secret.as_bytes())?;
-            file.sync_all()?;
-            Ok(secret)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let bytes = crate::delegation::read_private_regular(&path, "receiving identity", 128)?;
-            let secret = String::from_utf8(bytes)?;
-            if secret.len() != 43 {
-                bail!("invalid receiving identity; restore its saved file or forget the offline remote name before creating a new identity");
-            }
-            Ok(secret)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// Completion only lists local names; it never creates state or asks a laptop
 /// for file listings without a transfer approval.
 pub(crate) fn registered_names() -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    let directory = PathBuf::from(home).join(".syq-destinations-v1");
+    let directory = PathBuf::from(home).join(".syq-destinations-v2");
     let Ok(metadata) = fs::symlink_metadata(&directory) else {
         return Vec::new();
     };
@@ -289,11 +263,11 @@ fn load_registration(name: &str) -> Result<Registration> {
     let path = registry()?.join(format!("{name}.json"));
     let encoded = crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE)
         .with_context(|| {
-            format!("destination @{name} is unavailable; start syq receive on the laptop")
+            format!("destination @{name} is unavailable; connect from the laptop with syq while persist is on")
         })?;
     let registration: Registration = serde_json::from_slice(&encoded)?;
     if registration.version != VERSION || registration.identity != crate::identity::build() {
-        bail!("named destination build differs; use matching syq builds and restart syq receive");
+        bail!("named destination build differs; use matching syq builds and restart receiving");
     }
     Ok(registration)
 }
@@ -361,9 +335,73 @@ fn rebase(path: &[u8], root: &Path) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// Resolve the operator's starting directory separately from containment. The
+/// final entry is not followed: replacing a symlink replaces the entry itself.
+fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(PathBuf, PathBuf)> {
+    if path.len() > 4096 || path.contains(&0) {
+        bail!("invalid receiving destination path");
+    }
+    if let Some(root) = root {
+        let destination = PathBuf::from(OsString::from_vec(rebase(&request_path(path)?, cwd)?));
+        let container = root
+            .parent()
+            .context("receiving root must not be filesystem root")?
+            .to_path_buf();
+        return Ok((destination, container));
+    }
+    let path = cwd.join(OsString::from_vec(path.to_vec()));
+    let components: Vec<_> = path.components().collect();
+    let mut destination = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        use std::path::Component;
+        match component {
+            Component::RootDir => destination.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                destination.pop();
+            }
+            Component::Normal(name) => {
+                destination.push(name);
+                if index + 1 < components.len() {
+                    match fs::canonicalize(&destination) {
+                        Ok(path) => {
+                            if !path.is_dir() {
+                                bail!("receiving path ancestor is not a directory");
+                            }
+                            destination = path;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Component::Prefix(_) => unreachable!("Unix path"),
+        }
+    }
+    let mut container = destination
+        .parent()
+        .context("cannot replace filesystem root")?
+        .to_path_buf();
+    loop {
+        match fs::canonicalize(&container) {
+            Ok(path) => {
+                container = path;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !container.pop() {
+                    return Err(e.into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok((destination, container))
+}
+
 fn constrain(
     mut request: CopyRequest,
-    root: &Path,
+    destination: &Path,
     max_bytes: u64,
     max_entries: u64,
     max_delete: u64,
@@ -371,17 +409,12 @@ fn constrain(
     if request.copy.mutation_scopes.len() > 1024 {
         bail!("too many copy scopes");
     }
-    request.copy.destination = rebase(&request.copy.destination, root)?;
-    if request.copy.destination == root.as_os_str().as_bytes()
-        && request.copy.policy.placement == DestinationPlacement::ExactPath
-    {
-        bail!("cannot replace the receiving directory itself; use --into . or a child path");
-    }
+    request.copy.destination = rebase(&request.copy.destination, destination)?;
     for scope in &mut request.copy.mutation_scopes {
-        scope.path = rebase(&scope.path, root)?;
+        scope.path = rebase(&scope.path, destination)?;
     }
     for filter_root in &mut request.constraints.filters.destination_roots {
-        *filter_root = rebase(filter_root, root)?;
+        *filter_root = rebase(filter_root, destination)?;
     }
     if request.copy.options.preserve_owner
         || request.copy.options.preserve_group
@@ -410,19 +443,31 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let Some(destination) = args.locations.last() else {
         return Ok(());
     };
-    let Some(name) = destination
-        .host
-        .as_deref()
-        .and_then(|h| h.strip_prefix('@'))
-    else {
-        if args
-            .locations
-            .iter()
-            .any(|l| l.host.as_deref().is_some_and(|h| h.starts_with('@')))
-        {
-            bail!("named destinations can only be used with cp --to @NAME");
-        }
+    let Some(host) = destination.host.as_deref() else {
         return Ok(());
+    };
+    let explicit = host.starts_with('@');
+    let name = host.strip_prefix('@').unwrap_or(host).to_owned();
+    // A normal SSH endpoint with a user/port remains explicit SSH. Bare names
+    // opt into lookup only when this process can actually send a return copy.
+    let registration = if explicit {
+        load_registration(&name)?
+    } else {
+        if destination.user.is_some()
+            || destination.port.is_some()
+            || args.interface != crate::cli::Interface::NativeCp
+            || args.locations[..args.locations.len() - 1]
+                .iter()
+                .any(|l| l.is_remote())
+            || !registered_names().contains(&name)
+        {
+            return Ok(());
+        }
+        let registration = load_registration(&name)?;
+        if exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err() {
+            return Ok(());
+        }
+        registration
     };
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]
@@ -444,7 +489,6 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     if args.connections_opt.is_some() && args.connections > 32 {
         bail!("named destinations support at most 32 workers per transfer");
     }
-    let registration = load_registration(name)?;
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
@@ -467,6 +511,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         bail!("unexpected named destination response");
     };
     args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.locations.last_mut().unwrap().host = Some(format!("@{name}"));
     args.restricted_grant = Some(format!(
         "{PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
@@ -559,19 +604,21 @@ struct Session {
     opened: bool,
     channels: Arc<crate::private_broker::ConnectionRegistry>,
 }
+#[cfg(test)]
 struct Prompt {
     description: String,
-    deadline: Instant,
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
-    requester: String,
-    root: PathBuf,
+    cwd: PathBuf,
+    root: Option<PathBuf>,
     secret: String,
     max_bytes: u64,
     max_entries: u64,
     max_delete: u64,
+    #[cfg(test)]
     approval: Approval,
+    #[cfg(test)]
     prompts: mpsc::SyncSender<Prompt>,
     sessions: Mutex<HashMap<String, Session>>,
     request_lock: Mutex<()>,
@@ -579,8 +626,36 @@ struct Receiver {
 }
 
 impl Receiver {
+    /// Current local policy accepts requests from the connected server account.
+    /// A later approval UI belongs here, after scope validation and before a
+    /// usable token is issued. A connection itself never bypasses this decision.
+    fn authorize_request(&self, _request: &CopyRequest) -> Result<()> {
+        #[cfg(test)]
+        if matches!(self.approval, Approval::Ask) {
+            let (decision, reply) = mpsc::sync_channel(1);
+            self.prompts.try_send(Prompt {
+                description: "Source contents have not been inspected".into(),
+                decision,
+            })?;
+            if !reply.recv_timeout(Duration::from_secs(5))? {
+                bail!("transfer denied");
+            }
+        }
+        if self.stop.load(Ordering::Acquire) {
+            bail!("receiving stopped");
+        }
+        Ok(())
+    }
+    fn revoke_all(&self) {
+        for (_, session) in self.sessions.lock().unwrap().drain() {
+            session.authority.close_control();
+            session.channels.shutdown_all();
+        }
+    }
+
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
-        let envelope: Envelope = read_message(&mut stream)?;
+        let envelope: Envelope =
+            read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
         if envelope.version != VERSION || envelope.identity != crate::identity::build() {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
@@ -595,9 +670,16 @@ impl Receiver {
                         "another transfer is awaiting approval; retry after it is decided"
                     )
                 })?;
+                let (destination, container) =
+                    resolve_destination(&self.cwd, self.root.as_deref(), &request.destination)?;
+                if self.root.as_ref() == Some(&destination)
+                    && request.copy.policy.placement == DestinationPlacement::ExactPath
+                {
+                    bail!("cannot replace the receiving root itself; use --into . or a child path");
+                }
                 let request = constrain(
                     *request,
-                    &self.root,
+                    &destination,
                     self.max_bytes,
                     self.max_entries,
                     self.max_delete,
@@ -609,60 +691,10 @@ impl Receiver {
                         bail!("too many active transfers; wait for one to finish");
                     }
                 }
-                // Validate the complete operation before displaying an approval.
+                // Validate the complete operation before the local policy decision.
                 let (authority, mut approved) =
-                    crate::restricted::named_authority(&self.root, request.clone())?;
-                if matches!(self.approval, Approval::Ask) {
-                    let permission = if request.copy.options.dry_run {
-                        "preview only; no changes"
-                    } else if request.copy.options.verify_only {
-                        "compare contents only; no changes"
-                    } else {
-                        match request.copy.policy.existing {
-                            crate::delegation::ExistingDestinationPolicy::Replace => {
-                                "may create and overwrite matching entries"
-                            }
-                            crate::delegation::ExistingDestinationPolicy::Skip => {
-                                "keep existing entries; may create new entries"
-                            }
-                            crate::delegation::ExistingDestinationPolicy::MustExist => {
-                                "may update existing entries only"
-                            }
-                            crate::delegation::ExistingDestinationPolicy::UpdateIfOlder => {
-                                unreachable!("validated receiver policy")
-                            }
-                        }
-                    };
-                    let description = format!(
-                        "Copy request from {:?}\nDestination: {:?}\nPermission: {permission}. Deletion ceiling: {} entries.\nLimits: {} bytes, {} entries. Preserve permissions: {}.\nSource contents and file sizes have not been inspected by this laptop.",
-                        self.requester, String::from_utf8_lossy(&request.copy.destination), request.copy.limits.max_deletions, request.copy.limits.max_total_bytes, request.copy.limits.max_entries, request.copy.options.preserve_permissions,
-                    );
-                    let (decision, reply) = mpsc::sync_channel(1);
-                    let deadline = Instant::now() + REQUEST_TIMEOUT;
-                    self.prompts
-                        .try_send(Prompt {
-                            description,
-                            deadline,
-                            decision,
-                        })
-                        .context("approval terminal is busy")?;
-                    loop {
-                        if self.stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                            bail!("approval timed out or receiver stopped");
-                        }
-                        match reply.recv_timeout(Duration::from_millis(200)) {
-                            Ok(true)
-                                if Instant::now() < deadline
-                                    && !self.stop.load(Ordering::Relaxed) =>
-                            {
-                                break
-                            }
-                            Ok(_) => bail!("transfer denied or approval expired"),
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                }
+                    crate::restricted::named_authority(&container, request.clone())?;
+                self.authorize_request(&request)?;
                 approved.token = random_token()?;
                 self.sessions.lock().unwrap().insert(
                     approved.token.clone(),
@@ -687,7 +719,6 @@ impl Receiver {
                         if session.opened || session.issued.elapsed() >= START_TIMEOUT {
                             bail!("transfer authorization has already been used or expired");
                         }
-                        session.opened = true;
                     } else if !session.opened {
                         bail!("transfer control channel has not opened");
                     }
@@ -699,6 +730,9 @@ impl Receiver {
                         ))?)
                     };
                     let channel = session.channels.track(stream.try_clone()?)?;
+                    if control {
+                        session.opened = true;
+                    }
                     (
                         Arc::clone(&session.authority),
                         Arc::clone(&session.channels),
@@ -727,19 +761,6 @@ impl Receiver {
     }
 }
 
-struct StopOnDrop {
-    stop: Arc<AtomicBool>,
-    signals: [signal_hook::SigId; 2],
-}
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for signal in self.signals {
-            signal_hook::low_level::unregister(signal);
-        }
-    }
-}
-
 struct OwnedSsh(Child);
 impl Drop for OwnedSsh {
     fn drop(&mut self) {
@@ -751,7 +772,7 @@ impl Drop for OwnedSsh {
         let _ = self.0.wait();
     }
 }
-fn ssh_command(endpoint: &crate::cli::NativeEndpoint) -> Command {
+fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-a",
@@ -784,47 +805,30 @@ fn ssh_command(endpoint: &crate::cli::NativeEndpoint) -> Command {
     }
     cmd
 }
-fn receive(config: Receive) -> Result<i32> {
-    validate_name(&config.name)?;
-    let root = fs::canonicalize(&config.into).context("receiving directory must already exist")?;
-    if !root.is_dir() {
-        bail!("receiving path is not a directory");
-    }
-    let max_bytes = crate::cli::parse_size(&config.max_bytes)?;
-    if max_bytes == 0
-        || max_bytes > crate::delegation::MAX_COPY_BYTES
-        || config.max_entries == 0
-        || config.max_entries > crate::delegation::MAX_ENTRIES
-    {
-        bail!("invalid receiving limits");
-    }
-    let endpoint = crate::cli::parse_native_endpoint(Some(&config.via))?.unwrap();
-    if endpoint.host.starts_with('@') || endpoint.host.starts_with('-') {
-        bail!("--via requires an SSH endpoint");
-    }
-    let mut tty = match config.approve {
-        Approval::Ask => Some(OpenOptions::new().read(true).write(true).open("/dev/tty").context("approval needs a terminal; --approve always explicitly permits automatic copies and overwrites")?),
-        Approval::Always => None,
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-    let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
-    let sigterm = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
-    let (prompts, requests) = mpsc::sync_channel(1);
-    let secret = receiving_identity(&config, &root)?;
+pub(crate) fn serve_background(
+    config: crate::receive_service::Settings,
+    spec: crate::receive_service::ServiceSpec,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<crate::receive_service::ConnectionState>>,
+) -> Result<()> {
+    #[cfg(test)]
+    let (prompts, _requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
-        requester: config.via.clone(),
-        root,
-        secret,
-        max_bytes,
+        cwd: config.cwd.clone(),
+        root: config.root.clone(),
+        secret: random_token()?,
+        max_bytes: config.max_bytes,
         max_entries: config.max_entries,
         max_delete: config.max_delete,
-        approval: config.approve,
+        #[cfg(test)]
+        approval: Approval::Always,
+        #[cfg(test)]
         prompts,
         sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
-        stop: Arc::clone(&stop),
+        stop: stop.clone(),
     });
-    let handler = Arc::clone(&receiver);
+    let handler = receiver.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
             directory_prefix: "syq-return-",
@@ -835,179 +839,134 @@ fn receive(config: Receive) -> Result<i32> {
             io_timeout: Duration::from_secs(10),
         },
         move |stream, _| {
-            let error_writer = stream.try_clone();
+            let writer = stream.try_clone();
             if let Err(error) = handler.handle(stream) {
-                if let Ok(mut writer) = error_writer {
+                if let Ok(mut writer) = writer {
                     let _ = write_message(&mut writer, &Reply::Error(format!("{error:#}")));
                 }
             }
         },
     )?;
-    let _stop_on_drop = StopOnDrop {
-        stop: Arc::clone(&stop),
-        signals: [sigint, sigterm],
-    };
-    let mut spec = crate::conn::RemoteSpec::local_receiver(false);
-    spec.local_process = false;
-    spec.host = endpoint.host.clone();
-    spec.user = endpoint.user.clone();
-    spec.port = endpoint.port;
-    spec.rsh = vec![
-        "ssh".into(),
-        "-a".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ClearAllForwardings=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-    ];
-    spec.syq_path = config.syq_path.clone();
-    spec.bootstrap_helper = config.syq_path.is_none();
-    // Use the existing exact-build helper bootstrap once before publishing a
-    // registration. Reconnect attempts thereafter only invoke that helper.
-    drop(spec.connect_completion()?);
-    let mut delay = Duration::from_secs(1);
-    while !stop.load(Ordering::Relaxed) {
-        let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
-        let args = vec![
-            "--destination-register".into(),
-            config.name.clone(),
-            socket.clone(),
-            receiver.secret.clone(),
-        ];
-        let mut command = ssh_command(&endpoint);
-        command
-            .args([
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "StreamLocalBindMask=0177",
-            ])
-            .arg("-R")
-            .arg(format!("{socket}:{}", broker.socket_path().display()))
-            .arg("--")
-            .arg(&endpoint.host)
-            .arg(spec.program_command(&args))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .process_group(0);
-        crate::output::diagnostic!(
-            "syq: connecting @{0} through {1}; Ctrl-C revokes availability",
-            config.name,
-            config.via
-        );
-        let mut child = OwnedSsh(command.spawn().context("start receiving SSH connection")?);
-        let connected_at = Instant::now();
-        while !stop.load(Ordering::Relaxed) && child.0.try_wait()?.is_none() {
-            if let Ok(prompt) = requests.try_recv() {
-                let allowed = if let Some(tty) = tty.as_mut() {
-                    approve_terminal(tty, &prompt.description, prompt.deadline, &stop, || {
-                        child.0.try_wait().map_or(true, |status| status.is_some())
-                    })?
-                } else {
-                    false
-                };
-                let _ = prompt.decision.send(allowed);
+    let result = (|| {
+        let mut delay = Duration::from_secs(1);
+        while !stop.load(Ordering::Acquire) {
+            let socket = format!("/tmp/syq-return-{}.sock", random_token()?);
+            let args = [
+                "--destination-register".into(),
+                config.name.clone(),
+                socket.clone(),
+                receiver.secret.clone(),
+            ];
+            let mut command = ssh_command(&spec.endpoint);
+            command
+                .args([
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-o",
+                    "StreamLocalBindMask=0177",
+                ])
+                .arg("-R")
+                .arg(format!("{socket}:{}", broker.socket_path().display()))
+                .arg("--")
+                .arg(&spec.endpoint.host)
+                .arg(format!("{} {}", spec.program, shell_words::join(&args)))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0);
+            let mut child = OwnedSsh(command.spawn().context("start receiving SSH connection")?);
+            *state.lock().unwrap() = crate::receive_service::ConnectionState {
+                phase: "connecting".into(),
+                error: None,
+                ssh_pid: Some(child.0.id()),
+            };
+            let (ready, readiness) = mpsc::sync_channel(1);
+            let mut stdout = child.0.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let _ = ready.send(read_message::<Reply>(&mut stdout));
+            });
+            let mut stderr = child.0.stderr.take().unwrap();
+            let errors = Arc::new(Mutex::new(Vec::new()));
+            let captured = errors.clone();
+            let error_reader = std::thread::spawn(move || {
+                let mut buffer = [0u8; 1024];
+                while let Ok(count) = stderr.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    let mut bytes = captured.lock().unwrap();
+                    bytes.extend_from_slice(&buffer[..count]);
+                    let excess = bytes.len().saturating_sub(8192);
+                    bytes.drain(..excess);
+                }
+            });
+            let connected = Instant::now();
+            let mut online = false;
+            while !stop.load(Ordering::Acquire) && child.0.try_wait()?.is_none() {
+                if matches!(readiness.try_recv(), Ok(Ok(Reply::Ready))) {
+                    online = true;
+                    state.lock().unwrap().phase = "online".into();
+                }
+                if !online && connected.elapsed() >= Duration::from_secs(30) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let exit = child.0.try_wait()?;
-        drop(child);
-        if !stop.load(Ordering::Relaxed)
-            && exit
+            let exit = child.0.try_wait()?;
+            drop(child);
+            let _ = reader.join();
+            let _ = error_reader.join();
+            receiver.revoke_all();
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let error = String::from_utf8_lossy(&errors.lock().unwrap())
+                .trim()
+                .to_owned();
+            let error = if error.is_empty() {
+                "return connection closed or did not become ready".into()
+            } else {
+                error
+            };
+            if exit
                 .and_then(|s| s.code())
-                .is_some_and(|code| (1..128).contains(&code))
-        {
-            bail!("server rejected the named destination registration; fix the reported error and restart syq receive");
-        }
-        // Pending approvals cannot turn into usable grants after a lost link.
-        for (_, session) in receiver.sessions.lock().unwrap().drain() {
-            session.authority.close_control();
-            session.channels.shutdown_all();
-        }
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        if connected_at.elapsed() > Duration::from_secs(60) {
-            delay = Duration::from_secs(1);
-        }
-        crate::output::diagnostic!(
-            "syq: @{0} disconnected; laptop reconnects in {1}s; interrupted copies must be rerun",
-            config.name,
-            delay.as_secs()
-        );
-        let until = Instant::now() + delay;
-        while !stop.load(Ordering::Relaxed) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        delay = (delay * 2).min(Duration::from_secs(30));
-    }
-    stop.store(true, Ordering::Relaxed);
-    drop(broker);
-    Ok(0)
-}
-
-fn approve_terminal(
-    tty: &mut File,
-    description: &str,
-    deadline: Instant,
-    stop: &AtomicBool,
-    mut disconnected: impl FnMut() -> bool,
-) -> Result<bool> {
-    // A pasted or delayed answer to an earlier request cannot approve this one.
-    if unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    writeln!(
-        tty,
-        "\n{description}\nAllow this transfer once? [y/N] (expires in 300s)"
-    )?;
-    tty.flush()?;
-    let mut line = Vec::new();
-    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) && !disconnected() {
-        let mut descriptor = libc::pollfd {
-            fd: tty.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, 200) };
-        if result < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+                .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
+            {
+                bail!("server rejected return connection: {error}; reconnect with syq or change recv settings to retry");
             }
-            return Err(e.into());
+            *state.lock().unwrap() = crate::receive_service::ConnectionState {
+                phase: "reconnecting".into(),
+                error: Some(error),
+                ssh_pid: None,
+            };
+            if online && connected.elapsed() >= Duration::from_secs(60) {
+                delay = Duration::from_secs(1);
+            }
+            let until = Instant::now() + delay;
+            while !stop.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            delay = (delay * 2).min(Duration::from_secs(30));
         }
-        if result == 0 {
-            continue;
-        }
-        if Instant::now() >= deadline || stop.load(Ordering::Relaxed) || disconnected() {
-            return Ok(false);
-        }
-        let mut byte = [0];
-        if tty.read(&mut byte)? == 0 {
-            return Ok(false);
-        }
-        if byte[0] == b'\n' {
-            return Ok(line == b"y" || line == b"yes");
-        }
-        if line.len() >= 16 {
-            return Ok(false);
-        }
-        line.push(byte[0].to_ascii_lowercase());
-    }
-    writeln!(tty, "Request expired or receiver stopped.")?;
-    Ok(false)
+        Ok(())
+    })();
+    receiver.revoke_all();
+    drop(broker);
+    result
 }
 
 struct RegistrationGuard {
     socket: PathBuf,
     socket_identity: (u64, u64),
+    record: Option<(PathBuf, (u64, u64))>,
 }
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
+        if let Some((path, identity)) = &self.record {
+            if fs::symlink_metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == *identity) {
+                let _ = fs::remove_file(path);
+            }
+        }
         if fs::symlink_metadata(&self.socket)
             .is_ok_and(|m| (m.dev(), m.ino()) == self.socket_identity)
         {
@@ -1024,9 +983,10 @@ fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     {
         bail!("return socket must be owned and private");
     }
-    let _guard = RegistrationGuard {
+    let mut guard = RegistrationGuard {
         socket: socket.into(),
         socket_identity: (metadata.dev(), metadata.ino()),
+        record: None,
     };
     let registration = Registration {
         version: VERSION,
@@ -1048,29 +1008,50 @@ fn register(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join(format!("{name}.lock")))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // A laptop may reconnect before the server has noticed the old TCP
+        // session died. Only the same ephemeral credential gets a retry; it
+        // still cannot displace an active registration or obtain its lock.
+        if load_registration(name).is_ok_and(|previous| previous.secret == secret) {
+            crate::output::diagnostic!("syq: previous return connection is still closing");
+            return Ok(RECONNECT_PENDING);
+        }
         bail!("destination @{name} is already registered by another connection");
     }
     let path = directory.join(format!("{name}.json"));
-    if path.exists() {
-        let bytes = crate::delegation::read_private_regular(
-            &path,
-            "destination registration",
-            MAX_MESSAGE,
-        )?;
-        let previous: Registration = serde_json::from_slice(&bytes)?;
-        if previous.secret != secret {
-            bail!("destination @{name} belongs to another receiving configuration; choose a different name or explicitly run syq destination forget {name} while it is offline");
-        }
-    }
     let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
     temporary.write_all(&serde_json::to_vec(&registration)?)?;
     temporary.persist(&path)?;
-    println!("syq: @{name} is available from any shell on this server");
-    // EOF belongs to the laptop's owned SSH process. Its exit withdraws the
-    // live socket. Keep the identity record so another laptop cannot silently
-    // take over the name while this laptop is reconnecting.
-    let mut byte = [0];
-    while std::io::stdin().read(&mut byte)? != 0 {}
+    let meta = fs::symlink_metadata(&path)?;
+    guard.record = Some((path, (meta.dev(), meta.ino())));
+    // Drop the advertisement before releasing its name lock, including on a
+    // normal disconnect. A crash can leave a stale record, never a reservation.
+    let _guard = guard;
+    write_message(&mut std::io::stdout(), &Reply::Ready)?;
+    let mut input = std::io::stdin();
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // A quiet, half-open SSH transport must not reserve a name forever.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 15_000) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if ready == 0 {
+            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(10))?;
+            if !matches!(reply, Reply::Ready) {
+                bail!("return connection is no longer ready");
+            }
+        } else if input.read(&mut [0])? == 0 {
+            break;
+        }
+    }
     Ok(0)
 }
 fn available(name: &str) -> Result<()> {
@@ -1147,12 +1128,6 @@ fn destinations(action: DestinationAction) -> Result<i32> {
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|s| s.to_str())? {
-        "receive" => Some((|| {
-            let matches = receive_help()
-                .try_get_matches_from(&argv[1..])
-                .unwrap_or_else(|e| e.exit());
-            receive(Receive::from_arg_matches(&matches)?)
-        })()),
         "destination" => Some((|| {
             let matches = destination_help()
                 .try_get_matches_from(&argv[1..])
@@ -1222,8 +1197,8 @@ mod tests {
     ) {
         let (prompts, requests) = mpsc::sync_channel(1);
         let receiver = Arc::new(Receiver {
-            requester: "test-server".into(),
-            root: root.into(),
+            cwd: root.into(),
+            root: Some(root.into()),
             secret: random_token().unwrap(),
             max_bytes: 10_000_000,
             max_entries: 1000,
@@ -1641,69 +1616,6 @@ mod tests {
     }
 
     #[test]
-    fn named_terminal_requires_a_fresh_answer_and_cancels_on_disconnect() {
-        use std::os::fd::FromRawFd;
-        let mut master = -1;
-        let mut slave = -1;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            },
-            0
-        );
-        let mut master = unsafe { File::from_raw_fd(master) };
-        let mut slave = unsafe { File::from_raw_fd(slave) };
-        // A stale pretyped yes is discarded before this request is displayed.
-        master.write_all(b"yes\n").unwrap();
-        let response = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let mut output = Vec::new();
-            while Instant::now() < deadline {
-                let mut poll = libc::pollfd {
-                    fd: master.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut poll, 1, 100) } <= 0 {
-                    continue;
-                }
-                let mut bytes = [0; 256];
-                let count = master.read(&mut bytes).unwrap();
-                output.extend_from_slice(&bytes[..count]);
-                if output.windows(5).any(|w| w == b"[y/N]") {
-                    master.write_all(b"no\n").unwrap();
-                    return master;
-                }
-            }
-            panic!("approval prompt did not arrive before deadline");
-        });
-        let stop = AtomicBool::new(false);
-        assert!(!approve_terminal(
-            &mut slave,
-            "test request",
-            Instant::now() + Duration::from_secs(3),
-            &stop,
-            || false
-        )
-        .unwrap());
-        let _master = response.join().unwrap();
-        assert!(!approve_terminal(
-            &mut slave,
-            "disconnected",
-            Instant::now() + Duration::from_secs(3),
-            &stop,
-            || true
-        )
-        .unwrap());
-    }
-
-    #[test]
     fn named_limits_and_scope_validation_precede_approval() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("receiving");
@@ -1718,5 +1630,62 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+    }
+    #[test]
+    fn receiving_cwd_allows_other_paths_but_root_confines_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let cwd = temp.join("downloads");
+        fs::create_dir(&cwd).unwrap();
+        let outside = temp.join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+        assert_eq!(
+            resolve_destination(&cwd, None, b"../file").unwrap().0,
+            temp.join("file")
+        );
+        assert_eq!(
+            resolve_destination(&cwd, None, outside.join("file").as_os_str().as_bytes())
+                .unwrap()
+                .0,
+            outside.join("file")
+        );
+        assert_eq!(
+            resolve_destination(&cwd, None, b"link/file").unwrap().0,
+            outside.join("file")
+        );
+        assert_eq!(
+            resolve_destination(&cwd, None, b"link/../file").unwrap().0,
+            temp.join("file")
+        );
+        assert_eq!(
+            resolve_destination(&cwd, None, b"link").unwrap().0,
+            cwd.join("link")
+        );
+        assert!(resolve_destination(&cwd, Some(&cwd), b"../file").is_err());
+        assert!(resolve_destination(&cwd, Some(&cwd), outside.as_os_str().as_bytes()).is_err());
+        assert_eq!(
+            resolve_destination(&cwd, Some(&cwd), b"child/file")
+                .unwrap()
+                .0,
+            cwd.join("child/file")
+        );
+    }
+    #[test]
+    fn initial_envelope_deadline_is_not_extended_by_partial_bytes() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            for byte in 0..30 {
+                if writer.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert!(read_socket_message::<Envelope>(&mut reader, Duration::from_millis(100)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(reader);
+        sender.join().unwrap();
     }
 }

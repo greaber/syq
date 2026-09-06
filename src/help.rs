@@ -155,7 +155,7 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
-        .subcommand(Command::new("receive").about("Make a laptop directory available to copies initiated on a server"))
+        .subcommand(Command::new("recv").about("Configure background receiving over persistent SSH connections"))
         .subcommand(Command::new("destination").about("List named destinations available on this machine"))
         .subcommand(Command::new("persist").about("Manage reusable SSH connections and helper sessions"))
         .subcommand(Command::new("completion").about("Generate shell completion and manage cached endpoint suggestions"))
@@ -229,7 +229,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     }
     let mut command = match topics.first().copied() {
         None => root(),
-        Some("receive") => crate::destination::receive_help(),
+        Some("recv") => crate::receive_service::command_for_help(),
         Some("destination") => crate::destination::destination_help(),
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),

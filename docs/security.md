@@ -78,16 +78,21 @@ your agent as `ssh -A` would.
 ## Named receiving destinations
 
 A [named destination](receive.md) lets a server account request copies through
-an outbound connection maintained by your laptop. Keeping that connection open
-does not approve a transfer. The laptop checks the requested paths and limits
-and either asks in its receiving terminal or applies your explicit automatic
-permission. The same restricted filesystem executor checks every operation.
-The server receives no SSH agent and no general command-execution interface.
+an outbound connection maintained by your laptop. `persist on` enables this
+for syq's SSH connections by default. Requests are accepted automatically;
+there is no approval prompt. Each request's paths and limits are validated
+before its authority is issued, and the restricted filesystem executor checks
+every operation. The server receives no SSH agent or command-execution interface.
 
-Approval grants authority within the displayed destination scopes. It cannot
-prove that source files contain what you expect. A compromised authorized
-server can invent content, request more copies, and consume disk space within
-approved per-transfer limits. The laptop's receiving account is trusted.
+The default starting directory is your home directory, with no containment.
+`syq recv on --root DIRECTORY` contains copies; `syq recv off` disables receiving
+while keeping ordinary persistence. A compromised connected server account can
+invent content, request more copies, inspect destination entries during copy
+planning, and consume disk space. The laptop's receiving account is trusted.
+
+Bare destination names fall back to ordinary SSH while the laptop is offline.
+Use `@name` when you require a return connection and want failure instead of
+host resolution. A copy never switches routes after selecting its destination.
 
 ## Limits to keep in mind
 

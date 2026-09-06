@@ -1435,6 +1435,7 @@ impl RemoteSpec {
                     );
                 }
                 self.record_peer(&conn);
+                crate::receive_service::ensure(&multiplexer.path, self);
                 Some(conn)
             }
             Err(error) => {
@@ -1714,6 +1715,7 @@ impl RemoteSpec {
             if let Some(multiplexer) = &self.ssh_multiplexer {
                 if multiplexer.persistent {
                     crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
+                    crate::receive_service::ensure(&multiplexer.path, self);
                 }
             }
         }

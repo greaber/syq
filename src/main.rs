@@ -20,6 +20,7 @@ mod private_broker;
 mod progress;
 mod proto;
 mod receipt;
+mod receive_service;
 mod remote_helper;
 mod remote_to_remote;
 mod restricted;
@@ -236,7 +237,8 @@ fn main() {
             }
         }
     }
-    if let Some(result) = destination::dispatch(&argv) {
+    if let Some(result) = receive_service::dispatch(&argv).or_else(|| destination::dispatch(&argv))
+    {
         match result {
             Ok(code) => std::process::exit(code),
             Err(error) => {

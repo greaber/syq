@@ -14,10 +14,7 @@ cleanup() {
         kill -TERM "$return_copy_pid" 2>/dev/null || true
         wait "$return_copy_pid" 2>/dev/null || true
     fi
-    if [ -n "${receive_pid:-}" ]; then
-        kill -TERM "$receive_pid" 2>/dev/null || true
-        wait "$receive_pid" 2>/dev/null || true
-    fi
+    syq persist off >/dev/null 2>&1 || true
     if [ -n "${SSH_AGENT_PID:-}" ]; then
         ssh-agent -k >/dev/null 2>&1 || true
     fi
@@ -130,10 +127,17 @@ printf 'case: named return destination works from independent server shells with
 receive_root=/tmp/syq-real-ssh-receive
 mkdir -p "$receive_root" /tmp/syq-real-ssh-receive-other
 make_tree source /tmp/syq-real-ssh/return-source return
-syq receive --via source --name laptop --into "$receive_root" --approve always &
-receive_pid=$!
+syq persist on
+# The ordinary copy ends before receiving readiness: no foreground receiver.
+syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-return-pull
+syq recv wait source --timeout 30
+# The container hostname is the laptop's default advertised name.
+# shellcheck disable=SC2029
+ssh source "syq destination wait $(hostname) --timeout 5"
+syq recv on --name laptop --root "$receive_root"
+syq recv wait source --timeout 30
 ssh source 'syq destination wait laptop --timeout 30'
-ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
     cd "$receive_root/first"
@@ -159,13 +163,19 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 
 printf 'case: duplicate named return cannot displace the existing laptop\n'
-if timeout 20 syq receive --via source --name laptop --into /tmp/syq-real-ssh-receive-other --approve always; then
-    echo 'duplicate named destination unexpectedly succeeded' >&2
-    exit 1
-else
-    duplicate_status=$?
-    test "$duplicate_status" -eq 1
-fi
+(
+    export XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
+    mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    trap 'syq persist off' EXIT
+    syq persist on
+    syq recv on --name laptop --root /tmp/syq-real-ssh-receive-other
+    syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-duplicate-pull
+    if syq recv wait source --timeout 5; then
+        echo 'duplicate named destination unexpectedly succeeded' >&2
+        exit 1
+    fi
+    syq recv status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
+)
 ssh source 'syq destination wait laptop --timeout 5'
 
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
@@ -195,7 +205,7 @@ while :; do
 done
 # One complete 4 MiB prefix is now present and eligible for resume checks.
 # Only kill the receiver's owned SSH child; the tracing wrapper is its parent.
-receive_wrapper=$(pgrep -P "$receive_pid")
+receive_wrapper=$(syq recv status --json | python3 -c 'import json,sys; print(next(s["connection"]["ssh_pid"] for s in json.load(sys.stdin)["connections"] if s["endpoint"] == "source"))')
 pkill -KILL -P "$receive_wrapper" -x ssh
 if wait "$return_copy_pid"; then
     echo 'interrupted named transfer reported success' >&2
@@ -212,14 +222,34 @@ ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_ro
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
 printf 'return\n' | cmp - "$receive_root/after-reconnect"
-kill -TERM "$receive_pid"
-wait "$receive_pid"
-receive_pid=
+printf 'case: cwd permits destinations outside its starting directory\n'
+syq recv on --cwd "$receive_root"
+syq recv wait source --timeout 30
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as ../syq-return-outside'
+printf 'return\n' | cmp - /tmp/syq-return-outside
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
+printf 'return\n' | cmp - /tmp/syq-return-absolute
+printf 'case: recv off/on keeps ordinary persistence and restarts receiving\n'
+syq recv off
+if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as while-disabled'; then
+    echo 'disabled receiving unexpectedly accepted a transfer' >&2
+    exit 1
+fi
+syq recv on
+syq recv wait source --timeout 30
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as reenabled'
+printf 'return\n' | cmp - "$receive_root/reenabled"
+printf 'case: persistence off stops background receiving\n'
+syq persist off
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-stop'; then
     echo 'stopped receiver unexpectedly accepted a transfer' >&2
     exit 1
 fi
 test ! -e "$receive_root/after-stop"
+ssh source 'test ! -e ~/.syq-destinations-v2/laptop.json'
+# Unrelated pooling scenarios count SSH commands; explicitly disable receiving.
+syq recv off
+syq completion cache clear >/dev/null
 
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
@@ -271,11 +301,19 @@ open_spares() {
     ' "$trace"
 }
 complete_remote
-if [ "$(direct_logins)" -ne 1 ]; then
-    echo 'first completion did not finish exactly one direct login:' >&2
-    cat "$trace" >&2
-    exit 1
-fi
+# Completion can return just before its tracing SSH wrapper logs process exit.
+# Wait for that structured event before asserting the completed login count.
+deadline=$(($(date +%s) + 5))
+while :; do
+    logins=$(direct_logins)
+    if [ "$logins" -eq 1 ]; then break; fi
+    if [ "$logins" -gt 1 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "first completion login count: expected 1, observed $logins" >&2
+        cat "$trace" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
 deadline=$(($(date +%s) + 15))
 next_progress=$(($(date +%s) + 5))
 while :; do

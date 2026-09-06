@@ -14236,7 +14236,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "persist",
             "completion",
             "receiver",
-            "receive",
+            "recv",
             "destination",
             "--self-update",
         ],
@@ -17077,7 +17077,7 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
     assert_eq!(records.last().unwrap()["status"], "failed");
     // The completion route uses private local registration names only, without
     // attempting SSH or contacting the receiving laptop.
-    write(&t.path(".syq-destinations-v1/laptop.json"), b"{}");
+    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
     let completion = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "completion",
@@ -17098,4 +17098,172 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
         .unwrap();
     assert_output_ok(&completion);
     assert_eq!(completion.stdout, b"@laptop\0");
+}
+
+#[test]
+fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("downloads")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let status = || {
+        let output = run(&["recv", "status", "--json"]);
+        assert_output_ok(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let defaults = status();
+    assert_eq!(defaults["settings"]["enabled"], true);
+    assert_eq!(
+        defaults["settings"]["cwd"],
+        fs::canonicalize(t.path("")).unwrap().to_str().unwrap()
+    );
+    assert!(defaults["settings"]["root"].is_null());
+    assert!(!t.path("config").exists(), "status created configuration");
+    assert!(
+        !t.path("runtime").exists(),
+        "status created a runtime scope"
+    );
+    assert_output_ok(&run(&[
+        "recv",
+        "on",
+        "--name",
+        "laptop",
+        "--root",
+        "downloads",
+    ]));
+    assert_eq!(status()["settings"]["root"], t.s("downloads"));
+    assert_output_ok(&run(&["recv", "on", "--cwd", "."]));
+    assert!(status()["settings"]["root"].is_null());
+    assert_eq!(status()["settings"]["name"], "laptop");
+    assert_output_ok(&run(&["recv", "off"]));
+    assert_eq!(status()["settings"]["enabled"], false);
+    assert!(!t.path("config/syq/persistence.json").exists());
+    assert_eq!(
+        fs::metadata(t.path("config/syq/receive.json"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!run(&["recv", "on", "--cwd", ".", "--root", "downloads"])
+        .status
+        .success());
+}
+
+#[test]
+fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\n: > \"$SSH_MARKER\"\nexit 55\n");
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut path = vec![t.path("bin")];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("PATH", &path)
+            .env("SSH_MARKER", t.path("ssh-used"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
+    let registry = t.path(".syq-destinations-v2");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("return.sock");
+    let registration = serde_json::json!({"version":2,"identity":identity.trim(),"socket":socket_path,"secret":"test"});
+    write(
+        &registry.join("laptop.json"),
+        &serde_json::to_vec(&registration).unwrap(),
+    );
+    fs::set_permissions(
+        registry.join("laptop.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let offline = run(&[
+        "cp",
+        "source",
+        "--to",
+        "laptop",
+        "--syq-path",
+        "/test/helper",
+    ]);
+    assert!(!offline.status.success());
+    assert!(
+        t.path("ssh-used").exists(),
+        "offline bare name did not use SSH: {}",
+        stderr_of(&offline)
+    );
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    let explicit = run(&["cp", "source", "--to", "@laptop"]);
+    assert!(!explicit.status.success());
+    assert!(stderr_of(&explicit).contains("offline"));
+    assert!(!t.path("ssh-used").exists());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for response in [
+            serde_json::json!("Ready"),
+            serde_json::json!({"Error":"copy denied by test policy"}),
+        ] {
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("return test connection: {e}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let length = u32::from_be_bytes(length) as usize;
+            assert!(length < 256 * 1024);
+            let mut request = vec![0; length];
+            socket.read_exact(&mut request).unwrap();
+            let response = serde_json::to_vec(&response).unwrap();
+            socket
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&response).unwrap();
+        }
+    });
+    let denied = run(&["cp", "source", "--to", "laptop"]);
+    responder.join().unwrap();
+    assert!(!denied.status.success());
+    assert!(
+        stderr_of(&denied).contains("copy denied by test policy"),
+        "{}",
+        stderr_of(&denied)
+    );
+    assert!(
+        !t.path("ssh-used").exists(),
+        "a denied return copy switched to SSH"
+    );
 }

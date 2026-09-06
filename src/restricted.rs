@@ -4157,7 +4157,7 @@ pub(crate) fn named_request(
     let mut checked = args.clone();
     // These channels are encrypted by the laptop-initiated SSH connection.
     checked.no_tcp = false;
-    let path = crate::destination::request_path(&destination.path)?;
+    let path = crate::destination::request_path(b".")?;
     let grant = grant_for(
         &checked,
         sources,
@@ -4167,6 +4167,7 @@ pub(crate) fn named_request(
     )?;
     let GrantOperation::Copy(copy) = grant.operation;
     Ok(crate::destination::CopyRequest {
+        destination: destination.path.clone(),
         copy,
         constraints: GrantConstraints {
             max_file_data_bytes_per_second: args.bwlimit_bytes,
@@ -4192,9 +4193,7 @@ pub(crate) fn named_authority(
     crate::destination::Approved,
 )> {
     let (login, home) = current_account()?;
-    let parent = root
-        .parent()
-        .context("receiving directory must not be filesystem root")?;
+    let parent = root;
     let metadata = fs::metadata(parent)?;
     let id = EnrollmentId::random();
     let issued_at = now()?;
@@ -4218,10 +4217,23 @@ pub(crate) fn named_authority(
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
     let mut protected = receiver_control_paths(&home, &executable, None)?;
-    for directory in [".syq-receive-v1", ".syq-destinations-v1"] {
+    for directory in [
+        ".syq-receive-v1",
+        ".syq-destinations-v1",
+        ".syq-destinations-v2",
+    ] {
         protected.push(ReceiverControlPath {
             path: home.join(directory).as_os_str().as_bytes().to_vec(),
             label: "named destination authority state",
+        });
+    }
+    for path in [
+        crate::receive_service::config_path()?,
+        crate::persistence::runtime_parent_path(),
+    ] {
+        protected.push(ReceiverControlPath {
+            path: path.as_os_str().as_bytes().to_vec(),
+            label: "background receiving control state",
         });
     }
     let config = ReceiverEnrollment {

@@ -23,6 +23,7 @@ RUN apt-get update \
         openssh-client \
         openssh-server \
         procps \
+        python3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 syq \
     && useradd --uid 1000 --gid syq --create-home --shell /bin/sh syq \

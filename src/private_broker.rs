@@ -95,7 +95,7 @@ impl PrivateBroker {
         Self::start_inner(config, handler, true)
     }
 
-    /// The foreground receiver owns signal handling and child cleanup.
+    /// The caller owns signal handling and child cleanup.
     pub(crate) fn start_managed<F>(config: PrivateBrokerConfig<'_>, handler: F) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
