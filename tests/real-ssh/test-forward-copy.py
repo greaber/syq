@@ -149,7 +149,9 @@ import time
 child = subprocess.Popen(['/usr/local/bin/syq', *sys.argv[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 def pump(reader, writer):
     while True:
-        data = os.read(reader, 16384)
+        # Preserve any preamble bytes buffered while reading Approved, while
+        # returning available control bytes without waiting for a full chunk.
+        data = reader.read1(16384)
         if not data:
             break
         while data:
@@ -157,7 +159,7 @@ def pump(reader, writer):
             data = data[count:]
 def send_input():
     try:
-        pump(0, child.stdin.fileno())
+        pump(sys.stdin.buffer, child.stdin.fileno())
     except BrokenPipeError:
         pass
     finally:
@@ -172,7 +174,7 @@ assert 'Approved' in json.loads(reply)
 time.sleep(12)
 sys.stdout.buffer.write(header + reply)
 sys.stdout.buffer.flush()
-pump(child.stdout.fileno(), 1)
+pump(child.stdout, 1)
 sys.exit(child.wait())
 '''
 remote("printf %s " + shlex.quote(delayed_helper) + " > " + helper + ".fixture && chmod 700 " + helper + ".fixture && mv " + helper + ".fixture " + helper)
