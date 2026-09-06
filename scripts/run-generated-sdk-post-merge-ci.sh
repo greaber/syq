@@ -39,7 +39,7 @@ for workflow in "${workflows[@]}"; do
   dispatch=$(gh api --method POST \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
     "repos/$repository/actions/workflows/$workflow/dispatches" \
-    -f ref="$branch")
+    -f ref="$merge_sha")
   run_id=$(jq -er .workflow_run_id <<<"$dispatch")
   [[ "$run_id" =~ ^[0-9]+$ ]] || {
     echo "$workflow dispatch returned invalid workflow run ID: $run_id" >&2
