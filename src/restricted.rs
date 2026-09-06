@@ -4228,7 +4228,10 @@ pub(crate) fn named_authority(
         });
     }
     for path in [
-        crate::receive_service::config_path()?,
+        crate::receive_service::config_path()?
+            .parent()
+            .unwrap()
+            .to_path_buf(),
         crate::persistence::runtime_parent_path(),
     ] {
         protected.push(ReceiverControlPath {

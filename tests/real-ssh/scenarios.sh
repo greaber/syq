@@ -137,6 +137,67 @@ ssh source "syq destination wait $(hostname) --timeout 5"
 syq recv on --name laptop --root "$receive_root"
 syq recv wait source --timeout 30
 ssh source 'syq destination wait laptop --timeout 30'
+printf 'case: return copies await local approval and denial leaves no destination\n'
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as denied' &
+return_copy_pid=$!
+syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+request_id=$(python3 -c 'import json; r=json.load(open("/tmp/syq-pending.json")); assert len(r)==1 and "source" in r[0]["from"] and "denied" in r[0]["destination"],r; print(r[0]["id"])')
+test ! -e "$receive_root/denied"
+syq recv deny "$request_id"
+if wait "$return_copy_pid"; then echo 'denied copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
+return_copy_pid=
+test ! -e "$receive_root/denied"
+if syq recv approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
+
+printf 'case: approval allows only the pending copy once\n'
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as approved' &
+return_copy_pid=$!
+syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
+test ! -e "$receive_root/approved"
+syq recv approve "$request_id"
+wait "$return_copy_pid"
+return_copy_pid=
+printf 'return\n' | cmp - "$receive_root/approved"
+if syq recv approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
+
+printf 'case: disconnected requests cannot be approved later\n'
+ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as disconnected' &
+return_copy_pid=$!
+syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
+if wait "$return_copy_pid"; then echo 'unapproved copy succeeded' >&2; exit 1; fi
+return_copy_pid=
+python3 - <<'PYWAIT'
+import json, subprocess, time
+deadline = time.monotonic() + 3
+while True:
+    pending = json.loads(subprocess.check_output(["syq", "recv", "pending", "--json"]))
+    if not pending: break
+    assert time.monotonic() < deadline, pending
+    time.sleep(.05)
+PYWAIT
+if syq recv approve "$request_id"; then echo 'disconnected request was approved' >&2; exit 1; fi
+test ! -e "$receive_root/disconnected"
+
+printf 'case: changing policy cancels a pending request\n'
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as cancelled-policy' &
+return_copy_pid=$!
+syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
+syq recv on --notify off
+if wait "$return_copy_pid"; then echo 'cancelled copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
+return_copy_pid=
+syq recv wait source --timeout 30
+if syq recv approve "$request_id"; then echo 'cancelled request was approved' >&2; exit 1; fi
+test ! -e "$receive_root/cancelled-policy"
+
+printf 'case: native Linux notification actions control return copies\n'
+dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
+
+printf 'case: explicit automatic approval supports unattended copies\n'
+syq recv on --approve always
+syq recv wait source --timeout 30
 ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
