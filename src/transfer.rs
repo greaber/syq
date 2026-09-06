@@ -3136,7 +3136,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .filter_map(real_remote_spec)
                         .filter(|spec| spec.data_transport() == DataTransport::Ssh)
                     {
-                        spec.set_ssh_multiplexing(Some(file_bytes));
+                        spec.set_ssh_multiplexing(true);
                     }
                 }
                 if !workers_started {
@@ -3168,21 +3168,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     } else {
                         args.connections
                     };
-                    // A bounded SSH tree can finish on one reused channel.
-                    // Extra logins and channels cost more than the filesystem
-                    // overlap on a short copy. Explicit counts stay explicit,
-                    // and the tuner can still grow when enough work remains.
-                    if autotune
-                        && multiplex_small_files
-                        && file_bytes <= crate::conn::SHARED_SSH_COPY_BYTES
-                        && !opts.same_host
-                        && [&src_ep, &dst_ep]
-                            .into_iter()
-                            .filter_map(real_remote_spec)
-                            .any(|spec| spec.data_transport() == DataTransport::Ssh)
-                    {
-                        initial = 1;
-                    }
                     if single_direct_candidate {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;

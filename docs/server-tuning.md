@@ -81,10 +81,8 @@ bursts from unrelated clients, so choose limits that suit the server.
 
 `MaxSessions` is a different limit: channels sharing one SSH connection.
 Very low values can force extra logins when syq tries to reuse a connection.
-Fresh small-file copies can share SSH channels; with persistence enabled, this
-is limited to copies totaling at most 16 MiB. Larger copies use independent
-SSH data connections, so raising `MaxSessions` alone does not increase their
-capacity.
+Syq's SSH data workers use independent connections, so raising this limit
+alone does not increase their capacity.
 
 Validate configuration changes with `sshd -t`, then reload SSH using your
 system's normal procedure. Keep an administrative session open while doing
