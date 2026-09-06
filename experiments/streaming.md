@@ -50,6 +50,9 @@ This avoids waiting an extra round trip for an already-finished read. Stop
 and subsequent commands remain ordered on the same connection; there is
 exactly one Done, including on early cancellation. A split through a
 frame validates the whole frame's hash before truncating/re-hashing its prefix.
+Exhausting a reduced limit also emits Done before waiting for Stop, including
+when a late shrink moves the end behind read-ahead's current offset. The source
+still consumes all late controls through Stop before the next operation.
 In-process sources produce one block per receive, without preloading a range.
 
 Writes use unchanged `WriteRange` requests, with unchanged destination

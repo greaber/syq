@@ -51,13 +51,16 @@ impl RequestReader {
             .and_then(crate::conn::tcp_socket_stats)
     }
 
-    /// Process one-way limit updates before the next read. At the reduced end
-    /// (including a late update behind `off`), keep waiting for the stop marker.
-    /// Only that marker fences the stream, so late updates cannot leak into
-    /// the next operation on a reused connection.
-    fn stream_stopped(&self, off: u64, limit: &mut u64) -> Result<bool> {
+    /// Process one-way limit updates before the next read. Return to the
+    /// writer when a shrink exhausts the range so it can send Done before
+    /// waiting for Stop. Once Done is sent, consume late controls through Stop
+    /// before accepting another operation on this connection.
+    fn stream_stopped(&self, off: u64, limit: &mut u64, done_sent: bool) -> Result<bool> {
         use std::sync::mpsc::TryRecvError;
         loop {
+            if off >= *limit && !done_sent {
+                return Ok(false);
+            }
             let request = if off >= *limit {
                 self.recv()
                     .context("read stream control channel closed")??
@@ -537,8 +540,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         w.write_msg(&Response::ReadStreamDone)?;
                         done_sent = true;
                     }
-                    if reader.stream_stopped(stream.off, &mut limit)? {
+                    if reader.stream_stopped(stream.off, &mut limit, done_sent)? {
                         break;
+                    }
+                    if stream.off >= limit {
+                        // A late shrink crossed the current offset: send Done
+                        // on the next iteration, without another read or RTT.
+                        continue;
                     }
                     let t0 = std::time::Instant::now();
                     let response = ops.handle(&stream.next_request());
@@ -1305,7 +1313,7 @@ mod tests {
             .unwrap();
         tx.send(Ok(super::Request::ShrinkReadStream { end: 1024 }))
             .unwrap();
-        assert!(!reader.stream_stopped(0, &mut limit).unwrap());
+        assert!(!reader.stream_stopped(0, &mut limit, false).unwrap());
         assert_eq!(limit, 1024);
 
         // Even if a block straddled the new end, consume subsequent shrink
@@ -1315,7 +1323,7 @@ mod tests {
             .unwrap();
         tx.send(Ok(super::Request::StopReadStream)).unwrap();
         tx.send(Ok(super::Request::Shutdown)).unwrap();
-        assert!(reader.stream_stopped(2048, &mut limit).unwrap());
+        assert!(reader.stream_stopped(2048, &mut limit, true).unwrap());
         assert_eq!(limit, 0);
         assert!(matches!(
             reader.recv().unwrap().unwrap(),
@@ -1325,10 +1333,10 @@ mod tests {
         // Increasing a limit is a protocol error, not new read authority.
         tx.send(Ok(super::Request::ShrinkReadStream { end: u64::MAX }))
             .unwrap();
-        assert!(reader.stream_stopped(2048, &mut limit).is_err());
+        assert!(reader.stream_stopped(2048, &mut limit, true).is_err());
         assert_eq!(limit, 0);
         drop(tx);
-        assert!(reader.stream_stopped(2048, &mut limit).is_err());
+        assert!(reader.stream_stopped(2048, &mut limit, true).is_err());
     }
 
     use super::*;
@@ -1534,6 +1542,10 @@ mod tests {
         let selected = crate::test_support::tempdir().unwrap();
         let marker = selected.path().join("marker");
         std::fs::write(&marker, b"marker").unwrap();
+        std::fs::File::create(selected.path().join("stream-large"))
+            .unwrap()
+            .set_len(8 << 20)
+            .unwrap();
         let descriptor_session = DescriptorSessionSlot::default();
         let ticket = descriptor_session
             .register(std::fs::File::open(selected.path()).unwrap())
@@ -1716,6 +1728,46 @@ mod tests {
             // The next iteration's request must not consume a second Done
             // or a response to the late shrink/stop.
         }
+        // A late shrink can exhaust a still-active stream after read-ahead
+        // crossed its new boundary. It must produce Done before Stop, just
+        // like natural EOF. Small frames keep the stream in flight until the
+        // client sends the shrink; the read deadline catches a stop-RTT stall.
+        writer
+            .write_msg(&Request::ReadStream(ReadStreamRequest {
+                path: Vec::new(),
+                source: Some(selection.join(b"stream-large").unwrap()),
+                attempt: 0,
+                off: 0,
+                end: 8 << 20,
+                block: 512,
+            }))
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Ok
+        ));
+        let mut received = match reader.read_msg::<Response>().unwrap() {
+            Response::Block { data, .. } => data.len(),
+            other => panic!("expected first streamed block, got {other:?}"),
+        };
+        writer
+            .write_msg(&Request::ShrinkReadStream { end: 0 })
+            .unwrap();
+        loop {
+            match reader.read_msg::<Response>().unwrap() {
+                Response::Block { data, .. } => received += data.len(),
+                Response::ReadStreamDone => break,
+                other => panic!("unexpected late-shrink response: {other:?}"),
+            }
+        }
+        assert!(
+            received < 8 << 20,
+            "stream ended naturally before the shrink"
+        );
+        writer
+            .write_msg(&Request::ShrinkReadStream { end: 0 })
+            .unwrap();
+        writer.write_msg(&Request::StopReadStream).unwrap();
         writer
             .write_msg(&Request::ReadStream(ReadStreamRequest {
                 path: Vec::new(),
