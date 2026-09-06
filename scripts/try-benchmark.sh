@@ -144,8 +144,18 @@ run() {
     [[ $status -eq 0 ]] || return "$status"
     active_pid=
 }
-manifest() { (cd "$1"; for file in *; do cksum "$file"; done); }
-remote_manifest() { remote "cd $(quote "$1") && for file in *; do cksum \"\$file\" || exit; done"; }
+# Fixed-size argument batches avoid both one process per file and ARG_MAX.
+# The same POSIX shell program runs at both ends; LC_ALL=C fixes glob order.
+manifest_command='set -eu
+export LC_ALL=C
+set --
+for file in *; do
+    set -- "$@" "$file"
+    if [ "$#" -eq 128 ]; then cksum "$@" || exit; set --; fi
+done
+if [ "$#" -gt 0 ]; then cksum "$@"; fi'
+manifest() { (cd "$1"; bash -c "$manifest_command"); }
+remote_manifest() { remote "cd $(quote "$1") && $manifest_command"; }
 
 make_data() {
     local workload=$1 amount=$2
