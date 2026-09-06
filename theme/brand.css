@@ -40,3 +40,29 @@ html{font-family:var(--sans);background:var(--bg);color:var(--ink)}
 body{font:400 20px/1.65 var(--sans);background:var(--bg);color:var(--ink)}
 h1,h2,h3,h4{font-family:var(--display);letter-spacing:-.025em}
 code{font-family:var(--mono);font-size:.8em}
+
+/* Shared homepage title: keep the wordmark prominent without changing prose. */
+.hero h1.landing-title,.content h1.landing-title{
+ font:700 clamp(38px,4.1vw,58px)/1.12 var(--display);
+ letter-spacing:-.045em;margin:0 0 24px;text-wrap:balance}
+.landing-title .landing-wordmark{
+ display:block;color:var(--syq);font:800 clamp(64px,6vw,80px)/1 "Manrope",sans-serif;
+ letter-spacing:-.06em;margin-bottom:10px}
+.landing-title .landing-subtitle{display:block}
+@media print{
+ .hero h1.landing-title,.content h1.landing-title{font-size:36px}
+ .landing-title .landing-wordmark{font-size:48px}
+}
+
+/* Homepage shortcuts share their treatment across both renderers. */
+.landing-actions{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0 32px;padding:0}
+.landing-actions a,.content .landing-actions a{
+ display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+ padding:9px 16px;box-sizing:border-box;border:1px solid var(--line);border-radius:3px;
+ background:var(--panel);color:var(--ink);font:600 15px/1.4 var(--display);
+ text-decoration:none;letter-spacing:0}
+.landing-actions a:hover,.content .landing-actions a:hover{border-color:var(--syq);color:var(--syq)}
+.landing-actions a.landing-primary,.content .landing-actions a.landing-primary{
+ background:var(--syq);color:var(--fast-fg);border-color:var(--syq)}
+.landing-actions a:focus-visible{outline:2px solid var(--syq);outline-offset:4px}
+@media print{.landing-actions{display:none}}

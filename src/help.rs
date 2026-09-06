@@ -88,6 +88,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "from"
                     | "cwd"
                     | "to"
+                    | "auth_from"
                     | "into"
                     | "as"
                     | "dry_run"
@@ -114,8 +115,10 @@ pub(crate) fn filesystem(command: Command) -> Command {
             }
             "connections" | "connections_opt" | "block_size" | "bwlimit" => "Performance",
             "tuning_options" => "Benchmark tuning",
-            "rsh" | "syq_path" | "no_bootstrap" | "no_tcp" | "tcp_plain" | "tcp_ports"
-            | "tcp_congestion" | "pscope" | "compress" | "no_compress" => "SSH and transport",
+            "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp" | "tcp_plain"
+            | "tcp_ports" | "tcp_congestion" | "pscope" | "compress" | "no_compress" => {
+                "SSH and transport"
+            }
             "coordinate_at"
             | "detach"
             | "peer_auth"

@@ -45,11 +45,25 @@ pub struct Progress {
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
     pub start: Instant,
+    copy_first_ns: AtomicU64,
+    copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
     stop: AtomicBool,
     /// `--results`: machine-readable NDJSON outcome stream, set once after
     /// construction so workers and the planner reach it with no plumbing.
     results: std::sync::OnceLock<Arc<crate::results::ResultsWriter>>,
+}
+
+/// Span from the first file-work operation to the last completed operation,
+/// including gaps/overlap across workers, rather than a sum of worker times.
+pub struct CopyingInterval<'a>(&'a Progress);
+
+impl Drop for CopyingInterval<'_> {
+    fn drop(&mut self) {
+        self.0
+            .copy_last_ns
+            .fetch_max(self.0.copy_clock_ns(), Relaxed);
+    }
 }
 
 struct TermState {
@@ -109,6 +123,8 @@ impl Progress {
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
+            copy_first_ns: AtomicU64::new(u64::MAX),
+            copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
                 samples: VecDeque::from([(Instant::now(), 0)]),
                 last_json: None,
@@ -125,6 +141,21 @@ impl Progress {
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {
         self.results.get()
+    }
+
+    fn copy_clock_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos().min(u64::MAX as u128 - 1) as u64
+    }
+
+    pub fn copying_interval(&self) -> CopyingInterval<'_> {
+        self.copy_first_ns.fetch_min(self.copy_clock_ns(), Relaxed);
+        CopyingInterval(self)
+    }
+
+    pub fn copying_elapsed_ms(&self) -> Option<u64> {
+        let first = self.copy_first_ns.load(Relaxed);
+        let last = self.copy_last_ns.load(Relaxed);
+        (self.bytes_done.load(Relaxed) > 0 && last >= first).then(|| (last - first) / 1_000_000)
     }
 
     pub fn add_bytes(&self, n: u64) {
@@ -478,6 +509,30 @@ impl crate::tune::Meter for Progress {
 mod tests {
     use super::*;
     use crate::tune::Meter;
+
+    #[test]
+    fn copying_interval_excludes_initial_setup_and_counts_overlap_once() {
+        let mut progress = Progress::new(false, false, None, false);
+        // Move the origin back without sleeping: setup must not enter the span.
+        Arc::get_mut(&mut progress).unwrap().start = Instant::now() - Duration::from_secs(60);
+        assert_eq!(progress.copying_elapsed_ms(), None);
+        let first = progress.copying_interval();
+        let began = progress.copy_first_ns.load(Relaxed);
+        assert!(began >= 60_000_000_000);
+        let overlapping = progress.copying_interval();
+        drop(first);
+        let first_end = progress.copy_last_ns.load(Relaxed);
+        drop(overlapping);
+        assert_eq!(progress.copy_first_ns.load(Relaxed), began);
+        assert!(progress.copy_last_ns.load(Relaxed) >= first_end);
+        assert_eq!(progress.copying_elapsed_ms(), None);
+        progress.add_bytes(1);
+        let span = (progress.copy_last_ns.load(Relaxed) - began) / 1_000_000;
+        assert_eq!(progress.copying_elapsed_ms(), Some(span));
+        // A measured sub-millisecond copy is distinct from absent timing.
+        progress.copy_last_ns.store(began + 999_999, Relaxed);
+        assert_eq!(progress.copying_elapsed_ms(), Some(0));
+    }
 
     #[test]
     fn rollback_resets_display_rate_and_retries_do_not_inflate_tuning_progress() {

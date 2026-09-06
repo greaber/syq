@@ -3776,7 +3776,7 @@ fn root_existence_for(existence: Existence) -> RootExistence {
     }
 }
 
-fn validate_restricted_args(args: &Args) -> Result<()> {
+pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp || args.tcp_plain {
         bail!("command-restricted transfers require encrypted TCP data connections");
     }

@@ -238,6 +238,13 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(stream.cwd, home / "selected")
 
+    async def test_cp_selects_an_authorizer_and_rejects_conflicting_selectors(self) -> None:
+        await self.client.cp("source", to="backup", auth_from="@laptop", into="out")
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
+        with self.assertRaises(syq.SyqInvocationError):
+            await self.client.cp("source", to="backup", auth_from="ssh", via="laptop", into="out")
+
     async def test_cp_can_request_permission_via_a_return_connection(self) -> None:
         await self.client.cp("source", to="backup", via="@laptop", into="out")
         argv = self.argv()

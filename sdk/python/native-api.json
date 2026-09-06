@@ -27,6 +27,7 @@
         "max-delete",
         "dry-run",
         "connections",
+        "auth-from",
         "via",
         "coordinate-at",
         "rsh",

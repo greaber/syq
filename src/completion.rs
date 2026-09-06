@@ -856,6 +856,7 @@ enum EndpointSyntax {
 }
 
 enum ValueCompletion {
+    AuthFrom,
     ReturnName,
     NamedOrSshDestination,
     Endpoint(EndpointSyntax),
@@ -1214,6 +1215,7 @@ fn value_completion(
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
             b"--via" => Some(ValueCompletion::ReturnName),
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
             | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
@@ -1293,6 +1295,14 @@ fn option_takes_value(command: &clap::Command, option: &[u8]) -> bool {
     })
 }
 
+fn return_name_candidates(current: &[u8]) -> impl Iterator<Item = Candidate> + '_ {
+    crate::destination::registered_names()
+        .into_iter()
+        .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
+        .filter(move |name| name.starts_with(current))
+        .map(Candidate::text)
+}
+
 fn complete_value(
     command: &str,
     args: &[Vec<u8>],
@@ -1300,25 +1310,23 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
-        ValueCompletion::ReturnName => Ok(crate::destination::registered_names()
+        ValueCompletion::AuthFrom => Ok([b"auto".to_vec(), b"ssh".to_vec()]
             .into_iter()
-            .map(|name| format!("@{name}").into_bytes())
-            .filter(|name| name.starts_with(current))
+            .filter(|value| value.starts_with(current))
             .map(Candidate::text)
+            .chain(
+                return_name_candidates(current)
+                    .filter(|candidate| candidate.value != b"auto" && candidate.value != b"ssh"),
+            )
             .collect()),
+        ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
                 current,
                 EndpointSyntax::Native,
                 pscope_from_args(command, args),
             );
-            candidates.extend(
-                crate::destination::registered_names()
-                    .into_iter()
-                    .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
-                    .filter(|name| name.starts_with(current))
-                    .map(Candidate::text),
-            );
+            candidates.extend(return_name_candidates(current));
             Ok(candidates)
         }
         ValueCompletion::Endpoint(syntax) => Ok(endpoint_candidates(
@@ -1388,9 +1396,6 @@ fn complete_path_for(
     if source {
         return complete_source_path(command, args, current, true);
     }
-    if find_option_value(args, b"--via").is_some() {
-        return Ok(Vec::new());
-    }
     let Some(endpoint_text) = find_option_value(args, b"--to") else {
         return Ok(local_path_candidates_at(
             current,
@@ -1407,8 +1412,19 @@ fn complete_path_for(
             path_policy(command, args, false),
         ));
     };
+    let authorizer = find_option_value(args, b"--auth-from");
+    if find_option_value(args, b"--via").is_some()
+        || (authorizer != Some("ssh")
+            && (authorizer.is_some_and(|value| value != "auto")
+                || (command == "cp" && !crate::destination::registered_names().is_empty())))
+    {
+        // Completion must never request copy approval or inspect hostB through
+        // an automatically selected authorizer. Explicit SSH keeps normal completion.
+        return Ok(Vec::new());
+    }
     if endpoint.host.starts_with('@')
-        || crate::destination::registered_names().contains(&endpoint.host)
+        || (authorizer != Some("ssh")
+            && crate::destination::registered_names().contains(&endpoint.host))
     {
         return Ok(Vec::new());
     }

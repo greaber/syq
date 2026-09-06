@@ -61,12 +61,17 @@ keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
 copies from independent source shells without a forwarded agent, destination
 background startup through persistence, `--root` traversal refusal, unconfined
 `--cwd` paths, conflicting names, reconnection after killing the owned SSH
-transport, and stopping receiving with persistence. Approval cases cover local
+transport, recovery after a server heartbeat times out while the client is
+paused, and stopping receiving with persistence. Approval cases cover local
 allow/deny, one-use IDs, disconnect and settings cancellation, and explicit
 automatic approval. An isolated D-Bus notification service exercises the real
 Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
 service failure; only Allow starts a copy. This does not exercise a particular desktop's visual
 layout or the macOS dialog.
+
+Source-shell remote copies also cover cached helper reuse, bootstrap after a
+missing or unexecutable helper, a delayed approval relay before Hello, and
+remote-home tilde paths alongside literal `./~` paths.
 
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new
@@ -110,8 +115,11 @@ python3 tests/real-ssh/test-completion-display.py --syq target/debug/syq
 
 The shell dependencies are installed only in the test image.
 
-The source-shell remote-copy checks use `--via @laptop` without a source key or
-agent. They cover local approval despite automatic local receiving, denial,
+The source-shell remote-copy checks discover the authorizer automatically
+without a source key or agent. Explicit `--auth-from @laptop` and the released
+`--via @laptop` spelling exercise the same route; `--auth-from ssh` fails without
+those source credentials and creates no approval request. The automatic cached
+helper case still needs just one destination SSH connection. The checks cover local approval despite automatic local receiving, denial,
 direct TCP, cached and missing helper startup, a second approval during slow
 SSH setup, preview/verification, protected destination authority files,
 unreachable data ports, and revocation followed by an approved retry.

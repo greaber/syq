@@ -1,128 +1,125 @@
-# syq for Python
+<a id="syq-for-python"></a>
 
-The official Python client for [syq](https://github.com/greaber/syq), a fast
-file transfer tool. Call `syq.cp(...)` (including `cp --prune`), `syq.rm(...)`,
-and `syq.map(...)` and get typed results back; every other syq command remains
-one `syq.run([...])` away.
+# Guide and examples
 
-```sh
-python -m pip install syq
-```
+Use the `syq` package to call syq from Python. See
+[installation](https://greaber.github.io/syq/python.html#install) if you have not
+installed it yet.
 
-Installing the package does not install syq itself. The first default call that
-needs syq downloads the matching syq release if it is not
-already cached, checks it against the signed release manifest, and uses that
-managed binary for subsequent default calls.
-The Python package and its managed syq executable share one version: package `0.4.0`
-manages syq `0.4.0`.
-syq always runs as a subprocess with an argument list, never through a shell.
+## Copy files
+
+Copy a directory named `data` into `backup`, producing `backup/data`:
 
 ```python
 import syq
 
-print(syq.__version__)           # Python package version
-print(syq.PINNED_SYQ_VERSION)    # tested executable version
-print(syq.managed_executable())  # downloads once, then returns the cached path
-
-plan = syq.cp("project", to="server", into="/backup", dry_run=True)
-print(plan.files_transferred, plan.bytes_transferred)
+result = syq.cp("data", into="backup")
+print(result.files_transferred, result.bytes_transferred)
 ```
 
-The typed API validates syq's complete automation results stream and its agreement
-with the process status. Dry and live calls return the same `CpResult` type;
-dry runs report planned mutation totals and emit `TraceEvent` records:
+To copy just its contents, use `srcs_in`:
 
 ```python
-client = syq.Client(process_cwd="/srv/jobs")
-
-preview = client.cp(
-    srcs_in="build",
-    to="server",
-    into_existing="/srv/app",
-    prune=True,
-    max_delete=100,
-    dry_run=True,
-)
-
-removal = client.rm(
-    src_dir="old-output",
-    from_="server",
-    root="/srv",
-)
-print(removal.entries_removed, removal.selectors_missing)
+result = syq.cp(srcs_in="data", into="backup")
 ```
 
-Typed `rm` works for local and ordinary SSH endpoints. A command-restricted
-receiver rejects native removal because its signed grants currently authorize
-copy mutations only.
+Arguments follow the command-line names: replace hyphens with underscores,
+and add a trailing underscore for Python keywords, such as `from_` and `as_`.
+The [copy guide](https://greaber.github.io/syq/reference.html) explains placement,
+filtering, and verification options.
 
-Remote-copy controls use the same names with underscores, including `coordinate_at`,
-`rsh`, `pscope`, `syq_path`, `no_bootstrap`, `tcp_plain`, `no_tcp`, `tcp_ports`,
-`tcp_congestion`, and `peer_auth`. `detach` stays
-on raw `run()` because a detached command cannot return typed attached results.
-`pscope` is also available on typed `rm`. Direct remote-to-remote copies can
-lower the enrolled receiver's entry and byte ceilings with
-`receiver_max_entries=` and `receiver_max_bytes=`, and can request receipt
-detail with `receiver_receipt="sizes"` or `receiver_receipt="digests"`.
-Ignore rules retain native ordering when interleaved by using
-`ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`; `ignore_from=` remains the
-simple form when every file follows the inline patterns.
+## Copy over SSH
 
-`on_event` receives typed records as syq produces them without keeping a
-potentially enormous operation ledger in memory:
+Use `to` for an SSH destination and `from_` for an SSH source:
+
+```python
+syq.cp("data", to="user@server", into="/backup")
+syq.cp("report.csv", from_="user@server", cwd="/exports", into="downloads")
+```
+
+SSH hosts and paths are separate arguments. See
+[Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
+for copies with two remote endpoints. A typed remote-to-remote preview needs
+`coordinate_at="local"`; a live copy can also use an enrolled receiver.
+
+## Preview changes
+
+Pass `dry_run=True` to preview a copy or removal. The result has the same type
+as a live call, with counters describing the planned changes:
+
+```python
+preview = syq.cp("data", into="backup", dry_run=True)
+print(preview.files_transferred, preview.bytes_transferred)
+```
+
+Remove `dry_run=True` to apply the changes. syq checks the filesystem again
+when that call runs.
+
+## Mirror a directory
+
+Use `prune=True` to also remove destination entries absent from the source.
+Here, `staging` must already exist, and `max_delete` limits deletions:
+
+```python
+result = syq.cp(
+    srcs_in="build",
+    into_existing="staging",
+    prune=True,
+    max_delete=100,
+)
+```
+
+## Remove files
+
+```python
+result = syq.rm(src_dir="old-output", root="/srv/jobs")
+print(result.entries_removed, result.selectors_missing)
+```
+
+`root` confines removal to that directory. Add `from_="server"` to remove files
+over ordinary SSH. Command-restricted receivers do not support `rm`. See
+[Remove files](https://greaber.github.io/syq/remove.html) for selector behavior.
+
+## Handle failures
+
+A failed copy or removal raises `SyqOperationError` with its typed result:
+
+```python
+try:
+    result = syq.cp("data", into="backup")
+except syq.SyqOperationError as error:
+    print(error.result.status, error.result.errors)
+    print(error.stderr.decode(errors="replace"))
+```
+
+Use `check=False` to receive unsuccessful results without that exception.
+Invalid arguments, installation failures, and incomplete or invalid results
+still raise exceptions. Completed filesystem changes are not rolled back.
+
+## Watch events and save results
+
+`on_event` receives records as the operation runs. For example, show each copied
+entry or planned change:
 
 ```python
 def observe(event: syq.AutomationEvent) -> None:
     if isinstance(event, (syq.TraceEvent, syq.OperationResult)):
         print(event.action, event.dst)
-    elif isinstance(event, (syq.RemovalTrace, syq.RemovalResult)):
-        print(event.disposition, event.path)
 
 result = syq.cp("data", into="backup", on_event=observe)
 ```
 
-Pass a caller-owned binary file-like object as `results=` to retain the same
-validated NDJSON stream that produced the returned `CpResult` or `RmResult`:
+Events are not collected in the returned result. To save the validated NDJSON
+records, pass an open binary stream:
 
 ```python
 with open("run.ndjson", "wb") as records:
     result = syq.cp("data", into="backup", results=records)
 ```
 
-The object must report positive byte counts for non-empty writes. Nonblocking
-sinks that return `None` when full are rejected so an incomplete result stream
-cannot appear successful. The SDK flushes but never closes the object. Typed
-calls receive automation records through native `--results-fd`; stdout is not
-treated as machine output. Callers that need native `--results FILE` path
-behavior can use `run()`.
+## Rename while copying
 
-Asyncio applications use the same command names and result types. Native
-asyncio subprocesses keep the event loop responsive; async callbacks are
-awaited in stream order:
-
-```python
-import asyncio
-import syq
-
-client = syq.AsyncClient(process_cwd="/srv/jobs")
-events = asyncio.Queue()
-
-async def observe(event: syq.AutomationEvent) -> None:
-    await events.put(event)
-
-result = await client.cp(
-    "data",
-    to="server",
-    into="backup",
-    on_event=observe,
-)
-
-removed = await client.rm("old-data", from_="server", on_event=observe)
-```
-
-Mapping output is streaming and context-managed. Passing Python mapping
-entries to `cp` first materializes the complete iterable on disk, so a failed
-transform cannot launch a copy with only a valid prefix:
+Create a mapping, change its destination paths, then copy:
 
 ```python
 from dataclasses import replace
@@ -135,59 +132,69 @@ with syq.map(srcs_in="photos") as mapping:
     result = syq.cp(mapping=entries, cwd=mapping.cwd, into="published")
 ```
 
-The async mapping stream is lazy and uses an async context manager:
+This places the contents of `photos` under `published/archive`. Pass
+`mapping.cwd` through unchanged so the copy uses the mapping's source base.
+If the mapping required `follow_src=True`, use it on the copy too.
+The iterable must finish successfully before copying starts; a failed transform
+leaves the destination untouched. See
+[Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
+
+## Use asyncio
+
+Await operations on `AsyncClient`. Its arguments and results match `Client`:
 
 ```python
-async with client.map(srcs_in="photos") as mapping:
-    result = await client.cp(
-        mapping=mapping,
-        cwd=mapping.cwd,
-        into="published",
-    )
+import asyncio
+import syq
+
+async def main():
+    client = syq.AsyncClient()
+    result = await client.cp("data", into="backup")
+    print(result.files_transferred)
+
+asyncio.run(main())
 ```
 
-`mapping.cwd` is the absolute source-base spelling to pass to the consuming
-copy. It preserves component order such as `link/../selected` so the native
-walker encounters the link before `..`, and it expands `~/` with the mapping
-subprocess's `HOME`. Do not normalize or resolve it between `map` and `cp`.
-
-The source tree may contain typed support ahead of the latest released syq
-pin. During that development interval, use `Client(executable=...)` or
-`AsyncClient(executable=...)` with the candidate binary; the next SDK release
-updates the immutable pin only after candidate conformance tests pass.
-
-The managed executable is stored below
-`$XDG_CACHE_HOME/syq/sdk/python/v0.4.0/` or, when `XDG_CACHE_HOME` is not an
-absolute path, `~/.cache/syq/sdk/python/v0.4.0/`. The SDK checks the complete
-cached binary against its embedded release manifest before every use. A corrupt
-or missing cache entry is replaced atomically with a freshly downloaded,
-verified binary.
-
-`run()` raises `SyqProcessError` for a nonzero process status by default. The
-exception retains the complete result, including stdout and stderr as bytes.
-Pass `check=False` when the caller wants to interpret the status directly.
-When `timeout` expires or the caller is interrupted, the SDK kills and reaps
-syq's local process group, including child processes such as SSH transports,
-before propagating the exception.
-
-## Custom executable override
-
-An explicit executable bypasses the managed version:
+Async event callbacks are awaited in record order. Mapping streams use
+`async with` and `async for`; there is no `await` before `client.map()`:
 
 ```python
-result = syq.run(["--help"], executable="/opt/custom/bin/syq")
-custom_version = syq.version(executable="syq")  # intentional PATH lookup
+async def copy_photos():
+    client = syq.AsyncClient()
+    async with client.map(srcs_in="photos") as mapping:
+        return await client.cp(mapping=mapping, cwd=mapping.cwd, into="published")
 ```
 
-The SDK makes no compatibility or provenance guarantee for an override. Use it
-for local development, controlled offline provisioning, or when deliberately
-testing a different syq release.
+<a id="custom-executable-override"></a>
 
-The package targets Python 3.10 or newer on Linux and macOS and has no runtime
-Python dependencies. See the [SDK compatibility policy](../README.md) for the
-release mapping.
+## Configure a client
 
-## Native API reference
+Share a local working directory and timeout across calls:
 
-See [Python native API](NATIVE_API.md) for command signatures, mappings,
-failure behavior, resource ownership, and the CLI/SDK synchronization policy.
+```python
+client = syq.Client(process_cwd="/srv/jobs", timeout=3600)
+result = client.cp("data", into="backup")
+```
+
+`process_cwd` sets the local subprocess directory; typed `cwd` sets the source
+base, which may be on a remote host.
+
+To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
+This bypasses the managed version; see
+[Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility).
+
+<a id="native-api-reference"></a>
+
+## Run other commands
+
+`run` accepts arguments after the executable name and returns captured bytes:
+
+```python
+result = syq.run(["--help"])
+print(result.stdout.decode())
+```
+
+Use it for commands without a typed method, including `rsync` and receiver
+administration. See the
+[API reference](https://greaber.github.io/syq/python-reference.html) for process
+options and exceptions.

@@ -285,6 +285,42 @@ ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_ro
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
 printf 'return\n' | cmp - "$receive_root/after-reconnect"
+printf 'case: return heartbeat timeout reconnects without toggling persistence\n'
+python3 - <<'PYTEST'
+import json
+import os
+import signal
+import subprocess
+import time
+
+state = json.loads(subprocess.check_output(["syq", "recv", "status", "--json"]))
+wrapper = next(s["connection"]["ssh_pid"] for s in state["connections"] if s["endpoint"] == "source")
+transport = int(subprocess.check_output(["pgrep", "-P", str(wrapper), "-x", "ssh"]))
+# Pause the real client so the server can open its forwarded socket but cannot
+# receive a heartbeat reply. This produces a server-side socket timeout, unlike
+# killing SSH, which usually gives the client a transport exit status of 255.
+os.kill(transport, signal.SIGSTOP)
+try:
+    deadline = time.monotonic() + 40
+    while True:
+        result = subprocess.run(["ssh", "source", "test ! -e ~/.syq-destinations-v2/laptop.json"], timeout=5)
+        if result.returncode == 0:
+            break
+        assert result.returncode == 1, result.returncode
+        assert time.monotonic() < deadline, "heartbeat deadline: old registration still advertised"
+        print("waiting for the paused return connection's heartbeat to time out", flush=True)
+        time.sleep(2)
+finally:
+    os.kill(transport, signal.SIGCONT)
+subprocess.run(["ssh", "source", "syq destination wait laptop --timeout 40"], check=True, timeout=45)
+subprocess.run(["syq", "recv", "wait", "source", "--timeout", "10"], check=True, timeout=15)
+with open("/tmp/syq-real-ssh-ssh.trace") as trace:
+    ends = [dict(field.split("=", 1) for field in line.strip().split("\t")) for line in trace if line.startswith("phase=end\t")]
+assert any(row["pid"] == str(wrapper) and row["status"] == "75" for row in ends), "heartbeat did not report retry status 75"
+print("return connection recovered after the server heartbeat timed out", flush=True)
+PYTEST
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-heartbeat-timeout'
+printf 'return\n' | cmp - "$receive_root/after-heartbeat-timeout"
 printf 'case: cwd permits destinations outside its starting directory\n'
 syq recv on --cwd "$receive_root"
 syq recv wait source --timeout 30
@@ -774,6 +810,12 @@ for benchmark_mode in push pull; do
         --mode "$benchmark_mode" --host destination --workload both --size quick \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
+# Automatic sizing uses the real terminal timing from each remote direction.
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small \
+        --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
+done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
 rmdir "$benchmark_parent"
@@ -786,7 +828,7 @@ cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
-    --workload large --rounds 1 --source-dir "$cancel_parent" \
+    --workload large --size quick --rounds 1 --source-dir "$cancel_parent" \
     --dest-dir /tmp/benchmark-cancel &
 benchmark_pid=$!
 attempt=0

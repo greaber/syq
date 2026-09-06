@@ -25,30 +25,59 @@ comparison without installing a benchmark package. After downloading the
 script, you can repeat the same choices explicitly:
 
 ```sh
-bash try-benchmark.sh --yes --mode push --host server --workload both --size medium --rounds 3
+bash try-benchmark.sh --yes --mode push --host server --workload both --rounds 3
 bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
 ```
 
+The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
+automatic sizing uses Perl with its core JSON::PP module. Terminal runs also
+use Perl to keep SSH prompts interruptible. Remote tests
+need SSH access and rsync on the other machine. Syq prepares a helper matching
+your local build and shows installation progress when one is needed.
+Use an SSH config alias for custom ports or IPv6. `--install` installs syq
+locally if missing; `--help` lists the choices.
+
 Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
 scratch parent, including when pulling; `--source-dir` is always the local
-scratch parent. Budget roughly twice the selected data size locally and one
-copy remotely. Sizes are quick (64 MiB and 8 MiB), medium (1 GiB and 32 MiB),
-and large (8 GiB and 128 MiB), for the large-file and small-file workloads.
+scratch parent.
+
+By default, the script starts with 64 MiB for the large file and 1,024 files
+of 8 KiB for the small-file workload. It makes verified, unscored syq copies
+and increases each workload until syq's copying interval reaches about five
+seconds. Each increase is between 25% and tenfold, avoiding repeated
+near-identical tests when timings fluctuate. Available space at both ends limits
+growth, with room reserved for the copies and filesystem overhead; if space
+prevents a long enough copy, the script warns and uses the tested size.
+There is no fixed total-data or runtime limit. A slow first copy can take longer
+than five seconds, and generation and verification also take time.
+
+All tools then copy the same dataset into empty destinations. Three rounds mean
+six scored copies per workload over SSH (syq and rsync), or nine locally (also
+cp). Choosing both workloads doubles those counts. A faster cp result does not
+cause further growth.
+
+Automatic sizing requires syq to report `copying_elapsed_ms` in its automation
+results. Older builds can use `--size quick`, `--size medium`, or `--size large`
+for fixed workloads: respectively 64 MiB / 1,024 files, 1 GiB / 4,096 files,
+and 8 GiB / 16,384 files. Small files remain 8 KiB each. These flags also let
+you repeat a fixed-size comparison.
 
 Data comes from a fixed AES-CTR byte stream, making it reproducible and
 hard to compress. Every trial has an empty, pre-created destination; interrupted trials are
 never resumed. On Ctrl-C the script stops its local workers, moves remote
 scratch out of the transfer path, and deletes its temporary data. If SSH
 is unavailable, it reports the remote path for later cleanup. The script rotates
-tool order and reports each elapsed time and the mean for each tool. It uses
+tool order and reports speeds in decimal MB/s (1 MB = 1,000,000 bytes):
+each trial’s copied bytes divided by its elapsed time, followed by the mean,
+minimum and maximum trial speeds. Higher is faster. It uses
 syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
 These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem
-optimizations. Syq prints its transfer statistics.
+optimizations.
 
-Generation, a single 14-byte syq setup copy, and POSIX `cksum` comparisons are
-outside the timer. The setup copy prepares the helper and exercises transfer
-setup; it is labeled separately and does not print a throughput result. A failed command or content check stops the comparison.
+Generation, preparation, calibration, and POSIX `cksum` comparisons are
+outside the scored timers. Preparation shows helper installation messages without
+a throughput result. A failed command or content check stops the comparison.
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;
@@ -75,7 +104,11 @@ syq cp -vv --stats data --to server --into /backup
 
 `-vv` shows helper selection, reachable addresses, the chosen transport, and
 initial parallelism. `--stats` shows totals, connection count, and TCP
-statistics where available. `SYQ_DEBUG=1` adds engineering timings for a
+statistics where available. It also reports the copying interval when bytes moved:
+the span from first file work to last completed file work across all workers.
+This includes per-file checks, finalization and gaps; it may overlap planning
+and connection setup. It is not pure network time or a separate phase you can
+add to setup time. `SYQ_DEBUG=1` adds engineering timings for a
 detailed investigation.
 
 | Symptom | Try |
