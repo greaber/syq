@@ -62,4 +62,64 @@ run("ssh", "source", "python3 -c " + shlex.quote(script))
 assert (root / "skew-argv").read_bytes() == b"raw handoff\x00\xff"
 assert not (root / "skew-mapping").exists()
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+
+print("case: piped and single-writer FIFO ignore rules survive handoff and protect pruning", flush=True)
+setup = r'''
+from pathlib import Path
+base = Path('/tmp/syq-real-ssh/handoff-source')
+source = base / 'ignore-source'
+source.mkdir()
+for name in ['keep.txt', 'drop.tmp', 'allow.tmp', 'skip.log', 'drop.cache', 'keep.cache']:
+    (source / name).write_bytes(b'new source contents')
+(base / 'extra-rules').write_bytes(b'*.cache\n')
+'''
+run("ssh", "source", "python3 -c " + shlex.quote(setup))
+run("syq", "persist", "receive", "on", "--max-delete", "1", "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+try:
+    for binary in ["syq", "syq-other-build"]:
+        for kind in ["stdin", "fifo"]:
+            target = "ignore-" + binary + "-" + kind
+            destination = root / target
+            destination.mkdir()
+            for name in ["orphan.tmp", "orphan.log", "orphan.cache", "drop.tmp", "stale.txt"]:
+                (destination / name).write_bytes(b'protected destination contents')
+            script = r'''
+import os, subprocess, sys
+base = '/tmp/syq-real-ssh/handoff-source'
+binary, kind, target = sys.argv[1:]
+patterns = b'\xef\xbb\xbf*.tmp\r\n'
+path = '/dev/stdin' if kind == 'stdin' else base + '/fifo-' + binary
+writer = None
+if kind == 'fifo':
+    os.mkfifo(path)
+    writer = subprocess.Popen([sys.executable, '-c',
+        'import sys; f = open(sys.argv[1], "wb"); f.write(bytes.fromhex(sys.argv[2])); f.close()',
+        path, patterns.hex()])
+try:
+    args = [binary, 'cp', '--srcs-in', base + '/ignore-source', '--ignore', '*.log',
+            '--ignore', '!drop.tmp', '--ignore-from', path, '--ignore', '!allow.tmp',
+            '--ignore-from', base + '/extra-rules', '--ignore', '!keep.cache',
+            '--to', 'laptop' if kind == 'stdin' else '@laptop', '--into', target,
+            '--prune', '--max-delete', '1']
+    result = subprocess.run(args, input=patterns if kind == 'stdin' else None,
+                            capture_output=True, timeout=15)
+    assert result.returncode == 0, result
+    if writer:
+        assert writer.wait(timeout=3) == 0
+finally:
+    if writer and writer.poll() is None:
+        writer.kill()
+        writer.wait(timeout=3)
+'''
+            run("ssh", "source", shlex.join(["python3", "-c", script, binary, kind, target]))
+            for name in ["keep.txt", "allow.tmp", "keep.cache"]:
+                assert (destination / name).read_bytes() == b'new source contents', (target, name)
+            for name in ["orphan.tmp", "orphan.log", "orphan.cache", "drop.tmp"]:
+                assert (destination / name).read_bytes() == b'protected destination contents', (target, name)
+            for name in ["skip.log", "drop.cache", "stale.txt"]:
+                assert not (destination / name).exists(), (target, name)
+finally:
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 print("Return build handoff passed", flush=True)

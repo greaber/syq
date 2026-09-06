@@ -188,3 +188,72 @@ sys.exit(23)
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(output.stdout, input);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn handoff_does_not_read_ignore_sources_in_the_invoking_build() {
+    let fixture = Fixture::new();
+    let helper = fixture.script(
+        r#"
+import json, pathlib, sys
+assert sys.argv[1] == '--return-handoff-v1', sys.argv
+assert json.loads(sys.argv[2])['name'] == 'laptop'
+assert pathlib.Path('results').read_bytes() == b'untouched'
+sys.stdout.buffer.write(sys.stdin.buffer.read())
+sys.exit(23)
+"#,
+    );
+    fixture.registration(&helper, "another-build");
+    fs::write(fixture.temp.path().join("results"), b"untouched").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "source",
+            "--ignore",
+            "!keep.tmp",
+            "--ignore-from",
+            "/dev/stdin",
+            "--ignore",
+            "!last.tmp",
+            "--to",
+            "@laptop",
+            "--results",
+            "results",
+        ])
+        .current_dir(fixture.temp.path())
+        .env("HOME", fixture.temp.path())
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = b"*.tmp\n";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert_eq!(output.stdout, input);
+}
+
+#[test]
+fn ignore_input_errors_keep_the_argument_error_lane_and_do_not_open_results() {
+    let fixture = Fixture::new();
+    fs::write(fixture.temp.path().join("results"), b"untouched").unwrap();
+    let output = fixture.run(&[
+        "cp",
+        "source",
+        "--ignore-from",
+        "missing-rules",
+        "--as",
+        "destination",
+        "--results",
+        "results",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--ignore-from"));
+    assert_eq!(
+        fs::read(fixture.temp.path().join("results")).unwrap(),
+        b"untouched"
+    );
+    assert!(!fixture.temp.path().join("destination").exists());
+}

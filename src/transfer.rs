@@ -1437,6 +1437,15 @@ pub fn run(mut args: Args) -> Result<i32> {
     // Re-exec before consuming stdin or opening results. A failed handoff still
     // settles the normal automation stream below.
     let handoff = crate::destination::handoff::copy(&mut args);
+    if handoff.is_ok() {
+        // Finish input validation in the executing build, before opening results.
+        // Preserve the argument-error exit status and absence of an automation
+        // stream when reading an input fails.
+        if let Err(error) = args.read_copy_inputs() {
+            crate::output::diagnostic!("syq: {error:#}");
+            return Ok(2);
+        }
+    }
     // Create results and progress before reporting any setup failure, so a
     // failure in this process settles with a terminal record (spec: automation
     // results). A successful exec hands that responsibility to the helper.

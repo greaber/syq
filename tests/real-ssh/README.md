@@ -145,3 +145,8 @@ The receiving connection still uses its own pinned helper. Raw path arguments,
 inherited result descriptors, output bytes, and exit status are checked across
 the handoff. Unsupported mapping copies still fail with a terminal result;
 the local handoff test separately checks that stdin is not consumed before exec.
+
+Ignore-source regressions compare copies from matching and different builds
+using piped rules and a named FIFO with a single writer. They check ordered
+patterns, reinclusion, and protection of ignored destination entries during
+pruning, plus piped filters with automatic and explicit remote authorization.

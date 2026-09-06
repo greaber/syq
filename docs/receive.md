@@ -197,9 +197,11 @@ invalidate an ordinary copy.
 The server command can be a different syq build from the receiving machine.
 It automatically hands the command to the matching helper already installed
 by the receiving machine's connection, including an explicit `--syq-path`.
-Arguments, working directory, stdin, and output streams are preserved. The
-helper then requests approval and runs the copy using the receiving machine's
-build. A missing or replaced helper produces an error; reconnect with syq from
+Arguments, working directory, stdin, and output streams are preserved.
+`--ignore-from` inputs are read once by the executing build after handoff,
+before requesting approval or opening result files. Inline patterns and input
+files keep their command-line order. The helper then requests approval and runs
+the copy using the receiving machine's build. A missing or replaced helper produces an error; reconnect with syq from
 the receiving machine to refresh it. An option unknown to that helper is
 rejected before approval.
 

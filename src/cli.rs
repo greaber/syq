@@ -326,9 +326,12 @@ pub struct Args {
     /// Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<OsString>,
-    /// All ignore patterns, in command-line order (filled by parse_args)
+    /// All ignore patterns, loaded before authorization or opening results.
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
+    /// Native copy inputs are read only after selecting the executing build.
+    #[arg(skip)]
+    pending_ignore_inputs: Vec<IgnoreInput>,
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
@@ -418,9 +421,8 @@ impl Args {
         self.native_follow || self.native_follow_dst
     }
 
-    /// Parse the command line and read ignore files, keeping command-line and
-    /// file patterns in the order they were given (later lines win, as in
-    /// a .gitignore file).
+    /// Parse the command line. Native copy defers reading ignore sources until
+    /// after return handoff, retaining their order among inline patterns.
     pub fn parse_args(argv: &[OsString]) -> Result<Args> {
         let Some(command) = argv.first().and_then(|arg| arg.to_str()) else {
             if argv.is_empty() {
@@ -476,6 +478,21 @@ impl Args {
         let args = Args::from_arg_matches(&matches)?;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
+    }
+
+    pub(crate) fn read_copy_inputs(&mut self) -> Result<()> {
+        if !self.pending_ignore_inputs.is_empty() {
+            self.ignore_lines = read_ignore_inputs(
+                std::mem::take(&mut self.pending_ignore_inputs),
+                if self.native_follow {
+                    OperatorSymlinkPolicy::FollowAll
+                } else {
+                    OperatorSymlinkPolicy::Refuse
+                },
+                "--ignore-from",
+            )?;
+        }
+        Ok(())
     }
 
     pub fn normalize(&mut self) {
@@ -567,6 +584,36 @@ fn reject_remote_to_remote(args: &Args) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+enum IgnoreInput {
+    Pattern(String),
+    File(OsString),
+}
+
+fn ordered_ignore_inputs(
+    ignore: &[String],
+    ignore_from: &[OsString],
+    matches: &clap::ArgMatches,
+) -> Vec<IgnoreInput> {
+    let mut items = Vec::new();
+    if let Some(indices) = matches.indices_of("ignore") {
+        items.extend(
+            indices
+                .zip(ignore)
+                .map(|(index, value)| (index, IgnoreInput::Pattern(value.clone()))),
+        );
+    }
+    if let Some(indices) = matches.indices_of("ignore_from") {
+        items.extend(
+            indices
+                .zip(ignore_from)
+                .map(|(index, value)| (index, IgnoreInput::File(value.clone()))),
+        );
+    }
+    items.sort_by_key(|(index, _)| *index);
+    items.into_iter().map(|(_, item)| item).collect()
+}
+
 fn ordered_ignore_lines(
     ignore: &[String],
     ignore_from: &[OsString],
@@ -574,32 +621,23 @@ fn ordered_ignore_lines(
     symlink_policy: OperatorSymlinkPolicy,
     ignore_from_name: &str,
 ) -> Result<Vec<String>> {
-    enum Item {
-        Pattern(String),
-        File(OsString),
-    }
-    let mut items: Vec<(usize, Item)> = Vec::new();
-    if let Some(indices) = matches.indices_of("ignore") {
-        items.extend(
-            indices
-                .zip(ignore)
-                .map(|(index, value)| (index, Item::Pattern(value.clone()))),
-        );
-    }
-    if let Some(indices) = matches.indices_of("ignore_from") {
-        items.extend(
-            indices
-                .zip(ignore_from)
-                .map(|(index, value)| (index, Item::File(value.clone()))),
-        );
-    }
-    items.sort_by_key(|(index, _)| *index);
+    read_ignore_inputs(
+        ordered_ignore_inputs(ignore, ignore_from, matches),
+        symlink_policy,
+        ignore_from_name,
+    )
+}
 
+fn read_ignore_inputs(
+    items: Vec<IgnoreInput>,
+    symlink_policy: OperatorSymlinkPolicy,
+    ignore_from_name: &str,
+) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    for (_, item) in items {
+    for item in items {
         match item {
-            Item::Pattern(value) => lines.push(value),
-            Item::File(value) => {
+            IgnoreInput::Pattern(value) => lines.push(value),
+            IgnoreInput::File(value) => {
                 use std::io::Read;
                 let shown = std::path::Path::new(&value).display();
                 let mut file =
@@ -1790,17 +1828,7 @@ fn apply_native_copy_operational(
     args.bwlimit = bwlimit;
     args.tuning_options = tuning_options;
     args.stats = stats;
-    args.ignore_lines = ordered_ignore_lines(
-        &ignore,
-        &ignore_from,
-        matches,
-        if args.native_follow {
-            OperatorSymlinkPolicy::FollowAll
-        } else {
-            OperatorSymlinkPolicy::Refuse
-        },
-        "--ignore-from",
-    )?;
+    args.pending_ignore_inputs = ordered_ignore_inputs(&ignore, &ignore_from, matches);
     args.ignore = ignore;
     args.ignore_from = ignore_from;
     args.inplace = inplace;
@@ -2452,7 +2480,8 @@ mod tests {
             "destination",
         ]
         .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv).unwrap();
+        let mut args = parse_native_copy(&argv).unwrap();
+        args.read_copy_inputs().unwrap();
         assert!(args.native_follow);
         assert_eq!(args.ignore_lines, ["*.tmp", "!keep.tmp"]);
         assert!(args.perms);

@@ -20,14 +20,18 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq"):
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None):
 
     argv = [binary, "cp", "-vv", source, "--to", "destination",
             *auth, "--as", path, "--connections", "2", *extra]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output, start_new_session=True)
+        process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output,
+                                   stdin=subprocess.PIPE if stdin is not None else None, start_new_session=True)
         try:
+            if stdin is not None:
+                process.stdin.write(stdin)
+                process.stdin.close()
             pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
             request = pending[0]
@@ -121,6 +125,15 @@ for auth in [(), ("--auth-from", "@laptop")]:
     name = "skew-explicit" if auth else "skew-auto"
     copy("/tmp/syq-real-ssh/forward/" + name, auth=auth, binary="syq-other-build")
     assert remote("sha256sum /tmp/syq-real-ssh/forward/" + name).split()[0] == expected
+
+print("case: automatic and explicit authorization preserve piped ignore rules across builds", flush=True)
+for auth in [(), ("--auth-from", "@laptop")]:
+    name = "filtered-explicit" if auth else "filtered-auto"
+    path = "/tmp/syq-real-ssh/forward/" + name
+    copy(path, auth=auth, binary="syq-other-build", source="/tmp/syq-real-ssh/return-source",
+         extra=("--ignore-from", "/dev/stdin"), stdin=b"*.bin\n")
+    assert remote("cat " + path + "/message.txt") == "return\n"
+    remote("test ! -e " + path + "/subdir/chunks.bin")
 
 print("case: a missing helper is installed once after its launcher reports the cache miss", flush=True)
 helpers = remote('find "$HOME/.cache/syq/helpers" -type f -name syq').splitlines()
