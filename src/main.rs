@@ -2,6 +2,7 @@ mod agent_broker;
 mod bwlimit;
 mod cli;
 mod completion;
+mod completion_details;
 mod conn;
 mod delegation;
 #[allow(dead_code)]

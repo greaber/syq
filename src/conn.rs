@@ -477,6 +477,7 @@ impl Conn for LocalConn {
                 &req,
                 Request::TcpListen { .. }
                     | Request::ListDir { .. }
+                    | Request::ListDirDetails { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }

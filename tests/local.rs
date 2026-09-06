@@ -14564,8 +14564,11 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     assert_output_ok(&zsh);
     let zsh = String::from_utf8(zsh.stdout).unwrap();
     assert!(!zsh.contains("compadd -Q"), "{zsh}");
-    assert!(zsh.contains("compadd --"), "{zsh}");
-    assert!(zsh.contains("compadd -S '' --"), "{zsh}");
+    assert!(zsh.contains("compadd -l -d descriptions --"), "{zsh}");
+    assert!(
+        zsh.contains("compadd -l -d prefix_descriptions -S '' --"),
+        "{zsh}"
+    );
 
     let registered = Command::new("bash")
         .arg("-c")
@@ -17166,4 +17169,61 @@ fn native_verify_only_remote_results_require_local_coordination() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
     assert!(stderr_of(&out).contains("--coordinate-at local"));
     assert!(!t.path("results").exists());
+}
+
+#[test]
+fn completion_details_keep_metadata_out_of_inserted_paths() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let t = Tmp::new();
+    fs::write(t.path("alpha file"), vec![0; 2048]).unwrap();
+    fs::set_permissions(t.path("alpha file"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::create_dir(t.path("alpine")).unwrap();
+    symlink("missing-target", t.path("alias")).unwrap();
+    let plain = completion_command(&t, &["__complete", "bash", "2", "--", "syq", "cp", "al"])
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&plain);
+    assert_eq!(
+        completion_values(&plain.stdout),
+        vec![
+            (b'f', b"alias".to_vec()),
+            (b'f', b"alpha file".to_vec()),
+            (b'p', b"alpine/".to_vec())
+        ]
+    );
+    let detailed = completion_command(&t, &["__complete", "zsh", "2", "--", "syq", "cp", "al"])
+        .env("SYQ_COMPLETION_DETAILS", "1")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&detailed);
+    let records: Vec<_> = detailed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+    assert_eq!(records.len(), 6);
+    assert_eq!(records[0], b"falias");
+    assert!(String::from_utf8_lossy(records[1]).ends_with("alias -> missing-target"));
+    assert_eq!(records[2], b"falpha file");
+    let file = String::from_utf8_lossy(records[3]);
+    assert!(file.starts_with("-rw-r----- "), "{file}");
+    assert!(file.contains("2.0 KiB"), "{file}");
+    assert!(file.contains(" UTC  alpha file"), "{file}");
+    assert_eq!(records[4], b"palpine/");
+    let directory = String::from_utf8_lossy(records[5]);
+    assert!(
+        directory.starts_with('d') && directory.contains('—'),
+        "{directory}"
+    );
+    let bash = completion_command(&t, &["__complete-bash", "al", "--", "syq cp al"])
+        .env("SYQ_COMPLETION_DETAILS", "1")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&bash);
+    assert!(completion_values(&bash.stdout)
+        .iter()
+        .all(|(kind, _)| *kind == b'd'));
 }

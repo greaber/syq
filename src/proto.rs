@@ -823,6 +823,14 @@ pub enum Request {
     /// existing files, repair metadata and publish changed content through
     /// the ordinary staged path. See `SmallCopyRequest`.
     CopySmallFiles(SmallCopyRequest),
+    /// On-demand completion metadata. Appended to preserve existing wire tags.
+    ListDirDetails {
+        directory: PathBytes,
+        confined_root: Option<PathBytes>,
+        prefix: PathBytes,
+        limit: u16,
+        symlink_policy: OperatorSymlinkPolicy,
+    },
 }
 
 /// Bounds for one-turn small pushes. The receiver enforces them independently
@@ -1009,6 +1017,12 @@ pub enum Response {
     /// untrusted text and must never select a recovery path.
     CopyLocalUnsupported,
     SmallFilesCopied(SmallCopyResponse),
+    /// Parallel entries and endpoint-formatted, terminal-safe metadata columns.
+    DetailedDirectoryEntries {
+        entries: Vec<CompletionEntry>,
+        details: Vec<String>,
+        truncated: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1573,5 +1587,27 @@ mod tests {
                 .unwrap(),
             Response::CopyLocalUnsupported
         ));
+    }
+}
+
+#[cfg(test)]
+mod completion_compat_tests {
+    use super::*;
+    #[test]
+    fn released_v032_completion_messages_keep_their_wire_encoding() {
+        // Generated with unchanged src/proto.rs from tag v0.3.2. Do not regenerate
+        // these when editing the current writer or reader.
+        let bytes = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
+        let request: Request = postcard::from_bytes(bytes).unwrap();
+        assert!(
+            matches!(&request, Request::ListDir { directory, prefix, limit: 1000, symlink_policy: OperatorSymlinkPolicy::Refuse, confined_root: None } if directory == b"/data" && prefix == b"al")
+        );
+        assert_eq!(postcard::to_stdvec(&request).unwrap(), bytes);
+        let bytes = include_bytes!("../tests/fixtures/completion/directory-entries-v0.3.2.bin");
+        let response: Response = postcard::from_bytes(bytes).unwrap();
+        assert!(
+            matches!(&response, Response::DirectoryEntries { entries, truncated: false } if entries.len() == 1 && entries[0].name == b"alpha" && !entries[0].directory)
+        );
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), bytes);
     }
 }

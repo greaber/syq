@@ -2787,6 +2787,7 @@ impl FsOps {
             Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
+            | Request::ListDirDetails { .. }
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
@@ -2813,6 +2814,7 @@ impl FsOps {
         prefix: &[u8],
         requested_limit: u16,
         symlink_policy: OperatorSymlinkPolicy,
+        detailed: bool,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
         if directory.contains(&0)
@@ -2825,9 +2827,17 @@ impl FsOps {
         check_completion_directory(directory, confined_root, symlink_policy)?;
         let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
         if limit == 0 {
-            return Ok(Response::DirectoryEntries {
-                entries: Vec::new(),
-                truncated: false,
+            return Ok(if detailed {
+                Response::DetailedDirectoryEntries {
+                    entries: Vec::new(),
+                    details: Vec::new(),
+                    truncated: false,
+                }
+            } else {
+                Response::DirectoryEntries {
+                    entries: Vec::new(),
+                    truncated: false,
+                }
             });
         }
         let mut entries = Vec::new();
@@ -2857,7 +2867,16 @@ impl FsOps {
             entries.push(CompletionEntry { name, directory });
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(Response::DirectoryEntries { entries, truncated })
+        if detailed {
+            let details = crate::completion_details::describe(&resolve(directory), &entries);
+            Ok(Response::DetailedDirectoryEntries {
+                entries,
+                details,
+                truncated,
+            })
+        } else {
+            Ok(Response::DirectoryEntries { entries, truncated })
+        }
     }
 
     /// Return the retained destination capability and a strict path beneath it
@@ -6003,6 +6022,21 @@ impl FsOps {
                 prefix,
                 *limit,
                 *symlink_policy,
+                false,
+            ),
+            Request::ListDirDetails {
+                directory,
+                confined_root,
+                prefix,
+                limit,
+                symlink_policy,
+            } => self.completion_entries(
+                directory,
+                confined_root.as_deref(),
+                prefix,
+                *limit,
+                *symlink_policy,
+                true,
             ),
             Request::StatMany {
                 paths,
@@ -10053,5 +10087,52 @@ mod tests {
             .unwrap();
         let created = file.metadata().unwrap().mode() & 0o777;
         assert_eq!(created, 0o777 & !process_umask());
+    }
+}
+
+#[cfg(test)]
+mod completion_details_tests {
+    use super::*;
+
+    #[test]
+    fn detailed_listing_is_bounded_and_obeys_directory_confinement() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("alpha"), b"hello").unwrap();
+        std::fs::write(root.join("alpine"), b"other").unwrap();
+        let request = |directory: &Path, limit| Request::ListDirDetails {
+            directory: directory.as_os_str().as_bytes().to_vec(),
+            confined_root: Some(root.as_os_str().as_bytes().to_vec()),
+            prefix: b"al".to_vec(),
+            limit,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        };
+        let response = FsOps::new().handle(&request(&root, 1));
+        let Response::DetailedDirectoryEntries {
+            entries,
+            details,
+            truncated,
+        } = response
+        else {
+            panic!("{response:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("5 B"));
+        assert!(truncated);
+        assert!(
+            matches!(FsOps::new().handle(&request(&root, 0)), Response::DetailedDirectoryEntries { entries, details, truncated: false } if entries.is_empty() && details.is_empty())
+        );
+        assert!(matches!(
+            FsOps::new().handle(&request(temporary.path(), 10)),
+            Response::Err(_) | Response::EndpointError(_)
+        ));
+        let link = temporary.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(matches!(
+            FsOps::new().handle(&request(&link, 10)),
+            Response::Err(_) | Response::EndpointError(_)
+        ));
     }
 }
