@@ -557,6 +557,7 @@ struct Session {
     authority: Arc<crate::restricted::RestrictedAuthority>,
     issued: Instant,
     opened: bool,
+    channels: Arc<crate::private_broker::ConnectionRegistry>,
 }
 struct Prompt {
     description: String,
@@ -669,12 +670,15 @@ impl Receiver {
                         authority,
                         issued: Instant::now(),
                         opened: false,
+                        channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
+                            Duration::from_secs(10),
+                        )),
                     },
                 );
                 write_message(&mut stream, &Reply::Approved(approved))
             }
             Message::Open { token, control } => {
-                let authority = {
+                let (authority, channels, _permit, _channel) = {
                     let mut sessions = self.sessions.lock().unwrap();
                     let session = sessions
                         .get_mut(&token)
@@ -687,21 +691,34 @@ impl Receiver {
                     } else if !session.opened {
                         bail!("transfer control channel has not opened");
                     }
-                    Arc::clone(&session.authority)
+                    let permit = if control {
+                        None
+                    } else {
+                        Some(crate::server::ConnectionPermit::acquire(Arc::clone(
+                            &session.authority,
+                        ))?)
+                    };
+                    let channel = session.channels.track(stream.try_clone()?)?;
+                    (
+                        Arc::clone(&session.authority),
+                        Arc::clone(&session.channels),
+                        permit,
+                        channel,
+                    )
                 };
                 let result = (|| {
                     write_message(&mut stream, &Reply::Ready)?;
                     let writer = stream.try_clone()?;
-                    // Active streams die when SSH detects disconnect or the
-                    // receiver stops. The executor enforces its fixed deadline.
-                    writer.set_read_timeout(None)?;
-                    writer.set_write_timeout(None)?;
+                    // Keep the bounded Hello deadline until the server has
+                    // validated its complete handshake. Pending workers already
+                    // consume their per-transfer connection allowance.
                     crate::server::run_named(stream, writer, Arc::clone(&authority), control)
                 })();
                 if control {
                     // Opening consumes the token even if the reply fails. Do
                     // not leave an opened session occupying a slot forever.
                     authority.close_control();
+                    channels.shutdown_all();
                     self.sessions.lock().unwrap().remove(&token);
                 }
                 result
@@ -908,6 +925,7 @@ fn receive(config: Receive) -> Result<i32> {
         // Pending approvals cannot turn into usable grants after a lost link.
         for (_, session) in receiver.sessions.lock().unwrap().drain() {
             session.authority.close_control();
+            session.channels.shutdown_all();
         }
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1382,6 +1400,147 @@ mod tests {
             Duration::from_secs(2)
         )
         .is_err());
+    }
+
+    fn worker_stream(registration: &Registration, approved: &Approved) -> UnixStream {
+        let (stream, reply) = exchange(
+            registration,
+            Message::Open {
+                token: approved.token.clone(),
+                control: false,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(matches!(reply, Reply::Ready));
+        let mut writer = crate::proto::FrameWriter::new(stream.try_clone().unwrap(), false);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().into(),
+                compress: false,
+                debug: false,
+                token: Vec::new(),
+                role: crate::proto::ConnectionRole::DestinationWorker {
+                    destination: None,
+                    copy_sources: Vec::new(),
+                },
+            })
+            .unwrap();
+        let mut reader = crate::proto::FrameReader::new(stream.try_clone().unwrap());
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::HelloOk { .. }
+        ));
+        stream
+    }
+
+    #[test]
+    fn named_control_closure_revokes_connected_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        fs::create_dir(&root).unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let mut args = args(Path::new("source"), ".");
+        args.compress = false;
+        let (request, _) = request(&args);
+        let approved = approve(&registration, request);
+        let conn = control(registration.clone(), &approved);
+        let mut worker = worker_stream(&registration, &approved);
+        let authority = receiver
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&approved.token)
+            .unwrap()
+            .authority
+            .clone();
+        drop(conn);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(receiver.sessions.lock().unwrap().is_empty());
+        worker
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            worker.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "connected worker was not closed"
+        );
+        let mut request = Request::Apply {
+            ops: vec![crate::proto::Op::Mkdir {
+                path: root.join("source").as_os_str().as_bytes().to_vec(),
+                mode: 0o755,
+                condition: crate::proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        assert!(authority
+            .authorize(&mut request, false)
+            .unwrap_err()
+            .to_string()
+            .contains("control is closed"));
+        assert!(!root.join("source").exists());
+    }
+
+    #[test]
+    fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        fs::create_dir(&root).unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let mut args = args(Path::new("source"), ".");
+        args.compress = false;
+        let (request, _) = request(&args);
+        let approved = approve(&registration, request);
+        let _control = control(registration.clone(), &approved);
+        receiver
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&approved.token)
+            .unwrap()
+            .channels = Arc::new(crate::private_broker::ConnectionRegistry::new(
+            Duration::from_millis(200),
+        ));
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let (stream, reply) = exchange(
+                &registration,
+                Message::Open {
+                    token: approved.token.clone(),
+                    control: false,
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert!(matches!(reply, Reply::Ready));
+            pending.push(stream);
+        }
+        assert!(exchange(
+            &registration,
+            Message::Open {
+                token: approved.token.clone(),
+                control: false,
+            },
+            Duration::from_secs(2)
+        )
+        .is_err());
+        assert!(matches!(
+            exchange(&registration, Message::Ping, Duration::from_secs(1))
+                .unwrap()
+                .1,
+            Reply::Ready
+        ));
+        for mut stream in pending {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.read_to_end(&mut Vec::new()).unwrap();
+        }
+        // Expired handshakes release their worker allowance while control stays live.
+        let _worker = worker_stream(&registration, &approved);
     }
 
     #[test]

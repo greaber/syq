@@ -89,7 +89,37 @@ const MAX_LIVE_TCP_CONNECTIONS: u32 = 256;
 
 /// One authenticated worker's share of a signed grant's connection allowance,
 /// returned when the connection ends.
-struct ConnectionPermit(Arc<crate::restricted::RestrictedAuthority>);
+pub(crate) struct ConnectionPermit(Arc<crate::restricted::RestrictedAuthority>);
+
+impl ConnectionPermit {
+    pub(crate) fn acquire(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<Self> {
+        authority.acquire_connection()?;
+        Ok(Self(authority))
+    }
+}
+
+/// Absolute Hello deadline. Socket clones share the timeout; serve clears it
+/// only after validating Hello and sending HelloOk.
+struct NamedHandshakeReader {
+    inner: crate::private_broker::TrackedStream,
+    socket: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+impl Read for NamedHandshakeReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.socket.read_timeout()?.is_some() {
+            let remaining = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(ErrorKind::TimedOut, "named channel Hello timed out")
+                })?;
+            self.socket.set_read_timeout(Some(remaining))?;
+        }
+        self.inner.read(bytes)
+    }
+}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
@@ -148,8 +178,16 @@ pub(crate) fn run_named(
 ) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     let socket = w.try_clone()?;
+    let timeout = socket
+        .read_timeout()?
+        .context("named handshake requires a timeout")?;
+    let reader = NamedHandshakeReader {
+        inner: r,
+        socket: socket.try_clone()?,
+        deadline: std::time::Instant::now() + timeout,
+    };
     let result = serve(
-        r,
+        reader,
         w,
         control,
         None,
@@ -222,9 +260,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             // grant's worker allowance. The control connection arrives over
             // ssh and is not a worker.
             _permit = match (&authority, over_ssh) {
-                (Some(authority), false) => {
-                    authority.acquire_connection()?;
-                    Some(ConnectionPermit(authority.clone()))
+                (Some(authority), false) if named_socket.is_none() => {
+                    Some(ConnectionPermit::acquire(authority.clone())?)
                 }
                 _ => None,
             };
@@ -322,6 +359,11 @@ fn serve<R: Read + Send + 'static, W: Write>(
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
     })?;
+
+    if let Some(socket) = &named_socket {
+        socket.set_read_timeout(None)?;
+        socket.set_write_timeout(None)?;
+    }
 
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and

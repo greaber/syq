@@ -288,7 +288,7 @@ impl ConnectionRegistry {
         })
     }
 
-    fn shutdown_all(&self) {
+    pub(crate) fn shutdown_all(&self) {
         let streams = self
             .streams
             .lock()

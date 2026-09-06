@@ -694,6 +694,9 @@ impl RestrictedAuthority {
     }
 
     pub(crate) fn validate_hello(&self, compressed: bool) -> Result<()> {
+        if !self.control_is_open() {
+            bail!("transfer control is closed or expired");
+        }
         self.check_deadline()?;
         if compressed != self.copy.options.compressed_transport {
             bail!("transport compression does not match the signed grant");
@@ -706,12 +709,18 @@ impl RestrictedAuthority {
     }
 
     pub(crate) fn close_control(&self) {
+        // Serialize revocation with admission: already-admitted work may
+        // settle, but no new request can enter after this returns.
+        let _state = self.state.lock().unwrap();
         self.control_open.store(false, Ordering::Release);
     }
 
     pub(crate) fn acquire_connection(&self) -> Result<()> {
         self.check_deadline()?;
         let mut state = self.state.lock().unwrap();
+        if !self.control_is_open() {
+            bail!("transfer control is closed or expired");
+        }
         if state.live_connections >= self.copy.limits.max_connections {
             bail!("signed grant connection limit exceeded");
         }
@@ -1990,19 +1999,25 @@ impl RestrictedAuthority {
         // it is refused because the receipt has started. Authorization may
         // block afterwards (the file-data limiter, say) without letting the
         // receipt slip past it.
-        if tracked {
+        {
             let mut state = self.state.lock().unwrap();
-            if state.receipt_issued || state.receipt_closing {
+            if !self.control_is_open() {
+                bail!("transfer control is closed or expired");
+            }
+            if tracked && (state.receipt_issued || state.receipt_closing) {
                 bail!("the signed grant is closed: its receipt has been issued");
             }
-            if state
-                .receipt_stream
-                .as_ref()
-                .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
+            if tracked
+                && state
+                    .receipt_stream
+                    .as_ref()
+                    .is_some_and(crate::receipt::ReceiptStreamWriter::is_failed)
             {
                 bail!("the signed grant is closed because receipt recording failed");
             }
-            state.in_flight += 1;
+            if tracked {
+                state.in_flight += 1;
+            }
         }
         match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes, &mut touched) {
             Ok(()) => Ok(Settlement {
