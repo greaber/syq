@@ -95,8 +95,10 @@ total process memory or disk usage.
 The coordinator rejects stat, apply, and partial-path replies whose entry
 counts differ from their requests. It also checks each source data block's
 offset and length against the outstanding read before forwarding it to the
-destination. These checks expose malformed replies; they cannot establish
-that a source's file listing or contents are truthful.
+destination. An offset or length mismatch fails the copy and closes that
+worker's connections without reusing them for another file. These checks expose
+malformed replies; they cannot establish that a source's file listing or contents
+are truthful.
 
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The

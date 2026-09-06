@@ -2013,11 +2013,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     if let Some(benchmark) = &opts.benchmark {
                         benchmark.lock().unwrap().add(worker.benchmark);
                     }
-                    if collect_tcp_stats {
+                    let invalid_range = result
+                        .as_ref()
+                        .is_err_and(|error| error.is::<RangeReplyMismatch>());
+                    if collect_tcp_stats && !invalid_range {
                         let stats = worker.collect_transport_stats();
                         transport_stats.lock().unwrap().extend(stats);
                     }
-                    let dropped = result.is_err() && worker.transport_dead();
+                    let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
                         Ok(()) => {
                             gate.mark_absent(id);
@@ -3560,9 +3563,22 @@ fn stat_many(
     stat_many_registered(conn, paths, None, follow)
 }
 
+#[derive(Debug)]
+struct RangeReplyMismatch;
+
+impl std::fmt::Display for RangeReplyMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source range reply violates the protocol")
+    }
+}
+
+impl std::error::Error for RangeReplyMismatch {}
+
 fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usize) -> Result<()> {
     if off != expected_off || len as u64 != expected_len || off.checked_add(len as u64).is_none() {
-        bail!("source block range ({off}, {len}) does not match requested range ({expected_off}, {expected_len})");
+        return Err(anyhow::Error::new(RangeReplyMismatch).context(format!(
+            "source block range ({off}, {len}) does not match requested range ({expected_off}, {expected_len})"
+        )));
     }
     Ok(())
 }
@@ -7318,7 +7334,9 @@ impl Worker {
 
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
-        if r.is_err() && !self.transport_dead() {
+        if r.as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>() || !self.transport_dead())
+        {
             // Fatal local/protocol failures cannot be healed by reopening a
             // transport. Wake peers so the whole transfer unwinds.
             self.sched.abort();
@@ -7743,7 +7761,10 @@ impl Worker {
     }
 
     fn file_error(&mut self, idx: usize, e: anyhow::Error) -> Result<()> {
-        if self.src.is_dead() || self.dst.is_dead() {
+        // Range validation can leave pipelined source replies and destination
+        // acknowledgments unread. End this worker and abort the copy; neither
+        // connection may serve another job or enter transport recovery.
+        if e.is::<RangeReplyMismatch>() || self.transport_dead() {
             return Err(e);
         }
         if !self.sched.is_failed(idx) {
@@ -8538,6 +8559,200 @@ mod tests {
             assert!(validate_range_reply(4096, 1024, off, len).is_err());
         }
         assert!(validate_range_reply(u64::MAX, 1, u64::MAX, 1).is_err());
+    }
+
+    #[derive(Default)]
+    struct PipelineState {
+        requests: Vec<Request>,
+        replies: std::collections::VecDeque<Response>,
+        received: usize,
+    }
+
+    struct PipelineConn(Arc<Mutex<PipelineState>>);
+
+    impl Conn for PipelineConn {
+        fn send(&mut self, request: Request) -> Result<()> {
+            self.0.lock().unwrap().requests.push(request);
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Response> {
+            let mut state = self.0.lock().unwrap();
+            state.received += 1;
+            Ok(state.replies.pop_front().expect("unexpected receive"))
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
+        // Exercise both callers of transfer_range: initial file work and a
+        // queued range. Another file is ready when the malicious reply arrives.
+        for queued_range in [false, true] {
+            for wrong_length in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("source");
+                std::fs::write(&path, vec![0; 4096]).unwrap();
+                let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+                let sched = Arc::new(Sched::new(512, 8192));
+                let job = FileJob {
+                    src: b"first".to_vec(),
+                    source: RegisteredPath {
+                        root: serde_json::from_str("0").unwrap(),
+                        relative: b"first".to_vec(),
+                    },
+                    dst: b"first-dst".to_vec(),
+                    rel: "first".into(),
+                    entry,
+                    dst_entry: None,
+                    target_condition: TargetCondition::Any,
+                    container_guard: None,
+                    attempt: 0,
+                    done: Arc::new(AtomicU64::new(0)),
+                    inplace: false,
+                    rel_bytes: b"first".to_vec(),
+                    src_rel: None,
+                };
+                sched.push_file(job.clone());
+                let mut next = job;
+                next.src = b"second".to_vec();
+                next.dst = b"second-dst".to_vec();
+                sched.push_file(next);
+                sched.scan_done();
+                if queued_range {
+                    assert!(matches!(sched.next(), Item::File(0)));
+                    let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+                    sched.retry_range(&range, 0);
+                }
+                let src = Arc::new(Mutex::new(PipelineState::default()));
+                for i in 0..5 {
+                    let data = vec![0; if i == 1 && wrong_length { 511 } else { 512 }];
+                    src.lock().unwrap().replies.push_back(Response::Block {
+                        off: if i == 1 && !wrong_length {
+                            999
+                        } else {
+                            i * 512
+                        },
+                        hash: content_digest(&data),
+                        data,
+                    });
+                }
+                let dst = Arc::new(Mutex::new(PipelineState::default()));
+                if !queued_range {
+                    dst.lock()
+                        .unwrap()
+                        .replies
+                        .push_back(Response::PartialSize(None));
+                }
+                dst.lock().unwrap().replies.push_back(Response::Ok);
+                let opts = Arc::new(Opts {
+                    block: 512,
+                    tuning: crate::transfer_tuning::TransferTuning {
+                        copy_path: Some(crate::transfer_tuning::CopyPath::Ranges),
+                        pipeline_depth: Some(4),
+                        ..Default::default()
+                    },
+                    benchmark: None,
+                    flags: 0,
+                    recursive: true,
+                    links: false,
+                    perms: false,
+                    devices: false,
+                    checksum: false,
+                    verify_only: false,
+                    inplace: false,
+                    same_host: false,
+                    allow_sequential_nfs_fallback: false,
+                    dst_remote: true,
+                    restricted_receiver: false,
+                    dry_run: false,
+                    quiet: true,
+                    verbose: 0,
+                    umask: 0,
+                    copy_id: std::sync::OnceLock::from([0; 16]),
+                    ignore: Vec::new(),
+                    delete: false,
+                    delete_excluded: false,
+                    max_delete: None,
+                    update: false,
+                    ignore_existing: false,
+                    existing: false,
+                    insecure_links: false,
+                    operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+                    max_size: None,
+                    min_size: None,
+                });
+                let mut worker = Worker {
+                    id: 0,
+                    src: Box::new(PipelineConn(src.clone())),
+                    dst: Box::new(PipelineConn(dst.clone())),
+                    sched: sched.clone(),
+                    progress: Progress::new(false, false, None, false),
+                    opts,
+                    bwlimit: None,
+                    gate: Gate::new(1),
+                    t: [0.0; 4],
+                    fast: FastTiming::default(),
+                    benchmark: Default::default(),
+                    fast_batch_files: 1,
+                };
+                let error = worker.run().unwrap_err();
+                assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
+                assert!(sched.is_aborted());
+                assert!(
+                    !worker.transport_dead(),
+                    "protocol failure, not a lost socket"
+                );
+                let source = src.lock().unwrap();
+                assert_eq!(source.received, 2);
+                assert_eq!(source.replies.len(), 3);
+                assert_eq!(source.requests.len(), 5);
+                assert!(source.requests.iter().all(|request| matches!(
+                    request, Request::ReadRange { path, .. } if path == b"first"
+                )));
+                let destination = dst.lock().unwrap();
+                assert_eq!(destination.received, usize::from(!queued_range));
+                assert_eq!(
+                    destination.replies.len(),
+                    1,
+                    "write ack remains outstanding"
+                );
+                let writes: Vec<_> = destination
+                    .requests
+                    .iter()
+                    .filter(|request| matches!(request, Request::WriteRange { .. }))
+                    .collect();
+                assert_eq!(writes.len(), 1);
+                assert!(
+                    matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
+                );
+                assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
+            }
+        }
     }
 
     /// Enforce send-before-receive ordering while exercising the real local
