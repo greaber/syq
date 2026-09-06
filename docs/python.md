@@ -27,14 +27,3 @@ The typed API includes `syq.cp()`, `syq.rm()` and `syq.map()`. Call `syq.run([..
 for other commands. Asyncio programs use `await syq.AsyncClient().cp(...)`.
 Failures raise exceptions; typed calls also check the complete results stream
 rather than treating a truncated stream as success.
-
-## Guide and reference
-
-- [Python guide and examples](python-guide.md):
-  event callbacks, asyncio, mapping transformations, errors and custom binaries.
-- [Native API reference](python-reference.md):
-  signatures, option mappings and result types.
-- [SDK compatibility](sdk-compatibility.md):
-  package versions and their pinned executables.
-- [Rename and reorganize](mappings.md) and [Automation results](automation.md):
-  the underlying CLI interfaces.
