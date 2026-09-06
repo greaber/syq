@@ -198,7 +198,6 @@ format before starting or reusing a return service. After upgrading, run
 `syq recv on` to stop old receiving services, then connect to each server with
 the new syq build. Merely replacing the executable or inspecting status does
 not change a service that is already running. Older binaries reject the new
-preferences;
-use the newer binary to manage receiving, including `recv off`, before
+preferences; use the newer binary to manage receiving, including `recv off`, before
 switching versions. Pending requests and approval decisions exist only in the
 running service, never in preference files.
