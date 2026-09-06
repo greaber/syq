@@ -610,6 +610,20 @@ Timeouts cover subprocess execution. Managed installation and mapping-input
 materialization happen before the copy process starts and are not covered by
 its timeout. Async cancellation still stops mapping-input preparation.
 
+`syq exec` is also available through `run`; its command output and exit status
+are a process result:
+
+```python
+result = syq.run(
+    ["exec", "--on", "@mac", "--cwd", "work/project", "--", "cargo", "test"],
+    executable="/path/to/syq",
+)
+```
+
+For `exec`, pass `--cwd` in the argument list to select the receiving working
+directory. The SDK's `cwd=` parameter selects the local working directory of
+the requesting syq process.
+
 ### Result
 
 Frozen dataclass returned by `run()` and held in `SyqProcessError.result`:

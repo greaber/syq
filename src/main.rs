@@ -18,6 +18,7 @@ mod native_rm;
 mod output;
 mod persistence;
 mod private_broker;
+mod process_group;
 mod progress;
 mod proto;
 mod receipt;
@@ -203,6 +204,18 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
+        match destination::exec::run(&argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    error.exit();
+                }
+                crate::output::diagnostic!("syq exec: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("cat") {
         match janky_cat::run(&argv[2..]) {

@@ -25,6 +25,8 @@ To initiate a copy from a server to your laptop, use a [named receiving
 destination](receive.md), such as `syq cp results --to laptop`. `persist on`
 enables background receiving automatically. Bare names prefer live return
 connections; `@laptop` requires one and fails while offline.
+You can also [request a command on the receiving machine](exec.md), such as
+`syq exec --on @laptop --cwd work/project -- cargo test`, with local approval.
 
 ## See where files go
 

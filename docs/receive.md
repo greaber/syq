@@ -37,6 +37,9 @@ permission, and limits. Choose **Allow once** or **Deny**. Allowing a copy trust
 the server to supply its contents: syq cannot prove what you typed in the remote
 shell or that the files contain what you intended.
 
+You can also [run commands on the receiving machine](exec.md), with separate
+local approval, to build a project there or open a copied artifact.
+
 ## Approving copies
 
 On Linux, desktop prompts use `/usr/bin/notify-send` with action support
@@ -78,8 +81,9 @@ syq recv on --approve ask   # require approval again
 Automatic approval trusts every process running as those server accounts,
 including for overwrites. An approved copy can inspect destination entries
 needed for copying, write unwanted content, or consume disk space within its
-limits. The server receives neither your SSH agent nor an interface for running
-arbitrary laptop commands.
+limits. The server does not receive your SSH agent. [Command requests](exec.md) require
+a separate local decision for every execution, including when copies are
+automatically approved.
 
 To send files from that server to another SSH host using this machine's
 permission, use `syq cp results --to hostB`. Eligible copies discover a live

@@ -196,6 +196,7 @@ printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 
 python3 /usr/local/libexec/syq-test-forward-copy.py
+python3 /usr/local/libexec/syq-test-return-exec.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq recv on --approve always

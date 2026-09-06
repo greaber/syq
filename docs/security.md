@@ -142,3 +142,25 @@ key, or command-running interface. Host trust and SSH configuration are those
 of the approving machine. The destination account remains trusted, including
 its interpretation of relative paths. A compromised source can substitute
 content within the approved scope, just as with other return copies.
+
+## Approved commands on receiving machines
+
+[`syq exec`](exec.md) uses an existing return connection and always asks for a
+local decision before starting a program. Command approval is separate from
+copy approval, including when copies are automatically approved. The prompt
+shows the server account, argument list and working directory. A server
+account can request commands from any of its processes; syq cannot establish
+what a person typed in a remote shell.
+
+Approving execution grants the command your local user's authority. Copy root
+confinement, file protection and transfer limits do not restrict that program.
+Scripts and build files can change what it does. Commands receive the local
+service environment and closed stdin. They do not expose a general SSH agent
+forwarding interface, but an approved program can access credentials available
+to the local user.
+
+Disconnecting cancels the foreground process group; commands are never
+replayed automatically. Completed effects cannot be rolled back, and programs
+that create separate process sessions can outlive cancellation. See the
+[command reference](exec.md#output-completion-and-cancellation) for execution
+and interruption behavior.

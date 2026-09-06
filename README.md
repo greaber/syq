@@ -7,6 +7,7 @@ It is built for large files, large trees, and fast networks.
 - **Parallel copies and removal**, with automatic connection tuning.
 - **Resume interrupted copies** by rerunning the command.
 - **Direct server-to-server transfers** without forwarding your SSH agent.
+- **Approved commands on your receiving machine**, for local builds and opening artifacts.
 - **Gitignore-style filters**, programmable file placement, and JSON results.
 
 [Documentation](https://greaber.github.io/syq/) ·

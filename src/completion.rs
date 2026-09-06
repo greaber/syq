@@ -560,7 +560,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "recv" | "destination" => {
+        "completion" | "persist" | "receiver" | "recv" | "destination" | "exec" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -706,6 +706,7 @@ fn bash_replacement_candidates(
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
+        "exec",
         "rm",
         "map",
         "rsync",
@@ -732,6 +733,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
         "recv" => Some(crate::receive_service::command_for_help()),
+        "exec" => Some(crate::destination::exec::command_for_help()),
         "destination" => Some(crate::destination::destination_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         _ => crate::cli::command_for_completion(name),
@@ -1211,6 +1213,10 @@ fn value_completion(
     command_meta: &clap::Command,
 ) -> Option<ValueCompletion> {
     let known = match command {
+        "exec" => match option {
+            b"--on" => Some(ValueCompletion::ReturnName),
+            _ => None,
+        },
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),

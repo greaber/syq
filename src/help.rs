@@ -156,6 +156,7 @@ pub(crate) fn root() -> Command {
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
+        .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
@@ -233,6 +234,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     }
     let mut command = match topics.first().copied() {
         None => root(),
+        Some("exec") => crate::destination::exec::command_for_help(),
         Some("recv") => crate::receive_service::command_for_help(),
         Some("destination") => crate::destination::destination_help(),
         Some("persist") => crate::persistence::command_for_help(),

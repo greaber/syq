@@ -125,6 +125,23 @@ def tests():
                     pass
                 copy.wait()
         assert len(observed) == 5, observed
+        for choice in ["allow", "deny"]:
+            marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
+            command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
+            process = subprocess.Popen(["ssh", "source", command], start_new_session=True)
+            try:
+                assert (process.wait(timeout=20) == 0) == (choice == "allow")
+                assert marker.exists() == (choice == "allow")
+                _, title, body, _, _ = observed[-1]
+                assert title == "syq: incoming command", title
+                assert "literal arguments" in body and "local user" in body, body
+                assert "Run this command once?" in body and "Allow this copy" not in body, body
+                print(f"Command notification {choice}: passed", flush=True)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        assert len(observed) == 7, observed
     except BaseException:
         errors.append(traceback.format_exc())
     finally:
