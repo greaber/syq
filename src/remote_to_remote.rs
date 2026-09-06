@@ -1277,12 +1277,7 @@ fn run_remote(
 }
 
 fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
-    automatic
-        && matches!(
-            code,
-            Some(crate::remote_helper::HELPER_MISSING_EXIT)
-                | Some(crate::remote_helper::HELPER_NOT_EXECUTABLE_EXIT)
-        )
+    automatic && crate::remote_helper::needs_install(code)
 }
 
 #[cfg(test)]

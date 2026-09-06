@@ -129,8 +129,11 @@ self-updates is verified against a signed release manifest before use.
 That verification cannot protect a machine whose trusted account or programs
 have already been compromised.
 
-A server can also request a copy to another SSH host with `--via @name`.
-This always needs a local decision, even if automatic receiving is enabled.
+A server can also request a copy to another SSH host using a live receiving
+machine's SSH access. Eligible copies discover that machine automatically;
+`--auth-from @name` chooses it explicitly. This always needs a local decision,
+even if automatic receiving is enabled. Refusing the request ends the attempt;
+syq does not try another authorization source.
 Approval authorizes a connection using the receiving machine's SSH access and
 installation of a matching helper. The destination helper enforces one copy's
 paths, permissions and limits. The server gets a restricted control stream

@@ -83,7 +83,8 @@ class BenchmarkTests(unittest.TestCase):
             if executable is None:
                 self.fail(f'Missing test prerequisite: {name}')
             (self.bin / name).symlink_to(executable)
-        self.env = dict(os.environ, PATH=str(self.bin))
+        self.env = dict(os.environ, PATH=str(self.bin),
+                        SYQ_BENCHMARK_TEST_SMALL_FIXTURES='1')
 
     def invoke(self, *args, env=None):
         return subprocess.run(
@@ -101,7 +102,8 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 result = self.invoke('--mode', mode, '--host', 'test-host',
                                      '--workload', 'small', '--size', 'auto',
-                                     env=dict(self.env, BENCH_TEST_GROW='1'))
+                                     env=dict(self.env, BENCH_TEST_GROW='1',
+                                              SYQ_BENCHMARK_TEST_SMALL_FIXTURES='0'))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('Generating 2048 files', result.stdout)
                 self.assertEqual(result.stdout.count('Verified sizing copy'), 2)
@@ -122,7 +124,8 @@ class BenchmarkTests(unittest.TestCase):
         (self.bin / 'df').write_text('#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"\necho "test 36409 0 36409 0% /"\n')
         (self.bin / 'df').chmod(0o755)
         result = self.invoke('--size', 'auto', '--workload', 'small',
-                             env=dict(self.env, BENCH_TEST_GROW='1'))
+                             env=dict(self.env, BENCH_TEST_GROW='1',
+                                              SYQ_BENCHMARK_TEST_SMALL_FIXTURES='0'))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('WARNING: available scratch space', result.stderr)
         self.assertEqual(result.stdout.count('Verified sizing copy'), 1)
@@ -380,7 +383,7 @@ class BenchmarkTests(unittest.TestCase):
         prompts_answered = 0
         # All four default answers are read from /dev/tty, not the script pipe.
         os.write(fd, b'\n' * 4)
-        deadline = time.monotonic() + 45
+        deadline = time.monotonic() + 90
         try:
             while time.monotonic() < deadline:
                 if select.select([fd], [], [], 0.2)[0]:

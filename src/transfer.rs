@@ -201,7 +201,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
-                forwarded: args.via.as_ref().and(args.named_receipt.clone()),
+                forwarded: args
+                    .named_receipt
+                    .clone()
+                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_))),
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
@@ -1390,7 +1393,7 @@ fn handle_tcp_setup_error(
         progress.stop();
         return Err(error).with_context(|| {
             let reason = if spec.forwarded.is_some() {
-                "--via requires direct encrypted TCP data connections"
+                "return authorization requires direct encrypted TCP data connections"
             } else {
                 "a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required"
             };
