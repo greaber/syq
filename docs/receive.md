@@ -30,12 +30,56 @@ syq cp results --to laptop
 syq cp report.pdf --to laptop --as reports/latest.pdf
 ```
 
-Receiving is enabled by default with persistence, and copies are accepted
-**automatically**, including overwrites. This trusts every process running as
-the server account you connect to. There is no notification or approval prompt.
-A compromised server can send unwanted content, inspect destination entries
-needed for copying, or fill the disk through repeated transfers. It receives
-neither your SSH agent nor an interface for running arbitrary laptop commands.
+Receiving is enabled by default with persistence. Each incoming copy waits for
+approval **on your laptop** before it can inspect or change destination entries.
+The prompt identifies the connected server account, destination, overwrite
+permission, and limits. Choose **Allow once** or **Deny**. Allowing a copy trusts
+the server to supply its contents: syq cannot prove what you typed in the remote
+shell or that the files contain what you intended.
+
+## Approving copies
+
+On Linux, desktop prompts use `/usr/bin/notify-send` with action support
+(libnotify 0.7.10 or later) and your desktop notification service. On macOS,
+syq opens a native dialog through `/usr/bin/osascript`; Deny is the default
+button. The background connection inherits the desktop session in which you
+start it. After changing desktop sessions, run `syq recv on` from a terminal
+in the current session to restart it.
+
+You can also decide from any local terminal:
+
+```sh
+syq recv pending
+syq recv pending --wait --timeout 30 --json
+syq recv approve REQUEST_ID
+syq recv deny REQUEST_ID
+```
+
+Use the complete ID printed by `pending`. Each ID works once for that request.
+Requests expire after five minutes. Disconnecting the sender, losing the return
+connection, changing receiving settings, or stopping receiving cancels pending
+requests. An approval cannot carry over to a reconnected or retried copy.
+One request may await approval per server connection; other senders must retry.
+
+If a desktop prompt is unavailable or dismissed without a decision, the copy
+stays pending for a local command until it expires. `recv pending` shows prompt
+errors. A missing notification service never grants permission. To use only
+terminal approval, set `syq recv on --notify off`; `--notify desktop` restores
+prompts.
+
+For unattended copies from trusted server accounts, explicitly enable automatic
+approval:
+
+```sh
+syq recv on --approve always
+syq recv on --approve ask   # require approval again
+```
+
+Automatic approval trusts every process running as those server accounts,
+including for overwrites. An approved copy can inspect destination entries
+needed for copying, write unwanted content, or consume disk space within its
+limits. The server receives neither your SSH agent nor an interface for running
+arbitrary laptop commands.
 
 ## Names and paths
 
@@ -143,3 +187,14 @@ preferences, under `$XDG_CONFIG_HOME/syq` or `~/.config/syq`. Runtime services
 belong to their persistence scope. Transient server advertisements live in the
 private directory `~/.syq-destinations-v2`. These files do not change restricted
 receiver enrollments or signed-grant replay records.
+
+Receiving settings from the earlier automatic-only format keep their name,
+directory, and limits when upgraded, but require approval. Syq saves the new
+format before starting or reusing a return service. After upgrading, run
+`syq recv on` to stop old receiving services, then connect to each server with
+the new syq build. Merely replacing the executable or inspecting status does
+not change a service that is already running. Older binaries reject the new
+preferences;
+use the newer binary to manage receiving, including `recv off`, before
+switching versions. Pending requests and approval decisions exist only in the
+running service, never in preference files.

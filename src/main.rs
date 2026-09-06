@@ -21,6 +21,7 @@ mod private_broker;
 mod progress;
 mod proto;
 mod receipt;
+mod receive_approval;
 mod receive_service;
 mod remote_helper;
 mod remote_to_remote;

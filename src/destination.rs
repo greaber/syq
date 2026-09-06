@@ -19,7 +19,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -501,7 +501,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         },
     };
     let request = crate::restricted::named_request(args, policy.clone())?;
-    crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds)");
+    crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq recv pending)");
     let (_, reply) = exchange(
         &registration,
         Message::Request(Box::new(request)),
@@ -610,6 +610,11 @@ struct Prompt {
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
+    requester: String,
+    approval_mode: crate::receive_approval::Mode,
+    notifications: crate::receive_approval::Notifications,
+    approvals: Arc<crate::receive_approval::Queue>,
+    generation: AtomicU64,
     cwd: PathBuf,
     root: Option<PathBuf>,
     secret: String,
@@ -626,10 +631,13 @@ struct Receiver {
 }
 
 impl Receiver {
-    /// Current local policy accepts requests from the connected server account.
-    /// A later approval UI belongs here, after scope validation and before a
-    /// usable token is issued. A connection itself never bypasses this decision.
-    fn authorize_request(&self, _request: &CopyRequest) -> Result<()> {
+    /// Decide locally after scope validation and before issuing a usable token.
+    fn authorize_request(
+        &self,
+        request: &CopyRequest,
+        socket: &UnixStream,
+        generation: u64,
+    ) -> Result<()> {
         #[cfg(test)]
         if matches!(self.approval, Approval::Ask) {
             let (decision, reply) = mpsc::sync_channel(1);
@@ -641,13 +649,24 @@ impl Receiver {
                 bail!("transfer denied");
             }
         }
-        if self.stop.load(Ordering::Acquire) {
-            bail!("receiving stopped");
+        let cancelled = || {
+            self.stop.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+                || requester_closed(socket)
+        };
+        if cancelled() {
+            bail!("receiving stopped or request disconnected");
+        }
+        if self.approval_mode == crate::receive_approval::Mode::Ask {
+            self.approvals
+                .request(&self.requester, request, self.notifications, cancelled)?;
         }
         Ok(())
     }
     fn revoke_all(&self) {
-        for (_, session) in self.sessions.lock().unwrap().drain() {
+        let mut sessions = self.sessions.lock().unwrap();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        for (_, session) in sessions.drain() {
             session.authority.close_control();
             session.channels.shutdown_all();
         }
@@ -691,12 +710,27 @@ impl Receiver {
                         bail!("too many active transfers; wait for one to finish");
                     }
                 }
+                let generation = self.generation.load(Ordering::Acquire);
                 // Validate the complete operation before the local policy decision.
-                let (authority, mut approved) =
+                let (authority, approved) =
                     crate::restricted::named_authority(&container, request.clone())?;
-                self.authorize_request(&request)?;
+                self.authorize_request(&request, &stream.try_clone()?, generation)?;
+                // Start the grant clock at approval, including after a long prompt.
+                let (authority, mut approved) =
+                    if self.approval_mode == crate::receive_approval::Mode::Ask {
+                        crate::restricted::named_authority(&container, request)?
+                    } else {
+                        (authority, approved)
+                    };
+                let mut sessions = self.sessions.lock().unwrap();
+                if self.stop.load(Ordering::Acquire)
+                    || self.generation.load(Ordering::Acquire) != generation
+                    || requester_closed(&stream.try_clone()?)
+                {
+                    bail!("copy disconnected before approval could be used");
+                }
                 approved.token = random_token()?;
-                self.sessions.lock().unwrap().insert(
+                sessions.insert(
                     approved.token.clone(),
                     Session {
                         authority,
@@ -707,6 +741,7 @@ impl Receiver {
                         )),
                     },
                 );
+                drop(sessions);
                 write_message(&mut stream, &Reply::Approved(approved))
             }
             Message::Open { token, control } => {
@@ -761,6 +796,25 @@ impl Receiver {
     }
 }
 
+fn requester_closed(socket: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    let result = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    // No more bytes are valid on a completed copy request. Treat trailing
+    // data as cancellation too, so it cannot hide a subsequent EOF.
+    result >= 0
+        || !matches!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        )
+}
+
 struct OwnedSsh(Child);
 impl Drop for OwnedSsh {
     fn drop(&mut self) {
@@ -810,10 +864,16 @@ pub(crate) fn serve_background(
     spec: crate::receive_service::ServiceSpec,
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<crate::receive_service::ConnectionState>>,
+    approvals: Arc<crate::receive_approval::Queue>,
 ) -> Result<()> {
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
+        requester: spec.endpoint.label(),
+        approval_mode: config.approval,
+        notifications: config.notifications,
+        approvals,
+        generation: AtomicU64::new(0),
         cwd: config.cwd.clone(),
         root: config.root.clone(),
         secret: random_token()?,
@@ -1197,6 +1257,11 @@ mod tests {
     ) {
         let (prompts, requests) = mpsc::sync_channel(1);
         let receiver = Arc::new(Receiver {
+            requester: "test-server".into(),
+            approval_mode: crate::receive_approval::Mode::Always,
+            notifications: crate::receive_approval::Notifications::Off,
+            approvals: Arc::new(crate::receive_approval::Queue::default()),
+            generation: AtomicU64::new(0),
             cwd: root.into(),
             root: Some(root.into()),
             secret: random_token().unwrap(),
@@ -1263,6 +1328,19 @@ mod tests {
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, approved.token.clone()));
         spec.connect_with(false, false).unwrap()
+    }
+
+    #[test]
+    fn pending_request_disconnect_and_trailing_data_are_detected_without_blocking() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        assert!(!requester_closed(&socket));
+        peer.write_all(b"unexpected data").unwrap();
+        assert!(requester_closed(&socket));
+        drop(peer);
+        assert!(requester_closed(&socket));
+        let (socket, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert!(requester_closed(&socket));
     }
 
     #[test]
@@ -1527,8 +1605,8 @@ mod tests {
         let (request, _) = request(&args(Path::new("source"), "."));
         let approved = approve(&registration, request);
         let mut stream = UnixStream::connect(&registration.socket).unwrap();
-        // Refuse the opening reply before sending the request, forcing its
-        // write to fail instead of reaching the normal control cleanup.
+        // Refuse the reply and abandon the stream. SHUT_RD alone causes a
+        // failed peer write on Linux, but may still accept that write on macOS.
         stream.shutdown(std::net::Shutdown::Read).unwrap();
         write_message(
             &mut stream,
@@ -1543,6 +1621,7 @@ mod tests {
             },
         )
         .unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !receiver.sessions.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1555,7 +1634,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("receiving");
         fs::create_dir(&root).unwrap();
-        let source = temp.path().join("source");
+        let source = fs::canonicalize(temp.path()).unwrap().join("source");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("hello"), b"hello laptop").unwrap();
         fs::write(source.join("large"), vec![42; 5_000_000]).unwrap();

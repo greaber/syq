@@ -25,7 +25,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage reusable SSH connections and helper sessions",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving accepts copies automatically from connected server accounts by default; configure or disable it with syq recv. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq recv. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]

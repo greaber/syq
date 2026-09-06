@@ -61,7 +61,13 @@ keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
 copies from independent source shells without a forwarded agent, destination
 background startup through persistence, `--root` traversal refusal, unconfined
 `--cwd` paths, conflicting names, reconnection after killing the owned SSH
-transport, and stopping receiving with persistence.
+transport, and stopping receiving with persistence. Approval cases cover local
+allow/deny, one-use IDs, disconnect and settings cancellation, and explicit
+automatic approval. An isolated D-Bus notification service exercises the real
+Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
+service failure;
+only Allow starts a copy. This does not exercise a particular desktop's visual
+layout or the macOS dialog.
 
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new

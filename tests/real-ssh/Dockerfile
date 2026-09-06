@@ -17,6 +17,8 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         diffutils \
+        dbus \
+        libnotify-bin \
         fish \
         iptables \
         iproute2 \
@@ -25,7 +27,8 @@ RUN apt-get update \
         openssh-server \
         procps \
         python3 \
-
+        python3-dbus \
+        python3-gi \
         zsh \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 syq \
@@ -41,5 +44,7 @@ COPY --chmod=0755 tests/real-ssh/scenarios.sh /usr/local/libexec/syq-real-ssh-sc
 COPY tests/real-ssh/sshd_config /etc/ssh/sshd_config
 
 COPY tests/real-ssh/test-completion-display.py /usr/local/libexec/syq-test-completion-display.py
+
+COPY tests/real-ssh/test-receive-notifications.py /usr/local/libexec/syq-test-receive-notifications.py
 
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]
