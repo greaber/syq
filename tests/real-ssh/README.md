@@ -126,3 +126,12 @@ debug binary, not performance measurements.
 
 A cancellation case waits for an active remote partial file, interrupts the
 benchmark, and checks that scratch is removed while an unrelated file remains.
+
+
+Return command scenarios exercise local Allow/Deny even under automatic copy
+approval, literal arguments, command working directories beyond the copy root,
+binary stdout/stderr larger than pipe buffers, exit codes and signals, missing
+programs, sender interruption, receiving shutdown, process-group cleanup, and
+execution after reconnect. The D-Bus fixture also verifies separate command
+notification titles and Allow/Deny behavior. macOS UI rendering is not tested
+by this Linux container suite.

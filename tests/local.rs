@@ -18267,3 +18267,56 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         assert!(!t.path("home/ssh-used").exists());
     }
 }
+
+#[test]
+fn return_exec_completion_and_offline_selection_never_contact_ssh() {
+    let t = Tmp::new();
+    write(&t.path("home/.syq-destinations-v2/laptop.json"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v2"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_completion_candidates(&t, &["syq", "ex"], &["exec"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "lap"], &["laptop"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "@lap"], &["@laptop"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--cw"], &["--cwd"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "laptop", "--", "--he"], &[]);
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["absent", "@absent", "user@host", "host:22"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["exec", "--on", name, "--", "true"])
+            .env("HOME", t.path("home"))
+            .env("PATH", t.path("bin"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!t.path("home/ssh-used").exists());
+    }
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "5",
+            "--",
+            "syq",
+            "exec",
+            "--on",
+            "laptop",
+            "--cwd",
+            "anything",
+        ],
+    )
+    .env("PATH", t.path("bin"))
+    .output()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    assert!(!t.path("home/ssh-used").exists());
+}

@@ -104,7 +104,11 @@ The typed interface covers native `cp`, including its `--prune` mode, `rm`,
 and `map`. It does not wrap `syq rsync`, which remains available through
 `Client.run` and the module-level `syq.run` function. Enrollment and other
 administrative commands also remain raw operations until they have a stable
-machine contract that benefits from Python types.
+machine contract that benefits from Python types. `syq exec` is available through
+those raw `run` methods: its stdout, stderr and exit status are a process result,
+not a copy automation stream. Pass `--cwd` in the argument list to select the
+receiving working directory; the SDK's `cwd=` parameter selects the local
+working directory of the requesting syq process.
 
 Module functions and client methods have the same operation names and
 signatures. A module function uses a default `Client`; applications that need

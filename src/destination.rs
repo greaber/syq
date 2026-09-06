@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
+pub(crate) mod exec;
 mod forward;
 
 const VERSION: u16 = 2;
@@ -119,6 +120,7 @@ struct Envelope {
 #[derive(Serialize, Deserialize)]
 enum Message {
     Ping,
+    Exec(exec::ExecRequest),
     Request(Box<CopyRequest>),
     Forward {
         target: String,
@@ -673,7 +675,8 @@ struct Receiver {
     #[cfg(test)]
     prompts: mpsc::SyncSender<Prompt>,
     sessions: Mutex<HashMap<String, Session>>,
-    forwarded: Arc<crate::private_broker::ConnectionRegistry>,
+    active_streams: Arc<crate::private_broker::ConnectionRegistry>,
+    exec_count: AtomicU64,
     forward_count: std::sync::atomic::AtomicUsize,
     request_lock: Mutex<()>,
     stop: Arc<AtomicBool>,
@@ -715,7 +718,7 @@ impl Receiver {
     fn revoke_all(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.forwarded.shutdown_all();
+        self.active_streams.shutdown_all();
         for (_, session) in sessions.drain() {
             session.authority.close_control();
             session.channels.shutdown_all();
@@ -732,6 +735,7 @@ impl Receiver {
             bail!("named destination authentication failed");
         }
         match envelope.message {
+            Message::Exec(request) => self.execute(request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
             Message::Forward { target, request } => self.forward(target, *request, stream),
             Message::Request(request) => {
@@ -936,9 +940,10 @@ pub(crate) fn serve_background(
         #[cfg(test)]
         prompts,
         sessions: Mutex::new(HashMap::new()),
-        forwarded: Arc::new(crate::private_broker::ConnectionRegistry::new(
+        active_streams: Arc::new(crate::private_broker::ConnectionRegistry::new(
             Duration::from_secs(10),
         )),
+        exec_count: AtomicU64::new(0),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
@@ -1326,9 +1331,10 @@ mod tests {
             approval,
             prompts,
             sessions: Mutex::new(HashMap::new()),
-            forwarded: Arc::new(crate::private_broker::ConnectionRegistry::new(
+            active_streams: Arc::new(crate::private_broker::ConnectionRegistry::new(
                 Duration::from_secs(10),
             )),
+            exec_count: AtomicU64::new(0),
             forward_count: std::sync::atomic::AtomicUsize::new(0),
             request_lock: Mutex::new(()),
             stop: Arc::new(AtomicBool::new(false)),
