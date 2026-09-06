@@ -67,6 +67,15 @@ fn initial_fast_workers(
     max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
+fn fast_file_size_limit(opts: &Opts) -> u64 {
+    opts.block
+        .min(opts.tuning.batch_bytes())
+        .min(
+            opts.tuning
+                .request_size(opts.block, None, opts.restricted_receiver),
+        )
+}
+
 pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
@@ -2321,7 +2330,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // the nearest existing ancestor open so normal copies can create that
     // parent without giving an attacker a pathname-resolution window.
     let allow_missing = dst_root_entry.is_none();
-    let mut directory_selection = if use_operator_anchor {
+    // For an existing remote container, the initial stat already gives the
+    // identity anchoring must enforce. These receiver-local operations can run
+    // in order without waiting for the client between them. Keep same-machine
+    // copies on the path that performs ancestry checks before anchoring.
+    let prepare_existing = use_operator_anchor
+        && dst.is_remote()
+        && !srcs[0].is_remote()
+        && dst_is_dir
+        && dst_entry_is_dir
+        && !args.verify_only
+        && !args.existing;
+    let mut prepared_anchor = None;
+    let mut prepared_filesystem = None;
+    let mut directory_selection = if prepare_existing {
+        let (selection, filesystem, anchor) = prepare_existing_destination(
+            &mut *dst_ctl,
+            &operator_directory,
+            opts.operator_symlink_policy,
+            dst_root_entry.as_ref().expect("existing destination"),
+            request_prefix.clone(),
+        )?;
+        prepared_anchor = Some(anchor);
+        prepared_filesystem = Some(filesystem);
+        selection
+    } else if use_operator_anchor {
         check_operator_directory(
             &mut *dst_ctl,
             &operator_directory,
@@ -2406,7 +2439,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && (dst_root_entry.is_none() || (dst_entry_is_dir && can_inspect_existing_destination))
     {
         let check_empty = dst_root_entry.is_some() && dst_entry_is_dir;
-        destination_filesystem_info(&mut *dst_ctl, check_empty, exact_capacity_target.clone())?
+        match prepared_filesystem {
+            Some(info) => info,
+            None => destination_filesystem_info(
+                &mut *dst_ctl,
+                check_empty,
+                exact_capacity_target.clone(),
+            )?,
+        }
     } else {
         None
     };
@@ -2587,8 +2627,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition)?);
         }
         if let Some(selection) = directory_selection.take() {
-            let anchor =
-                activate_control_destination(&mut *dst_ctl, selection, request_prefix.clone())?;
+            let anchor = match prepared_anchor.take() {
+                Some(anchor) => anchor,
+                None => {
+                    activate_control_destination(&mut *dst_ctl, selection, request_prefix.clone())?
+                }
+            };
             if create_root {
                 mutation_root_condition = TargetCondition::Matches {
                     dev: anchor.dev,
@@ -2883,6 +2927,56 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             scan_err = Some(e);
         }
     }
+    // The complete buffered scan lets small trees keep the same bounded
+    // starting count as normal scheduling. Open TCP workers while the control
+    // connection rechecks capacity and inspects the destination; no jobs are
+    // released until those preflights pass. A failed preflight aborts the idle
+    // workers through the same scheduler path as any other planning failure.
+    if scan_err.is_none()
+        && !st.collision
+        && !workers_started
+        && dst_ep.is_remote()
+        && !opts.same_host
+        && all_remote_endpoints_use_tcp
+        && destination_anchor.get().is_some()
+        && st
+            .fresh_capacity
+            .as_ref()
+            .is_some_and(|plan| plan.root_existed)
+        && !opts.dry_run
+        && !opts.verify_only
+        && !opts.inplace
+        && !opts.checksum
+        && !opts.update
+        && !opts.ignore_existing
+        && !opts.tuning.force_ranges()
+        && bwlimit.is_none()
+    {
+        let mut files = 0;
+        let mut bytes = 0u64;
+        let mut all_small = true;
+        for planned in st.buffer.iter().flatten().flat_map(|mapped| &mapped.others) {
+            let entry = &planned.e;
+            if entry.kind == Kind::File
+                && opts.max_size.is_none_or(|max| entry.size <= max)
+                && opts.min_size.is_none_or(|min| entry.size >= min)
+            {
+                files += 1;
+                bytes = bytes.saturating_add(entry.size);
+                all_small &= entry.size <= fast_file_size_limit(&opts);
+            }
+        }
+        if files > 0 && all_small {
+            spawn_workers(initial_fast_workers(
+                args.connections,
+                files,
+                bytes,
+                opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
+                opts.tuning.batch_bytes(),
+            ));
+            workers_started = true;
+        }
+    }
     if scan_err.is_none() && !st.collision {
         match st.assess_fresh_capacity() {
             Ok(assessment) => {
@@ -2948,14 +3042,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().all(|job| {
-                                job.entry.size
-                                    <= opts.block.min(opts.tuning.batch_bytes()).min(
-                                        opts.tuning.request_size(
-                                            opts.block,
-                                            None,
-                                            opts.restricted_receiver,
-                                        ),
-                                    )
+                                job.entry.size <= fast_file_size_limit(&opts)
                                     && job.dst_entry.is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any
@@ -3721,6 +3808,62 @@ fn activate_control_destination(
         }),
         other => bail!("unexpected response {other:?}"),
     }
+}
+
+/// Pipeline the existing v0.3.2 requests: selection and capacity inspection
+/// are read-only, and anchoring registers a descriptor without changing files.
+/// The receiver checks the observed inode before issuing the worker ticket.
+fn prepare_existing_destination(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+    expected: &Entry,
+    request_prefix: PathBytes,
+) -> Result<(
+    Option<DirectoryAnchor>,
+    Option<DestinationFilesystemInfo>,
+    DestinationAnchor,
+)> {
+    conn.send(Request::CheckOperatorDirectory {
+        path: path.to_vec(),
+        allow_missing: false,
+        symlink_policy,
+    })?;
+    conn.send(Request::DestinationFilesystemInfo {
+        check_empty: true,
+        target: None,
+    })?;
+    conn.send(Request::AnchorDestination {
+        expected_dev: expected.dev,
+        expected_ino: expected.ino,
+        request_prefix: request_prefix.clone(),
+    })?;
+    // Drain all replies even when a receiver check fails: pooled control
+    // sessions must never keep an unread response from a preceding copy.
+    let selection = conn.recv();
+    let filesystem = conn.recv();
+    let anchor = conn.recv();
+    let selection = match ok(selection?, "operator path")? {
+        Response::DirectorySelection(selection) => selection,
+        other => bail!("unexpected response {other:?}"),
+    };
+    let filesystem = match filesystem? {
+        Response::DestinationFilesystemInfo(info) => Some(info),
+        Response::EndpointError(_) | Response::Err(_) => None,
+        other => bail!("unexpected response {other:?}"),
+    };
+    let anchor = match ok(anchor?, "anchor destination root")? {
+        Response::DestinationRegistered(ticket) => DestinationAnchor {
+            destination: RegisteredDestinationRoot {
+                ticket,
+                request_prefix,
+            },
+            dev: expected.dev,
+            ino: expected.ino,
+        },
+        other => bail!("unexpected response {other:?}"),
+    };
+    Ok((selection, filesystem, anchor))
 }
 
 fn parent_path(path: &[u8]) -> PathBytes {
@@ -8302,6 +8445,232 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Enforce send-before-receive ordering while exercising the real local
+    /// receiver. Inject response failures to check that every reply is drained.
+    struct SetupConn {
+        inner: Box<dyn Conn>,
+        sent: usize,
+        received: usize,
+        fail_at: Option<usize>,
+        requests: Vec<Request>,
+    }
+
+    impl Conn for SetupConn {
+        fn send(&mut self, request: Request) -> Result<()> {
+            self.sent += 1;
+            self.requests.push(request.clone());
+            self.inner.send(request)
+        }
+        fn recv(&mut self) -> Result<Response> {
+            assert_eq!(self.sent, 3, "setup waited before sending every request");
+            let response = self.inner.recv()?;
+            let index = self.received;
+            self.received += 1;
+            if self.fail_at == Some(index) {
+                Ok(Response::Err("injected setup error".into()))
+            } else {
+                Ok(response)
+            }
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn existing_destination_setup_pipelines_and_drains_failures() {
+        for fail_at in [None, Some(0), Some(1), Some(2)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().as_os_str().as_bytes();
+            let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
+            let mut conn = SetupConn {
+                inner: Endpoint::local().connect_control(false).unwrap(),
+                sent: 0,
+                received: 0,
+                fail_at,
+                requests: Vec::new(),
+            };
+            let result = prepare_existing_destination(
+                &mut conn,
+                path,
+                OperatorSymlinkPolicy::FollowAll,
+                &entry,
+                path.to_vec(),
+            );
+            // Unavailable filesystem counters are advisory, as before.
+            assert_eq!(result.is_ok(), fail_at.is_none() || fail_at == Some(1));
+            assert_eq!(conn.received, 3);
+            if let Ok((selection, filesystem, anchor)) = result {
+                assert_eq!(selection.unwrap().ino, entry.ino);
+                assert_eq!(anchor.ino, entry.ino);
+                assert_eq!(filesystem.is_none(), fail_at == Some(1));
+            }
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            assert!(matches!(
+                conn.inner
+                    .call(Request::DestinationFilesystemInfo {
+                        check_empty: true,
+                        target: None,
+                    })
+                    .unwrap(),
+                Response::DestinationFilesystemInfo(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn existing_destination_setup_rejects_replaced_inode_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let entry = crate::fsops::lstat_entry(Vec::new(), &destination).unwrap();
+        std::fs::rename(&destination, directory.path().join("original")).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let path = destination.as_os_str().as_bytes();
+        let mut conn = SetupConn {
+            inner: Endpoint::local().connect_control(false).unwrap(),
+            sent: 0,
+            received: 0,
+            fail_at: None,
+            requests: Vec::new(),
+        };
+        let result = prepare_existing_destination(
+            &mut conn,
+            path,
+            OperatorSymlinkPolicy::FollowAll,
+            &entry,
+            path.to_vec(),
+        );
+        assert!(result.is_err());
+        assert_eq!(conn.received, 3);
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("original"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "set SYQ_V032_BINARY to the verified official v0.3.2 executable"]
+    fn existing_destination_setup_replays_on_v032_receiver() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // This probe deliberately speaks the released client's identity. Real
+        // clients retain exact build pinning; it is not a mixed-build bypass.
+        let binary = std::env::var_os("SYQ_V032_BINARY").expect("SYQ_V032_BINARY");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().as_os_str().as_bytes();
+        let entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
+        let mut conn = SetupConn {
+            inner: Endpoint::local().connect_control(false).unwrap(),
+            sent: 0,
+            received: 0,
+            fail_at: None,
+            requests: Vec::new(),
+        };
+        prepare_existing_destination(
+            &mut conn,
+            path,
+            OperatorSymlinkPolicy::FollowAll,
+            &entry,
+            path.to_vec(),
+        )
+        .unwrap();
+        struct Receiver(std::process::Child);
+        impl Drop for Receiver {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut receiver = Receiver(
+            Command::new(binary)
+                .arg("--server")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = receiver.0.stdin.take().unwrap();
+        let mut output = receiver.0.stdout.take().unwrap();
+        let identity = b"v0.3.2";
+        input.write_all(b"SYQWIRE\0").unwrap();
+        input
+            .write_all(&(identity.len() as u16).to_be_bytes())
+            .unwrap();
+        input.write_all(identity).unwrap();
+        let mut writer = FrameWriter::with_preamble_written(input, false);
+        writer
+            .write_msg(&Request::Hello {
+                identity: "v0.3.2".into(),
+                compress: false,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::Control,
+            })
+            .unwrap();
+        let mut header = [0u8; 10];
+        output.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..8], b"SYQWIRE\0");
+        let mut peer_identity = vec![0; u16::from_be_bytes([header[8], header[9]]) as usize];
+        output.read_exact(&mut peer_identity).unwrap();
+        assert_eq!(peer_identity, identity);
+        fn response(output: &mut impl Read) -> Response {
+            let mut length = [0u8; 4];
+            output.read_exact(&mut length).unwrap();
+            let length = u32::from_le_bytes(length) as usize;
+            assert!((1..65536).contains(&length));
+            let mut bytes = vec![0; length];
+            output.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes[0], 0, "compression was disabled");
+            postcard::from_bytes(&bytes[1..]).unwrap()
+        }
+        assert!(matches!(response(&mut output), Response::HelloOk { .. }));
+        for request in &conn.requests {
+            writer.write_msg(request).unwrap();
+        }
+        assert!(matches!(
+            response(&mut output),
+            Response::DirectorySelection(Some(_))
+        ));
+        assert!(matches!(
+            response(&mut output),
+            Response::DestinationFilesystemInfo(_)
+        ));
+        assert!(matches!(
+            response(&mut output),
+            Response::DestinationRegistered(_)
+        ));
+        drop(writer);
+        assert!(receiver.0.wait().unwrap().success());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn fresh_capacity_keeps_a_sixty_four_inode_margin() {
