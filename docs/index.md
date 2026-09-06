@@ -4,8 +4,6 @@ Syq (pronounced "sick") copies and removes files in parallel, on one machine
 or over SSH. It can resume interrupted copies and transfer directly between
 servers without forwarding your SSH agent.
 
-[Discussions](https://github.com/greaber/syq/discussions)
-
 In published tests, syq copied a folder from Amsterdam to Tokyo
 [5.2× faster than rsync](https://greaber.github.io/syq-bench/#fly-cross-region-memory),
 and 20,000 small files to NFS
@@ -25,19 +23,6 @@ of `project` directly into `/backup`, use `--srcs-in`:
 ```sh
 syq cp --srcs-in project --to server --into /backup
 ```
-
-Directories are copied recursively; no recursion flag is needed. Native
-copies preserve modification times. To preserve permissions too, including
-executable permissions on scripts, add `--preserve=permissions`:
-
-```sh
-syq cp --preserve=permissions project --to server --into /backup
-```
-
-The final summary shows transferred and unchanged files and bytes, directories
-created, elapsed time, rate, and errors. Add `-v` for copied paths, `-vv` for
-helper and transport details, or `--stats` for more totals and connection
-statistics. See [understanding a copy result](reference.md).
 
 Use `--dry-run` to preview a summary without copying, or `--dry-run -v`
 to list the planned changes by path.

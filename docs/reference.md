@@ -5,31 +5,17 @@ syq cp project --into backup
 ```
 
 This copies `project` to `backup/project`. Existing files are updated when
-needed; unrelated files stay. Directories are copied recursively without a
-special option. Modification times are preserved; permissions are not
-preserved unless requested. For a project with executable scripts, use:
-
-```sh
-syq cp --preserve=permissions project --into backup
-```
-
-Without that option, new files use the source permissions limited by the
-destination umask, and existing files keep their destination permissions.
-`--preserve=permissions` copies the source permission bits in both cases. See
-[metadata preservation](#preserve-metadata) for ownership and special files.
+needed; unrelated files stay.
 
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.
-An unchanged file needed no content transfer; by default, matching size and
-modification time are enough to skip it. Progress appears while copying when
-stderr is a terminal.
 
 Add `-v` to list copied paths. `-vv` also explains helper selection and
 transport; `--stats` adds scan totals, excluded-file counts, connection count,
 and available TCP statistics. For example:
 
 ```sh
-syq cp -vv --stats --preserve=permissions project --into backup
+syq cp -vv --stats project --into backup
 ```
 
 See [diagnosing a slow copy](speed.md#diagnose-a-slow-copy) for interpreting
@@ -307,8 +293,14 @@ through your machine, including when you need comparison results in JSON.
 
 ## Preserve metadata
 
-Copy keeps modification times and copies symlinks as symlinks. Add other
-metadata when needed:
+Copy keeps modification times and copies symlinks as symlinks. New files use
+the source read, write, and execute permissions limited by the destination
+umask; existing files keep their destination permissions. For example, a new
+script with mode `755` stays executable with umask `022`. Source setuid,
+setgid, and sticky bits are not copied by default.
+
+To copy source permissions exactly, including onto existing files, or request
+ownership too:
 
 ```sh
 syq cp --preserve=permissions,ownership project --into backup
