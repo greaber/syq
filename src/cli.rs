@@ -68,7 +68,7 @@ pub struct Args {
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
-    pub(crate) via: Option<String>,
+    pub(crate) auth_from: AuthFrom,
     /// Which public command produced this execution request.
     #[arg(skip)]
     pub interface: Interface,
@@ -857,9 +857,37 @@ struct NativeRemoteHelperArgs {
     no_bootstrap: bool,
 }
 
+/// A process-local choice of authority; no credentials or durable preferences.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AuthFrom {
+    #[default]
+    Auto,
+    Ssh,
+    Return(String),
+}
+
+impl AuthFrom {
+    fn receiving(value: &str) -> Result<Self> {
+        let name = value.strip_prefix('@').unwrap_or(value);
+        crate::destination::validate_name(name)?;
+        Ok(Self::Return(name.to_owned()))
+    }
+}
+
+fn parse_auth_from(value: &str) -> Result<AuthFrom> {
+    match value {
+        "auto" => Ok(AuthFrom::Auto),
+        "ssh" => Ok(AuthFrom::Ssh),
+        _ => AuthFrom::receiving(value),
+    }
+}
+
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Ask a receiving machine to authorize a copy to another SSH host; file data goes directly to that host
+    /// Authorize with a live receiving machine, or use SSH from this machine (default: auto)
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, conflicts_with = "via")]
+    auth_from: Option<AuthFrom>,
+    /// Alias for --auth-from @NAME; every bare value remains a receiving name
     #[arg(long, value_name = "@NAME")]
     via: Option<String>,
     /// Choose the endpoint that runs the coordinator
@@ -1798,7 +1826,10 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
             "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
         );
     }
-    args.via = remote.via;
+    args.auth_from = match remote.via {
+        Some(name) => AuthFrom::receiving(&name)?,
+        None => remote.auth_from.unwrap_or_default(),
+    };
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
     args.syq_path = remote.helper.syq_path;

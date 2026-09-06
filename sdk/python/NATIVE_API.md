@@ -1,9 +1,7 @@
 # Python native API
 
-Status: implemented for the upcoming syq release that ships the automation
-results stream. Until such a release exists, source-tree users must select the candidate
-binary explicitly; the next Python SDK release updates its managed pin after
-conformance tests pass.
+The Python package pins a matching syq executable. To use a custom development
+build, pass executable= explicitly; see the [Python guide](https://greaber.github.io/syq/python-guide.html).
 
 This document describes the Python interface to syq's native filesystem
 commands.
@@ -57,7 +55,9 @@ learn a second set of names for concepts that syq already names.
 | `--into-existing` | `into_existing=` |
 | `--no-compress` | `no_compress=` |
 | `--max-delete` | `max_delete=` |
-| `--via @laptop` | `via="@laptop"` |
+| `--auth-from @laptop` | `auth_from="@laptop"` |
+| `--auth-from ssh` | `auth_from="ssh"` |
+| `--via @laptop` (alias) | `via="@laptop"` (alias) |
 | `--from` | `from_=` |
 | `--as` | `as_=` |
 | `class` event field | `class_` attribute |
@@ -575,8 +575,8 @@ receiver-attested `FinalStateEvent`, and the terminal `CpResult` or `RmResult`.
 Additive unknown record types are validated for a well-formed envelope and
 sequence position, then ignored.
 
-The product's [automation results contract](../../docs/automation.md) and
-[JSON Schema](../../schemas/automation.schema.json), not this document, own
+The product's [automation results contract](https://greaber.github.io/syq/automation.html) and
+[JSON Schema](https://github.com/greaber/syq/blob/master/schemas/automation.schema.json), not this document, own
 their exact fields and enum members. The Python types expose every stable
 schema field without parsing display text.
 

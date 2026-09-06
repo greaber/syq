@@ -2827,7 +2827,7 @@ impl Endpoint {
                             if spec.restricted_grant.is_some() {
                                 return Err(e).with_context(|| {
                                     let reason = if spec.forwarded.is_some() {
-                                        "TCP data connection failed; --via requires direct encrypted TCP and cannot fall back to SSH data"
+                                        "TCP data connection failed; return authorization requires direct encrypted TCP and cannot fall back to SSH data"
                                     } else {
                                         "signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback"
                                     };
@@ -2863,7 +2863,7 @@ impl Endpoint {
                     && !crate::destination::is_named(&spec.restricted_grant)
                 {
                     let reason = if spec.forwarded.is_some() {
-                        "--via has no authorized encrypted TCP data connection"
+                        "return authorization has no authorized encrypted TCP data connection"
                     } else {
                         "signed receiver has no authorized TCP data connection"
                     };

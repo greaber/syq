@@ -9,11 +9,11 @@ copy, remain available through raw `run`. The executable remains authoritative
 for argument semantics, filesystem behavior, exit status, and safety checks.
 
 The Python-native surface is documented in
-[`python/NATIVE_API.md`](python/NATIVE_API.md).
+[`python/NATIVE_API.md`](https://greaber.github.io/syq/python-reference.html).
 
 | Ecosystem | Package/module | Source |
 |---|---|---|
-| Python | `syq` | [`python/`](python/) |
+| Python | `syq` | [`python/`](https://github.com/greaber/syq/tree/master/sdk/python) |
 
 Every SDK release pins one exact, tested syq release. The default client does
 not search `PATH` or adopt a separately installed syq. On first use it downloads
@@ -40,5 +40,5 @@ to untested executable drift.
 
 The Python package implements this model.
 
-See [`RELEASING.md`](RELEASING.md) for the one-time registry setup and exact
+See [`RELEASING.md`](https://github.com/greaber/syq/blob/master/sdk/RELEASING.md) for the one-time registry setup and exact
 tag conventions.

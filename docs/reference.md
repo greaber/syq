@@ -93,8 +93,12 @@ Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
 For two remote endpoints, see [Copy between servers](remote-to-remote.md).
-From a server shell, `syq cp results --to hostB --via @laptop` can ask a live
-receiving machine to authorize the copy while data flows directly to hostB.
+From a server shell, `syq cp results --to hostB` automatically looks for a live
+receiving machine that can authorize the copy while data flows directly to
+hostB. Use `--auth-from @laptop` to select one, or `--auth-from ssh` to use
+SSH from this machine. See [authorization selection](remote-to-remote.md#start-a-copy-from-the-source-server)
+for ordering, supported options, and approval behavior. `--via @laptop` remains
+an alias for the explicit receiving-machine selection.
 
 ## Progress
 

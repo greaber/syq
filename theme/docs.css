@@ -1,4 +1,5 @@
 /* mdBook adapter; the shared palette, fonts and site header live in brand.css. */
+html {scroll-behavior:smooth}
 :root {
   --sidebar-target-width: 300px;
   --content-max-width: 820px;
@@ -48,13 +49,7 @@ h1,h2,h3,h4,h5,h6 {font-family:var(--display);font-weight:700;letter-spacing:-.0
 .content table {font-family:var(--display);font-size:16px;line-height:1.6}
 .content th,.content td {padding:10px 14px}
 .content blockquote {margin-inline:0;padding:12px 20px;border-left:2px solid var(--syq)}
-/* Preserve mdBook's compact sidebar rather than restyling it as benchmark navigation. */
-.sidebar {top:var(--site-header-height);font:14px var(--display)}
-.sidebar .sidebar-scrollbox {padding:10px}
-.chapter {font:14px/2.2em var(--display);margin:1em 0;padding:0}
-.chapter li a {display:block}
-.chapter li a strong {font-weight:700}
-.chapter-link-wrapper>a {flex:1;min-width:0}
+.sidebar {top:var(--site-header-height)}
 .copy-demo {padding:22px;border-radius:2px}
 .copy-demo legend {font-family:var(--display)}
 .copy-demo-choices {font:500 17px/1.4 var(--display)}
@@ -128,3 +123,41 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
   .docs-compact-header .site-nav {font-size:14px;gap:8px}
 }
 @media print {.docs-page-actions{display:none}}
+
+/* Readable, theme-aware walkthroughs; no JavaScript or text baked into images. */
+.benchmark-example,.transfer-flow{margin:28px 0;font:16px/1.5 var(--display)}
+.benchmark-example-grid{display:grid;grid-template-columns:1fr 1.45fr;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.benchmark-example section{padding:22px;min-width:0}
+.benchmark-example section+section{background:var(--bg);border-left:1px solid var(--line)}
+.visual-step{display:flex;align-items:center;gap:12px;color:var(--syq);font:600 20px var(--mono)}
+.visual-step span{color:var(--ink);font:600 16px var(--display)}
+.benchmark-choices{display:grid;grid-template-columns:1fr auto;gap:12px;margin:24px 0}
+.benchmark-choices dt{color:var(--muted)}
+.benchmark-choices dd{margin:0;font-family:var(--mono);color:var(--syq)}
+.content .visual-note{font-size:14px;color:var(--muted);line-height:1.6;margin:18px 0 0}
+.content .benchmark-example table{display:table;width:100%;margin-top:18px;font-size:14px}
+.benchmark-example caption{text-align:left;color:var(--muted);padding-bottom:8px}
+.content .benchmark-example th,.content .benchmark-example td{padding:8px 6px;background:transparent;border:0;border-bottom:1px solid var(--line)}
+.benchmark-example td{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.benchmark-example th{text-align:left;white-space:nowrap}
+.benchmark-example th:not(:first-child){text-align:right}
+.benchmark-example figcaption,.transfer-flow figcaption{margin-top:12px;color:var(--muted);font-size:14px}
+.transfer-flow{padding:24px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.flow-machine{display:flex;flex-direction:column;gap:4px;padding:12px 18px;background:var(--bg);border:1px solid var(--line);border-radius:6px;text-align:center}
+.flow-machine strong{font:600 16px var(--mono)}
+.flow-machine span{font-size:14px;color:var(--muted)}
+.transfer-flow>.flow-machine{width:max-content;margin:auto}
+.flow-control{text-align:center;color:var(--muted);height:36px;font-size:28px}
+.flow-data{display:grid;grid-template-columns:1fr 1fr 1fr;align-items:center;gap:12px}
+.flow-arrow{display:flex;flex-direction:column;align-items:center;color:var(--syq);font-size:14px}
+.flow-arrow b{font-size:44px;line-height:1;font-weight:400}
+@media(max-width:600px){
+  .benchmark-example-grid{grid-template-columns:1fr}
+  .benchmark-example section+section{border-left:0;border-top:1px solid var(--line)}
+  .benchmark-example section{padding:18px}
+  .transfer-flow{padding:16px 10px}.flow-data{gap:6px}.flow-machine{padding:12px 6px}
+}
+
+/* Align the homepage title's top spacing with the benchmark introduction. */
+.content h1.landing-title{margin-top:44px}
+@media(max-width:820px){.content h1.landing-title{margin-top:32px}}
