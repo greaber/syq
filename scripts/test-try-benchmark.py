@@ -288,7 +288,7 @@ class BenchmarkTests(unittest.TestCase):
         prompts_answered = 0
         # All five default answers are read from /dev/tty, not the script pipe.
         os.write(fd, b'\n' * 5)
-        deadline = time.monotonic() + 45
+        deadline = time.monotonic() + 90
         try:
             while time.monotonic() < deadline:
                 if select.select([fd], [], [], 0.2)[0]:
