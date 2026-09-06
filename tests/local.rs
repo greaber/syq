@@ -7249,6 +7249,97 @@ fn small_files_atomic_no_partials() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn buffered_remote_scan_overlaps_tcp_setup() {
+    for (case, existing, tcp, detached, reachable, require_tcp) in [
+        ("empty", true, true, false, true, true),
+        ("missing", false, true, false, true, true),
+        ("ssh", true, false, false, true, false),
+        ("detached", true, true, true, true, true),
+        ("fallback", true, true, false, false, false),
+        ("required-failure", true, true, false, false, true),
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
+        for i in 0..3 {
+            write(
+                &t.path(&format!("src/f{i}")),
+                format!("contents-{i}").as_bytes(),
+            );
+        }
+        if existing {
+            fs::create_dir_all(t.path("dst")).unwrap();
+        }
+        let events = t.path("setup-events");
+        let mut command = compat_command();
+        command
+            .arg("-e")
+            .arg(&rsh)
+            .arg("--rsync-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "--syq-tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "-a",
+                "--no-progress",
+            ])
+            .arg(t.s("src/"))
+            .arg(format!("setup.invalid:{}", t.s("dst/")))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "FAKE_SSH_CONNECTION",
+                if reachable {
+                    "127.0.0.1 40000 127.0.0.1 22"
+                } else {
+                    "192.0.2.1 40000 192.0.2.1 22"
+                },
+            )
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("SYQ_TEST_SETUP_EVENTS", &events);
+        if require_tcp {
+            command.env("SYQ_TEST_REQUIRE_TCP", "1");
+        }
+        if !tcp {
+            command.arg("--syq-no-tcp");
+        }
+        if detached {
+            command.env("SYQ_INTERNAL_DETACH_READY", t.path("ready"));
+        }
+        let output = command.run().unwrap();
+        if require_tcp && !reachable {
+            assert!(!output.status.success(), "{case}");
+            assert!(stderr_of(&output).contains("TCP data transport required by test"));
+            assert_eq!(fs::read_to_string(events).unwrap(), "scan_complete\n");
+            assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+            continue;
+        }
+        assert!(output.status.success(), "{case}: {}", stderr_of(&output));
+        assert_eq!(
+            fs::read_to_string(events).unwrap(),
+            if existing && tcp && !detached {
+                "scan_complete\ntransport_ready\n"
+            } else {
+                "transport_ready\nscan_complete\n"
+            },
+            "{case}"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                read(&t.path(&format!("dst/f{i}"))),
+                format!("contents-{i}").as_bytes()
+            );
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+        if detached {
+            assert_eq!(read(&t.path("ready")), b"ready\n");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn small_inplace_files_use_one_batched_worker() {
     let t = Tmp::new();
     for i in 0..3 {

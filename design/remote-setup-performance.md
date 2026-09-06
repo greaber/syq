@@ -23,6 +23,31 @@ preflights pass; planning failure aborts the idle workers. This overlap excludes
 same-machine copies, dry runs, verification, in-place copying, checksumming,
 update/ignore-existing, forced ranges, and bandwidth-limited copies.
 
+## Overlapping route probes with buffered planning
+
+For buffered planning into an existing destination, the coordinator settles
+pending TCP address probes after the source scan and sidecar namespace checks.
+Those checks use the control connection and do not mutate the destination.
+The complete probe window and bandwidth-based address selection are unchanged;
+only the point at which the coordinator joins the probe thread moves.
+Transport selection, the tuning cache lookup, and initial connection counts
+still settle before any worker starts or the buffered plan is replayed.
+Unreachable ordinary TCP routes still fall back to SSH.
+
+Initially missing destination trees retain their earlier worker startup during
+scanning. Unbuffered planning retains its previous setup order, since it can
+release work while scanning. Signed receivers settle TCP before destination
+creation because their one-time grants cannot be replayed for SSH fallback.
+Detached copies also retain their earlier setup order so readiness notification
+does not wait for a potentially long source scan. No extra scan or buffering
+is introduced to obtain the overlap.
+
+The regression test records coordinator setup events separately from helper
+stderr. It checks scan-before-transport ordering for an empty existing remote
+directory, the previous ordering for missing destinations, forced SSH and
+detached copies, successful fallback when advertised TCP is unreachable, and
+an empty destination when a required TCP probe fails after scanning.
+
 ## Compatibility
 
 No messages, state formats, resume identities, CLI options, or output fields
