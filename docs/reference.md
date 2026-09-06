@@ -9,9 +9,6 @@ needed; unrelated files stay.
 
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.
-An unchanged file needed no content transfer; by default, matching size and
-modification time are enough to skip it. Progress appears while copying when
-stderr is a terminal.
 
 Add `-v` to list copied paths. `-vv` also explains helper selection and
 transport; `--stats` adds scan totals, excluded-file counts, connection count,
@@ -255,7 +252,7 @@ with its exact name. Keep partials belonging to copies still running.
 ## Check file contents
 
 Syq normally skips files whose size and modification time match.
-`--hash` checks contents even when those two attributes match:
+`-H` / `--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
