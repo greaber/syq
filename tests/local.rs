@@ -4960,14 +4960,18 @@ fn bounded_persistent_ssh_tree_starts_one_worker_and_recovers_channel_refusal() 
         }
         let output = command.run().unwrap();
         assert_output_ok(&output);
-        let stderr = stderr_of(&output);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr_of(&output)
+        );
         assert!(
-            stderr.contains(if explicit {
+            report.contains(if explicit {
                 "connections: 3"
             } else {
                 "settled at 1"
             }),
-            "{stderr}"
+            "{report}"
         );
         for i in 0..300 {
             assert_eq!(
