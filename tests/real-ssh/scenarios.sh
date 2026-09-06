@@ -130,41 +130,41 @@ make_tree source /tmp/syq-real-ssh/return-source return
 syq persist on
 # The ordinary copy ends before receiving readiness: no foreground receiver.
 syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-return-pull
-syq recv wait source --timeout 30
+syq persist receive wait source --timeout 30
 # The container hostname is the laptop's default advertised name.
 # shellcheck disable=SC2029
-ssh source "syq destination wait $(hostname) --timeout 5"
-syq recv on --name laptop --root "$receive_root"
-syq recv wait source --timeout 30
-ssh source 'syq destination wait laptop --timeout 30'
+ssh source "syq persist destinations wait $(hostname) --timeout 5"
+syq persist receive on --name laptop --root "$receive_root"
+syq persist receive wait source --timeout 30
+ssh source 'syq persist destinations wait laptop --timeout 30'
 printf 'case: return copies await local approval and denial leaves no destination\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as denied' &
 return_copy_pid=$!
-syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; r=json.load(open("/tmp/syq-pending.json")); assert len(r)==1 and "source" in r[0]["from"] and "denied" in r[0]["destination"],r; print(r[0]["id"])')
 test ! -e "$receive_root/denied"
-syq recv deny "$request_id"
+syq persist receive deny "$request_id"
 if wait "$return_copy_pid"; then echo 'denied copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
 return_copy_pid=
 test ! -e "$receive_root/denied"
-if syq recv approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
+if syq persist receive approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
 
 printf 'case: approval allows only the pending copy once\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as approved' &
 return_copy_pid=$!
-syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
 test ! -e "$receive_root/approved"
-syq recv approve "$request_id"
+syq persist receive approve "$request_id"
 wait "$return_copy_pid"
 return_copy_pid=
 printf 'return\n' | cmp - "$receive_root/approved"
-if syq recv approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
+if syq persist receive approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
 
 printf 'case: disconnected requests cannot be approved later\n'
 ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as disconnected' &
 return_copy_pid=$!
-syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
 if wait "$return_copy_pid"; then echo 'unapproved copy succeeded' >&2; exit 1; fi
 return_copy_pid=
@@ -172,34 +172,36 @@ python3 - <<'PYWAIT'
 import json, subprocess, time
 deadline = time.monotonic() + 3
 while True:
-    pending = json.loads(subprocess.check_output(["syq", "recv", "pending", "--json"]))
+    pending = json.loads(subprocess.check_output(["syq", "persist", "receive", "pending", "--json"]))
     if not pending: break
     assert time.monotonic() < deadline, pending
     time.sleep(.05)
 PYWAIT
-if syq recv approve "$request_id"; then echo 'disconnected request was approved' >&2; exit 1; fi
+if syq persist receive approve "$request_id"; then echo 'disconnected request was approved' >&2; exit 1; fi
 test ! -e "$receive_root/disconnected"
 
 printf 'case: changing policy cancels a pending request\n'
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as cancelled-policy' &
 return_copy_pid=$!
-syq recv pending --wait --timeout 10 --json > /tmp/syq-pending.json
+syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
-syq recv on --notify off
+syq persist receive on --notify off
 if wait "$return_copy_pid"; then echo 'cancelled copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
 return_copy_pid=
-syq recv wait source --timeout 30
-if syq recv approve "$request_id"; then echo 'cancelled request was approved' >&2; exit 1; fi
+syq persist receive wait source --timeout 30
+if syq persist receive approve "$request_id"; then echo 'cancelled request was approved' >&2; exit 1; fi
 test ! -e "$receive_root/cancelled-policy"
 
 printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 
+python3 /usr/local/libexec/syq-test-return-handoff.py
 python3 /usr/local/libexec/syq-test-forward-copy.py
+python3 /usr/local/libexec/syq-test-return-exec.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
-syq recv on --approve always
-syq recv wait source --timeout 30
+syq persist receive on --approve always
+syq persist receive wait source --timeout 30
 ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
@@ -231,15 +233,15 @@ printf 'case: duplicate named return cannot displace the existing laptop\n'
     mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
     trap 'syq persist off' EXIT
     syq persist on
-    syq recv on --name laptop --root /tmp/syq-real-ssh-receive-other
+    syq persist receive on --name laptop --root /tmp/syq-real-ssh-receive-other
     syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-duplicate-pull
-    if syq recv wait source --timeout 5; then
+    if syq persist receive wait source --timeout 5; then
         echo 'duplicate named destination unexpectedly succeeded' >&2
         exit 1
     fi
-    syq recv status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
+    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
 )
-ssh source 'syq destination wait laptop --timeout 5'
+ssh source 'syq persist destinations wait laptop --timeout 5'
 
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
 ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
@@ -268,7 +270,7 @@ while :; do
 done
 # One complete 4 MiB prefix is now present and eligible for resume checks.
 # Only kill the receiver's owned SSH child; the tracing wrapper is its parent.
-receive_wrapper=$(syq recv status --json | python3 -c 'import json,sys; print(next(s["connection"]["ssh_pid"] for s in json.load(sys.stdin)["connections"] if s["endpoint"] == "source"))')
+receive_wrapper=$(syq persist receive status --json | python3 -c 'import json,sys; print(next(s["connection"]["ssh_pid"] for s in json.load(sys.stdin)["connections"] if s["endpoint"] == "source"))')
 pkill -KILL -P "$receive_wrapper" -x ssh
 if wait "$return_copy_pid"; then
     echo 'interrupted named transfer reported success' >&2
@@ -279,7 +281,7 @@ else
 fi
 return_copy_pid=
 test ! -e "$receive_root/interrupted"
-ssh source 'syq destination wait laptop --timeout 30'
+ssh source 'syq persist destinations wait laptop --timeout 30'
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
 test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
@@ -293,7 +295,7 @@ import signal
 import subprocess
 import time
 
-state = json.loads(subprocess.check_output(["syq", "recv", "status", "--json"]))
+state = json.loads(subprocess.check_output(["syq", "persist", "receive", "status", "--json"]))
 wrapper = next(s["connection"]["ssh_pid"] for s in state["connections"] if s["endpoint"] == "source")
 transport = int(subprocess.check_output(["pgrep", "-P", str(wrapper), "-x", "ssh"]))
 # Pause the real client so the server can open its forwarded socket but cannot
@@ -303,7 +305,7 @@ os.kill(transport, signal.SIGSTOP)
 try:
     deadline = time.monotonic() + 40
     while True:
-        result = subprocess.run(["ssh", "source", "test ! -e ~/.syq-destinations-v2/laptop.json"], timeout=5)
+        result = subprocess.run(["ssh", "source", "test ! -e ~/.syq-destinations-v3/laptop.json"], timeout=5)
         if result.returncode == 0:
             break
         assert result.returncode == 1, result.returncode
@@ -312,8 +314,8 @@ try:
         time.sleep(2)
 finally:
     os.kill(transport, signal.SIGCONT)
-subprocess.run(["ssh", "source", "syq destination wait laptop --timeout 40"], check=True, timeout=45)
-subprocess.run(["syq", "recv", "wait", "source", "--timeout", "10"], check=True, timeout=15)
+subprocess.run(["ssh", "source", "syq persist destinations wait laptop --timeout 40"], check=True, timeout=45)
+subprocess.run(["syq", "persist", "receive", "wait", "source", "--timeout", "10"], check=True, timeout=15)
 with open("/tmp/syq-real-ssh-ssh.trace") as trace:
     ends = [dict(field.split("=", 1) for field in line.strip().split("\t")) for line in trace if line.startswith("phase=end\t")]
 assert any(row["pid"] == str(wrapper) and row["status"] == "75" for row in ends), "heartbeat did not report retry status 75"
@@ -322,20 +324,20 @@ PYTEST
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-heartbeat-timeout'
 printf 'return\n' | cmp - "$receive_root/after-heartbeat-timeout"
 printf 'case: cwd permits destinations outside its starting directory\n'
-syq recv on --cwd "$receive_root"
-syq recv wait source --timeout 30
+syq persist receive on --cwd "$receive_root"
+syq persist receive wait source --timeout 30
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as ../syq-return-outside'
 printf 'return\n' | cmp - /tmp/syq-return-outside
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
 printf 'return\n' | cmp - /tmp/syq-return-absolute
-printf 'case: recv off/on keeps ordinary persistence and restarts receiving\n'
-syq recv off
+printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
+syq persist receive off
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as while-disabled'; then
     echo 'disabled receiving unexpectedly accepted a transfer' >&2
     exit 1
 fi
-syq recv on
-syq recv wait source --timeout 30
+syq persist receive on
+syq persist receive wait source --timeout 30
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as reenabled'
 printf 'return\n' | cmp - "$receive_root/reenabled"
 printf 'case: persistence off stops background receiving\n'
@@ -345,9 +347,9 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
     exit 1
 fi
 test ! -e "$receive_root/after-stop"
-ssh source 'test ! -e ~/.syq-destinations-v2/laptop.json'
+ssh source 'test ! -e ~/.syq-destinations-v3/laptop.json'
 # Unrelated pooling scenarios count SSH commands; explicitly disable receiving.
-syq recv off
+syq persist receive off
 syq completion cache clear >/dev/null
 
 printf 'case: shell completion adapters parse and keep descriptions separate\n'

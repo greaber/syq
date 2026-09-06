@@ -26,6 +26,7 @@ fn short_and_long_help_spellings_are_identical_at_every_public_level() {
     for path in [
         vec![],
         vec!["cp"],
+        vec!["exec"],
         vec!["rm"],
         vec!["map"],
         vec!["--self-update"],
@@ -41,18 +42,18 @@ fn short_and_long_help_spellings_are_identical_at_every_public_level() {
         vec!["completion", "cache", "list"],
         vec!["completion", "cache", "forget"],
         vec!["completion", "cache", "clear"],
-        vec!["recv"],
-        vec!["recv", "on"],
-        vec!["recv", "off"],
-        vec!["recv", "status"],
-        vec!["recv", "wait"],
-        vec!["recv", "pending"],
-        vec!["recv", "approve"],
-        vec!["recv", "deny"],
-        vec!["destination"],
-        vec!["destination", "list"],
-        vec!["destination", "wait"],
-        vec!["destination", "forget"],
+        vec!["persist", "receive"],
+        vec!["persist", "receive", "on"],
+        vec!["persist", "receive", "off"],
+        vec!["persist", "receive", "status"],
+        vec!["persist", "receive", "wait"],
+        vec!["persist", "receive", "pending"],
+        vec!["persist", "receive", "approve"],
+        vec!["persist", "receive", "deny"],
+        vec!["persist", "destinations"],
+        vec!["persist", "destinations", "list"],
+        vec!["persist", "destinations", "wait"],
+        vec!["persist", "destinations", "forget"],
         vec!["receiver"],
         vec!["receiver", "enroll"],
         vec!["receiver", "list"],
@@ -116,8 +117,11 @@ fn lifecycle_and_root_help_describe_the_real_commands() {
     assert!(!run(&["--self-update", "unexpected"]).status.success());
     for path in [
         vec!["cp"],
+        vec!["exec"],
         vec!["receiver", "enroll"],
         vec!["persist", "on"],
+        vec!["persist", "receive", "pending"],
+        vec!["persist", "destinations", "wait"],
         vec!["completion", "cache", "forget"],
     ] {
         let mut direct = path.clone();
@@ -127,6 +131,10 @@ fn lifecycle_and_root_help_describe_the_real_commands() {
         assert_eq!(help(&direct), help(&topic));
     }
     assert!(!run(&["help", "unknown"]).status.success());
+    for removed in ["recv", "destination"] {
+        assert!(!run(&[removed, "--help"]).status.success());
+        assert!(!run(&["help", removed]).status.success());
+    }
 }
 
 #[test]

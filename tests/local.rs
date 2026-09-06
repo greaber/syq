@@ -585,58 +585,61 @@ fn confinement_matrix_tcp_requirement_refuses_ssh_transport() {
 #[cfg(debug_assertions)]
 #[test]
 fn source_scan_uses_registered_root_after_operator_path_replacement() {
-    let t = Tmp::new();
-    write(&t.path("src/original"), b"original");
-    write(&t.path("outside/replacement"), b"replacement");
-    let ready = t.path("source-ready");
+    for insecure in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/original"), b"original");
+        write(&t.path("outside/replacement"), b"replacement");
+        let ready = t.path("source-ready");
 
-    let mut child = compat_command()
-        .args([
-            "-anv",
-            "--syq-connections",
-            "1",
-            &t.s("src/"),
-            &t.s("dst/"),
-            "--no-progress",
-        ])
-        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
+        let mut child = compat_command()
+            .args(insecure.then_some("--insecure-links"))
+            .args([
+                "-anv",
+                "--syq-connections",
+                "1",
+                &t.s("src/"),
+                &t.s("dst/"),
+                "--no-progress",
+            ])
+            .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before registering the source root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
+            ready.exists(),
+            "source root was not registered before timeout"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("/original (destination missing)"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("/replacement (destination missing)"),
+            "{stdout}"
+        );
+        assert!(
+            !t.path("dst").exists(),
+            "dry run unexpectedly created output"
+        );
     }
-    assert!(
-        ready.exists(),
-        "source root was not registered before timeout"
-    );
-
-    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
-    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
-
-    let output = child.wait_with_output().unwrap();
-    assert_output_ok(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("/original (destination missing)"),
-        "{stdout}"
-    );
-    assert!(
-        !stdout.contains("/replacement (destination missing)"),
-        "{stdout}"
-    );
-    assert!(
-        !t.path("dst").exists(),
-        "dry run unexpectedly created output"
-    );
 }
 
 #[cfg(debug_assertions)]
@@ -825,53 +828,56 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
 #[cfg(debug_assertions)]
 #[test]
 fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
-    let t = Tmp::new();
-    let original_large = vec![b'o'; 5 << 20];
-    write(&t.path("src/small"), b"original");
-    write(&t.path("src/large"), &original_large);
-    write(&t.path("outside/small"), b"replaced");
-    write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
-    let ready = t.path("source-content-ready");
+    for insecure in [false, true] {
+        let t = Tmp::new();
+        let original_large = vec![b'o'; 5 << 20];
+        write(&t.path("src/small"), b"original");
+        write(&t.path("src/large"), &original_large);
+        write(&t.path("outside/small"), b"replaced");
+        write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
+        let ready = t.path("source-content-ready");
 
-    let mut child = compat_command()
-        .args([
-            "-a",
-            "--syq-connections",
-            "1",
-            &t.s("src/"),
-            &t.s("dst/"),
-            "--no-progress",
-        ])
-        // Keep the test on the ranged transport path instead of the excluded
-        // same-machine CopyLocal optimization.
-        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
-        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
+        let mut child = compat_command()
+            .args(insecure.then_some("--insecure-links"))
+            .args([
+                "-a",
+                "--syq-connections",
+                "1",
+                &t.s("src/"),
+                &t.s("dst/"),
+                "--no-progress",
+            ])
+            // Keep the test on the ranged transport path instead of the excluded
+            // same-machine CopyLocal optimization.
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before registering the source root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
+            ready.exists(),
+            "source root was not registered before timeout"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/small")), b"original");
+        assert_eq!(read(&t.path("dst/large")), original_large);
     }
-    assert!(
-        ready.exists(),
-        "source root was not registered before timeout"
-    );
-
-    fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
-    std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
-
-    let output = child.wait_with_output().unwrap();
-    assert_output_ok(&output);
-    assert_eq!(read(&t.path("dst/small")), b"original");
-    assert_eq!(read(&t.path("dst/large")), original_large);
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -1044,9 +1050,23 @@ fn insecure_links_does_not_delegate_unconfined_names_to_copy_local() {
         .run()
         .unwrap();
 
-    assert_output_ok(&output);
+    assert_eq!(output.status.code(), Some(23));
     assert!(!copy_local_ready.exists());
-    assert_eq!(read(&t.path("dst/link/secret")), contents);
+    assert!(!t.path("dst/link/secret").exists());
+}
+
+#[test]
+fn verbose_copy_escapes_peer_filename_control_characters() {
+    let t = Tmp::new();
+    let name = "file\x1b]52;c;ZXZpbA==\x07\nline\r";
+    write(&t.path(&format!("src/{name}")), b"payload");
+    let out = syq(&["-av", &t.s("src/"), &t.s("dst/")]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path(&format!("dst/{name}"))), b"payload");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains('\x1b'));
+    assert!(!stdout.contains('\x07'));
+    assert!(stdout.contains("\\nline\\r"), "{stdout}");
 }
 
 fn run_native_ok(args: &[&str]) -> String {
@@ -9969,9 +9989,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
     assert!(!t.path("dst/link/secret").exists());
 
-    // The compatibility escape hatch is explicit and unconfined. It restores
-    // the old followed-ancestor behavior; implied parents are materialized as
-    // real destination directories. `a` is still not recursively walked.
+    // The ownership opt-out keeps descendant traversal confined too.
     let out = syq(&[
         "-a",
         "-r",
@@ -9981,17 +9999,9 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
         &t.s("src"),
         &t.s("dst-insecure"),
     ]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(
-        listing(&t.path("dst-insecure")),
-        ["a", "a/listed", "link", "link/secret"]
-    );
-    assert!(t
-        .path("dst-insecure/link")
-        .symlink_metadata()
-        .unwrap()
-        .is_dir());
-    assert_eq!(read(&t.path("dst-insecure/link/secret")), b"secret");
+    assert_eq!(out.status.code(), Some(23));
+    assert_eq!(listing(&t.path("dst-insecure")), ["a", "a/listed"]);
+    assert!(!t.path("dst-insecure/link/secret").exists());
 
     // An ancestor that resolves to a file, or dangles, is an error.
     std::os::unix::fs::symlink("a/listed", t.path("src/tofile")).unwrap();
@@ -10008,7 +10018,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
     assert_eq!(out.status.code(), Some(23));
     let se = stderr_of(&out);
     assert!(
-        se.contains("tofile is not a directory") && se.contains("dangling/y: no such file"),
+        se.contains("tofile is not a directory") && se.contains("dangling is not a directory"),
         "{se}"
     );
     assert_eq!(listing(&t.path("dst2")), Vec::<String>::new());
@@ -10025,7 +10035,7 @@ fn files_from_rejects_symlinked_ancestors_and_recurses_only_listed_dirs() {
         &t.s("dst3"),
     ]);
     assert_eq!(out.status.code(), Some(23));
-    assert!(stderr_of(&out).contains("listed as a non-directory"));
+    assert!(stderr_of(&out).contains("link is not a directory"));
     assert!(t.path("dst3/link").symlink_metadata().unwrap().is_symlink());
     assert!(!t.path("outside/secret2").exists());
 }
@@ -10071,8 +10081,7 @@ fn insecure_links_never_reaches_a_remote_endpoint() {
     assert_eq!(listing(&t.path("dst")), ["a", "a/listed"]);
     assert!(!t.path("dst/link").exists());
 
-    // Local source, remote destination: the local opt-out still applies and
-    // the remote receiver is unaffected by it.
+    // Local source, remote destination: descendant traversal stays refused.
     let remote_dst = format!("fake:{}", t.s("dst-remote"));
     let out = remote_syq(
         &t,
@@ -10088,12 +10097,9 @@ fn insecure_links_never_reaches_a_remote_endpoint() {
             &remote_dst,
         ],
     );
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(
-        listing(&t.path("dst-remote")),
-        ["a", "a/listed", "link", "link/secret"]
-    );
-    assert_eq!(read(&t.path("dst-remote/link/secret")), b"secret");
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert_eq!(listing(&t.path("dst-remote")), ["a", "a/listed"]);
+    assert!(!t.path("dst-remote/link/secret").exists());
 }
 
 #[test]
@@ -15270,14 +15276,13 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["syq", "help", ""],
         &[
             "cp",
+            "exec",
             "rm",
             "map",
             "rsync",
             "persist",
             "completion",
             "receiver",
-            "recv",
-            "destination",
             "--self-update",
         ],
     );
@@ -15288,6 +15293,9 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["list", "forget", "clear", "help"],
     );
     assert_completion_candidates(&t, &["syq", "persist", "o"], &["on", "off"]);
+    assert_completion_candidates(&t, &["syq", "persist", "r"], &["receive"]);
+    assert_completion_candidates(&t, &["syq", "persist", "receive", "p"], &["pending"]);
+    assert_completion_candidates(&t, &["syq", "persist", "destinations", "w"], &["wait"]);
     for action in ["off", "status"] {
         assert_completion_candidates(
             &t,
@@ -18167,7 +18175,7 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
     assert_eq!(records.last().unwrap()["status"], "failed");
     // The completion route uses private local registration names only, without
     // attempting SSH or contacting the receiving laptop.
-    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    write(&t.path(".syq-destinations-v3/laptop.json"), b"{}");
     let completion = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "completion",
@@ -18206,7 +18214,7 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             .unwrap()
     };
     let status = || {
-        let output = run(&["recv", "status", "--json"]);
+        let output = run(&["persist", "receive", "status", "--json"]);
         assert_output_ok(&output);
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
@@ -18225,7 +18233,8 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
         "status created a runtime scope"
     );
     assert_output_ok(&run(&[
-        "recv",
+        "persist",
+        "receive",
         "on",
         "--name",
         "laptop",
@@ -18233,11 +18242,12 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
         "downloads",
     ]));
     assert_eq!(status()["settings"]["root"], t.s("downloads"));
-    assert_output_ok(&run(&["recv", "on", "--cwd", "."]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--cwd", "."]));
     assert!(status()["settings"]["root"].is_null());
     assert_eq!(status()["settings"]["name"], "laptop");
     assert_output_ok(&run(&[
-        "recv",
+        "persist",
+        "receive",
         "on",
         "--approve",
         "always",
@@ -18246,11 +18256,11 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     ]));
     assert_eq!(status()["settings"]["approval"], "always");
     assert_eq!(status()["settings"]["notifications"], "off");
-    assert_output_ok(&run(&["recv", "on", "--max-entries", "500"]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--max-entries", "500"]));
     assert_eq!(status()["settings"]["approval"], "always");
-    assert_output_ok(&run(&["recv", "on", "--approve", "ask"]));
+    assert_output_ok(&run(&["persist", "receive", "on", "--approve", "ask"]));
     assert_eq!(status()["settings"]["approval"], "ask");
-    assert_output_ok(&run(&["recv", "off"]));
+    assert_output_ok(&run(&["persist", "receive", "off"]));
     assert_eq!(status()["settings"]["enabled"], false);
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_eq!(
@@ -18260,9 +18270,17 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             & 0o777,
         0o600
     );
-    assert!(!run(&["recv", "on", "--cwd", ".", "--root", "downloads"])
-        .status
-        .success());
+    assert!(!run(&[
+        "persist",
+        "receive",
+        "on",
+        "--cwd",
+        ".",
+        "--root",
+        "downloads"
+    ])
+    .status
+    .success());
 }
 
 #[test]
@@ -18291,11 +18309,11 @@ fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
-    let registry = t.path(".syq-destinations-v2");
+    let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = t.path("return.sock");
-    let registration = serde_json::json!({"version":2,"identity":identity.trim(),"socket":socket_path,"secret":"test"});
+    let registration = serde_json::json!({"version":3,"identity":identity.trim(),"socket":socket_path,"secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes()});
     write(
         &registry.join("laptop.json"),
         &serde_json::to_vec(&registration).unwrap(),
@@ -18449,7 +18467,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
             .output()
             .unwrap()
     };
-    let output = run(&["recv", "status", "--json"]);
+    let output = run(&["persist", "receive", "status", "--json"]);
     assert_output_ok(&output);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["settings"]["approval"], "ask");
@@ -18458,7 +18476,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
         old,
         "read-only status mutated old state"
     );
-    assert_output_ok(&run(&["recv", "on"]));
+    assert_output_ok(&run(&["persist", "receive", "on"]));
     let migrated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let original: serde_json::Value = serde_json::from_slice(old).unwrap();
     for field in [
@@ -18476,15 +18494,15 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     assert_eq!(migrated["approval"], "ask");
     assert_eq!(migrated["notifications"], "desktop");
     assert!(!t.path("config/syq/persistence.json").exists());
-    assert_output_ok(&run(&["recv", "off"]));
+    assert_output_ok(&run(&["persist", "receive", "off"]));
 }
 
 #[test]
 fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
     let t = Tmp::new();
-    write(&t.path(".syq-destinations-v2/laptop.json"), b"{}");
+    write(&t.path(".syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(
-        t.path(".syq-destinations-v2"),
+        t.path(".syq-destinations-v3"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -18579,7 +18597,7 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
     write(&path, old);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args(["recv", "status", "--json"])
+        .args(["persist", "receive", "status", "--json"])
         .env("HOME", t.path(""))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_RUNTIME_DIR", t.path("runtime"))
@@ -18620,14 +18638,15 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             .unwrap()
     };
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
-    let registry = t.path(".syq-destinations-v2");
+    let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = t.path("return.sock");
-    for name in ["a-offline", "b-old-build", "laptop", "ssh", "z-other"] {
+    for name in ["a-offline", "b-invalid", "laptop", "ssh", "z-other"] {
         let registration = serde_json::json!({
-            "version": 2,
-            "identity": if name == "b-old-build" { "another-build" } else { identity.trim() },
+            "version": if name == "b-invalid" { 0 } else { 3 },
+            "identity": identity.trim(),
+            "program": env!("CARGO_BIN_EXE_syq").as_bytes(),
             "socket": if name == "a-offline" { t.path("absent.sock") } else { socket_path.clone() },
             "secret": name,
         });
@@ -18765,12 +18784,12 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
     write(&t.path("local-folder/file"), b"payload");
     for name in ["laptop", "ssh"] {
         write(
-            &t.path(&format!("home/.syq-destinations-v2/{name}.json")),
+            &t.path(&format!("home/.syq-destinations-v3/{name}.json")),
             b"{}",
         );
     }
     fs::set_permissions(
-        t.path("home/.syq-destinations-v2"),
+        t.path("home/.syq-destinations-v3"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -18813,4 +18832,57 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         assert!(output.stdout.is_empty(), "{output:?}");
         assert!(!t.path("home/ssh-used").exists());
     }
+}
+
+#[test]
+fn return_exec_completion_and_offline_selection_never_contact_ssh() {
+    let t = Tmp::new();
+    write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_completion_candidates(&t, &["syq", "ex"], &["exec"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "lap"], &["laptop"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "@lap"], &["@laptop"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--cw"], &["--cwd"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "laptop", "--", "--he"], &[]);
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["absent", "@absent", "user@host", "host:22"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["exec", "--on", name, "--", "true"])
+            .env("HOME", t.path("home"))
+            .env("PATH", t.path("bin"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!t.path("home/ssh-used").exists());
+    }
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "5",
+            "--",
+            "syq",
+            "exec",
+            "--on",
+            "laptop",
+            "--cwd",
+            "anything",
+        ],
+    )
+    .env("PATH", t.path("bin"))
+    .output()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    assert!(!t.path("home/ssh-used").exists());
 }

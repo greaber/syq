@@ -38,8 +38,29 @@ pub trait Conn: Send {
         crate::streaming::drain_reads(|| self.recv())
     }
     fn call(&mut self, req: Request) -> Result<Response> {
+        let expected = match &req {
+            Request::StatMany { paths, .. } => Some(("stat", paths.len())),
+            Request::Apply { ops, .. } => Some(("apply", ops.len())),
+            Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
+            _ => None,
+        };
         self.send(req)?;
-        self.recv()
+        let response = self.recv()?;
+        if let Some((operation, expected)) = expected {
+            let actual = match &response {
+                Response::Stats(values) => Some(values.len()),
+                Response::Applied(values) => Some(values.len()),
+                Response::PathResults(values) => Some(values.len()),
+                _ => None,
+            };
+            if actual.is_some_and(|actual| actual != expected) {
+                bail!(
+                    "{operation} reply count {} does not match request count {expected}",
+                    actual.unwrap()
+                );
+            }
+        }
+        Ok(response)
     }
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
@@ -743,7 +764,7 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: Option<std::sync::mpsc::Receiver<std::io::Result<Response>>>,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
@@ -774,14 +795,26 @@ fn spawn_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
 ) -> (
-    std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
 ) {
     let (tx, rx) = std::sync::mpsc::sync_channel(read_ahead);
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
+        r.set_limit(MAX_HANDSHAKE_FRAME);
+        let hello = r.read_budgeted::<Response>();
+        // Make the same acceptance check as receive_hello before allowing the
+        // background reader to allocate any ordinary data frame. This also
+        // covers pooled sessions, whose Hello was sent by another process.
+        let accepted = matches!(&hello, Ok(message)
+            if matches!(&message.value, Response::HelloOk { identity, .. }
+                if identity == crate::identity::build()));
+        if tx.send(hello).is_err() || !accepted {
+            return;
+        }
+        r.set_limit(MAX_FRAME);
         loop {
-            let msg = r.read_msg::<Response>();
+            let msg = r.read_budgeted::<Response>();
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
                 break;
@@ -792,16 +825,23 @@ fn spawn_reader(
 }
 
 fn receive_transport_stats(
-    rx: &std::sync::mpsc::Receiver<std::io::Result<Response>>,
+    rx: &std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     timeout: std::time::Duration,
 ) -> Option<TcpSocketStats> {
-    match rx.recv_timeout(timeout) {
+    match rx
+        .recv_timeout(timeout)
+        .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
+    {
         Ok(Ok(Response::TransportStats(stats))) => stats,
         _ => None,
     }
 }
 
-fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()> {
+fn validate_remote_scan_batch(
+    batch: &[Entry],
+    saw_root: &mut bool,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+) -> Result<()> {
     for entry in batch {
         if !*saw_root {
             if !entry.path.is_empty() {
@@ -822,6 +862,14 @@ fn validate_remote_scan_batch(batch: &[Entry], saw_root: &mut bool) -> Result<()
         {
             bail!(
                 "scan response contained unsafe relative path {:?}",
+                String::from_utf8_lossy(&entry.path)
+            );
+        }
+        if matcher.is_some_and(|matcher| {
+            crate::scan::path_is_ignored(matcher, &entry.path, entry.kind == Kind::Dir)
+        }) {
+            bail!(
+                "scan response contained excluded path {:?}",
                 String::from_utf8_lossy(&entry.path)
             );
         }
@@ -959,6 +1007,7 @@ impl Conn for RemoteConn {
             .as_ref()
             .context("response reader is collecting streaming writes")?
             .recv()
+            .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
         {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
@@ -1050,11 +1099,12 @@ impl Conn for RemoteConn {
             report_ignored,
             guard: None,
         })?;
+        let matcher = crate::scan::build_ignore(ignore)?;
         let mut saw_root = false;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => {
-                    validate_remote_scan_batch(&b, &mut saw_root)
+                    validate_remote_scan_batch(&b, &mut saw_root, matcher.as_ref())
                         .with_context(|| format!("{}: unsafe remote scan", self.label))?;
                     sink(b)?;
                 }
@@ -1245,7 +1295,7 @@ pub(crate) struct PendingTcpSetup {
     token: Vec<u8>,
     congestion_control: Option<String>,
     remote_congestion_control: Option<String>,
-    probe: std::thread::JoinHandle<Vec<TcpCandidate>>,
+    probe: std::thread::JoinHandle<Result<Vec<TcpCandidate>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2045,6 +2095,11 @@ impl RemoteSpec {
                 other => bail!("unexpected response {other:?}"),
             },
         };
+        if advertised.len() > MAX_ADVERTISED_TCP_ADDRESSES {
+            bail!(
+                "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
+            );
+        }
         let mut candidates: Vec<TcpCandidate> = advertised
             .into_iter()
             .map(|(address, speed_mbps)| TcpCandidate {
@@ -2083,8 +2138,8 @@ impl RemoteSpec {
         // coordinator do destination preflight and plan payloads while every
         // candidate receives its complete bounded probe window.
         let probe = std::thread::spawn(move || {
-            probe_reachable(&mut candidates, port);
-            candidates
+            probe_reachable(&mut candidates, port)?;
+            Ok(candidates)
         });
         Ok(PendingTcpSetup {
             port,
@@ -2107,7 +2162,7 @@ impl RemoteSpec {
         } = pending;
         let mut candidates = probe
             .join()
-            .map_err(|_| anyhow!("TCP route probe thread panicked"))?;
+            .map_err(|_| anyhow!("TCP route probe thread panicked"))??;
         // Multipath only across comparable-speed NICs: keep those within 2x of
         // the fastest reachable one. Mixing a fast and a slow path (a rail and
         // Tailscale, say) would drag the transfer down, so we don't.
@@ -2251,7 +2306,7 @@ impl RemoteSpec {
                 );
             }
             stream.set_nodelay(true)?;
-            let conn_id = TCP_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let conn_id = next_tcp_connection_id(&TCP_CONN_ID)?;
             (&stream).write_all(&conn_id.to_be_bytes())?;
             let (wc, rc) = match &info.key {
                 Some(k) => (
@@ -2300,7 +2355,14 @@ fn helper_needs_install(e: &anyhow::Error) -> bool {
 
 /// Concurrently probe which (addr, speed) entries accept a TCP connection on
 /// `port`, preserving the server's priority order. Used once per endpoint.
-fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
+const MAX_ADVERTISED_TCP_ADDRESSES: usize = 64;
+const MAX_RESOLVED_TCP_ADDRESSES: usize = 128;
+
+fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
+    // One extra candidate is the coordinator's SSH target.
+    if candidates.len() > MAX_ADVERTISED_TCP_ADDRESSES + 1 {
+        bail!("too many TCP probe candidates");
+    }
     // Resolve candidate names in parallel. More importantly, probe every
     // resolved socket address in parallel too: a dual-stack name must not
     // spend the whole candidate budget timing out on IPv6 before trying IPv4.
@@ -2308,13 +2370,15 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
     for (i, candidate) in candidates.iter().enumerate() {
         let tx = resolved_tx.clone();
         let address = candidate.address.clone();
-        std::thread::spawn(move || {
-            let addrs = (address.as_str(), port)
-                .to_socket_addrs()
-                .map(|addresses| addresses.collect())
-                .unwrap_or_default();
-            let _ = tx.send((i, addrs));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let addrs = (address.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.take(MAX_RESOLVED_TCP_ADDRESSES + 1).collect())
+                    .unwrap_or_default();
+                let _ = tx.send((i, addrs));
+            })
+            .context("start TCP address resolver")?;
     }
     drop(resolved_tx);
     let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
@@ -2323,6 +2387,9 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
             break;
         };
         resolved[i] = addrs;
+        if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
+            bail!("TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})");
+        }
     }
 
     // Probe each distinct socket address once. An advertised literal and the
@@ -2353,9 +2420,11 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
     for (t, (addr, _)) in targets.iter().enumerate() {
         let tx = tx.clone();
         let addr = *addr;
-        std::thread::spawn(move || {
-            let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
+            })
+            .context("start TCP address probe")?;
     }
     drop(tx);
 
@@ -2382,9 +2451,19 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) {
             }
         }
     }
+    Ok(())
 }
 
 static TCP_CONN_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_tcp_connection_id(next: &std::sync::atomic::AtomicU32) -> Result<u32> {
+    next.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |id| (id <= crate::tcp_records::CONNECTION_ID_MAX).then(|| id + 1),
+    )
+    .map_err(|_| anyhow!("TCP connection IDs exhausted; restart the copy"))
+}
 
 #[derive(Clone)]
 pub struct TcpInfo {
@@ -3105,9 +3184,182 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tcp_connection_ids_fail_at_nonce_space_exhaustion() {
+        let next = std::sync::atomic::AtomicU32::new(crate::tcp_records::CONNECTION_ID_MAX);
+        assert_eq!(super::next_tcp_connection_id(&next).unwrap(), 0x00ff_ffff);
+        for _ in 0..3 {
+            assert!(super::next_tcp_connection_id(&next)
+                .unwrap_err()
+                .to_string()
+                .contains("restart the copy"));
+        }
+        assert_eq!(next.load(std::sync::atomic::Ordering::Relaxed), 0x0100_0000);
+    }
+
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    fn hello_ok() -> Response {
+        Response::HelloOk {
+            identity: crate::identity::build().into(),
+            platform: crate::identity::platform(),
+            supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
+        }
+    }
+
+    #[test]
+    fn client_handshake_limit_applies_before_reading_the_body() {
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false).write_preamble().unwrap();
+        wire.extend_from_slice(&((MAX_HANDSHAKE_FRAME + 1) as u32).to_le_bytes());
+        let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+        let error = rx.recv().unwrap().unwrap_err();
+        assert!(error.to_string().contains("bad frame length"));
+        assert!(rx.recv().is_err());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn client_handshake_limit_also_bounds_compressed_output() {
+        let mut hello = hello_ok();
+        if let Response::HelloOk { platform, .. } = &mut hello {
+            *platform = "x".repeat(MAX_HANDSHAKE_FRAME + 1);
+        }
+        let payload = postcard::to_stdvec(&hello).unwrap();
+        let body = zstd::bulk::compress(&payload, 1).unwrap();
+        let mut wire = Vec::new();
+        FrameWriter::new(&mut wire, false).write_preamble().unwrap();
+        wire.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        wire.push(1);
+        wire.extend_from_slice(&body);
+        let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+        assert!(rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed frame exceeds limit"));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn client_reader_requires_accepted_hello_before_large_data() {
+        for accepted in [false, true] {
+            let mut wire = Vec::new();
+            let mut writer = FrameWriter::new(&mut wire, false);
+            let mut hello = hello_ok();
+            if let Response::HelloOk { identity, .. } = &mut hello {
+                if !accepted {
+                    *identity = "wrong-build".into();
+                }
+            }
+            writer.write_msg(&hello).unwrap();
+            writer
+                .write_msg(&Response::Block {
+                    off: 0,
+                    hash: [0; 32],
+                    data: vec![7; 2 << 20],
+                })
+                .unwrap();
+            drop(writer);
+            let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+            assert!(matches!(
+                rx.recv().unwrap().unwrap().value,
+                Response::HelloOk { .. }
+            ));
+            if accepted {
+                assert!(
+                    matches!(rx.recv().unwrap().unwrap().value, Response::Block { data, .. } if data.len() == 2 << 20)
+                );
+            } else {
+                assert!(rx.recv().is_err());
+            }
+            drop(rx);
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_vector_replies_must_match_request_counts() {
+        for count in [0, 1, 2] {
+            let cases = [
+                (
+                    Request::StatMany {
+                        paths: vec![b"file".to_vec()],
+                        sources: None,
+                        follow: false,
+                        guard: None,
+                    },
+                    Response::Stats(vec![None; count]),
+                ),
+                (
+                    Request::Apply {
+                        ops: vec![Op::Unlink {
+                            path: b"file".to_vec(),
+                        }],
+                        guard: None,
+                    },
+                    Response::Applied(vec![None; count]),
+                ),
+                (
+                    Request::PartialPaths {
+                        paths: vec![b"file".to_vec()],
+                        copy_id: [0; 16],
+                        guard: None,
+                    },
+                    Response::PathResults(vec![Ok(b"partial".to_vec()); count]),
+                ),
+            ];
+            for (request, response) in cases {
+                let mut bytes = Vec::new();
+                let mut writer = FrameWriter::new(&mut bytes, false);
+                writer.write_msg(&hello_ok()).unwrap();
+                writer.write_msg(&response).unwrap();
+                drop(writer);
+                let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
+                let mut conn = RemoteConn {
+                    child: None,
+                    w: FrameWriter::new(Box::new(std::io::sink()), false),
+                    rx: Some(rx),
+                    reader: Some(reader),
+                    label: "hostile vector reply".into(),
+                    dead: false,
+                    write_stream: None,
+                    peer: None,
+                    tcp_socket: None,
+                    named_socket: None,
+                    multiplexed_ssh: false,
+                    detached: false,
+                };
+                conn = receive_hello(conn, false).unwrap();
+                let result = conn.call(request);
+                if count == 1 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("reply count"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn excessive_probe_candidates_fail_before_resolution() {
+        let mut candidates: Vec<_> = (0..MAX_ADVERTISED_TCP_ADDRESSES + 2)
+            .map(|_| TcpCandidate {
+                address: "must-not-resolve.invalid".into(),
+                speed_mbps: 0,
+                source: DataAddressSource::RemoteInterface,
+                reachable: false,
+                selected: false,
+            })
+            .collect();
+        assert!(probe_reachable(&mut candidates, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("too many"));
+    }
 
     struct ExitObserved<R> {
         inner: R,
@@ -3760,6 +4012,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut requests = FrameReader::new(helper.try_clone().unwrap());
             let mut responses = FrameWriter::new(helper, false);
+            responses.write_msg(&hello_ok()).unwrap();
             for _ in 0..depth {
                 let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
                     panic!("expected a range request");
@@ -3774,6 +4027,10 @@ mod tests {
             }
         });
         let (responses, reader) = spawn_reader(Box::new(coordinator.try_clone().unwrap()), depth);
+        assert!(matches!(
+            responses.recv_timeout(timeout).unwrap().unwrap().value,
+            Response::HelloOk { .. }
+        ));
         let mut requests = FrameWriter::new(coordinator, false);
         // Both directions exceed socket buffering. A reader queue stuck at
         // four responses deadlocks against a sequential helper while the
@@ -3790,7 +4047,11 @@ mod tests {
                 .unwrap();
         }
         for i in 0..depth {
-            let response = responses.recv_timeout(timeout).unwrap().unwrap();
+            let response = responses
+                .recv_timeout(timeout)
+                .unwrap()
+                .unwrap()
+                .into_inner();
             assert!(matches!(response, Response::Block { off, data, .. }
                 if off == i as u64 * (64 << 10) && data == vec![7; 64 << 10]));
         }
@@ -3882,9 +4143,72 @@ mod tests {
     }
 
     #[test]
+    fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
+        for (path, patterns, allowed) in [
+            (b".env".as_slice(), vec![".env"], false),
+            (
+                b"ignored/keep/file",
+                vec!["ignored/", "!ignored/keep/file"],
+                false,
+            ),
+            (b"logs/keep/file", vec!["logs/*", "!logs/keep/"], true),
+            (b"nested/.env", vec!["/.env"], true),
+        ] {
+            let mut wire = Vec::new();
+            let mut writer = FrameWriter::new(&mut wire, false);
+            writer.write_msg(&hello_ok()).unwrap();
+            let mut root = entry(b"");
+            root.kind = Kind::Dir;
+            writer.write_msg(&Response::ScanBatch(vec![root])).unwrap();
+            // No excluded ancestor is sent. Filtering must not depend on the
+            // source's claimed tree order or on previous batches.
+            writer
+                .write_msg(&Response::ScanBatch(vec![entry(path)]))
+                .unwrap();
+            writer.write_msg(&Response::ScanDone).unwrap();
+            drop(writer);
+            let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
+            let mut remote = RemoteConn {
+                child: None,
+                w: FrameWriter::new(Box::new(Vec::new()), false),
+                rx: Some(rx),
+                reader: Some(reader),
+                label: "hostile source".into(),
+                dead: false,
+                write_stream: None,
+                peer: None,
+                tcp_socket: None,
+                named_socket: None,
+                multiplexed_ssh: false,
+                detached: false,
+            };
+            remote = receive_hello(remote, false).unwrap();
+            let mut planned = Vec::new();
+            let result = remote.scan(
+                b"source",
+                None,
+                false,
+                &patterns.into_iter().map(String::from).collect::<Vec<_>>(),
+                false,
+                &mut |entries| {
+                    planned.extend(entries.into_iter().map(|e| e.path));
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+                &mut |_| {},
+            );
+            assert_eq!(result.is_ok(), allowed, "{path:?}: {result:?}");
+            assert_eq!(planned.contains(&path.to_vec()), allowed);
+            if !allowed {
+                assert!(format!("{:#}", result.unwrap_err()).contains("excluded path"));
+            }
+        }
+    }
+
+    #[test]
     fn remote_scan_paths_are_rooted_and_normalized() {
         let mut saw_root = false;
-        validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root).unwrap();
+        validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root, None).unwrap();
         assert!(saw_root);
 
         for bad in [
@@ -3897,17 +4221,17 @@ mod tests {
             &b"nul\0byte"[..],
         ] {
             let mut saw_root = true;
-            assert!(validate_remote_scan_batch(&[entry(bad)], &mut saw_root).is_err());
+            assert!(validate_remote_scan_batch(&[entry(bad)], &mut saw_root, None).is_err());
         }
     }
 
     #[test]
     fn remote_scan_requires_exactly_one_leading_root() {
         let mut saw_root = false;
-        assert!(validate_remote_scan_batch(&[entry(b"file")], &mut saw_root).is_err());
+        assert!(validate_remote_scan_batch(&[entry(b"file")], &mut saw_root, None).is_err());
 
         let mut saw_root = true;
-        assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root).is_err());
+        assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root, None).is_err());
     }
 
     #[test]
@@ -4289,7 +4613,7 @@ mod tests {
             candidate("localhost"),
             candidate("127.0.0.1"),
         ];
-        probe_reachable(&mut candidates, port);
+        probe_reachable(&mut candidates, port).unwrap();
         assert!(candidates[0].reachable);
         assert!(candidates[2].reachable);
         assert_eq!(candidates[1].reachable, via_localhost);

@@ -156,12 +156,11 @@ pub(crate) fn root() -> Command {
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
+        .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
-        .subcommand(Command::new("recv").about("Configure background receiving over persistent SSH connections"))
-        .subcommand(Command::new("destination").about("List named destinations available on this machine"))
-        .subcommand(Command::new("persist").about("Manage reusable SSH connections and helper sessions"))
+        .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
         .subcommand(Command::new("completion").about("Generate shell completion and manage cached endpoint suggestions"))
         .subcommand(Command::new("receiver").about("Enroll, list, or revoke command-restricted receivers"))
         .subcommand(Command::new("help").about("Show help for a command, e.g. syq help cp")))
@@ -233,8 +232,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     }
     let mut command = match topics.first().copied() {
         None => root(),
-        Some("recv") => crate::receive_service::command_for_help(),
-        Some("destination") => crate::destination::destination_help(),
+        Some("exec") => crate::destination::exec::command_for_help(),
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),
         Some("receiver") => receiver(),

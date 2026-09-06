@@ -4486,7 +4486,7 @@ impl FsOps {
             let partial_size = target
                 .root
                 .metadata_optional(&relative)?
-                .filter(|metadata| is_safe_rooted_partial(*metadata))
+                .filter(|metadata| is_owned_rooted_partial(*metadata))
                 .map(|metadata| metadata.len);
             return Ok(Response::PartialSize(partial_size));
         }
@@ -4494,7 +4494,7 @@ impl FsOps {
         let pp = self.partial_path(&p, copy_id)?;
         let partial_size = match fs::symlink_metadata(&pp) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if is_safe_partial(&metadata) => Some(metadata.len()),
+            Ok(metadata) if is_owned_partial(&metadata) => Some(metadata.len()),
             Ok(_) => None,
             Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
         };
@@ -4531,7 +4531,7 @@ impl FsOps {
         let mut repaired_permissions = false;
         for _ in 0..8 {
             match fs::symlink_metadata(pp) {
-                Ok(md) if is_safe_partial(&md) => {
+                Ok(md) if is_owned_partial(&md) => {
                     match OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -4541,8 +4541,8 @@ impl FsOps {
                         Ok(file) => {
                             let fd_meta = file.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
-                            if !is_safe_partial(&fd_meta)
-                                || !is_safe_partial(&path_meta)
+                            if !is_owned_partial(&fd_meta)
+                                || !is_owned_partial(&path_meta)
                                 || fd_meta.dev() != path_meta.dev()
                                 || fd_meta.ino() != path_meta.ino()
                             {
@@ -4599,8 +4599,8 @@ impl FsOps {
                             };
                             let fd_meta = handle.metadata()?;
                             let path_meta = fs::symlink_metadata(pp)?;
-                            if !is_safe_partial(&fd_meta)
-                                || !is_safe_partial(&path_meta)
+                            if !is_owned_partial(&fd_meta)
+                                || !is_owned_partial(&path_meta)
                                 || fd_meta.dev() != md.dev()
                                 || fd_meta.ino() != md.ino()
                                 || fd_meta.dev() != path_meta.dev()
@@ -4683,13 +4683,13 @@ impl FsOps {
         }
         for _ in 0..8 {
             match root.metadata_optional(relative)? {
-                Some(metadata) if is_safe_rooted_partial(metadata) => {
+                Some(metadata) if is_owned_rooted_partial(metadata) => {
                     match root.open_regular_read_write(relative) {
                         Ok(file) => {
                             let opened = file.metadata()?;
                             let named = root.metadata(relative)?;
-                            if !is_safe_partial(&opened)
-                                || !is_safe_rooted_partial(named)
+                            if !is_owned_partial(&opened)
+                                || !is_owned_rooted_partial(named)
                                 || opened.dev() != named.dev
                                 || opened.ino() != named.ino
                             {
@@ -4762,6 +4762,9 @@ impl FsOps {
                                     continue;
                                 }
                             };
+                            if !is_owned_partial(&handle.metadata()?) {
+                                continue;
+                            }
                             require_rooted_metadata(&handle, metadata, label)?;
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
@@ -6532,6 +6535,16 @@ fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// Ownership is required when adopting a leftover, before chmod or writes.
+// Publication checks deliberately allow metadata's requested final owner.
+fn is_owned_partial(metadata: &fs::Metadata) -> bool {
+    is_safe_partial(metadata) && metadata.uid() == unsafe { libc::geteuid() }
+}
+
+fn is_owned_rooted_partial(metadata: RootMetadata) -> bool {
+    is_safe_rooted_partial(metadata) && metadata.uid == unsafe { libc::geteuid() }
 }
 
 fn is_safe_partial(metadata: &fs::Metadata) -> bool {

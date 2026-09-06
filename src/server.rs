@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 struct RequestReader {
-    rx: Option<std::sync::mpsc::Receiver<io::Result<Request>>>,
+    rx: Option<std::sync::mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Request>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     tcp_socket: Option<TcpStream>,
     named_socket: Option<std::os::unix::net::UnixStream>,
@@ -27,7 +27,7 @@ impl RequestReader {
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::spawn(move || loop {
-            let msg = reader.read_msg::<Request>();
+            let msg = reader.read_budgeted::<Request>();
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
                 break;
@@ -41,7 +41,12 @@ impl RequestReader {
         }
     }
 
-    fn recv(&self) -> std::result::Result<io::Result<Request>, std::sync::mpsc::RecvError> {
+    fn recv(
+        &self,
+    ) -> std::result::Result<
+        io::Result<crate::wire_budget::Budgeted<Request>>,
+        std::sync::mpsc::RecvError,
+    > {
         self.rx.as_ref().expect("request receiver present").recv()
     }
 
@@ -71,7 +76,7 @@ impl RequestReader {
                     Err(TryRecvError::Disconnected) => bail!("read stream control channel closed"),
                 }
             };
-            match request {
+            match request.value {
                 Request::StopReadStream => return Ok(true),
                 Request::ShrinkReadStream { end } => {
                     crate::streaming::shrink_limit(limit, end)?;
@@ -287,6 +292,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         descriptor_session,
     } = session;
     let mut r = FrameReader::new(r);
+    r.set_limit(MAX_HANDSHAKE_FRAME);
     let mut w = FrameWriter::new(w, false);
     // Send our build identity before waiting for the client's first postcard
     // frame. Both peers can therefore diagnose version skew even when their
@@ -298,7 +304,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // Held for the life of the connection; dropping it releases the worker
     // permit even when a later request fails.
     let _permit: Option<ConnectionPermit>;
-    match r.read_msg::<Request>()? {
+    let (hello, _hello_hold) = r.read_budgeted::<Request>()?.into_parts();
+    match hello {
         Request::Hello {
             identity,
             compress,
@@ -422,6 +429,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
     })?;
 
+    if let Some(socket) = &tcp_socket {
+        socket.set_read_timeout(None)?;
+        socket.set_write_timeout(None)?;
+    }
     if let Some(socket) = &named_socket {
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
@@ -434,18 +445,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
+    r.set_limit(MAX_FRAME);
     let reader = RequestReader::spawn(r, tcp_socket, named_socket);
 
     let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let t0 = std::time::Instant::now();
-        let mut req: Request = match reader.recv() {
+        let queued = match reader.recv() {
             Ok(Ok(req)) => req,
             Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break,
         };
+        let (mut req, _request_hold) = queued.into_parts();
         t[0] += t0.elapsed().as_secs_f64();
         if !is_control
             && matches!(
@@ -1130,6 +1143,7 @@ fn accept_data_connections(
             }
             Err(_) => continue,
         };
+        let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let id = next_id.fetch_add(1, Relaxed);
         // Reserve a slot atomically: both family listeners charge one bound.
         if live.fetch_add(1, Relaxed) >= max_live {
@@ -1160,6 +1174,7 @@ fn accept_data_connections(
                 &seen,
                 authority.clone(),
                 descriptor_session,
+                handshake_deadline,
             ) {
                 if debug {
                     crate::output::diagnostic!("syq server (tcp {id}): {e:#}");
@@ -1181,6 +1196,7 @@ fn serve_tcp(
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
+    handshake_deadline: std::time::Instant,
 ) -> Result<()> {
     // The listening socket is nonblocking so its owner can notice session
     // shutdown. Darwin propagates that status flag to accepted sockets, while
@@ -1188,13 +1204,28 @@ fn serve_tcp(
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     // Scanners and stray connections must not hold a thread forever.
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let handshake_timeout = handshake_deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("TCP Hello deadline expired before the handler started")?;
+    stream.set_read_timeout(Some(handshake_timeout))?;
+    stream.set_write_timeout(Some(handshake_timeout))?;
+    let handshake_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut handshake_reader = TcpHandshakeReader {
+        stream: stream.try_clone()?,
+        pending: handshake_pending.clone(),
+        deadline: handshake_deadline,
+    };
     // The client tells us its connection id first (plaintext), so both sides
     // derive the same nonces.
     let mut idbuf = [0u8; 4];
-    (&stream).read_exact(&mut idbuf)?;
+    handshake_reader.read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
     let _ = id;
+    // Reject aliases before reserving the ID or emitting encrypted records.
+    if conn_id > crate::tcp_records::CONNECTION_ID_MAX {
+        bail!("TCP connection id {conn_id} exceeds nonce space");
+    }
     // Each client connection id is single-use: a replayed record stream carries
     // the original id (it must, to decrypt) and is rejected here.
     if !seen.lock().unwrap().insert(conn_id) {
@@ -1207,7 +1238,7 @@ fn serve_tcp(
         ),
         None => (None, None),
     };
-    let reader = RecordReader::new(stream.try_clone()?, rc);
+    let reader = RecordReader::new(handshake_reader, rc);
     let writer = RecordWriter::new(stream.try_clone()?, wc);
     // Free the id only if the connection NEVER authenticated, so an
     // unauthenticated peer can't reserve ids. Once the token authenticated, the
@@ -1216,18 +1247,14 @@ fn serve_tcp(
     // then replay captured records under it.
     let authed = std::sync::atomic::AtomicBool::new(false);
     let res = serve(
-        TimeoutOnce {
-            inner: reader,
-            stream: stream.try_clone()?,
-            cleared: false,
-        },
+        reader,
         writer,
         false,
         Some(token),
         Some(&authed),
         Some(stream.try_clone()?),
         ServeSession {
-            handshake_pending: None,
+            handshake_pending: Some(handshake_pending),
             allow_tcp: true,
             named_socket: None,
             authority,
@@ -1278,21 +1305,25 @@ fn drop_after_handling_for_test(_request: &Request) -> bool {
     false
 }
 
-/// Clears the socket read timeout after the first successful read.
-struct TimeoutOnce<R: Read> {
-    inner: R,
+/// Bound every socket read, including partial IDs and records, by the same
+/// Hello deadline. `serve` clears the shared socket timeout after HelloOk.
+struct TcpHandshakeReader {
     stream: TcpStream,
-    cleared: bool,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
 }
 
-impl<R: Read> Read for TimeoutOnce<R> {
+impl Read for TcpHandshakeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if !self.cleared {
-            self.cleared = true;
-            let _ = self.stream.set_read_timeout(None);
+        if self.pending.load(std::sync::atomic::Ordering::Acquire) {
+            let remaining = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "TCP Hello timed out"))?;
+            self.stream.set_read_timeout(Some(remaining))?;
         }
-        Ok(n)
+        self.stream.read(buf)
     }
 }
 
@@ -1308,31 +1339,34 @@ mod tests {
             tcp_socket: None,
             named_socket: None,
         };
+        let send = |value| {
+            tx.send(Ok(crate::wire_budget::Budgeted {
+                value,
+                hold: crate::wire_budget::Hold::new(),
+            }))
+            .unwrap();
+        };
         let mut limit = 4096;
-        tx.send(Ok(super::Request::ShrinkReadStream { end: 2048 }))
-            .unwrap();
-        tx.send(Ok(super::Request::ShrinkReadStream { end: 1024 }))
-            .unwrap();
+        send(super::Request::ShrinkReadStream { end: 2048 });
+        send(super::Request::ShrinkReadStream { end: 1024 });
         assert!(!reader.stream_stopped(0, &mut limit, false).unwrap());
         assert_eq!(limit, 1024);
 
         // Even if a block straddled the new end, consume subsequent shrink
         // commands and wait for Stop; never issue another read or consume
         // the next stream's command. A zero limit cancels all future reads.
-        tx.send(Ok(super::Request::ShrinkReadStream { end: 0 }))
-            .unwrap();
-        tx.send(Ok(super::Request::StopReadStream)).unwrap();
-        tx.send(Ok(super::Request::Shutdown)).unwrap();
+        send(super::Request::ShrinkReadStream { end: 0 });
+        send(super::Request::StopReadStream);
+        send(super::Request::Shutdown);
         assert!(reader.stream_stopped(2048, &mut limit, true).unwrap());
         assert_eq!(limit, 0);
         assert!(matches!(
-            reader.recv().unwrap().unwrap(),
+            reader.recv().unwrap().unwrap().value,
             super::Request::Shutdown
         ));
 
         // Increasing a limit is a protocol error, not new read authority.
-        tx.send(Ok(super::Request::ShrinkReadStream { end: u64::MAX }))
-            .unwrap();
+        send(super::Request::ShrinkReadStream { end: u64::MAX });
         assert!(reader.stream_stopped(2048, &mut limit, true).is_err());
         assert_eq!(limit, 0);
         drop(tx);
@@ -1925,6 +1959,233 @@ mod tests {
             Response::Err(error) if error.contains("initialize source worker")
         ));
         server.join().unwrap();
+    }
+
+    fn tcp_test_hello(token: &[u8]) -> Request {
+        Request::Hello {
+            identity: crate::identity::build().to_string(),
+            compress: true,
+            debug: false,
+            token: token.to_vec(),
+            role: ConnectionRole::DestinationWorker {
+                destination: None,
+                copy_sources: Vec::new(),
+            },
+        }
+    }
+
+    fn tcp_test_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        (client, listener.accept().unwrap().0)
+    }
+
+    #[test]
+    fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let authority = Arc::new(crate::restricted::tests::tcp_test_authority(
+            temporary.path(),
+        ));
+        let key = vec![7; crate::tcp_records::KEY_LEN];
+        let token = b"replay-test";
+        let conn_id = 42u32;
+        let mut capture = Vec::new();
+        FrameWriter::new(
+            RecordWriter::new(&mut capture, Some(Cipher::new(&key, conn_id, 1))),
+            false,
+        )
+        .write_msg(&tcp_test_hello(token))
+        .unwrap();
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        // The original authenticates; changing only the high byte used to
+        // bypass the replay set while decrypting exactly the same records.
+        for (attempt, high) in [0u32, 1, 2, 128, 255, 0].into_iter().enumerate() {
+            let (mut client, server) = tcp_test_pair();
+            client
+                .write_all(&(conn_id | (high << 24)).to_be_bytes())
+                .unwrap();
+            client.write_all(&capture).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let result = serve_tcp(
+                server,
+                0,
+                Some(key.clone()),
+                token.to_vec(),
+                false,
+                false,
+                &seen,
+                Some(authority.clone()),
+                DescriptorSessionSlot::default(),
+                std::time::Instant::now() + Duration::from_secs(1),
+            );
+            if high != 0 {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds nonce space"));
+                // Rejection must precede the server's encrypted preamble.
+                let mut response = Vec::new();
+                let _ = client.read_to_end(&mut response);
+                assert!(response.is_empty());
+            } else if attempt != 0 {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate connection id"));
+            } else {
+                result.unwrap();
+                assert!(seen.lock().unwrap().contains(&conn_id));
+            }
+            assert_eq!(
+                *seen.lock().unwrap(),
+                std::collections::HashSet::from([conn_id])
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_partial_handshakes_time_out_without_reserving_ids() {
+        for encrypted in [false, true] {
+            // Stop inside the ID, after a complete preamble record, and
+            // inside the Hello record. None of these authenticates a peer.
+            for part in 0..3 {
+                let key = encrypted.then(|| vec![9; crate::tcp_records::KEY_LEN]);
+                let id = 43u32;
+                let mut preamble = Vec::new();
+                FrameWriter::new(
+                    RecordWriter::new(
+                        &mut preamble,
+                        key.as_ref().map(|key| Cipher::new(key, id, 1)),
+                    ),
+                    false,
+                )
+                .write_preamble()
+                .unwrap();
+                let mut hello = Vec::new();
+                FrameWriter::new(
+                    RecordWriter::new(&mut hello, key.as_ref().map(|key| Cipher::new(key, id, 1))),
+                    false,
+                )
+                .write_msg(&tcp_test_hello(b"timeout-test"))
+                .unwrap();
+                let mut bytes = id.to_be_bytes().to_vec();
+                match part {
+                    0 => bytes.truncate(1),
+                    1 => bytes.extend_from_slice(&preamble),
+                    _ => bytes.extend_from_slice(&hello[..hello.len() - 1]),
+                }
+                let (mut client, server) = tcp_test_pair();
+                client.write_all(&bytes).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+                    let result = serve_tcp(
+                        server,
+                        0,
+                        key,
+                        b"timeout-test".to_vec(),
+                        false,
+                        false,
+                        &seen,
+                        None,
+                        DescriptorSessionSlot::default(),
+                        std::time::Instant::now() + Duration::from_millis(100),
+                    );
+                    tx.send((result, seen.into_inner().unwrap())).unwrap();
+                });
+                let result = rx.recv_timeout(Duration::from_secs(3));
+                // Ensure a regression never leaves a blocked server thread.
+                client.shutdown(std::net::Shutdown::Both).ok();
+                worker.join().unwrap();
+                let (result, seen) =
+                    result.expect("partial TCP Hello held a worker past its deadline");
+                assert!(result.is_err());
+                assert!(seen.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_hello_clears_timeouts_only_after_authentication() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let authority = Arc::new(crate::restricted::tests::tcp_test_authority(
+            temporary.path(),
+        ));
+        for encrypted in [false, true] {
+            let key = encrypted.then(|| vec![8; crate::tcp_records::KEY_LEN]);
+            let server_key = key.clone();
+            let authority = authority.clone();
+            let (client, server) = tcp_test_pair();
+            let observer = server.try_clone().unwrap();
+            let worker = std::thread::spawn(move || {
+                let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+                serve_tcp(
+                    server,
+                    0,
+                    server_key,
+                    b"valid-token".to_vec(),
+                    false,
+                    false,
+                    &seen,
+                    Some(authority),
+                    DescriptorSessionSlot::default(),
+                    std::time::Instant::now() + Duration::from_millis(100),
+                )
+            });
+            (&client).write_all(&44u32.to_be_bytes()).unwrap();
+            let mut writer = FrameWriter::new(
+                RecordWriter::new(
+                    client.try_clone().unwrap(),
+                    key.as_ref().map(|key| Cipher::new(key, 44, 1)),
+                ),
+                false,
+            );
+            let mut reader = FrameReader::new(RecordReader::new(
+                client.try_clone().unwrap(),
+                key.as_ref().map(|key| Cipher::new(key, 44, 2)),
+            ));
+            writer.write_msg(&tcp_test_hello(b"valid-token")).unwrap();
+            assert!(matches!(
+                reader.read_msg::<Response>().unwrap(),
+                Response::HelloOk { .. }
+            ));
+            // Wait beyond the handshake deadline, then prove the worker is
+            // still alive and both shared socket timeouts have been cleared.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(observer.read_timeout().unwrap(), None);
+            assert_eq!(observer.write_timeout().unwrap(), None);
+            assert!(!worker.is_finished());
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            worker.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn tcp_handshake_deadline_does_not_reset_after_partial_reads() {
+        let (mut client, server) = tcp_test_pair();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = TcpHandshakeReader {
+            stream: server,
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deadline: std::time::Instant::now() + Duration::from_millis(100),
+        };
+        client.write_all(b"a").unwrap();
+        reader.read_exact(&mut [0]).unwrap();
+        assert!(reader.stream.read_timeout().unwrap().is_some());
+        std::thread::sleep(Duration::from_millis(150));
+        client.write_all(b"b").unwrap();
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
     }
 
     /// Connect to the data listener and complete a token-authenticated Hello

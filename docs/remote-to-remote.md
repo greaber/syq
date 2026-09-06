@@ -33,9 +33,10 @@ syq cp results --to hostB --into /archive
 
 Syq looks for a live receiving machine automatically before trying SSH from
 hostA. It checks names in alphabetical order, allowing up to two seconds for
-each readiness reply, and uses the first available matching build. Offline or
-incompatible registrations are skipped. With none available, it uses ordinary
-SSH. Options this route cannot support also use ordinary SSH automatically.
+each readiness reply, and uses the first available registration. If its build
+differs, the command automatically hands off to that machine's registered
+helper. Offline or unsupported registrations are skipped. With none available,
+it uses ordinary SSH. Options this route cannot support also use ordinary SSH automatically.
 A copy addressed to a live receiving name still goes to that machine itself.
 
 These choices apply to `syq cp` with local sources and an SSH destination.
@@ -47,8 +48,8 @@ The older `--via NAME` spelling remains an alias for `--auth-from @NAME`;
 every bare `--via` value is still a receiving name.
 
 The selected laptop asks for approval before contacting hostB. Approve with the desktop
-prompt or `syq recv pending` and `syq recv approve REQUEST_ID` on the laptop.
-These requests require a decision even when `recv --approve always` permits
+prompt or `syq persist receive pending` and `syq persist receive approve REQUEST_ID` on the laptop.
+These requests require a decision even when `persist receive on --approve always` permits
 automatic copies onto the laptop itself. Once an approval request is sent,
 a refusal, interrupted connection, setup failure, or copy failure ends that
 attempt; syq does not try another authorizer or SSH. Explicit receiving names
@@ -73,8 +74,10 @@ ceilings still apply. The helper on hostB checks the approved copy permissions a
 control and SSH authority files. The source verifies its signed receipt before
 reporting success. No durable receiver enrollment or reusable grant is created.
 
-All three machines must use the same syq build. Keep the source command and
-the laptop's return connection alive until completion. Stopping receiving or
+The source command may be a different build: it invokes the laptop's registered
+helper before requesting approval. That helper and the helper started on hostB
+use the laptop's build. Keep the source command and the laptop's return
+connection alive until completion. Stopping receiving or
 losing that connection cancels the copy. After hostB approves setup, the source
 has 60 seconds to start its handshake and then 10 seconds to complete it.
 Retry with a new approval to resume eligible partial files. This route accepts

@@ -79,9 +79,7 @@ eval "$(syq completion bash)"
 
 # Zsh (~/.zshrc), after autoload -Uz compinit && compinit
 source <(syq completion zsh)
-```
 
-```fish
 # fish (~/.config/fish/config.fish)
 syq completion fish | source
 ```
@@ -117,8 +115,8 @@ syq persist off
 
 Persistence also enables [background receiving](receive.md) from the server
 accounts syq connects to. Incoming copies require approval on your machine;
-the default destination is your home directory. Use `syq recv off` to keep only ordinary connection reuse, or
-`syq recv on --root DIRECTORY` to contain receiving in an existing directory.
+the default destination is your home directory. Use `syq persist receive off` to keep only ordinary connection reuse, or
+`syq persist receive on --root DIRECTORY` to contain receiving in an existing directory.
 
 Ordinary SSH connections can stay reusable for up to ten minutes after your last command.
 During that window, other processes running as your user can reuse the login

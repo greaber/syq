@@ -139,8 +139,7 @@ pub struct Opts {
     pub ignore_existing: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Explicit rsync compatibility escape hatch for unconfined source
-    /// discovery through symlinked descendant components.
+    /// Record the local rsync operator-path opt-out in the resume identity.
     pub insecure_links: bool,
     /// Symlink policy for the operator-selected destination path.
     pub operator_symlink_policy: OperatorSymlinkPolicy,
@@ -1433,10 +1432,22 @@ fn announce_detached_ready() -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: Args) -> Result<i32> {
-    // The results stream and progress exist before anything else can fail,
-    // so every run that got past argument parsing settles with a terminal
-    // record — fatal setup failures included (spec: automation results).
+pub fn run(mut args: Args) -> Result<i32> {
+    // Re-exec before consuming stdin or opening results. A failed handoff still
+    // settles the normal automation stream below.
+    let handoff = crate::destination::handoff::copy(&mut args);
+    if handoff.is_ok() {
+        // Finish input validation in the executing build, before opening results.
+        // Preserve the argument-error exit status and absence of an automation
+        // stream when reading an input fails.
+        if let Err(error) = args.read_copy_inputs() {
+            crate::output::diagnostic!("syq: {error:#}");
+            return Ok(2);
+        }
+    }
+    // Create results and progress before reporting any setup failure, so a
+    // failure in this process settles with a terminal record (spec: automation
+    // results). A successful exec hands that responsibility to the helper.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
     let progress = Progress::new(
         show_progress,
@@ -1459,7 +1470,7 @@ pub fn run(args: Args) -> Result<i32> {
     let dry_run = args.dry_run;
     let verify_only = args.verify_only;
     let prune = args.delete;
-    let outcome = run_transfer(args, Arc::clone(&progress));
+    let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
     if outcome.is_err() {
         // run_transfer's ticker guard has stopped and joined on every return,
         // including failures in deferred metadata and deletion finalization.
@@ -1941,10 +1952,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone())
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux")
-                                && opts.same_host
-                                && !opts.insecure_links
-                            {
+                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
                                 initial_sources.clone()
                             } else {
                                 Vec::new()
@@ -2018,11 +2026,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     if let Some(benchmark) = &opts.benchmark {
                         benchmark.lock().unwrap().add(worker.benchmark);
                     }
-                    if collect_tcp_stats {
+                    let invalid_range = result
+                        .as_ref()
+                        .is_err_and(|error| error.is::<RangeReplyMismatch>());
+                    if collect_tcp_stats && !invalid_range {
                         let stats = worker.collect_transport_stats();
                         transport_stats.lock().unwrap().extend(stats);
                     }
-                    let dropped = result.is_err() && worker.transport_dead();
+                    let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
                         Ok(()) => {
                             gate.mark_absent(id);
@@ -2130,12 +2141,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // source capabilities from the source endpoint's broker before reporting
     // ready. These are foreign-session claims even when both logical endpoints
     // are local to the coordinator process.
-    let copy_local_claim_workers =
-        if cfg!(target_os = "linux") && opts.same_host && !opts.insecure_links {
-            maximum_workers
-        } else {
-            0
-        };
+    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
+        maximum_workers
+    } else {
+        0
+    };
     let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;
@@ -3566,6 +3576,26 @@ fn stat_many(
     stat_many_registered(conn, paths, None, follow)
 }
 
+#[derive(Debug)]
+struct RangeReplyMismatch;
+
+impl std::fmt::Display for RangeReplyMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source range reply violates the protocol")
+    }
+}
+
+impl std::error::Error for RangeReplyMismatch {}
+
+fn validate_range_reply(expected_off: u64, expected_len: u64, off: u64, len: usize) -> Result<()> {
+    if off != expected_off || len as u64 != expected_len || off.checked_add(len as u64).is_none() {
+        return Err(anyhow::Error::new(RangeReplyMismatch).context(format!(
+            "source block range ({off}, {len}) does not match requested range ({expected_off}, {expected_len})"
+        )));
+    }
+    Ok(())
+}
+
 fn stat_many_registered(
     conn: &mut dyn Conn,
     paths: Vec<PathBytes>,
@@ -3831,7 +3861,7 @@ fn register_source_roots(
             base,
             selections,
             symlink_policy: source_operator_symlink_policy(args, source_is_local),
-            allow_unconfined_paths: rsync_insecure_links(args, source_is_local),
+            allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,
         })?,
@@ -4150,7 +4180,7 @@ fn follow_container_symlink(
 }
 
 fn display(p: &[u8]) -> String {
-    String::from_utf8_lossy(p).into_owned()
+    crate::completion_details::display_bytes(p)
 }
 
 fn display_directory(p: &[u8]) -> String {
@@ -4851,11 +4881,7 @@ impl Planner<'_> {
             self,
             src,
             src_root,
-            if self.opts.insecure_links {
-                None
-            } else {
-                Some(&source)
-            },
+            Some(&source),
             follow_root,
             &ignore,
             |pl, batch| {
@@ -4926,9 +4952,8 @@ impl Planner<'_> {
 
     /// --files-from: instead of walking the source, stat each listed path (and
     /// the directories leading to it) and feed them to the planner as if a scan
-    /// had produced them. By default, implied parents are descriptor-relative
-    /// and never traversed through symlinks. `--insecure-links` selects the
-    /// legacy unconfined pathname behavior explicitly. Listed directories —
+    /// had produced them. Implied parents are descriptor-relative and never
+    /// traversed through symlinks, including with `--insecure-links`. Listed directories —
     /// only those, not implied parents — are walked with an explicit -r.
     fn scan_files_from(
         &mut self,
@@ -4945,16 +4970,12 @@ impl Planner<'_> {
             .context("registered source reference was not initialized")?;
         // Validate the root but never plan it: it isn't in the list, so an
         // existing destination is not stamped with source-root metadata.
-        let mut source_root_stat = if self.opts.insecure_links {
-            stat_many(src, vec![src_root.to_vec()], true)?
-        } else {
-            stat_many_registered(
-                src,
-                vec![src_root.to_vec()],
-                Some(vec![source_base.clone()]),
-                true,
-            )?
-        };
+        let mut source_root_stat = stat_many_registered(
+            src,
+            vec![src_root.to_vec()],
+            Some(vec![source_base.clone()]),
+            true,
+        )?;
         match source_root_stat.pop().flatten() {
             Some(e) if e.kind == Kind::Dir => {}
             Some(_) => bail!(
@@ -4967,8 +4988,7 @@ impl Planner<'_> {
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
         // Implied ancestors must be directories. Registered stats never follow
-        // descendant symlinks; only --insecure-links uses legacy followed
-        // pathname stats. Results are kept for the whole list, since a later
+        // descendant symlinks. Results are kept for the whole list, since a later
         // line may repeat a path or name one first seen as a parent.
         let mut leaves: HashMap<PathBytes, Option<Entry>> = HashMap::new();
         let mut parents: HashMap<PathBytes, Option<Entry>> = HashMap::new();
@@ -4984,9 +5004,6 @@ impl Planner<'_> {
         };
         let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| -> Result<_> {
             let legacy_paths = paths.iter().map(|r| join(src_root, r)).collect();
-            if self.opts.insecure_links {
-                return stat_many(src, legacy_paths, follow);
-            }
             let registered = paths
                 .iter()
                 .map(|relative| source_base.join(relative))
@@ -5325,11 +5342,7 @@ impl Planner<'_> {
             self,
             src,
             &join(src_root, rel),
-            if self.opts.insecure_links {
-                None
-            } else {
-                Some(&source)
-            },
+            Some(&source),
             false,
             &[],
             |pl, batch| {
@@ -7326,16 +7339,17 @@ struct BlockDiff {
 }
 
 impl Worker {
-    /// Confined source sessions carry the registered capability on every
-    /// content request. Only rsync's explicit --insecure-links compatibility
-    /// mode intentionally asks the endpoint to use its legacy pathname.
+    /// Every content request carries the source capability, including when
+    /// the operator allowed a foreign-owned symlink in the typed root path.
     fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
-        (!self.opts.insecure_links).then(|| job.source.clone())
+        Some(job.source.clone())
     }
 
     fn run(&mut self) -> Result<()> {
         let r = self.run_inner();
-        if r.is_err() && !self.transport_dead() {
+        if r.as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>() || !self.transport_dead())
+        {
             // Fatal local/protocol failures cannot be healed by reopening a
             // transport. Wake peers so the whole transfer unwinds.
             self.sched.abort();
@@ -7661,12 +7675,8 @@ impl Worker {
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
         let phase = std::time::Instant::now();
-        let now = if self.opts.insecure_links {
-            stat_many(&mut *self.src, paths, false)?
-        } else {
-            let registered = jobs.iter().map(|job| job.source.clone()).collect();
-            stat_many_registered(&mut *self.src, paths, Some(registered), false)?
-        };
+        let registered = jobs.iter().map(|job| job.source.clone()).collect();
+        let now = stat_many_registered(&mut *self.src, paths, Some(registered), false)?;
         self.fast.restat += phase.elapsed().as_secs_f64();
         let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
@@ -7764,7 +7774,10 @@ impl Worker {
     }
 
     fn file_error(&mut self, idx: usize, e: anyhow::Error) -> Result<()> {
-        if self.src.is_dead() || self.dst.is_dead() {
+        // Range validation can leave pipelined source replies and destination
+        // acknowledgments unread. End this worker and abort the copy; neither
+        // connection may serve another job or enter transport recovery.
+        if e.is::<RangeReplyMismatch>() || self.transport_dead() {
             return Err(e);
         }
         if !self.sched.is_failed(idx) {
@@ -7839,7 +7852,6 @@ impl Worker {
         // uses the regular userspace path (also useful for mounted NFS paths).
         if self.opts.same_host
             && !self.opts.tuning.force_ranges()
-            && !self.opts.insecure_links
             && !self.opts.checksum
             && self.bwlimit.is_none()
             && job.entry.size > 0
@@ -8233,7 +8245,7 @@ impl Worker {
             1
         };
         let inplace = job.inplace;
-        let mut reads_out = 0usize;
+        let mut pending_reads = std::collections::VecDeque::new();
         let mut writes_out = 0usize;
         let result = (|| -> Result<()> {
             loop {
@@ -8246,7 +8258,7 @@ impl Worker {
                     // worker picks it up; what's already requested still completes.
                     self.sched.release_rest(h);
                 }
-                while reads_out < read_window {
+                while pending_reads.len() < read_window {
                     let (off, n) = {
                         let mut g = h.lock().unwrap();
                         if g.pos >= g.end {
@@ -8267,19 +8279,20 @@ impl Worker {
                     })?;
                     self.benchmark.range_requests += 1;
                     self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
-                    reads_out += 1;
+                    pending_reads.push_back((off, n));
                 }
-                if reads_out == 0 {
+                if pending_reads.is_empty() {
                     break;
                 }
                 let t0 = std::time::Instant::now();
                 let response = self.src.recv();
-                reads_out -= 1;
+                let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
                 self.t[0] += t0.elapsed().as_secs_f64();
                 let (off, hash, data) = match ok(response?, "read")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     other => bail!("unexpected response {other:?}"),
                 };
+                validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
                 let t0 = std::time::Instant::now();
                 self.dst.send(Request::WriteRange {
@@ -8307,12 +8320,22 @@ impl Worker {
             }
             Ok(())
         })();
+        // A malformed source is not an ordinary endpoint error. Preserve
+        // master's fail-closed behavior: never drain or reuse this worker's
+        // connections, and let the caller abort the whole copy.
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>())
+        {
+            return result;
+        }
         // Ordinary endpoint errors consume one response but do not break the
         // connection. Drain all previously issued reads and writes before any
         // later file (including an automatically streamed range) can use it.
         // Evaluate both drains even if the operation or first drain failed.
         let t0 = std::time::Instant::now();
-        let source_end = crate::conn::drain_range_replies(&mut *self.src, reads_out, "read");
+        let source_end =
+            crate::conn::drain_range_replies(&mut *self.src, pending_reads.len(), "read");
         self.t[0] += t0.elapsed().as_secs_f64();
         let t0 = std::time::Instant::now();
         let destination_end = crate::conn::drain_range_replies(&mut *self.dst, writes_out, "write");
@@ -8384,10 +8407,7 @@ impl Worker {
                 };
                 self.t[0] += t0.elapsed().as_secs_f64();
                 let requested = (end - expected).min(block);
-                anyhow::ensure!(
-                    off == expected && data.len() as u64 == requested,
-                    "read stream returned an incorrect offset or block length"
-                );
+                validate_range_reply(expected, requested, off, data.len())?;
                 expected += requested;
                 let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
                 self.benchmark.stream_discarded_bytes += requested - claimed;
@@ -8416,6 +8436,15 @@ impl Worker {
             }
             Ok(())
         })();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<RangeReplyMismatch>())
+        {
+            // As with ordinary ranges, do not wait for more messages from a
+            // source that violated the protocol. Dropping the connections
+            // cancels the collector; the caller aborts rather than reconnects.
+            return result;
+        }
         // Always restore both protocol boundaries, even after a local write
         // error. No following file can consume this one's data or late errors.
         let (source_end, destination_end, destination_wait) =
@@ -8551,11 +8580,7 @@ impl Worker {
     /// the source changed during that work.
     fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
         // Did the source change under us?
-        let now = if self.opts.insecure_links {
-            stat_one(&mut *self.src, &job.src, false)?
-        } else {
-            stat_one_registered(&mut *self.src, &job.src, &job.source, false)?
-        };
+        let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
         let changed = match &now {
             Some(e) => {
                 e.kind != Kind::File
@@ -8681,6 +8706,235 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_block_must_match_the_requested_range() {
+        assert!(validate_range_reply(4096, 1024, 4096, 1024).is_ok());
+        for (off, len) in [
+            (0, 1024),
+            (8192, 1024),
+            (4096, 0),
+            (4096, 1023),
+            (4096, 1025),
+            (u64::MAX, 1024),
+        ] {
+            assert!(validate_range_reply(4096, 1024, off, len).is_err());
+        }
+        assert!(validate_range_reply(u64::MAX, 1, u64::MAX, 1).is_err());
+    }
+
+    #[derive(Default)]
+    struct PipelineState {
+        requests: Vec<Request>,
+        replies: std::collections::VecDeque<Response>,
+        received: usize,
+    }
+
+    struct PipelineConn(Arc<Mutex<PipelineState>>);
+
+    impl Conn for PipelineConn {
+        fn begin_streaming_writes(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn check_streaming_writes(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn send(&mut self, request: Request) -> Result<()> {
+            self.0.lock().unwrap().requests.push(request);
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Response> {
+            let mut state = self.0.lock().unwrap();
+            state.received += 1;
+            Ok(state.replies.pop_front().expect("unexpected receive"))
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
+        // Exercise both callers of transfer_range: initial file work and a
+        // queued range. Another file is ready when the malicious reply arrives.
+        for streaming in [false, true] {
+            for queued_range in [false, true] {
+                for wrong_length in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("source");
+                    std::fs::write(&path, vec![0; 4096]).unwrap();
+                    let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+                    let sched = Arc::new(Sched::new(512, 8192));
+                    let job = FileJob {
+                        src: b"first".to_vec(),
+                        source: RegisteredPath {
+                            root: serde_json::from_str("0").unwrap(),
+                            relative: b"first".to_vec(),
+                        },
+                        dst: b"first-dst".to_vec(),
+                        rel: "first".into(),
+                        entry,
+                        dst_entry: None,
+                        target_condition: TargetCondition::Any,
+                        container_guard: None,
+                        attempt: 0,
+                        done: Arc::new(AtomicU64::new(0)),
+                        inplace: false,
+                        rel_bytes: b"first".to_vec(),
+                        src_rel: None,
+                    };
+                    sched.push_file(job.clone());
+                    let mut next = job;
+                    next.src = b"second".to_vec();
+                    next.dst = b"second-dst".to_vec();
+                    sched.push_file(next);
+                    sched.scan_done();
+                    if queued_range {
+                        assert!(matches!(sched.next(), Item::File(0)));
+                        let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+                        sched.retry_range(&range, 0);
+                    }
+                    let src = Arc::new(Mutex::new(PipelineState::default()));
+                    if streaming {
+                        src.lock().unwrap().replies.push_back(Response::Ok);
+                    }
+                    for i in 0..5 {
+                        let data = vec![0; if i == 1 && wrong_length { 511 } else { 512 }];
+                        src.lock().unwrap().replies.push_back(Response::Block {
+                            off: if i == 1 && !wrong_length {
+                                999
+                            } else {
+                                i * 512
+                            },
+                            hash: content_digest(&data),
+                            data,
+                        });
+                    }
+                    let dst = Arc::new(Mutex::new(PipelineState::default()));
+                    if !queued_range {
+                        dst.lock()
+                            .unwrap()
+                            .replies
+                            .push_back(Response::PartialSize(None));
+                    }
+                    dst.lock().unwrap().replies.push_back(Response::Ok);
+                    let opts = Arc::new(Opts {
+                        block: 512,
+                        tuning: crate::transfer_tuning::TransferTuning {
+                            copy_path: (!streaming)
+                                .then_some(crate::transfer_tuning::CopyPath::Ranges),
+                            pipeline_depth: (!streaming).then_some(4),
+                            ..Default::default()
+                        },
+                        benchmark: None,
+                        flags: 0,
+                        recursive: true,
+                        links: false,
+                        perms: false,
+                        devices: false,
+                        checksum: false,
+                        verify_only: false,
+                        inplace: false,
+                        same_host: false,
+                        allow_sequential_nfs_fallback: false,
+                        dst_remote: true,
+                        restricted_receiver: false,
+                        dry_run: false,
+                        quiet: true,
+                        verbose: 0,
+                        umask: 0,
+                        copy_id: std::sync::OnceLock::from([0; 16]),
+                        ignore: Vec::new(),
+                        delete: false,
+                        delete_excluded: false,
+                        max_delete: None,
+                        update: false,
+                        ignore_existing: false,
+                        existing: false,
+                        insecure_links: false,
+                        operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+                        max_size: None,
+                        min_size: None,
+                    });
+                    let mut worker = Worker {
+                        id: 0,
+                        src: Box::new(PipelineConn(src.clone())),
+                        dst: Box::new(PipelineConn(dst.clone())),
+                        sched: sched.clone(),
+                        progress: Progress::new(false, false, None, false),
+                        opts,
+                        bwlimit: None,
+                        gate: Gate::new(1),
+                        t: [0.0; 4],
+                        fast: FastTiming::default(),
+                        benchmark: Default::default(),
+                        fast_batch_files: 1,
+                    };
+                    let error = worker.run().unwrap_err();
+                    assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
+                    assert!(sched.is_aborted());
+                    assert!(
+                        !worker.transport_dead(),
+                        "protocol failure, not a lost socket"
+                    );
+                    let source = src.lock().unwrap();
+                    assert_eq!(source.received, 2 + usize::from(streaming));
+                    assert_eq!(source.replies.len(), 3);
+                    if streaming {
+                        assert_eq!(source.requests.len(), 1);
+                        assert!(
+                            matches!(&source.requests[0], Request::ReadStream(stream) if stream.path == b"first")
+                        );
+                    } else {
+                        assert_eq!(source.requests.len(), 5);
+                        assert!(source.requests.iter().all(|request| matches!(
+                            request, Request::ReadRange { path, .. } if path == b"first"
+                        )));
+                    }
+                    let destination = dst.lock().unwrap();
+                    assert_eq!(destination.received, usize::from(!queued_range));
+                    assert_eq!(
+                        destination.replies.len(),
+                        1,
+                        "write ack remains outstanding"
+                    );
+                    let writes: Vec<_> = destination
+                        .requests
+                        .iter()
+                        .filter(|request| matches!(request, Request::WriteRange { .. }))
+                        .collect();
+                    assert_eq!(writes.len(), 1);
+                    assert!(
+                        matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
+                    );
+                    assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
+                }
+            }
+        }
+    }
 
     /// Enforce send-before-receive ordering while exercising the real local
     /// receiver. Inject response failures to check that every reply is drained.

@@ -94,7 +94,9 @@ except syq.SyqOperationError as error:
 
 Use `check=False` to receive unsuccessful results without that exception.
 Invalid arguments, installation failures, and incomplete or invalid results
-still raise exceptions. Completed filesystem changes are not rolled back.
+still raise exceptions. Catch `syq.SyqError` to handle any SDK-defined exception,
+or catch a specific subclass as above. Completed filesystem changes are not
+rolled back.
 
 ## Watch events and save results
 
@@ -125,18 +127,17 @@ Create a mapping, change its destination paths, then copy:
 from dataclasses import replace
 
 with syq.map(srcs_in="photos") as mapping:
-    entries = (
-        replace(entry, dst=syq.RelativePath("archive") / entry.dst)
-        for entry in mapping
+    renamed = mapping.transform(
+        lambda entry: replace(entry, dst=syq.RelativePath("archive") / entry.dst)
     )
-    result = syq.cp(mapping=entries, cwd=mapping.cwd, into="published")
+    result = syq.cp(mapping=renamed, into="published")
 ```
 
-This places the contents of `photos` under `published/archive`. Pass
-`mapping.cwd` through unchanged so the copy uses the mapping's source base.
-If the mapping required `follow_src=True`, use it on the copy too.
-The iterable must finish successfully before copying starts; a failed transform
-leaves the destination untouched. See
+This places the contents of `photos` under `published/archive`. The mapping
+carries its source base and symlink-following policy through the transform.
+Return `None` from the transform to skip an entry. The entire transform must
+finish successfully before copying starts; a failed transform leaves the
+destination untouched. See
 [Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
 
 ## Use asyncio
@@ -162,7 +163,7 @@ Async event callbacks are awaited in record order. Mapping streams use
 async def copy_photos():
     client = syq.AsyncClient()
     async with client.map(srcs_in="photos") as mapping:
-        return await client.cp(mapping=mapping, cwd=mapping.cwd, into="published")
+        return await client.cp(mapping=mapping, into="published")
 ```
 
 <a id="custom-executable-override"></a>
@@ -177,7 +178,12 @@ result = client.cp("data", into="backup")
 ```
 
 `process_cwd` sets the local subprocess directory; typed `cwd` sets the source
-base, which may be on a remote host.
+base, which may be on a remote host. Omit `timeout` on a call to use the client
+default; pass `timeout=None` to disable it for that call:
+
+```python
+result = client.cp("data", into="backup", timeout=None)
+```
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
 This bypasses the managed version; see

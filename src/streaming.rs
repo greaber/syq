@@ -134,7 +134,7 @@ fn claim_block_with_digest(
     }
 }
 
-pub(crate) type Responses = mpsc::Receiver<io::Result<Response>>;
+pub(crate) type Responses = mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Response>>>;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Failure {
@@ -179,11 +179,14 @@ impl WriteReplies {
                 // Normally woken by a reply, not a timer. The timeout only
                 // lets a failed sender cancel without leaking a drain thread.
                 match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(Ok(Response::WriteStreamDone)) => {
-                        status.lock().unwrap().fenced = true;
-                        break;
+                    Ok(Ok(message)) => {
+                        let (response, _hold) = message.into_parts();
+                        if matches!(response, Response::WriteStreamDone) {
+                            status.lock().unwrap().fenced = true;
+                            break;
+                        }
+                        status.lock().unwrap().record(response);
                     }
-                    Ok(Ok(response)) => status.lock().unwrap().record(response),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     message => {
                         let error = match message {
@@ -489,10 +492,10 @@ mod tests {
         let (finished, done) = mpsc::channel();
         let sender = std::thread::spawn(move || {
             for _ in 0..10_000 {
-                tx.send(Ok(Response::Ok)).unwrap();
+                tx.send(queued(Response::Ok)).unwrap();
             }
-            tx.send(Ok(Response::WriteStreamDone)).unwrap();
-            tx.send(Ok(Response::Path(b"next operation".to_vec())))
+            tx.send(queued(Response::WriteStreamDone)).unwrap();
+            tx.send(queued(Response::Path(b"next operation".to_vec())))
                 .unwrap();
             finished.send(()).unwrap();
         });
@@ -501,7 +504,10 @@ mod tests {
         let (rx, state) = replies.finish(false);
         assert_eq!(state.count, 10_000);
         assert!(state.fenced && state.error.is_none());
-        assert!(matches!(rx.recv().unwrap().unwrap(), Response::Path(_)));
+        assert!(matches!(
+            rx.recv().unwrap().unwrap().value,
+            Response::Path(_)
+        ));
         sender.join().unwrap();
     }
 
@@ -509,15 +515,16 @@ mod tests {
     fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
         let (tx, rx) = mpsc::channel();
         let replies = WriteReplies::spawn(rx);
-        tx.send(Ok(Response::Ok)).unwrap();
-        tx.send(Ok(Response::EndpointError(WireError {
+        tx.send(queued(Response::Ok)).unwrap();
+        tx.send(queued(Response::EndpointError(WireError {
             message: "disk full".into(),
             io_kind: Some(crate::proto::WireIoKind::NoSpace),
             raw_os_error: None,
         })))
         .unwrap();
-        tx.send(Ok(Response::Err("later error".into()))).unwrap();
-        tx.send(Ok(Response::WriteStreamDone)).unwrap();
+        tx.send(queued(Response::Err("later error".into())))
+            .unwrap();
+        tx.send(queued(Response::WriteStreamDone)).unwrap();
         let (_, state) = replies.finish(false);
         assert_eq!(state.count, 3);
         assert!(state.fenced);
@@ -530,7 +537,7 @@ mod tests {
     fn streaming_replies_eof_is_not_success_and_abort_wakes_a_quiet_collector() {
         let (tx, rx) = mpsc::channel();
         let replies = WriteReplies::spawn(rx);
-        tx.send(Ok(Response::Ok)).unwrap();
+        tx.send(queued(Response::Ok)).unwrap();
         drop(tx);
         let (_, state) = replies.finish(false);
         assert!(!state.fenced && matches!(state.error, Some(Failure::Transport(_))));
@@ -539,5 +546,12 @@ mod tests {
         let start = std::time::Instant::now();
         let _ = replies.finish(true);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    fn queued(value: Response) -> io::Result<crate::wire_budget::Budgeted<Response>> {
+        Ok(crate::wire_budget::Budgeted {
+            value,
+            hold: crate::wire_budget::Hold::new(),
+        })
     }
 }

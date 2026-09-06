@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      scope_commit:
+        description: Commit whose diff determines the selected checks
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.run_id }}
@@ -36,6 +41,8 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: changes
+        env:
+          SYQ_CI_SCOPE_COMMIT: ${{ inputs.scope_commit }}
         run: scripts/ci-scope.sh "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   rust:

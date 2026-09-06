@@ -404,7 +404,9 @@ impl SshEndpoint {
             words.extend(["-p".to_owned(), port.to_string()]);
         }
         words.extend(["--".to_owned(), self.target.clone()]);
-        shell_words::join(words)
+        // OpenSSH expands percent tokens even inside shell quotes. Escape
+        // literal endpoint bytes before inserting them in ProxyCommand.
+        shell_words::join(words).replace('%', "%%")
     }
 }
 
@@ -678,6 +680,16 @@ mod tests {
                 .as_str(),
             "backup_user@host-b.example"
         );
+    }
+
+    #[test]
+    fn native_proxy_target_preserves_literal_percent_tokens() {
+        let endpoint = SshEndpoint::from_parts("user%h", "fe80::1%eth0", Some(2222)).unwrap();
+        assert_eq!(
+            endpoint.proxy_target(),
+            "-p 2222 -- 'user%%h@fe80::1%%eth0'"
+        );
+        assert_eq!(endpoint.as_str(), "user%h@fe80::1%eth0");
     }
 
     #[test]

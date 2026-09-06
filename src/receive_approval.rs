@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -39,18 +38,58 @@ pub(crate) enum Notifications {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Kind {
+    #[default]
+    Copy,
+    Command,
+}
+impl Kind {
+    pub(crate) fn is_copy(&self) -> bool {
+        *self == Self::Copy
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Self::Copy => "syq: incoming copy",
+            Self::Command => "syq: incoming command",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Summary {
     pub id: String,
     pub from: String,
-    pub destination: String,
-    pub permission: String,
-    pub max_bytes: u64,
-    pub max_entries: u64,
-    pub max_delete: u64,
-    pub preserve_permissions: bool,
     pub expires_at: u64,
     pub notification: String,
+    #[serde(flatten)]
+    pub details: Details,
+}
+// Preserve the released copy JSON fields. Commands have their own explicit
+// kind and no fabricated copy fields: old copy-only readers reject them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Details {
+    Command {
+        kind: CommandKind,
+        argv: Vec<String>,
+        cwd: String,
+        permission: String,
+    },
+    Copy {
+        destination: String,
+        permission: String,
+        max_bytes: u64,
+        max_entries: u64,
+        max_delete: u64,
+        preserve_permissions: bool,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandKind {
+    Command,
 }
 impl Summary {
     fn new(
@@ -78,23 +117,39 @@ impl Summary {
             // Debug formatting preserves unusual bytes and escapes terminal
             // control characters. Do not interpret remote text as UI markup.
             from: format!("{from:?}"),
-            destination: format!(
-                "{:?}",
-                std::ffi::OsStr::from_bytes(&request.copy.destination)
-            ),
-            permission: permission.into(),
-            max_bytes: request.copy.limits.max_total_bytes,
-            max_entries: request.copy.limits.max_entries,
-            max_delete: request.copy.limits.max_deletions,
-            preserve_permissions: request.copy.options.preserve_permissions,
+            details: Details::Copy {
+                destination: format!(
+                    "{:?}",
+                    std::ffi::OsStr::from_bytes(&request.copy.destination)
+                ),
+                permission: permission.into(),
+                max_bytes: request.copy.limits.max_total_bytes,
+                max_entries: request.copy.limits.max_entries,
+                max_delete: request.copy.limits.max_deletions,
+                preserve_permissions: request.copy.options.preserve_permissions,
+            },
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                 + lifetime.as_secs(),
             notification: "starting".into(),
         })
     }
+    pub(crate) fn kind(&self) -> Kind {
+        match self.details {
+            Details::Copy { .. } => Kind::Copy,
+            Details::Command { .. } => Kind::Command,
+        }
+    }
     pub(crate) fn description(&self) -> String {
-        format!("From: {}\nDestination: {}\n{}\nLimits: {} bytes, {} entries; at most {} deletions.\nPreserve permissions: {}.\nSource contents have not been inspected by this machine.\n\nAllow this copy once?\nLocal command: syq recv approve {}", self.from, self.destination, self.permission,
-            self.max_bytes, self.max_entries, self.max_delete, self.preserve_permissions, self.id)
+        let body = match &self.details {
+            Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
+                format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine.\n\nAllow this copy once?"),
+            Details::Command { argv, cwd, permission, .. } =>
+                format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.\n\nRun this command once?", argv.join(" ")),
+        };
+        format!(
+            "From: {}\n{body}\nLocal command: syq persist receive approve {}",
+            self.from, self.id
+        )
     }
 }
 struct Pending {
@@ -116,13 +171,18 @@ impl Queue {
             .map(|p| p.summary.clone())
             .collect()
     }
-    pub(crate) fn decide(&self, id: &str, allow: bool) -> Result<()> {
+    pub(crate) fn decide(&self, id: &str, allow: bool, kind: Kind) -> Result<()> {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending
             .get_mut(id)
             .context("approval is unknown, expired, or already answered")?;
         if entry.decision.is_some() || Instant::now() >= entry.deadline {
             bail!("approval is expired or already answered");
+        }
+        if entry.summary.kind() != kind {
+            bail!(
+                "approval request kind differs; use a matching syq client to inspect and decide it"
+            );
         }
         entry.decision = Some(allow);
         Ok(())
@@ -155,12 +215,42 @@ impl Queue {
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         let mut summary = Summary::new(from, request, TIMEOUT)?;
-        summary.destination = format!(
-            "SSH {target:?}, path {:?} (relative paths and ~ refer to the destination login home)",
-            std::ffi::OsStr::from_bytes(&request.destination)
-        );
-        summary.permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
+        if let Details::Copy {
+            destination,
+            permission,
+            ..
+        } = &mut summary.details
+        {
+            *destination = format!(
+                "SSH {target:?}, path {:?} (relative paths and ~ refer to the destination login home)",
+                std::ffi::OsStr::from_bytes(&request.destination)
+            );
+            permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
+        }
         self.wait(summary, notifications, TIMEOUT, cancelled)
+    }
+    pub(crate) fn request_command(
+        &self,
+        from: &str,
+        argv: &[Vec<u8>],
+        cwd: &std::path::Path,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        self.wait(Summary {
+            id: id.iter().map(|b| format!("{b:02x}")).collect(),
+            from: format!("{from:?}"),
+            expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
+            notification: "starting".into(),
+            details: Details::Command {
+                kind: CommandKind::Command,
+                argv: argv.iter().map(|arg| format!("{:?}", std::ffi::OsStr::from_bytes(arg))).collect(),
+                cwd: format!("{cwd:?}"),
+                permission: "Runs as your local user with access to your files, programs and credentials. Copy root and copy limits do not contain this command. Stdin is closed.".into(),
+            },
+        }, notifications, TIMEOUT, cancelled)
     }
     fn wait(
         &self,
@@ -170,14 +260,14 @@ impl Queue {
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         if cancelled() {
-            bail!("copy disconnected before approval");
+            bail!("request disconnected before approval");
         }
         let id = summary.id.clone();
         let deadline = Instant::now() + lifetime;
         {
             let mut pending = self.pending.lock().unwrap();
             if pending.len() >= 8 {
-                bail!("too many copies awaiting approval");
+                bail!("too many requests awaiting approval");
             }
             pending.insert(
                 id.clone(),
@@ -202,29 +292,37 @@ impl Queue {
             id: id.clone(),
         };
         let mut notification = if notifications == Notifications::Desktop {
-            match Notification::spawn(&summary.description(), lifetime) {
+            match Notification::spawn(&summary.description(), lifetime, summary.kind().title()) {
                 Ok(notification) => {
-                    self.notification_status(&id, "desktop prompt requested; use local recv approve/deny if it is not visible".into());
+                    self.notification_status(&id, "desktop prompt requested; use local syq persist receive approve/deny if it is not visible".into());
                     Some(notification)
                 }
                 Err(error) => {
                     self.notification_status(
                         &id,
-                        format!("unavailable: {error:#}; use local recv approve/deny"),
+                        format!(
+                            "unavailable: {error:#}; use local syq persist receive approve/deny"
+                        ),
                     );
                     None
                 }
             }
         } else {
-            self.notification_status(&id, "disabled; use local recv approve/deny".into());
+            self.notification_status(
+                &id,
+                "disabled; use local syq persist receive approve/deny".into(),
+            );
             None
         };
         loop {
             if cancelled() {
-                bail!("copy disconnected or receiving stopped while awaiting approval");
+                bail!("request disconnected or receiving stopped while awaiting approval");
             }
             if Instant::now() >= deadline {
-                bail!("copy approval expired after {} seconds", lifetime.as_secs());
+                bail!(
+                    "request approval expired after {} seconds",
+                    lifetime.as_secs()
+                );
             }
             if let Some(allow) = self
                 .pending
@@ -234,11 +332,11 @@ impl Queue {
                 .and_then(|p| p.decision)
             {
                 if !allow {
-                    bail!("copy denied on the receiving machine");
+                    bail!("request denied on the receiving machine");
                 }
                 // An answer that races disconnect/expiry cannot survive it.
                 if cancelled() || Instant::now() >= deadline {
-                    bail!("copy approval expired or was cancelled");
+                    bail!("request approval expired or was cancelled");
                 }
                 return Ok(());
             }
@@ -249,22 +347,23 @@ impl Queue {
                 if process.error_seen.load(Ordering::Acquire) {
                     self.notification_status(
                         &id,
-                        "desktop reported an error; use local recv approve/deny".into(),
+                        "desktop reported an error; use local syq persist receive approve/deny"
+                            .into(),
                     );
                 }
                 if let Some(result) = process.poll() {
                     notification.take();
                     match result {
                         Ok(Some(allow)) => {
-                            let _ = self.decide(&id, allow);
+                            let _ = self.decide(&id, allow, summary.kind());
                         }
                         Ok(None) => self.notification_status(
                             &id,
-                            "dismissed; use local recv approve/deny".into(),
+                            "dismissed; use local syq persist receive approve/deny".into(),
                         ),
                         Err(error) => self.notification_status(
                             &id,
-                            format!("unavailable: {error:#}; use local recv approve/deny"),
+                            format!("unavailable: {error:#}; use local syq persist receive approve/deny"),
                         ),
                     }
                 }
@@ -286,7 +385,7 @@ fn escape_markup(text: &str) -> String {
 #[cfg(target_os = "macos")]
 const APPLESCRIPT: &str = r#"on run argv
     try
-        set answer to display dialog (item 1 of argv) with title "syq: incoming copy" buttons {"Deny", "Allow once"} default button "Deny" cancel button "Deny" giving up after (item 2 of argv as integer)
+        set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Deny", "Allow once"} default button "Deny" cancel button "Deny" giving up after (item 2 of argv as integer)
         if gave up of answer then return "expired"
         if button returned of answer is "Allow once" then return "allow"
         return "deny"
@@ -294,7 +393,7 @@ const APPLESCRIPT: &str = r#"on run argv
         return "deny"
     end try
 end run"#;
-fn notification_command(description: &str, lifetime: Duration) -> Command {
+fn notification_command(description: &str, lifetime: Duration, title: &str) -> Command {
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("/usr/bin/osascript");
@@ -304,6 +403,7 @@ fn notification_command(description: &str, lifetime: Duration) -> Command {
             "--",
             description,
             &lifetime.as_secs().max(1).to_string(),
+            title,
         ]);
         cmd
     }
@@ -318,7 +418,7 @@ fn notification_command(description: &str, lifetime: Duration) -> Command {
         ])
         .arg(format!("--expire-time={}", lifetime.as_millis()))
         .arg("--")
-        .arg("syq: incoming copy")
+        .arg(title)
         .arg(escape_markup(description));
         cmd
     }
@@ -344,68 +444,42 @@ fn capture(
     })
 }
 struct Notification {
-    child: Child,
-    closed: bool,
+    child: crate::process_group::ProcessGroup,
     error_seen: Arc<AtomicBool>,
     output: Option<std::thread::JoinHandle<Vec<u8>>>,
     errors: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 impl Notification {
-    fn spawn(description: &str, lifetime: Duration) -> Result<Self> {
-        Self::spawn_command(notification_command(description, lifetime))
+    fn spawn(description: &str, lifetime: Duration, title: &str) -> Result<Self> {
+        Self::spawn_command(notification_command(description, lifetime, title))
     }
     fn spawn_command(mut command: std::process::Command) -> Result<Self> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = command.spawn().context("start desktop approval prompt")?;
+            .stderr(Stdio::piped());
+        let mut child = crate::process_group::ProcessGroup::spawn(&mut command)
+            .context("start desktop approval prompt")?;
         let error_seen = Arc::new(AtomicBool::new(false));
-        let output = Some(capture(child.stdout.take().unwrap(), None));
+        let output = Some(capture(child.child.stdout.take().unwrap(), None));
         let errors = Some(capture(
-            child.stderr.take().unwrap(),
+            child.child.stderr.take().unwrap(),
             Some(error_seen.clone()),
         ));
         Ok(Self {
             child,
-            closed: false,
             error_seen,
             output,
             errors,
         })
     }
     fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if !self.closed {
-            self.closed = true;
-            // Keep the leader unreaped until after killing its process group.
-            // Its PID therefore cannot name an unrelated, newly created group.
-            unsafe {
-                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-            }
-        }
-        self.child.wait()
+        self.child.close()
     }
     fn poll(&mut self) -> Option<Result<Option<bool>>> {
-        // Observe exit without reaping: descendants may still hold our output
-        // pipes, and close must kill them before joining the capture threads.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result < 0 {
-            return Some(Err(std::io::Error::last_os_error().into()));
-        }
-        if info.si_signo == 0 {
-            return None;
-        }
-        let status = match self.close() {
-            Ok(status) => status,
+        let status = match self.child.poll() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status,
             Err(error) => return Some(Err(error.into())),
         };
         let output = self.output.take().unwrap().join().unwrap_or_default();
@@ -443,12 +517,14 @@ mod tests {
         Summary {
             id: "request".into(),
             from: "server".into(),
-            destination: "/tmp/receiving".into(),
-            permission: "May create and overwrite".into(),
-            max_bytes: 100,
-            max_entries: 3,
-            max_delete: 0,
-            preserve_permissions: false,
+            details: Details::Copy {
+                destination: "/tmp/receiving".into(),
+                permission: "May create and overwrite".into(),
+                max_bytes: 100,
+                max_entries: 3,
+                max_delete: 0,
+                preserve_permissions: false,
+            },
             expires_at: 0,
             notification: String::new(),
         }
@@ -474,7 +550,7 @@ mod tests {
             assert!(Instant::now() < deadline, "prompt did not exit");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(prompt.closed);
+        assert!(prompt.child.poll().unwrap().is_some());
     }
     #[test]
     fn decisions_are_local_one_use_and_expire() {
@@ -490,9 +566,9 @@ mod tests {
                 )
             });
             wait_pending(&queue);
-            assert!(queue.decide("unknown", true).is_err());
-            queue.decide("request", allow).unwrap();
-            assert!(queue.decide("request", !allow).is_err());
+            assert!(queue.decide("unknown", true, Kind::Copy).is_err());
+            queue.decide("request", allow, Kind::Copy).unwrap();
+            assert!(queue.decide("request", !allow, Kind::Copy).is_err());
             assert_eq!(task.join().unwrap().is_ok(), allow);
             assert!(queue.snapshots().is_empty());
         }
@@ -505,7 +581,7 @@ mod tests {
                 || false
             )
             .is_err());
-        assert!(queue.decide("request", true).is_err());
+        assert!(queue.decide("request", true, Kind::Copy).is_err());
         assert!(queue.snapshots().is_empty());
     }
     #[test]
@@ -525,7 +601,7 @@ mod tests {
         });
         wait_pending(&queue);
         stopped.store(true, Ordering::Release);
-        let _ = queue.decide("request", true);
+        let _ = queue.decide("request", true, Kind::Copy);
         assert!(task.join().unwrap().is_err());
         assert!(queue.snapshots().is_empty());
     }
@@ -548,7 +624,7 @@ mod tests {
     #[test]
     fn remote_text_is_data_in_desktop_commands() {
         let text = "<a>&\"; do shell script \"touch /tmp/not-code\"";
-        let command = notification_command(text, TIMEOUT);
+        let command = notification_command(text, TIMEOUT, Kind::Copy.title());
         let args: Vec<_> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

@@ -497,7 +497,7 @@ class NativeClientTests(unittest.TestCase):
             ["run", "progress", "operation_result", "final_state", "result"],
         )
         self.assertEqual(records[-1]["provenance"], "receiver_attested")
-        self.assertEqual(result.receipt_status, syq.ReceiptStatus.CLEAN)
+        self.assertEqual(result.receipt.status, syq.ReceiptStatus.CLEAN)
         self.assertTrue(
             any(isinstance(event, syq.FinalStateEvent) for event in events)
         )
@@ -1073,8 +1073,8 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
 
         decoder = self._final_state_decoder()
         result = decoder.feed(self._terminal(**attested))
-        self.assertIs(result.receipt_status, syq.ReceiptStatus.CLEAN)
-        self.assertEqual(result.receipt_records, 1)
+        self.assertIs(result.receipt.status, syq.ReceiptStatus.CLEAN)
+        self.assertEqual(result.receipt.records, 1)
 
     def test_attested_records_decode_with_the_receiver_vocabulary(self) -> None:
         from syq.protocol import AutomationDecoder
@@ -1189,7 +1189,7 @@ class ReceiverAttestedDecodingTests(unittest.TestCase):
         self.assertIsNone(result.deletions_planned)
         self.assertIsNone(result.deletions_blocked)
         self.assertEqual(result.deletions_completed, 0)
-        self.assertEqual(result.receipt_status, "clean")
-        self.assertEqual(result.operations, 3)
-        self.assertEqual(result.final_states, 1)
-        self.assertEqual(result.receipt_records, 4)
+        self.assertEqual(result.receipt.status, "clean")
+        self.assertEqual(result.receipt.operations, 3)
+        self.assertEqual(result.receipt.final_states, 1)
+        self.assertEqual(result.receipt.records, 4)

@@ -560,7 +560,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "recv" | "destination" => {
+        "completion" | "persist" | "receiver" | "exec" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -706,12 +706,11 @@ fn bash_replacement_candidates(
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
+        "exec",
         "rm",
         "map",
         "rsync",
         "persist",
-        "recv",
-        "destination",
         "completion",
         "receiver",
         "help",
@@ -731,8 +730,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "completion" => Some(command_for_help()),
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
-        "recv" => Some(crate::receive_service::command_for_help()),
-        "destination" => Some(crate::destination::destination_help()),
+        "exec" => Some(crate::destination::exec::command_for_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         _ => crate::cli::command_for_completion(name),
     }
@@ -838,12 +836,16 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
-        ("destination", "wait" | "forget") => Ok(crate::destination::registered_names()
-            .into_iter()
-            .map(String::into_bytes)
-            .filter(|name| name.starts_with(current))
-            .map(Candidate::text)
-            .collect()),
+        ("persist", "wait" | "forget")
+            if args.first().is_some_and(|arg| arg == b"destinations") =>
+        {
+            Ok(crate::destination::registered_names()
+                .into_iter()
+                .map(String::into_bytes)
+                .filter(|name| name.starts_with(current))
+                .map(Candidate::text)
+                .collect())
+        }
         ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
         _ => Ok(Vec::new()),
     }
@@ -1211,6 +1213,10 @@ fn value_completion(
     command_meta: &clap::Command,
 ) -> Option<ValueCompletion> {
     let known = match command {
+        "exec" => match option {
+            b"--on" => Some(ValueCompletion::ReturnName),
+            _ => None,
+        },
         "cp" => match option {
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
@@ -1252,13 +1258,7 @@ fn value_completion(
             _ => None,
         },
         "persist" => match option {
-            b"--pscope" => Some(ValueCompletion::LocalPath {
-                directories_only: true,
-            }),
-            _ => None,
-        },
-        "recv" => match option {
-            b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
+            b"--pscope" | b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
             _ => None,

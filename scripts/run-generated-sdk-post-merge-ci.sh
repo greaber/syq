@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dispatch and await the post-merge workflows on one generated SDK commit.
+# Dispatch and await Python SDK validation on one generated SDK commit.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -33,7 +33,7 @@ reference_sha=$(jq -er .object.sha <<<"$reference")
   exit 1
 }
 
-workflows=(ci.yml rsync-compat.yml macos.yml)
+workflows=(ci.yml)
 poll_attempts=${SYQ_POST_MERGE_POLL_ATTEMPTS:-30}
 [[ "$poll_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "invalid poll attempt count" >&2; exit 2; }
 run_ids=()
@@ -41,7 +41,8 @@ for workflow in "${workflows[@]}"; do
   gh api --method POST \
     -H 'X-GitHub-Api-Version: 2026-03-10' \
     "repos/$repository/actions/workflows/$workflow/dispatches" \
-    -f ref="$branch" >/dev/null
+    -f ref="$branch" \
+    -f "inputs[scope_commit]=$merge_sha" >/dev/null
   run_id=
   for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
     runs=$(gh api "repos/$repository/actions/workflows/$workflow/runs?event=workflow_dispatch&branch=$branch&per_page=100")
@@ -86,4 +87,4 @@ if [ "$sdk_count" -ne 1 ] || [ "$sdk_status" != completed ] || \
     exit 1
 fi
 
-echo "Post-merge workflows passed for $merge_sha"
+echo "Post-merge Python SDK validation passed for $merge_sha"

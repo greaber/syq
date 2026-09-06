@@ -4225,6 +4225,7 @@ pub(crate) fn named_authority(
         ".syq-receive-v1",
         ".syq-destinations-v1",
         ".syq-destinations-v2",
+        ".syq-destinations-v3",
     ] {
         protected.push(ReceiverControlPath {
             path: home.join(directory).as_os_str().as_bytes().to_vec(),

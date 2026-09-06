@@ -1,7 +1,7 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
 use anyhow::{bail, Context, Result};
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -44,18 +44,18 @@ pub(crate) struct Settings {
     pub notifications: crate::receive_approval::Notifications,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
-    name = "syq recv",
+    name = "receive",
     about = "Configure background receiving for persistent SSH connections. Copies require local approval by default."
 )]
-struct ReceiveCommand {
+pub(crate) struct ReceiveCommand {
     #[command(subcommand)]
     action: Action,
 }
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Action {
-    /// Show incoming copies awaiting approval on this machine
+    /// Show incoming copy and command requests awaiting approval on this machine
     Pending {
         #[arg(long)]
         json: bool,
@@ -65,9 +65,9 @@ enum Action {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
-    /// Allow one pending request using the ID from recv pending
+    /// Allow one pending request using the ID from persist receive pending
     Approve { id: String },
-    /// Deny one pending request using the ID from recv pending
+    /// Deny one pending request using the ID from persist receive pending
     Deny { id: String },
     /// Enable receiving and optionally change its global settings (enabled by default)
     On(Configure),
@@ -85,7 +85,7 @@ enum Action {
         timeout: u64,
     },
 }
-#[derive(Args, Default)]
+#[derive(Args, Default, Debug)]
 struct Configure {
     /// Require local approval for each copy, or explicitly trust connected servers
     #[arg(long = "approve", value_enum)]
@@ -113,9 +113,6 @@ struct Configure {
     max_delete: Option<u64>,
 }
 
-pub(crate) fn command_for_help() -> clap::Command {
-    crate::help::configure(ReceiveCommand::command())
-}
 pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(crate::persistence::config_path()
         .context("HOME and XDG_CONFIG_HOME are unset")?
@@ -252,7 +249,7 @@ fn ensure_current_settings() -> Result<Settings> {
         return settings();
     }
     let _lock = settings_lock()?;
-    // Re-read under the writer lock. A concurrent recv command may have already
+    // Re-read under the writer lock. A concurrent receiving command may have already
     // changed policy; initialization must never overwrite that newer choice.
     let config = settings()?;
     if !current_settings_exist()? {
@@ -330,6 +327,11 @@ struct LocalRequest {
 struct Decision {
     id: String,
     allow: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::receive_approval::Kind::is_copy"
+    )]
+    kind: crate::receive_approval::Kind,
 }
 fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
@@ -641,7 +643,7 @@ fn run(control: &Path) -> Result<()> {
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 approvals
-                                    .decide(&decision.id, decision.allow)
+                                    .decide(&decision.id, decision.allow, decision.kind)
                                     .err()
                                     .map(|e| e.to_string())
                             });
@@ -764,7 +766,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&requests)?);
             } else if requests.is_empty() {
-                println!("No copies awaiting approval");
+                println!("No requests awaiting approval");
             } else {
                 for request in requests {
                     println!(
@@ -781,7 +783,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             bail!("timed out waiting for approval requests: none pending");
         }
         if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!("syq: waiting for incoming copies: none pending");
+            crate::output::diagnostic!("syq: waiting for incoming requests: none pending");
             progress = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -789,19 +791,20 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
 }
 fn decide(id: &str, allow: bool) -> Result<()> {
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("use the complete request ID from syq recv pending");
+        bail!("use the complete request ID from syq persist receive pending");
     }
     for control in all_controls()? {
         let Ok(state) = status(&control, false) else {
             continue;
         };
-        if state.pending.iter().any(|request| request.id == id) {
+        if let Some(request) = state.pending.iter().find(|request| request.id == id) {
             let response = query(
                 &control,
                 false,
                 Some(Decision {
                     id: id.into(),
                     allow,
+                    kind: request.kind(),
                 }),
             )?;
             if let Some(error) = response.decision_error {
@@ -823,117 +826,127 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
             run(Path::new(&argv[2]))?;
             Ok(0)
         })()),
-        "recv" => {
-            Some((|| {
-                let matches = command_for_help()
-                    .try_get_matches_from(&argv[1..])
-                    .unwrap_or_else(|e| e.exit());
-                match ReceiveCommand::from_arg_matches(&matches)?.action {
-                    Action::On(options) => configure(options)?,
-                    Action::Pending {
-                        json,
-                        wait,
-                        timeout,
-                    } => pending(json, wait, timeout)?,
-                    Action::Approve { id } => decide(&id, true)?,
-                    Action::Deny { id } => decide(&id, false)?,
-                    Action::Off => {
-                        let _lock = settings_lock()?;
-                        let mut config = settings()?;
-                        config.enabled = false;
-                        save_settings(&config)?;
-                        for control in all_controls()? {
-                            stop_inner(&control, false)?;
-                        }
-                        println!("Receiving is off; ordinary SSH persistence is unchanged");
-                    }
-                    Action::Status { json } => {
-                        let config = settings()?;
-                        let connections = statuses()?;
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string(
-                                    &serde_json::json!({ "settings": config, "connections": connections })
-                                )?
-                            );
-                        } else {
-                            println!(
-                                "Receiving is {}: {} ({})",
-                                if config.enabled { "on" } else { "off" },
-                                config.name,
-                                config.approval
-                            );
-                            println!("cwd: {}", config.cwd.display());
-                            if let Some(root) = config.root {
-                                println!("root: {}", root.display());
-                            }
-                            for state in connections {
-                                println!(
-                                    "  {}: {} ({}, {} pending){}",
-                                    state.endpoint,
-                                    state.connection.phase,
-                                    state.approval.map(|mode| mode.to_string()).unwrap_or_else(
-                                        || "approval policy unknown; reconnect with this syq build"
-                                            .into()
-                                    ),
-                                    state.pending.len(),
-                                    state
-                                        .connection
-                                        .error
-                                        .map(|e| format!(" ({e})"))
-                                        .unwrap_or_default()
-                                );
-                            }
-                        }
-                    }
-                    Action::Wait { host, timeout } => {
-                        if timeout == 0 || timeout > 3600 {
-                            bail!("timeout must be between 1 and 3600 seconds");
-                        }
-                        let deadline = Instant::now() + Duration::from_secs(timeout);
-                        let mut progress = Instant::now();
-                        loop {
-                            let states: Vec<_> = statuses()?
-                                .into_iter()
-                                .filter(|s| s.endpoint == host)
-                                .collect();
-                            if states.iter().any(|s| s.connection.phase == "online") {
-                                break;
-                            }
-                            let observed = states
-                                .iter()
-                                .map(|s| format!("{} {:?}", s.connection.phase, s.connection.error))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let observed = if observed.is_empty() {
-                                "no connection; connect with syq while persistence is on"
-                            } else {
-                                &observed
-                            };
-                            if Instant::now() >= deadline {
-                                bail!("timed out waiting for return connection through {host}: {observed}");
-                            }
-                            if progress.elapsed() >= Duration::from_secs(5) {
-                                crate::output::diagnostic!(
-                                    "syq: waiting for receiving through {host}: {observed}"
-                                );
-                                progress = Instant::now();
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                    }
-                }
-                Ok(0)
-            })())
-        }
         _ => None,
     }
+}
+
+pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
+    match command.action {
+        Action::On(options) => configure(options)?,
+        Action::Pending {
+            json,
+            wait,
+            timeout,
+        } => pending(json, wait, timeout)?,
+        Action::Approve { id } => decide(&id, true)?,
+        Action::Deny { id } => decide(&id, false)?,
+        Action::Off => {
+            let _lock = settings_lock()?;
+            let mut config = settings()?;
+            config.enabled = false;
+            save_settings(&config)?;
+            for control in all_controls()? {
+                stop_inner(&control, false)?;
+            }
+            println!("Receiving is off; ordinary SSH persistence is unchanged");
+        }
+        Action::Status { json } => {
+            let config = settings()?;
+            let connections = statuses()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &serde_json::json!({ "settings": config, "connections": connections })
+                    )?
+                );
+            } else {
+                println!(
+                    "Receiving is {}: {} ({})",
+                    if config.enabled { "on" } else { "off" },
+                    config.name,
+                    config.approval
+                );
+                println!("cwd: {}", config.cwd.display());
+                if let Some(root) = config.root {
+                    println!("root: {}", root.display());
+                }
+                for state in connections {
+                    println!(
+                        "  {}: {} ({}, {} pending){}",
+                        state.endpoint,
+                        state.connection.phase,
+                        state
+                            .approval
+                            .map(|mode| mode.to_string())
+                            .unwrap_or_else(|| {
+                                "approval policy unknown; reconnect with this syq build".into()
+                            }),
+                        state.pending.len(),
+                        state
+                            .connection
+                            .error
+                            .map(|e| format!(" ({e})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+        Action::Wait { host, timeout } => {
+            if timeout == 0 || timeout > 3600 {
+                bail!("timeout must be between 1 and 3600 seconds");
+            }
+            let deadline = Instant::now() + Duration::from_secs(timeout);
+            let mut progress = Instant::now();
+            loop {
+                let states: Vec<_> = statuses()?
+                    .into_iter()
+                    .filter(|s| s.endpoint == host)
+                    .collect();
+                if states.iter().any(|s| s.connection.phase == "online") {
+                    break;
+                }
+                let observed = states
+                    .iter()
+                    .map(|s| format!("{} {:?}", s.connection.phase, s.connection.error))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let observed = if observed.is_empty() {
+                    "no connection; connect with syq while persistence is on"
+                } else {
+                    &observed
+                };
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for return connection through {host}: {observed}");
+                }
+                if progress.elapsed() >= Duration::from_secs(5) {
+                    crate::output::diagnostic!(
+                        "syq: waiting for receiving through {host}: {observed}"
+                    );
+                    progress = Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_copy_decision_remains_copy_only() {
+        // Actual v0.4.0 client bytes checked by tests/receive-control-compat.py.
+        let old = include_str!("../tests/fixtures/receive-copy-decision-v0.4.0.json").trim();
+        let request: LocalRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            request.decision.as_ref().unwrap().kind,
+            crate::receive_approval::Kind::Copy
+        );
+        assert_eq!(serde_json::to_string(&request).unwrap(), old);
+    }
 
     #[test]
     fn stop_and_status_preserve_the_previous_daemon_request_format() {

@@ -251,10 +251,29 @@ class Endpoint:
 
 
 @dataclass(frozen=True, slots=True)
-class RunEvent:
+class ProtocolMetadata:
+    """Wire envelope shared by automation events and terminal results."""
+
     schema: str
     schema_version: int
     seq: int
+    type: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptSummary:
+    """Bookkeeping from a verified receiver receipt."""
+
+    status: ReceiptStatus
+    operations: int
+    final_states: int
+    records: int
+    provenance: str = "receiver_attested"
+
+
+@dataclass(frozen=True, slots=True)
+class RunEvent:
+    protocol: ProtocolMetadata
     run_id: str
     started_at: int
     syq_version: str
@@ -263,15 +282,12 @@ class RunEvent:
     mapping: bool | None
     dry_run: bool
     endpoints: tuple[Endpoint, ...]
-    type: str = "run"
     verify_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressEvent:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     bytes_done: int
     bytes_total: int
     bytes_unchanged: int
@@ -282,28 +298,22 @@ class ProgressEvent:
     scanned: int
     scan_done: bool
     elapsed_ms: int
-    type: str = "progress"
 
 
 @dataclass(frozen=True, slots=True)
 class TraceEvent:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     action: OperationAction
     dst: PathValue
     src: PathValue | None
     kind: EntryKind
     bytes: int | None
     reason: TraceReason
-    type: str = "trace"
 
 
 @dataclass(frozen=True, slots=True)
 class OperationResult:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     action: OperationAction
     dst: PathValue
     src: PathValue | None
@@ -318,7 +328,6 @@ class OperationResult:
     provenance: str | None = None
     scope: int | None = None
     code: ReceiptCode | None = None
-    type: str = "operation_result"
 
     @property
     def is_retryable(self) -> bool:
@@ -342,33 +351,25 @@ class OperationResult:
 
 @dataclass(frozen=True, slots=True)
 class SelectionResult:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     selector: int
     path: PathValue
     status: SelectionStatus
     kind: EntryKind | None
-    type: str = "selection_result"
 
 
 @dataclass(frozen=True, slots=True)
 class RemovalTrace:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     selector: int
     path: PathValue
     kind: EntryKind
     disposition: RemovalDisposition
-    type: str = "removal_trace"
 
 
 @dataclass(frozen=True, slots=True)
 class RemovalResult:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     selector: int
     path: PathValue
     kind: EntryKind | None
@@ -378,20 +379,16 @@ class RemovalResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
-    type: str = "removal_result"
 
 
 @dataclass(frozen=True, slots=True)
 class ErrorEvent:
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     message: str
     class_: ErrorClass | None
     os_kind: OsKind | None
     provenance: str | None = None
     code: ReceiptCode | None = None
-    type: str = "error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,9 +415,7 @@ class AttestedDigest:
 class FinalStateEvent:
     """A receiver-attested closure-time observation of one touched path."""
 
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     provenance: str
     scope: int
     dst: PathValue
@@ -433,7 +428,6 @@ class FinalStateEvent:
     observation_error: str | None
     code: ReceiptCode | None
     message: str | None
-    type: str = "final_state"
 
 
 class OperationSummary:
@@ -441,9 +435,7 @@ class OperationSummary:
 
     __slots__ = ()
 
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     status: OperationStatus
     exit_code: int
     dry_run: bool
@@ -453,9 +445,7 @@ class OperationSummary:
 
 @dataclass(frozen=True, slots=True)
 class CpResult(OperationSummary):
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     status: OperationStatus
     exit_code: int
     dry_run: bool
@@ -472,19 +462,12 @@ class CpResult(OperationSummary):
     deletions_planned: int | None
     deletions_completed: int | None
     deletions_blocked: int | None
-    provenance: str | None = None
-    receipt_status: ReceiptStatus | None = None
-    operations: int | None = None
-    final_states: int | None = None
-    receipt_records: int | None = None
-    type: str = "result"
+    receipt: ReceiptSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RmResult(OperationSummary):
-    schema: str
-    schema_version: int
-    seq: int
+    protocol: ProtocolMetadata
     status: OperationStatus
     exit_code: int
     dry_run: bool
@@ -498,7 +481,6 @@ class RmResult(OperationSummary):
     errors: int
     elapsed_ms: int
     mode: str = "rm"
-    type: str = "result"
 
 
 AutomationEvent = (

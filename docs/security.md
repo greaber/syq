@@ -55,9 +55,50 @@ without changing its owner. See the [rename rules](https://man7.org/linux/man-pa
 Native syq avoids that implicit trust decision. This is a stricter default
 for this case, not a claim that syq is more secure overall. `syq rsync`
 keeps the ownership-based policy for compatibility. Its local-only
-`--insecure-links` option relaxes source, destination, and control-path checks.
+`--insecure-links` option permits foreign-owned symlinks in typed local source,
+destination, and control paths. After opening a source root, scans and content
+reads still use its directory handles and refuse descendant symlink traversal.
+
+## TCP data connections
+
+TCP workers authenticate with a token delivered through the control connection.
+Their ten-second Hello deadline remains active across partial reads, including
+when encryption is off. After Hello succeeds, it does not limit copy duration.
+There is no general coordinator I/O deadline: a stalled peer can leave a copy
+waiting until you cancel it.
+
+TCP discovery accepts at most 64 advertised addresses plus the SSH target,
+and at most 128 resolved socket addresses in total. Excessive replies fail
+TCP setup visibly; ordinary copies can still fall back to SSH data.
+
+Encrypted TCP rejects reused connection IDs and IDs outside its 24-bit nonce
+space. If a copying process exhausts those IDs, it reports an error; restart the
+copy to continue with a fresh session.
+
+Framed input has a separate memory allowance from the signed transfer's disk
+limits. Hello is limited to 1 MiB, ordinary metadata messages to 8 MiB, and
+bulk-data or hash messages to 65 MiB. Compression cannot bypass these limits;
+zstd windows are limited to 8 MiB. Both endpoints apply the smaller Hello
+limit before reading or decompressing its body.
+
+A shared 512 MiB allowance bounds decoded collection storage, including queued
+collections, because a short frame can advertise a very large collection.
+Exhaustion fails the connection visibly. Flat byte buffers, strings, and
+compression workspace use the frame-size limits and each connection's bounded
+queue instead of competing for that shared allowance. Their aggregate memory
+use grows with the connection count, request size, and pipeline depth; reduce
+those settings to use less memory. The collection allowance is not a limit on
+total process memory or disk usage.
 
 ## A compromised source server
+
+The coordinator rejects stat, apply, and partial-path replies whose entry
+counts differ from their requests. It also checks each source data block's
+offset and length against the outstanding read before forwarding it to the
+destination. An offset or length mismatch fails the copy and closes that
+worker's connections without reusing them for another file. These checks expose
+malformed replies; they cannot establish that a source's file listing or contents
+are truthful.
 
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The
@@ -80,7 +121,7 @@ your agent as `ssh -A` would.
 A [named destination](receive.md) lets a server account request copies through
 an outbound connection maintained by your laptop. `persist on` enables this
 for syq's SSH connections by default. Each request requires approval on the
-receiving machine through a desktop prompt or `recv approve`. Paths and limits
+receiving machine through a desktop prompt or `persist receive approve`. Paths and limits
 are validated before prompting; the restricted filesystem executor checks
 every operation after approval. The server receives no SSH agent or
 command-execution interface.
@@ -90,11 +131,11 @@ It does not authenticate what you typed on a remote server or attest to source
 contents. The receiving user and desktop session remain trusted. Request IDs
 are local, expire after five minutes, and cannot be reused. Disconnecting or
 stopping receiving cancels pending decisions. Desktop failure never approves a
-copy. `syq recv on --approve always` explicitly removes the per-copy decision
+copy. `syq persist receive on --approve always` explicitly removes the per-copy decision
 and trusts connected server accounts for repeated copies.
 
 The default starting directory is your home directory, with no containment.
-`syq recv on --root DIRECTORY` contains copies; `syq recv off` disables receiving
+`syq persist receive on --root DIRECTORY` contains copies; `syq persist receive off` disables receiving
 while keeping ordinary persistence. A compromised connected server account can
 request more copies and invent their content. Once approved, it can inspect
 destination entries during copy planning and consume disk space within the
@@ -108,8 +149,9 @@ host resolution. A copy never switches routes after selecting its destination.
 
 - **Privileged copies need trusted destination directories.** Resume uses
   predictable partial-file names. Do not copy as root into a directory
-  writable by untrusted users: file checks cannot establish who created a
-  preexisting partial.
+  writable by untrusted users. Syq only reuses partials owned by its effective
+  user; foreign-owned leftovers are replaced without changing their contents
+  or permissions. This does not make a shared writable directory trusted.
 - **Copies are not snapshots or transactions.** Stop concurrent writers or
   use snapshots for consistent data. `--inplace` exposes incomplete updates.
   Syq does not `fsync` transfer data, so completion is not a power-loss
@@ -142,3 +184,28 @@ key, or command-running interface. Host trust and SSH configuration are those
 of the approving machine. The destination account remains trusted, including
 its interpretation of relative paths. A compromised source can substitute
 content within the approved scope, just as with other return copies.
+
+## Approved commands on receiving machines
+
+[`syq exec`](exec.md) uses an existing return connection and always asks for a
+local decision before starting a program. Command approval is separate from
+copy approval, including when copies are automatically approved. The prompt
+shows the server account, argument list and working directory. A server
+account can request commands from any of its processes; syq cannot establish
+what a person typed in a remote shell.
+
+Approving execution grants the command your local user's authority. Copy root
+confinement, file protection and transfer limits do not restrict that program.
+Scripts and build files can change what it does. Commands receive the local
+service environment and closed stdin. They do not expose a general SSH agent
+forwarding interface, but an approved program can access credentials available
+to the local user.
+
+Disconnecting cancels the foreground process group; commands are never
+replayed automatically. Completed effects cannot be rolled back, and programs
+that create separate process sessions can outlive cancellation. See the
+[command reference](exec.md#output-completion-and-cancellation) for execution
+and interruption behavior.
+
+Human copy listings escape control characters in filenames. Diagnostics also
+escape terminal control sequences from peers; NDJSON keeps its JSON encoding.

@@ -78,20 +78,20 @@ fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
-pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     let explicit = match &args.auth_from {
         crate::cli::AuthFrom::Return(name) => Some(name.clone()),
-        _ => None,
+        _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
     };
     let target = match eligible_target(args) {
         Ok(target) => target,
-        Err(_) if explicit.is_none() => return Ok(()),
+        Err(_) if explicit.is_none() => return Ok(None),
         Err(error) => return Err(error),
     };
     if explicit.is_none() && args.locations.last().unwrap().path.starts_with(b"~//") {
         // Ordinary SSH interprets ~// as absolute. Do not change the copy's
         // destination just because a return authorizer became available.
-        return Ok(());
+        return Ok(None);
     }
     let (name, registration) = if let Some(name) = explicit {
         let registration = load_registration(&name)?;
@@ -102,10 +102,26 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(2)).ok()?;
             matches!(reply, Reply::Ready).then_some((name, registration))
         }) else {
-            return Ok(());
+            return Ok(None);
         };
         found
     };
+    Ok(Some(handoff::Selection::new(
+        name,
+        registration,
+        handoff::Kind::Forward,
+        Some(target),
+    )))
+}
+
+pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection) -> Result<()> {
+    let handoff::Selection {
+        name,
+        registration,
+        target,
+        ..
+    } = selection;
+    let target = target.context("remote authorization target missing")?;
     let (secret, public) = crate::receipt::generate_recipient()?;
     let policy = crate::receipt::ReceiptPolicy {
         required: true,
@@ -118,7 +134,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         },
     };
     let request = crate::restricted::named_request(args, policy.clone())?;
-    crate::output::diagnostic!("syq: requesting permission from @{name} to copy to {target:?}; approve on that machine with its desktop prompt or syq recv pending");
+    crate::output::diagnostic!("syq: requesting permission from @{name} to copy to {target:?}; approve on that machine with its desktop prompt or syq persist receive pending");
     let (stream, reply) = exchange(
         &registration,
         Message::Forward {
@@ -199,7 +215,7 @@ impl Receiver {
             let _sessions = self.sessions.lock().unwrap();
             (
                 self.generation.load(Ordering::Acquire),
-                self.forwarded.track(stream.try_clone()?)?,
+                self.active_streams.track(stream.try_clone()?)?,
             )
         };
         let socket = stream.try_clone()?;
@@ -914,13 +930,17 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             };
-            assert!(pending.destination.contains("backup"));
-            assert!(pending.destination.contains("output"));
-            assert!(pending.permission.contains("SSH access"));
+            let description = pending.description();
+            assert!(description.contains("backup"));
+            assert!(description.contains("output"));
+            assert!(description.contains("SSH access"));
             if revoke {
                 receiver.revoke_all();
             } else {
-                receiver.approvals.decide(&pending.id, false).unwrap();
+                receiver
+                    .approvals
+                    .decide(&pending.id, false, crate::receive_approval::Kind::Copy)
+                    .unwrap();
             }
             assert!(task.join().unwrap().is_err());
             let deadline = Instant::now() + Duration::from_secs(2);

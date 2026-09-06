@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
+from ._mapping import Mapping as FileMapping, _source_options
+from ._paths import PathArgument, _map_stream_cwd
 from .managed import managed_executable
 from .errors import (
     SyqInvocationError,
@@ -37,7 +40,6 @@ from .models import (
 from .protocol import AutomationDecoder, parse_mapping_line
 
 
-PathArgument = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 Argument = str | bytes
 Selector = PathArgument | Iterable[PathArgument]
 IgnoreSelector = str | IgnoreFrom | Iterable[str | IgnoreFrom]
@@ -72,50 +74,6 @@ def _argument(value: PathArgument, *, label: str) -> Argument:
     if contains_nul:
         raise ValueError(f"{label} may not contain NUL")
     return result
-
-
-def _native_path_spelling(
-    value: PathArgument, env: Mapping[str, str] | None
-) -> str:
-    """Apply native ``~`` expansion without normalizing path components."""
-
-    spelling = os.fsdecode(os.fspath(value))
-    if spelling == "~" or spelling.startswith("~/"):
-        home = (os.environ if env is None else env).get("HOME")
-        if home is not None:
-            suffix = spelling[2:] if len(spelling) > 2 else ""
-            return os.path.join(home, suffix) if suffix else home
-    return spelling
-
-
-def _join_path_spelling(base: str, path: str) -> str:
-    return path if os.path.isabs(path) else os.path.join(base, path)
-
-
-def _map_stream_cwd(
-    process_cwd: PathArgument | None,
-    env: Mapping[str, str] | None,
-    selected_base: PathArgument | None,
-    contents_selector: PathArgument | None,
-) -> Path:
-    """Derive the consumer base using the native component spelling."""
-
-    if process_cwd is None:
-        process_base = os.getcwd()
-    else:
-        process_spelling = os.fsdecode(os.fspath(process_cwd))
-        process_base = _join_path_spelling(os.getcwd(), process_spelling)
-    base_spelling = _native_path_spelling(
-        "." if selected_base is None else selected_base, env
-    )
-    effective = _join_path_spelling(process_base, base_spelling)
-    if contents_selector is not None:
-        effective = _join_path_spelling(
-            effective, _native_path_spelling(contents_selector, env)
-        )
-    # Path preserves `..` components. In particular, do not use abspath or
-    # resolve here: the native walker must encounter symlinks before `..`.
-    return Path(effective)
 
 
 def run(
@@ -852,15 +810,23 @@ def _write_mapping_manifest(
     manifest.flush()
 
 
-class MapStream(Iterable[MappingEntry]):
+class MapStream(FileMapping):
     """A context-managed, streaming ``syq map`` result."""
 
-    def __init__(self, process: _LineProcess, cwd: PathArgument) -> None:
+    def __init__(
+        self, process: _LineProcess, cwd: PathArgument, *,
+        confined: bool = False, follow_src: bool = False,
+    ) -> None:
+        super().__init__(
+            (), cwd=None if confined else cwd,
+            root=cwd if confined else None, follow_src=follow_src,
+        )
         self._process = process
-        self.cwd = cwd
         self._complete = False
 
     def __iter__(self) -> MapStream:
+        if self._complete:
+            raise SyqInvocationError("mapping stream is closed or exhausted")
         return self
 
     def __next__(self) -> MappingEntry:
@@ -941,7 +907,7 @@ class Client:
         check: bool = True,
         cwd: PathArgument | None = None,
         env: Mapping[str, str] | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         input: bytes | None = None,
     ) -> Result:
         return run(
@@ -950,7 +916,7 @@ class Client:
             check=check,
             cwd=self.process_cwd if cwd is None else cwd,
             env=self.env if env is None else env,
-            timeout=self.timeout if timeout is None else timeout,
+            timeout=resolve_timeout(timeout, self.timeout),
             input=input,
         )
 
@@ -970,7 +936,7 @@ class Client:
         selectors_total: int | None,
         on_event: Callable[[AutomationEvent], object] | None,
         results: BinaryIO | None,
-        timeout: float | None,
+        timeout: Timeout,
         check: bool,
     ) -> OperationSummary:
         command = (self._executable_value(), *argv)
@@ -978,7 +944,7 @@ class Client:
             command,
             cwd=self.process_cwd,
             env=self.env,
-            timeout=self.timeout if timeout is None else timeout,
+            timeout=resolve_timeout(timeout, self.timeout),
         )
         writer = _ResultsFileWriter(results)
         decoder = AutomationDecoder(
@@ -1070,7 +1036,7 @@ class Client:
         min_size: str | int | None = None,
         max_delete: int | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> CpResult:
         if (
@@ -1085,6 +1051,9 @@ class Client:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        cwd, root, follow_src = _source_options(
+            mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
+        )
         results = _prepare_results_file(results)
         argv, source_count, source_end = _copy_arguments(
             "cp",
@@ -1222,7 +1191,7 @@ class Client:
         no_bootstrap: bool = False,
         pscope: PathArgument | None = None,
         on_event: Callable[[AutomationEvent], object] | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
         check: bool = True,
     ) -> RmResult:
         results = _prepare_results_file(results)
@@ -1270,7 +1239,7 @@ class Client:
         follow: bool = False,
         follow_src: bool = False,
         as_: PathArgument | None = None,
-        timeout: float | None = None,
+        timeout: Timeout = CLIENT_DEFAULT,
     ) -> MapStream:
         # Materialize selectors once so generators are not consumed separately
         # while deriving the source base carried by MapStream.cwd.
@@ -1341,7 +1310,9 @@ class Client:
                 command,
                 cwd=self.process_cwd,
                 env=self.env,
-                timeout=self.timeout if timeout is None else timeout,
+                timeout=resolve_timeout(timeout, self.timeout),
             ),
             effective_cwd,
+            confined=root is not None,
+            follow_src=follow or follow_src,
         )

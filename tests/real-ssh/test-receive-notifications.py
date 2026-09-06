@@ -76,7 +76,7 @@ def wait_notification_status(expected):
     deadline = time.monotonic() + 10
     progress = time.monotonic() + 5
     while True:
-        pending = json.loads(run("syq", "recv", "pending", "--json"))
+        pending = json.loads(run("syq", "persist", "receive", "pending", "--json"))
         if len(pending) == 1 and pending[0]["notification"].startswith(expected):
             return pending[0]
         assert time.monotonic() < deadline, ("prompt did not finish", pending)
@@ -89,8 +89,8 @@ def wait_notification_status(expected):
 def tests():
     global choice
     try:
-        run("syq", "recv", "on", "--approve", "ask", "--notify", "desktop")
-        run("syq", "recv", "wait", "source", "--timeout", "30")
+        run("syq", "persist", "receive", "on", "--approve", "ask", "--notify", "desktop")
+        run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
         for choice in ["allow", "deny", "dismiss", "unexpected", "unavailable"]:
             destination = Path("/tmp/syq-real-ssh-receive") / f"desktop-{choice}-<b>&\nFrom: fake"
             command = shlex.join([
@@ -103,7 +103,7 @@ def tests():
                     pending = wait_notification_status("desktop reported an error" if choice == "unavailable" else "dismissed")
                     assert not destination.exists()
                     assert copy.poll() is None, "dismissal completed the copy"
-                    run("syq", "recv", "deny", pending["id"])
+                    run("syq", "persist", "receive", "deny", pending["id"])
                 assert (copy.wait(timeout=20) == 0) == (choice == "allow")
                 assert destination.exists() == (choice == "allow")
                 if choice == "allow":
@@ -116,7 +116,7 @@ def tests():
                 assert "at most 0 deletions" in body and "not been inspected" in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
-                assert json.loads(run("syq", "recv", "pending", "--json")) == []
+                assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
                 print(f"Notification action {choice}: passed", flush=True)
             finally:
                 try:
@@ -125,12 +125,29 @@ def tests():
                     pass
                 copy.wait()
         assert len(observed) == 5, observed
+        for choice in ["allow", "deny"]:
+            marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
+            command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
+            process = subprocess.Popen(["ssh", "source", command], start_new_session=True)
+            try:
+                assert (process.wait(timeout=20) == 0) == (choice == "allow")
+                assert marker.exists() == (choice == "allow")
+                _, title, body, _, _ = observed[-1]
+                assert title == "syq: incoming command", title
+                assert "literal arguments" in body and "local user" in body, body
+                assert "Run this command once?" in body and "Allow this copy" not in body, body
+                print(f"Command notification {choice}: passed", flush=True)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        assert len(observed) == 7, observed
     except BaseException:
         errors.append(traceback.format_exc())
     finally:
         try:
-            run("syq", "recv", "on", "--notify", "off")
-            run("syq", "recv", "wait", "source", "--timeout", "30")
+            run("syq", "persist", "receive", "on", "--notify", "off")
+            run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
         except BaseException:
             errors.append(traceback.format_exc())
         GLib.idle_add(loop.quit)

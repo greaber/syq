@@ -190,12 +190,20 @@ fn cache_path() -> Option<PathBuf> {
 
 fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
     let lock_path = path.with_extension("json.lock");
+    use std::os::unix::fs::OpenOptionsExt;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .mode(0o600)
         .open(lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "tuning cache lock is not a regular file",
+        ));
+    }
     let operation = if exclusive {
         libc::LOCK_EX
     } else {
@@ -1096,6 +1104,23 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_lock_refuses_symlinks_and_non_regular_files() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let cache = dir.path().join("tuning.json");
+        let lock = cache.with_extension("json.lock");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+        assert!(lock_file(&cache, true).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(lock_file(&cache, false).is_err());
+        std::fs::remove_dir(&lock).unwrap();
+        assert!(lock_file(&cache, true).is_ok());
+    }
 
     #[test]
     fn local_start_reduces_only_for_one_or_two_cpus() {
