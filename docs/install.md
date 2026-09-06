@@ -40,7 +40,10 @@ config alias for custom ports or IPv6 addresses. No remote system packages are
 installed; syq performs its usual remote helper setup.
 
 The quick test copies a 64 MiB file and 1,024 files of 8 KiB each. Each tool
-runs three times. Temporary test files are removed on success, failure, or Ctrl-C. If SSH is
+runs three times. Syq persistence is off for the benchmark, and rsync opens a
+fresh SSH connection for every trial. Connection startup is included in each
+timed copy. Your normal persistence setting and open sessions are unchanged.
+Temporary test files are removed on success, failure, or Ctrl-C. If SSH is
 unreachable during cleanup, the script prints the remote scratch path for
 you to remove later. It never uses your existing files as test data.
 

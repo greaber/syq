@@ -47,14 +47,21 @@ never resumed. On Ctrl-C the script stops its local workers, moves remote
 scratch out of the transfer path, and deletes its temporary data. If SSH
 is unavailable, it reports the remote path for later cleanup. The script rotates
 tool order and reports each elapsed time and the mean for each tool. It uses
-syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
+syq's defaults with persistence off and permissions preserved, `rsync -rpt`,
+and local `cp -pR`.
 These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem
 optimizations. Syq prints its transfer statistics.
 
+The script disables syq persistence in private configuration and runtime
+directories, leaving your normal setting and open sessions untouched. Rsync
+also opens a fresh SSH connection for each trial, even if your SSH config
+enables multiplexing. Every timed copy includes connection startup.
+
 Generation, a single 14-byte syq setup copy, and POSIX `cksum` comparisons are
 outside the timer. The setup copy prepares the helper and exercises transfer
-setup; it is labeled separately and does not print a throughput result. A failed command or content check stops the comparison.
+setup; its connections close before timing begins. It is labeled separately
+and does not print a throughput result. A failed command or content check stops the comparison.
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;

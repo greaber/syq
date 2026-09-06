@@ -4,7 +4,7 @@ set -euo pipefail
 export LC_ALL=C
 # Quote remote paths ourselves for both old (including macOS) and new rsync.
 export RSYNC_OLD_ARGS=1
-export RSYNC_RSH="ssh -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+export RSYNC_RSH="ssh -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 
 usage() {
     cat <<'HELP'
@@ -30,6 +30,8 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
 Requires Bash, rsync, OpenSSL, and standard Unix utilities locally; terminal runs
 also need Perl (for terminal process-group control). Remote tests
 also need SSH locally and rsync plus standard utilities on the remote host.
+SSH tests disable syq persistence in private settings and prevent rsync from
+reusing SSH connections. Every timed trial includes connection startup.
 Only newly created syq-bench.* directories are used. Existing data is not copied.
 HELP
 }
@@ -42,7 +44,7 @@ ask() {
     REPLY=${answer:-$2}
 }
 need() { command -v "$1" >/dev/null || fail "Missing required command: $1"; }
-remote() { ssh -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" "$1"; }
+remote() { ssh -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" "$1"; }
 
 # Background jobs have their own process groups, so interruption stops the whole
 # local copy/generation group before cleanup. Remote cleanup first moves scratch
@@ -276,6 +278,13 @@ main() {
         export PATH="$HOME/.local/bin:$PATH"
         need syq
     fi
+    # Isolate both policy and runtime before disabling persistence. A private
+    # config alone would still make persist off close the user's global scope.
+    # Keep the normal helper cache: installation is prepared outside the timer.
+    mkdir -m 700 "$local_root/config" "$local_root/runtime"
+    export XDG_CONFIG_HOME="$local_root/config"
+    export XDG_RUNTIME_DIR="$local_root/runtime"
+    run syq persist off || fail 'Could not disable syq persistence for this benchmark.'
     printf '\nVersions:\n'
     printf 'syq: '
     syq --build-identity
@@ -301,7 +310,9 @@ main() {
     printf 'Each trial uses an empty destination; order rotates. Setup and checksum verification are untimed.\n'
     printf 'Caches are NOT flushed; times include startup and buffered writes, not durable disk flushes.\n'
     printf 'Allow roughly twice the selected data size locally, plus one copy remotely for SSH tests.\n'
-    printf 'Using syq defaults with permissions preserved, rsync -rpt, and local cp -pR.\n\n'
+    printf 'Using syq defaults with persistence OFF and permissions preserved, rsync -rpt, and local cp -pR.\n'
+    [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
+    printf '\n'
     exec 4>&1 5>&2
     local tools=(syq rsync) workloads=(large small)
     [[ $mode != local ]] || tools+=(cp)
@@ -367,6 +378,7 @@ main() {
         [[ $mode != pull ]] || remote "rm -rf $(quote "$source") $(quote "$remote_root/probe")"
     done
     printf '\nResults (mean elapsed seconds; all completed copies checked with POSIX cksum):\n'
+    [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
     awk '{key=$1 " " $2;
           if (!(key in n)) {order[++count]=key; low[key]=$3; high[key]=$3}
           total[key]+=$3; n[key]++;

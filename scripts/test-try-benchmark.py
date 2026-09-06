@@ -18,10 +18,21 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().with_name('try-benchmark.sh')
 FAKE_SYQ = r'''#!/usr/bin/env python3
-import os, pathlib, shutil, subprocess, sys, time
+import json, os, pathlib, shutil, subprocess, sys, time
 args=sys.argv[1:]
 if args in (['--version'], ['--build-identity']):
     print('syq test double'); sys.exit(0)
+config=pathlib.Path(os.environ['XDG_CONFIG_HOME'])/'syq'/'persistence.json'
+if args == ['persist', 'off']:
+    if os.environ.get('BENCH_TEST_PERSIST_FAIL'): sys.exit(25)
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{"enabled": false}')
+    print('SSH connection persistence is off'); sys.exit(0)
+assert json.loads(config.read_text()) == {'enabled': False}
+assert '--pscope' not in args
+if os.environ.get('BENCH_TEST_ENV_LOG'):
+    with open(os.environ['BENCH_TEST_ENV_LOG'], 'a') as log:
+        log.write(json.dumps({'config': str(config), 'runtime': os.environ['XDG_RUNTIME_DIR']})+'\n')
 src=pathlib.Path(args[args.index('--srcs-in')+1])
 dst=pathlib.Path(args[args.index('--into-existing')+1])
 if src.name == 'probe' and os.environ.get('BENCH_TEST_ASK'):
@@ -42,6 +53,9 @@ if mode == 'corrupt':
 '''
 FAKE_SSH = '''#!/usr/bin/env bash
 set -eu
+if [[ ${BENCH_TEST_SSH_LOG:-} != '' ]]; then
+    { printf '%q ' "$@"; printf '\n'; } >> "$BENCH_TEST_SSH_LOG"
+fi
 while [[ $1 == -o ]]; do shift 2; done
 shift
 if [[ ${BENCH_TEST_CLEANUP_FAIL:-} == 1 && $* == *cleanup_dir=* ]]; then exit 255; fi
@@ -133,6 +147,45 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertNotIn('large cp', result.stdout)
                 self.assert_clean()
+
+    def test_persistence_off_ignores_and_preserves_user_policy_and_runtime(self):
+        import json
+        config = self.root / 'user-config' / 'syq' / 'persistence.json'
+        config.parent.mkdir(parents=True)
+        config.write_text('{"enabled": true}')
+        runtime = self.root / 'user-runtime'
+        runtime.mkdir()
+        live = runtime / 'existing-connection'
+        live.write_text('user-owned connection')
+        env_log = self.root / 'copy-env.jsonl'
+        ssh_log = self.root / 'ssh.log'
+        env = dict(self.env, XDG_CONFIG_HOME=str(config.parent.parent),
+                   XDG_RUNTIME_DIR=str(runtime), BENCH_TEST_ENV_LOG=str(env_log),
+                   BENCH_TEST_SSH_LOG=str(ssh_log))
+        for mode in ['push', 'pull']:
+            with self.subTest(mode=mode):
+                result = self.invoke('--mode', mode, '--host', 'test-host', env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('syq persistence OFF; rsync fresh SSH', result.stdout)
+                self.assertEqual(json.loads(config.read_text()), {'enabled': True})
+                self.assertEqual(live.read_text(), 'user-owned connection')
+                for line in env_log.read_text().splitlines():
+                    copy_env = json.loads(line)
+                    self.assertNotEqual(Path(copy_env['config']), config)
+                    self.assertNotEqual(Path(copy_env['runtime']), runtime)
+                    self.assertFalse(Path(copy_env['config']).exists())
+                    self.assertFalse(Path(copy_env['runtime']).exists())
+                for line in ssh_log.read_text().splitlines():
+                    self.assertIn('-o ControlMaster=no -o ControlPath=none -o ControlPersist=no', line)
+                self.assert_clean()
+
+    def test_persistence_configuration_failure_stops_before_copy(self):
+        result = self.invoke(env=dict(self.env, BENCH_TEST_PERSIST_FAIL='1'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not disable syq persistence', result.stderr)
+        self.assertNotIn('Preparing syq', result.stdout)
+        self.assertNotIn('Results (mean', result.stdout)
+        self.assert_clean()
 
     def test_failures_do_not_report_success(self):
         for failure in ['fail', 'corrupt']:
