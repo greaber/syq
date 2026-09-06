@@ -38,7 +38,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False):
                 progress = time.monotonic() + 5
                 state = ""
                 while time.monotonic() < deadline:
-                    state = remote("find /tmp/syq-real-ssh/forward -type f -name '*.part'")
+                    state = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'")
                     if state:
                         break
                     assert process.poll() is None, "copy exited before cancellation"
