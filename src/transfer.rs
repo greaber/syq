@@ -67,6 +67,19 @@ fn initial_fast_workers(
     max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
+#[cfg(debug_assertions)]
+fn record_worker_event_for_test(event: &str, worker: usize, files: usize) -> Result<()> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("SYQ_TEST_WORKER_EVENTS") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(format!("{event} {worker} {files}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
 fn fast_file_size_limit(opts: &Opts) -> u64 {
     opts.block
         .min(opts.tuning.batch_bytes())
@@ -1956,6 +1969,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         benchmark: Default::default(),
                         fast_batch_files,
                     };
+                    #[cfg(debug_assertions)]
+                    record_worker_event_for_test("connected", id, 0)?;
                     if debug() {
                         crate::output::diagnostic!(
                             "syq: worker {id} connected in {:.2}s",
@@ -7427,6 +7442,8 @@ impl Worker {
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
+        #[cfg(debug_assertions)]
+        record_worker_event_for_test("batch", self.id, batch.len())?;
         self.fast.batches += 1;
         self.fast.files += batch.len();
         let jobs: Vec<FileJob> = {

@@ -26,7 +26,7 @@ update/ignore-existing, forced ranges, and bandwidth-limited copies.
 ## Compatibility
 
 No messages, state formats, resume identities, CLI options, or output fields
-change. `src/proto.rs` and `src/resume.rs` are unchanged from v0.3.2. Managed
+change. These setup requests and resume identities retain their v0.3.2 representation. Managed
 helpers still require exact build identities before reading framed requests.
 The compatibility probe deliberately speaks the v0.3.2 client's identity to
 replay the new request order against the unchanged official v0.3.2 receiver;
