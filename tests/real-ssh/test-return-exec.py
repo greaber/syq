@@ -106,7 +106,9 @@ assert err.endswith(b"e" * 262145)
 for cancellation in ["interrupt", "stop"]:
     print("case: command group cleanup after", cancellation, flush=True)
     script = "echo $$ > leader; (sleep 1; touch survived) & touch ready; wait"
-    execute(["sh", "-c", script], status=130 if cancellation == "interrupt" else 1, cancel=cancellation)
+    # OpenSSH reports the killed requesting client as exit-signal (255),
+    # distinct from an executed program whose exit status syq returns normally.
+    execute(["sh", "-c", script], status=255 if cancellation == "interrupt" else 1, cancel=cancellation)
     leader = int((root / "leader").read_text())
     def gone():
         try:
