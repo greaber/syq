@@ -107,3 +107,35 @@ probing delayed transport readiness until 6.12 seconds, matching the baseline.
 Workers connected during subsequent candidate planning; the baseline waited
 until planning completed to start them. The probing wait limits how much of
 the reduced setup latency reaches the TCP elapsed result.
+
+## Probe-overlap measurement, 2026-09-06
+
+A follow-up compares clean `e6dc071` (the setup and early-worker changes above)
+with clean `9e73649` (buffered planning overlaps route probes). Both use the
+same static release build flags, 1,024-file source, copy command, stats/debug
+output and verification method above. Each binary receives an untimed full-copy
+warmup to install its exact helper; three measured rounds reverse case order
+in the middle round. This task's builds and test suites finished before timing.
+The source and OS caches remain warm, the machines and public route are shared,
+and copies do not request durable disk writes. Every destination passed the
+checksum comparison, and the disposable remote root was removed afterward.
+
+| Transport | Baseline seconds | Candidate seconds | Mean baseline → candidate |
+|---|---|---|---|
+| Encrypted TCP | 10.251, 10.263, 10.303 | 10.019, 10.204, 10.437 | 10.272 → 10.220 |
+| SSH control comparison | 10.522, 11.112, 10.965 | 11.111, 10.639, 10.903 | 10.866 → 10.884 |
+
+The total TCP difference is only 0.052 seconds (0.5%), well within the observed
+variation; these trials do not establish an end-to-end speedup. The internal
+stages do show the intended overlap consistently. Time from control connection
+readiness to completed payload planning was 2.36/2.39/2.33 seconds before and
+2.09/2.10/2.12 seconds afterward: roughly one 260 ms round trip is covered by
+the probe window. Remaining planning after transport readiness shrinks from
+1.09/1.11/1.06 to 0.81/0.82/0.84 seconds. TCP worker authentication still overlaps
+the later destination checks, and each trial starts eight workers.
+
+This workload's scan covers only part of the roughly half-second probe wait
+remaining after destination preflight. The bounded probe window still finishes
+about one second after it starts. SSH connection setup and payload processing
+remain larger costs; a wider performance claim needs controlled latency and
+more repetitions rather than extrapolating from the stage improvement.
