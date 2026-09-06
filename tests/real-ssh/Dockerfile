@@ -25,7 +25,6 @@ RUN apt-get update \
         openssh-server \
         procps \
         python3 \
-
         zsh \
         rsync \
         openssl \

@@ -20,7 +20,7 @@ SCRIPT = Path(__file__).resolve().with_name('try-benchmark.sh')
 FAKE_SYQ = r'''#!/usr/bin/env python3
 import os, pathlib, shutil, subprocess, sys, time
 args=sys.argv[1:]
-if args == ['--version']:
+if args in (['--version'], ['--build-identity']):
     print('syq test double'); sys.exit(0)
 src=pathlib.Path(args[args.index('--srcs-in')+1])
 dst=pathlib.Path(args[args.index('--into-existing')+1])
@@ -93,6 +93,33 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual([line.split()[1].rstrip(',') for line in lines],
                          ['syq', 'rsync', 'cp', 'rsync', 'cp', 'syq', 'cp', 'syq', 'rsync'])
         self.assertIn('small cp', result.stdout)
+        self.assertIn('syq: syq test double', result.stdout)
+        self.assertEqual(result.stdout.count('Command:'), 18)
+        self.assertIn('Command: syq cp --preserve=permissions', result.stdout)
+        # Each reported mean must agree with the untimed per-trial records;
+        # range columns show the variability hidden by a mean alone.
+        import re
+        trials = {}
+        current = None
+        for line in result.stdout.splitlines():
+            match = re.match(r'(large|small): (syq|rsync|cp), trial', line)
+            if match:
+                current = tuple(match.groups())
+            match = re.match(r'Verified contents; elapsed ([0-9.]+) seconds', line)
+            if match:
+                trials.setdefault(current, []).append(float(match[1]))
+        summaries = 0
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 6 and tuple(fields[:2]) in trials:
+                summaries += 1
+                values = trials[tuple(fields[:2])]
+                self.assertAlmostEqual(float(fields[2]), sum(values)/len(values), delta=0.00051)
+                self.assertEqual(float(fields[3]), min(values))
+                self.assertEqual(float(fields[4]), max(values))
+                self.assertEqual(int(fields[5]), len(values))
+        self.assertEqual(summaries, 6)
+
         self.assertEqual(result.stdout.count('Preparing syq with a 14-byte setup copy'), 1)
         self.assertEqual(result.stdout.count('test double: copy statistics'), 6)
         self.assertIn('Setup complete.', result.stdout)

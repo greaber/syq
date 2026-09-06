@@ -44,6 +44,11 @@ runs three times. Temporary test files are removed on success, failure, or Ctrl-
 unreachable during cleanup, the script prints the remote scratch path for
 you to remove later. It never uses your existing files as test data.
 
+The transcript includes the exact syq build, the commands being timed, each
+verified trial, and the mean, minimum and maximum elapsed times. Keep that
+output when sharing a surprising result; differences smaller than the trial
+variation may not indicate a speed advantage.
+
 To inspect the script first, download it with curl's `-o try-benchmark.sh`,
 then run `bash try-benchmark.sh`. Use `--help` for repeatable command-line
 options, including `--yes` to use defaults without questions and `--install`

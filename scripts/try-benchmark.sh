@@ -161,26 +161,34 @@ make_data() {
 }
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local syq_options=(--stats)
+    local command=() syq_options=(--stats)
     [[ ${4:-} != setup ]] || syq_options+=(--quiet)
     case $tool in
         syq)
             case $mode in
-                local) syq cp --preserve=permissions --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}" ;;
-                push) syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into-existing "$destination" "${syq_options[@]}" ;;
-                pull) syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}" ;;
+                local) command=(syq cp --preserve=permissions --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}") ;;
+                push) command=(syq cp --preserve=permissions --srcs-in "$source" --to "$host" --into-existing "$destination" "${syq_options[@]}") ;;
+                pull) command=(syq cp --preserve=permissions --from "$host" --srcs-in "$source" --into-existing "$destination" "${syq_options[@]}") ;;
             esac ;;
         rsync)
             case $mode in
-                local) rsync -rpt -- "$source/" "$destination/" ;;
-                push) rsync -rpt -- "$source/" "$host:$(quote "$destination/")" ;;
-                pull) rsync -rpt -- "$host:$(quote "$source/")" "$destination/" ;;
+                local) command=(rsync -rpt -- "$source/" "$destination/") ;;
+                push) command=(rsync -rpt -- "$source/" "$host:$(quote "$destination/")") ;;
+                pull) command=(rsync -rpt -- "$host:$(quote "$source/")" "$destination/") ;;
             esac ;;
-        cp) cp -pR "$source/." "$destination/" ;;
+        cp) command=(cp -pR "$source/." "$destination/") ;;
     esac
+    if [[ ${4:-} == show ]]; then
+        printf 'Command:'
+        printf ' %q' "${command[@]}"
+        printf '\n'
+    else
+        "${command[@]}"
+    fi
 }
 timed_copy() {
     # Separate Bash's timing output from the command's live stdout/stderr.
+    copy_with "$@" show
     TIMEFORMAT='%R'
     { time copy_with "$@" 1>&4 2>&5; } 2> "$local_root/time"
 }
@@ -262,7 +270,8 @@ main() {
         need syq
     fi
     printf '\nVersions:\n'
-    syq --version
+    printf 'syq: '
+    syq --build-identity
     rsync --version | sed -n '1p'
     if [[ $mode == local ]]; then
         dest_dir=$(cd -- "$dest_dir" && pwd -P) || fail 'Destination scratch parent must exist.'
@@ -278,6 +287,7 @@ main() {
         dest_root=$(mktemp -d "$local_parent/syq-bench.XXXXXXXX")
     fi
     printf '\nMode: %s; workloads: %s; size: %s; rounds: %s\n' "$mode" "$workload" "$size" "$rounds"
+    [[ $mode == local ]] || printf 'SSH host: %s\n' "$host"
     printf 'Local scratch: %s\nDestination scratch: %s\n' "$local_root" "${remote_root:-$dest_root}"
     printf 'Each trial uses an empty destination; order rotates. Setup and checksum verification are untimed.\n'
     printf 'Caches are NOT flushed; times include startup and buffered writes, not durable disk flushes.\n'
@@ -289,7 +299,8 @@ main() {
     [[ $workload == both ]] || workloads=("$workload")
     : > "$local_root/results"
     for case_name in "${workloads[@]}"; do
-        printf 'Generating %s workload...\n' "$case_name"
+        if [[ $case_name == large ]]; then printf 'Generating one %s MiB file...\n' "$large_mib"
+        else printf 'Generating %s files of 8 KiB each...\n' "$small_files"; fi
         if [[ $case_name == large ]]; then run make_data large "$large_mib"; bytes=$((large_mib * 1048576))
         else run make_data small "$small_files"; bytes=$((small_files * 8192)); fi
         manifest "$local_root/$case_name" > "$local_root/expected"
@@ -347,9 +358,12 @@ main() {
         [[ $mode != pull ]] || remote "rm -rf $(quote "$source") $(quote "$remote_root/probe")"
     done
     printf '\nResults (mean elapsed seconds; all completed copies checked with POSIX cksum):\n'
-    awk '{key=$1 " " $2; if (!(key in n)) order[++count]=key; total[key]+=$3; n[key]++}
-         END {printf "%-18s %10s %8s\n", "Workload / tool", "Seconds", "Trials";
-              for (i=1; i<=count; i++) {key=order[i]; printf "%-18s %10.3f %8d\n", key, total[key]/n[key], n[key]}}' "$local_root/results"
+    awk '{key=$1 " " $2;
+          if (!(key in n)) {order[++count]=key; low[key]=$3; high[key]=$3}
+          total[key]+=$3; n[key]++;
+          if ($3 < low[key]) low[key]=$3; if ($3 > high[key]) high[key]=$3}
+         END {printf "%-18s %10s %10s %10s %8s\n", "Workload / tool", "Mean", "Min", "Max", "Trials";
+              for (i=1; i<=count; i++) {key=order[i]; printf "%-18s %10.3f %10.3f %10.3f %8d\n", key, total[key]/n[key], low[key], high[key], n[key]}}' "$local_root/results"
     printf '\nA quick synthetic comparison, not a prediction for every workload.\n'
     printf 'Filesystem caching, cloning, network conditions and startup costs affect results.\n'
     printf 'Try larger data and your real workloads too. Resume and direct server copies are other reasons to use syq.\n'
