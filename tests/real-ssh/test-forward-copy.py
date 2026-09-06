@@ -20,7 +20,7 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False):
-    argv = ["syq", "cp", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
+    argv = ["syq", "cp", "-vv", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin", "--to", "destination",
             "--via", "@laptop", "--as", path, "--connections", "2", *extra]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
@@ -48,7 +48,18 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False):
                     time.sleep(.1)
                 assert state, ("no copy partial before deadline", state)
                 run("syq", "recv", "on", "--notify", "off")
-            status = process.wait(timeout=65)
+            deadline = time.monotonic() + 65
+            last_output = 0
+            while True:
+                try:
+                    status = process.wait(timeout=5)
+                    break
+                except subprocess.TimeoutExpired:
+                    data = os.pread(output.fileno(), 1024 * 1024, last_output)
+                    last_output += len(data)
+                    print(data.decode(errors="replace"), end="", flush=True)
+                    print("Waiting for remote copy:", path, flush=True)
+                    assert time.monotonic() < deadline, "remote copy exceeded its deadline"
             output.seek(0)
             text = output.read().decode(errors="replace")
             print(text, end="", flush=True)

@@ -114,6 +114,9 @@ pub(super) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         },
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
     )?;
+    if args.verbose > 0 {
+        crate::output::diagnostic!("syq: remote copy approved; opening its control connection");
+    }
     let Reply::Approved(approved) = reply else {
         bail!("unexpected remote copy approval response");
     };
@@ -252,8 +255,12 @@ struct ForwardChild {
 }
 impl ForwardChild {
     fn spawn(target: &str) -> Result<Self> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .args(["--return-connect", target])
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["--return-connect", target]);
+        Self::spawn_command(command)
+    }
+    fn spawn_command(mut command: Command) -> Result<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -308,6 +315,24 @@ impl Drop for ForwardChild {
     }
 }
 
+// Control frames must reach the other side immediately. Avoid kernel copy
+// offload, which can wait for more pipe data across this request/reply boundary.
+fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64> {
+    let mut buffer = [0; 16 * 1024];
+    let mut total = 0;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(total),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+        total += count as u64;
+    }
+}
+
 fn relay(
     mut socket: UnixStream,
     mut input: std::process::ChildStdin,
@@ -320,10 +345,10 @@ fn relay(
     let (done, completions) = mpsc::channel();
     let sent = done.clone();
     let upload = std::thread::spawn(move || {
-        let _ = sent.send(std::io::copy(&mut socket, &mut input));
+        let _ = sent.send(pump(&mut socket, &mut input));
     });
     let download = std::thread::spawn(move || {
-        let _ = done.send(std::io::copy(&mut output, &mut writer));
+        let _ = done.send(pump(&mut output, &mut writer));
     });
     let deadline = Instant::now() + FINISH_TIMEOUT;
     let result = loop {
@@ -409,7 +434,7 @@ impl<T: Write + AsRawFd, F: Fn() -> bool> Write for DeadlineIo<'_, T, F> {
             self.deadline,
             self.cancelled,
         )?;
-        self.inner.write(&bytes[..bytes.len().min(4096)])
+        self.inner.write(&bytes[..bytes.len().min(512)])
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
@@ -550,6 +575,26 @@ mod tests {
     use super::*;
     use crate::destination::tests::{args, broker, request};
 
+    #[test]
+    fn duplex_control_relay_delivers_small_messages_without_waiting_for_eof() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut command = Command::new("cat");
+        command.arg("-");
+        let mut child = ForwardChild::spawn_command(command).unwrap();
+        let input = child.child.stdin.take().unwrap();
+        let output = child.child.stdout.take().unwrap();
+        let thread = std::thread::spawn(move || relay(server, input, output, || false, &mut child));
+        client.write_all(b"hello").unwrap();
+        let mut response = [0; 5];
+        let result = client.read_exact(&mut response);
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = thread.join().unwrap();
+        result.unwrap();
+        assert_eq!(&response, b"hello");
+    }
     #[test]
     fn remote_targets_are_endpoints_not_shell_or_ssh_options() {
         for target in ["backup", "alice@backup:2222", "alice@[2001:db8::1]:22"] {
