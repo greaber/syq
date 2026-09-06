@@ -52,3 +52,8 @@ forking the book template or replacing the control implementations.
 
 The oversized side-of-page chapter arrows are hidden; sidebar links and the
 end-of-page navigation provide the chapter routes.
+
+Anchor navigation scrolls smoothly, matching benchmarks. The reduced-motion
+preference disables this animation. Both sites use 20px Open Sans main prose
+and compact 14px Open Sans navigation with a 300px default sidebar width;
+their content layouts remain independent.
