@@ -172,3 +172,12 @@ Mac and Linux release-profile builds match `v0.4.0+dev.4a9372e4e11e`. They retai
 the pre-existing `unused_mut` release-profile warning in `session_pool.rs`.
 The temporary remote build and benchmark scratch are removed; versioned helper
 caches remain. No PR workflows were dispatched and no merge was performed.
+
+The final status audit found `master` CI red at `a706e11` because ShellCheck
+reported two inherited findings in this script: SC2016 on intentionally delayed
+manifest expansion, and SC2115 on the calibration cleanup path. This branch
+documents the deferred expansion with a targeted ShellCheck annotation and
+guards the cleanup root with `${local_root:?}`. Linting all tracked shell
+scripts, Bash syntax, and all 21 standalone tests pass after these changes.
+Rust and real-SSH suites were not repeated for this shell-only guard/comment
+change; their results above remain at `4a9372e`.

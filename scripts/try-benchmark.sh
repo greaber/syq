@@ -148,6 +148,8 @@ run() {
 }
 # Fixed-size argument batches avoid both one process per file and ARG_MAX.
 # The same POSIX shell program runs at both ends; LC_ALL=C fixes glob order.
+# Expand paths in the shell that runs the manifest, including on the remote host.
+# shellcheck disable=SC2016
 manifest_command='set -eu
 export LC_ALL=C
 set --
@@ -481,7 +483,7 @@ main() {
                 printf 'WARNING: available scratch space limits test size. Short copies may mostly measure startup; interpret speeds cautiously.\n' >&2
                 break
             fi
-            rm -rf -- "$local_root/$case_name"
+            rm -rf -- "${local_root:?}/$case_name"
             [[ $mode != pull ]] || remote "rm -rf $(quote "$source")"
             amount=$next
             printf 'Increasing the dataset automatically...\n'
