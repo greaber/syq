@@ -8403,12 +8403,12 @@ impl Worker {
         })();
         // Always restore both protocol boundaries, even after a local write
         // error. No following file can consume this one's data or late errors.
-        let source_end = self.src.stop_read_stream().map(|discarded| {
+        let (source_end, destination_end, destination_wait) =
+            crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
+        let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });
-        let t0 = std::time::Instant::now();
-        let destination_end = self.dst.finish_streaming_writes(sent);
-        self.t[2] += t0.elapsed().as_secs_f64();
+        self.t[2] += destination_wait.as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 

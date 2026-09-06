@@ -62,7 +62,10 @@ reply list. `WriteStreamFence` / `WriteStreamDone` is an ordered, non-writing
 fence. The authenticated server returns it even after grant expiration or
 revocation, so rejected writes cannot strand the collector. Completion
 requires every write reply and that fence. It does not flush disk.
-Both endpoints are drained on an operation error before connection reuse.
+The destination fence is sent before draining the source, allowing their
+independent remote round trips to overlap. Both endpoints are drained and the
+write collector is joined even after a fence-send or source error, before
+connection reuse. Both completion boundaries must succeed.
 
 The initial experiment adds a reply-drain thread per remote destination range.
 It can lose on short/CPU-bound work through startup, synchronization, source

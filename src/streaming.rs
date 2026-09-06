@@ -7,7 +7,25 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Start the destination fence before draining the source, so independent
+/// remote round trips overlap. Always finish both boundaries, even if either
+/// one fails. Return destination send/join time without charging source drain
+/// time to the worker's destination-wait diagnostic.
+pub(crate) fn finish_range(
+    source: &mut dyn crate::conn::Conn,
+    destination: &mut dyn crate::conn::Conn,
+    sent: u64,
+) -> (anyhow::Result<u64>, anyhow::Result<()>, Duration) {
+    let start = Instant::now();
+    let fence = destination.fence_streaming_writes();
+    let fence_wait = start.elapsed();
+    let source = source.stop_read_stream();
+    let start = Instant::now();
+    let destination = destination.finish_streaming_writes(sent, fence);
+    (source, destination, fence_wait + start.elapsed())
+}
 
 /// Only reduce the read limit. A late update can be behind the source's
 /// current offset; it stops future reads but cannot recall queued frames.
@@ -181,6 +199,110 @@ impl Drop for WriteReplies {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::Conn;
+    use crate::proto::*;
+
+    struct FinishingConn {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_fence: bool,
+        fail_source: bool,
+        fail_destination: bool,
+    }
+
+    impl Conn for FinishingConn {
+        fn send(&mut self, _: Request) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn recv(&mut self) -> anyhow::Result<Response> {
+            unreachable!()
+        }
+        fn fence_streaming_writes(&mut self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("fence");
+            anyhow::ensure!(!self.fail_fence, "fence failed");
+            Ok(())
+        }
+        fn stop_read_stream(&mut self) -> anyhow::Result<u64> {
+            let mut events = self.events.lock().unwrap();
+            assert_eq!(
+                *events,
+                ["fence"],
+                "source drained before destination fence"
+            );
+            events.push("source");
+            anyhow::ensure!(!self.fail_source, "source failed");
+            Ok(17)
+        }
+        fn finish_streaming_writes(
+            &mut self,
+            sent: u64,
+            fence: anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(sent, 3);
+            let mut events = self.events.lock().unwrap();
+            assert_eq!(*events, ["fence", "source"]);
+            events.push("destination");
+            assert_eq!(fence.is_err(), self.fail_fence);
+            fence?;
+            anyhow::ensure!(!self.fail_destination, "destination failed");
+            Ok(())
+        }
+        fn scan(
+            &mut self,
+            _: &[u8],
+            _: Option<&RegisteredPath>,
+            _: bool,
+            _: &[String],
+            _: bool,
+            _: &mut dyn FnMut(Vec<Entry>) -> anyhow::Result<()>,
+            _: &mut dyn FnMut(Vec<PathBytes>) -> anyhow::Result<()>,
+            _: &mut dyn FnMut(String),
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn native_remove(
+            &mut self,
+            _: Option<&[u8]>,
+            _: Option<&[u8]>,
+            _: &[NativeRemoveSelection],
+            _: bool,
+            _: bool,
+            _: usize,
+            _: &mut dyn FnMut(Vec<String>) -> anyhow::Result<()>,
+            _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn finishing_starts_the_fence_before_source_drain_and_checks_both_failures() {
+        for fail_fence in [false, true] {
+            for fail_source in [false, true] {
+                for fail_destination in [false, true] {
+                    let events = Arc::new(Mutex::new(Vec::new()));
+                    let mut source = FinishingConn {
+                        events: events.clone(),
+                        fail_fence,
+                        fail_source,
+                        fail_destination,
+                    };
+                    let mut destination = FinishingConn {
+                        events: events.clone(),
+                        fail_fence,
+                        fail_source,
+                        fail_destination,
+                    };
+                    let (source, destination, _) = finish_range(&mut source, &mut destination, 3);
+                    assert_eq!(source.is_err(), fail_source);
+                    if let Ok(discarded) = source {
+                        assert_eq!(discarded, 17);
+                    }
+                    assert_eq!(destination.is_err(), fail_fence || fail_destination);
+                    assert_eq!(*events.lock().unwrap(), ["fence", "source", "destination"]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn streaming_limit_accepts_repeated_and_zero_limits_but_never_grows() {

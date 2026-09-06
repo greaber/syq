@@ -25,7 +25,12 @@ pub trait Conn: Send {
     fn check_streaming_writes(&mut self) -> Result<()> {
         bail!("no streaming writes are active")
     }
-    fn finish_streaming_writes(&mut self, _sent: u64) -> Result<()> {
+    /// Start the non-writing fence without waiting for its reply. Pass its
+    /// result to finish even after failure, so the collector is always joined.
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        bail!("no streaming writes are active")
+    }
+    fn finish_streaming_writes(&mut self, _sent: u64, _fence: Result<()>) -> Result<()> {
         bail!("no streaming writes are active")
     }
     fn stop_read_stream(&mut self) -> Result<u64> {
@@ -607,11 +612,19 @@ impl Conn for LocalConn {
                 .clone(),
         )
     }
-    fn finish_streaming_writes(&mut self, sent: u64) -> Result<()> {
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.write_stream.is_some(),
+            "no streaming writes are active"
+        );
+        Ok(())
+    }
+    fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
         let state = self
             .write_stream
             .take()
             .context("no streaming writes are active")?;
+        fence?;
         anyhow::ensure!(
             state.count == sent,
             "streaming write completion count mismatch"
@@ -949,14 +962,20 @@ impl Conn for RemoteConn {
         }
         streaming_result(state.error)
     }
-    fn finish_streaming_writes(&mut self, sent: u64) -> Result<()> {
+    fn fence_streaming_writes(&mut self) -> Result<()> {
         // The non-writing marker fences every reply, even when a signed grant
         // has expired and the destination is rejecting all further writes.
-        let fence = if self.dead {
+        anyhow::ensure!(
+            self.write_stream.is_some(),
+            "no streaming writes are active"
+        );
+        if self.dead {
             Err(anyhow!("streaming transport failed"))
         } else {
             self.send(Request::WriteStreamFence)
-        };
+        }
+    }
+    fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
         let stream = self
             .write_stream
             .take()
