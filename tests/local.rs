@@ -1179,7 +1179,9 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn janky_cat_concatenates_files_and_stdin() {
     let t = Tmp::new();
-    write(&t.path("first"), b"first\0");
+    // Cross several bursts, including a short final one, without changing bytes.
+    let first: Vec<u8> = (0..=255).cycle().take(1300).collect();
+    write(&t.path("first"), &first);
     write(&t.path("last"), b"\nlast");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -1192,7 +1194,7 @@ fn janky_cat_concatenates_files_and_stdin() {
     let output = child.wait_with_output().unwrap();
 
     assert_output_ok(&output);
-    assert_eq!(output.stdout, b"first\0middle\nlast");
+    assert_eq!(output.stdout, [first.as_slice(), b"middle\nlast"].concat());
 }
 
 #[test]
@@ -5770,6 +5772,446 @@ fn large_file_parallel_chunks() {
     }
     run_ok(&args);
     assert!(read(&t.path("dst/huge.bin")) == data);
+}
+
+#[test]
+fn progress_bar_slow_copy_stays_on_one_line_and_leaves_final_counts() {
+    let t = Tmp::new();
+    let data = prng(2 * 1024 * 1024, 451);
+    write(&t.path("src"), &data);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "--progress",
+            "--connections",
+            "4",
+            "--bwlimit",
+            "1M",
+        ])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&t.path("dst")), data);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("100%  done  2.00 MiB/2.00 MiB"),
+        "{stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "only final frame ends a line: {stderr:?}"
+    );
+    assert!(
+        !stderr
+            .replace("\x1b[K", "")
+            .replace("\x1b[2K", "")
+            .contains("\x1b"),
+        "no screen clearing or cursor-up: {stderr:?}"
+    );
+    assert!(
+        stderr
+            .split('\r')
+            .filter(|frame| frame.starts_with('['))
+            .count()
+            > 2,
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn progress_bar_reports_incomplete_verification_and_entry_removal() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"source");
+    write(&t.path("dst"), b"different");
+    let out = compat_command()
+        .args(["--syq-verify-only", "--progress", &t.s("src"), &t.s("dst")])
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("incomplete"), "{stderr:?}");
+    assert!(!stderr.contains("%  done"), "{stderr:?}");
+    assert_eq!(read(&t.path("dst")), b"different");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--progress", &t.s("dst")])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("100%  done  1/1 entries"), "{stderr:?}");
+    assert!(!t.path("dst").exists());
+}
+
+#[test]
+fn progress_bar_does_not_mix_with_json_progress() {
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(1024 * 1024, 452));
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "--progress",
+            "--progress-json",
+            "--bwlimit",
+            "1M",
+        ])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.is_empty());
+    for line in stderr.lines() {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("JSON without a terminal bar");
+        assert!(value["bytes_done"].is_u64(), "{line}");
+    }
+}
+
+#[test]
+fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
+    let t = Tmp::new();
+    write(&t.path("src"), b"payload");
+    for (dst, flags) in [
+        ("default", vec![]),
+        ("disabled", vec!["--progress", "--no-progress"]),
+        ("quiet", vec!["--progress", "--quiet"]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", &t.s("src"), "--as", &t.s(dst)])
+            .args(flags)
+            .run()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stderr.is_empty(), "{dst}: {out:?}");
+    }
+}
+
+#[test]
+fn tuning_options_force_ranges_for_small_and_whole_local_files() {
+    let t = Tmp::new();
+    for (file, size) in [("small", 1024), ("large", 6 << 20), ("empty", 0)] {
+        write(&t.path(&format!("source/{file}")), &prng(size, 909));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("source"),
+            "--into",
+            &t.s("destination"),
+            "--tuning-options=copy-path=ranges,request-size=1M,split-min-size=1M",
+            "-j",
+            "2",
+            "-v",
+            "--no-progress",
+            "--preserve=permissions",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    let observed = tuning_observed(&out);
+    assert!(observed["range_requests"].as_u64().unwrap() >= 7);
+    assert_eq!(observed["max_request_bytes"], 1 << 20);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["small_batches"], 0);
+    assert!(stderr_of(&out).contains("split-min-size=8388608"));
+    assert_same_tree(&t.path("source"), &t.path("destination"));
+}
+
+fn tuning_observed(out: &Output) -> serde_json::Value {
+    let diagnostic = stderr_of(out);
+    let line = diagnostic
+        .lines()
+        .find_map(|line| line.strip_prefix("syq: tuning observed: "))
+        .unwrap_or_else(|| panic!("missing benchmark observations: {diagnostic}"));
+    serde_json::from_str(line).unwrap()
+}
+
+#[test]
+fn tuning_options_batch_limits_include_the_first_file() {
+    let t = Tmp::new();
+    for i in 0..7 {
+        write(&t.path(&format!("source/{i}")), &prng(600 << 10, i));
+    }
+    for (files, bytes, expected_files) in [(3, 2 << 20, 3), (10, 1 << 20, 1)] {
+        let destination = t.s(&format!("destination-{files}"));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("source"),
+                "--into",
+                &destination,
+                "--tuning-options",
+                &format!("batch-files={files},batch-bytes={bytes}"),
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--preserve=permissions",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["max_batch_files"], expected_files, "{observed}");
+        assert!(observed["max_batch_bytes"].as_u64().unwrap() <= bytes);
+        assert_eq!(observed["range_requests"], 0);
+        assert_same_tree(&t.path("source"), Path::new(&destination));
+    }
+}
+
+#[test]
+fn tuning_options_control_the_native_small_copy_shortcut() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("source"), b"native small copy");
+    for options in [
+        "copy-path=auto",
+        "copy-path=ranges",
+        "batch-files=2,batch-bytes=512",
+    ] {
+        let destination = t.s(&format!("destination-{}", options.len()));
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "host",
+                "--as",
+                &destination,
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-tcp",
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--tuning-options",
+                options,
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let observed = tuning_observed(&out);
+        let counter = match options {
+            "copy-path=auto" => "native_small_copies",
+            "copy-path=ranges" => "range_requests",
+            _ => "small_batches",
+        };
+        assert_eq!(observed[counter], 1, "{observed}");
+        assert_eq!(read(Path::new(&destination)), b"native small copy");
+    }
+}
+
+#[test]
+fn tuning_options_average_pacing_pays_for_one_large_request() {
+    let t = Tmp::new();
+    let data = prng(2 << 20, 910);
+    write(&t.path("source"), &data);
+    for (pacing, expected_max) in [("average", 2 << 20), ("25ms", 52_428)] {
+        let start = std::time::Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("source"),
+                "--as",
+                &t.s(pacing),
+                "-j",
+                "1",
+                "-v",
+                "--no-progress",
+                "--bwlimit=2M",
+                "--tuning-options",
+                &format!("copy-path=ranges,request-size=2M,bw-pacing={pacing}"),
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "{out:?}"
+        );
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["max_request_bytes"], expected_max, "{observed}");
+        if pacing == "average" {
+            assert_eq!(observed["range_requests"], 1);
+        }
+        assert_eq!(read(&t.path(pacing)), data);
+    }
+}
+
+#[test]
+fn tuning_options_are_in_full_help_and_validate_before_copying() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"source");
+    for interface in ["cp", "rsync"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([interface, "--help"])
+            .run()
+            .unwrap();
+        assert_output_ok(&help);
+        assert!(!String::from_utf8_lossy(&help.stdout).contains("--tuning-options"));
+        let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([interface, "--help-all"])
+            .run()
+            .unwrap();
+        assert_output_ok(&help);
+        let text = String::from_utf8_lossy(&help.stdout);
+        assert!(
+            text.contains("--tuning-options") && text.contains("pipeline-depth"),
+            "{text}"
+        );
+        for options in [
+            "typo=4",
+            "pipeline-depth=0",
+            "request-size=65M",
+            "pipeline-depth=4,pipeline-depth=8",
+            "copy-path=ranges,batch-files=1",
+            "bw-pacing=average",
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([interface, "--tuning-options", options, &t.s("source")]);
+            if interface == "cp" {
+                command.arg("--as");
+            }
+            let out = command.arg(t.s("destination")).run().unwrap();
+            assert!(!out.status.success(), "{out:?}");
+            assert!(stderr_of(&out).contains("--tuning-options"), "{out:?}");
+            assert!(!t.path("destination").exists());
+        }
+    }
+}
+
+#[test]
+fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(9 * 1024 * 1024 + 123, 904);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for pull in [false, true] {
+            for (size, depth) in [(64 << 10, 1), (1 << 20, 8), (64 << 10, 64), (8 << 20, 8)] {
+                let destination = t.s(&format!("dst-{tcp}-{pull}-{size}-{depth}"));
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--connections",
+                    "1",
+                    "--no-progress",
+                    "--stats",
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--tuning-options",
+                    &format!("request-size={size},pipeline-depth={depth}"),
+                ]);
+                if !tcp {
+                    command.arg("--no-tcp");
+                } else {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                }
+                if pull {
+                    command.args(["--from", "host"]);
+                }
+                command.arg(t.s("source"));
+                if !pull {
+                    command.args(["--to", "host"]);
+                }
+                command
+                    .args(["--as", &destination])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+                let out = command.run().unwrap();
+                assert_output_ok(&out);
+                let diagnostic = stderr_of(&out);
+                assert!(
+                    diagnostic.contains(&format!("request-size={size} bytes")),
+                    "{diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains(&format!("pipeline-depth={depth}")),
+                    "{diagnostic}"
+                );
+                assert!(
+                    diagnostic.contains("hash-block-size=4194304 bytes"),
+                    "{diagnostic}"
+                );
+                assert_eq!(read(Path::new(&destination)), data);
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
+    let t = Tmp::new();
+    let data = prng(6 * 1024 * 1024, 905);
+    write(&t.path("source"), &data);
+    set_mtime(&t.path("source"), 1_600_000_000);
+    let src = t.s("source");
+    let dst = t.s("destination");
+    let initial = ["-a", "--block-size=1M", "--bwlimit=1G", &src, &dst];
+    let partial = interrupted_partial(&initial, &t.0);
+    let f = File::create(&partial).unwrap();
+    (&f).write_all(&data[..3 * 1024 * 1024]).unwrap();
+    f.set_len(data.len() as u64).unwrap();
+    drop(f);
+    let out = run_ok(&[
+        "-a",
+        "--block-size=1M",
+        "--bwlimit=1G",
+        "--tuning-options=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
+        &src,
+        &dst,
+    ]);
+    assert_eq!(read(&t.path("destination")), data);
+    assert!(!partial.exists(), "override stranded the existing partial");
+    assert!(
+        out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
+        "{out}"
+    );
+}
+
+#[test]
+fn tuning_options_keep_the_aggregate_bandwidth_limit() {
+    let t = Tmp::new();
+    let data = prng(2 * 1024 * 1024, 906);
+    write(&t.path("source"), &data);
+    let start = std::time::Instant::now();
+    let out = run_ok(&[
+        "-a",
+        "--bwlimit=1M",
+        "--syq-connections=4",
+        "--tuning-options=request-size=64M,pipeline-depth=64",
+        &t.s("source"),
+        &t.s("destination"),
+    ]);
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(1600),
+        "{out}"
+    );
+    assert_eq!(read(&t.path("destination")), data);
 }
 
 #[test]
@@ -14446,8 +14888,11 @@ fn completion_adapters_and_local_filename_candidates_are_shell_safe() {
     assert_output_ok(&zsh);
     let zsh = String::from_utf8(zsh.stdout).unwrap();
     assert!(!zsh.contains("compadd -Q"), "{zsh}");
-    assert!(zsh.contains("compadd --"), "{zsh}");
-    assert!(zsh.contains("compadd -S '' --"), "{zsh}");
+    assert!(zsh.contains("compadd -l -d descriptions --"), "{zsh}");
+    assert!(
+        zsh.contains("compadd -l -d prefix_descriptions -S '' --"),
+        "{zsh}"
+    );
 
     let registered = Command::new("bash")
         .arg("-c")
@@ -17266,4 +17711,61 @@ fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
         !t.path("ssh-used").exists(),
         "a denied return copy switched to SSH"
     );
+}
+
+#[test]
+fn completion_details_keep_metadata_out_of_inserted_paths() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let t = Tmp::new();
+    fs::write(t.path("alpha file"), vec![0; 2048]).unwrap();
+    fs::set_permissions(t.path("alpha file"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::create_dir(t.path("alpine")).unwrap();
+    symlink("missing-target", t.path("alias")).unwrap();
+    let plain = completion_command(&t, &["__complete", "bash", "2", "--", "syq", "cp", "al"])
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&plain);
+    assert_eq!(
+        completion_values(&plain.stdout),
+        vec![
+            (b'f', b"alias".to_vec()),
+            (b'f', b"alpha file".to_vec()),
+            (b'p', b"alpine/".to_vec())
+        ]
+    );
+    let detailed = completion_command(&t, &["__complete", "zsh", "2", "--", "syq", "cp", "al"])
+        .env("SYQ_COMPLETION_DETAILS", "1")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&detailed);
+    let records: Vec<_> = detailed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+    assert_eq!(records.len(), 6);
+    assert_eq!(records[0], b"falias");
+    assert!(String::from_utf8_lossy(records[1]).ends_with("alias -> missing-target"));
+    assert_eq!(records[2], b"falpha file");
+    let file = String::from_utf8_lossy(records[3]);
+    assert!(file.starts_with("-rw-r----- "), "{file}");
+    assert!(file.contains("2.0 KiB"), "{file}");
+    assert!(file.contains(" UTC  alpha file"), "{file}");
+    assert_eq!(records[4], b"palpine/");
+    let directory = String::from_utf8_lossy(records[5]);
+    assert!(
+        directory.starts_with('d') && directory.contains('—'),
+        "{directory}"
+    );
+    let bash = completion_command(&t, &["__complete-bash", "al", "--", "syq cp al"])
+        .env("SYQ_COMPLETION_DETAILS", "1")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+    assert_output_ok(&bash);
+    assert!(completion_values(&bash.stdout)
+        .iter()
+        .all(|(kind, _)| *kind == b'd'));
 }

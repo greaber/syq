@@ -77,6 +77,11 @@ the reversed constrained-agent edge, and an explicit local relay. Every path
 uses real SSH for control and bootstrap, and the suite compares the complete
 source and destination manifests afterward.
 
+Range-transfer checks also copy a large file with a 64-request pipeline and
+2 MiB requests with average bandwidth pacing over TCP and SSH, then through
+source, destination, and local coordinators. Batch overrides also run through
+a restricted receiver. Each result is compared byte for byte with the original.
+
 This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. For release preparation, use
@@ -85,3 +90,13 @@ successful default-profile validation for the complete clean tree, reusable
 across an identical-tree merge. See `RELEASING.md` for the evidence rules.
 A failure retains public logs
 under `target/real-ssh.*`; the ephemeral private key is always removed.
+
+The default suite also runs interactive Bash, Zsh, and fish completion checks
+in disposable PTYs. They verify that the detail view shows metadata while
+completion inserts only the pathname. To run the Bash check locally:
+
+```sh
+python3 tests/real-ssh/test-completion-display.py --syq target/debug/syq
+```
+
+The shell dependencies are installed only in the test image.

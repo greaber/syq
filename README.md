@@ -1,6 +1,7 @@
 # syq
 
-Syq copies and removes files in parallel, on one machine or over SSH.
+Syq (pronounced "sick") copies and removes files in parallel, on one machine
+or over SSH.
 It is built for large files, large trees, and fast networks.
 
 - **Parallel copies and removal**, with automatic connection tuning.

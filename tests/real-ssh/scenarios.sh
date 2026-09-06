@@ -251,6 +251,21 @@ ssh source 'test ! -e ~/.syq-destinations-v2/laptop.json'
 syq recv off
 syq completion cache clear >/dev/null
 
+printf 'case: shell completion adapters parse and keep descriptions separate\n'
+for completion_shell in bash zsh fish; do
+    python3 /usr/local/libexec/syq-test-completion-display.py --syq /usr/local/bin/syq --shell "$completion_shell"
+done
+syq completion bash > /tmp/syq-completion.bash
+bash -n /tmp/syq-completion.bash
+syq completion zsh > /tmp/syq-completion.zsh
+zsh -n /tmp/syq-completion.zsh
+syq completion fish > /tmp/syq-completion.fish
+fish -n /tmp/syq-completion.fish
+mkdir -p /tmp/syq-real-ssh/completion-adapters
+printf 'hello' > /tmp/syq-real-ssh/completion-adapters/alpha
+fish -c 'source /tmp/syq-completion.fish; complete -C "syq cp /tmp/syq-real-ssh/completion-adapters/al"' > /tmp/syq-fish-details
+awk -F '\t' '$1 == "/tmp/syq-real-ssh/completion-adapters/alpha" && $2 ~ /^-rw/ && $2 ~ /5 B/ && $2 ~ /UTC/ { found=1 } END { exit !found }' /tmp/syq-fish-details
+
 printf 'case: remote filename completion reuses a persistent ordinary SSH login\n'
 ssh source 'rm -rf /tmp/syq-real-ssh/completion; mkdir -p /tmp/syq-real-ssh/completion/alpine; : > "/tmp/syq-real-ssh/completion/alpha file"'
 # Observe the environment at the remote helper, after real SendEnv/AcceptEnv
@@ -376,6 +391,16 @@ awk '
 ' /tmp/syq-real-ssh-completion-env.out
 unset SYQ_REAL_SSH_SENT_ENV
 syq completion cache clear >/dev/null
+
+printf 'case: remote completion details use remote metadata without persistence\n'
+SYQ_COMPLETION_DETAILS=1 syq completion __complete fish 4 -- syq cp --from source /tmp/syq-real-ssh/completion/al > /tmp/syq-completion-details
+tr '\000' '\n' < /tmp/syq-completion-details > /tmp/syq-completion-details-lines
+awk -F '\t' '
+    $1 == "/tmp/syq-real-ssh/completion/alpha file" && $2 ~ /^-rw/ && $2 ~ /syq +syq/ && $2 ~ /0 B/ && $2 ~ /UTC/ { file=1 }
+    $1 == "/tmp/syq-real-ssh/completion/alpine/" && $2 ~ /^d/ && $2 ~ /UTC/ { directory=1 }
+    END { exit !(file && directory) }
+' /tmp/syq-completion-details-lines
+
 
 printf 'case: small native push to an ordinary SSH destination takes one turn\n'
 small_source=/tmp/syq-real-ssh-small.bin
@@ -601,6 +626,46 @@ assert_same_tree \
     source /tmp/syq-real-ssh/relay-source \
     destination /tmp/syq-real-ssh/relay-destination \
     relay
+
+printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
+tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average
+dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
+for transport in tcp ssh; do
+    if [ "$transport" = ssh ]; then
+        set -- --no-tcp
+    else
+        set --
+    fi
+    syq cp /tmp/syq-real-ssh-tuning.bin --to source \
+        --as "/tmp/syq-real-ssh/tuning-$transport" -j 1 --no-progress \
+        --bwlimit 8M --tuning-options "$tuning" "$@"
+    syq cp --from source "/tmp/syq-real-ssh/tuning-$transport" \
+        --as "/tmp/syq-real-ssh-tuning-$transport-download" -j 1 --no-progress \
+        --bwlimit 8M --tuning-options "$tuning" "$@"
+    cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-tuning-$transport-download"
+done
+for coordinator in src dst local; do
+    case "$coordinator" in
+        src) set -- ;;
+        dst) set -- --peer-auth broker --no-tcp ;;
+        local) set -- --no-tcp ;;
+    esac
+    syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
+        --as "/tmp/syq-real-ssh/tuning-$coordinator" --coordinate-at "$coordinator" \
+        -j 1 --no-progress --bwlimit 8M --tuning-options "$tuning" "$@"
+    ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-tuning-check <<'EOF'
+cat "/tmp/syq-real-ssh/tuning-$1"
+EOF
+    cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
+done
+
+printf 'case: batch overrides through a command-restricted receiver\n'
+ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'
+syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
+    --to destination --into /tmp/syq-real-ssh/tuning-batches -j 1 --no-progress \
+    --tuning-options batch-files=3,batch-bytes=1M
+assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
+    destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2

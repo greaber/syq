@@ -2,6 +2,7 @@ mod agent_broker;
 mod bwlimit;
 mod cli;
 mod completion;
+mod completion_details;
 mod conn;
 mod delegation;
 #[allow(dead_code)]
@@ -37,6 +38,7 @@ mod tcp_records;
 #[cfg(test)]
 mod test_support;
 mod transfer;
+mod transfer_tuning;
 mod tune;
 mod update;
 

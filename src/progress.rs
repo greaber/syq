@@ -1,17 +1,10 @@
-//! Progress display: one status line plus one line per active worker.
+//! A fixed-height aggregate progress bar. Byte accounting belongs to the engine.
 
 use std::collections::VecDeque;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-#[derive(Clone)]
-pub struct WorkerStatus {
-    pub path: String,
-    pub done: Arc<AtomicU64>,
-    pub total: u64,
-}
 
 pub struct Progress {
     pub enabled: bool,
@@ -52,7 +45,6 @@ pub struct Progress {
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
     pub start: Instant,
-    workers: Mutex<Vec<Option<WorkerStatus>>>,
     term: Mutex<TermState>,
     stop: AtomicBool,
     /// `--results`: machine-readable NDJSON outcome stream, set once after
@@ -61,22 +53,39 @@ pub struct Progress {
 }
 
 struct TermState {
-    lines_drawn: usize,
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
     last_results: Option<Instant>,
 }
 
+/// Own the ticker until it has stopped. In particular, `?` must not detach a
+/// thread that can clear or redraw the final bar after a fatal copy error.
+pub struct ProgressTicker {
+    progress: Arc<Progress>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressTicker {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.progress.stop();
+        self.thread.take().map_or(Ok(()), |thread| thread.join())
+    }
+
+    pub fn join(mut self) -> std::thread::Result<()> {
+        self.stop_and_join()
+    }
+}
+
+impl Drop for ProgressTicker {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
 impl Progress {
-    pub fn new(
-        n_workers: usize,
-        enabled: bool,
-        force: bool,
-        width: Option<usize>,
-        json: bool,
-    ) -> Arc<Self> {
+    pub fn new(enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
         Arc::new(Progress {
-            enabled: enabled && (force || std::io::stderr().is_terminal()),
+            enabled: enabled && !json && (force || std::io::stderr().is_terminal()),
             json,
             width,
             rm: false,
@@ -100,10 +109,8 @@ impl Progress {
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
-            workers: Mutex::new(vec![None; n_workers]),
             term: Mutex::new(TermState {
-                lines_drawn: 0,
-                samples: VecDeque::new(),
+                samples: VecDeque::from([(Instant::now(), 0)]),
                 last_json: None,
                 last_results: None,
             }),
@@ -120,14 +127,6 @@ impl Progress {
         self.results.get()
     }
 
-    pub fn set_worker(&self, id: usize, s: Option<WorkerStatus>) {
-        let mut w = self.workers.lock().unwrap();
-        if id >= w.len() {
-            w.resize(id + 1, None);
-        }
-        w[id] = s;
-    }
-
     pub fn add_bytes(&self, n: u64) {
         let done = self.bytes_done.fetch_add(n, Relaxed).saturating_add(n);
         self.tuning_high_water.fetch_max(done, Relaxed);
@@ -135,27 +134,11 @@ impl Progress {
 
     /// Print a line to stdout, keeping the progress area intact.
     pub fn println(&self, line: &str) {
-        let mut term = Some(self.term.lock().unwrap());
-        self.erase(term.as_mut().unwrap());
-        // A redirected stdout cannot disturb the terminal display. Let the
-        // ticker keep running while a slow pipe blocks this printing worker.
-        if !std::io::stdout().is_terminal() {
-            drop(term.take());
-        }
-        let result = {
-            let mut out = std::io::stdout().lock();
-            writeln!(out, "{line}").and_then(|()| out.flush())
-        };
-        drop(term);
-        if let Err(error) = result {
-            crate::output::warn_stdout(&error);
-        }
+        crate::output::emit_human_stdout(format_args!("{line}"));
     }
 
-    /// Print a line to stderr (errors and warnings), keeping the progress area intact.
+    /// Print diagnostics through the same output lock as the live bar.
     pub fn eprintln(&self, line: &str) {
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
         crate::output::diagnostic!("{line}");
     }
 
@@ -177,8 +160,6 @@ impl Progress {
     }
 
     pub fn warning(&self, code: &str, count: u64, message: &str) {
-        let mut term = self.term.lock().unwrap();
-        self.erase(&mut term);
         if self.json {
             crate::output::diagnostic!(
                 "{}",
@@ -194,26 +175,23 @@ impl Progress {
         }
     }
 
-    fn erase(&self, t: &mut TermState) {
-        if t.lines_drawn > 0 {
-            let _ = write!(std::io::stderr().lock(), "\r\x1b[{}A\x1b[J", t.lines_drawn);
-            t.lines_drawn = 0;
-        }
-    }
-
-    fn rate(&self, t: &mut TermState) -> f64 {
-        let now = Instant::now();
-        let done = self.bytes_done.load(Relaxed);
+    fn rate(&self, t: &mut TermState, now: Instant, done: u64) -> f64 {
         if t.samples
             .back()
             .is_some_and(|&(_, previous)| done < previous)
         {
             // Recovery can retract bytes whose acknowledgement is uncertain.
-            // A window spanning that rollback is not a meaningful rate.
             t.samples.clear();
         }
-        t.samples.push_back((now, done));
-        while t.samples.len() > 2 && now - t.samples[0].0 > Duration::from_secs(5) {
+        // Sample byte changes, not redraws. Keep the sample before the window:
+        // a block taking 30 seconds must not look like it arrived in 5 seconds.
+        if t.samples
+            .back()
+            .is_none_or(|&(_, previous)| done != previous)
+        {
+            t.samples.push_back((now, done));
+        }
+        while t.samples.len() > 2 && now - t.samples[1].0 > Duration::from_secs(5) {
             t.samples.pop_front();
         }
         let (t0, b0) = t.samples[0];
@@ -225,9 +203,14 @@ impl Progress {
     }
 
     pub fn render(&self) {
+        self.render_status(None);
+    }
+
+    fn render_status(&self, status: Option<&str>) {
         let mut t = self.term.lock().unwrap();
-        let rate = self.rate(&mut t);
+        let now = Instant::now();
         let done = self.bytes_done.load(Relaxed);
+        let rate = self.rate(&mut t, now, done);
         let total = self.bytes_total.load(Relaxed);
         let fdone = self.files_done.load(Relaxed);
         let ftotal = self.files_total.load(Relaxed);
@@ -240,7 +223,7 @@ impl Progress {
             None
         };
 
-        if let Some(results) = self.results.get() {
+        if let Some(results) = self.results.get().filter(|_| status.is_none()) {
             let now = Instant::now();
             if t.last_results
                 .is_none_or(|last| now - last >= Duration::from_secs(1))
@@ -260,7 +243,7 @@ impl Progress {
                 });
             }
         }
-        if self.json {
+        if self.json && status.is_none() {
             let now = Instant::now();
             if t.last_json
                 .is_none_or(|l| now - l >= Duration::from_secs(1))
@@ -280,84 +263,100 @@ impl Progress {
         if !self.enabled {
             return;
         }
-        self.erase(&mut t);
-        let width = self.width.unwrap_or_else(term_width);
-        let mut lines = Vec::new();
-        let pct = if total > 0 { done * 100 / total } else { 0 };
-        let mut head = if self.rm {
-            format!("removed {} / {} entries", commas(fdone), commas(ftotal))
+        let age = now - t.samples.back().unwrap().0;
+        let elapsed = now - self.start;
+        let state = if let Some(status) = status {
+            status.to_string()
+        } else if !scan_done {
+            format!("scanning {}", commas(self.scanned.load(Relaxed)))
+        } else if self.errors.load(Relaxed) > 0 {
+            format!("{} errors", self.errors.load(Relaxed))
+        } else if !self.rm && done >= total && fdone < ftotal {
+            "finishing".to_string()
+        } else if age >= Duration::from_secs(5) && !self.rm {
+            format!("no update {}", hms(age.as_secs_f64()))
+        } else if self.rm {
+            "removing".to_string()
         } else {
-            format!(
-                "{} / {}  {pct:>3}%  {}/s  files {fdone}/{ftotal}",
-                human(done),
-                human(total),
-                human(rate as u64)
-            )
+            format!("{}/s", human(rate as u64))
         };
-        if let Some(e) = eta {
-            head.push_str(&format!("  ETA {}", hms(e)));
+        let (count, total, units) = if self.rm {
+            (
+                fdone,
+                ftotal,
+                format!("{}/{} entries", commas(fdone), commas(ftotal)),
+            )
+        } else {
+            (done, total, format!("{}/{}", human(done), human(total)))
+        };
+        let mut details = vec![state, format!("elapsed {}", hms(elapsed.as_secs_f64()))];
+        if status.is_none() && age < Duration::from_secs(5) && !self.rm {
+            if let Some(eta) = eta {
+                details.push(format!("ETA {}", hms(eta)));
+            }
+        }
+        if !self.rm {
+            details.push(format!("files {fdone}/{ftotal}"));
+        }
+        if skipped > 0 {
+            details.push(format!("unchanged {}", human(skipped)));
         }
         let active = self.active_workers.load(Relaxed);
         if active > 0 {
-            head.push_str(&format!("  {active} conn"));
+            details.push(format!("{active} conn"));
         }
-        if skipped > 0 {
-            head.push_str(&format!("  (unchanged {})", human(skipped)));
+        let line = bar_line(
+            self.width.unwrap_or_else(term_width).saturating_sub(1),
+            count,
+            total,
+            scan_done || status.is_some(),
+            status == Some("done")
+                || (status.is_none()
+                    && scan_done
+                    && ftotal > 0
+                    && fdone == ftotal
+                    && self.errors.load(Relaxed) == 0),
+            &units,
+            &details,
+        );
+        // Never blank the display between frames or move through worker rows.
+        // One buffered write replaces this line and clears only its old tail.
+        crate::output::draw_progress(line);
+    }
+
+    /// Leave the final bar visible. Call after joining the ticker, with the
+    /// actual operation outcome; a full byte counter alone is not success.
+    pub fn finish(&self, success: bool) {
+        self.render_status(Some(if success { "done" } else { "incomplete" }));
+        if self.enabled {
+            crate::output::finish_progress();
         }
-        if !scan_done {
-            head.push_str(&format!(
-                "  scanning: {} entries",
-                self.scanned.load(Relaxed)
-            ));
-        }
-        lines.push(head);
-        // One line per file in flight; several workers may share a file.
-        let mut seen: Vec<(String, u64, u64, usize)> = Vec::new();
-        for w in self.workers.lock().unwrap().iter().flatten() {
-            match seen.iter_mut().find(|s| s.0 == w.path) {
-                Some(s) => s.3 += 1,
-                None => seen.push((w.path.clone(), w.done.load(Relaxed), w.total, 1)),
-            }
-        }
-        for (path, done, total, n) in seen {
-            let done = done.min(total);
-            let pct = if total > 0 { done * 100 / total } else { 100 };
-            let prefix = format!("  {pct:>3}% ");
-            let suffix = if n > 1 {
-                format!("  ×{n}")
-            } else {
-                String::new()
-            };
-            let room = width.saturating_sub(prefix.len() + suffix.len() + 1);
-            lines.push(format!("{prefix}{}{suffix}", truncate(&path, room)));
-        }
-        let mut err = std::io::stderr().lock();
-        for l in &lines {
-            let _ = writeln!(err, "{}", truncate(l, width.saturating_sub(1)));
-        }
-        let _ = err.flush();
-        t.lines_drawn = lines.len();
     }
 
     pub fn clear(&self) {
-        let mut t = self.term.lock().unwrap();
-        self.erase(&mut t);
+        if self.enabled {
+            crate::output::clear_progress();
+        }
     }
 
-    pub fn spawn_ticker(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
+    pub fn spawn_ticker(self: &Arc<Self>) -> Option<ProgressTicker> {
         // A results stream needs the ticker too: sampled progress records
         // are emitted from render() even when stderr is not a terminal.
         if !self.enabled && !self.json && self.results.get().is_none() {
             return None;
         }
         let p = self.clone();
-        Some(std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             while !p.stop.load(Relaxed) {
                 p.render();
                 std::thread::sleep(Duration::from_millis(100));
             }
             p.clear();
-        }))
+        });
+        Some(ProgressTicker {
+            progress: self.clone(),
+            thread: Some(thread),
+        })
     }
 
     pub fn stop(&self) {
@@ -375,24 +374,52 @@ pub fn term_width() -> usize {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+/// All fields are ASCII and the line reserves the terminal's final column,
+/// avoiding autowrap. Drop optional fields whole; never truncate away progress.
+fn bar_line(
+    width: usize,
+    done: u64,
+    total: u64,
+    known: bool,
+    success: bool,
+    units: &str,
+    details: &[String],
+) -> String {
+    let pct = if total > 0 {
+        (u128::from(done.min(total)) * 100 / u128::from(total)) as usize
+    } else if success {
+        100
+    } else {
+        0
+    };
+    let percent = if known {
+        format!("{pct:>3}%")
+    } else {
+        " ---".to_string()
+    };
+    let cells = (width / 5).clamp(3, 24);
+    let filled = if known { pct * cells / 100 } else { 0 };
+    let mut line = format!(
+        "[{}{}] {percent}",
+        "=".repeat(filled),
+        " ".repeat(cells - filled)
+    );
+    if line.len() > width {
+        return percent.trim().chars().take(width).collect();
     }
-    if max < 4 {
-        return s.chars().take(max).collect();
+    for field in details
+        .iter()
+        .take(1)
+        .map(String::as_str)
+        .chain(std::iter::once(units))
+        .chain(details.iter().skip(1).map(String::as_str))
+    {
+        if line.len() + 2 + field.len() <= width {
+            line.push_str("  ");
+            line.push_str(field);
+        }
     }
-    let keep = max - 1;
-    // keep the tail (file names matter more than leading dirs)
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{tail}")
+    line
 }
 
 pub fn human(n: u64) -> String {
@@ -454,14 +481,14 @@ mod tests {
 
     #[test]
     fn rollback_resets_display_rate_and_retries_do_not_inflate_tuning_progress() {
-        let progress = Progress::new(1, false, false, None, false);
+        let progress = Progress::new(false, false, None, false);
         progress.add_bytes(1_000);
         let mut term = progress.term.lock().unwrap();
         term.samples
             .push_back((Instant::now() - Duration::from_secs(1), 1_000));
 
         progress.bytes_done.fetch_sub(600, Relaxed);
-        assert_eq!(progress.rate(&mut term), 0.0);
+        assert_eq!(progress.rate(&mut term, Instant::now(), 400), 0.0);
         assert_eq!(term.samples.len(), 1);
         assert_eq!(Meter::bytes(&*progress), 1_000);
 
@@ -469,5 +496,126 @@ mod tests {
         assert_eq!(Meter::bytes(&*progress), 1_000);
         progress.add_bytes(100);
         assert_eq!(Meter::bytes(&*progress), 1_100);
+    }
+
+    #[test]
+    fn slow_blocks_keep_their_full_measurement_interval() {
+        let progress = Progress::new(false, false, None, false);
+        let mut term = progress.term.lock().unwrap();
+        let start = Instant::now();
+        term.samples = VecDeque::from([(start, 0)]);
+        for second in 1..30 {
+            assert_eq!(
+                progress.rate(&mut term, start + Duration::from_secs(second), 0),
+                0.0
+            );
+        }
+        let block = 4 * 1024 * 1024;
+        let rate = progress.rate(&mut term, start + Duration::from_secs(30), block);
+        assert_eq!(rate, block as f64 / 30.0);
+        // No invented bytes, and no jump to zero after the old five-second window.
+        assert_eq!(
+            progress.rate(&mut term, start + Duration::from_secs(40), block),
+            block as f64 / 40.0
+        );
+        assert_eq!(
+            progress.rate(&mut term, start + Duration::from_secs(60), block * 2),
+            block as f64 / 30.0
+        );
+    }
+
+    #[test]
+    fn bar_stays_visible_across_sparse_updates_without_scrolling_or_clearing() {
+        let mut term = crate::output::Terminal::default();
+        let mut output = Vec::new();
+        let first = bar_line(
+            79,
+            25,
+            100,
+            true,
+            false,
+            "25 B/100 B",
+            &["elapsed 0:01".into()],
+        );
+        term.draw(&mut output, first.clone()).unwrap();
+        let before = output.clone();
+        term.draw(&mut output, first.clone()).unwrap();
+        assert_eq!(output, before, "identical frames need no terminal writes");
+        let waiting = bar_line(
+            79,
+            25,
+            100,
+            true,
+            false,
+            "25 B/100 B",
+            &["no update 0:30".into()],
+        );
+        assert_eq!(first.split(']').next(), waiting.split(']').next());
+        term.draw(&mut output, waiting.clone()).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("\r{first}\x1b[K\r{waiting}\x1b[K")
+        );
+    }
+
+    #[test]
+    fn bar_fits_narrow_terminals_and_keeps_counts_and_outcomes() {
+        for width in 0..200 {
+            let line = bar_line(
+                width,
+                u64::MAX,
+                u64::MAX,
+                true,
+                false,
+                "16.0 EiB/16.0 EiB",
+                &["incomplete".into(), "elapsed 0:30".into()],
+            );
+            assert!(line.len() <= width, "width {width}: {line}");
+            assert!(!line.contains('\n'));
+            if width >= 30 {
+                assert!(line.contains("incomplete"), "{line}");
+            }
+        }
+        let scanning = bar_line(
+            79,
+            10,
+            10,
+            false,
+            false,
+            "10 B/10 B",
+            &["scanning 10".into()],
+        );
+        assert!(scanning.contains("---") && !scanning.contains("100%"));
+        let empty = bar_line(79, 0, 0, true, true, "0 B/0 B", &["done".into()]);
+        assert!(empty.contains("100%") && empty.contains("done"));
+    }
+
+    #[test]
+    fn ticker_is_joined_when_an_error_leaves_its_scope() {
+        let progress = Progress::new(false, false, None, false);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let p = progress.clone();
+        let done = stopped.clone();
+        let result: Result<(), ()> = (|| {
+            let _ticker = ProgressTicker {
+                progress: progress.clone(),
+                thread: Some(std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !p.stop.load(Relaxed) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(p.stop.load(Relaxed), "ticker was detached on error");
+                    done.store(true, Relaxed);
+                })),
+            };
+            Err(())?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert!(
+            stopped.load(Relaxed),
+            "finalization must wait for the ticker to exit"
+        );
+        assert_eq!(Arc::strong_count(&progress), 1);
     }
 }

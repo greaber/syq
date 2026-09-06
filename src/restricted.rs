@@ -2413,7 +2413,7 @@ impl RestrictedAuthority {
             | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
-            Request::ListDir { .. } => {
+            Request::ListDir { .. } | Request::ListDirDetails { .. } => {
                 bail!("directory completion is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
