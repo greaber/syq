@@ -71,6 +71,7 @@
         "no-progress",
         "progress-json",
         "stats",
+        "tuning-options",
         "detach"
       ],
       "follow_up": []

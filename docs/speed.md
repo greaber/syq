@@ -59,6 +59,120 @@ including mounted NFS paths, do not use the tuning cache.
 `--bwlimit` to cap bandwidth rather than trying to control it indirectly
 through worker count. Short copies may finish before tuning has enough data.
 
+## Benchmark tuning
+
+`syq cp` and `syq rsync` accept `--tuning-options` for controlled performance
+experiments. It appears in `--help-all`, outside the common options. Supply
+comma-separated `KEY=VALUE` pairs:
+
+```sh
+syq cp large-file --to server --as /scratch/benchmark-copy \
+  --connections 1 -v \
+  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=8
+```
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
+| `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
+| `copy-path` | `auto` | `auto` or `ranges` |
+| `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
+| `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
+| `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
+| `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
+
+Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
+keys, and out-of-range values fail the command. Overrides apply to the remote
+coordinator too. They are not saved, and these runs neither read nor update
+the remembered connection count. Connection auto-tuning still runs unless you
+fix `--connections` (`--syq-connections` with `syq rsync`). These are experimental
+controls whose keys and bounds may change between releases.
+
+Request size limits the payload of one range read or write. A final request or
+a range selected for repair can be smaller. Larger requests reduce overhead
+per byte; deeper pipelines allow more work to remain outstanding while replies
+travel back. Both increase potential buffering. In-process endpoints handle
+one request at a time; the response queue on worker connections follows the
+pipeline depth. These settings do not change hash blocks or partial identities.
+
+`copy-path=ranges` makes file contents use range requests, bypassing both
+small-file batches and whole-file copying, including local kernel offload.
+Matching data can still be skipped or reused. With `auto`, syq chooses the copy
+method as usual. Explicit batch controls select worker batching instead of the
+native small-copy shortcut. Files larger than the batch byte limit use another
+copy path. File and byte limits are ceilings, and the scheduler can choose a
+smaller batch to share work among workers. With `--bwlimit`, worker batches
+contain at most one file. Batch controls cannot be combined with
+`copy-path=ranges`.
+
+For example, compare small-file batches with:
+
+```sh
+syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
+  --connections 1 -v --tuning-options batch-files=256,batch-bytes=8M
+```
+
+`split-min-size` controls when an idle worker can take part of another worker's
+remaining file region. Lower values permit smaller divisions; higher values
+avoid small assignments. A division remains aligned to hash blocks. The
+scheduler divides a region only when at least twice the effective minimum
+remains. This is a work-assignment threshold, separate from request size.
+
+### Average rate and burst patterns
+
+`--bwlimit` budgets logical file-data bytes across the copy's workers, before
+compression, encryption, and protocol overhead. It caps a rate, not a total
+byte count. The request pacing modes make different trade-offs:
+
+- **Timed pacing**, such as `bw-pacing=125ms`, limits request size to the smaller
+  of the configured request size and `max(rate * interval, 512 bytes)`. Workers
+  wait for the start of each reserved interval. The first request can start
+  immediately, so a short copy can exceed the configured average by that
+  initial request. The default `125ms` retains the existing sizing and pacing.
+- **Average pacing**, `bw-pacing=average`, leaves request size independent of
+  `--bwlimit`. Workers wait for the *end* of each reservation before issuing the
+  request, including the first one. A single 2 MiB request at 1 MiB/s therefore
+  waits about two seconds before it is issued. Large requests can then travel
+  in bursts, while their full byte budgets have already been paid.
+
+For example, to test larger requests under an average rate cap:
+
+```sh
+syq cp large-file --to server --as /scratch/benchmark-capped \
+  --connections 1 --bwlimit 1M -v \
+  --tuning-options copy-path=ranges,request-size=4M,bw-pacing=average
+```
+
+Neither mode promises a maximum network burst or uninterrupted service for
+other traffic. They pace source requests; helper processing, queues,
+compression, and transport buffering affect when bytes actually cross a link.
+A deeper pipeline can accumulate more data before forwarding it. A restricted
+receiver also enforces its signed rate ceiling independently, including its
+existing `max(rate * 125ms, 512 bytes)` request-size ceiling. Both tuning modes
+respect that additional ceiling; `-v` shows the effective size. Average pacing
+decouples size from rate where this signed receiver constraint does not apply.
+Measure both sustained throughput and short-interval traffic when evaluating
+capped runs.
+
+### Recording a comparison
+
+With overrides, `-v` reports effective settings, including any reduction in
+request size or increase in the split threshold. A final `syq: tuning observed:`
+line contains diagnostic JSON with copy-path counts, range request count,
+largest requested range, and largest worker batch by file count and content
+bytes. These are observations of attempted work, so retries can contribute
+more than once. They are experimental diagnostics, separate from completion
+records. `--stats` also enables them, but currently bypasses the native
+small-copy shortcut; use `-v` to compare that shortcut with other paths.
+
+Use the same reporting options for every comparison, a fresh disposable
+destination, and explicit defaults for the baseline, such as
+`--tuning-options copy-path=auto`. Record the source data, transport, connection
+count, effective settings, elapsed time, CPU use, and peak memory. Check the
+exit status and copied contents. Leave `--bwlimit` unset when measuring
+unrestricted throughput. Default request size and pipeline depth are not
+automatically tuned.
+
 ## TCP data connections
 
 SSH authenticates and controls remote copies. When reachable, encrypted TCP

@@ -489,6 +489,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tuning_split_threshold_controls_when_idle_workers_can_help() {
+        for (threshold, can_split) in [(8 << 20, true), (32 << 20, false)] {
+            let tuning: crate::transfer_tuning::TransferTuning =
+                format!("split-min-size={threshold}").parse().unwrap();
+            let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20));
+            let mut inner = sched.inner.lock().unwrap();
+            inner.inflight.push(Arc::new(Mutex::new(RangeState {
+                idx: 0,
+                pos: 0,
+                end: 48 << 20,
+            })));
+            let stolen = sched.steal(&mut inner);
+            assert_eq!(stolen.is_some(), can_split);
+            if let Some(stolen) = stolen {
+                let stolen = stolen.lock().unwrap();
+                assert_eq!((stolen.pos, stolen.end), (24 << 20, 48 << 20));
+            }
+        }
+    }
+
+    #[test]
     fn worker_exit_wakes_the_tuning_wait() {
         let sched = Arc::new(Sched::new(64, 128));
         {
