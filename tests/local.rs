@@ -15298,6 +15298,12 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
     write(&t.path("remote-home/data/name with spaces"), b"remote");
     write(&t.path("from-local"), b"local");
     let ssh = fake_ssh(&t);
+    // An SSH command starts in the remote account's home.
+    let script = fs::read_to_string(&ssh)
+        .unwrap()
+        .replace("exec /bin/sh -c", "cd \"$HOME\" || exit 1\nexec /bin/sh -c");
+    executable(&ssh, script.as_bytes());
+
     let path = format!("{}/n", t.s("remote-home/data"));
     let executable = env!("CARGO_BIN_EXE_syq");
     let output = completion_command(
@@ -15420,6 +15426,47 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
             (b'p', b"nested/".to_vec()),
         ]
     );
+
+    fs::create_dir_all(t.path("go/local-only")).unwrap();
+    fs::create_dir_all(t.path("remote-home/go/remote-only")).unwrap();
+    for mode in ["__complete", "__complete-bash"] {
+        let words = [
+            "syq",
+            "cp",
+            "--syq-path",
+            executable,
+            "--src",
+            "AGENTS.md",
+            "--to",
+            "fake.example",
+            "--into",
+            "go/",
+        ];
+        let line = shell_words::join(words);
+        let args = if mode == "__complete-bash" {
+            vec![mode, "go/", "--", &line]
+        } else {
+            let mut args = vec![mode, "bash", "9", "--"];
+            args.extend(words);
+            args
+        };
+        let output = completion_command(&t, &args)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(
+            completion_values(&output.stdout),
+            vec![(b'p', b"go/remote-only/".to_vec())],
+            "{mode}"
+        );
+    }
 
     let destination = completion_command(
         &t,

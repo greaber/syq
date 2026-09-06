@@ -61,7 +61,8 @@ keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
 copies from independent source shells without a forwarded agent, destination
 background startup through persistence, `--root` traversal refusal, unconfined
 `--cwd` paths, conflicting names, reconnection after killing the owned SSH
-transport, and stopping receiving with persistence. Approval cases cover local
+transport, recovery after a server heartbeat times out while the client is
+paused, and stopping receiving with persistence. Approval cases cover local
 allow/deny, one-use IDs, disconnect and settings cancellation, and explicit
 automatic approval. An isolated D-Bus notification service exercises the real
 Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
