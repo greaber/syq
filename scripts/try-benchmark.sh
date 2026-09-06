@@ -34,7 +34,7 @@ Only newly created syq-bench.* directories are used. Existing data is not copied
 HELP
 }
 fail() { printf 'Benchmark: %s\n' "$*" >&2; exit 1; }
-quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+quote() { printf '%s\n' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/"; }
 ask() {
     local answer
     printf '%s [%s]: ' "$1" "$2" >&2
