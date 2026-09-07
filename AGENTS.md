@@ -239,6 +239,9 @@ report actual access or decision blockers instead of bypassing them.
   belong there. Keep only brief `current-plans/` notes needed to continue
   active work. State a limitation as a fact about today's behavior, not as
   an intention.
+- Keep the selected data route fixed. TCP may fall back to SSH between the
+  same endpoints, but failure must never silently relay file data through the
+  invoking or authorizing machine. Relaying requires an explicit route choice.
 - Copy failures must be visible. Do not make an incomplete or truncated result
   look successful.
 - Exercise copy, resume, verification, and removal behavior in disposable

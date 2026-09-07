@@ -1420,15 +1420,11 @@ fn handle_tcp_setup_error(
             )
         });
     }
-    if spec.restricted_grant.is_some() {
+    if spec.forwarded.is_some() {
         sched.abort();
         progress.stop();
         return Err(error).with_context(|| {
-            let reason = if spec.forwarded.is_some() {
-                "return authorization requires direct encrypted TCP data connections"
-            } else {
-                "a signed receiver uses its one SSH authorization for the control connection, so encrypted TCP data connections are required"
-            };
+            let reason = "return authorization requires direct encrypted TCP data connections";
             format!("{}: {reason}", spec.label())
         });
     }
@@ -1672,13 +1668,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     if args.restricted_grant.is_some()
-        && ((args.no_tcp && !crate::destination::is_named(&args.restricted_grant))
-            || args.tcp_plain
-            || original_srcs[0].is_remote()
-            || !dst.is_remote())
+        && (args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
-            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted TCP data connections"
+            "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted data connections"
         );
     }
     for source in original_srcs {
@@ -2679,10 +2672,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    // A signed receiver cannot fall back to replaying its one-time SSH grant.
-    // Settle its TCP reachability before any destination creation, preserving
-    // the pre-mutation failure boundary even though ordinary route probes may
-    // overlap the rest of destination preflight.
+    // Settle restricted transport setup before destination creation. Return
+    // authorization still requires direct TCP; enrolled receivers can instead
+    // attach SSH workers to the already-authorized copy on the same route.
     if pending_tcp_setups
         .iter()
         .any(|(spec, _)| spec.restricted_grant.is_some())

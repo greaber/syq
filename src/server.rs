@@ -112,6 +112,7 @@ impl Drop for RequestReader {
 
 struct ServeSession {
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
     named_socket: Option<std::os::unix::net::UnixStream>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
@@ -175,6 +176,7 @@ pub fn run() -> Result<()> {
         None,
         ServeSession {
             handshake_pending: None,
+            ssh_worker_ticket: None,
             allow_tcp: true,
             named_socket: None,
             authority: None,
@@ -185,7 +187,17 @@ pub fn run() -> Result<()> {
     result
 }
 
-pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+pub(crate) fn run_restricted(
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    state: &std::path::Path,
+) -> Result<()> {
+    let (_workers, ticket) = match crate::restricted::start_ssh_workers(state, authority.clone()) {
+        Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
+        Err(error) => (
+            None,
+            Err(format!("start restricted SSH workers: {error:#}")),
+        ),
+    };
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         io::stdin(),
@@ -196,6 +208,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         ServeSession {
             handshake_pending: None,
+            ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
@@ -223,6 +236,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
         None,
         ServeSession {
             handshake_pending: Some(pending),
+            ssh_worker_ticket: None,
             allow_tcp: true,
             named_socket: None,
             authority: Some(authority.clone()),
@@ -261,6 +275,7 @@ pub(crate) fn run_named(
         None,
         ServeSession {
             handshake_pending: None,
+            ssh_worker_ticket: None,
             allow_tcp: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
@@ -287,6 +302,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
 ) -> Result<()> {
     let ServeSession {
         handshake_pending,
+        ssh_worker_ticket,
         allow_tcp,
         named_socket,
         authority,
@@ -428,6 +444,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
+        ssh_worker_ticket: if is_control { ssh_worker_ticket } else { None },
     })?;
 
     if let Some(socket) = &tcp_socket {
@@ -1256,6 +1273,7 @@ fn serve_tcp(
         Some(stream.try_clone()?),
         ServeSession {
             handshake_pending: Some(handshake_pending),
+            ssh_worker_ticket: None,
             allow_tcp: true,
             named_socket: None,
             authority,
@@ -1402,6 +1420,7 @@ mod tests {
                 Some(socket),
                 ServeSession {
                     handshake_pending: None,
+                    ssh_worker_ticket: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: Some(server_authority),
@@ -1610,6 +1629,7 @@ mod tests {
                 Some(socket),
                 ServeSession {
                     handshake_pending: None,
+                    ssh_worker_ticket: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,
@@ -1869,6 +1889,7 @@ mod tests {
                 None,
                 ServeSession {
                     handshake_pending: None,
+                    ssh_worker_ticket: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,
@@ -1932,6 +1953,7 @@ mod tests {
                 None,
                 ServeSession {
                     handshake_pending: None,
+                    ssh_worker_ticket: None,
                     allow_tcp: true,
                     named_socket: None,
                     authority: None,

@@ -1,6 +1,8 @@
 //! End-to-end enrollment and signed restricted-transfer integration.
 
 mod active;
+mod ssh;
+pub(crate) use ssh::start as start_ssh_workers;
 
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
@@ -368,6 +370,7 @@ pub(crate) struct RestrictedAuthority {
     state: Mutex<AuthorityState>,
     /// Signalled whenever an in-flight request settles.
     settled: std::sync::Condvar,
+    tcp_congestion: Option<String>,
 }
 
 impl RestrictedAuthority {
@@ -385,6 +388,7 @@ impl RestrictedAuthority {
             filters,
             root_existence,
             receipt_policy,
+            tcp_congestion,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -432,6 +436,7 @@ impl RestrictedAuthority {
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
+            tcp_congestion,
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
                 dev: config.root_dev,
@@ -2095,7 +2100,7 @@ impl RestrictedAuthority {
                 {
                     bail!("TCP listener range does not match the signed grant");
                 }
-                if congestion_control.is_some() {
+                if congestion_control.as_ref() != self.tcp_congestion.as_ref() {
                     bail!("TCP congestion override is not authorized by the signed grant");
                 }
                 let mut state = self.state.lock().unwrap();
@@ -3572,8 +3577,18 @@ fn run_management_over_route(
     action: ManagementAction,
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    let executable = std::env::current_exe().context("resolve local syq executable")?;
-    let bytes = read_local_management_executable(&executable)?;
+    let platform = run_ssh(target, route.clone(), "set -eu; uname -s; uname -m", &[])?;
+    let platform = std::str::from_utf8(&platform).context("receiver platform is not UTF-8")?;
+    let mut lines = platform.lines();
+    let os = lines
+        .next()
+        .context("receiver platform probe returned no operating system")?;
+    let arch = lines
+        .next()
+        .context("receiver platform probe returned no architecture")?;
+    let platform = crate::remote_helper::Target::from_uname(os, arch)
+        .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
+    let bytes = management_executable(platform)?;
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).context("generate receiver staging filename")?;
     let stage = format!(".syq-receiver-{}-{:016x}", id, u64::from_le_bytes(nonce));
@@ -3583,6 +3598,23 @@ fn run_management_over_route(
     // management helper exits, so there is no inter-session orphan window or
     // cleanup request that depends on a route which has already failed.
     run_ssh(target, route, &command, &bytes)
+}
+
+fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
+    if Some(target) != crate::remote_helper::Target::local() {
+        if crate::identity::is_release_build() {
+            let helper = crate::update::trusted_current_helper(target)?;
+            return crate::update::verified_current_helper(&helper);
+        }
+        bail!("cannot install a source-built restricted receiver for {} from {}; use an official release or enroll from a compatible host", target.key, crate::identity::platform());
+    }
+    // Same-platform enrollment and revocation retain their existing offline
+    // upload path, including official releases.
+    #[cfg(target_os = "linux")]
+    let executable = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let executable = std::env::current_exe().context("resolve local syq executable")?;
+    read_local_management_executable(&executable)
 }
 
 fn read_local_management_executable(path: &Path) -> Result<Vec<u8>> {
@@ -3796,11 +3828,8 @@ fn root_existence_for(existence: Existence) -> RootExistence {
 }
 
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
-    if args.no_tcp || args.tcp_plain {
-        bail!("command-restricted transfers require encrypted TCP data connections");
-    }
-    if args.tcp_congestion.is_some() {
-        bail!("--tcp-congestion is not yet represented in the signed receiver grant");
+    if args.tcp_plain {
+        bail!("command-restricted transfers require encrypted data connections");
     }
     if args.update {
         bail!(
@@ -4142,6 +4171,7 @@ pub(crate) fn prepare_transfer(
     let grant = delegation::sign_grant(
         grant,
         GrantConstraints {
+            tcp_congestion: args.tcp_congestion.clone(),
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -4193,6 +4223,7 @@ pub(crate) fn named_request(
         destination: destination.path.clone(),
         copy,
         constraints: GrantConstraints {
+            tcp_congestion: args.tcp_congestion.clone(),
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -4318,6 +4349,13 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
     let enrollment = EnrollmentId::parse(enrollment)?;
     let original = std::env::var("SSH_ORIGINAL_COMMAND")
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
+    if let Some(ticket) = ssh::worker_command(&original)? {
+        let (_, _, replay) = receiver_config(enrollment)?;
+        return ssh::connect(
+            replay.parent().context("receiver state directory")?,
+            &ticket,
+        );
+    }
     let envelope = decode_receiver_command(&original)?;
     let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
     let state = replay_path.parent().context("receiver state directory")?;
@@ -4379,7 +4417,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         (observed_state.dev(), observed_state.ino()),
         deadline,
     )?;
-    crate::server::run_restricted(authority)
+    crate::server::run_restricted(authority, state)
 }
 
 fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {
@@ -4544,6 +4582,185 @@ pub(crate) mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn enrollment_upload_selects_and_verifies_the_remote_platform() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use flate2::{write::GzEncoder, Compression};
+        use sha2::{Digest, Sha256};
+        if let Ok(case) = std::env::var("SYQ_ENROLLMENT_TEST_CHILD") {
+            let result = run_management_over_route(
+                &endpoint("receiver", "fixture", None).unwrap(),
+                EnrollmentRoute::Direct,
+                EnrollmentId::test_v4(1),
+                ManagementAction::Install,
+                b"{}",
+            );
+            assert_eq!(
+                result.is_ok(),
+                matches!(case.as_str(), "valid" | "local-release"),
+                "{result:?}"
+            );
+            return;
+        }
+        let (os, arch, target) =
+            if crate::remote_helper::Target::local().unwrap().key == "macos-arm64" {
+                ("Linux", "x86_64", "linux-x86_64")
+            } else {
+                ("Darwin", "arm64", "macos-arm64")
+            };
+        let binary = b"receiver executable for the destination platform";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(binary).unwrap();
+        let archive = encoder.finish().unwrap();
+        let digest = |bytes: &[u8]| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let signing = SigningKey::from_bytes(&[19; 32]);
+        for case in [
+            "valid",
+            "local-release",
+            "manifest-tampered",
+            "archive-tampered",
+            "source-build",
+        ] {
+            let (os, arch) = if case == "local-release" {
+                (
+                    if cfg!(target_os = "linux") {
+                        "Linux"
+                    } else {
+                        "Darwin"
+                    },
+                    std::env::consts::ARCH,
+                )
+            } else {
+                (os, arch)
+            };
+            let temporary = crate::test_support::tempdir().unwrap();
+            let root = temporary.path();
+            fs::create_dir(root.join("bin")).unwrap();
+            fs::write(
+                root.join("bin/ssh"),
+                br#"#!/bin/sh
+for argument do command=$argument; done
+case "$command" in
+    *'uname -s'*) printf '%s\n%s\n' "$SYQ_TEST_REMOTE_OS" "$SYQ_TEST_REMOTE_ARCH" ;;
+    *'--restricted-install'*) cat > "$SYQ_TEST_UPLOAD" ;;
+    *) exit 91 ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(root.join("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+            let mut manifest = serde_json::json!({
+                "schema": 1, "repository": "https://github.com/greaber/syq",
+                "version": env!("CARGO_PKG_VERSION"), "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "artifacts": {(target): {
+                    "binary": {"name": format!("syq-{target}"), "sha256": digest(binary), "size": binary.len()},
+                    "archive": {"name": format!("syq-{target}.gz"), "sha256": digest(&archive), "size": archive.len()}
+                }},
+                "installer": {"name":"install.sh", "sha256":"1".repeat(64), "size":1},
+                "homebrew_formula": {"name":"syq.rb", "sha256":"2".repeat(64), "size":1},
+                "signature_scheme":"ed25519-jcs-v1"
+            });
+            let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
+            manifest["signature"] = base64::engine::general_purpose::STANDARD
+                .encode(signing.sign(&canonical).to_bytes())
+                .into();
+            if case == "manifest-tampered" {
+                manifest["installer"]["size"] = 2.into();
+            }
+            fs::write(
+                root.join("syq-release-manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let mut bytes = archive.clone();
+            if case == "archive-tampered" {
+                bytes[0] ^= 1;
+            }
+            fs::write(root.join(format!("syq-{target}.gz")), bytes).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "restricted::tests::enrollment_upload_selects_and_verifies_the_remote_platform",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
+                )
+                .env("HOME", root)
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env("SYQ_ENROLLMENT_TEST_CHILD", case)
+                .env(
+                    "SYQ_TEST_RELEASE_BUILD",
+                    if case == "source-build" { "0" } else { "1" },
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_PUBLIC_KEY",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(signing.verifying_key().to_bytes()),
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_DOWNLOADS",
+                    "https://release.invalid/download",
+                )
+                .env("SYQ_TEST_FIXTURES", root)
+                .env("SYQ_TEST_UPLOAD", root.join("uploaded"))
+                .env("SYQ_TEST_REMOTE_OS", os)
+                .env("SYQ_TEST_REMOTE_ARCH", arch)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if case == "valid" {
+                assert_eq!(fs::read(root.join("uploaded")).unwrap(), binary);
+            } else if case == "local-release" {
+                assert_eq!(
+                    fs::read(root.join("uploaded")).unwrap(),
+                    fs::read(std::env::current_exe().unwrap()).unwrap()
+                );
+            } else {
+                assert!(!root.join("uploaded").exists(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut authority = tcp_test_authority(temporary.path());
+        let listener = |algorithm: Option<&str>| Request::TcpListen {
+            key: Some(vec![0; crate::tcp_records::KEY_LEN]),
+            token: vec![0; 16],
+            port_lo: 47_600,
+            port_hi: 47_699,
+            congestion_control: algorithm.map(str::to_owned),
+        };
+        assert!(authority
+            .authorize(&mut listener(Some("cubic")), true)
+            .is_err());
+        authority.tcp_congestion = Some("cubic".into());
+        assert!(authority.authorize(&mut listener(None), true).is_err());
+        assert!(authority
+            .authorize(&mut listener(Some("bbr")), true)
+            .is_err());
+        assert!(authority
+            .authorize(&mut listener(Some("cubic")), false)
+            .is_err());
+        authority
+            .authorize(&mut listener(Some("cubic")), true)
+            .unwrap();
+    }
 
     #[test]
     fn receiver_configuration_preserves_released_v041_bytes() {
@@ -4921,6 +5138,7 @@ pub(crate) mod tests {
             &config,
             grant,
             GrantConstraints {
+                tcp_congestion: None,
                 max_file_data_bytes_per_second,
                 filters,
                 root_existence,

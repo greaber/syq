@@ -92,7 +92,7 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, true)
+        Self::start_inner(config, handler, true, None)
     }
 
     /// The caller owns signal handling and child cleanup.
@@ -100,13 +100,26 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, false)
+        Self::start_inner(config, handler, false, None)
+    }
+
+    /// Keep receiver worker sockets inside its already protected enrollment state.
+    pub(crate) fn start_in<F>(
+        config: PrivateBrokerConfig<'_>,
+        directory: &Path,
+        handler: F,
+    ) -> Result<Self>
+    where
+        F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
+    {
+        Self::start_inner(config, handler, false, Some(directory))
     }
 
     fn start_inner<F>(
         config: PrivateBrokerConfig<'_>,
         handler: F,
         signal_cleanup: bool,
+        directory: Option<&Path>,
     ) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
@@ -114,10 +127,13 @@ impl PrivateBroker {
         if config.max_connections == 0 {
             bail!("private broker needs at least one connection slot");
         }
-        let socket_dir = tempfile::Builder::new()
-            .prefix(config.directory_prefix)
-            .tempdir()
-            .context("create private broker directory")?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(config.directory_prefix);
+        let socket_dir = match directory {
+            Some(directory) => builder.tempdir_in(directory),
+            None => builder.tempdir(),
+        }
+        .context("create private broker directory")?;
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
         let socket_path = socket_dir.path().join(config.socket_name);
         let listener = UnixListener::bind(&socket_path)
