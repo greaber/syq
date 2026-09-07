@@ -5256,6 +5256,8 @@ impl Planner<'_> {
         self.mapping_mode = true;
         if self.opts.restricted_receiver {
             self.mapping_explicit_parents = explicit_parents;
+        } else {
+            drop(explicit_parents);
         }
         let source_base = self
             .active_source

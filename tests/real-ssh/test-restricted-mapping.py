@@ -93,10 +93,12 @@ def direct():
         assert preview.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), preview.stderr
         ssh("destination", f"from pathlib import Path; assert not (Path({blocked!r})/'good').exists()")
         results_path = Path(temporary) / "results-blocked.ndjson"
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--results", str(results_path)], data=selected, expected=23)
+        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--results", str(results_path)], data=selected, expected=23)
+        assert result.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
-        failed = [r for r in records if r.get("disposition") == "failed"]
-        assert sorted((r["src"]["value"], r["dst"]["value"]) for r in failed) == sorted((src, dst) for src, dst, _ in blocked_entries), failed
+        # Remote-to-remote results attest receiver operations; planner failures
+        # are diagnostics and still make the terminal outcome partial.
+        assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); assert (p/'blocked-file').read_bytes()==b'keep file'; assert (p/'blocked-link').is_symlink(); assert list((p/'protected').iterdir())==[p/'protected'/'sentinel']; assert (p/'protected'/'sentinel').read_bytes()==b'keep target'; assert (p/'good'/'item').read_bytes()==b'mapped contents'")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")
@@ -107,9 +109,10 @@ def direct():
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
         results_path = Path(temporary) / "results-large.ndjson"
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
-        assert sorted(r["dst"]["value"] for r in records if r.get("disposition") == "failed") == ["blocked/first", "blocked/last"]
+        assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; assert Path({root + '/large/blocked'!r}).read_bytes()==b'keep implicit parent'")
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
     print("Restricted mapping and timestamp selection passed", flush=True)
@@ -122,6 +125,17 @@ def named():
     run(prefix, data=contents)
     run(prefix + ["--verify-only"], data=contents)
     run(prefix + ["--skip-newer", "--only-existing"], data=contents)
+    # Here the source-side caller receives coordinator operation records, so
+    # a parent obstruction must produce a retryable per-entry failure too.
+    blocked = manifest([("message.txt", "nested/renamed/child", "file"), ("message.txt", "nested/good", "file")])
+    with tempfile.TemporaryDirectory(prefix="syq-named-mapping-") as temporary:
+        results_path = Path(temporary) / "results.ndjson"
+        run(prefix + ["--results", str(results_path)], data=blocked, expected=23)
+        records = [json.loads(line) for line in results_path.read_text().splitlines()]
+        failed = [r for r in records if r.get("disposition") == "failed"]
+        assert [(r["src"]["value"], r["dst"]["value"]) for r in failed] == [("message.txt", "nested/renamed/child")], failed
+        assert records[-1]["status"] == "partial", records[-1]
+    run(prefix + ["--verify-only"], data=contents + manifest([("message.txt", "nested/good", "file")]))
     print("Named mapping and timestamp selection passed", flush=True)
 
 
