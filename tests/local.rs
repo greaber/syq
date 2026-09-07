@@ -18947,11 +18947,12 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     let command = |args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args(args)
-            .env("XDG_RUNTIME_DIR", &t.0)
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("XDG_CONFIG_HOME", t.path("config"));
         command
     };
