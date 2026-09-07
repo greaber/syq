@@ -244,7 +244,15 @@ class _ResultsFileWriter:
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except PermissionError:
+            # Darwin can report EPERM for a group containing only zombies.
+            # Reap our exited leader, then retry so surviving descendants still
+            # receive the signal and genuine permission failures remain visible.
+            if process.poll() is None:
+                raise
+            os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
