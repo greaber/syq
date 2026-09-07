@@ -160,6 +160,10 @@ syq cp --only-existing --srcs-in project --into deployed
 
 `--only-new` still descends into existing directories to add missing children,
 but does not explicitly change their permissions, ownership, or timestamps.
+Adding children requires write access to those directories: `--only-new` does
+not temporarily widen their permissions. If access is denied, the entry fails
+and the copy reports an error. A dry run previews intended changes without
+testing whether writes will be permitted.
 Adding or removing children can change directory timestamps through normal
 filesystem behavior. Newly created directories receive normal copy metadata.
 If a source directory meets an existing non-directory,

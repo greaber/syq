@@ -104,14 +104,18 @@ Typed remote-to-remote copies require an enrolled receiver or
 
 `only_new=True` traverses existing directories but does not explicitly update
 their metadata. Adding children may naturally change directory timestamps.
-New directories receive normal copy metadata.
+New directories receive normal copy metadata. Adding children to existing
+directories requires write access; permissions are not temporarily widened.
+Permission failures are reported in the result and raise `SyqOperationError`
+unless `check=False`. A dry run does not test write permission.
 
 <a id="removal"></a>
 
 ## rm
 
 `on="server"` selects the removal endpoint. A final selected symlink is
-always unlinked; `follow_src=True` permits only parent-directory traversal.
+always unlinked. Both `follow_src=True` and `follow=True` permit symlinks in
+`cwd`, `root`, and selector parent directories.
 Directory and contents selectors reject a final symlink even with following
 enabled.
 

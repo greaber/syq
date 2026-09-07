@@ -737,10 +737,10 @@ struct NativeRmSelectionArgs {
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR")]
     root: Option<OsString>,
-    /// Follow parent-directory and control-path symlinks; never follow a selected final symlink
+    /// Like --follow-src; also follow symlinks in the --results path
     #[arg(long)]
     follow: bool,
-    /// Follow parent-directory symlinks; never follow a selected final symlink
+    /// Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink
     #[arg(long)]
     follow_src: bool,
     /// Select an object without constraining its type; attach =PATH when it begins with `-` (repeatable)
@@ -816,7 +816,7 @@ struct NativeCopyOperationalArgs {
     /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
-    /// Copy missing entries; traverse existing directories without changing their metadata
+    /// Copy missing entries without changing existing metadata; adding children requires write access (permissions are not widened)
     #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
     ignore_existing: bool,
     /// Update only entries already present; create no missing entries or directories

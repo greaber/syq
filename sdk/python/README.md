@@ -76,7 +76,7 @@ result = syq.rm(src_dir="old-output", root="/srv/jobs")
 print(result.entries_removed, result.selectors_missing)
 ```
 
-`root` confines removal to that directory. Add `from_="server"` to remove files
+`root` confines removal to that directory. Add `on="server"` to remove files
 over ordinary SSH. Command-restricted receivers do not support `rm`. See
 [Remove files](https://greaber.github.io/syq/remove.html) for selector behavior.
 

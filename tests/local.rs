@@ -3385,9 +3385,11 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
 
     let t = Tmp::new();
     write(&t.path("root/victim"), b"keep");
-    fs::create_dir_all(t.path("root/inside")).unwrap();
+    write(&t.path("root/inside/child"), b"inside");
+    write(&t.path("outside/child"), b"outside");
     symlink("root", t.path("root-link")).unwrap();
-    symlink("../../root/inside", t.path("root/escape")).unwrap();
+    symlink("../outside", t.path("root/escape")).unwrap();
+    symlink("../root/inside", t.path("root/reentry")).unwrap();
 
     let base_link = native_syq(&["rm", "--root", &t.s("root-link"), "--src", "victim"]);
     assert!(!base_link.status.success());
@@ -3404,18 +3406,31 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
     assert!(!t.path("root/victim").exists());
     write(&t.path("root/victim"), b"keep");
 
-    let excursion = native_syq(&[
-        "rm",
-        "--root",
-        &t.s("root"),
-        "--follow",
-        "--src",
-        "victim",
-        "--srcs-in",
-        "escape",
-    ]);
-    assert!(!excursion.status.success());
-    assert_eq!(read(&t.path("root/victim")), b"keep");
+    // Follow a parent link, not a final directory selector: refusal must be
+    // confinement, not the independent rule rejecting final directory links.
+    for follow in ["--follow", "--follow-src"] {
+        for selector in ["escape/child", "reentry/child"] {
+            let excursion = native_syq(&[
+                "rm",
+                "--root",
+                &t.s("root"),
+                follow,
+                "--src",
+                "victim",
+                "--src",
+                selector,
+            ]);
+            assert!(!excursion.status.success());
+            assert!(
+                stderr_of(&excursion).contains("outside its confined root"),
+                "{}",
+                stderr_of(&excursion)
+            );
+            assert_eq!(read(&t.path("root/victim")), b"keep");
+            assert_eq!(read(&t.path("outside/child")), b"outside");
+            assert_eq!(read(&t.path("root/inside/child")), b"inside");
+        }
+    }
 }
 
 #[test]

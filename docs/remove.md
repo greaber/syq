@@ -41,7 +41,9 @@ deletion begins. Filters are not supported.
 A selected symlink is removed as a link, leaving its target alone. Symlinks
 inside a selected directory are also only unlinked.
 
-`--follow-src` permits traversal through symlinks in parent directories.
+`--follow-src` permits traversal through symlinks in `--cwd`, `--root`, and
+selector parent directories. `--follow` also permits symlinks in the
+`--results` path.
 The final selected symlink is always removed as a link, even with `--follow-src`
 or `--follow`. For example, if `current` points to `releases/v1`,
 `syq rm --follow-src current/log.txt` removes `releases/v1/log.txt`, while
