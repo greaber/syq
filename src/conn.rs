@@ -2604,18 +2604,23 @@ impl RemoteSpec {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = cmd
-            .output()
+        let out = run_captured(&mut cmd, None)
             .with_context(|| format!("probe platform on {}", self.label()))?;
         if !out.status.success() {
             bail!(
                 "could not detect the platform on {} ({}){}",
                 self.label(),
                 out.status,
-                output_suffix(&out.stderr)
+                output_suffix(&out.stderr.bytes)
             );
         }
-        let text = String::from_utf8_lossy(&out.stdout);
+        if out.stdout.truncated {
+            bail!(
+                "{}: platform probe printed more than {MAX_BOOTSTRAP_OUTPUT_BYTES} bytes",
+                self.label()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout.bytes);
         let value = text
             .lines()
             .find_map(|line| line.strip_prefix("syq-helper-target:"))
@@ -2734,15 +2739,11 @@ impl RemoteSpec {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("remote helper download stdout was not piped"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("remote helper download stderr was not piped"))?;
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        });
+        let stderr_reader = capture_stream(stderr);
 
         let report = read_remote_download_report(&mut BufReader::new(stdout));
         let mut helper = None;
@@ -2798,7 +2799,9 @@ impl RemoteSpec {
             .with_context(|| format!("wait for helper download on {}", self.label()))?;
         let stderr = stderr_reader
             .join()
-            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?;
+            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?
+            .map(|captured| captured.bytes)
+            .unwrap_or_default();
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
@@ -2847,26 +2850,19 @@ impl RemoteSpec {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("start helper upload to {}", self.label()))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("helper upload stdin was not piped"))?;
-        let write_result = stdin.write_all(binary);
-        drop(stdin);
-        let out = child
-            .wait_with_output()
-            .with_context(|| format!("wait for helper upload to {}", self.label()))?;
+        let out = run_captured(&mut cmd, Some(binary))
+            .with_context(|| format!("run helper upload to {}", self.label()))?;
         if !out.status.success() {
             bail!(
                 "remote helper upload exited {}{}",
                 out.status,
-                output_suffix(&out.stderr)
+                output_suffix(&out.stderr.bytes)
             );
         }
-        write_result.with_context(|| format!("upload helper to {}", self.label()))
+        match out.input_error {
+            Some(error) => Err(error).with_context(|| format!("upload helper to {}", self.label())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2894,12 +2890,118 @@ struct RemoteDownloadReport {
     sha256: String,
 }
 
+/// Bound on each captured stream of a bootstrap command: the platform probe,
+/// the remote download report's stderr, and the helper upload. Legitimate
+/// output is a few lines; the bound keeps a faulty or hostile remote from
+/// growing local memory without limit. Streams are drained past the bound so
+/// the child never blocks on a full pipe.
+const MAX_BOOTSTRAP_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Largest remote release manifest accepted from the download report.
+const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
+/// Longest report line buffered before it is checked. A manifest data line may
+/// carry the whole manifest after its framing prefix.
+const MAX_REPORT_LINE_BYTES: usize = MAX_MANIFEST_SIZE + 1024;
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    /// The stream produced more than the retained bytes; the rest was discarded.
+    truncated: bool,
+}
+
+/// Read a stream keeping at most `limit` bytes, then drain and discard the
+/// remainder so a child process writing to it never blocks.
+fn read_capped(mut reader: impl Read, limit: usize) -> std::io::Result<CapturedStream> {
+    let mut bytes = Vec::new();
+    reader.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    let discarded = std::io::copy(&mut reader, &mut std::io::sink())?;
+    Ok(CapturedStream {
+        bytes,
+        truncated: discarded > 0,
+    })
+}
+
+fn capture_stream(
+    reader: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<CapturedStream>> {
+    std::thread::spawn(move || read_capped(reader, MAX_BOOTSTRAP_OUTPUT_BYTES))
+}
+
+struct CapturedOutput {
+    status: std::process::ExitStatus,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    /// Writing `input` to the child's stdin failed. Reported after the exit
+    /// status, which usually explains why the child stopped reading.
+    input_error: Option<std::io::Error>,
+}
+
+/// Run a bootstrap command, feeding it `input` when given, with both output
+/// streams captured under `MAX_BOOTSTRAP_OUTPUT_BYTES`. The command must have
+/// piped stdout and stderr; stdin is piped when there is input.
+fn run_captured(cmd: &mut Command, input: Option<&[u8]>) -> Result<CapturedOutput> {
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("start command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("command stderr was not piped"))?;
+    let stdout_reader = capture_stream(stdout);
+    let stderr_reader = capture_stream(stderr);
+    let input_error = match input {
+        Some(bytes) => {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("command stdin was not piped"))?;
+            stdin.write_all(bytes).err()
+        }
+        None => None,
+    };
+    let status = child.wait().context("wait for command")?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("stdout reader panicked"))?
+        .context("read command stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("stderr reader panicked"))?
+        .context("read command stderr")?;
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+        input_error,
+    })
+}
+
+/// Read one report line into `line`, refusing lines longer than
+/// `MAX_REPORT_LINE_BYTES` before they are buffered in full.
+fn read_report_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<usize> {
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(MAX_REPORT_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', line)?;
+    if read > MAX_REPORT_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote helper report line exceeded the size limit",
+        ));
+    }
+    Ok(read)
+}
+
 fn read_remote_download_report(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<RemoteDownloadReport>> {
-    const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
     let mut line = Vec::new();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Ok(None);
     }
     if protocol_line(&line) != b"syq-helper-manifest-begin" {
@@ -2908,8 +3010,7 @@ fn read_remote_download_report(
 
     let mut manifest = Vec::new();
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        if read_report_line(reader, &mut line)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "remote manifest was not terminated",
@@ -2937,8 +3038,7 @@ fn read_remote_download_report(
         manifest.push(b'\n');
     }
 
-    line.clear();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "remote helper digest was missing",
@@ -2953,8 +3053,7 @@ fn read_remote_download_report(
             )
         })?;
     let sha256 = String::from_utf8_lossy(digest).into_owned();
-    line.clear();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "remote helper report was not terminated",
@@ -4232,6 +4331,41 @@ mod tests {
 
         let mut saw_root = true;
         assert!(validate_remote_scan_batch(&[entry(b"")], &mut saw_root, None).is_err());
+    }
+
+    #[test]
+    fn remote_download_report_rejects_an_oversized_line() {
+        let mut input = b"syq-helper-manifest-begin\nsyq-helper-manifest-data:".to_vec();
+        input.resize(input.len() + MAX_REPORT_LINE_BYTES + 16, b'x');
+        let error = read_remote_download_report(&mut input.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line exceeded"), "{error}");
+    }
+
+    #[test]
+    fn capped_reads_keep_the_prefix_and_drain_the_rest() {
+        let captured = read_capped(std::io::repeat(b'x').take(5000), 100).unwrap();
+        assert_eq!(captured.bytes.len(), 100);
+        assert!(captured.truncated);
+        let captured = read_capped(&b"short"[..], 100).unwrap();
+        assert_eq!(captured.bytes, b"short");
+        assert!(!captured.truncated);
+    }
+
+    #[test]
+    fn captured_commands_bound_both_streams_and_feed_input() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("cat >/dev/null; head -c 3000000 /dev/zero; echo boom >&2; exit 3")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = run_captured(&mut cmd, Some(b"input")).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout.bytes.len(), MAX_BOOTSTRAP_OUTPUT_BYTES);
+        assert!(out.stdout.truncated);
+        assert_eq!(out.stderr.bytes, b"boom\n");
+        assert!(!out.stderr.truncated);
+        assert!(out.input_error.is_none());
     }
 
     #[test]
