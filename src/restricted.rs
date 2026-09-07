@@ -5582,7 +5582,9 @@ pub(crate) mod tests {
         fs::write(&kept, b"old").unwrap();
         let authority = existence_authority(
             &root,
-            ExistingDestinationPolicy::Skip,
+            // Frozen JSON enum spelling from v0.4.1. Do not regenerate with
+            // the current writer: old signed Skip still permits directory metadata.
+            serde_json::from_str(r#""Skip""#).unwrap(),
             DestinationPlacement::ExactPath,
             RootExistence::Any,
         )
