@@ -36,8 +36,7 @@ const LOCK_SUFFIX: &[u8] = b".pool.lock";
 /// Spares kept ready per endpoint. One covers a person typing; a burst
 /// takes the in-flight spare, whose hello it then finishes itself.
 const DEPTH: usize = 1;
-/// Exit after this long without a handoff. Spares are live channels, so
-/// the master's own ControlPersist window begins only after this.
+/// Retire unused helper processes without closing the persistent SSH login.
 const IDLE: Duration = Duration::from_secs(300);
 /// A failed spare open (usually a dead master) is not retried sooner.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);

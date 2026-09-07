@@ -1105,7 +1105,7 @@ pub(crate) fn serve_background(
                 .and_then(|s| s.code())
                 .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
             {
-                bail!("server rejected return connection: {error}; reconnect with syq or change receiving settings with syq persist receive on to retry");
+                bail!("server rejected return connection: {error}; run syq persist connect {} on the receiving machine to retry", shell_words::quote(&spec.endpoint.label()));
             }
             *state.lock().unwrap() = crate::receive_service::ConnectionState {
                 phase: "reconnecting".into(),

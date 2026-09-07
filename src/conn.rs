@@ -1094,17 +1094,22 @@ pub(crate) struct SshMultiplexer {
     /// deliberately outlives this process.
     _directory: Option<tempfile::TempDir>,
     path: PathBuf,
-    /// A managed persistence scope uses ControlMaster=auto with a
-    /// ControlPersist window, so later syq runs in that scope skip the SSH
-    /// handshake.
+    /// A managed persistence scope keeps its control master alive, so later
+    /// syq runs in that scope skip the SSH handshake.
     persistent: bool,
     reuse_for_workers: AtomicBool,
 }
 
-/// How long a persistent control master lingers after its last client, in
-/// seconds. Long enough for scripted bursts of runs; short enough that the
-/// no-reauthentication window stays comparable to sudo's credential cache.
-const REUSE_PERSIST_SECONDS: &str = "300";
+// User-managed connections remain available until explicitly stopped. Keepalives
+// detect dead transports so a later command can establish a fresh connection.
+const PERSISTENT_SSH_OPTIONS: &[&str] = &[
+    "-o",
+    "ControlPersist=yes",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
 
 /// The oldest OpenSSH release whose client speaks the agent session-bind
 /// extension and host-bound public-key authentication. Constrained agent
@@ -1228,6 +1233,10 @@ impl SshMultiplexer {
             persistent: true,
             reuse_for_workers: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn control_path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn set_reuse_for_workers(&self, reuse: bool) {
@@ -1402,8 +1411,7 @@ impl RemoteSpec {
                         .arg("ControlMaster=auto")
                         .arg("-S")
                         .arg(crate::persistence::openssh_control_path(&multiplexer.path))
-                        .arg("-o")
-                        .arg(format!("ControlPersist={REUSE_PERSIST_SECONDS}"));
+                        .args(PERSISTENT_SSH_OPTIONS);
                 } else {
                     if master {
                         // A failed control command can leave its socket briefly
@@ -4142,9 +4150,7 @@ mod tests {
         assert!(control
             .windows(2)
             .any(|pair| pair[0] == "-S" && pair[1] == control_path));
-        assert!(control
-            .iter()
-            .any(|arg| arg == &format!("ControlPersist={REUSE_PERSIST_SECONDS}")));
+        assert!(control.iter().any(|arg| arg == "ControlPersist=yes"));
         // Worker data channels never ride a cross-run master, even when the
         // small-file path asks for in-run multiplexing.
         spec.set_ssh_multiplexing(true);

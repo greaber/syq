@@ -155,3 +155,8 @@ The disposable runner also checks privileged copies before dropping to its
 normal test user: foreign-owned partials are replaced without modifying their
 inodes, requested final ownership still works, and `--insecure-links` permits
 foreign-owned symlinks in typed local paths. No host files are used.
+
+The persistence cases establish receiving with `persist connect` without a copy,
+verify that repeating it preserves a pending approval and the service process,
+and check that it respects disabled receiving. Network interruption and heartbeat
+expiry cases verify automatic recovery and successful subsequent copies.

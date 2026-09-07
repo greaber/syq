@@ -402,6 +402,55 @@ pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
         );
     }
 }
+/// Return readiness for one owned endpoint; do not restart a healthy service.
+pub(crate) fn ensure_ready(
+    control: &Path,
+    remote: &crate::conn::RemoteSpec,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    ensure_inner(control, remote)?;
+    if !settings()?.enabled {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut progress = Instant::now();
+    loop {
+        let observed = match status(control, false) {
+            Ok(state) if state.connection.phase == "online" => return Ok(Some(state.name)),
+            Ok(state) => {
+                let observed = format!(
+                    "{}{}",
+                    state.connection.phase,
+                    state
+                        .connection
+                        .error
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+                if state.connection.phase == "failed" {
+                    bail!("{}: {observed}", remote.label());
+                }
+                observed
+            }
+            Err(error) => format!("receiving is starting or unavailable: {error:#}"),
+        };
+        if Instant::now() >= deadline {
+            bail!("{} is not ready: {observed}; check syq persist status (background reconnects continue while enabled)", remote.label());
+        }
+        if progress.elapsed() >= Duration::from_secs(5) {
+            crate::output::diagnostic!("syq: waiting for {}: {observed}", remote.label());
+            progress = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub(crate) fn connection_status(control: &Path) -> Option<(String, ConnectionState)> {
+    status(control, false)
+        .ok()
+        .map(|state| (state.name, state.connection))
+}
+
 fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
     // Persist v3 before reuse so older binaries reject a policy downgrade.
     let config = ensure_current_settings()?;
@@ -502,22 +551,6 @@ fn stop_inner(control: &Path, remove_record: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-pub(crate) fn summary(control: &Path) -> String {
-    match status(control, false) {
-        Ok(state) => format!(
-            ", return {} ({}){}",
-            state.name,
-            state.connection.phase,
-            state
-                .connection
-                .error
-                .map(|e| format!(": {e}"))
-                .unwrap_or_default()
-        ),
-        Err(_) if suffixed(control, RECORD).exists() => ", return inactive".into(),
-        Err(_) => String::new(),
-    }
 }
 
 struct SocketCleanup {
