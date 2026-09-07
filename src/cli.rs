@@ -106,9 +106,6 @@ pub struct Args {
     /// Permit symlinks that must be traversed in directly supplied destination paths.
     #[arg(skip)]
     pub native_follow_dst: bool,
-    /// Native --only-new preserves existing directory metadata as well as contents.
-    #[arg(skip)]
-    pub native_only_new: bool,
     /// Source-side base for `syq map` selectors, joined at walk time so the
     /// emitted `src` values stay relative to it.
     #[arg(skip)]
@@ -416,6 +413,10 @@ pub struct Args {
 }
 
 impl Args {
+    pub(crate) fn only_new_native_entries(&self) -> bool {
+        self.interface == Interface::NativeCp && self.ignore_existing
+    }
+
     pub(crate) fn follows_native_source_paths(&self) -> bool {
         self.native_follow || self.native_follow_src
     }
@@ -1817,7 +1818,6 @@ fn apply_native_copy_operational(
     args.checksum = hash;
     args.verify_only = verify_only;
     args.ignore_existing = ignore_existing;
-    args.native_only_new = ignore_existing;
     args.existing = existing;
     args.update = update;
     args.no_compress = no_compress;

@@ -104,7 +104,9 @@ Typed remote-to-remote copies require an enrolled receiver or
 
 `only_new=True` traverses existing directories but does not explicitly update
 their metadata. Adding children may naturally change directory timestamps.
-New directories receive normal copy metadata. Adding children to existing
+New directories receive normal copy metadata. When several sources supply a
+directory created by this copy, the last source supplies its metadata, just
+as without `only_new=True`. Adding children to existing
 directories requires write access; permissions are not temporarily widened.
 Permission failures are reported in the result and raise `SyqOperationError`
 unless `check=False`. A dry run does not test write permission.

@@ -115,11 +115,9 @@ syq receiver enroll hostB:/archive
 syq cp --dry-run -v --from hostA --srcs-in data --to hostB --into /archive
 ```
 
-Receiver enrollments are tied to a protocol generation. After an incompatible
-upgrade, syq ignores older local enrollment metadata and prepares a fresh
-receiver on the next eligible copy. You can also run `syq receiver enroll`
-again explicitly. This requires ordinary SSH access to install the receiver;
-old signed grants and replay records are not migrated or reset.
+After an incompatible upgrade, syq installs a fresh receiver on the next
+eligible copy. You can also prepare it explicitly with `syq receiver enroll`.
+Installing the receiver requires ordinary SSH access.
 
 Inspect or remove this access with:
 

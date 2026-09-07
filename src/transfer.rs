@@ -1850,7 +1850,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_delete: args.max_delete,
         update: args.update,
         ignore_existing: args.ignore_existing,
-        preserve_existing_directory_metadata: args.native_only_new,
+        preserve_existing_directory_metadata: args.only_new_native_entries(),
         existing: args.existing,
         insecure_links: rsync_insecure_links(&args, !src_ep.is_remote()),
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
@@ -2938,8 +2938,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
-        created_mapping_dirs: std::collections::HashSet::new(),
-        destination_root_created: create_root,
+        created_dirs: if create_root && !defer_destination_mutations {
+            std::collections::HashSet::from([dst_root.clone()])
+        } else {
+            std::collections::HashSet::new()
+        },
         mapping_mode: false,
         create_root: if defer_operator_directory_creation {
             Some((
@@ -4715,10 +4718,8 @@ struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     implicit_dirs: std::collections::HashSet<PathBytes>,
-    /// Missing-only mappings may name an implicitly created directory in a later batch.
-    created_mapping_dirs: std::collections::HashSet<PathBytes>,
-    /// Preflight creates this root before directory stat/planning sees it.
-    destination_root_created: bool,
+    /// Directories this copy created may receive metadata from later sources.
+    created_dirs: std::collections::HashSet<PathBytes>,
     /// This run consumes a --mapping manifest (identity entries included).
     mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
@@ -5527,7 +5528,7 @@ impl Planner<'_> {
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims and live sidecar names.
-        self.created_mapping_dirs = std::collections::HashSet::new();
+        self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
         self.dry_run_replaced_dirs = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
@@ -5746,6 +5747,9 @@ impl Planner<'_> {
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));
                 }
+            }
+            if is_destination_root && self.opts.preserve_existing_directory_metadata {
+                self.created_dirs.insert(self.dst_root.clone());
             }
         }
         // Validated: from here on they are ordinary entries (the one that is
@@ -5995,9 +5999,8 @@ impl Planner<'_> {
                         let preexisting = existing_dirs.contains(name);
                         let succeeded = err.is_none();
                         let created = succeeded && !preexisting;
-                        if created && opts.preserve_existing_directory_metadata && self.mapping_mode
-                        {
-                            self.created_mapping_dirs.insert(name.clone());
+                        if created && opts.preserve_existing_directory_metadata {
+                            self.created_dirs.insert(name.clone());
                         }
                         let os_kind = err.as_ref().and_then(wire_os_kind);
                         if let Some(err) = &err {
@@ -6064,12 +6067,11 @@ impl Planner<'_> {
                 for (p, _, e, s) in &planned {
                     // Implicit --mapping ancestors keep the metadata their
                     // creation gave them; only named entries stamp source
-                    // metadata.
+                    // metadata. Missing-only copies stamp only successful
+                    // creations, never failed mkdirs or pre-existing directories.
                     if self.implicit_dirs.contains(p)
                         || (opts.preserve_existing_directory_metadata
-                            && !(self.destination_root_created && p == &self.dst_root)
-                            && !self.created_mapping_dirs.contains(p)
-                            && s.as_ref().is_some_and(|d| d.kind == Kind::Dir))
+                            && !self.created_dirs.contains(p))
                     {
                         continue;
                     }

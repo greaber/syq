@@ -167,6 +167,8 @@ and the copy reports an error. A dry run previews intended changes without
 testing whether writes will be permitted.
 Adding or removing children can change directory timestamps through normal
 filesystem behavior. Newly created directories receive normal copy metadata.
+If several sources supply the same directory created by this copy, the last
+source supplies its metadata, as in a copy without `--only-new`.
 If a source directory meets an existing non-directory,
 it keeps the destination entry and skips that source subtree.
 `--only-existing` also skips a source directory and its subtree when the destination

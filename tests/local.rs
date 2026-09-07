@@ -19205,3 +19205,50 @@ fn native_only_new_stamps_its_new_destination_root() {
         assert_eq!(metadata.mtime(), 1_600_000_000);
     }
 }
+
+#[test]
+fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_500_000_000), ("b", 0o711, 1_600_000_000)] {
+        write(
+            &t.path(&format!("{source}/shared/{source}")),
+            source.as_bytes(),
+        );
+        for dir in [source.to_owned(), format!("{source}/shared")] {
+            fs::set_permissions(t.path(&dir), fs::Permissions::from_mode(mode)).unwrap();
+            set_mtime(&t.path(&dir), time);
+        }
+    }
+    for only_new in [false, true] {
+        let dst = if only_new { "missing-only" } else { "ordinary" };
+        let a = t.s("a");
+        let b = t.s("b");
+        let destination = t.s(dst);
+        let mut args = vec![
+            "cp",
+            "--preserve=permissions",
+            "--srcs-in",
+            &a,
+            "--srcs-in",
+            &b,
+            "--into",
+            &destination,
+        ];
+        if only_new {
+            args.insert(1, "--only-new");
+        }
+        run_native_ok(&args);
+        for dir in [dst.to_owned(), format!("{dst}/shared")] {
+            let meta = fs::metadata(t.path(&dir)).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o711, "{dir}");
+            assert_eq!(meta.mtime(), 1_600_000_000, "{dir}");
+        }
+        for source in ["a", "b"] {
+            assert_eq!(
+                read(&t.path(&format!("{dst}/shared/{source}"))),
+                source.as_bytes()
+            );
+        }
+    }
+}

@@ -157,11 +157,10 @@ pub(crate) enum DestinationPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ExistingDestinationPolicy {
     Replace,
+    /// Create missing entries without modifying pre-existing entries.
     Skip,
     UpdateIfOlder,
     MustExist,
-    /// Create missing entries without changing existing directory metadata.
-    OnlyNew,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
