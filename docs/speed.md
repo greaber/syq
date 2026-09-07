@@ -14,6 +14,10 @@ their initial worker count to the available files and splittable ranges.
 Updates keep their usual count. If a missing file has a resumable partial,
 syq restores that count when it discovers the partial: one file can contain
 many separate changed regions.
+With automatic concurrency, syq divides a single large fresh file over SSH
+before copying starts, so workers that connect later can help without waiting for a large enough
+remaining range to split. Earlier workers can keep taking work while those
+connections start.
 When pushing into an
 existing directory, syq pipelines destination setup checks to reduce network
 round trips. For eligible small-file trees in an empty destination, TCP workers

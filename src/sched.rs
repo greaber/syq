@@ -87,6 +87,7 @@ pub struct Sched {
     cv: Condvar,
     tune_cv: Condvar,
     direct_fallback_workers: AtomicUsize,
+    initial_range_workers: AtomicUsize,
     tune_request: AtomicUsize,
     pub jobs: Mutex<Vec<FileJob>>,
     pub block: u64,
@@ -113,6 +114,7 @@ impl Sched {
             cv: Condvar::new(),
             tune_cv: Condvar::new(),
             direct_fallback_workers: AtomicUsize::new(0),
+            initial_range_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
             jobs: Mutex::new(Vec::new()),
             block,
@@ -158,6 +160,12 @@ impl Sched {
 
     pub fn arm_direct_fallback(&self, workers: usize) {
         self.direct_fallback_workers.store(workers, Relaxed);
+    }
+
+    pub fn reserve_initial_ranges(&self, workers: usize) {
+        // Reserve runnable work, not workers: an early connection can take
+        // another queued range if its peers are still connecting.
+        self.initial_range_workers.store(workers, Relaxed);
     }
 
     pub fn request_direct_fallback(&self) {
@@ -419,9 +427,35 @@ impl Sched {
 
     /// After probing a file: register its ranges. Returns the handle for the
     /// first range (already marked in flight) or None if nothing to transfer.
-    pub fn ranges_ready(&self, idx: usize, ranges: Vec<(u64, u64)>) -> Option<RangeHandle> {
+    pub fn ranges_ready(&self, idx: usize, mut ranges: Vec<(u64, u64)>) -> Option<RangeHandle> {
         let mut g = self.inner.lock().unwrap();
         g.probing -= 1;
+        let workers = self.initial_range_workers.swap(0, Relaxed) as u64;
+        // Preserve the split floor while exposing the initial parallelism
+        // before any worker's progress makes balanced stealing impossible.
+        if workers > 1 && g.files.is_empty() && ranges.len() == 1 {
+            let (start, end) = ranges[0];
+            if start.is_multiple_of(self.block) {
+                let blocks = (end - start) / self.block;
+                let parts = workers
+                    .min(blocks / self.min_split.div_ceil(self.block))
+                    .max(1);
+                if parts > 1 {
+                    ranges.clear();
+                    let mut off = start;
+                    for part in 0..parts {
+                        let n = blocks / parts + u64::from(part < blocks % parts);
+                        let limit = if part + 1 == parts {
+                            end
+                        } else {
+                            off + n * self.block
+                        };
+                        ranges.push((off, limit));
+                        off = limit;
+                    }
+                }
+            }
+        }
         if !ranges.is_empty() {
             g.outstanding.insert(idx, ranges.len() as u32);
         }
@@ -487,6 +521,88 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_ranges_preserve_coverage_alignment_and_split_floor() {
+        for size in [
+            1,
+            31 << 20,
+            32 << 20,
+            63 << 20,
+            64 << 20,
+            256 << 20,
+            (257 << 20) + 7,
+        ] {
+            for workers in [0, 1, 2, 8, 16] {
+                let sched = Sched::new(4 << 20, 32 << 20);
+                sched.inner.lock().unwrap().probing = 1;
+                sched.reserve_initial_ranges(workers);
+                let first = sched.ranges_ready(0, vec![(0, size)]).unwrap();
+                let mut spans = {
+                    let r = first.lock().unwrap();
+                    vec![(r.pos, r.end)]
+                };
+                let inner = sched.inner.lock().unwrap();
+                spans.extend(inner.ranges.iter().map(|(_, off, end)| (*off, *end)));
+                spans.sort_unstable();
+                let count = workers.min((size / sched.min_split) as usize).max(1);
+                assert_eq!(spans.len(), count);
+                assert_eq!(inner.outstanding[&0] as usize, count);
+                let mut end = 0;
+                for (off, limit) in spans {
+                    assert_eq!(off, end);
+                    assert_eq!(off % sched.block, 0);
+                    assert!(count == 1 || limit - off >= sched.min_split);
+                    end = limit;
+                }
+                assert_eq!(end, size);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_ranges_remain_available_after_the_first_worker_advances() {
+        let sched = Sched::new(4 << 20, 32 << 20);
+        sched.inner.lock().unwrap().probing = 1;
+        sched.reserve_initial_ranges(8);
+        let first = sched.ranges_ready(0, vec![(0, 256 << 20)]).unwrap();
+        first.lock().unwrap().pos += 4 << 20;
+        sched.scan_done();
+        for _ in 1..8 {
+            let Item::Range(range) = sched.next() else {
+                panic!("missing reserved range")
+            };
+            assert!(!sched.range_done(&range));
+        }
+        assert!(sched.range_done(&first));
+        assert!(matches!(sched.next(), Item::Exit));
+    }
+
+    #[test]
+    fn initial_ranges_leave_diff_ranges_and_other_files_alone() {
+        for queued_file in [false, true] {
+            let sched = Sched::new(4 << 20, 32 << 20);
+            {
+                let mut inner = sched.inner.lock().unwrap();
+                inner.probing = 1;
+                if queued_file {
+                    inner.files.push((64 << 20, Reverse(1)));
+                }
+            }
+            sched.reserve_initial_ranges(8);
+            let spans = if queued_file {
+                vec![(0, 256 << 20)]
+            } else {
+                vec![(0, 64 << 20), (128 << 20, 256 << 20)]
+            };
+            let first = sched.ranges_ready(0, spans.clone()).unwrap();
+            let range = first.lock().unwrap();
+            assert_eq!((range.pos, range.end), spans[0]);
+            let inner = sched.inner.lock().unwrap();
+            assert_eq!(inner.outstanding[&0] as usize, spans.len());
+            assert_eq!(sched.initial_range_workers.load(Relaxed), 0);
+        }
+    }
 
     #[test]
     fn tuning_split_threshold_controls_when_idle_workers_can_help() {

@@ -3242,6 +3242,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         if initial < args.connections {
                             sched.arm_direct_fallback(args.connections);
                         }
+                        if jobs.len() == 1 {
+                            sched.reserve_initial_ranges(initial);
+                        }
                         if args.verbose >= 2 && initial < args.connections {
                             crate::output::diagnostic!(
                                 "syq: SSH startup limited to {initial} workers by available files and ranges"
