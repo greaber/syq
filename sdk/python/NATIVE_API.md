@@ -39,13 +39,13 @@ downloading it if needed. See [Compatibility](https://greaber.github.io/syq/pyth
 Options use CLI names with hyphens replaced by underscores. Python keywords
 get a trailing underscore: `from_`, `as_`. Paths accept `str`, `bytes`, or
 `os.PathLike`; selector keywords accept one path or an iterable of paths.
-Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_file` and `src_dir`.
+Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_non_dir` and `src_dir`.
 
 | Shared by `cp`, `rm`, and `map` | Meaning |
 |---|---|
 | `*sources`, `src` | Select named objects |
 | `srcs_in` | Select a directory's contents |
-| `src_file`, `src_dir` | Require non-directory objects or directories |
+| `src_non_dir`, `src_dir` | Require non-directory objects or directories |
 | `cwd` | Source resolution base; may be remote for `cp` and `rm` |
 | `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
 | `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
@@ -75,7 +75,7 @@ In addition to the shared arguments above, it accepts:
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
-| `ignore_existing`, `existing`, `update` | Boolean: skip existing, require existing, or skip newer destination files |
+| `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `preserve` | Preservation string or iterable of strings |
@@ -115,12 +115,28 @@ Typed remote-to-remote copies require an enrolled receiver or
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
+With `only_new=True`, directories already present when syq first checks them
+keep their metadata. Missing children are still added.
+Adding children may naturally change directory timestamps. Directories copied
+as new receive normal copy metadata. When several sources supply the same new
+directory, the last source supplies its metadata, just as without
+`only_new=True`. Adding children to those existing
+directories requires write access; permissions are not temporarily widened.
+Permission failures are reported in the result and raise `SyqOperationError`
+unless `check=False`. A dry run does not test write permission.
+
 <a id="removal"></a>
 
 ## rm
 
+`on="server"` selects the removal endpoint. A final selected symlink is
+always unlinked. Both `follow_src=True` and `follow=True` permit symlinks in
+`cwd`, `root`, and selector parent directories.
+Directory and contents selectors reject a final symlink even with following
+enabled.
+
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
-arguments, it accepts `from_`, `dry_run`, `connections`, `syq_path`,
+arguments, it accepts `on`, `dry_run`, `connections`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local and ordinary SSH endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).

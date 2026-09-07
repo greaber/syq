@@ -77,7 +77,7 @@ fn full_reference_reveals_specialized_options_without_exposing_internal_switches
     for (command, common, advanced) in [
         ("cp", "--into", "--coordinate-at"),
         ("rm", "--srcs-in", "--results-fd"),
-        ("map", "--as", "--src-files"),
+        ("map", "--as", "--src-non-dirs"),
         ("rsync", "--archive", "--syq-tcp-ports"),
     ] {
         let short = help(&[command, "--help"]);

@@ -923,7 +923,7 @@ fn option_name(arg: &clap::Arg) -> Vec<u8> {
 fn selector_id(id: &str) -> bool {
     matches!(
         id,
-        "src" | "srcs_in" | "src_file" | "src_dir" | "srcs" | "src_files" | "src_dirs"
+        "src" | "srcs_in" | "src_non_dir" | "src_dir" | "srcs" | "src_non_dirs" | "src_dirs"
     )
 }
 
@@ -1195,10 +1195,10 @@ fn native_copy_source_option(option: &[u8]) -> bool {
             | b"--root"
             | b"--src"
             | b"--srcs-in"
-            | b"--src-file"
+            | b"--src-non-dir"
             | b"--src-dir"
             | b"--srcs"
-            | b"--src-files"
+            | b"--src-non-dirs"
             | b"--src-dirs"
             | b"--mapping"
     )
@@ -1228,8 +1228,10 @@ fn value_completion(
             b"--via" => Some(ValueCompletion::ReturnName),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
             | b"--as-existing" => Some(ValueCompletion::DestinationPath),
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
@@ -1244,10 +1246,12 @@ fn value_completion(
             b"--results" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
-            b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"--on" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
@@ -1255,8 +1259,10 @@ fn value_completion(
         },
         "map" => match option {
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--as" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1372,9 +1378,32 @@ fn option_candidates(command: &clap::Command, current: &[u8]) -> Vec<Candidate> 
         .collect()
 }
 
-fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> OperatorSymlinkPolicy {
+#[derive(Clone, Copy)]
+struct PathCompletionPolicy {
+    parents: OperatorSymlinkPolicy,
+    follow_final_symlinks: bool,
+}
+
+impl PathCompletionPolicy {
+    fn new(parents: OperatorSymlinkPolicy, follow_final_symlinks: bool) -> Self {
+        Self {
+            parents,
+            follow_final_symlinks,
+        }
+    }
+}
+
+fn path_policy(
+    command: &str,
+    args: &[Vec<u8>],
+    source: bool,
+    follow_final_symlinks: bool,
+) -> PathCompletionPolicy {
     if command == "rsync" {
-        return OperatorSymlinkPolicy::TrustedOwner;
+        return PathCompletionPolicy::new(
+            OperatorSymlinkPolicy::TrustedOwner,
+            follow_final_symlinks,
+        );
     }
     if contains_option(args, b"--follow")
         || contains_option(
@@ -1386,9 +1415,9 @@ fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> OperatorSymlink
             },
         )
     {
-        OperatorSymlinkPolicy::FollowAll
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::FollowAll, follow_final_symlinks)
     } else {
-        OperatorSymlinkPolicy::Refuse
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::Refuse, follow_final_symlinks)
     }
 }
 
@@ -1406,7 +1435,7 @@ fn complete_path_for(
             current,
             false,
             None,
-            path_policy(command, args, false),
+            path_policy(command, args, false, true),
         ));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
@@ -1414,7 +1443,7 @@ fn complete_path_for(
             current,
             false,
             None,
-            path_policy(command, args, false),
+            path_policy(command, args, false, true),
         ));
     };
     let authorizer = find_option_value(args, b"--auth-from");
@@ -1440,7 +1469,7 @@ fn complete_path_for(
         current,
         Vec::new(),
         None,
-        path_policy(command, args, false),
+        path_policy(command, args, false, true),
     )
 }
 
@@ -1450,40 +1479,22 @@ fn complete_source_path(
     current: &[u8],
     apply_base: bool,
 ) -> Result<Vec<Candidate>> {
+    // Removal follows parent paths when requested, but selects the final link
+    // itself. --cwd and --root still resolve their complete directory paths.
+    let policy = path_policy(command, args, true, command != "rm" || !apply_base);
     let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+        return Ok(local_path_candidates_at(current, false, base, policy));
     }
-    let Some(endpoint_text) = find_option_value(args, b"--from") else {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+    let Some(endpoint_text) =
+        find_option_value(args, if command == "rm" { b"--on" } else { b"--from" })
+    else {
+        return Ok(local_path_candidates_at(current, false, base, policy));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+        return Ok(local_path_candidates_at(current, false, base, policy));
     };
-    remote_path_candidates(
-        command,
-        args,
-        endpoint,
-        current,
-        Vec::new(),
-        base,
-        path_policy(command, args, true),
-    )
+    remote_path_candidates(command, args, endpoint, current, Vec::new(), base, policy)
 }
 
 fn source_base(args: &[Vec<u8>]) -> Option<SourceBase<'_>> {
@@ -1512,11 +1523,15 @@ fn complete_rsync_operand(args: &[Vec<u8>], current: &[u8]) -> Result<Vec<Candid
             path,
             wrapper,
             None,
-            OperatorSymlinkPolicy::TrustedOwner,
+            PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, true),
         );
     }
-    let mut candidates =
-        local_path_candidates_at(current, false, None, OperatorSymlinkPolicy::TrustedOwner);
+    let mut candidates = local_path_candidates_at(
+        current,
+        false,
+        None,
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, true),
+    );
     candidates.extend(endpoint_candidates(
         current,
         EndpointSyntax::Rsync,
@@ -1558,7 +1573,7 @@ fn remote_path_candidates(
     current: &[u8],
     wrapper: Vec<u8>,
     base: Option<SourceBase<'_>>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
 ) -> Result<Vec<Candidate>> {
     if has_explicit_rsh(command, args) {
         return Ok(Vec::new());
@@ -1604,7 +1619,7 @@ fn remote_path_candidates(
                     directory_for_thread.clone(),
                     root_for_thread.clone(),
                     prefix_for_thread.clone(),
-                    symlink_policy,
+                    policy,
                     false,
                 );
                 let names_available = result.is_ok();
@@ -1615,7 +1630,7 @@ fn remote_path_candidates(
                         directory_for_thread,
                         root_for_thread,
                         prefix_for_thread,
-                        symlink_policy,
+                        policy,
                         true,
                     );
                     let _ = sender.send(result);
@@ -1698,16 +1713,25 @@ fn list_remote_entries(
     directory: Vec<u8>,
     confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
     detailed: bool,
 ) -> Result<(Vec<CompletionEntry>, Vec<String>)> {
-    let request = if detailed {
+    let request = if !policy.follow_final_symlinks {
+        Request::ListDirNoFollowFinal {
+            directory,
+            confined_root,
+            prefix: prefix.clone(),
+            limit: MAX_DIRECTORY_CANDIDATES,
+            symlink_policy: policy.parents,
+            detailed,
+        }
+    } else if detailed {
         Request::ListDirDetails {
             directory,
             confined_root,
             prefix: prefix.clone(),
             limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy,
+            symlink_policy: policy.parents,
         }
     } else {
         Request::ListDir {
@@ -1715,7 +1739,7 @@ fn list_remote_entries(
             confined_root,
             prefix: prefix.clone(),
             limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy,
+            symlink_policy: policy.parents,
         }
     };
     match connection.call(request)? {
@@ -1774,7 +1798,7 @@ fn local_path_candidates(current: &[u8], directories_only: bool) -> Vec<Candidat
         current,
         directories_only,
         None,
-        OperatorSymlinkPolicy::FollowAll,
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::FollowAll, true),
     )
 }
 
@@ -1782,7 +1806,7 @@ fn local_path_candidates_at(
     current: &[u8],
     directories_only: bool,
     base: Option<SourceBase<'_>>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
 ) -> Vec<Candidate> {
     if current == b"~" && !matches!(base, Some(SourceBase::Root(_))) {
         return std::env::var_os("HOME")
@@ -1799,7 +1823,7 @@ fn local_path_candidates_at(
     if crate::fsops::check_completion_directory(
         &directory.path,
         directory.confined_root.as_deref(),
-        symlink_policy,
+        policy.parents,
     )
     .is_err()
     {
@@ -1819,10 +1843,11 @@ fn local_path_candidates_at(
         };
         let is_directory = file_type.is_dir()
             || (file_type.is_symlink()
+                && policy.follow_final_symlinks
                 && crate::fsops::check_completion_directory(
                     item.path().as_os_str().as_bytes(),
                     directory.confined_root.as_deref(),
-                    symlink_policy,
+                    policy.parents,
                 )
                 .is_ok());
         if directories_only && !is_directory {

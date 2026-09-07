@@ -411,14 +411,14 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                 self.assertTrue(events[0].verify_only)
                 self.assertFalse((root / "dst/new").exists())
                 self.assertEqual((root / "dst/file").read_bytes(), b"target")
-                kept = copy(ignore_existing=True)
+                kept = copy(only_new=True)
                 self.assertEqual(kept.files_excluded, 1)
                 self.assertEqual((root / "dst/file").read_bytes(), b"target")
                 (root / "dst/new").unlink()
-                copy(existing=True, update=True)
+                copy(only_existing=True, skip_newer=True)
                 self.assertEqual((root / "dst/file").read_bytes(), b"target")
                 self.assertFalse((root / "dst/new").exists())
-                copy(existing=True)
+                copy(only_existing=True)
                 self.assertEqual((root / "dst/file").read_bytes(), b"source")
                 self.assertFalse((root / "dst/new").exists())
                 matched = copy(verify_only=True, ignore="new")
@@ -427,6 +427,31 @@ class CopyPolicyCandidateTests(unittest.TestCase):
                 self.assertEqual(matched.files_transferred, 0)
                 with self.assertRaises(syq.SyqInvocationError):
                     copy(verify_only=True, prune=True)
+
+    def test_sync_and_async_removal_keeps_final_link_identity(self) -> None:
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:
+                root = Path(temporary)
+                (root / "real").mkdir()
+                (root / "real/file").write_bytes(b"keep")
+                (root / "link").symlink_to("real")
+                client = (syq.AsyncClient if asynchronous else syq.Client)(
+                    executable=Path(EXECUTABLE), process_cwd=root
+                )
+                def remove(**options: object) -> syq.RmResult:
+                    result = client.rm(root=root, follow_src=True, **options)
+                    return asyncio.run(result) if asynchronous else result
+                for selector in ("src_dir", "srcs_in"):
+                    with self.assertRaises(syq.SyqOperationError):
+                        remove(**{selector: "link"})
+                    self.assertEqual((root / "real/file").read_bytes(), b"keep")
+                remove(src_non_dir="link")
+                self.assertFalse((root / "link").is_symlink())
+                self.assertEqual((root / "real/file").read_bytes(), b"keep")
+                (root / "link").symlink_to("real")
+                remove(src_non_dir="link/file")
+                self.assertTrue((root / "link").is_symlink())
+                self.assertFalse((root / "real/file").exists())
 
 
 if __name__ == "__main__":

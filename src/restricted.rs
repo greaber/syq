@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Advance this generation whenever an installed receiver or its signed grant
 // protocol becomes incompatible. Local metadata from another generation is
 // ignored, so the next eligible copy installs a fresh receiver enrollment.
-const CONFIG_VERSION: u16 = 3;
+const CONFIG_VERSION: u16 = 4;
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
@@ -1254,8 +1254,8 @@ impl RestrictedAuthority {
     /// the transfer, so creation is forced to be no-replace; `MustExist`
     /// creates nothing, so something must already be there and the mutation
     /// is pinned to that object's identity. `directory` marks a directory
-    /// creation, which may reuse an existing directory under `Skip` exactly
-    /// as the ordinary engine keeps recursing into it. A root the grant
+    /// creation. Under `Skip`, a raced-in directory fails its individual
+    /// no-replace operation without refusing unrelated batch entries. A root the grant
     /// requires to be new is forced to no-replace creation under every
     /// policy, as a directory whenever the placement puts names inside it.
     /// A creation this call records is provisional until `settle` sees the
@@ -1344,18 +1344,13 @@ impl RestrictedAuthority {
                 Ok(())
             }
             ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::Replace => {
-                match observed {
-                    Some(metadata)
-                        if directory
-                            && metadata.is_dir()
-                            && policy == ExistingDestinationPolicy::Skip =>
-                    {
-                        return Ok(());
-                    }
-                    Some(_) => {
-                        bail!("signed grant retains existing objects: {label} already exists")
-                    }
-                    None => {}
+                // An existing directory under Skip may disappear before execution.
+                // Keep the common no-replace condition and creation bookkeeping
+                // so a successful mkdir can receive its later metadata updates.
+                if observed.is_some_and(|metadata| {
+                    !(directory && metadata.is_dir() && policy == ExistingDestinationPolicy::Skip)
+                }) {
+                    bail!("signed grant retains existing objects: {label} already exists")
                 }
                 match *condition {
                     Any | Absent => *condition = Absent,
@@ -1377,15 +1372,12 @@ impl RestrictedAuthority {
         }
     }
 
-    /// Bind an operation that modifies an existing non-directory object at
-    /// `path` (metadata, replacement bases, in-place content) to the signed
-    /// existing-object policy. Only `Skip` forbids these, and only for objects
-    /// that predate the transfer; directories are kept and may still receive
-    /// metadata, as in the ordinary engine.
+    /// Bind mutations at `path` to the signed existing-object policy.
+    /// `Skip` protects all pre-existing objects, including directories,
+    /// while permitting updates to objects created by this grant.
     fn constrain_update(
         &self,
         path: &[u8],
-        is_dir: bool,
         condition: Option<&mut proto::TargetCondition>,
         pending: &[PendingCreation],
     ) -> Result<()> {
@@ -1397,7 +1389,7 @@ impl RestrictedAuthority {
         let own = self.created_by_this_grant(path)
             || pending.iter().any(|creation| creation.path == path);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if is_dir || own => Ok(()),
+            ExistingDestinationPolicy::Skip if own => Ok(()),
             ExistingDestinationPolicy::Skip => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
@@ -1951,7 +1943,7 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, is_dir, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -1973,7 +1965,7 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                self.constrain_update(path, false, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -2241,7 +2233,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, false, None, pending)?;
+                self.constrain_update(path, None, pending)?;
                 self.reserve_bytes(path, *copy_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
@@ -2264,7 +2256,7 @@ impl RestrictedAuthority {
                 ..
             } => {
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, false, Some(&mut *condition), pending)?;
+                self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
                     meta,
@@ -2434,7 +2426,9 @@ impl RestrictedAuthority {
             | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
-            Request::ListDir { .. } | Request::ListDirDetails { .. } => {
+            Request::ListDir { .. }
+            | Request::ListDirDetails { .. }
+            | Request::ListDirNoFollowFinal { .. } => {
                 bail!("directory completion is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
@@ -3833,16 +3827,16 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.update {
         bail!(
-            "--update compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
+            "--skip-newer compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
         );
     }
     if args.inplace
-        && (args.ignore_existing
+        && (args.only_new_native_entries()
             || args.existing
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
+            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     if !args.dry_run && !args.verify_only && args.delete && args.max_delete.is_none() {
@@ -3986,7 +3980,7 @@ fn grant_for(
     // (`--into-existing` and friends) is the separate signed root-existence
     // field; folding it in here would forbid creating files inside an
     // existing directory.
-    let existing = if args.ignore_existing {
+    let existing = if args.only_new_native_entries() {
         ExistingDestinationPolicy::Skip
     } else if args.update {
         ExistingDestinationPolicy::UpdateIfOlder
@@ -4767,7 +4761,10 @@ esac
         // --restricted-install, produced in a disposable account/container.
         let encoded = include_bytes!("../tests/fixtures/restricted-enrollment-v0.4.1.json");
         let config: ReceiverEnrollment = serde_json::from_slice(encoded).unwrap();
-        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.version, 3);
+        // The old representation is still readable, but cannot authorize a
+        // generation-4 receiver. Enrollment must be recreated after upgrade.
+        assert_ne!(config.version, CONFIG_VERSION);
         assert_eq!(
             config.id,
             EnrollmentId::parse("00112233445546778899aabbccddeeff").unwrap()
@@ -5795,6 +5792,120 @@ esac
     }
 
     #[test]
+    fn signed_only_new_rejects_existing_directory_mutation() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let dir = root.join("target/dir");
+        let new_dir = root.join("target/new-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut existing = apply(mkdir(&dir));
+        authority.authorize(&mut existing, false).unwrap();
+        assert_eq!(op_condition(&existing), proto::TargetCondition::Absent);
+        assert!(authority
+            .authorize(&mut apply(set_meta(&dir)), false)
+            .is_err());
+        let mut create = apply(mkdir(&new_dir));
+        let settlement = authority.authorize(&mut create, false).unwrap();
+        assert_eq!(op_condition(&create), proto::TargetCondition::Absent);
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        authority
+            .authorize(&mut apply(set_meta(&new_dir)), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn signed_skip_records_directory_created_after_foreign_directory_disappears() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let dir = root.join("target/dir");
+        fs::create_dir_all(&dir).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut create = apply(mkdir(&dir));
+        let settlement = authority.authorize(&mut create, false).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        let Request::Apply { ops, guard } = &create else {
+            unreachable!()
+        };
+        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        assert!(results.iter().all(Option::is_none), "{results:?}");
+        authority.settle(settlement, &proto::Response::Applied(results));
+        assert!(dir.is_dir());
+        authority
+            .authorize(&mut apply(set_meta(&dir)), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn signed_skip_directory_race_preserves_metadata_and_allows_siblings() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for before_authorization in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let root = temporary.path().join("root");
+            let target = root.join("target");
+            fs::create_dir_all(&target).unwrap();
+            let raced = target.join("raced");
+            let sibling = target.join("sibling");
+            let authority = existence_authority(
+                &root,
+                ExistingDestinationPolicy::Skip,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+            )
+            .unwrap();
+            let create_foreign = || {
+                fs::create_dir(&raced).unwrap();
+                fs::set_permissions(&raced, fs::Permissions::from_mode(0o555)).unwrap();
+            };
+            if before_authorization {
+                create_foreign();
+            }
+            let mut batch = Request::Apply {
+                ops: vec![mkdir(&raced), mkdir(&sibling)],
+                guard: None,
+            };
+            let settlement = authority.authorize(&mut batch, false).unwrap();
+            if !before_authorization {
+                create_foreign();
+            }
+            let before = fs::metadata(&raced).unwrap();
+            let Request::Apply { ops, guard } = &batch else {
+                unreachable!()
+            };
+            let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+            assert!(results[0].is_some());
+            assert!(results[1].is_none(), "{results:?}");
+            authority.settle(settlement, &proto::Response::Applied(results));
+            assert!(sibling.is_dir());
+            let after = fs::metadata(&raced).unwrap();
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!(
+                (after.mtime(), after.mtime_nsec()),
+                (before.mtime(), before.mtime_nsec())
+            );
+            assert!(authority
+                .authorize(&mut apply(set_meta(&raced)), false)
+                .is_err());
+            authority
+                .authorize(&mut apply(set_meta(&sibling)), false)
+                .unwrap();
+            fs::set_permissions(&raced, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
     fn special_file_creation_checks_kind_and_masks_mode() {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
@@ -5901,11 +6012,11 @@ esac
         authority.authorize(&mut small_new, false).unwrap();
         assert_eq!(small_put_condition(&small_new), Absent);
 
-        // Existing directories are kept and reused; nothing existing becomes
-        // a directory, and new directories are created without replacement.
+        // Existing directories cannot be reopened: the individual creation
+        // is no-replace. New directories are created without replacement too.
         let mut reuse_dir = apply(mkdir(&dir));
         authority.authorize(&mut reuse_dir, false).unwrap();
-        assert_eq!(op_condition(&reuse_dir), Any);
+        assert_eq!(op_condition(&reuse_dir), Absent);
         let mut dir_over_file = apply(mkdir(&kept));
         assert!(authority.authorize(&mut dir_over_file, false).is_err());
         let mut create_dir = apply(mkdir(&new_dir));
@@ -5913,7 +6024,7 @@ esac
         assert_eq!(op_condition(&create_dir), Absent);
 
         // Symlinks follow the same rule, and metadata may follow only this
-        // grant's own creations or directories.
+        // grant's own creations.
         let mut link_over_file = apply(symlink_op(&kept));
         assert!(authority.authorize(&mut link_over_file, false).is_err());
         let mut create_link = apply(symlink_op(&link));
@@ -5923,7 +6034,7 @@ esac
         let mut meta_link = apply(set_meta(&link));
         authority.authorize(&mut meta_link, false).unwrap();
         let mut meta_dir = apply(set_meta(&dir));
-        authority.authorize(&mut meta_dir, false).unwrap();
+        assert!(authority.authorize(&mut meta_dir, false).is_err());
         let mut meta_kept = apply(set_meta(&kept));
         assert!(authority.authorize(&mut meta_kept, false).is_err());
         let mut same_kept = apply(Op::SetFileMetaIfSame {

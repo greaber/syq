@@ -4,7 +4,7 @@
 //! is a component walk rooted at an already-open directory; it never produces
 //! a canonical pathname that is reopened later. The selected object and its
 //! parent directory remain pinned while an endpoint-local worker pool removes
-//! descendants relative to directory descriptors. Without source following,
+//! descendants relative to directory descriptors. Regardless of source following,
 //! a selected symlink and symlinks encountered below a selected directory are
 //! unlinked as entries; neither is followed.
 
@@ -120,7 +120,6 @@ enum ResolvedSelection {
 struct Resolver {
     resolver: OperatorResolver,
     confined: bool,
-    follow: bool,
     symlink_policy: OperatorSymlinkPolicy,
 }
 
@@ -134,7 +133,6 @@ impl Resolver {
         Ok(Self {
             resolver: OperatorResolver::beneath(base, confined, symlink_policy)?,
             confined,
-            follow,
             symlink_policy,
         })
     }
@@ -150,7 +148,7 @@ impl Resolver {
         let path = crate::fsops::resolve(&selection.path);
         let mut hops = Vec::new();
         let final_component = OperatorFinalComponent::Entry {
-            follow_symlink: self.follow,
+            follow_symlink: false,
         };
         let resolved = if path.is_absolute() {
             OperatorResolver::resolve_process(
@@ -288,6 +286,10 @@ fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
 
 fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Result<()> {
     match kind {
+        NativeRemoveKind::Contents | NativeRemoveKind::Directory if identity.is_symlink() => bail!(
+            "selector {:?} must resolve to a directory; final symlinks are never followed, even with --follow-src or --follow; name the target directory explicitly",
+            String::from_utf8_lossy(label)
+        ),
         NativeRemoveKind::Contents | NativeRemoveKind::Directory if !identity.is_dir() => bail!(
             "selector {:?} must resolve to a directory",
             String::from_utf8_lossy(label)
@@ -1536,29 +1538,24 @@ mod tests {
     }
 
     #[test]
-    fn follow_removes_referent_and_leaves_link() {
+    fn follow_unlinks_final_symlink_and_preserves_referent() {
         let temp = crate::test_support::tempdir().unwrap();
         fs::create_dir(temp.path().join("real")).unwrap();
         fs::write(temp.path().join("real/file"), b"data").unwrap();
         symlink("real", temp.path().join("link")).unwrap();
-        let mut outcomes = Vec::new();
         remove(
             Some(temp.path().as_os_str().as_bytes()),
             None,
-            &[selector(b"link", NativeRemoveKind::Directory)],
+            &[selector(b"link", NativeRemoveKind::File)],
             true,
             false,
             2,
             &mut |_| Ok(()),
-            &mut |batch| {
-                outcomes.extend(batch);
-                Ok(())
-            },
+            &mut |_| Ok(()),
         )
         .unwrap();
-        assert!(temp.path().join("link").is_symlink());
-        assert!(!temp.path().join("real").exists());
-        assert!(outcomes.iter().all(|outcome| outcome.failure.is_none()));
+        assert!(!temp.path().join("link").is_symlink());
+        assert_eq!(fs::read(temp.path().join("real/file")).unwrap(), b"data");
     }
 
     #[test]

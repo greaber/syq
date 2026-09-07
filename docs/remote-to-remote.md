@@ -117,6 +117,12 @@ syq receiver enroll hostB:/archive
 syq cp --dry-run -v --from hostA --srcs-in data --to hostB --into /archive
 ```
 
+After an incompatible upgrade, syq installs a fresh receiver on the next
+eligible copy. You can also prepare it explicitly with `syq receiver enroll`.
+Installing the receiver requires ordinary SSH access. Enrollments from an
+incompatible older version are not shown by `syq receiver list` or removed by re-enrollment; they require
+manual cleanup on both machines.
+
 Inspect or remove this access with:
 
 ```sh

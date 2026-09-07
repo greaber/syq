@@ -19,7 +19,7 @@ rolled back.
 ## On another machine
 
 ```sh
-syq rm --from server /scratch/old-output
+syq rm --on server /scratch/old-output
 ```
 
 This removes `/scratch/old-output` on `server`. Remote removal runs while your
@@ -32,7 +32,7 @@ syq rm --root /srv cache old-output
 ```
 
 This removes `/srv/cache` and `/srv/old-output`, with selection confined to
-`/srv`. Use `--src-file PATH` or `--src-dir DIR` when the path must be a
+`/srv`. Use `--src-non-dir PATH` or `--src-dir DIR` when the path must be a
 non-directory or directory respectively. All selections are checked before
 deletion begins. Filters are not supported.
 
@@ -41,8 +41,17 @@ deletion begins. Filters are not supported.
 A selected symlink is removed as a link, leaving its target alone. Symlinks
 inside a selected directory are also only unlinked.
 
-`--follow-src` follows links in paths you supply and removes the referent;
-the link remains. With `--root`, the selection must still stay inside that root.
+`--follow-src` permits traversal through symlinks in `--cwd`, `--root`, and
+selector parent directories. `--follow` also permits symlinks in the
+`--results` path.
+The final selected symlink is always removed as a link, even with `--follow-src`
+or `--follow`. For example, if `current` points to `releases/v1`,
+`syq rm --follow-src current/log.txt` removes `releases/v1/log.txt`, while
+`syq rm --follow-src current` removes only the link.
+
+`--src-dir` and `--srcs-in` reject a final selected symlink, including when
+following is enabled. Select the actual directory to remove it or its contents.
+With `--root`, traversal must still stay inside that root.
 
 ## Results
 

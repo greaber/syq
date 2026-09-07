@@ -554,6 +554,7 @@ impl Conn for LocalConn {
                 Request::TcpListen { .. }
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
+                    | Request::ListDirNoFollowFinal { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }

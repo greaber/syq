@@ -559,7 +559,7 @@ def _copy_arguments(
     *,
     src: Selector | None,
     srcs_in: Selector | None,
-    src_file: Selector | None,
+    src_non_dir: Selector | None,
     src_dir: Selector | None,
     from_: str | None,
     cwd: PathArgument | None,
@@ -578,9 +578,9 @@ def _copy_arguments(
     dry_run: bool,
     hash: bool,
     verify_only: bool,
-    ignore_existing: bool,
-    existing: bool,
-    update: bool,
+    only_new: bool,
+    only_existing: bool,
+    skip_newer: bool,
     no_compress: bool,
     bwlimit: str | int | None,
     connections: int | None,
@@ -605,7 +605,7 @@ def _copy_arguments(
     for option, value in (
         ("--src", src),
         ("--srcs-in", srcs_in),
-        ("--src-file", src_file),
+        ("--src-non-dir", src_non_dir),
         ("--src-dir", src_dir),
     ):
         appended = _append_paths(argv, option, value)
@@ -663,19 +663,19 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
-    if verify_only and (dry_run or prune or inplace or ignore_existing or existing or update):
+    if verify_only and (dry_run or prune or inplace or only_new or only_existing or skip_newer):
         raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
-    if ignore_existing and (existing or update or inplace):
-        raise SyqInvocationError("ignore_existing conflicts with existing, update, and inplace")
-    if existing and (into_new is not None or as_new is not None):
-        raise SyqInvocationError("existing conflicts with into_new and as_new")
-    if update and inplace:
-        raise SyqInvocationError("update conflicts with inplace")
+    if only_new and (only_existing or skip_newer or inplace):
+        raise SyqInvocationError("only_new conflicts with only_existing, skip_newer, and inplace")
+    if only_existing and (into_new is not None or as_new is not None):
+        raise SyqInvocationError("only_existing conflicts with into_new and as_new")
+    if skip_newer and inplace:
+        raise SyqInvocationError("skip_newer conflicts with inplace")
     for enabled, option in (
         (verify_only, "--verify-only"),
-        (ignore_existing, "--ignore-existing"),
-        (existing, "--existing"),
-        (update, "--update"),
+        (only_new, "--only-new"),
+        (only_existing, "--only-existing"),
+        (skip_newer, "--skip-newer"),
     ):
         if enabled:
             argv.append(option)
@@ -737,9 +737,9 @@ def _rm_arguments(
     *,
     src: Selector | None,
     srcs_in: Selector | None,
-    src_file: Selector | None,
+    src_non_dir: Selector | None,
     src_dir: Selector | None,
-    from_: str | None,
+    on: str | None,
     cwd: PathArgument | None,
     root: PathArgument | None,
     follow: bool,
@@ -759,14 +759,14 @@ def _rm_arguments(
     for option, value in (
         ("--src", src),
         ("--srcs-in", srcs_in),
-        ("--src-file", src_file),
+        ("--src-non-dir", src_non_dir),
         ("--src-dir", src_dir),
     ):
         source_count += _append_paths(argv, option, value)
     if source_count == 0:
         raise SyqInvocationError("syq rm needs at least one source selector")
-    if from_ is not None:
-        argv.extend(("--from", _text_arg(from_, label="from_")))
+    if on is not None:
+        argv.extend(("--on", _text_arg(on, label="on")))
     if cwd is not None and root is not None:
         raise SyqInvocationError("cwd and root are mutually exclusive")
     if cwd is not None:
@@ -782,7 +782,7 @@ def _rm_arguments(
     connections = _positive_integer(connections, option="--connections")
     if connections is not None:
         argv.extend(("--connections", str(connections)))
-    if from_ is None and (syq_path is not None or no_bootstrap):
+    if on is None and (syq_path is not None or no_bootstrap):
         raise SyqInvocationError(
             "syq_path and no_bootstrap apply only to a remote removal endpoint"
         )
@@ -998,7 +998,7 @@ class Client:
         *sources: PathArgument,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
-        src_file: Selector | None = None,
+        src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
         from_: str | None = None,
         cwd: PathArgument | None = None,
@@ -1019,9 +1019,9 @@ class Client:
         dry_run: bool = False,
         hash: bool = False,
         verify_only: bool = False,
-        ignore_existing: bool = False,
-        existing: bool = False,
-        update: bool = False,
+        only_new: bool = False,
+        only_existing: bool = False,
+        skip_newer: bool = False,
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
@@ -1072,7 +1072,7 @@ class Client:
             sources,
             src=src,
             srcs_in=srcs_in,
-            src_file=src_file,
+            src_non_dir=src_non_dir,
             src_dir=src_dir,
             from_=from_,
             cwd=cwd,
@@ -1091,9 +1091,9 @@ class Client:
             dry_run=dry_run,
             hash=hash,
             verify_only=verify_only,
-            ignore_existing=ignore_existing,
-            existing=existing,
-            update=update,
+            only_new=only_new,
+            only_existing=only_existing,
+            skip_newer=skip_newer,
             no_compress=no_compress,
             bwlimit=bwlimit,
             connections=connections,
@@ -1189,9 +1189,9 @@ class Client:
         *sources: PathArgument,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
-        src_file: Selector | None = None,
+        src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
-        from_: str | None = None,
+        on: str | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
         follow: bool = False,
@@ -1211,9 +1211,9 @@ class Client:
             sources,
             src=src,
             srcs_in=srcs_in,
-            src_file=src_file,
+            src_non_dir=src_non_dir,
             src_dir=src_dir,
-            from_=from_,
+            on=on,
             cwd=cwd,
             root=root,
             follow=follow,
@@ -1244,7 +1244,7 @@ class Client:
         *sources: PathArgument,
         src: Selector | None = None,
         srcs_in: Selector | None = None,
-        src_file: Selector | None = None,
+        src_non_dir: Selector | None = None,
         src_dir: Selector | None = None,
         cwd: PathArgument | None = None,
         root: PathArgument | None = None,
@@ -1257,14 +1257,14 @@ class Client:
         # while deriving the source base carried by MapStream.cwd.
         src_values = _values(src, label="--src")
         srcs_in_values = _values(srcs_in, label="--srcs-in")
-        src_file_values = _values(src_file, label="--src-file")
+        src_non_dir_values = _values(src_non_dir, label="--src-non-dir")
         src_dir_values = _values(src_dir, label="--src-dir")
         argv, source_count, _source_end = _copy_arguments(
             "map",
             sources,
             src=src_values,
             srcs_in=srcs_in_values,
-            src_file=src_file_values,
+            src_non_dir=src_non_dir_values,
             src_dir=src_dir_values,
             from_=None,
             cwd=cwd,
@@ -1283,9 +1283,9 @@ class Client:
             dry_run=False,
             hash=False,
             verify_only=False,
-            ignore_existing=False,
-            existing=False,
-            update=False,
+            only_new=False,
+            only_existing=False,
+            skip_newer=False,
             no_compress=False,
             bwlimit=None,
             connections=None,

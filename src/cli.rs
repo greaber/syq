@@ -413,6 +413,10 @@ pub struct Args {
 }
 
 impl Args {
+    pub(crate) fn only_new_native_entries(&self) -> bool {
+        self.interface == Interface::NativeCp && self.ignore_existing
+    }
+
     pub(crate) fn follows_native_source_paths(&self) -> bool {
         self.native_follow || self.native_follow_src
     }
@@ -699,13 +703,13 @@ struct NativeSourceArgs {
     srcs_in: Vec<OsString>,
     /// Select a named non-directory source object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
-    src_file: Vec<OsString>,
+    src_non_dir: Vec<OsString>,
     /// Select a named source directory; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several named non-directory source objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    src_files: Vec<OsString>,
+    src_non_dirs: Vec<OsString>,
     /// Select several named source directories
     #[arg(long, value_name = "DIR", num_args = 1..)]
     src_dirs: Vec<OsString>,
@@ -728,19 +732,19 @@ struct NativeSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeRmSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
-    #[arg(long, value_name = "ENDPOINT")]
+    /// Removal endpoint ([USER@]HOST[:PORT]); omitted means local
+    #[arg(long = "on", value_name = "ENDPOINT")]
     from: Option<String>,
-    /// Resolve relative selectors from DIR at the source endpoint
+    /// Resolve relative selectors from DIR at the removal endpoint
     #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
     cwd: Option<OsString>,
     /// Confine resolution and removal beneath DIR
     #[arg(long, value_name = "DIR")]
     root: Option<OsString>,
-    /// Follow symlinks in all directly supplied filesystem paths
+    /// Like --follow-src; also follow symlinks in the --results path
     #[arg(long)]
     follow: bool,
-    /// Follow symlinks in directly supplied source paths
+    /// Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink
     #[arg(long)]
     follow_src: bool,
     /// Select an object without constraining its type; attach =PATH when it begins with `-` (repeatable)
@@ -751,13 +755,13 @@ struct NativeRmSelectionArgs {
     srcs_in: Vec<OsString>,
     /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
-    src_file: Vec<OsString>,
+    src_non_dir: Vec<OsString>,
     /// Select a directory tree; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
     src_dir: Vec<OsString>,
     /// Select several non-directory objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    src_files: Vec<OsString>,
+    src_non_dirs: Vec<OsString>,
     /// Select several directory trees
     #[arg(long, value_name = "DIR", num_args = 1..)]
     src_dirs: Vec<OsString>,
@@ -816,14 +820,14 @@ struct NativeCopyOperationalArgs {
     /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
-    /// Keep existing non-directory entries; still descend into existing directories
-    #[arg(long, conflicts_with_all = ["existing", "update", "inplace"])]
+    /// Copy entries found missing; keep metadata of entries found present; adding children requires write access
+    #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
     ignore_existing: bool,
     /// Update only entries already present; create no missing entries or directories
-    #[arg(long, conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
+    #[arg(long = "only-existing", conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
     existing: bool,
     /// Skip regular files newer at the destination; type replacements still occur
-    #[arg(long, conflicts_with_all = ["ignore_existing", "inplace"])]
+    #[arg(long = "skip-newer", conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
     /// Disable transport compression
     #[arg(long)]
@@ -1080,9 +1084,9 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
         ("root", "--root"),
         ("src", "--src"),
         ("srcs_in", "--srcs-in"),
-        ("src_file", "--src-file"),
+        ("src_non_dir", "--src-non-dir"),
         ("src_dir", "--src-dir"),
-        ("src_files", "--src-files"),
+        ("src_non_dirs", "--src-non-dirs"),
         ("src_dirs", "--src-dirs"),
         ("srcs", "--srcs"),
         ("sources", "a positional source"),
@@ -1136,9 +1140,9 @@ struct NativeMapCommand {
 #[command(
     name = "syq rm",
     version,
-    about = "Remove selected files and directory trees.\n\nDirectories are removed recursively. --srcs-in removes their contents instead.\nBy default, selected symlinks are removed as links and path symlinks are refused.",
-    before_help = "Examples:\n  syq rm --dry-run old-backup\n  syq rm old-backup\n  syq rm --from nas --srcs-in /backup/old",
-    long_about = "Remove selected files and directory trees. Directories are removed recursively; --srcs-in removes their contents instead. By default, selected symlinks are removed as links and path symlinks are refused.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    about = "Remove selected files and directory trees.\n\nDirectories are removed recursively. --srcs-in removes their contents instead.\nSelected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.",
+    before_help = "Examples:\n  syq rm --dry-run old-backup\n  syq rm old-backup\n  syq rm --on nas --srcs-in /backup/old",
+    long_about = "Remove selected files and directory trees. Directories are removed recursively; --srcs-in removes their contents instead. Selected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
@@ -1177,10 +1181,10 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--root",
         b"--src",
         b"--srcs-in",
-        b"--src-file",
+        b"--src-non-dir",
         b"--src-dir",
         b"--srcs",
-        b"--src-files",
+        b"--src-non-dirs",
         b"--src-dirs",
         b"--into",
         b"--into-new",
@@ -1194,7 +1198,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"--pscope",
         b"--syq-path",
     ];
-    const VARIADIC_VALUE_OPTIONS: &[&[u8]] = &[b"--srcs", b"--src-files", b"--src-dirs"];
+    const VARIADIC_VALUE_OPTIONS: &[&[u8]] = &[b"--srcs", b"--src-non-dirs", b"--src-dirs"];
 
     let arguments = argv
         .split(|argument| argument.as_bytes() == b"--")
@@ -1254,9 +1258,9 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
     for list in [
         &mut source.src,
         &mut source.srcs_in,
-        &mut source.src_file,
+        &mut source.src_non_dir,
         &mut source.src_dir,
-        &mut source.src_files,
+        &mut source.src_non_dirs,
         &mut source.src_dirs,
         &mut source.srcs,
         &mut source.sources,
@@ -1314,9 +1318,9 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         let has_selectors = !(source.src.is_empty()
             && source.srcs_in.is_empty()
             && source.srcs.is_empty()
-            && source.src_file.is_empty()
+            && source.src_non_dir.is_empty()
             && source.src_dir.is_empty()
-            && source.src_files.is_empty()
+            && source.src_non_dirs.is_empty()
             && source.src_dirs.is_empty()
             && source.sources.is_empty());
         if has_selectors {
@@ -1570,9 +1574,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             &parsed.selection.srcs_in,
         ),
         (
-            "src_file",
+            "src_non_dir",
             SourceSelection::File,
-            &parsed.selection.src_file,
+            &parsed.selection.src_non_dir,
         ),
         (
             "src_dir",
@@ -1580,9 +1584,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             &parsed.selection.src_dir,
         ),
         (
-            "src_files",
+            "src_non_dirs",
             SourceSelection::File,
-            &parsed.selection.src_files,
+            &parsed.selection.src_non_dirs,
         ),
         (
             "src_dirs",
@@ -1659,9 +1663,9 @@ fn lower_native_sources(
         ("src", SourceSelection::NamedNoFollow, &parsed.src),
         ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
         ("srcs_in", SourceSelection::Contents, &parsed.srcs_in),
-        ("src_file", SourceSelection::File, &parsed.src_file),
+        ("src_non_dir", SourceSelection::File, &parsed.src_non_dir),
         ("src_dir", SourceSelection::Directory, &parsed.src_dir),
-        ("src_files", SourceSelection::File, &parsed.src_files),
+        ("src_non_dirs", SourceSelection::File, &parsed.src_non_dirs),
         ("src_dirs", SourceSelection::Directory, &parsed.src_dirs),
     ] {
         if let Some(indices) = matches.indices_of(id) {
@@ -2560,12 +2564,12 @@ mod tests {
 
     #[test]
     fn native_rm_lowers_remote_helper_selection() {
-        let argv = ["--from=backup", "--syq-path=/opt/syq", "old"].map(std::ffi::OsString::from);
+        let argv = ["--on=backup", "--syq-path=/opt/syq", "old"].map(std::ffi::OsString::from);
         let args = parse_native_rm(&argv).unwrap();
         assert_eq!(args.syq_path.as_deref(), Some("/opt/syq"));
         assert!(!args.no_bootstrap);
 
-        let argv = ["--from=backup", "--no-bootstrap", "old"].map(std::ffi::OsString::from);
+        let argv = ["--on=backup", "--no-bootstrap", "old"].map(std::ffi::OsString::from);
         let args = parse_native_rm(&argv).unwrap();
         assert!(args.syq_path.is_none());
         assert!(args.no_bootstrap);

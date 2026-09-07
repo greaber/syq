@@ -743,7 +743,7 @@ fn exact_regular_source_replacement_is_rejected_after_registration() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-file",
+            "--src-non-dir",
             &t.s("selected"),
             "--as-new",
             &t.s("destination"),
@@ -790,7 +790,7 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-file",
+            "--src-non-dir",
             &t.s("selected"),
             "--as-new",
             &t.s("destination"),
@@ -1764,11 +1764,11 @@ fn native_copy_typed_selectors_are_source_preconditions() {
         "cp",
         "--cwd",
         &t.s("src"),
-        "--src-file",
+        "--src-non-dir",
         "file",
         "--src-dir",
         "dir",
-        "--src-file",
+        "--src-non-dir",
         "link",
         "--into-new",
         &t.s("copied"),
@@ -1782,7 +1782,7 @@ fn native_copy_typed_selectors_are_source_preconditions() {
 
     run_native_ok(&[
         "cp",
-        "--src-file",
+        "--src-non-dir",
         &t.s("src/file"),
         "--as-new",
         &t.s("exact"),
@@ -1833,15 +1833,15 @@ fn native_cp_with_prune_checks_all_typed_sources_before_mutation() {
     let output = native_syq(&[
         "cp",
         "--prune",
-        "--src-file",
+        "--src-non-dir",
         &t.s("src/good"),
-        "--src-file",
+        "--src-non-dir",
         &t.s("src/not-a-file"),
         "--into-existing",
         &t.s("dst"),
     ]);
     assert!(!output.status.success());
-    assert!(stderr_of(&output).contains("--src-file selector"));
+    assert!(stderr_of(&output).contains("--src-non-dir selector"));
     assert_eq!(read(&t.path("dst/good")), b"old");
     assert_eq!(read(&t.path("dst/extra")), b"keep");
 }
@@ -1854,7 +1854,7 @@ fn native_copy_accepts_copy_only_operational_controls() {
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "cp",
-            "--src-file",
+            "--src-non-dir",
             &t.s("src/file"),
             "--as-new",
             &t.s("copied"),
@@ -3159,7 +3159,7 @@ fn native_rm_without_follow_unlinks_selected_symlinks_and_preserves_referents() 
         &t.s(""),
         "--src",
         "dir-link",
-        "--src-file",
+        "--src-non-dir",
         "file-link",
         "--src",
         "dangling-link",
@@ -3198,82 +3198,38 @@ fn native_rm_directory_selector_rejects_a_selected_symlink_before_mutation() {
 }
 
 #[test]
-fn native_rm_follow_removes_the_referent_and_leaves_the_link() {
+fn native_rm_follow_preserves_final_symlink_identity() {
     use std::os::unix::fs::symlink;
-
-    let t = Tmp::new();
-    write(&t.path("real/file"), b"remove");
-    symlink("real", t.path("link")).unwrap();
-
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow-src", "--src-dir", "link"]);
-
-    assert!(t.path("link").is_symlink());
-    assert!(!t.path("real").exists());
-}
-
-#[test]
-fn native_rm_follow_contents_empties_the_referent_directory_and_keeps_the_link() {
-    use std::os::unix::fs::symlink;
-
-    let t = Tmp::new();
-    write(&t.path("real/file"), b"remove");
-    symlink("real", t.path("link")).unwrap();
-
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--srcs-in", "link"]);
-
-    assert!(t.path("link").is_symlink());
-    assert!(t.path("real").is_dir());
-    assert!(listing(&t.path("real")).is_empty());
-}
-
-#[test]
-fn native_rm_follow_resolves_a_complete_link_chain_without_removing_links() {
-    use std::os::unix::fs::symlink;
-
-    let t = Tmp::new();
-    write(&t.path("terminal"), b"remove");
-    symlink("terminal", t.path("link-b")).unwrap();
-    symlink("link-b", t.path("link-a")).unwrap();
-
-    run_native_ok(&["rm", "--cwd", &t.s(""), "--follow", "--src-file", "link-a"]);
-
-    assert!(t.path("link-a").is_symlink());
-    assert!(t.path("link-b").is_symlink());
-    assert!(!t.path("terminal").exists());
-}
-
-#[test]
-fn native_rm_double_verbose_logs_base_symlink_hops_and_final_identity() {
-    use std::os::unix::fs::symlink;
-
-    let t = Tmp::new();
-    write(&t.path("real"), b"keep");
-    symlink("real", t.path("link")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "rm",
-            "--dry-run",
-            "-vv",
-            "--cwd",
-            &t.s(""),
-            "--follow",
-            "--src-file",
-            "link",
-        ])
-        .run()
-        .unwrap();
-    assert_output_ok(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("--cwd") && stdout.contains("pinned as"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("symlink") && stdout.contains("->"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("resolved to non-directory"), "{stdout}");
-    assert_eq!(read(&t.path("real")), b"keep");
+    for follow in ["--follow", "--follow-src"] {
+        let t = Tmp::new();
+        write(&t.path("real/file"), b"keep");
+        symlink("real", t.path("link")).unwrap();
+        for selector in ["--src-dir", "--srcs-in"] {
+            let out = native_syq(&["rm", "--root", &t.s(""), follow, selector, "link"]);
+            assert!(!out.status.success());
+            assert!(stderr_of(&out).contains("final symlinks are never followed"));
+            assert!(stderr_of(&out).contains("name the target directory explicitly"));
+            assert_eq!(read(&t.path("real/file")), b"keep");
+            assert!(t.path("link").is_symlink());
+        }
+        run_native_ok(&["rm", "--root", &t.s(""), follow, "--src-non-dir", "link"]);
+        assert!(!t.path("link").is_symlink());
+        assert_eq!(read(&t.path("real/file")), b"keep");
+        for selector in [None, Some("--src")] {
+            symlink("real", t.path("link")).unwrap();
+            let root = t.s("");
+            let mut args = vec!["rm", "--root", &root, follow];
+            args.extend(selector);
+            args.push("link");
+            run_native_ok(&args);
+            assert!(!t.path("link").is_symlink());
+            assert_eq!(read(&t.path("real/file")), b"keep");
+        }
+        symlink("real", t.path("parent")).unwrap();
+        run_native_ok(&["rm", "--root", &t.s(""), follow, "parent/file"]);
+        assert!(t.path("parent").is_symlink());
+        assert!(!t.path("real/file").exists());
+    }
 }
 
 #[test]
@@ -3354,7 +3310,7 @@ fn native_rm_results_preserve_non_utf8_paths() {
         .arg("rm")
         .arg("--cwd")
         .arg(t.path(""))
-        .arg("--src-file")
+        .arg("--src-non-dir")
         .arg(OsStr::from_bytes(raw_name))
         .args(["--results", &t.s("results.ndjson"), "-q"])
         .run()
@@ -3441,9 +3397,11 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
 
     let t = Tmp::new();
     write(&t.path("root/victim"), b"keep");
-    fs::create_dir_all(t.path("root/inside")).unwrap();
+    write(&t.path("root/inside/child"), b"inside");
+    write(&t.path("outside/child"), b"outside");
     symlink("root", t.path("root-link")).unwrap();
-    symlink("../../root/inside", t.path("root/escape")).unwrap();
+    symlink("../outside", t.path("root/escape")).unwrap();
+    symlink("../root/inside", t.path("root/reentry")).unwrap();
 
     let base_link = native_syq(&["rm", "--root", &t.s("root-link"), "--src", "victim"]);
     assert!(!base_link.status.success());
@@ -3460,18 +3418,31 @@ fn native_rm_root_uses_the_common_follow_policy_and_still_confines_selectors() {
     assert!(!t.path("root/victim").exists());
     write(&t.path("root/victim"), b"keep");
 
-    let excursion = native_syq(&[
-        "rm",
-        "--root",
-        &t.s("root"),
-        "--follow",
-        "--src",
-        "victim",
-        "--srcs-in",
-        "escape",
-    ]);
-    assert!(!excursion.status.success());
-    assert_eq!(read(&t.path("root/victim")), b"keep");
+    // Follow a parent link, not a final directory selector: refusal must be
+    // confinement, not the independent rule rejecting final directory links.
+    for follow in ["--follow", "--follow-src"] {
+        for selector in ["escape/child", "reentry/child"] {
+            let excursion = native_syq(&[
+                "rm",
+                "--root",
+                &t.s("root"),
+                follow,
+                "--src",
+                "victim",
+                "--src",
+                selector,
+            ]);
+            assert!(!excursion.status.success());
+            assert!(
+                stderr_of(&excursion).contains("outside its confined root"),
+                "{}",
+                stderr_of(&excursion)
+            );
+            assert_eq!(read(&t.path("root/victim")), b"keep");
+            assert_eq!(read(&t.path("outside/child")), b"outside");
+            assert_eq!(read(&t.path("root/inside/child")), b"inside");
+        }
+    }
 }
 
 #[test]
@@ -3487,8 +3458,8 @@ fn native_rm_root_allows_following_a_symlink_that_stays_inside() {
         "--root",
         &t.s("root"),
         "--follow",
-        "--srcs-in",
-        "link",
+        "--src",
+        "link/file",
     ]);
     assert!(t.path("root/link").is_symlink());
     assert!(listing(&t.path("root/inside")).is_empty());
@@ -3513,7 +3484,7 @@ fn native_rm_typed_selectors_check_every_type_before_mutation() {
         &t.s(""),
         "--src",
         "victim",
-        "--src-file",
+        "--src-non-dir",
         "directory",
     ]);
     assert!(!wrong.status.success());
@@ -3523,7 +3494,7 @@ fn native_rm_typed_selectors_check_every_type_before_mutation() {
         "rm",
         "--cwd",
         &t.s(""),
-        "--src-file",
+        "--src-non-dir",
         "file",
         "--src-dir",
         "directory",
@@ -3544,7 +3515,7 @@ fn native_rm_accepts_bulk_typed_selectors() {
         "rm",
         "--cwd",
         &t.s("base"),
-        "--src-files",
+        "--src-non-dirs",
         "file-a",
         "file-b",
         "--src-dirs",
@@ -8237,7 +8208,7 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("rm")
             .args(helper)
-            .args(["--from", "fake", "--cwd", &t.s(""), "--src", selected])
+            .args(["--on", "fake", "--cwd", &t.s(""), "--src", selected])
             .args(["--results", &results, "-q"])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -9023,7 +8994,7 @@ fn native_rm_rejects_conflicting_or_local_remote_helper_selection() {
     let conflict = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
             "rm",
-            "--from",
+            "--on",
             "fake",
             "--syq-path",
             "/opt/syq",
@@ -9117,7 +9088,7 @@ fn native_rm_endpoint_conflicts_have_the_same_local_and_remote_classification() 
             "-q",
         ]);
         if remote {
-            command.args(["--from", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")]);
+            command.args(["--on", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")]);
             command
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -9270,7 +9241,7 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "tree",
         "--srcs-in",
         "contents",
-        "--src-files",
+        "--src-non-dirs",
         "file-a",
         "file-b",
         "--src-dirs",
@@ -15030,7 +15001,7 @@ fn native_mapping_and_map_respect_typed_selectors() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("replaces source selectors"));
     // syq map enforces typed-selector preconditions like native cp.
-    let out = syq_map_in(&t.path("src"), &["--src-file", "d"]);
+    let out = syq_map_in(&t.path("src"), &["--src-non-dir", "d"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("is a directory"));
     let out = syq_map_in(&t.path("src"), &["--src-dir", "f.txt"]);
@@ -15039,7 +15010,7 @@ fn native_mapping_and_map_respect_typed_selectors() {
     // Happy paths still emit.
     let lines = map_lines(&syq_map_in(
         &t.path("src"),
-        &["--src-dir", "d", "--src-file", "f.txt"],
+        &["--src-dir", "d", "--src-non-dir", "f.txt"],
     ));
     let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
     assert_eq!(dsts, ["d", "f.txt"]);
@@ -15336,6 +15307,27 @@ fn completion_source_bases_types_and_symlink_policies_match_operations() {
             &["syq", command, "--root", "base", "--follow-src", "escape/"],
             &[],
         );
+        for follow in ["--follow", "--follow-src"] {
+            for selector in ["--src-dir", "--src-dirs", "--srcs-in"] {
+                assert_completion_candidates(
+                    &t,
+                    &["syq", command, follow, selector, "li"],
+                    if command == "rm" { &[] } else { &["link/"] },
+                );
+            }
+            assert_completion_candidates(
+                &t,
+                &["syq", command, follow, "li"],
+                if command == "rm" {
+                    &["link"]
+                } else {
+                    &["link/"]
+                },
+            );
+            for base in ["--cwd", "--root"] {
+                assert_completion_candidates(&t, &["syq", command, follow, base, "li"], &["link/"]);
+            }
+        }
         assert_completion_candidates(&t, &["syq", command, "link/"], &[]);
         assert_completion_candidates(
             &t,
@@ -15831,7 +15823,9 @@ fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
     let link = format!("{}/in", t.s("remote-home/link"));
     let attached_base = format!("-C{base}");
     let remote_link = format!("fake.example:{link}");
-    for (words, expected) in [
+    let link_prefix = t.s("remote-home/li");
+    let link_path = t.s("remote-home/link");
+    let mut cases = vec![
         (
             vec![
                 "syq",
@@ -15902,7 +15896,47 @@ fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
                 format!("{}side.txt", remote_link),
             ],
         ),
-    ] {
+    ];
+    for command in ["cp", "rm"] {
+        for follow in ["--follow", "--follow-src"] {
+            let endpoint = if command == "rm" { "--on" } else { "--from" };
+            let common = vec![
+                "syq",
+                command,
+                "--syq-path",
+                binary,
+                endpoint,
+                "fake.example",
+                follow,
+            ];
+            for selector in [
+                "--src-dir",
+                "--src-dirs",
+                "--srcs-in",
+                "--src",
+                "--cwd",
+                "--root",
+            ] {
+                let mut words = common.clone();
+                words.extend([selector, &link_prefix]);
+                let expected = if command != "rm" || ["--cwd", "--root"].contains(&selector) {
+                    vec![format!("{link_path}/")]
+                } else if selector == "--src" {
+                    vec![link_path.clone()]
+                } else {
+                    vec![]
+                };
+                cases.push((words, expected));
+            }
+            let mut words = common;
+            words.push(&link);
+            cases.push((
+                words,
+                vec![format!("{link}ner-dir/"), format!("{link}side.txt")],
+            ));
+        }
+    }
+    for (words, expected) in cases {
         let index = (words.len() - 1).to_string();
         let mut args = vec!["__complete", "bash", &index, "--"];
         args.extend_from_slice(&words);
@@ -16262,7 +16296,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
             "syq",
             "rm",
             "--",
-            "--from",
+            "--on",
             "fake.example",
             &t.s("from-l"),
         ],
@@ -17717,6 +17751,30 @@ fn native_cp_mapping_cross_chunk_directory_upgrade_emits_one_trace() {
     // The explicit entry claimed the directory, so the (deferred) trace
     // carries its src even though an earlier chunk synthesized the path.
     assert_eq!(x_traces[0]["src"]["value"], "xdir");
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fs::set_permissions(t.path("src/xdir"), fs::Permissions::from_mode(0o750)).unwrap();
+    set_mtime(&t.path("src/xdir"), 1_500_000_000);
+    let live = syq_cp_in(
+        &t.path(""),
+        &[
+            "-C",
+            "src",
+            "--mapping",
+            "-",
+            "--into",
+            "dst",
+            "--only-new",
+            "--preserve=permissions",
+            "-q",
+        ],
+        Some(manifest.as_bytes()),
+    );
+    assert_output_ok(&live);
+    assert_eq!(fs::metadata(t.path("dst/x")).unwrap().mode() & 0o777, 0o750);
+    assert_eq!(
+        fs::metadata(t.path("dst/x")).unwrap().mtime(),
+        1_500_000_000
+    );
 }
 
 #[test]
@@ -18326,7 +18384,7 @@ fn native_verify_only_compares_contents_without_mutations() {
 
 #[test]
 fn native_overwrite_policies_apply_per_entry() {
-    for policy in ["--ignore-existing", "--existing", "--update"] {
+    for policy in ["--only-new", "--only-existing", "--skip-newer"] {
         let t = Tmp::new();
         write(&t.path("src/present"), b"source");
         write(&t.path("src/new"), b"new");
@@ -18345,7 +18403,7 @@ fn native_overwrite_policies_apply_per_entry() {
             "--into",
             &t.s("dst"),
         ]);
-        let updates = policy == "--existing";
+        let updates = policy == "--only-existing";
         assert_eq!(
             read(&t.path("dst/present")),
             if updates {
@@ -18354,9 +18412,12 @@ fn native_overwrite_policies_apply_per_entry() {
                 b"destination"
             }
         );
-        assert_eq!(t.path("dst/new").exists(), policy != "--existing");
-        assert_eq!(t.path("dst/nested/new").exists(), policy != "--existing");
-        if policy == "--update" {
+        assert_eq!(t.path("dst/new").exists(), policy != "--only-existing");
+        assert_eq!(
+            t.path("dst/nested/new").exists(),
+            policy != "--only-existing"
+        );
+        if policy == "--skip-newer" {
             assert_eq!(read(&t.path("dst/dir/child")), b"child");
         } else {
             assert_eq!(read(&t.path("dst/dir")), b"keep non-directory");
@@ -18366,7 +18427,7 @@ fn native_overwrite_policies_apply_per_entry() {
     write(&t.path("source"), b"source");
     run_native_ok(&[
         "cp",
-        "--existing",
+        "--only-existing",
         &t.s("source"),
         "--into",
         &t.s("missing"),
@@ -18382,13 +18443,13 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
         ["--verify-only", "--prune"],
         ["--verify-only", "--dry-run"],
         ["--verify-only", "--inplace"],
-        ["--verify-only", "--ignore-existing"],
-        ["--verify-only", "--existing"],
-        ["--verify-only", "--update"],
-        ["--ignore-existing", "--existing"],
-        ["--ignore-existing", "--update"],
-        ["--ignore-existing", "--inplace"],
-        ["--update", "--inplace"],
+        ["--verify-only", "--only-new"],
+        ["--verify-only", "--only-existing"],
+        ["--verify-only", "--skip-newer"],
+        ["--only-new", "--only-existing"],
+        ["--only-new", "--skip-newer"],
+        ["--only-new", "--inplace"],
+        ["--skip-newer", "--inplace"],
     ] {
         let out = native_syq(&[
             "cp",
@@ -18407,9 +18468,9 @@ fn native_copy_policy_conflicts_refuse_before_writing() {
 fn native_direct_remote_forwards_verification_and_overwrite_policies() {
     for policy in [
         "--verify-only",
-        "--ignore-existing",
-        "--existing",
-        "--update",
+        "--only-new",
+        "--only-existing",
+        "--skip-newer",
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
@@ -18451,7 +18512,7 @@ fn native_direct_remote_forwards_verification_and_overwrite_policies() {
         );
         assert_eq!(
             read(&t.path("dst/file")),
-            if policy == "--existing" {
+            if policy == "--only-existing" {
                 b"source" as &[u8]
             } else {
                 b"destination"
@@ -18459,7 +18520,7 @@ fn native_direct_remote_forwards_verification_and_overwrite_policies() {
         );
         assert_eq!(
             t.path("dst/new").exists(),
-            matches!(policy, "--ignore-existing" | "--update")
+            matches!(policy, "--only-new" | "--skip-newer")
         );
         assert!(fs::read_to_string(t.path("rsh.log"))
             .unwrap()
@@ -19089,7 +19150,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
     for extra in [
         vec!["--auth-from", "ssh"],
         vec!["--no-tcp"],
-        vec!["--update"],
+        vec!["--skip-newer"],
         vec!["--preserve", "ownership"],
         vec!["--inplace"],
         vec!["--min-size", "1"],
@@ -19250,6 +19311,101 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
 }
 
 #[test]
+fn native_only_new_preserves_existing_directory_metadata() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for mapping in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/existing/new/file"), b"new");
+        fs::create_dir_all(t.path("src/unchanged")).unwrap();
+        fs::create_dir_all(t.path("dst/existing")).unwrap();
+        fs::create_dir_all(t.path("dst/unchanged")).unwrap();
+        for path in ["src/existing", "src/unchanged", "src/existing/new"] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o750)).unwrap();
+            set_mtime(&t.path(path), 1_500_000_000);
+        }
+        for path in ["dst/existing", "dst/unchanged"] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o711)).unwrap();
+            set_mtime(&t.path(path), 1_600_000_000);
+        }
+        if mapping {
+            let map = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(["map", "--srcs-in", &t.s("src")])
+                .run()
+                .unwrap();
+            assert_output_ok(&map);
+            write(&t.path("mapping"), &map.stdout);
+        }
+        let mut args = vec!["cp", "--only-new", "--preserve=permissions", "--cwd"];
+        let base = t.s("src");
+        let manifest = t.s("mapping");
+        let dest = t.s("dst");
+        args.push(&base);
+        if mapping {
+            args.extend(["--mapping", &manifest]);
+        } else {
+            args.extend(["--srcs-in", "."]);
+        }
+        args.extend(["--into", &dest]);
+        let mut preview = args.clone();
+        preview.extend(["--dry-run", "-v"]);
+        let out = native_syq(&preview);
+        assert_output_ok(&out);
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("update metadata"));
+        run_native_ok(&args);
+        for path in ["dst/existing", "dst/unchanged"] {
+            assert_eq!(fs::metadata(t.path(path)).unwrap().mode() & 0o777, 0o711);
+        }
+        assert_eq!(
+            fs::metadata(t.path("dst/unchanged")).unwrap().mtime(),
+            1_600_000_000
+        );
+        assert_eq!(
+            fs::metadata(t.path("dst/existing/new")).unwrap().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(t.path("dst/existing/new")).unwrap().mtime(),
+            1_500_000_000
+        );
+        assert_eq!(read(&t.path("dst/existing/new/file")), b"new");
+    }
+}
+
+#[test]
+fn native_rm_double_verbose_logs_base_symlink_hops_and_final_identity() {
+    use std::os::unix::fs::symlink;
+
+    let t = Tmp::new();
+    write(&t.path("real/file"), b"keep");
+    symlink("real", t.path("link")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "rm",
+            "--dry-run",
+            "-vv",
+            "--cwd",
+            &t.s(""),
+            "--follow",
+            "--src-non-dir",
+            "link/file",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--cwd") && stdout.contains("pinned as"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("symlink") && stdout.contains("->"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("resolved to non-directory"), "{stdout}");
+    assert_eq!(read(&t.path("real/file")), b"keep");
+}
+
+#[test]
 fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
@@ -19383,5 +19539,111 @@ fn native_ignores_internal_rsh_environment() {
             .unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dest")), b"data");
+    }
+}
+
+#[test]
+fn native_rm_follows_multiple_parent_symlink_hops() {
+    use std::os::unix::fs::symlink;
+    for follow in ["--follow", "--follow-src"] {
+        let t = Tmp::new();
+        write(&t.path("real/file"), b"remove");
+        symlink("real", t.path("link-b")).unwrap();
+        symlink("link-b", t.path("link-a")).unwrap();
+        run_native_ok(&["rm", "--root", &t.s(""), follow, "--src", "link-a/file"]);
+        assert!(!t.path("real/file").exists());
+        assert_eq!(
+            fs::read_link(t.path("link-a")).unwrap(),
+            Path::new("link-b")
+        );
+        assert_eq!(fs::read_link(t.path("link-b")).unwrap(), Path::new("real"));
+    }
+}
+
+#[test]
+fn native_only_new_stamps_its_new_destination_root() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for deferred in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/file"), b"new");
+        for path in ["src", "src/sub"] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o750)).unwrap();
+            set_mtime(&t.path(path), 1_500_000_000);
+        }
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let extra = t.s("extra");
+        let mut args = vec![
+            "cp",
+            "--only-new",
+            "--preserve=permissions",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        if deferred {
+            write(&t.path("extra"), b"extra");
+            args.splice(5..5, ["--src", &extra]);
+        }
+        run_native_ok(&args);
+        for path in ["dst", "dst/sub"] {
+            let metadata = fs::metadata(t.path(path)).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o750, "{path}");
+            assert_eq!(metadata.mtime(), 1_500_000_000, "{path}");
+        }
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o711)).unwrap();
+        set_mtime(&t.path("dst"), 1_600_000_000);
+        run_native_ok(&args);
+        let metadata = fs::metadata(t.path("dst")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o711);
+        assert_eq!(metadata.mtime(), 1_600_000_000);
+    }
+}
+
+#[test]
+fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_500_000_000), ("b", 0o711, 1_600_000_000)] {
+        write(
+            &t.path(&format!("{source}/shared/{source}")),
+            source.as_bytes(),
+        );
+        for dir in [source.to_owned(), format!("{source}/shared")] {
+            fs::set_permissions(t.path(&dir), fs::Permissions::from_mode(mode)).unwrap();
+            set_mtime(&t.path(&dir), time);
+        }
+    }
+    for only_new in [false, true] {
+        let dst = if only_new { "missing-only" } else { "ordinary" };
+        let a = t.s("a");
+        let b = t.s("b");
+        let destination = t.s(dst);
+        let mut args = vec![
+            "cp",
+            "--preserve=permissions",
+            "--srcs-in",
+            &a,
+            "--srcs-in",
+            &b,
+            "--into",
+            &destination,
+        ];
+        if only_new {
+            args.insert(1, "--only-new");
+        }
+        run_native_ok(&args);
+        for dir in [dst.to_owned(), format!("{dst}/shared")] {
+            let meta = fs::metadata(t.path(&dir)).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o711, "{dir}");
+            assert_eq!(meta.mtime(), 1_600_000_000, "{dir}");
+        }
+        for source in ["a", "b"] {
+            assert_eq!(
+                read(&t.path(&format!("{dst}/shared/{source}"))),
+                source.as_bytes()
+            );
+        }
     }
 }

@@ -103,38 +103,34 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "version"
             ) || (rm && id == "root")
         };
-        let heading = match id {
-            "sources" | "paths" | "src" | "srcs_in" | "src_file" | "src_dir" | "src_files"
-            | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "follow" | "follow_src" => {
-                "Sources and selection"
-            }
-            "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
-            | "follow_dst" => "Destination placement",
-            "results" | "results_fd" | "progress" | "no_progress" | "progress_json" | "stats" => {
-                "Progress and results"
-            }
-            "connections" | "connections_opt" | "block_size" | "bwlimit" => "Performance",
-            "tuning_options" => "Benchmark tuning",
-            "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp" | "tcp_plain"
-            | "tcp_ports" | "tcp_congestion" | "pscope" | "compress" | "no_compress" => {
-                "SSH and transport"
-            }
-            "coordinate_at"
-            | "detach"
-            | "peer_auth"
-            | "receiver_max_entries"
-            | "receiver_max_bytes"
-            | "receiver_receipt" => "Remote-to-remote transfers",
-            "help" | "version" => "Help and version",
-            "dry_run" | "verbose" | "quiet" => "Preview and output",
-            _ => "Copy policy and filtering",
-        };
+        let heading =
+            match id {
+                "sources" | "paths" | "src" | "srcs_in" | "src_non_dir" | "src_dir"
+                | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "follow"
+                | "follow_src" => "Sources and selection",
+                "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
+                | "follow_dst" => "Destination placement",
+                "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
+                | "stats" => "Progress and results",
+                "connections" | "connections_opt" | "block_size" | "bwlimit" => "Performance",
+                "tuning_options" => "Benchmark tuning",
+                "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
+                | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
+                | "no_compress" => "SSH and transport",
+                "coordinate_at"
+                | "detach"
+                | "peer_auth"
+                | "receiver_max_entries"
+                | "receiver_max_bytes"
+                | "receiver_receipt" => "Remote-to-remote transfers",
+                "help" | "version" => "Help and version",
+                "dry_run" | "verbose" | "quiet" => "Preview and output",
+                _ => "Copy policy and filtering",
+            };
         let mut arg = arg.hide_short_help(!common).help_heading(heading);
         // Shared parser fields need command-specific explanations.
         if rm && id == "syq_path" {
             arg = arg.help("Use this exact syq executable on the remote removal endpoint");
-        } else if rm && matches!(id, "follow" | "follow_src") {
-            arg = arg.help("Follow symlinks in supplied source paths; remove the selected target, leaving the link");
         } else if rm && id == "verbose" {
             arg = arg.help("List removed paths");
         } else if id == "verbose" && !map {
