@@ -12,7 +12,7 @@ fn safe_message(args: Arguments<'_>) -> String {
     let mut result = String::new();
     for ch in args.to_string().chars() {
         if (ch.is_control() && !matches!(ch, '\n' | '\t'))
-            || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         {
             result.extend(ch.escape_default());
         } else {
@@ -144,6 +144,14 @@ mod tests {
         assert!(!text.contains('\r'));
         assert!(!text.contains('\u{202e}'));
         assert!(text.contains("\\u{1b}]52"));
+    }
+
+    #[test]
+    fn human_messages_escape_unicode_separators_and_directional_marks() {
+        let text = safe_message(format_args!(
+            "a\u{061c}\u{200e}\u{200f}\u{2028}\u{2029}z\n\t"
+        ));
+        assert_eq!(text, "a\\u{61c}\\u{200e}\\u{200f}\\u{2028}\\u{2029}z\n\t");
     }
 
     #[test]

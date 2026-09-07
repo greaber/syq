@@ -1,0 +1,13 @@
+{
+  "tag": "v0.4.1",
+  "object": {
+    "type": "commit",
+    "sha": "13fc7d1093b28aadd212e1a7ffabcfa277ba3b20"
+  },
+  "verification": {
+    "verified": true,
+    "reason": "valid",
+    "payload": "object 13fc7d1093b28aadd212e1a7ffabcfa277ba3b20\ntype commit\ntag v0.4.1\ntagger Grant Reaber <grant.reaber@gmail.com> 1788717858 +0200\n\nsyq 0.4.1\n",
+    "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAghJrK7jKiOvJ9OaCL2opROU2RaT\nA19WYDQbJWNuEcJAoAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\nAAAAQKXBo9j6eD7ITDm5x4RWSiE6xoo1pgSHKmyy7IKHBakNkgWSbcmAiegAC5MZFpsR4+\nUTbC3VxEzi9UytO0yNJgI=\n-----END SSH SIGNATURE-----\n"
+  }
+}
