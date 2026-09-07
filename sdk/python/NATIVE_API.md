@@ -589,8 +589,10 @@ are re-raised unchanged. Async cancellation remains `asyncio.CancelledError`.
 These exceptions are not wrapped in `SyqError`.
 
 Timeout, cancellation, early mapping exit, and streaming failures terminate and
-reap the local process group, including SSH children. Filesystem changes already
-completed are not rolled back.
+reap the local process group, including SSH children. Closing a mapping whose
+producer has already exited still cleans up its children; the exited producer
+alone does not cause a cleanup permission error on macOS. Filesystem changes
+already completed are not rolled back.
 
 <a id="deliberate-exclusions"></a>
 

@@ -17207,14 +17207,14 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
     let ssh = fake_ssh(&t);
-    let connect = |scope: Option<&Path>| {
+    let connect = |scope: Option<&Path>, log: &str| {
         let mut cmd = persistence_command(&t, &["connect", "test-server", "--timeout", "1"]);
         cmd.args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
             .env_remove("HOME")
             .env("XDG_CACHE_HOME", t.path("cache"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_RSH_LOG", t.path(log))
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
@@ -17229,7 +17229,7 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
     write(&receive, b"not json");
     fs::set_permissions(&receive, fs::Permissions::from_mode(0o600)).unwrap();
     let scope = ephemeral_scope(&t);
-    let output = connect(Some(&scope));
+    let output = connect(Some(&scope), "rsh.log");
     assert_output_ok(&output);
     assert!(String::from_utf8_lossy(&output.stdout)
         .contains("ready; ephemeral scopes do not support receiving"));
@@ -17269,7 +17269,7 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
 
     // Successful forward setup followed by invalid receiving settings reports
     // one error, with no best-effort setup attempt before the explicit one.
-    let output = connect(None);
+    let output = connect(None, "rsh.log");
     assert!(!output.status.success());
     let error = stderr_of(&output);
     assert_eq!(error.matches("expected ident").count(), 1, "{error}");
@@ -17284,11 +17284,15 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
         &t.path("config/syq/persistence.json"),
         b"{\"enabled\":false}\n",
     );
-    fs::remove_file(t.path("rsh.log")).unwrap();
-    let rejected = connect(Some(global));
+    // Earlier connections leave a pool that can still write to rsh.log.
+    // Only this invocation can write to the rejection log.
+    let rejected = connect(Some(global), "rejected-rsh.log");
     assert!(!rejected.status.success());
     assert!(stderr_of(&rejected).contains("without --pscope"));
-    assert!(!t.path("rsh.log").exists(), "invalid scope reached SSH");
+    assert!(
+        !t.path("rejected-rsh.log").exists(),
+        "invalid scope reached SSH"
+    );
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
 }
 
