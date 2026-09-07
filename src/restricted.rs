@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Advance this generation whenever an installed receiver or its signed grant
 // protocol becomes incompatible. Local metadata from another generation is
 // ignored, so the next eligible copy installs a fresh receiver enrollment.
-const CONFIG_VERSION: u16 = 3;
+const CONFIG_VERSION: u16 = 4;
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
@@ -1372,11 +1372,10 @@ impl RestrictedAuthority {
         }
     }
 
-    /// Bind an operation that modifies an existing non-directory object at
-    /// `path` (metadata, replacement bases, in-place content) to the signed
-    /// existing-object policy. Only `Skip` forbids these, and only for objects
-    /// that predate the transfer; directories are kept and may still receive
-    /// metadata, as in the ordinary engine.
+    /// Bind mutations at `path` to the signed existing-object policy.
+    /// `Skip` protects pre-existing non-directories but permits directory
+    /// metadata updates. `OnlyNew` protects pre-existing directories too.
+    /// Both permit updates to objects created by this grant.
     fn constrain_update(
         &self,
         path: &[u8],
@@ -3943,8 +3942,10 @@ fn grant_for(
     // (`--into-existing` and friends) is the separate signed root-existence
     // field; folding it in here would forbid creating files inside an
     // existing directory.
-    let existing = if args.ignore_existing {
+    let existing = if args.native_only_new {
         ExistingDestinationPolicy::OnlyNew
+    } else if args.ignore_existing {
+        ExistingDestinationPolicy::Skip
     } else if args.update {
         ExistingDestinationPolicy::UpdateIfOlder
     } else if args.existing {

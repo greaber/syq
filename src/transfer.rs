@@ -1850,8 +1850,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_delete: args.max_delete,
         update: args.update,
         ignore_existing: args.ignore_existing,
-        preserve_existing_directory_metadata: args.interface == crate::cli::Interface::NativeCp
-            && args.ignore_existing,
+        preserve_existing_directory_metadata: args.native_only_new,
         existing: args.existing,
         insecure_links: rsync_insecure_links(&args, !src_ep.is_remote()),
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
@@ -2940,6 +2939,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
         created_mapping_dirs: std::collections::HashSet::new(),
+        destination_root_created: create_root,
         mapping_mode: false,
         create_root: if defer_operator_directory_creation {
             Some((
@@ -4717,6 +4717,8 @@ struct Planner<'a> {
     implicit_dirs: std::collections::HashSet<PathBytes>,
     /// Missing-only mappings may name an implicitly created directory in a later batch.
     created_mapping_dirs: std::collections::HashSet<PathBytes>,
+    /// Preflight creates this root before directory stat/planning sees it.
+    destination_root_created: bool,
     /// This run consumes a --mapping manifest (identity entries included).
     mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
@@ -6065,6 +6067,7 @@ impl Planner<'_> {
                     // metadata.
                     if self.implicit_dirs.contains(p)
                         || (opts.preserve_existing_directory_metadata
+                            && !(self.destination_root_created && p == &self.dst_root)
                             && !self.created_mapping_dirs.contains(p)
                             && s.as_ref().is_some_and(|d| d.kind == Kind::Dir))
                     {

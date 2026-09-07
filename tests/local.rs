@@ -19146,3 +19146,62 @@ fn native_ignores_internal_rsh_environment() {
         assert_eq!(read(&t.path("dest")), b"data");
     }
 }
+
+#[test]
+fn native_rm_follows_multiple_parent_symlink_hops() {
+    use std::os::unix::fs::symlink;
+    for follow in ["--follow", "--follow-src"] {
+        let t = Tmp::new();
+        write(&t.path("real/file"), b"remove");
+        symlink("real", t.path("link-b")).unwrap();
+        symlink("link-b", t.path("link-a")).unwrap();
+        run_native_ok(&["rm", "--root", &t.s(""), follow, "--src", "link-a/file"]);
+        assert!(!t.path("real/file").exists());
+        assert_eq!(
+            fs::read_link(t.path("link-a")).unwrap(),
+            Path::new("link-b")
+        );
+        assert_eq!(fs::read_link(t.path("link-b")).unwrap(), Path::new("real"));
+    }
+}
+
+#[test]
+fn native_only_new_stamps_its_new_destination_root() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for deferred in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/file"), b"new");
+        for path in ["src", "src/sub"] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o750)).unwrap();
+            set_mtime(&t.path(path), 1_500_000_000);
+        }
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let extra = t.s("extra");
+        let mut args = vec![
+            "cp",
+            "--only-new",
+            "--preserve=permissions",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        if deferred {
+            write(&t.path("extra"), b"extra");
+            args.splice(5..5, ["--src", &extra]);
+        }
+        run_native_ok(&args);
+        for path in ["dst", "dst/sub"] {
+            let metadata = fs::metadata(t.path(path)).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o750, "{path}");
+            assert_eq!(metadata.mtime(), 1_500_000_000, "{path}");
+        }
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o711)).unwrap();
+        set_mtime(&t.path("dst"), 1_600_000_000);
+        run_native_ok(&args);
+        let metadata = fs::metadata(t.path("dst")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o711);
+        assert_eq!(metadata.mtime(), 1_600_000_000);
+    }
+}
