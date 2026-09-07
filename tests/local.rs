@@ -4712,7 +4712,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     );
     assert!(
         stderr.contains(
-            "a real transfer would start with 8 connections (auto-tuned); dry-run starts no workers"
+            "target 8 connections (auto-tuned); initial count limited by available work; dry-run starts no workers"
         ),
         "{stderr}"
     );
@@ -4904,6 +4904,55 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"in-place over reachable TCP");
+}
+
+#[test]
+fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let content = prng(64 << 20, 3241);
+    write(&t.path("src"), &content);
+    for (label, fixed, nonempty) in [
+        ("auto", false, false),
+        ("fixed", true, false),
+        ("nonempty", false, true),
+    ] {
+        let directory = t.path(&format!("dst-{label}"));
+        fs::create_dir_all(&directory).unwrap();
+        if nonempty {
+            write(&directory.join("src"), b"old destination contents");
+        }
+        let destination = format!("host:{}/", directory.display());
+        let events = t.path(&format!("events-{label}"));
+        let mut command = compat_command();
+        command
+            .arg("-e")
+            .arg(&rsh)
+            .arg("--rsync-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args(["--syq-no-tcp", "-a", "--no-progress"])
+            .arg(t.s("src"))
+            .arg(destination)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path(label));
+        if fixed {
+            command.args(["--syq-connections", "8"]);
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&directory.join("src")), content);
+        let connected = fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .count();
+        assert_eq!(
+            connected,
+            if fixed || nonempty { 8 } else { 2 },
+            "{label}: {out:?}"
+        );
+    }
 }
 
 #[test]
