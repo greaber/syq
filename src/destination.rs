@@ -1526,7 +1526,16 @@ mod tests {
         assert!(requester_closed(&socket));
         let (socket, peer) = UnixStream::pair().unwrap();
         drop(peer);
-        assert!(requester_closed(&socket));
+        // Another test's forked child can briefly inherit the peer until exec.
+        // Wait for actual EOF rather than assuming our drop closed its last fd.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !requester_closed(&socket) {
+            assert!(
+                Instant::now() < deadline,
+                "disconnected requester did not reach EOF"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
