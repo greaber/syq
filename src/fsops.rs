@@ -2038,16 +2038,24 @@ impl FsOps {
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         let (partial, label) = rooted_partial_target(&rooted, copy_id)?;
-        let (file, _) = self
-            .open_private_partial_rooted(&rooted.root, &partial, &label, true)?
+        let (file, basis_size) = self
+            .open_private_partial_rooted(
+                &rooted.root,
+                &partial,
+                &label,
+                true,
+                staged_file_mode(meta, flags),
+            )?
             .context("sidecar creation was requested")?;
-        file.set_len(0)?;
+        if basis_size.is_some() {
+            file.set_len(0)?;
+        }
         file.write_all_at(data, 0)
             .with_context(|| format!("write {}", label.display()))?;
-        file.set_len(data.len() as u64)?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
-        require_safe_rooted_named_partial(&rooted.root, &partial, &label, &file)?;
+        // `publish_partial_rooted` re-checks the staged name against the open
+        // descriptor immediately before the rename.
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         Ok(StagedSmallFile {
@@ -4508,6 +4516,7 @@ impl FsOps {
         &mut self,
         pp: &Path,
         create_if_missing: bool,
+        create_mode: u32,
     ) -> Result<Option<(File, Option<u64>)>> {
         self.uncache(pp);
         if create_if_missing {
@@ -4515,7 +4524,7 @@ impl FsOps {
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(create_mode)
                 .open(pp)
             {
                 Ok(file) => {
@@ -4671,11 +4680,12 @@ impl FsOps {
         relative: &RelativePath,
         label: &Path,
         create_if_missing: bool,
+        create_mode: u32,
     ) -> Result<Option<(File, Option<u64>)>> {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
-            match root.create_file(relative, 0o600) {
+            match root.create_file(relative, create_mode) {
                 Ok(file) => return Ok(Some((file, None))),
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -4797,7 +4807,7 @@ impl FsOps {
                 Some(_) if !create_if_missing => return Ok(None),
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
-                None => match root.create_file(relative, 0o600) {
+                None => match root.create_file(relative, create_mode) {
                     Ok(file) => return Ok(Some((file, None))),
                     Err(error)
                         if error
@@ -4908,6 +4918,7 @@ impl FsOps {
                 &relative,
                 &label,
                 create_if_missing,
+                PRIVATE_PARTIAL_MODE,
             )?
             else {
                 return Ok(None);
@@ -4952,7 +4963,9 @@ impl FsOps {
             return Ok(None);
         }
         let pp = self.partial_path(&p, copy_id)?;
-        let Some((f, basis_size)) = self.open_private_partial(&pp, create_if_missing)? else {
+        let Some((f, basis_size)) =
+            self.open_private_partial(&pp, create_if_missing, PRIVATE_PARTIAL_MODE)?
+        else {
             return Ok(None);
         };
         if let Some(old_size) = basis_size {
@@ -5107,7 +5120,13 @@ impl FsOps {
         let (dst, basis_size, location) = if let Some(target) = rooted {
             let (relative, label) = rooted_partial_target(&target, copy_id)?;
             let opened = self
-                .open_private_partial_rooted(&target.root, &relative, &label, true)?
+                .open_private_partial_rooted(
+                    &target.root,
+                    &relative,
+                    &label,
+                    true,
+                    PRIVATE_PARTIAL_MODE,
+                )?
                 .context("sidecar creation was requested")?;
             (
                 opened.0,
@@ -5120,7 +5139,7 @@ impl FsOps {
         } else {
             let pp = self.partial_path(&held.label, copy_id)?;
             let opened = self
-                .open_private_partial(&pp, true)?
+                .open_private_partial(&pp, true, PRIVATE_PARTIAL_MODE)?
                 .context("sidecar creation was requested")?;
             (opened.0, opened.1, FileLocation::Path(pp))
         };
@@ -5282,6 +5301,7 @@ impl FsOps {
                     &target_relative,
                     &target_label,
                     true,
+                    PRIVATE_PARTIAL_MODE,
                 )?
                 .context("sidecar creation was requested")?;
             if basis_size.is_some() {
@@ -5484,6 +5504,7 @@ impl FsOps {
         if content_digest(data) != hash {
             bail!("block hash mismatch on receive");
         }
+        let staged_mode = staged_file_mode(meta, flags);
         if let Some(rooted) = self.rooted_destination_target(target.path, target.guard)? {
             self.uncache_rooted(&rooted.root, &rooted.relative);
             if inplace {
@@ -5544,7 +5565,6 @@ impl FsOps {
                 };
                 file.write_all_at(data, 0)
                     .with_context(|| format!("write {}", rooted.label.display()))?;
-                file.set_len(data.len() as u64)?;
                 set_meta_file(&file, meta, flags)
                     .with_context(|| format!("set metadata {}", rooted.label.display()))?;
                 if matches!(
@@ -5592,16 +5612,19 @@ impl FsOps {
             // policy, stage through the same private rooted sidecar as ranged
             // writes do.
             let (relative, label) = rooted_partial_target(&rooted, target.id)?;
-            let (file, _) = self
-                .open_private_partial_rooted(&rooted.root, &relative, &label, true)?
+            let (file, basis_size) = self
+                .open_private_partial_rooted(&rooted.root, &relative, &label, true, staged_mode)?
                 .context("sidecar creation was requested")?;
-            file.set_len(0)?;
+            if basis_size.is_some() {
+                file.set_len(0)?;
+            }
             file.write_all_at(data, 0)
                 .with_context(|| format!("write {}", label.display()))?;
-            file.set_len(data.len() as u64)?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", label.display()))?;
-            require_safe_rooted_named_partial(&rooted.root, &relative, &label, &file)?;
+            // `publish_partial_rooted` re-checks the staged name against the
+            // open descriptor immediately before the rename, so no separate
+            // check is needed here.
             #[cfg(debug_assertions)]
             fail_put_small_before_rename_for_test(&rooted.label)?;
             publish_partial_rooted(&rooted.root, &relative, &rooted.relative, &file, condition)?;
@@ -5618,7 +5641,6 @@ impl FsOps {
             file.set_len(0)?;
             file.write_all_at(data, 0)
                 .with_context(|| format!("write existing {}", p.display()))?;
-            file.set_len(data.len() as u64)?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", p.display()))?;
             require_named_target_identity(&file, &p, condition)?;
@@ -5627,7 +5649,7 @@ impl FsOps {
         let pp = self.partial_path(&p, target.id)?;
         self.uncache(&pp);
         let (f, basis_size) = self
-            .open_private_partial(&pp, true)?
+            .open_private_partial(&pp, true, staged_mode)?
             .context("sidecar creation was requested")?;
         if basis_size.is_some() {
             f.set_len(0)?;
@@ -6561,6 +6583,21 @@ fn is_owned_partial(metadata: &fs::Metadata) -> bool {
 
 fn is_owned_rooted_partial(metadata: RootMetadata) -> bool {
     is_safe_rooted_partial(metadata) && metadata.uid == unsafe { libc::geteuid() }
+}
+
+/// Creation mode of a staging sidecar whose final mode is not yet known.
+const PRIVATE_PARTIAL_MODE: u32 = 0o600;
+
+/// Creation mode for a whole-file sidecar: the final permission bits, so that
+/// publication needs no separate chmod (on a network filesystem every setattr
+/// is a round trip). Special bits are still applied by `set_meta_file` once the
+/// content is written. Without a requested mode the sidecar stays private.
+fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
+    if flags & flags::MODE_MASK != 0 {
+        meta.mode & 0o777
+    } else {
+        PRIVATE_PARTIAL_MODE
+    }
 }
 
 fn is_safe_partial(metadata: &fs::Metadata) -> bool {
@@ -7699,6 +7736,55 @@ mod tests {
         );
         assert!(target.is_dir());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rooted = FsOps::new();
+        rooted
+            .install_destination(File::open(dir.path()).unwrap(), b"logical")
+            .unwrap();
+        let copy_id: CopyId = [7; 16];
+        // A sidecar left by an interrupted run must be truncated before the new
+        // content is written, since the new content can be shorter.
+        let sidecar = partial_path_with_name_max(Path::new("logical/file"), &copy_id, 255).unwrap();
+        let stale = dir.path().join(sidecar.file_name().unwrap());
+        fs::write(&stale, b"stale content that is longer").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        let put = |path: &[u8], mode: u32, flags: u8| SmallPut {
+            path: path.to_vec(),
+            copy_id,
+            data: b"new".to_vec(),
+            hash: content_digest(b"new"),
+            meta: Meta {
+                mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags,
+            inplace: false,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let response = rooted.handle(&Request::PutSmallBatch(vec![
+            put(b"logical/file", 0o640, flags::RECEIVER_MODE),
+            put(b"logical/private", 0o640, 0),
+        ]));
+        assert!(
+            matches!(&response, Response::Applied(errors) if errors == &vec![None, None]),
+            "{response:?}"
+        );
+        assert!(!stale.exists(), "stale sidecar must be published away");
+        let file = dir.path().join("file");
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o640);
+        // Without a requested mode the sidecar's private mode is published.
+        let private = dir.path().join("private");
+        assert_eq!(fs::read(&private).unwrap(), b"new");
+        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o600);
     }
 
     #[test]
