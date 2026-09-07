@@ -354,7 +354,8 @@ a mixture of old and new contents while the copy runs. If interrupted, that
 incomplete version stays at the final filename until you finish the copy.
 
 `--no-compress` saves CPU at the cost of potentially sending more bytes; it
-does not affect file contents or integrity checks.
+does not affect file contents or integrity checks. Compression applies across
+the network, not between syq and its receiver process on the same machine.
 
 Examples use native options. In rsync mode, syq-specific options have a
 `--syq-` prefix, such as `--syq-connections` and `--syq-no-tcp`.

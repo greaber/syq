@@ -1920,6 +1920,9 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        // The receiver child is on this machine, not across the network.
+        // Recompressing forwarded blocks here adds CPU work to downloads.
+        let compress = compress && !self.local_process;
         let return_stream = if let Some(approved) = &self.forwarded {
             if !matches!(role, ConnectionRole::Control) {
                 bail!("copies via a return connection require encrypted TCP workers");
@@ -2258,6 +2261,8 @@ impl RemoteSpec {
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        // Keep network compression, but not on the local receiver's data hop.
+        let compress = compress && !self.local_process;
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         let mut last = anyhow!("no data address");
@@ -3941,6 +3946,52 @@ mod tests {
             tcp_congestion_fallback_note(Some("reno")),
             "; requested congestion control reno is not used by the SSH fallback"
         );
+    }
+
+    #[test]
+    fn only_the_local_receiver_disables_requested_tcp_compression() {
+        for local_process in [false, true] {
+            for requested in [false, true] {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut id = [0; 4];
+                    socket.read_exact(&mut id).unwrap();
+                    let mut reader =
+                        FrameReader::new(RecordReader::new(socket.try_clone().unwrap(), None));
+                    let Request::Hello { compress, .. } = reader.read_msg().unwrap() else {
+                        panic!("expected Hello");
+                    };
+                    let mut writer = FrameWriter::new(RecordWriter::new(socket, None), false);
+                    writer.write_msg(&hello_ok()).unwrap();
+                    compress
+                });
+                let mut spec = RemoteSpec::local_receiver(false);
+                // Even an explicit SSH endpoint on loopback is not the
+                // in-process receiver and keeps the requested compression.
+                spec.local_process = local_process;
+                let info = TcpInfo {
+                    addrs: vec!["127.0.0.1".into()],
+                    port,
+                    key: None,
+                    token: Vec::new(),
+                    congestion_control: None,
+                    failed: false,
+                    failure: None,
+                    next: Default::default(),
+                };
+                let conn = spec
+                    .connect_tcp(&info, requested, ConnectionRole::Control)
+                    .unwrap();
+                let expected = requested && !local_process;
+                assert_eq!(conn.w.compress, expected);
+                assert_eq!(server.join().unwrap(), expected);
+            }
+        }
     }
 
     #[test]
