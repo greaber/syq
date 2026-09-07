@@ -19129,6 +19129,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         "source",
         "--to",
         "backup",
+        "--skip-newer",
         "--results",
         "result.ndjson",
     ]);
@@ -19150,7 +19151,6 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
     for extra in [
         vec!["--auth-from", "ssh"],
         vec!["--no-tcp"],
-        vec!["--skip-newer"],
         vec!["--preserve", "ownership"],
         vec!["--inplace"],
         vec!["--min-size", "1"],
@@ -19192,6 +19192,10 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
     assert_eq!(messages[0]["secret"], "laptop");
     assert_eq!(messages[0]["message"], "Ping");
     assert_eq!(messages[1]["secret"], "laptop");
+    assert_eq!(
+        messages[1]["message"]["Forward"]["request"]["copy"]["policy"]["existing"],
+        "Replace"
+    );
     assert_eq!(messages[2]["secret"], "z-other");
     assert_eq!(messages[3]["secret"], "ssh");
     // The registry remains, but every socket is now unavailable. Discovery

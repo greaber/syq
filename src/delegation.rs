@@ -438,6 +438,7 @@ pub(crate) struct SignedGrantEnvelope {
     /// Canonical OpenSSH armored SSHSIG bytes.
     pub signature: Vec<u8>,
     pub tcp_congestion: Option<String>,
+    pub mapping: Option<crate::mapping::Authorization>,
 }
 
 impl SignedGrantEnvelope {
@@ -450,6 +451,7 @@ impl SignedGrantEnvelope {
             root_existence: RootExistence::Any,
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
+            mapping: None,
             signature,
         }
     }
@@ -464,6 +466,7 @@ impl SignedGrantEnvelope {
             self.root_existence,
             &self.receipt_policy,
             self.tcp_congestion.as_deref(),
+            self.mapping.as_ref(),
         )?;
         if body.len() > MAX_GRANT_BYTES {
             bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -506,15 +509,20 @@ impl SignedGrantEnvelope {
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
         let (body, extension): (GrantBody, &[u8]) =
             postcard::take_from_bytes(body_bytes).context("decode signed grant")?;
-        let tcp_congestion = if extension.is_empty() {
-            None
+        let (tcp_congestion, mapping) = if extension.is_empty() {
+            (None, None)
         } else {
-            let (kind, algorithm): (String, String) =
-                postcard::from_bytes(extension).context("decode signed TCP constraint")?;
-            if kind != "tcp-congestion-v1" {
-                bail!("unknown signed grant extension");
+            let (kind, rest): (String, &[u8]) =
+                postcard::take_from_bytes(extension).context("decode signed grant extension")?;
+            match kind.as_str() {
+                "tcp-congestion-v1" => (Some(postcard::from_bytes(rest)?), None),
+                "mapping-v1" => {
+                    let (tcp, mapping): (Option<String>, crate::mapping::Authorization) =
+                        postcard::from_bytes(rest)?;
+                    (tcp, Some(mapping))
+                }
+                _ => bail!("unknown signed grant extension"),
             }
-            Some(algorithm)
         };
         let GrantBody {
             grant,
@@ -530,6 +538,7 @@ impl SignedGrantEnvelope {
             root_existence,
             &receipt_policy,
             tcp_congestion.as_deref(),
+            mapping.as_ref(),
         )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
@@ -547,6 +556,7 @@ impl SignedGrantEnvelope {
             receipt_policy,
             signature,
             tcp_congestion,
+            mapping,
         })
     }
 
@@ -558,6 +568,7 @@ impl SignedGrantEnvelope {
             self.root_existence,
             &self.receipt_policy,
             self.tcp_congestion.as_deref(),
+            self.mapping.as_ref(),
         )
     }
 }
@@ -585,6 +596,7 @@ pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest)
         policy.root_existence,
         &policy.receipt_policy,
         policy.tcp_congestion.as_deref(),
+        policy.mapping.as_ref(),
     )?;
     Ok(())
 }
@@ -600,6 +612,7 @@ pub(crate) fn sign_grant(
         root_existence,
         receipt_policy,
         tcp_congestion,
+        mapping,
     } = constraints;
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted enrollment key");
@@ -613,6 +626,7 @@ pub(crate) fn sign_grant(
         root_existence,
         &receipt_policy,
         tcp_congestion.as_deref(),
+        mapping.as_ref(),
     )?;
     let signature = private_key
         .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
@@ -628,6 +642,7 @@ pub(crate) fn sign_grant(
         receipt_policy,
         signature,
         tcp_congestion,
+        mapping,
     }
     .encode()
 }
@@ -641,6 +656,7 @@ fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -
         RootExistence::Any,
         &test_receipt_policy(),
         None,
+        None,
     )
 }
 
@@ -651,6 +667,7 @@ fn signing_payload(
     root_existence: RootExistence,
     receipt_policy: &crate::receipt::ReceiptPolicy,
     tcp_congestion: Option<&str>,
+    mapping: Option<&crate::mapping::Authorization>,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
@@ -661,6 +678,7 @@ fn signing_payload(
         root_existence,
         receipt_policy,
         tcp_congestion,
+        mapping,
     )?;
     if body.len() > MAX_GRANT_BYTES {
         bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -679,6 +697,7 @@ fn canonical_body_bytes(
     root_existence: RootExistence,
     receipt_policy: &crate::receipt::ReceiptPolicy,
     tcp_congestion: Option<&str>,
+    mapping: Option<&crate::mapping::Authorization>,
 ) -> Result<Vec<u8>> {
     receipt_policy.validate()?;
     // Preserve the released v0.4.1 body byte for byte when no override is
@@ -694,6 +713,18 @@ fn canonical_body_bytes(
     .context("encode canonical signed grant")?;
     if let Some(algorithm) = tcp_congestion {
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(mapping) = mapping {
+        let GrantOperation::Copy(copy) = &grant.operation;
+        if copy.policy.deletion != DeletionPolicy::Forbid {
+            bail!("mapping authorization does not permit pruning");
+        }
+        bytes.extend(postcard::to_stdvec(&(
+            "mapping-v1",
+            tcp_congestion,
+            mapping,
+        ))?);
+    } else if let Some(algorithm) = tcp_congestion {
         bytes.extend(postcard::to_stdvec(&("tcp-congestion-v1", algorithm))?);
     }
     Ok(bytes)
@@ -1141,6 +1172,7 @@ pub(crate) struct VerifiedGrant {
     grant_digest: [u8; 32],
     execution_deadline: Instant,
     pub tcp_congestion: Option<String>,
+    pub mapping: Option<crate::mapping::Authorization>,
 }
 
 /// Signed receiver policy carried alongside the copy grant.
@@ -1151,6 +1183,8 @@ pub(crate) struct GrantConstraints {
     pub root_existence: RootExistence,
     pub receipt_policy: crate::receipt::ReceiptPolicy,
     pub tcp_congestion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<crate::mapping::Authorization>,
 }
 
 #[cfg(test)]
@@ -1162,6 +1196,7 @@ impl Default for GrantConstraints {
             root_existence: RootExistence::Any,
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
+            mapping: None,
         }
     }
 }
@@ -1181,6 +1216,7 @@ impl VerifiedGrant {
                 root_existence: self.root_existence,
                 receipt_policy: self.receipt_policy,
                 tcp_congestion: self.tcp_congestion,
+                mapping: self.mapping,
             },
             self.grant_digest,
             self.execution_deadline,
@@ -1224,6 +1260,7 @@ pub(crate) fn verify_and_redeem(
         root_existence: envelope.root_existence,
         receipt_policy: envelope.receipt_policy,
         tcp_congestion: envelope.tcp_congestion,
+        mapping: envelope.mapping,
         grant_digest,
         execution_deadline,
     })
@@ -2108,6 +2145,7 @@ mod tests {
             RootExistence::Any,
             &test_receipt_policy(),
             None,
+            None,
         )
         .expect("encode test grant");
         let mut out = Vec::new();
@@ -2206,6 +2244,77 @@ mod tests {
             verified.into_parts().1.tcp_congestion.as_deref(),
             Some("cubic")
         );
+    }
+
+    #[test]
+    fn mapping_extension_is_signed_and_preserves_non_mapping_encoding() {
+        let private = PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
+            "syq-test",
+        )
+        .unwrap();
+        let fixture = Fixture::ordinary();
+        fs::write(
+            &fixture.allowed_signers,
+            format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        let mapping = crate::mapping::Authorization::from_contents(b"manifest bytes");
+        for tcp in [None, Some("cubic".to_string())] {
+            let encoded = sign_grant(
+                fixture_grant(44),
+                GrantConstraints {
+                    mapping: Some(mapping.clone()),
+                    tcp_congestion: tcp.clone(),
+                    ..Default::default()
+                },
+                &private,
+            )
+            .unwrap();
+            let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
+            assert_eq!(decoded.mapping, Some(mapping.clone()));
+            assert_eq!(decoded.tcp_congestion, tcp);
+            // Released readers require byte-for-byte canonical re-encoding of
+            // their GrantBody and cannot discard trailing signed constraints.
+            let size = u32::from_be_bytes(encoded[8..12].try_into().unwrap()) as usize;
+            let body = &encoded[WIRE_HEADER_LEN..WIRE_HEADER_LEN + size];
+            let (old, _): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
+            assert_ne!(postcard::to_stdvec(&old).unwrap(), body);
+            let replay = fixture.replay(if tcp.is_some() {
+                "mapping-tcp-replay"
+            } else {
+                "mapping-replay"
+            });
+            for changed in [
+                None,
+                Some(crate::mapping::Authorization {
+                    bytes: mapping.bytes + 1,
+                    ..mapping.clone()
+                }),
+                Some(crate::mapping::Authorization {
+                    digest: [0; 32],
+                    ..mapping.clone()
+                }),
+            ] {
+                let mut tampered = decoded.clone();
+                tampered.mapping = changed;
+                assert!(verify_and_redeem(
+                    &tampered.encode().unwrap(),
+                    &context(SIGNER, TARGET, NOW, 0),
+                    &fixture.policy(),
+                    &replay
+                )
+                .is_err());
+            }
+            let verified = verify_and_redeem(
+                &encoded,
+                &context(SIGNER, TARGET, NOW, 0),
+                &fixture.policy(),
+                &replay,
+            )
+            .unwrap();
+            assert_eq!(verified.into_parts().1.mapping, Some(mapping.clone()));
+        }
     }
 
     #[test]

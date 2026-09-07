@@ -490,6 +490,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::AnchorDestination { .. }
                     | Request::CopySmallFiles(_)
                     | Request::Receipt
+                    | Request::MappingChunk { .. }
             )
         {
             w.write_msg(&Response::Err(
@@ -796,6 +797,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             Request::TransportStats => {
                 w.write_msg(&Response::TransportStats(reader.tcp_stats()))?;
+            }
+            Request::MappingChunk { .. } => {
+                let response = if authority.is_some() {
+                    Response::Ok
+                } else {
+                    Response::Err("mapping admission requires a restricted receiver".into())
+                };
+                if let (Some(authority), Some(settlement)) = (&authority, settlement) {
+                    authority.settle(settlement, &response);
+                }
+                w.write_msg(&response)?;
             }
             Request::Receipt => match &authority {
                 Some(authority) => match authority.issue_receipt() {

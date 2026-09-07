@@ -371,6 +371,7 @@ pub(crate) struct RestrictedAuthority {
     /// Signalled whenever an in-flight request settles.
     settled: std::sync::Condvar,
     tcp_congestion: Option<String>,
+    mapping: Option<Mutex<crate::mapping::Admission>>,
 }
 
 impl RestrictedAuthority {
@@ -389,6 +390,7 @@ impl RestrictedAuthority {
             root_existence,
             receipt_policy,
             tcp_congestion,
+            mapping,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -437,6 +439,12 @@ impl RestrictedAuthority {
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
             tcp_congestion,
+            mapping: mapping.map(|authorization| {
+                Mutex::new(crate::mapping::Admission::new(
+                    authorization,
+                    copy.limits.max_entries,
+                ))
+            }),
             guard: ContainerGuard {
                 root: config.root.as_bytes().to_vec(),
                 dev: config.root_dev,
@@ -962,6 +970,39 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    fn mapping_relative<'a>(&self, path: &'a [u8]) -> Result<&'a [u8]> {
+        if path == self.destination {
+            return Ok(b"");
+        }
+        path.strip_prefix(self.destination.as_slice())
+            .and_then(|relative| relative.strip_prefix(b"/"))
+            .context("mapping path is outside the destination")
+    }
+
+    fn check_mapping_path(&self, path: &[u8], directory: Option<bool>) -> Result<()> {
+        if let Some(mapping) = &self.mapping {
+            let mapping = mapping.lock().unwrap();
+            if !mapping
+                .permissions()?
+                .allows(self.mapping_relative(path)?, directory)
+            {
+                bail!("path is not authorized by the signed mapping");
+            }
+        }
+        Ok(())
+    }
+
+    fn mapping_parent(&self, path: &[u8]) -> Result<bool> {
+        match &self.mapping {
+            Some(mapping) => Ok(mapping
+                .lock()
+                .unwrap()
+                .permissions()?
+                .implicit_directory(self.mapping_relative(path)?)),
+            None => Ok(false),
+        }
+    }
+
     fn check_observation_path(&self, path: &[u8]) -> Result<()> {
         Self::validate_request_path(path)?;
         if path != self.destination
@@ -973,6 +1014,7 @@ impl RestrictedAuthority {
         {
             bail!("receiver observation is outside the signed destination scopes");
         }
+        self.check_mapping_path(path, None)?;
         self.record_path(path)
     }
 
@@ -1006,6 +1048,7 @@ impl RestrictedAuthority {
 
     fn check_mutation_path(&self, path: &[u8], is_dir: bool) -> Result<()> {
         self.check_mutation_authority(path)?;
+        self.check_mapping_path(path, Some(is_dir))?;
         if self.path_is_ignored(path, is_dir) {
             bail!("receiver mutation targets a path excluded by the signed filter policy");
         }
@@ -1879,6 +1922,19 @@ impl RestrictedAuthority {
                 condition,
             } => {
                 self.constrain_creation(path, condition, true, index, pending)?;
+                if self.mapping_parent(path)? {
+                    // Parent access permits creating missing directories, but
+                    // cannot reopen or change an existing directory's mode.
+                    *condition = proto::TargetCondition::Absent;
+                    if !pending.iter().any(|creation| creation.path == *path) {
+                        self.state.lock().unwrap().provisional.insert(path.clone());
+                        pending.push(PendingCreation {
+                            index,
+                            path: path.clone(),
+                            persist: true,
+                        });
+                    }
+                }
                 if !self.copy.options.preserve_permissions {
                     self.remember_receiver_creation(path, true)?;
                     *mode = 0o700;
@@ -1943,6 +1999,12 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
+                if self.mapping_parent(path)?
+                    && !self.created_by_this_grant(path)
+                    && !pending.iter().any(|creation| creation.path == *path)
+                {
+                    bail!("mapping cannot change metadata of an existing implicit parent");
+                }
                 self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
                     path,
@@ -2070,6 +2132,22 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         self.check_deadline()?;
         match request {
+            Request::MappingChunk {
+                offset,
+                data,
+                finish,
+            } => {
+                if !over_ssh {
+                    bail!("mapping admission requires the signed control connection");
+                }
+                self.mapping
+                    .as_ref()
+                    .context("this grant does not authorize a mapping")?
+                    .lock()
+                    .unwrap()
+                    .append(*offset, data, *finish)?;
+            }
+
             Request::TcpListen {
                 key,
                 token,
@@ -2111,6 +2189,9 @@ impl RestrictedAuthority {
             } => {
                 if source.is_some() {
                     bail!("source references are not valid on a command-restricted destination");
+                }
+                if self.mapping.is_some() {
+                    bail!("mapping grants do not authorize recursive destination scans");
                 }
                 if *follow_root {
                     bail!("signed destination scans cannot follow a root symlink");
@@ -3825,11 +3906,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.tcp_plain {
         bail!("command-restricted transfers require encrypted data connections");
     }
-    if args.update {
-        bail!(
-            "--skip-newer compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
-        );
-    }
     if args.inplace
         && (args.only_new_native_entries()
             || args.existing
@@ -3869,13 +3945,9 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             bail!("--max-size must be at least 1 byte on the command-restricted path");
         }
     }
-    if !args.files_from_lines.is_empty()
-        || args.files_from.is_some()
-        || args.native_mapping.is_some()
-        || args.min_size.is_some()
-    {
+    if !args.files_from_lines.is_empty() || args.files_from.is_some() || args.min_size.is_some() {
         bail!(
-            "--files-from, --mapping, and --min-size are not yet independently enforceable by the command-restricted receiver"
+            "--files-from and --min-size are not yet independently enforceable by the command-restricted receiver"
         );
     }
     if args.pscope_explicit {
@@ -3980,10 +4052,10 @@ fn grant_for(
     // (`--into-existing` and friends) is the separate signed root-existence
     // field; folding it in here would forbid creating files inside an
     // existing directory.
+    // Timestamp selection is a coordinator policy based on source metadata.
+    // The receiver enforces only the independently observable write authority.
     let existing = if args.only_new_native_entries() {
         ExistingDestinationPolicy::Skip
-    } else if args.update {
-        ExistingDestinationPolicy::UpdateIfOlder
     } else if args.existing {
         ExistingDestinationPolicy::MustExist
     } else {
@@ -4067,6 +4139,19 @@ fn filter_destination_roots(
     roots.sort();
     roots.dedup();
     Ok(roots)
+}
+
+fn mapping_authorization(args: &Args) -> Result<Option<crate::mapping::Authorization>> {
+    args.native_mapping
+        .as_ref()
+        .map(|_| {
+            let contents = args
+                .mapping_contents
+                .as_ref()
+                .context("mapping input was not acquired before authorization")?;
+            Ok(crate::mapping::Authorization::from_contents(contents))
+        })
+        .transpose()
 }
 
 pub(crate) fn prepare_transfer(
@@ -4166,6 +4251,7 @@ pub(crate) fn prepare_transfer(
         grant,
         GrantConstraints {
             tcp_congestion: args.tcp_congestion.clone(),
+            mapping: mapping_authorization(args)?,
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -4218,6 +4304,7 @@ pub(crate) fn named_request(
         copy,
         constraints: GrantConstraints {
             tcp_congestion: args.tcp_congestion.clone(),
+            mapping: mapping_authorization(args)?,
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -5135,6 +5222,7 @@ esac
             grant,
             GrantConstraints {
                 tcp_congestion: None,
+                mapping: None,
                 max_file_data_bytes_per_second,
                 filters,
                 root_existence,
@@ -5902,6 +5990,111 @@ esac
                 .authorize(&mut apply(set_meta(&sibling)), false)
                 .unwrap();
             fs::set_permissions(&raced, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn mapping_receiver_confines_entries_and_protects_existing_parents() {
+        let root = crate::test_support::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir_all(target.join("existing")).unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), target.join("escape")).unwrap();
+        let manifest = ["fresh/item", "existing/item", "escape/item"].map(|dst| {
+            format!(r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"{dst}"}}}}
+"#)
+        }).concat().into_bytes();
+        let mut authority = tcp_test_authority(root.path());
+        authority.copy.limits.max_entries = 100;
+        authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
+            crate::mapping::Authorization::from_contents(&manifest),
+            authority.copy.limits.max_entries,
+        )));
+        assert!(authority
+            .authorize(&mut prepare_request(&target.join("existing/item")), false)
+            .is_err());
+        let mut admission = Request::MappingChunk {
+            offset: 0,
+            data: manifest,
+            finish: true,
+        };
+        assert!(authority.authorize(&mut admission, false).is_err());
+        let settlement = authority.authorize(&mut admission, true).unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+        assert!(authority
+            .authorize(
+                &mut Request::Scan {
+                    root: target.as_os_str().as_bytes().to_vec(),
+                    source: None,
+                    follow_root: false,
+                    ignore: vec![],
+                    report_ignored: false,
+                    guard: None,
+                },
+                true
+            )
+            .is_err());
+        assert!(authority
+            .authorize(&mut prepare_request(&target.join("unlisted")), false)
+            .is_err());
+        assert!(authority
+            .authorize(&mut prepare_request(&target.join("existing")), false)
+            .is_err());
+        assert!(authority
+            .authorize(&mut apply(set_meta(&target.join("existing"))), false)
+            .is_err());
+        assert!(authority
+            .authorize(
+                &mut prepare_request(&target.join("existing/item/child")),
+                false
+            )
+            .is_err());
+        let run = |mut request| {
+            let settlement = authority.authorize(&mut request, false)?;
+            let response = crate::fsops::FsOps::new().handle(&request);
+            authority.settle(settlement, &response);
+            Ok::<_, anyhow::Error>(response)
+        };
+        let created = run(apply(mkdir(&target.join("fresh")))).unwrap();
+        assert!(
+            matches!(created, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+            "{created:?}"
+        );
+        assert!(run(apply(set_meta(&target.join("fresh")))).is_ok());
+        let written = run(small_put(&target.join("fresh/item"))).unwrap();
+        assert!(
+            matches!(written, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+            "{written:?}"
+        );
+        assert_eq!(fs::read(target.join("fresh/item")).unwrap(), b"new");
+        let escaped = run(small_put(&target.join("escape/item")));
+        assert!(
+            !matches!(escaped, Ok(proto::Response::Applied(ref errors)) if errors.iter().all(Option::is_none))
+        );
+        assert!(!outside.path().join("item").exists());
+    }
+
+    #[test]
+    fn timestamp_selection_preserves_independent_existing_authority() {
+        use clap::Parser;
+        let mut args = Args::parse_from(["syq", "--update", "source", "destination"]);
+        let sources = [Location::parse("hostA:source").unwrap()];
+        for (existing, policy) in [
+            (false, ExistingDestinationPolicy::Replace),
+            (true, ExistingDestinationPolicy::MustExist),
+        ] {
+            args.existing = existing;
+            let grant = grant_for(
+                &args,
+                &sources,
+                EnrollmentId::random(),
+                "receiver",
+                b"/destination",
+            )
+            .unwrap();
+            let GrantOperation::Copy(copy) = grant.operation;
+            assert_eq!(copy.policy.existing, policy);
+            assert!(args.update);
         }
     }
 

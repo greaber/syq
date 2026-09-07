@@ -10,6 +10,8 @@ use crate::conn::{
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
 use crate::fsops::{content_digest, is_partial_name, join};
+pub(crate) use crate::mapping::validate_manifest_path;
+use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
@@ -1615,6 +1617,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
     let mut args = args;
+    // The executing build consumes stdin once, then shares immutable bytes with
+    // authorization and remote coordination. Neither may reopen the manifest.
+    if let Some(mapping) = args.native_mapping.as_deref() {
+        if args.detach {
+            bail!("--mapping requires an attached copy");
+        }
+        let mut contents = Vec::new();
+        if mapping == b"-" {
+            std::io::stdin()
+                .read_to_end(&mut contents)
+                .context("--mapping -: read stdin")?;
+        } else {
+            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
+                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
+                .with_context(|| format!("--mapping {}", display(mapping)))?;
+        }
+        read_mapping_manifest(&mut std::io::Cursor::new(&contents))?;
+        args.mapping_contents = Some(Arc::new(contents));
+    }
     // Authorization failures settle the already-open automation stream too.
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
@@ -1861,25 +1882,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
-    // Acquire the entire mapping through its retained selection before any
-    // destination root can be created. The planner already consumes the whole
-    // manifest; retaining these bytes also makes later namespace replacement
-    // irrelevant.
-    let mapping_contents = if let Some(mapping) = args.native_mapping.as_deref() {
-        let mut contents = Vec::new();
-        if mapping == b"-" {
-            std::io::stdin()
-                .read_to_end(&mut contents)
-                .context("--mapping -: read stdin")?;
-        } else {
-            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
-                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
-                .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
-        }
-        Some(contents)
-    } else {
-        None
-    };
+    let mapping_contents = args.mapping_contents.clone();
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
     // Workers connect on their own threads once the control connections are
@@ -2148,6 +2151,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: control connections up in {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    if args.restricted_grant.is_some() {
+        if let Some(contents) = &mapping_contents {
+            crate::mapping::send(contents, &mut *dst_ctl)?;
+        }
     }
     let destination_supports_confined_socket_nodes = match &dst_ep {
         Endpoint::Remote(spec) => {
@@ -8793,6 +8801,47 @@ impl Worker {
     }
 }
 
+/// A destination ancestor directory no manifest entry names: created with
+/// default metadata (mode through the umask, natural mtime; see
+/// `Planner::implicit_dirs`).
+fn implicit_dir_entry(path: PathBytes) -> Entry {
+    Entry {
+        path,
+        kind: Kind::Dir,
+        size: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        dev: 0,
+        ino: 0,
+        ctime: 0,
+        ctime_nsec: 0,
+        link: None,
+    }
+}
+
+/// A queued symlink/special creation: the display string for -v plus the
+/// machine-readable identity `--results` records need.
+struct QueuedLeafOp {
+    dst_rel: PathBytes,
+    action: &'static str,
+    kind: &'static str,
+    name: String,
+}
+
+/// The container-relative spelling of a full destination path; None for the
+/// container itself.
+fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
+    if path == dst_root {
+        return None;
+    }
+    let rest = path.strip_prefix(dst_root)?;
+    Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9582,217 +9631,4 @@ mod tests {
         assert!(output.contains("receive unavailable, send-buffer unavailable"));
         assert!(output.contains("tcp ECN CE deliveries: unavailable"));
     }
-}
-
-/// One parsed `--mapping` manifest entry.
-struct ManifestEntry {
-    src: PathBytes,
-    dst: PathBytes,
-    kind: Option<DeclaredKind>,
-}
-
-/// The manifest's `kind` field: disambiguation of the request, not a
-/// precondition. A mismatch fails that entry the way a missing source does.
-#[derive(Clone, Copy)]
-enum DeclaredKind {
-    File,
-    Dir,
-    Symlink,
-    Special,
-}
-
-impl DeclaredKind {
-    fn matches(self, kind: Kind) -> bool {
-        match self {
-            DeclaredKind::File => kind == Kind::File,
-            DeclaredKind::Dir => kind == Kind::Dir,
-            DeclaredKind::Symlink => kind == Kind::Symlink,
-            DeclaredKind::Special => matches!(
-                kind,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
-            ),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DeclaredKind::File => "file",
-            DeclaredKind::Dir => "dir",
-            DeclaredKind::Symlink => "symlink",
-            DeclaredKind::Special => "special",
-        }
-    }
-}
-
-fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
-    use base64::Engine as _;
-    // Unknown keys are rejected so a typo cannot be silently dropped; the
-    // known informational fields (`size`, `mtime`, a tagged path's `display`)
-    // are accepted and ignored so `syq map` output and future automation
-    // records round-trip.
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WirePath {
-        encoding: String,
-        value: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        display: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WireEntry {
-        src: WirePath,
-        dst: WirePath,
-        #[serde(default)]
-        kind: Option<String>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        size: Option<u64>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        mtime: Option<i64>,
-    }
-    let entry: WireEntry = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let decode = |path: WirePath, which: &str| -> Result<PathBytes> {
-        let bytes = match path.encoding.as_str() {
-            "utf-8" => path.value.into_bytes(),
-            "base64" => base64::engine::general_purpose::STANDARD
-                .decode(path.value.as_bytes())
-                .map_err(|e| anyhow::anyhow!("{which}: invalid base64 path: {e}"))?,
-            other => bail!("{which}: unknown path encoding {other:?}"),
-        };
-        validate_manifest_path(&bytes, which)?;
-        Ok(bytes)
-    };
-    let src = decode(entry.src, "src")?;
-    let dst = decode(entry.dst, "dst")?;
-    let kind = match entry.kind.as_deref() {
-        None => None,
-        Some("file") => Some(DeclaredKind::File),
-        Some("dir") => Some(DeclaredKind::Dir),
-        Some("symlink") => Some(DeclaredKind::Symlink),
-        Some("special") => Some(DeclaredKind::Special),
-        Some(other) => bail!("unknown kind {other:?}"),
-    };
-    Ok(ManifestEntry { src, dst, kind })
-}
-
-pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
-    if path.is_empty() {
-        bail!("{which} path is empty");
-    }
-    if path[0] == b'/' {
-        bail!(
-            "{which} path {:?} is absolute; mapping entries are root-relative",
-            String::from_utf8_lossy(path)
-        );
-    }
-    if path.contains(&0) {
-        bail!("{which} path contains NUL");
-    }
-    for component in path.split(|&byte| byte == b'/') {
-        if component.is_empty() || component == b"." || component == b".." {
-            bail!(
-                "{which} path {:?} contains an empty, `.`, or `..` component",
-                String::from_utf8_lossy(path)
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A destination ancestor directory no manifest entry names: created with
-/// default metadata (mode through the umask, natural mtime; see
-/// `Planner::implicit_dirs`).
-fn implicit_dir_entry(path: PathBytes) -> Entry {
-    Entry {
-        path,
-        kind: Kind::Dir,
-        size: 0,
-        mtime: 0,
-        mtime_nsec: 0,
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        dev: 0,
-        ino: 0,
-        ctime: 0,
-        ctime_nsec: 0,
-        link: None,
-    }
-}
-
-/// A queued symlink/special creation: the display string for -v plus the
-/// machine-readable identity `--results` records need.
-struct QueuedLeafOp {
-    dst_rel: PathBytes,
-    action: &'static str,
-    kind: &'static str,
-    name: String,
-}
-
-/// The container-relative spelling of a full destination path; None for the
-/// container itself.
-fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
-    if path == dst_root {
-        return None;
-    }
-    let rest = path.strip_prefix(dst_root)?;
-    Some(rest.strip_prefix(b"/").unwrap_or(rest))
-}
-
-/// Phase-1 manifest read for `--mapping`: parse every line and run the
-/// parse-level preflight (duplicate destinations; an entry whose destination
-/// is a strict ancestor of another entry's destination must not declare a
-/// non-directory kind) before anything is written. Whether an undeclared
-/// ancestor really is a directory is only knowable from the source and is
-/// checked during execution.
-fn read_mapping_manifest(reader: &mut dyn std::io::BufRead) -> Result<Vec<(u64, ManifestEntry)>> {
-    let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
-    let mut declared: std::collections::HashMap<PathBytes, Option<DeclaredKind>> =
-        std::collections::HashMap::new();
-    let mut line_number = 0u64;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        line_number += 1;
-        let text = line.trim_end_matches('\n').trim_end_matches('\r');
-        if text.is_empty() {
-            continue;
-        }
-        let entry = parse_manifest_entry(text)
-            .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
-        if declared.insert(entry.dst.clone(), entry.kind).is_some() {
-            bail!(
-                "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
-                display(&entry.dst)
-            );
-        }
-        entries.push((line_number, entry));
-    }
-    for (line_number, entry) in &entries {
-        for (i, &byte) in entry.dst.iter().enumerate() {
-            if byte != b'/' {
-                continue;
-            }
-            if let Some(Some(kind)) = declared.get(&entry.dst[..i]) {
-                if !matches!(kind, DeclaredKind::Dir) {
-                    bail!(
-                        "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
-                        display(&entry.dst[..i]),
-                        display(&entry.dst),
-                        kind.label()
-                    );
-                }
-            }
-        }
-    }
-    Ok(entries)
 }

@@ -1045,19 +1045,23 @@ fn run_remote(
         remote.push("--cwd".into());
         remote.push(delegated_operand(path));
     }
-    for source in srcs {
-        remote.push(
-            match source.selection {
-                SourceSelection::Contents => "--srcs-in",
-                SourceSelection::File => "--src-non-dir",
-                SourceSelection::Directory => "--src-dir",
-                SourceSelection::Named
-                | SourceSelection::NamedNoFollow
-                | SourceSelection::Rsync => "--src",
-            }
-            .into(),
-        );
-        remote.push(delegated_operand(&source.path));
+    if args.mapping_contents.is_some() {
+        remote.push("--mapping=-".into());
+    } else {
+        for source in srcs {
+            remote.push(
+                match source.selection {
+                    SourceSelection::Contents => "--srcs-in",
+                    SourceSelection::File => "--src-non-dir",
+                    SourceSelection::Directory => "--src-dir",
+                    SourceSelection::Named
+                    | SourceSelection::NamedNoFollow
+                    | SourceSelection::Rsync => "--src",
+                }
+                .into(),
+            );
+            remote.push(delegated_operand(&source.path));
+        }
     }
     if !coordinator_at_dst && !same_host {
         remote.push("--to".into());
@@ -1205,24 +1209,45 @@ fn run_remote(
     }
     let run = || {
         let mut cmd = make_command();
-        cmd.stdin(Stdio::null()).stderr(Stdio::inherit());
-        if receipt_expectation.is_none() {
-            // Nothing to intercept: leave stdout to the terminal or pipe the
-            // user gave us, bytes and all.
-            let status = cmd
-                .status()
-                .with_context(|| format!("spawn {:?}", rsh[0]))?;
-            return Ok::<_, anyhow::Error>((status, None));
+        cmd.stdin(if args.mapping_contents.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::inherit());
+        if receipt_expectation.is_some() {
+            cmd.stdout(Stdio::piped());
         }
-        cmd.stdout(Stdio::piped());
         let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", rsh[0]))?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        // Always reap the child, even when relaying its output failed.
-        let relayed = relay_stdout(stdout);
+        // Read stdout while sending the manifest, including for large manifests
+        // and setup errors. Reuse the same bytes if helper bootstrap retries.
+        let input = args.mapping_contents.as_ref().map(|contents| {
+            let contents = contents.clone();
+            let mut stdin = child.stdin.take().expect("piped mapping input");
+            std::thread::spawn(move || {
+                use std::io::Write;
+                stdin.write_all(&contents)
+            })
+        });
+        let relayed = match child.stdout.take() {
+            Some(stdout) => relay_stdout(stdout),
+            None => Ok(None),
+        };
         let status = child
             .wait()
             .with_context(|| format!("wait for {:?}", rsh[0]))?;
-        Ok((status, relayed?))
+        let written = input
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("mapping input writer panicked"))
+                    .and_then(|written| written.map_err(anyhow::Error::from))
+            })
+            .transpose();
+        if status.success() {
+            written.context("send mapping to remote coordinator")?;
+        }
+        Ok::<_, anyhow::Error>((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
     if helper_missing(status.code(), spec.bootstrap_helper) {

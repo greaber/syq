@@ -102,7 +102,9 @@ are truthful.
 
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The
-restricted receiver enforces the destination, options, and limits independently.
+restricted receiver independently enforces the allowed destination paths,
+write and deletion permissions, and limits. Selection based on source facts,
+such as `--skip-newer` timestamp comparisons, relies on the source's reports.
 The source cannot enlarge or replay that permission. SSH and encrypted TCP
 workers share the same live receiver and copy limits. Falling back to SSH
 keeps file data on the source-to-destination route; relaying through your

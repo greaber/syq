@@ -13,6 +13,7 @@ mod fsops;
 mod help;
 mod identity;
 mod janky_cat;
+mod mapping;
 mod native_map;
 mod native_rm;
 mod output;

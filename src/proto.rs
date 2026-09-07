@@ -861,6 +861,12 @@ pub enum Request {
         symlink_policy: OperatorSymlinkPolicy,
         detailed: bool,
     },
+    /// Install a signed mapping on the restricted control connection before filesystem requests.
+    MappingChunk {
+        offset: u64,
+        data: Vec<u8>,
+        finish: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

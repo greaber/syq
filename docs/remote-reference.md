@@ -47,7 +47,9 @@ finish within seven days of authorization.
 | `--no-tcp` | Use SSH workers directly from source to destination |
 | `--tcp-congestion` | The receiver enforces the algorithm authorized for TCP |
 | `--tcp-plain` | Unsupported; data connections must be encrypted |
-| `--mapping`, `--min-size` | Unsupported |
+| `--mapping` | Listed destinations and necessary parent creation are authorized |
+| `--skip-newer` | Timestamp selection uses source-reported modification times |
+| `--min-size` | Unsupported |
 | `--max-size` with `--prune` | Unsupported |
 | Fixed `--connections` above 64 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
