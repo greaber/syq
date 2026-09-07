@@ -155,6 +155,11 @@ using piped rules and a named FIFO with a single writer. They check ordered
 patterns, reinclusion, and protection of ignored destination entries during
 pruning, plus piped filters with automatic and explicit remote authorization.
 
+Desktop approval checks verify that compact prompts keep the destination or
+command prominent and preserve escaped remote text through the notification
+service. Full copy limits and permission details remain available through
+`persist receive pending`; macOS also offers Details and Back buttons.
+
 The disposable runner also checks privileged copies before dropping to its
 normal test user: foreign-owned partials are replaced without modifying their
 inodes, requested final ownership still works, and `--insecure-links` permits
