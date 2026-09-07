@@ -5726,6 +5726,9 @@ impl FsOps {
         {
             bail!("test read-range failure");
         }
+        if u64::from(len) > MAX_READ_BYTES {
+            bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
+        }
         let target = self.source_content_target(source)?;
         let p = resolve(path);
         let f = if let Some((root_id, target)) = target {
@@ -6264,24 +6267,37 @@ impl FsOps {
                 len,
                 ..
             } => self.read_range(path, source.as_ref(), *attempt, *off, *len),
-            Request::ReadSmallBatch(reads) => Ok(Response::SmallBlocks(
-                reads
-                    .iter()
-                    .map(|read| {
-                        match self.read_range(
-                            &read.path,
-                            read.source.as_ref(),
-                            read.attempt,
-                            0,
-                            read.len,
-                        ) {
-                            Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock { data, hash }),
-                            Ok(other) => Err(format!("unexpected response {other:?}")),
-                            Err(error) => Err(errstr(&error)),
-                        }
-                    })
-                    .collect(),
-            )),
+            Request::ReadSmallBatch(reads) => {
+                // Every block is collected before the batch is answered, so
+                // bound the whole batch, not just each read.
+                let total: u64 = reads.iter().map(|read| u64::from(read.len)).sum();
+                if total > MAX_READ_BYTES {
+                    Err(anyhow!(
+                        "small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit"
+                    ))
+                } else {
+                    Ok(Response::SmallBlocks(
+                        reads
+                            .iter()
+                            .map(|read| {
+                                match self.read_range(
+                                    &read.path,
+                                    read.source.as_ref(),
+                                    read.attempt,
+                                    0,
+                                    read.len,
+                                ) {
+                                    Ok(Response::Block { data, hash, .. }) => {
+                                        Ok(SmallBlock { data, hash })
+                                    }
+                                    Ok(other) => Err(format!("unexpected response {other:?}")),
+                                    Err(error) => Err(errstr(&error)),
+                                }
+                            })
+                            .collect(),
+                    ))
+                }
+            }
             Request::WriteRange {
                 path,
                 inplace,
@@ -6944,6 +6960,53 @@ mod tests {
         // Return the control endpoint so tests retain the complete session
         // lifecycle in addition to each worker's own root and leaf clones.
         (worker, selections, control)
+    }
+
+    #[test]
+    fn oversized_reads_are_rejected_before_allocation() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("marker"), b"original").unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+        let marker = selections[0].join(b"marker").unwrap();
+        let path = selected.join("marker").as_os_str().as_bytes().to_vec();
+
+        let response = worker.handle(&Request::ReadRange {
+            path: path.clone(),
+            source: Some(marker.clone()),
+            attempt: 0,
+            off: 0,
+            len: u32::MAX,
+        });
+        assert!(
+            matches!(&response, Response::EndpointError(error) if error.message.contains("exceed")),
+            "{response:?}"
+        );
+
+        // Each read stays under the limit; together they exceed it.
+        let half = u32::try_from(MAX_READ_BYTES / 2 + 1).unwrap();
+        let read = SmallRead {
+            path: path.clone(),
+            source: Some(marker.clone()),
+            attempt: 0,
+            len: half,
+        };
+        let response = worker.handle(&Request::ReadSmallBatch(vec![read.clone(), read]));
+        assert!(
+            matches!(&response, Response::EndpointError(error) if error.message.contains("exceed")),
+            "{response:?}"
+        );
+
+        // A read within the limit still reaches the file.
+        let response = worker.handle(&Request::ReadRange {
+            path,
+            source: Some(marker),
+            attempt: 0,
+            off: 0,
+            len: 8,
+        });
+        assert!(matches!(response, Response::Block { data, .. } if data == b"original"));
     }
 
     #[test]

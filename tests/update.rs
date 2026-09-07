@@ -260,7 +260,7 @@ fn self_update_rejects_a_tampered_archive_without_changing_install() {
         .unwrap();
 
     let update = fixture.command("--self-update");
-    assert_failure_contains(&update, "downloaded release archive has size");
+    assert_failure_contains(&update, "response exceeds the expected");
     fixture.assert_original_unchanged();
 }
 

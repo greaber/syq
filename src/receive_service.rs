@@ -779,12 +779,12 @@ fn configure(options: Configure) -> Result<()> {
             spawn(&control)?;
         }
     }
-    println!("Receiving is on: {} ({})", config.name, config.approval);
-    println!("cwd: {}", config.cwd.display());
+    crate::output::human_stdout!("Receiving is on: {} ({})", config.name, config.approval);
+    crate::output::human_stdout!("cwd: {}", config.cwd.display());
     if let Some(root) = config.root {
-        println!("root: {}", root.display());
+        crate::output::human_stdout!("root: {}", root.display());
     }
-    println!(
+    crate::output::human_stdout!(
         "Applies to persistent syq SSH connections; use syq persist on to enable persistence."
     );
     Ok(())
@@ -804,10 +804,10 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&requests)?);
             } else if requests.is_empty() {
-                println!("No requests awaiting approval");
+                crate::output::human_stdout!("No requests awaiting approval");
             } else {
                 for request in requests {
-                    println!(
+                    crate::output::human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
                         request.description(),
@@ -848,7 +848,7 @@ fn decide(id: &str, allow: bool) -> Result<()> {
             if let Some(error) = response.decision_error {
                 bail!("{error}");
             }
-            println!("{} {id}", if allow { "Approved" } else { "Denied" });
+            crate::output::human_stdout!("{} {id}", if allow { "Approved" } else { "Denied" });
             return Ok(());
         }
     }
@@ -886,7 +886,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             for control in all_controls()? {
                 stop_inner(&control, false)?;
             }
-            println!("Receiving is off; ordinary SSH persistence is unchanged");
+            crate::output::human_stdout!("Receiving is off; ordinary SSH persistence is unchanged");
         }
         Action::Status { json } => {
             let config = settings()?;
@@ -899,18 +899,18 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                     )?
                 );
             } else {
-                println!(
+                crate::output::human_stdout!(
                     "Receiving is {}: {} ({})",
                     if config.enabled { "on" } else { "off" },
                     config.name,
                     config.approval
                 );
-                println!("cwd: {}", config.cwd.display());
+                crate::output::human_stdout!("cwd: {}", config.cwd.display());
                 if let Some(root) = config.root {
-                    println!("root: {}", root.display());
+                    crate::output::human_stdout!("root: {}", root.display());
                 }
                 for state in connections {
-                    println!(
+                    crate::output::human_stdout!(
                         "  {}: {} ({}, {} pending){}",
                         state.endpoint,
                         state.connection.phase,

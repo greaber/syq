@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Require a GitHub-verified annotated tag that directly names the commit being
-# built by this release workflow, is reachable from the protected branch, and
+# Require a maintainer-signed, GitHub-verified annotated tag that directly names
+# the workflow commit, is reachable from the protected branch, and
 # has every named CI check concluded successfully. Pull requests do not run CI;
 # the tagged commit's own post-merge or manual check runs are what prove it.
 set -euo pipefail
@@ -62,6 +62,26 @@ test "$target_commit" = "$expected_commit" || {
 }
 if [ "$verified" != true ] || [ "$reason" != valid ]; then
   echo "GitHub did not verify the signature on release tag $tag (reason: $reason)" >&2
+  exit 1
+fi
+
+# GitHub's verified flag establishes signature validity, not release authority.
+# Verify the signed payload against the public maintainer identity as well.
+command -v ssh-keygen >/dev/null || { echo 'tag verification needs ssh-keygen' >&2; exit 1; }
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+verification_dir=$(mktemp -d "${TMPDIR:-/tmp}/syq-tag-verification.XXXXXXXX")
+trap 'rm -rf "$verification_dir"' EXIT
+for field in signature payload; do
+  if ! jq -ej --arg field "$field" \
+    '.verification[$field] | select(type == "string" and length > 0)' \
+    <<<"$tag_object" >"$verification_dir/$field"; then
+    echo "release tag $tag has a missing, empty, or invalid verification $field" >&2
+    exit 1
+  fi
+done
+if ! ssh-keygen -Y verify -f "$script_dir/release-tag-signers" -I syq-release \
+  -n git -s "$verification_dir/signature" <"$verification_dir/payload"; then
+  echo "release tag $tag was not signed by the pinned maintainer key" >&2
   exit 1
 fi
 

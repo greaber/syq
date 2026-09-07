@@ -183,8 +183,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::On { ephemeral: false } => {
             let scope = ensure_global_scope()?;
             write_global_config(true)?;
-            println!("SSH connection persistence is on");
-            println!("scope: {}", scope.display());
+            crate::output::human_stdout!("SSH connection persistence is on");
+            crate::output::human_stdout!("scope: {}", scope.display());
         }
         PersistAction::Off {
             pscope: Some(scope),
@@ -195,7 +195,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 );
             }
             close_scope(&scope)?;
-            println!("persistence scope closed: {}", scope.display());
+            crate::output::human_stdout!("persistence scope closed: {}", scope.display());
         }
         PersistAction::Off { pscope: None } => {
             // Disable first so a later command cannot intentionally join the
@@ -210,7 +210,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                         .with_context(|| format!("inspect global scope {}", scope.display()));
                 }
             }
-            println!("SSH connection persistence is off");
+            crate::output::human_stdout!("SSH connection persistence is off");
         }
         PersistAction::Status {
             pscope: Some(scope),
@@ -226,7 +226,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::Status { pscope: None, json } => {
             let enabled = global_enabled()?;
             if !json {
-                println!(
+                crate::output::human_stdout!(
                     "SSH connection persistence is {}",
                     if enabled { "on" } else { "off" }
                 );
@@ -241,7 +241,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                             serde_json::json!({"enabled": enabled, "scope": scope, "connections": []})
                         );
                     } else {
-                        println!("connections: 0");
+                        crate::output::human_stdout!("connections: 0");
                     }
                 }
                 Err(error) => {
@@ -281,7 +281,7 @@ fn connect(
             let scope = ensure_global_scope()?;
             if !global_enabled()? {
                 write_global_config(true)?;
-                println!("SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)");
+                crate::output::human_stdout!("SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)");
             }
             scope
         }
@@ -312,7 +312,7 @@ fn connect(
         forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
-    println!("Connecting to {}...", remote.label());
+    crate::output::human_stdout!("Connecting to {}...", remote.label());
     // This uses the same pinned-helper bootstrap and authentication as a copy.
     // No source roots, data workers or filesystem operations are requested.
     let connection = remote.connect_with(true, false)?;
@@ -320,12 +320,14 @@ fn connect(
         crate::receive_service::ensure_ready(multiplexer.control_path(), &remote, timeout)?;
     drop(connection);
     match receiving {
-        Some(name) => println!("{} ready; receiving as @{name}", remote.label()),
-        None if ephemeral => println!(
+        Some(name) => {
+            crate::output::human_stdout!("{} ready; receiving as @{name}", remote.label())
+        }
+        None if ephemeral => crate::output::human_stdout!(
             "{} ready; ephemeral scopes do not support receiving",
             remote.label()
         ),
-        None => println!("{} ready; receiving is disabled", remote.label()),
+        None => crate::output::human_stdout!("{} ready; receiving is disabled", remote.label()),
     }
     Ok(())
 }
@@ -862,41 +864,44 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("scope ({kind}): {}", scope.display());
+    crate::output::human_stdout!("scope ({kind}): {}", scope.display());
     if let Some(error) = &receiving_error {
-        println!("Receiving configuration failed: {error}");
+        crate::output::human_stdout!("Receiving configuration failed: {error}");
     }
-    println!("connections: {}", connections.len());
+    crate::output::human_stdout!("connections: {}", connections.len());
     for connection in connections {
-        print!("  {}  {}", connection.endpoint, connection.state);
+        let mut line = format!("  {}  {}", connection.endpoint, connection.state);
         if kind == "ephemeral" {
-            print!(" (ephemeral scope; receiving not supported)");
+            line.push_str(" (ephemeral scope; receiving not supported)");
         } else if receiving_enabled == Some(false) {
-            print!(" (receiving disabled)");
+            line.push_str(" (receiving disabled)");
         } else if let Some(name) = connection
             .receiving_name
             .as_deref()
             .filter(|name| !name.is_empty())
         {
-            print!(" (receiving as @{name})");
+            line.push_str(&format!(" (receiving as @{name})"));
         }
         if let Some(error) = connection
             .receiving
             .as_ref()
             .and_then(|state| state.error.as_deref())
         {
-            print!(": {error}");
+            line.push_str(&format!(": {error}"));
         }
         if connection.state == "inactive" {
-            print!(
+            line.push_str(&format!(
                 "; run syq persist connect {}",
                 shell_words::quote(&connection.endpoint)
-            );
+            ));
             if kind != "global" {
-                print!(" --pscope {}", shell_words::quote(&scope.to_string_lossy()));
+                line.push_str(&format!(
+                    " --pscope {}",
+                    shell_words::quote(&scope.to_string_lossy())
+                ));
             }
         }
-        println!();
+        crate::output::human_stdout!("{line}");
     }
     Ok(())
 }
