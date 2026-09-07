@@ -918,7 +918,7 @@ fn option_name(arg: &clap::Arg) -> Vec<u8> {
 fn selector_id(id: &str) -> bool {
     matches!(
         id,
-        "src" | "srcs_in" | "src_file" | "src_dir" | "srcs" | "src_files" | "src_dirs"
+        "src" | "srcs_in" | "src_non_dir" | "src_dir" | "srcs" | "src_non_dirs" | "src_dirs"
     )
 }
 
@@ -1190,10 +1190,10 @@ fn native_copy_source_option(option: &[u8]) -> bool {
             | b"--root"
             | b"--src"
             | b"--srcs-in"
-            | b"--src-file"
+            | b"--src-non-dir"
             | b"--src-dir"
             | b"--srcs"
-            | b"--src-files"
+            | b"--src-non-dirs"
             | b"--src-dirs"
             | b"--mapping"
     )
@@ -1223,8 +1223,10 @@ fn value_completion(
             b"--via" => Some(ValueCompletion::ReturnName),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
             | b"--as-existing" => Some(ValueCompletion::DestinationPath),
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
@@ -1239,10 +1241,12 @@ fn value_completion(
             b"--results" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
-            b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"--on" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--pscope" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
@@ -1250,8 +1254,10 @@ fn value_completion(
         },
         "map" => match option {
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-file" | b"--src-dir" | b"--srcs" | b"--src-files"
-            | b"--src-dirs" => Some(ValueCompletion::SourcePath { apply_base: true }),
+            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
+            | b"--src-non-dirs" | b"--src-dirs" => {
+                Some(ValueCompletion::SourcePath { apply_base: true })
+            }
             b"--as" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1454,7 +1460,9 @@ fn complete_source_path(
             path_policy(command, args, true),
         ));
     }
-    let Some(endpoint_text) = find_option_value(args, b"--from") else {
+    let Some(endpoint_text) =
+        find_option_value(args, if command == "rm" { b"--on" } else { b"--from" })
+    else {
         return Ok(local_path_candidates_at(
             current,
             false,

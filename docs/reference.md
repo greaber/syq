@@ -146,38 +146,41 @@ These options apply to individual entries inside the copy:
 
 | Option | Behavior |
 |---|---|
-| `--ignore-existing` | Copy missing entries; keep existing files, symlinks, and special nodes |
-| `--existing` | Update existing entries; create no missing entries or directories |
-| `--update` | Skip regular files whose destination modification time is newer |
+| `--only-new` | Copy missing entries; keep existing entries and their metadata |
+| `--only-existing` | Update existing entries; create no missing entries or directories |
+| `--skip-newer` | Skip regular files whose destination modification time is newer |
 
 ```sh
 # Import new files without replacing existing files.
-syq cp --ignore-existing --srcs-in incoming --into archive
+syq cp --only-new --srcs-in incoming --into archive
 
 # Refresh only files already in the destination.
-syq cp --existing --srcs-in project --into deployed
+syq cp --only-existing --srcs-in project --into deployed
 ```
 
-`--ignore-existing` still descends into existing directories and can update
-their metadata. If a source directory meets an existing non-directory,
+`--only-new` still descends into existing directories to add missing children,
+but does not explicitly change their permissions, ownership, or timestamps.
+Adding or removing children can change directory timestamps through normal
+filesystem behavior. Newly created directories receive normal copy metadata.
+If a source directory meets an existing non-directory,
 it keeps the destination entry and skips that source subtree.
-`--existing` also skips a source directory and its subtree when the destination
-is missing or is not a directory. `--existing` cannot combine with
+`--only-existing` also skips a source directory and its subtree when the destination
+is missing or is not a directory. `--only-existing` cannot combine with
 `--into-new` or `--as-new`. These policies differ from
 `--into-existing` and `--as-existing`, which check the placement path only.
 
-`--update` compares timestamps, not the age of the contents. It affects only
+`--skip-newer` compares timestamps, not the age of the contents. It affects only
 regular-file pairs: replacing a different entry type still occurs.
-Combine it with `--existing` to avoid creating missing entries too.
-`--ignore-existing` cannot combine with either policy. Neither
-`--ignore-existing` nor `--update` can combine with `--inplace`: an interrupted
+Combine it with `--only-existing` to avoid creating missing entries too.
+`--only-new` cannot combine with either policy. Neither
+`--only-new` nor `--skip-newer` can combine with `--inplace`: an interrupted
 in-place write could otherwise leave an incomplete file that the next run skips.
 
 These options do not disable `--prune`; requested pruning still removes extras.
-For command-restricted remote-to-remote copies, `--update` is refused because
+For command-restricted remote-to-remote copies, `--skip-newer` is refused because
 the receiver cannot independently enforce the source timestamp claim.
 Use `--coordinate-at local` to make that comparison on your machine.
-The restricted path also refuses `--existing --inplace`.
+The restricted path also refuses `--only-existing --inplace`.
 
 ## Preview changes
 
@@ -356,7 +359,7 @@ constrain the destination.
 
 ## More options
 
-`--src-file` and `--src-dir` require a non-directory or directory respectively.
+`--src-non-dir` and `--src-dir` require a non-directory or directory respectively.
 Use `--min-size` and `--max-size` to select regular files by size.
 
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,

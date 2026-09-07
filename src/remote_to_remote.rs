@@ -926,9 +926,9 @@ fn run_remote(
     }
     for (enabled, option) in [
         (args.verify_only, "--verify-only"),
-        (args.ignore_existing, "--ignore-existing"),
-        (args.existing, "--existing"),
-        (args.update, "--update"),
+        (args.ignore_existing, "--only-new"),
+        (args.existing, "--only-existing"),
+        (args.update, "--skip-newer"),
     ] {
         if enabled {
             remote.push(option.into());
@@ -1049,7 +1049,7 @@ fn run_remote(
         remote.push(
             match source.selection {
                 SourceSelection::Contents => "--srcs-in",
-                SourceSelection::File => "--src-file",
+                SourceSelection::File => "--src-non-dir",
                 SourceSelection::Directory => "--src-dir",
                 SourceSelection::Named
                 | SourceSelection::NamedNoFollow

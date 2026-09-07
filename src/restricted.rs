@@ -1336,7 +1336,9 @@ impl RestrictedAuthority {
                 }
                 Ok(())
             }
-            ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::Replace => {
+            ExistingDestinationPolicy::Skip
+            | ExistingDestinationPolicy::OnlyNew
+            | ExistingDestinationPolicy::Replace => {
                 match observed {
                     Some(metadata)
                         if directory
@@ -1391,7 +1393,8 @@ impl RestrictedAuthority {
             || pending.iter().any(|creation| creation.path == path);
         match self.copy.policy.existing {
             ExistingDestinationPolicy::Skip if is_dir || own => Ok(()),
-            ExistingDestinationPolicy::Skip => {
+            ExistingDestinationPolicy::OnlyNew if own => Ok(()),
+            ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::OnlyNew => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
             ExistingDestinationPolicy::MustExist if own => Ok(()),
@@ -1449,7 +1452,9 @@ impl RestrictedAuthority {
         }
         let label = String::from_utf8_lossy(path);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if self.rooted_metadata(path)?.is_some() => {
+            ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::OnlyNew
+                if self.rooted_metadata(path)?.is_some() =>
+            {
                 bail!("signed grant retains existing objects: {label} already exists")
             }
             ExistingDestinationPolicy::MustExist if self.rooted_metadata(path)?.is_none() => {
@@ -3785,7 +3790,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.update {
         bail!(
-            "--update compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
+            "--skip-newer compares against source modification times that only hostA reports, so the command-restricted receiver cannot enforce it"
         );
     }
     if args.inplace
@@ -3794,7 +3799,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--inplace cannot be combined with --ignore-existing, --existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
+            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     if !args.dry_run && !args.verify_only && args.delete && args.max_delete.is_none() {
@@ -3939,7 +3944,7 @@ fn grant_for(
     // field; folding it in here would forbid creating files inside an
     // existing directory.
     let existing = if args.ignore_existing {
-        ExistingDestinationPolicy::Skip
+        ExistingDestinationPolicy::OnlyNew
     } else if args.update {
         ExistingDestinationPolicy::UpdateIfOlder
     } else if args.existing {
@@ -5532,6 +5537,33 @@ pub(crate) mod tests {
             flags: 0,
             condition: proto::TargetCondition::Any,
         }
+    }
+
+    #[test]
+    fn signed_only_new_rejects_existing_directory_mutation() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let dir = root.join("target/dir");
+        let new_dir = root.join("target/new-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::OnlyNew,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        assert!(authority.authorize(&mut apply(mkdir(&dir)), false).is_err());
+        assert!(authority
+            .authorize(&mut apply(set_meta(&dir)), false)
+            .is_err());
+        let mut create = apply(mkdir(&new_dir));
+        let settlement = authority.authorize(&mut create, false).unwrap();
+        assert_eq!(op_condition(&create), proto::TargetCondition::Absent);
+        authority.settle(settlement, &proto::Response::Applied(vec![None]));
+        authority
+            .authorize(&mut apply(set_meta(&new_dir)), false)
+            .unwrap();
     }
 
     #[test]

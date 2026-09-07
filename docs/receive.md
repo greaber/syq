@@ -130,9 +130,9 @@ Each request is checked on the laptop before syq issues permission for that
 copy. The restricted filesystem executor then checks individual operations.
 Directory recursion, symlinks, modification times, filters, hashing, resume,
 and staged publication work as in other syq copies. `--preserve=permissions`,
-`--verify-only`, `--ignore-existing`, and `--existing` are supported. Ownership,
-special-file preservation, `--inplace`, `--update`, mappings, and `--min-size`
-are refused. `--update` depends on timestamps supplied by the source that the
+`--verify-only`, `--only-new`, and `--only-existing` are supported. Ownership,
+special-file preservation, `--inplace`, `--skip-newer`, mappings, and `--min-size`
+are refused. `--skip-newer` depends on timestamps supplied by the source that the
 laptop cannot independently verify.
 
 Each copy is limited to 100 GiB and one million touched entries by default.

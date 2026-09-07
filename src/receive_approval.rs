@@ -107,7 +107,8 @@ impl Summary {
             use crate::delegation::ExistingDestinationPolicy::*;
             match request.copy.policy.existing {
                 Replace => "May create and overwrite matching entries",
-                Skip => "May create new entries; keep existing entries",
+                Skip => "May create new entries and update existing directory metadata",
+                OnlyNew => "May create new entries; keep existing entries",
                 MustExist => "May change existing entries only",
                 UpdateIfOlder => bail!("unsupported receiving overwrite policy"),
             }

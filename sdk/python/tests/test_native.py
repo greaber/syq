@@ -66,7 +66,7 @@ if command == "rm":
     status = os.environ.get("SYQ_FAKE_STATUS", "success")
     exit_code = 0 if status == "success" else 23
     selector_total = sum(
-        arg in {"--src", "--srcs-in", "--src-file", "--src-dir"}
+        arg in {"--src", "--srcs-in", "--src-non-dir", "--src-dir"}
         for arg in args
     ) or 1
     records = [{
@@ -353,7 +353,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertLess(argv.index("--mapping"), argv.index("--into"))
 
     def test_rm_hyphen_prefixed_syq_path_uses_an_attached_value(self) -> None:
-        self.client.rm("victim", from_="host", syq_path="-helper")
+        self.client.rm("victim", on="host", syq_path="-helper")
 
         argv = self.argv()
         self.assertIn("--syq-path=-helper", argv)
@@ -366,9 +366,9 @@ class NativeClientTests(unittest.TestCase):
         result = self.client.rm(
             src="victim",
             srcs_in="contents",
-            src_file="leaf",
+            src_non_dir="leaf",
             src_dir="tree",
-            from_="source",
+            on="source",
             root="source-root",
             follow_src=True,
             dry_run=True,
@@ -400,9 +400,9 @@ class NativeClientTests(unittest.TestCase):
             "rm",
             "--src",
             "--srcs-in",
-            "--src-file",
+            "--src-non-dir",
             "--src-dir",
-            "--from",
+            "--on",
             "--root",
             "--follow-src",
             "--dry-run",

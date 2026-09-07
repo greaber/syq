@@ -104,7 +104,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
             ) || (rm && id == "root")
         };
         let heading = match id {
-            "sources" | "paths" | "src" | "srcs_in" | "src_file" | "src_dir" | "src_files"
+            "sources" | "paths" | "src" | "srcs_in" | "src_non_dir" | "src_dir" | "src_non_dirs"
             | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "follow" | "follow_src" => {
                 "Sources and selection"
             }
@@ -134,7 +134,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
         if rm && id == "syq_path" {
             arg = arg.help("Use this exact syq executable on the remote removal endpoint");
         } else if rm && matches!(id, "follow" | "follow_src") {
-            arg = arg.help("Follow symlinks in supplied source paths; remove the selected target, leaving the link");
+            arg = arg.help("Follow parent-directory symlinks; always remove a final selected symlink as a link");
         } else if rm && id == "verbose" {
             arg = arg.help("List removed paths");
         } else if id == "verbose" && !map {

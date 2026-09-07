@@ -160,6 +160,8 @@ pub(crate) enum ExistingDestinationPolicy {
     Skip,
     UpdateIfOlder,
     MustExist,
+    /// Create missing entries without changing existing directory metadata.
+    OnlyNew,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

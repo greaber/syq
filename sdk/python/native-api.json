@@ -12,7 +12,7 @@
         "follow-dst",
         "src",
         "srcs-in",
-        "src-file",
+        "src-non-dir",
         "src-dir",
         "to",
         "into",
@@ -44,9 +44,9 @@
         "receiver-receipt",
         "hash",
         "verify-only",
-        "ignore-existing",
-        "existing",
-        "update",
+        "only-new",
+        "only-existing",
+        "skip-newer",
         "no-compress",
         "bwlimit",
         "ignore",
@@ -63,7 +63,7 @@
       ],
       "aliases": {
         "srcs": "src",
-        "src-files": "src-file",
+        "src-non-dirs": "src-non-dir",
         "src-dirs": "src-dir"
       },
       "raw_only": [
@@ -81,14 +81,14 @@
     "rm": {
       "sdk": "python",
       "python": [
-        "from",
+        "on",
         "cwd",
         "root",
         "follow",
         "follow-src",
         "src",
         "srcs-in",
-        "src-file",
+        "src-non-dir",
         "src-dir",
         "results",
         "dry-run",
@@ -102,7 +102,7 @@
       ],
       "aliases": {
         "srcs": "src",
-        "src-files": "src-file",
+        "src-non-dirs": "src-non-dir",
         "src-dirs": "src-dir"
       },
       "raw_only": [
@@ -124,13 +124,13 @@
         "follow-src",
         "src",
         "src-dir",
-        "src-file",
+        "src-non-dir",
         "srcs-in"
       ],
       "internal": [],
       "aliases": {
         "srcs": "src",
-        "src-files": "src-file",
+        "src-non-dirs": "src-non-dir",
         "src-dirs": "src-dir"
       },
       "raw_only": [],

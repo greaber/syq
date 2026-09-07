@@ -213,7 +213,7 @@ remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.ma
 ) > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
 ssh source 'syq cp --verify-only --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
-ssh source 'syq cp --ignore-existing /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
+ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
@@ -618,17 +618,33 @@ assert_same_tree \
     destination /tmp/syq-real-ssh/direct-destination \
     direct
 
+printf 'case: native remote removal follows parents but preserves final link identity\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/rm-policy/real; printf keep > /tmp/syq-real-ssh/rm-policy/real/file; ln -s real /tmp/syq-real-ssh/rm-policy/link'
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src --src-non-dir link
+ssh source 'test ! -L /tmp/syq-real-ssh/rm-policy/link; test "$(cat /tmp/syq-real-ssh/rm-policy/real/file)" = keep; ln -s real /tmp/syq-real-ssh/rm-policy/link'
+policy_status=0
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src --srcs-in link || policy_status=$?
+test "$policy_status" -ne 0
+ssh source 'test -f /tmp/syq-real-ssh/rm-policy/real/file'
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src link/file
+ssh source 'test -L /tmp/syq-real-ssh/rm-policy/link; test ! -e /tmp/syq-real-ssh/rm-policy/real/file'
+
 printf 'case: native verification and overwrite policies through the restricted receiver\n'
 syq cp --verify-only --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh source 'printf source > /tmp/syq-real-ssh/direct-source/policy-file; printf new > /tmp/syq-real-ssh/direct-source/policy-new'
 ssh destination 'printf destination > /tmp/syq-real-ssh/direct-destination/policy-file'
-syq cp --ignore-existing --no-progress -j 2 \
+ssh source 'mkdir -p /tmp/syq-real-ssh/direct-source/policy-dir/new; chmod 750 /tmp/syq-real-ssh/direct-source/policy-dir /tmp/syq-real-ssh/direct-source/policy-dir/new'
+ssh destination 'mkdir -p /tmp/syq-real-ssh/direct-destination/policy-dir; chmod 711 /tmp/syq-real-ssh/direct-destination/policy-dir'
+
+syq cp --only-new --preserve=permissions --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = destination; test "$(cat /tmp/syq-real-ssh/direct-destination/policy-new)" = new; rm /tmp/syq-real-ssh/direct-destination/policy-new'
-syq cp --existing --no-progress -j 2 \
+ssh destination 'test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir)" = 711; test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir/new)" = 750'
+
+syq cp --only-existing --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
@@ -639,13 +655,13 @@ syq cp --verify-only --no-progress -j 2 \
 test "$policy_status" -eq 23
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 policy_status=0
-syq cp --update --no-progress -j 2 \
+syq cp --skip-newer --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
 test "$policy_status" -ne 0
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'
-syq cp --update --coordinate-at local --no-progress -j 2 \
+syq cp --skip-newer --coordinate-at local --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
