@@ -123,6 +123,24 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: restricted SSH worker handshake, revocation, and resume\n'
+python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
+
+printf 'case: long receiver home supports explicit SSH and blocked-TCP fallback\n'
+ssh longhome@destination 'test "${#HOME}" -gt 36; mkdir -p /tmp/syq-long-home'
+make_tree source /tmp/syq-real-ssh/long-home-source long-home
+syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+    --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
+    --to longhome@destination --into /tmp/syq-long-home/explicit
+assert_same_tree source /tmp/syq-real-ssh/long-home-source \
+    longhome@destination /tmp/syq-long-home/explicit long-home-explicit
+syq cp --no-progress -j 2 --preserve=permissions \
+    --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
+    --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
+    --to longhome@destination --into /tmp/syq-long-home/fallback
+assert_same_tree source /tmp/syq-real-ssh/long-home-source \
+    longhome@destination /tmp/syq-long-home/fallback long-home-fallback
+
 printf 'case: ephemeral connect only reuses forward SSH and leaves receiving off\n'
 ephemeral_connect_scope=$(syq persist on --ephemeral)
 syq persist connect source --pscope "$ephemeral_connect_scope"
@@ -667,7 +685,7 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
-syq cp --no-progress -j 2 --preserve=permissions \
+syq cp --no-progress -j 2 --preserve=permissions --tcp-congestion cubic \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
@@ -726,7 +744,7 @@ ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" 
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
 syq cp --no-progress -j 2 --preserve=permissions \
-    --peer-auth broker --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
+    --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
 assert_same_tree \
@@ -737,13 +755,22 @@ assert_same_tree \
 printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
 syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
-    --peer-auth broker \
     --from source --srcs-in /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
     source /tmp/syq-real-ssh/ssh-source \
     destination /tmp/syq-real-ssh/ssh-destination \
     ssh
+
+printf 'case: an unavailable direct SSH data route fails without relaying through the runner\n'
+ssh source 'dd if=/dev/zero of=/tmp/syq-real-ssh/no-route-source bs=1048576 count=2 status=none; touch /tmp/syq-real-ssh-block-restricted-workers'
+route_status=0
+syq cp --no-progress --no-tcp -j 1 \
+    --from source /tmp/syq-real-ssh/no-route-source \
+    --to destination --as /tmp/syq-real-ssh/no-route-destination || route_status=$?
+ssh source 'rm /tmp/syq-real-ssh-block-restricted-workers'
+test "$route_status" -ne 0
+ssh destination 'test ! -e /tmp/syq-real-ssh/no-route-destination'
 
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull

@@ -73,6 +73,8 @@ Source-shell remote copies also cover cached helper reuse, bootstrap after a
 missing or unexecutable helper, a delayed approval relay before Hello, and
 remote-home tilde paths alongside literal `./~` paths.
 
+Revocation and resume are exercised with both encrypted TCP and restricted SSH workers.
+
 The smoke suite also checks that pooled helpers keep the spawning command’s
 `SendEnv` values, while direct sessions and restarted persistence use the new
 values. A remote wrapper records one test variable and executes the candidate
@@ -80,9 +82,10 @@ helper, so the check exercises real OpenSSH environment forwarding.
 
 The smoke suite currently covers rejection of a restricted destination that
 overlaps the receiver's SSH control plane, source-side direct coordination with
-automatic restricted-destination enrollment over encrypted TCP, source-side
-coordination with constrained authentication, firewall-triggered TCP fallback,
-explicitly selected SSH data channels, destination-side coordination through
+automatic restricted-destination enrollment over encrypted TCP with an approved
+congestion algorithm, firewall-triggered fallback to restricted SSH workers,
+explicitly selected restricted SSH data channels (including receivers with long
+account-home paths for both SSH modes), destination-side coordination through
 the reversed constrained-agent edge, and an explicit local relay. Every path
 uses real SSH for control and bootstrap, and the suite compares the complete
 source and destination manifests afterward.

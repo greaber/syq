@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -50,11 +51,13 @@ def stop(process):
 
 
 def main():
+    assert sys.argv[1:] in ([], ["--no-tcp"])
+    transport = sys.argv[1:]
     root = "/tmp/syq-real-ssh/revoke-active-" + uuid.uuid4().hex
     source = "/tmp/syq-real-ssh/revoke-source"
     remote("mkdir -p " + shlex.quote(root))
     run("ssh", "source", "python3 -c " + shlex.quote(
-        f"from pathlib import Path; Path({source!r}).write_bytes(b'x' * (32 << 20))"))
+        f"from pathlib import Path; p = Path({source!r}); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b'x' * (32 << 20))"))
     run("syq", "receiver", "enroll", f"destination:{root}/one")
     before = enrollment(root)
     # EnrollmentId is serialized as bytes in the private JSON state.
@@ -68,7 +71,7 @@ def main():
             outputs.append(output)
             process = subprocess.Popen([
                 "syq", "cp", "--from", "source", source, "--to", "destination",
-                "--as", f"{root}/{name}", "--connections", "1", "--bwlimit", "1M", "--no-progress",
+                "--as", f"{root}/{name}", "--connections", "1", "--bwlimit", "1M", "--no-progress", *transport,
             ], stdout=output, stderr=output, start_new_session=True)
             processes.append(process)
         probe = "python3 -c " + shlex.quote(f"""
@@ -100,7 +103,7 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
             with tempfile.TemporaryDirectory(prefix="revoke-resume-results-") as temporary:
                 results = Path(temporary) / "results.ndjson"
                 run("syq", "cp", "--from", "source", source, "--to", "destination",
-                    "--as", f"{root}/{name}", "--connections", "2", "--no-progress", "--results", str(results))
+                    "--as", f"{root}/{name}", "--connections", "2", "--no-progress", "--results", str(results), *transport)
                 terminal = [json.loads(line) for line in results.read_text().splitlines()][-1]
                 assert terminal["type"] == "result" and terminal["status"] == "success", terminal
                 assert 0 < terminal["bytes_transferred"] <= 28 << 20, terminal
@@ -108,6 +111,13 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
             assert actual == hashlib.sha256(b'x' * (32 << 20)).hexdigest()
         run("syq", "receiver", "revoke", bytes(after["id"]).hex())
         print("Active receiver revocation and fresh-enrollment resume passed", flush=True)
+    except BaseException:
+        for process in processes:
+            stop(process)
+        for output in outputs:
+            output.seek(0)
+            print(output.read().decode(errors="replace"), end="", flush=True)
+        raise
     finally:
         for process in processes:
             stop(process)

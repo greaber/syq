@@ -7,6 +7,7 @@ control_path='unset'
 host='unset'
 next_is_control_path=false
 next_is_host=false
+restricted_worker=no
 for argument do
     if [ "$next_is_host" = true ]; then
         host=$argument
@@ -21,6 +22,7 @@ for argument do
     case "$argument" in
         ControlMaster=*) control_master=${argument#ControlMaster=} ;;
         ControlPath=*) control_path=${argument#ControlPath=} ;;
+        *--restricted-worker=*) restricted_worker=yes ;;
         -S) next_is_control_path=true ;;
         --) next_is_host=true ;;
     esac
@@ -43,14 +45,18 @@ fi
 trace=/tmp/syq-real-ssh-ssh.trace
 printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\n' \
     "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" >>"$trace"
-if [ "$strict_mux" = yes ]; then
+if [ "$restricted_worker" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-workers ]; then
+    printf 'restricted SSH worker blocked by the route test\n' >&2
+    status=255
+elif [ "$strict_mux" = yes ]; then
     # A live control socket is tried first. If sshd rejects that channel,
     # prevent OpenSSH from hiding the rejection with its own direct fallback.
     /usr/bin/ssh -o ProxyCommand=false "$@"
+    status=$?
 else
     /usr/bin/ssh "$@"
+    status=$?
 fi
-status=$?
 printf 'phase=end\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\tstatus=%s\n' \
     "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$status" >>"$trace"
 exit "$status"

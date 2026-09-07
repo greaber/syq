@@ -103,7 +103,10 @@ are truthful.
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The
 restricted receiver enforces the destination, options, and limits independently.
-The source cannot enlarge or replay that permission.
+The source cannot enlarge or replay that permission. SSH and encrypted TCP
+workers share the same live receiver and copy limits. Falling back to SSH
+keeps file data on the source-to-destination route; relaying through your
+machine requires explicit `--coordinate-at local`.
 
 The receiver signs what it did, and your machine verifies the receipt. A
 source cannot forge a clean account of destination changes. It can still omit

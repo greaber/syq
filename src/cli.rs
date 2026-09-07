@@ -2160,7 +2160,7 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
+pub(crate) fn parse_tcp_congestion(value: &str) -> std::result::Result<String, String> {
     // Linux's TCP_CA_NAME_MAX is 16 including the terminating NUL. Keep this
     // validation platform-independent so a forwarded command fails the same
     // way on every coordinator. The kernel otherwise looks up the registered
