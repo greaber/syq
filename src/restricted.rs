@@ -2085,8 +2085,7 @@ impl RestrictedAuthority {
                     if *flags & !(proto::flags::MODE | proto::flags::RECEIVER_MODE) != 0
                         || remembered.is_none()
                         || (!matches!(remembered, Some(ReceiverModeState::Existing { .. }))
-                            && !self.created_by_this_grant(path)
-                            && !pending.iter().any(|creation| creation.path == *path))
+                            && !self.created_by_this_grant(path))
                     {
                         bail!("mapping cannot change metadata of an existing implicit parent");
                     }
@@ -6297,6 +6296,43 @@ esac
             );
             assert!(authority.created_by_this_grant(&path_bytes(&parent)));
         }
+    }
+
+    #[test]
+    fn mapping_pending_parent_creation_cannot_authorize_foreign_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::tempdir().unwrap();
+        let parent = root.path().join("target/parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o550)).unwrap();
+        let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+        admit_test_mapping(&mut authority, "parent/item");
+        let mut request = Request::Apply {
+            ops: vec![
+                Op::Mkdir {
+                    path: path_bytes(&parent),
+                    mode: 0o755,
+                    condition: proto::TargetCondition::Absent,
+                },
+                Op::SetMeta {
+                    path: path_bytes(&parent),
+                    meta: plain_meta(),
+                    flags: proto::flags::RECEIVER_MODE,
+                    condition: proto::TargetCondition::Any,
+                },
+            ],
+            guard: None,
+        };
+        // Reject during authorization, without relying on the executor to
+        // abort metadata after the guarded mkdir inevitably fails.
+        let error = authority.authorize(&mut request, false).unwrap_err();
+        assert!(
+            error.to_string().contains("existing implicit parent"),
+            "{error:#}"
+        );
+        assert!(!authority.created_by_this_grant(&path_bytes(&parent)));
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

@@ -84,12 +84,33 @@ def direct():
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", stable, "--no-tcp"], data=manifest([("file", "parent/item", "file")]))
         after = ssh("destination", f"from pathlib import Path; print((Path({stable!r})/'parent').stat().st_ctime_ns)").stdout.strip()
         assert before == after, (before, after)
+        # A protected implicit parent blocks only its mapped descendants.
+        blocked = root + "/blocked"
+        ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); p.mkdir(); (p/'blocked-file').write_bytes(b'keep file'); (p/'protected').mkdir(); (p/'protected'/'sentinel').write_bytes(b'keep target'); (p/'blocked-link').symlink_to('protected')")
+        blocked_entries = [("file", "blocked-file/deep/item", "file"), ("file", "blocked-link/item", "file"), ("directory", "blocked-file/directory", "dir")]
+        selected = manifest(blocked_entries + [("file", "good/item", "file")])
+        preview = run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--dry-run"], data=selected, expected=23)
+        assert preview.stderr.count(b"blocks an implicit mapping parent") == len(blocked_entries), preview.stderr
+        ssh("destination", f"from pathlib import Path; assert not (Path({blocked!r})/'good').exists()")
+        results_path = Path(temporary) / "results-blocked.ndjson"
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", blocked, "--no-tcp", "--results", str(results_path)], data=selected, expected=23)
+        records = [json.loads(line) for line in results_path.read_text().splitlines()]
+        failed = [r for r in records if r.get("disposition") == "failed"]
+        assert sorted((r["src"]["value"], r["dst"]["value"]) for r in failed) == sorted((src, dst) for src, dst, _ in blocked_entries), failed
+        ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); assert (p/'blocked-file').read_bytes()==b'keep file'; assert (p/'blocked-link').is_symlink(); assert list((p/'protected').iterdir())==[p/'protected'/'sentinel']; assert (p/'protected'/'sentinel').read_bytes()==b'keep target'; assert (p/'good'/'item').read_bytes()==b'mapped contents'")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")
-        large = manifest([("file", f"group/file-{i}", "file") for i in range(10_000)] + [("directory", "group", "dir")])
+        # The later explicit group entry permits replacing its old file, while
+        # blocked descendants in different scan batches fail independently.
+        ssh("destination", f"from pathlib import Path; p=Path({root + '/large'!r}); p.mkdir(); (p/'group').write_bytes(b'replace explicit parent'); (p/'blocked').write_bytes(b'keep implicit parent')")
+        large = manifest([("file", "blocked/first", "file")] + [("file", f"group/file-{i}", "file") for i in range(10_000)] + [("directory", "group", "dir"), ("file", "blocked/last", "file")])
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions"], data=large)
+        results_path = Path(temporary) / "results-large.ndjson"
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        records = [json.loads(line) for line in results_path.read_text().splitlines()]
+        assert sorted(r["dst"]["value"] for r in records if r.get("disposition") == "failed") == ["blocked/first", "blocked/last"]
+        ssh("destination", f"from pathlib import Path; assert Path({root + '/large/blocked'!r}).read_bytes()==b'keep implicit parent'")
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
     print("Restricted mapping and timestamp selection passed", flush=True)
 

@@ -1635,7 +1635,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         let parsed = read_mapping_manifest(contents)?;
         args.mapping_contents = Some(Arc::new(parsed.input));
-        Some(parsed.entries)
+        Some((parsed.entries, parsed.explicit_parents))
     } else {
         None
     };
@@ -2941,6 +2941,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
+        mapping_explicit_parents: std::collections::HashSet::new(),
+        blocked_mapping_parents: std::collections::HashSet::new(),
         implicit_restorations: Vec::new(),
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root && opts.preserve_existing_directory_metadata {
@@ -2983,14 +2985,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut fresh_capacity_assessment = None;
     let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some(mapping_entries) = mapping_entries {
+    if let Some((mapping_entries, explicit_parents)) = mapping_entries {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, mapping_entries) {
+        match st.scan_mapping(
+            &mut *src_ctl,
+            &src.path,
+            &dst_root,
+            mapping_entries,
+            explicit_parents,
+        ) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -4728,6 +4736,11 @@ struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     implicit_dirs: std::collections::HashSet<PathBytes>,
+    /// Manifest-relative parents with their own entry, even in a later batch.
+    /// The signed mapping permits replacing these, unlike implicit parents.
+    mapping_explicit_parents: std::collections::HashSet<PathBytes>,
+    /// Observed obstructions at implicit parents fail only mapped descendants.
+    blocked_mapping_parents: std::collections::HashSet<PathBytes>,
     /// Only implicit parents actually reopened for writing need a final chmod.
     /// Keep these separate until the manifest is complete: a later explicit
     /// directory entry supplies its own deferred metadata instead.
@@ -5237,9 +5250,13 @@ impl Planner<'_> {
         src_root: &[u8],
         dst_root: &[u8],
         entries: Vec<(u64, ManifestEntry)>,
+        explicit_parents: std::collections::HashSet<PathBytes>,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         self.mapping_mode = true;
+        if self.opts.restricted_receiver {
+            self.mapping_explicit_parents = explicit_parents;
+        }
         let source_base = self
             .active_source
             .clone()
@@ -5539,6 +5556,8 @@ impl Planner<'_> {
         // alone still needs the destination claims and live sidecar names.
         self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
+        self.mapping_explicit_parents = std::collections::HashSet::new();
+        self.blocked_mapping_parents = std::collections::HashSet::new();
         self.dry_run_replaced_dirs = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
         // Dry-run directory traces are intentionally deferred until after
@@ -5607,6 +5626,9 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
+            if claim != Claim::Weak && self.fail_blocked_mapping_entry(&dst, &dst_rel, e.kind) {
+                continue;
+            }
             self.record_fresh_entry(&dst, &e, new_capacity_object);
             let src = match self.src_overrides.get(&e.path) {
                 Some(actual) => join(src_root, actual),
@@ -5783,7 +5805,7 @@ impl Planner<'_> {
         let Mapped {
             dst_root,
             dirs,
-            others,
+            mut others,
             dir_stats,
             mut other_stats,
         } = mapped;
@@ -5802,6 +5824,9 @@ impl Planner<'_> {
             };
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
+                if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
+                    continue;
+                }
                 // Keep the parent-first overlay invariant explicit here too:
                 // a directory below a replacement is missing in the virtual
                 // destination tree.
@@ -5841,6 +5866,18 @@ impl Planner<'_> {
                         ));
                     }
                     self.missing_dirs.insert(p);
+                    continue;
+                }
+                if opts.restricted_receiver
+                    && self.implicit_dirs.contains(&p)
+                    && !self.mapping_explicit_parents.contains(&dst_rel)
+                    && st.is_some()
+                    && !is_dir
+                {
+                    // Parent creation does not grant permission to replace a
+                    // file or symlink. Use the stat already in this batch to
+                    // fail affected entries before sending any mkdir request.
+                    self.blocked_mapping_parents.insert(p);
                     continue;
                 }
                 if opts.dry_run && st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
@@ -6136,6 +6173,9 @@ impl Planner<'_> {
             }
         }
 
+        if !self.blocked_mapping_parents.is_empty() {
+            others.retain(|p| !self.fail_blocked_mapping_entry(&p.dst, &p.dst_rel, p.e.kind));
+        }
         if others.is_empty() {
             return Ok(());
         }
@@ -6801,6 +6841,41 @@ impl Planner<'_> {
                 .cloned()
                 .unwrap_or_else(|| dst_rel.to_vec()),
         )
+    }
+
+    /// Report only real manifest entries beneath a protected obstruction;
+    /// synthesized directories have no source object or retry record.
+    fn fail_blocked_mapping_entry(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) -> bool {
+        if !Self::under_any(&self.blocked_mapping_parents, dst, &self.dst_root) {
+            return false;
+        }
+        if !self.implicit_dirs.contains(dst) {
+            let message = format!(
+                "syq: {}: a file or symlink blocks an implicit mapping parent",
+                display(dst)
+            );
+            self.progress
+                .error_classified(&message, Some("conflict"), None);
+            self.emit_mapping_entry_failed(
+                &ManifestEntry {
+                    src: self
+                        .mapping_source_rel(dst_rel)
+                        .expect("mapping parent failure"),
+                    dst: dst_rel.to_vec(),
+                    kind: Some(match kind {
+                        Kind::Dir => DeclaredKind::Dir,
+                        Kind::File => DeclaredKind::File,
+                        Kind::Symlink => DeclaredKind::Symlink,
+                        _ => DeclaredKind::Special,
+                    }),
+                },
+                "unknown",
+                "conflict",
+                None,
+                &message,
+            );
+        }
+        true
     }
 
     /// A mapping entry that failed before any job existed (missing source,
