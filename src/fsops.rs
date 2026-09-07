@@ -5300,6 +5300,23 @@ impl FsOps {
         let destination_key = file_system_key(&d, destination_dev);
         let source_fs = file_system_traits(&s, source_key);
         let destination_fs = file_system_traits(&d, destination_key);
+        // Exercise fallback policy independently of the filesystem hosting the
+        // integration tests. Apply before the NFS/synchronous overrides so those
+        // exclusions can still be tested with otherwise eligible local traits.
+        #[cfg(debug_assertions)]
+        let (source_fs, destination_fs) = match std::env::var("SYQ_TEST_COPY_LOCAL_FS").as_deref() {
+            Ok("local") => {
+                let local = FileSystemTraits {
+                    measured_local_source: true,
+                    local_userspace_copy: true,
+                    ..FileSystemTraits::default()
+                };
+                (local, local)
+            }
+            Ok("unsupported") => (FileSystemTraits::default(), FileSystemTraits::default()),
+            Ok(value) => panic!("unknown SYQ_TEST_COPY_LOCAL_FS value: {value}"),
+            Err(_) => (source_fs, destination_fs),
+        };
         #[cfg(debug_assertions)]
         let source_fs = FileSystemTraits {
             is_nfs: source_fs.is_nfs

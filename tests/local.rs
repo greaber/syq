@@ -910,6 +910,7 @@ fn copy_local_uses_registered_source_after_path_replacement() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
+            .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_FS", "local")))
             .start()
             .unwrap();
 
@@ -960,6 +961,7 @@ fn copy_local_refuses_a_replaced_destination_parent() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
+            .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_FS", "local")))
             .start()
             .unwrap();
 
@@ -1013,6 +1015,7 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
+            .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_FS", "local")))
             .start()
             .unwrap();
 
@@ -11535,6 +11538,7 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         let out = command
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()
             .unwrap();
         assert_output_ok(&out);
@@ -11545,6 +11549,27 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         assert!(observed["small_batches"].as_u64().unwrap() > 0);
         assert!(partial_files(&t.0).is_empty());
     }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_unsupported_filesystems_retain_ranges() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(5 << 20, 460));
+    write(&t.path("src/other"), &prng(5 << 20, 461));
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 0);
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -11566,6 +11591,7 @@ fn copy_local_disk_whole_files_write_concurrently() {
         ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
         .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
         .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
@@ -11615,6 +11641,7 @@ fn copy_local_disk_single_file_retains_parallel_ranges() {
         let out = command
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()
             .unwrap();
         assert_output_ok(&out);
@@ -11651,6 +11678,7 @@ fn copy_local_disk_exdev_preserves_range_controls() {
             .args(args)
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .envs(synchronous.then_some(("SYQ_TEST_COPY_LOCAL_NFS_SYNC", "1")))
             .run()
             .unwrap();
@@ -11674,6 +11702,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
         .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
         .run()
         .unwrap();
@@ -11696,6 +11725,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
         .run()
         .unwrap();
     assert_output_ok(&out);
@@ -11717,6 +11747,7 @@ fn copy_local_disk_source_shrink_is_not_published() {
     let mut child = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
         .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", &ready)
         .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &resume)
         .stdout(Stdio::piped())
