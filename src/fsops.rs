@@ -6591,9 +6591,16 @@ const PRIVATE_PARTIAL_MODE: u32 = 0o600;
 /// Creation mode for a whole-file sidecar: the final permission bits, so that
 /// publication needs no separate chmod (on a network filesystem every setattr
 /// is a round trip). Special bits are still applied by `set_meta_file` once the
-/// content is written. Without a requested mode the sidecar stays private.
+/// content is written.
+///
+/// The sidecar stays private when no mode is requested, and when group
+/// preservation is requested: the kernel assigns the receiver's or a setgid
+/// parent's group at creation, and final group bits would let that group read
+/// or write the content until the chown. Without group preservation the group
+/// at creation is the final group, and the owner bits only widen access for
+/// the receiver, which already holds the content.
 fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
-    if flags & flags::MODE_MASK != 0 {
+    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 {
         meta.mode & 0o777
     } else {
         PRIVATE_PARTIAL_MODE
@@ -7785,6 +7792,35 @@ mod tests {
         let private = dir.path().join("private");
         assert_eq!(fs::read(&private).unwrap(), b"new");
         assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() {
+        let meta = |mode: u32| Meta {
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        // Without group preservation the sidecar carries the final bits, so
+        // publication needs no chmod.
+        assert_eq!(staged_file_mode(&meta(0o640), flags::RECEIVER_MODE), 0o640);
+        assert_eq!(staged_file_mode(&meta(0o644), flags::MODE), 0o644);
+        // Special bits wait until the content is written.
+        assert_eq!(staged_file_mode(&meta(0o4755), flags::MODE), 0o755);
+        // Group preservation can change the group after creation, so group
+        // bits must not be granted to the group the kernel assigns.
+        assert_eq!(
+            staged_file_mode(&meta(0o640), flags::RECEIVER_MODE | flags::GROUP),
+            PRIVATE_PARTIAL_MODE
+        );
+        // Without a requested mode the sidecar stays private.
+        assert_eq!(staged_file_mode(&meta(0o640), 0), PRIVATE_PARTIAL_MODE);
+        assert_eq!(
+            staged_file_mode(&meta(0o640), flags::TIMES),
+            PRIVATE_PARTIAL_MODE
+        );
     }
 
     #[test]
