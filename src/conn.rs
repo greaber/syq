@@ -1319,17 +1319,22 @@ pub(crate) struct SshMultiplexer {
     /// deliberately outlives this process.
     _directory: Option<tempfile::TempDir>,
     path: PathBuf,
-    /// A managed persistence scope uses ControlMaster=auto with a
-    /// ControlPersist window, so later syq runs in that scope skip the SSH
-    /// handshake.
+    /// A managed persistence scope keeps its control master alive, so later
+    /// syq runs in that scope skip the SSH handshake.
     persistent: bool,
+    idle_timeout: &'static str,
+    automatic_receiving: bool,
     reuse_for_workers: AtomicBool,
 }
 
-/// How long a persistent control master lingers after its last client, in
-/// seconds. Long enough for scripted bursts of runs; short enough that the
-/// no-reauthentication window stays comparable to sudo's credential cache.
-const REUSE_PERSIST_SECONDS: &str = "300";
+// Keepalives detect dead transports so a later command can reconnect. Durable
+// logins have no idle expiry; abandoned script scopes retain a bounded lifetime.
+const PERSISTENT_SSH_OPTIONS: &[&str] = &[
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+];
 
 /// The oldest OpenSSH release whose client speaks the agent session-bind
 /// extension and host-bound public-key authentication. Constrained agent
@@ -1436,6 +1441,8 @@ impl SshMultiplexer {
             _directory: Some(directory),
             path,
             persistent: false,
+            idle_timeout: "no",
+            automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
         })
     }
@@ -1447,12 +1454,24 @@ impl SshMultiplexer {
         port: Option<u16>,
     ) -> Result<Self> {
         let path = crate::persistence::prepare_endpoint(scope, user, host, port)?;
+        let global = crate::persistence::is_global_scope(scope)?;
         Ok(Self {
             _directory: None,
             path,
             persistent: true,
+            idle_timeout: if global { "yes" } else { "300" },
+            automatic_receiving: global,
             reuse_for_workers: AtomicBool::new(false),
         })
+    }
+
+    /// The explicit connect command starts receiving once and propagates setup errors.
+    pub(crate) fn defer_receiving(&mut self) {
+        self.automatic_receiving = false;
+    }
+
+    pub(crate) fn control_path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn set_reuse_for_workers(&self, reuse: bool) {
@@ -1628,7 +1647,8 @@ impl RemoteSpec {
                         .arg("-S")
                         .arg(crate::persistence::openssh_control_path(&multiplexer.path))
                         .arg("-o")
-                        .arg(format!("ControlPersist={REUSE_PERSIST_SECONDS}"));
+                        .arg(format!("ControlPersist={}", multiplexer.idle_timeout))
+                        .args(PERSISTENT_SSH_OPTIONS);
                 } else {
                     if master {
                         // A failed control command can leave its socket briefly
@@ -1728,7 +1748,9 @@ impl RemoteSpec {
                     );
                 }
                 self.record_peer(&conn);
-                crate::receive_service::ensure(&multiplexer.path, self);
+                if multiplexer.automatic_receiving {
+                    crate::receive_service::ensure(&multiplexer.path, self);
+                }
                 Some(conn)
             }
             Err(error) => {
@@ -2028,7 +2050,9 @@ impl RemoteSpec {
             if let Some(multiplexer) = &self.ssh_multiplexer {
                 if multiplexer.persistent {
                     crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
-                    crate::receive_service::ensure(&multiplexer.path, self);
+                    if multiplexer.automatic_receiving {
+                        crate::receive_service::ensure(&multiplexer.path, self);
+                    }
                 }
             }
         }
@@ -4712,9 +4736,7 @@ mod tests {
         assert!(control
             .windows(2)
             .any(|pair| pair[0] == "-S" && pair[1] == control_path));
-        assert!(control
-            .iter()
-            .any(|arg| arg == &format!("ControlPersist={REUSE_PERSIST_SECONDS}")));
+        assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
         // Worker data channels never ride a cross-run master, even when the
         // small-file path asks for in-run multiplexing.
         spec.set_ssh_multiplexing(true);
@@ -4742,6 +4764,8 @@ mod tests {
             _directory: None,
             path: PathBuf::from("/tmp/syq-test-socket"),
             persistent: true,
+            idle_timeout: "300",
+            automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
         }));
         assert!(!verbose(&spec, true));
@@ -4762,6 +4786,8 @@ mod tests {
             _directory: None,
             path,
             persistent: true,
+            idle_timeout: "300",
+            automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
         };
         let spec = RemoteSpec {

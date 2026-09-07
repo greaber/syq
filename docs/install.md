@@ -105,20 +105,69 @@ source the completion adapter again to use the new display.
 
 ## Keep connections open
 
-Avoid repeated logins when running several network copies:
+Connect to a server without copying any files:
 
 ```sh
-syq persist on
+syq persist connect server
 syq persist status
 syq persist off
 ```
 
-Persistence also enables [background receiving](receive.md) from the server
-accounts syq connects to. Incoming copies require approval on your machine;
-the default destination is your home directory. Use `syq persist receive off` to keep only ordinary connection reuse, or
-`syq persist receive on --root DIRECTORY` to contain receiving in an existing directory.
+`connect` enables persistence, installs or reuses the matching remote helper,
+and waits until receiving is ready when it is enabled. Calling it again reuses
+a healthy connection, or restarts receiving if its service has stopped or failed.
+It does not cancel requests on a healthy connection. `--timeout 30` controls
+how long it waits for receiving after SSH and helper setup; it does not limit
+authentication or helper installation. When `connect` turns persistence on,
+it says so before connecting. A failed connection leaves the setting on; use
+`syq persist off` to disable it.
 
-Ordinary SSH connections can stay reusable for up to ten minutes after your last command.
-During that window, other processes running as your user can reuse the login
-without another key touch or agent approval. Return connections stay available
-until stopped. `persist off` closes both.
+You can also run `syq persist on` to enable persistence for later ordinary syq
+connections. No separate receiving startup command is needed. Receiving is on
+by default and [incoming copies and commands require local approval](receive.md).
+Use `syq persist receive off` to disable receiving, or
+`syq persist receive on --root DIRECTORY` to contain copies in an existing directory.
+
+Durable connections have no idle expiry. Keepalives detect network failures; receiving
+reconnects automatically after a dropped connection or laptop sleep. Ordinary
+copies reopen a broken SSH login when used again. Reconnection needs an available
+SSH key or agent; background receiving cannot ask for a password. After reboot,
+run `syq persist connect server` again. Syq does not install a login service.
+
+While an SSH login remains connected, other processes running as your local
+user can reuse it without another key touch or agent approval. Incoming requests
+still have their own approval checks. `persist off` closes both directions.
+Connections started by an older binary keep that binary's idle policy until
+closed and reopened; upgrading does not interrupt a working connection solely
+to change its timeout.
+
+`syq persist status --json` reports the persistence setting, scope, and one
+entry per endpoint. Each entry includes its state (`starting`, `connecting`,
+`ready`, `reconnecting`, `failed`, or `inactive`), whether ordinary SSH is connected,
+and receiving state and errors. With receiving enabled, `ready` means that the
+return connection is online; ordinary SSH can reconnect on its next use.
+Inspecting status does not start connections. A configuration failure is shown
+as `failed`; correct it and run `syq persist connect server` to retry. If receiving
+preferences cannot be read, status still lists SSH connections. JSON includes
+`receiving_error`, and each connection's `receiving_enabled` is `null` because
+the setting could not be determined.
+
+For an isolated script, `syq persist on --ephemeral` prints a scope path;
+pass it to `syq persist connect server --pscope PATH` and later copy commands.
+`syq persist off --pscope PATH` closes it without changing the user setting.
+Ephemeral scopes reuse forward SSH logins only: they do not enable return copies,
+forwarded authorization, or commands on your machine. SSH logins expire five
+minutes after their last session closes. An unused helper pool can hold a session
+for another five minutes, so an abandoned script leaves at most ten idle minutes
+of connection reuse. Closing the scope explicitly ends both immediately.
+
+Syq 0.4.1 also enabled receiving in ephemeral scopes. Replacing the executable
+does not replace background receivers that are already running, so those old
+receivers can keep working until stopped. Running an old executable can start
+them again. With the current executable, `syq persist receive on` stops existing
+receivers to apply the settings and restarts them only for durable persistence.
+
+To replace an old ephemeral scope, close it with
+`syq persist off --pscope PATH` and create a new one. If your script needs
+return copies or commands, use `syq persist connect server` without `--pscope`
+to establish a durable connection.

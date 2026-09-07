@@ -4,11 +4,15 @@ Inspect files on your server, then copy them to your laptop from the same shell.
 The laptop opens and maintains the connection. It needs no SSH server, public
 address, or incoming network port.
 
-With syq installed on both machines, turn on persistence on your laptop:
+With syq installed on both machines, connect from your laptop:
 
 ```sh
-syq persist on
+syq persist connect server
 ```
+
+This enables persistence and waits until receiving is ready. You can run it
+again to reuse a working connection or recover a stopped service. Alternatively,
+`syq persist on` starts receiving with later ordinary syq connections.
 
 When syq connects to an SSH server, it also starts a background return
 connection. The default destination name is your laptop's short hostname,
@@ -18,8 +22,7 @@ To choose a name and a different starting directory:
 ```sh
 mkdir -p ~/Downloads/server
 syq persist receive on --name laptop --cwd ~/Downloads/server
-syq cp --from server report.pdf
-syq persist receive wait server --timeout 30
+syq persist connect server
 ```
 
 On the server, use the name from any shell, including an existing tmux session:
@@ -30,7 +33,7 @@ syq cp results --to laptop
 syq cp report.pdf --to laptop --as reports/latest.pdf
 ```
 
-Receiving is enabled by default with persistence. Each incoming copy waits for
+Receiving is enabled by default with durable persistence. Each incoming copy waits for
 approval **on your laptop** before it can inspect or change destination entries.
 The prompt puts the destination first, followed by the connected server account
 and permission to change files. A positive deletion limit is shown too. Choose
@@ -153,32 +156,39 @@ The sender verifies a signed receipt before reporting success.
 ## Background connections
 
 ```sh
-syq persist receive status
-syq persist receive status --json
-syq persist receive wait server --timeout 30
+syq persist status
+syq persist status --json
+syq persist connect server
 syq persist receive off
 syq persist receive on
 syq persist off
 ```
 
 `persist receive off` stops receiving while keeping ordinary SSH persistence enabled.
-`persist receive on` enables it again and can restart previously connected endpoints.
-`persist off` stops both kinds of connection in its scope. Explicit ephemeral
-persistence scopes also own return connections and end them when closed.
+`persist receive on` enables it again and can restart previously connected endpoints
+in durable persistence.
+`persist off` stops both kinds of connection. Ephemeral scopes selected with
+`--pscope` only reuse forward SSH connections; they do not enable receiving.
+
+To wait for receiving without starting or restarting a connection, use:
+
+```sh
+syq persist receive wait server --timeout 30
+```
 
 Return connections have no idle expiry. After a network interruption or laptop
 sleep, the laptop reconnects with delays of one to thirty seconds, including
 when a return-connection heartbeat times out. Ordinary
-reusable SSH logins still expire after ten idle minutes. An interrupted copy
-fails: rerun it after reconnection to reuse eligible partial files. Copies are
+reusable SSH logins in durable persistence also have no idle expiry and reconnect on the next use.
+An interrupted copy fails: rerun it after reconnection to reuse eligible partial files. Copies are
 not queued while offline. A copy must open its control channel within sixty
 seconds of authorization and finish within seven days. Closing that control
 channel revokes its workers and prevents further requests.
 
 If `syq persist status` reports a failed return connection, fix the reported
-configuration or permission problem and run `syq persist receive on` to retry previously
-connected endpoints. This keeps ordinary SSH persistence enabled; there is no
-need to toggle `persist off` and `persist on`.
+configuration or permission problem and run `syq persist connect server` to retry
+that endpoint. A healthy connection is reused without cancelling its copies,
+commands, or pending approvals. There is no need to toggle receiving or persistence.
 
 On the server, `syq persist destinations list` shows availability and
 `syq persist destinations wait laptop --timeout 30` waits with a deadline. Stale records
@@ -195,7 +205,7 @@ Reconnects require an available SSH key or agent and a trusted server host key.
 No agent is forwarded. The server must permit remote Unix socket forwarding;
 OpenSSH 9.2 also requires remote TCP forwarding permission. Syq does not change
 server configuration. `persist receive status` reports setup errors; after correcting one,
-connect with syq again or run `persist receive on` to retry. A failed return setup does not
+run `syq persist connect server` to retry. A failed return setup does not
 invalidate an ordinary copy.
 
 The server command can be a different syq build from the receiving machine.

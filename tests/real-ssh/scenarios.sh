@@ -123,14 +123,58 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: ephemeral connect only reuses forward SSH and leaves receiving off\n'
+ephemeral_connect_scope=$(syq persist on --ephemeral)
+syq persist connect source --pscope "$ephemeral_connect_scope"
+syq persist status --json --pscope "$ephemeral_connect_scope" > /tmp/syq-ephemeral-connected.json
+python3 - <<'PYEPHEMERAL'
+import json
+from pathlib import Path
+state = json.load(open("/tmp/syq-ephemeral-connected.json"))
+connection = next(c for c in state["connections"] if c["endpoint"] == "source")
+assert connection["state"] == "ready" and connection["ssh_connected"], connection
+assert connection["receiving_enabled"] is False and connection["receiving"] is None, connection
+assert not any(".recv" in p.name for p in Path(state["scope"]).iterdir()), state
+PYEPHEMERAL
+syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
+syq persist off --pscope "$ephemeral_connect_scope"
+
 printf 'case: named return destination works from independent server shells without agent forwarding\n'
 receive_root=/tmp/syq-real-ssh-receive
 mkdir -p "$receive_root" /tmp/syq-real-ssh-receive-other
 make_tree source /tmp/syq-real-ssh/return-source return
-syq persist on
-# The ordinary copy ends before receiving readiness: no foreground receiver.
+# A failed receiving setup is an error from connect, and another connect repairs
+# that one service after the cause is fixed, without toggling receive settings.
+ssh source 'cat > /tmp/syq-connect-helper && chmod +x /tmp/syq-connect-helper && touch /tmp/syq-connect-fail' <<'HELPER'
+#!/bin/sh
+if [ "$1" = --destination-register ] && [ -e /tmp/syq-connect-fail ]; then
+    echo 'intentional registration failure for connect recovery' >&2
+    exit 1
+fi
+exec /usr/local/bin/syq "$@"
+HELPER
+if syq persist connect source --syq-path /tmp/syq-connect-helper --timeout 10; then
+    echo 'connect reported ready after receiving failed' >&2
+    exit 1
+fi
+syq persist status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); c=next(c for c in s["connections"] if c["endpoint"] == "source"); assert c["state"]=="failed" and "intentional registration failure" in c["receiving"]["error"],c'
+ssh source 'rm /tmp/syq-connect-fail'
+syq persist connect source --syq-path /tmp/syq-connect-helper --timeout 10
+syq persist off
+ssh source 'rm /tmp/syq-connect-helper'
+# Connecting prepares both directions without a dummy copy or receive wait.
+syq persist connect source
+syq persist status --json > /tmp/syq-connected.json
+python3 - <<'PYCONNECT'
+import json
+state = json.load(open("/tmp/syq-connected.json"))
+assert state["enabled"] is True, state
+connection = next(c for c in state["connections"] if c["endpoint"] == "source")
+assert connection["state"] == "ready" and connection["ssh_connected"], connection
+assert connection["receiving"]["phase"] == "online", connection
+PYCONNECT
+test ! -e /tmp/syq-return-pull
 syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-return-pull
-syq persist receive wait source --timeout 30
 # The container hostname is the laptop's default advertised name.
 # shellcheck disable=SC2029
 ssh source "syq persist destinations wait $(hostname) --timeout 5"
@@ -143,6 +187,18 @@ return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; r=json.load(open("/tmp/syq-pending.json")); assert len(r)==1 and "source" in r[0]["from"] and "denied" in r[0]["destination"],r; print(r[0]["id"])')
 test ! -e "$receive_root/denied"
+# A repeated connect must preserve the daemon and the pending approval.
+python3 - <<'PYCONNECT'
+import json, subprocess
+before = json.loads(subprocess.check_output(["syq", "persist", "receive", "status", "--json"]))["connections"]
+subprocess.run(["syq", "persist", "connect", "source"], check=True, timeout=15)
+after = json.loads(subprocess.check_output(["syq", "persist", "receive", "status", "--json"]))["connections"]
+before = next(c for c in before if c["endpoint"] == "source")
+after = next(c for c in after if c["endpoint"] == "source")
+assert before["pid"] == after["pid"], (before, after)
+assert before["connection"]["ssh_pid"] == after["connection"]["ssh_pid"], (before, after)
+assert [p["id"] for p in before["pending"]] == [p["id"] for p in after["pending"]] != [], (before, after)
+PYCONNECT
 syq persist receive deny "$request_id"
 if wait "$return_copy_pid"; then echo 'denied copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
 return_copy_pid=
@@ -332,6 +388,8 @@ ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as 
 printf 'return\n' | cmp - /tmp/syq-return-absolute
 printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
 syq persist receive off
+syq persist connect source
+syq persist status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); c=next(c for c in s["connections"] if c["endpoint"] == "source"); assert c["state"]=="ready" and c["receiving_enabled"] is False and c["receiving"] is None,c'
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as while-disabled'; then
     echo 'disabled receiving unexpectedly accepted a transfer' >&2
     exit 1
@@ -449,11 +507,7 @@ while :; do
     fi
     sleep 0.1
 done
-syq persist status | grep -q 'session pool' || {
-    echo 'persist status does not show the session pool:' >&2
-    syq persist status >&2
-    exit 1
-}
+syq persist status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); assert any(c["session_pool"] for c in s["connections"]),s'
 # Later completions take the ready session: no login of their own, and
 # their changed environment does not replace the pool's inherited values.
 export SYQ_REAL_SSH_SENT_ENV=caller-changed
