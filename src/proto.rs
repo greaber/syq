@@ -14,6 +14,10 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 
 // 64 MiB data/batch tuning remains supported, with room for its metadata.
 pub const MAX_FRAME: usize = 65 * 1024 * 1024;
+/// Largest single `ReadRange` length and largest total `ReadSmallBatch`
+/// payload a server accepts. A longer read could never fit in a `MAX_FRAME`
+/// response, so it is rejected before the server allocates anything.
+pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;

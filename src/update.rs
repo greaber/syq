@@ -28,6 +28,10 @@ const RECEIPT_SCHEMA: u32 = 1;
 const MANIFEST_SCHEMA: u32 = 1;
 const MANIFEST_SIGNATURE_SCHEME: &str = "ed25519-jcs-v1";
 const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
+/// Ceiling for a release manifest download. Signed manifests are a few
+/// kilobytes; this bounds what an unverified response can write before its
+/// signature is checked.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RELEASE_PUBLIC_KEY: Option<&str> = option_env!("SYQ_RELEASE_PUBLIC_KEY");
 
@@ -271,7 +275,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
         helper.tag,
         helper.archive.name
     );
-    fetch(&url, &archive, FetchMode::Interactive)?;
+    fetch(&url, &archive, FetchMode::Interactive, helper.archive.size)?;
     verify_file_as(
         archive.path(),
         &helper.archive,
@@ -312,7 +316,12 @@ fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
     let temp_dir = config_dir()?;
     create_private_dir(&temp_dir)?;
     let manifest_temp = TempFile::new(&temp_dir, ".json")?;
-    fetch(&format!("{base_url}/{MANIFEST_NAME}"), &manifest_temp, mode)?;
+    fetch(
+        &format!("{base_url}/{MANIFEST_NAME}"),
+        &manifest_temp,
+        mode,
+        MAX_MANIFEST_BYTES,
+    )?;
     let manifest_bytes = fs::read(manifest_temp.path()).context("read release manifest")?;
     let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
@@ -521,7 +530,12 @@ fn download_artifact(
         release.manifest.tag,
         artifact.archive.name
     );
-    fetch(&url, &archive, FetchMode::Interactive)?;
+    fetch(
+        &url,
+        &archive,
+        FetchMode::Interactive,
+        artifact.archive.size,
+    )?;
     verify_file_as(
         archive.path(),
         &artifact.archive,
@@ -606,7 +620,35 @@ fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
     Ok(())
 }
 
-fn fetch(url: &str, destination: &TempFile, mode: FetchMode) -> Result<()> {
+/// A response body exceeded the caller's byte ceiling. Retrying cannot help.
+#[derive(Debug)]
+struct DownloadTooLarge {
+    limit: u64,
+}
+
+impl std::fmt::Display for DownloadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "response exceeds the expected {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for DownloadTooLarge {}
+
+/// Copy at most `limit` bytes; a longer source fails instead of being
+/// truncated to something that might still look complete.
+fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64) -> Result<u64> {
+    let copied = std::io::copy(&mut source.take(limit.saturating_add(1)), destination)?;
+    if copied > limit {
+        bail!(DownloadTooLarge { limit });
+    }
+    Ok(copied)
+}
+
+/// Download `url` into `destination`, writing at most `limit` bytes. The
+/// caller passes the signed size for an archive and a fixed ceiling for a
+/// manifest, so an unverified response cannot fill the disk before its
+/// signature or digest is checked.
+fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Result<()> {
     #[cfg(debug_assertions)]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
@@ -614,9 +656,10 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode) -> Result<()> {
             .next()
             .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
             .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
-        std::io::copy(
+        copy_bounded(
             &mut File::open(PathBuf::from(root).join(name))?,
             &mut destination.writer()?,
+            limit,
         )
         .with_context(|| format!("copy test release fixture {name}"))?;
         return Ok(());
@@ -643,7 +686,7 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode) -> Result<()> {
                 .with_context(|| format!("request {url}"))?;
             let file = destination.writer()?;
             let mut file = BufWriter::new(file);
-            std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+            copy_bounded(&mut response.body_mut().as_reader(), &mut file, limit)
                 .with_context(|| format!("download {url}"))?;
             file.flush().with_context(|| {
                 format!("flush downloaded file {}", destination.path().display())
@@ -653,11 +696,12 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode) -> Result<()> {
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let retryable = !matches!(
-                    error.downcast_ref::<ureq::Error>(),
-                    Some(ureq::Error::StatusCode(code))
-                        if *code < 500 && !matches!(*code, 408 | 429)
-                );
+                let retryable = error.downcast_ref::<DownloadTooLarge>().is_none()
+                    && !matches!(
+                        error.downcast_ref::<ureq::Error>(),
+                        Some(ureq::Error::StatusCode(code))
+                            if *code < 500 && !matches!(*code, 408 | 429)
+                    );
                 last_error = Some(error);
                 if !retryable || attempt + 1 == attempts {
                     break;
@@ -1009,6 +1053,20 @@ mod tests {
     }
 
     #[test]
+    fn bounded_copies_fail_instead_of_truncating() {
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_bounded(&mut &b"abcdef"[..], &mut output, 6).unwrap(),
+            6
+        );
+        let error = copy_bounded(&mut &b"abcdef"[..], &mut Vec::new(), 5).unwrap_err();
+        assert!(
+            error.downcast_ref::<DownloadTooLarge>().is_some(),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn release_fetches_reject_plain_http() {
         let parent = crate::test_support::temp_dir();
         let destination = TempFile::new(&parent, ".http-test").unwrap();
@@ -1016,6 +1074,7 @@ mod tests {
             "http://127.0.0.1:1/release",
             &destination,
             FetchMode::BackgroundCheck,
+            MAX_MANIFEST_BYTES,
         )
         .unwrap_err();
         assert!(matches!(
