@@ -167,5 +167,7 @@ foreign-owned symlinks in typed local paths. No host files are used.
 
 The persistence cases establish receiving with `persist connect` without a copy,
 verify that repeating it preserves a pending approval and the service process,
-and check that it respects disabled receiving. Network interruption and heartbeat
+and check that it respects disabled receiving. An ephemeral connect establishes
+forward SSH without creating a return service or enabling durable persistence.
+Network interruption and heartbeat
 expiry cases verify automatic recovery and successful subsequent copies.

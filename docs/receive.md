@@ -166,13 +166,19 @@ syq persist off
 
 `persist receive off` stops receiving while keeping ordinary SSH persistence enabled.
 `persist receive on` enables it again and can restart previously connected endpoints.
-`persist off` stops both kinds of connection in its scope. Explicit ephemeral
-persistence scopes also own return connections and end them when closed.
+`persist off` stops both kinds of connection. Ephemeral scopes selected with
+`--pscope` only reuse forward SSH connections; they do not enable receiving.
+
+To wait for receiving without starting or restarting a connection, use:
+
+```sh
+syq persist receive wait server --timeout 30
+```
 
 Return connections have no idle expiry. After a network interruption or laptop
 sleep, the laptop reconnects with delays of one to thirty seconds, including
 when a return-connection heartbeat times out. Ordinary
-reusable SSH logins also have no idle expiry and reconnect on the next use.
+reusable SSH logins in durable persistence also have no idle expiry and reconnect on the next use.
 An interrupted copy fails: rerun it after reconnection to reuse eligible partial files. Copies are
 not queued while offline. A copy must open its control channel within sixty
 seconds of authorization and finish within seven days. Closing that control

@@ -123,6 +123,22 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: ephemeral connect only reuses forward SSH and leaves receiving off\n'
+ephemeral_connect_scope=$(syq persist on --ephemeral)
+syq persist connect source --pscope "$ephemeral_connect_scope"
+syq persist status --json --pscope "$ephemeral_connect_scope" > /tmp/syq-ephemeral-connected.json
+python3 - <<'PYEPHEMERAL'
+import json
+from pathlib import Path
+state = json.load(open("/tmp/syq-ephemeral-connected.json"))
+connection = next(c for c in state["connections"] if c["endpoint"] == "source")
+assert connection["state"] == "ready" and connection["ssh_connected"], connection
+assert connection["receiving_enabled"] is False and connection["receiving"] is None, connection
+assert not any(".recv" in p.name for p in Path(state["scope"]).iterdir()), state
+PYEPHEMERAL
+syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
+syq persist off --pscope "$ephemeral_connect_scope"
+
 printf 'case: named return destination works from independent server shells without agent forwarding\n'
 receive_root=/tmp/syq-real-ssh-receive
 mkdir -p "$receive_root" /tmp/syq-real-ssh-receive-other

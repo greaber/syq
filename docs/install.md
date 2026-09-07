@@ -118,7 +118,9 @@ and waits until receiving is ready when it is enabled. Calling it again reuses
 a healthy connection, or restarts receiving if its service has stopped or failed.
 It does not cancel requests on a healthy connection. `--timeout 30` controls
 how long it waits for receiving after SSH and helper setup; it does not limit
-authentication or helper installation.
+authentication or helper installation. When `connect` turns persistence on,
+it says so before connecting. A failed connection leaves the setting on; use
+`syq persist off` to disable it.
 
 You can also run `syq persist on` to enable persistence for later ordinary syq
 connections. No separate receiving startup command is needed. Receiving is on
@@ -126,7 +128,7 @@ by default and [incoming copies and commands require local approval](receive.md)
 Use `syq persist receive off` to disable receiving, or
 `syq persist receive on --root DIRECTORY` to contain copies in an existing directory.
 
-Connections have no idle expiry. Keepalives detect network failures; receiving
+Durable connections have no idle expiry. Keepalives detect network failures; receiving
 reconnects automatically after a dropped connection or laptop sleep. Ordinary
 copies reopen a broken SSH login when used again. Reconnection needs an available
 SSH key or agent; background receiving cannot ask for a password. After reboot,
@@ -145,8 +147,21 @@ entry per endpoint. Each entry includes its state (`starting`, `connecting`,
 and receiving state and errors. With receiving enabled, `ready` means that the
 return connection is online; ordinary SSH can reconnect on its next use.
 Inspecting status does not start connections. A configuration failure is shown
-as `failed`; correct it and run `syq persist connect server` to retry.
+as `failed`; correct it and run `syq persist connect server` to retry. If receiving
+preferences cannot be read, status still lists SSH connections. JSON includes
+`receiving_error`, and each connection's `receiving_enabled` is `null` because
+the setting could not be determined.
 
 For an isolated script, `syq persist on --ephemeral` prints a scope path;
 pass it to `syq persist connect server --pscope PATH` and later copy commands.
 `syq persist off --pscope PATH` closes it without changing the user setting.
+Ephemeral scopes reuse forward SSH logins only: they do not enable return copies,
+forwarded authorization, or commands on your machine. SSH logins expire five
+minutes after their last session closes. An unused helper pool can hold a session
+for another five minutes, so an abandoned script leaves at most ten idle minutes
+of connection reuse. Closing the scope explicitly ends both immediately.
+
+For scopes created by an older binary, close them with
+`syq persist off --pscope PATH` and create new ones to apply this behavior.
+Already-running old services keep their old behavior until stopped; running an
+old binary can still start receiving in an ephemeral scope.

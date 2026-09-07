@@ -17012,6 +17012,154 @@ fn persist_connect_prepares_helper_without_selecting_copy_data() {
 }
 
 #[test]
+fn persist_connect_failure_announces_policy_and_status_survives_bad_receive_settings() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let ssh = t.path("bin/ssh");
+    executable(&ssh, b"#!/bin/sh\necho 'test key rejected' >&2\nexit 255\n");
+    let output = persistence_command(&t, &["connect", "test-server", "--no-bootstrap"])
+        .env("HOME", &t.0)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+        )
+        .run()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("kept on if connecting fails"));
+    assert!(stderr_of(&output).contains("test key rejected"));
+    let policy: serde_json::Value =
+        serde_json::from_slice(&read(&t.path("config/syq/persistence.json"))).unwrap();
+    assert_eq!(policy["enabled"], true);
+
+    let receive = t.path("config/syq/receive.json");
+    for (contents, mode, missing_home) in [
+        (&b"{}"[..], 0o644, false),
+        (&b"not json"[..], 0o600, false),
+        (&b"{}"[..], 0o000, false),
+        (&b""[..], 0o600, true),
+    ] {
+        if receive.exists() {
+            fs::set_permissions(&receive, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::remove_file(&receive).unwrap();
+        }
+        if !missing_home {
+            write(&receive, contents);
+            fs::set_permissions(&receive, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for json in [false, true] {
+            let mut command = persistence_command(&t, &["status"]);
+            command.env("HOME", &t.0);
+            if missing_home {
+                command.env_remove("HOME");
+            }
+            if json {
+                command.arg("--json");
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            if json {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(status["connections"][0]["endpoint"], "test-server");
+                assert_eq!(status["connections"][0]["state"], "failed");
+                assert!(status["connections"][0]["receiving_enabled"].is_null());
+                assert!(status["receiving_error"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()));
+            } else {
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(text.contains("test-server  failed"), "{text}");
+                assert!(text.contains("Receiving configuration failed:"), "{text}");
+            }
+        }
+    }
+    assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+}
+
+#[test]
+fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let ssh = fake_ssh(&t);
+    let connect = |scope: Option<&Path>| {
+        let mut cmd = persistence_command(&t, &["connect", "test-server", "--timeout", "1"]);
+        cmd.args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .env_remove("HOME")
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            );
+        if let Some(scope) = scope {
+            cmd.arg("--pscope").arg(scope);
+        }
+        cmd.run().unwrap()
+    };
+    // Invalid preferences must not affect a forward-only script scope.
+    let receive = t.path("config/syq/receive.json");
+    write(&receive, b"not json");
+    fs::set_permissions(&receive, fs::Permissions::from_mode(0o600)).unwrap();
+    let scope = ephemeral_scope(&t);
+    assert_output_ok(&connect(Some(&scope)));
+    assert!(!t.path("config/syq/persistence.json").exists());
+    assert_eq!(read(&receive), b"not json");
+    assert!(fs::read_dir(&scope).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .as_encoded_bytes()
+        .windows(5)
+        .any(|s| s == b".recv")));
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains("ControlPersist=300"), "{log}");
+    assert!(!log.contains("ControlPersist=yes"), "{log}");
+    let output = persistence_command(&t, &["status", "--pscope", scope.to_str().unwrap()])
+        .env_remove("HOME")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!(
+            "run syq persist connect test-server --pscope {}",
+            scope.display()
+        )),
+        "{text}"
+    );
+    assert_output_ok(
+        &persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
+            .run()
+            .unwrap(),
+    );
+
+    // Successful forward setup followed by invalid receiving settings reports
+    // one error, with no best-effort setup attempt before the explicit one.
+    let output = connect(None);
+    assert!(!output.status.success());
+    let error = stderr_of(&output);
+    assert_eq!(error.matches("expected ident").count(), 1, "{error}");
+    assert!(!error.contains("background receiving through"), "{error}");
+    let status = persistence_command(&t, &["status", "--json"])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let global = Path::new(status["scope"].as_str().unwrap());
+    write(
+        &t.path("config/syq/persistence.json"),
+        b"{\"enabled\":false}\n",
+    );
+    fs::remove_file(t.path("rsh.log")).unwrap();
+    let rejected = connect(Some(global));
+    assert!(!rejected.status.success());
+    assert!(stderr_of(&rejected).contains("without --pscope"));
+    assert!(!t.path("rsh.log").exists(), "invalid scope reached SSH");
+    assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
+}
+
+#[test]
 fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
@@ -17115,6 +17263,8 @@ exit 0
     let output = scoped_copy.run().unwrap();
     assert_output_ok(&output);
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.contains("ControlPersist=300"), "{log}");
+    assert!(!log.contains("--destination-register"), "{log}");
     assert!(
         log.contains(&format!("-S {}/cm-", scope.display())),
         "{log}"
