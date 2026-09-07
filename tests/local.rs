@@ -888,6 +888,7 @@ fn copy_local_uses_registered_source_after_path_replacement() {
         let t = Tmp::new();
         let original = vec![b'o'; 8 << 20];
         write(&t.path("src/file"), &original);
+        write(&t.path("src/other"), &vec![b'o'; 5 << 20]);
         write(&t.path("outside/file"), &vec![b'r'; original.len()]);
         let ready = t.path("source-capability-ready");
 
@@ -940,6 +941,7 @@ fn copy_local_refuses_a_replaced_destination_parent() {
     for userspace in [false, true] {
         let t = Tmp::new();
         write(&t.path("src/tree/file"), &vec![b's'; 8 << 20]);
+        write(&t.path("src/tree/other"), &vec![b'o'; 5 << 20]);
         fs::create_dir_all(t.path("dst/tree")).unwrap();
         write(&t.path("outside/sentinel"), b"unchanged");
         let ready = t.path("copy-local-ready");
@@ -987,11 +989,12 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
     for userspace in [false, true] {
         let t = Tmp::new();
         let contents = vec![b's'; 8 << 20];
-        write(&t.path("src"), &contents);
-        write(&t.path("dst"), &vec![b'd'; contents.len()]);
+        write(&t.path("src/file"), &contents);
+        write(&t.path("src/other"), &vec![b'o'; 5 << 20]);
+        write(&t.path("dst/file"), &vec![b'd'; contents.len()]);
         write(&t.path("outside"), b"unchanged");
-        set_mtime(&t.path("src"), 1_700_000_000);
-        set_mtime(&t.path("dst"), 1_600_000_000);
+        set_mtime(&t.path("src/file"), 1_700_000_000);
+        set_mtime(&t.path("dst/file"), 1_600_000_000);
         let ready = t.path("copy-local-ready");
 
         let mut child = compat_command()
@@ -1000,8 +1003,8 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
                 "--inplace",
                 "--syq-connections",
                 "1",
-                &t.s("src"),
-                &t.s("dst"),
+                &t.s("src/"),
+                &t.s("dst/"),
                 "--no-progress",
             ])
             .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
@@ -1023,14 +1026,14 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
         }
         assert!(ready.exists(), "local copy did not reach the test hook");
 
-        fs::remove_file(t.path("dst")).unwrap();
-        std::os::unix::fs::symlink("outside", t.path("dst")).unwrap();
+        fs::remove_file(t.path("dst/file")).unwrap();
+        std::os::unix::fs::symlink("../outside", t.path("dst/file")).unwrap();
 
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("outside")), b"unchanged");
-        assert!(fs::symlink_metadata(t.path("dst")).unwrap().is_file());
-        assert_eq!(read(&t.path("dst")), contents);
+        assert!(fs::symlink_metadata(t.path("dst/file")).unwrap().is_file());
+        assert_eq!(read(&t.path("dst/file")), contents);
     }
 }
 
@@ -11546,6 +11549,94 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn copy_local_disk_whole_files_write_concurrently() {
+    let t = Tmp::new();
+    for name in ["first", "second"] {
+        write(&t.path(&format!("src/{name}")), &prng(8 << 20, 459));
+    }
+    let continuation = t.path("continue");
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--syq-connections",
+            "2",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", t.path("ready"))
+        .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut both_written = false;
+    while std::time::Instant::now() < deadline {
+        let partials = partial_files(&t.path("dst"));
+        if partials.len() == 2
+            && partials
+                .iter()
+                .all(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() == 1 << 20))
+        {
+            both_written = true;
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Release both workers before checking the result, including on failure.
+    write(&continuation, b"continue");
+    let out = child.wait_with_output().unwrap();
+    assert!(both_written, "whole-file copies were serialized: {out:?}");
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 2);
+    assert_eq!(observed["range_requests"], 0);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn copy_local_disk_single_file_retains_parallel_ranges() {
+    for connections in [None, Some("2")] {
+        let t = Tmp::new();
+        let contents = prng(8 << 20, 458);
+        write(&t.path("src"), &contents);
+        let mut command = compat_command();
+        command.args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")]);
+        if let Some(connections) = connections {
+            command.args(["--syq-connections", connections]);
+        }
+        let out = command
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), contents);
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["local_whole_files"], 0);
+        assert!(observed["range_requests"].as_u64().unwrap() > 0);
+        if connections.is_none() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&format!(
+                    "connections: auto: settled at {0} (path {0}, peak {0})",
+                    expected_local_start()
+                )),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn copy_local_disk_exdev_preserves_range_controls() {
     for (args, synchronous) in [
         (vec!["--checksum"], false),
@@ -11553,9 +11644,10 @@ fn copy_local_disk_exdev_preserves_range_controls() {
         (vec![], true),
     ] {
         let t = Tmp::new();
-        write(&t.path("src"), &prng(5 << 20, 455));
+        write(&t.path("src/small"), b"parallel file work");
+        write(&t.path("src/file"), &prng(5 << 20, 455));
         let out = compat_command()
-            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
             .args(args)
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
@@ -11563,7 +11655,7 @@ fn copy_local_disk_exdev_preserves_range_controls() {
             .run()
             .unwrap();
         assert_output_ok(&out);
-        assert_eq!(read(&t.path("src")), read(&t.path("dst")));
+        assert_eq!(read(&t.path("src/file")), read(&t.path("dst/file")));
         let observed = tuning_observed(&out);
         assert_eq!(observed["local_whole_files"], 0);
         assert!(observed["range_requests"].as_u64().unwrap() > 0);
@@ -11574,11 +11666,12 @@ fn copy_local_disk_exdev_preserves_range_controls() {
 #[test]
 fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_source() {
     let t = Tmp::new();
+    write(&t.path("src/small"), b"parallel file work");
     let original = prng(8 << 20, 456);
-    write(&t.path("src"), &original);
-    write(&t.path("dst"), b"old destination");
+    write(&t.path("src/file"), &original);
+    write(&t.path("dst/file"), b"old destination");
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
@@ -11586,8 +11679,8 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(stderr_of(&out).contains("test local-copy write failure"));
-    assert_eq!(read(&t.path("dst")), b"old destination");
-    let partials = partial_files(&t.0);
+    assert_eq!(read(&t.path("dst/file")), b"old destination");
+    let partials = partial_files(&t.path("dst"));
     assert_eq!(partials.len(), 1);
     assert_eq!(fs::metadata(&partials[0]).unwrap().len(), 1 << 20);
     let observed = tuning_observed(&out);
@@ -11598,30 +11691,31 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     // checking bytes that changed in the source before the retry.
     let mut changed = original;
     changed[..1 << 20].fill(b'c');
-    write(&t.path("src"), &changed);
+    write(&t.path("src/file"), &changed);
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), changed);
+    assert_eq!(read(&t.path("dst/file")), changed);
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert!(partial_files(&t.0).is_empty());
+    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn copy_local_disk_source_shrink_is_not_published() {
     let t = Tmp::new();
-    write(&t.path("src"), &prng(8 << 20, 457));
+    write(&t.path("src/small"), b"parallel file work");
+    write(&t.path("src/file"), &prng(8 << 20, 457));
     let ready = t.path("written");
     let resume = t.path("continue");
     let mut child = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", &ready)
         .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &resume)
@@ -11635,13 +11729,13 @@ fn copy_local_disk_source_shrink_is_not_published() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(ready.exists(), "copy did not reach the first-write barrier");
-    File::create(t.path("src")).unwrap();
+    File::create(t.path("src/file")).unwrap();
     write(&resume, b"continue");
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(23), "{out:?}");
     assert!(stderr_of(&out).contains("source shortened while copying"));
-    assert!(!t.path("dst").exists());
-    assert_eq!(partial_files(&t.0).len(), 1);
+    assert!(!t.path("dst/file").exists());
+    assert_eq!(partial_files(&t.path("dst")).len(), 1);
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]

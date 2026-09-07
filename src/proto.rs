@@ -747,14 +747,17 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Receiver-side copy of a same-machine file (copy_file_range when
-    /// possible, optionally a sequential userspace fallback for a local
-    /// source and asynchronous NFS destination). `CopyLocalUnsupported`
+    /// possible, otherwise an eligible sequential userspace fallback).
+    /// Local and NFS fallback policies are independent. `CopyLocalUnsupported`
     /// tells the caller to use the normal streaming path.
     CopyLocal {
         source: RegisteredPath,
         dst: PathBytes,
         inplace: bool,
         allow_sequential_nfs_fallback: bool,
+        /// The planner has multiple files, so whole-file writers can run in
+        /// parallel. A single local file retains adaptive range copying.
+        allow_sequential_local_fallback: bool,
         copy_id: CopyId,
         size: u64,
         mode: u32,
@@ -1085,7 +1088,7 @@ pub enum Response {
     /// and authorization protocol failures continue to use Err(String).
     EndpointError(WireError),
     Err(String),
-    /// `CopyLocal` could not use the receiver-side kernel-copy path. This is
+    /// `CopyLocal` could not use the receiver-side direct-copy path. This is
     /// deliberately distinct from `Err`: filenames and other diagnostics are
     /// untrusted text and must never select a recovery path.
     CopyLocalUnsupported,

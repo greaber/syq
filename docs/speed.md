@@ -342,11 +342,12 @@ copy authorization.
 ## Local copies and NFS
 
 Same-machine Linux copies first try kernel or NFS server-side copying. If
-that is unavailable between ext4, XFS, or tmpfs filesystems, syq copies eligible
-large files directly through their open source and destination files. It runs
+that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
+copy, syq copies eligible large files directly through their open source and destination files. It runs
 these file copies in parallel without sending their contents through local TCP
 connections. Small files still use batches. This happens automatically, without
-tuning options.
+tuning options. Single-file copies retain parallel range copying when offload
+is unavailable.
 
 Syq also uses a sequential destination writer for eligible local-disk to
 asynchronous-NFS copies. NFS sources, synchronous destinations, and other

@@ -124,6 +124,7 @@ enum FileSystemKey {
 struct CopyLocalPolicy {
     inplace: bool,
     allow_sequential_nfs_fallback: bool,
+    allow_sequential_local_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -5176,6 +5177,7 @@ impl FsOps {
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
+            allow_sequential_local_fallback,
         } = policy;
         let source_target = self
             .registered_source_target(source)
@@ -5325,7 +5327,8 @@ impl FsOps {
         // Local files keep parallelism across files without paying transport
         // and per-range hashing costs. Do not widen the NFS exception above.
         let use_userspace_fallback = use_sequential_nfs_fallback
-            || (source_fs.local_userspace_copy
+            || (allow_sequential_local_fallback
+                && source_fs.local_userspace_copy
                 && destination_fs.local_userspace_copy
                 && !source_fs.is_nfs
                 && !destination_fs.is_nfs
@@ -6249,6 +6252,7 @@ impl FsOps {
                 dst,
                 inplace,
                 allow_sequential_nfs_fallback,
+                allow_sequential_local_fallback,
                 copy_id,
                 size,
                 mode,
@@ -6259,6 +6263,7 @@ impl FsOps {
                     CopyLocalPolicy {
                         inplace: *inplace,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
+                        allow_sequential_local_fallback: *allow_sequential_local_fallback,
                     },
                     copy_id,
                     *size,
