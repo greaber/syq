@@ -23,7 +23,9 @@ SSH configuration, programs, or enrollment state. Manage that state with
 
 Repeating `enroll` updates the receiver to match your local build. A pending
 enrollment can be retried or revoked. Revoke and enroll again to rotate its
-receipt key.
+receipt key. Revocation stops active receivers for that enrollment before
+removing its state; see [revocation and upgrades](remote-to-remote.md#first-copy-and-access-management)
+for interruption, retry, and older-receiver behavior.
 
 Enrollment uploads the executable running on your machine, which must also run
 on the destination. It does not use `--syq-path` or fetch a release for another

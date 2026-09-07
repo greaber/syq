@@ -152,6 +152,10 @@ host resolution. A copy never switches routes after selecting its destination.
   writable by untrusted users. Syq only reuses partials owned by its effective
   user; foreign-owned leftovers are replaced without changing their contents
   or permissions. This does not make a shared writable directory trusted.
+- **Hard links share contents and metadata.** In-place writes and metadata
+  changes through a destination hard link affect every name for that file,
+  including names outside the selected destination or a restricted grant's
+  path scope.
 - **Copies are not snapshots or transactions.** Stop concurrent writers or
   use snapshots for consistent data. `--inplace` exposes incomplete updates.
   Syq does not `fsync` transfer data, so completion is not a power-loss

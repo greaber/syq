@@ -122,9 +122,24 @@ syq receiver list
 syq receiver revoke ID
 ```
 
-Use the ID from `list`. Revocation blocks new sessions; an ongoing copy may
-finish. If your machine reaches hostB through hostA, add `--via hostA` to
-`enroll` or `revoke`.
+Use the ID from `list`. Revocation stops all active restricted receivers for
+that enrollment and blocks new sessions. It waits for their shutdown before
+reporting success, then removes the enrollment from both machines. Other
+enrollments keep running. Revocation does not undo completed writes; interrupted
+copies fail and can leave partial files. Enroll again to authorize a new copy
+that can resume them.
+
+If receivers have not stopped within ten seconds, revocation reports failure
+and keeps the enrollment marked revoked. Retry `receiver revoke` to finish
+cleanup; an enrollment with unfinished revocation cannot be refreshed.
+
+Before upgrading from released v0.4.1 or an older binary, stop its active copies:
+those running processes have no shutdown watcher. Updating the installed
+executable does not add revocation support to a process already running it.
+The seven-day finish window is unchanged.
+
+If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
+`revoke`.
 
 ## Mirror a directory
 

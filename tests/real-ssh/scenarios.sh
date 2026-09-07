@@ -662,6 +662,9 @@ ssh destination '
     test ! -e ~/.local/libexec/syq-receiver
 '
 
+printf 'case: enrollment revocation stops active restricted receivers\n'
+python3 /usr/local/libexec/syq-test-receiver-revoke.py
+
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 syq cp --no-progress -j 2 --preserve=permissions \
