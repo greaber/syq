@@ -11058,6 +11058,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     set_mtime(&t.path("first"), 1_600_000_001);
     set_mtime(&t.path("second"), 1_600_000_002);
     let ready = t.path("basis-ready");
+    let continuation = t.path("basis-continue");
 
     let mut first = compat_command()
         .args([
@@ -11071,18 +11072,10 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
             &t.s("basis"),
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .env("SYQ_TEST_BASIS_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never retained its destination basis");
+    wait_for_confinement_marker(&mut first, &ready, "destination basis retention");
     assert!(
         partial_files(&t.0).is_empty(),
         "hashing alone must not create a sidecar"
@@ -11099,6 +11092,9 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     ]);
     assert_output_ok(&second);
     assert_eq!(read(&t.path("basis")), second_contents);
+    // Publish the second copy before allowing the first to seed its partial
+    // from the retained inode, regardless of how long the second copy takes.
+    release_confinement_barrier(&continuation);
     assert!(first.wait().unwrap().success());
     assert_eq!(read(&t.path("basis")), first_contents);
     assert!(partial_files(&t.0).is_empty());

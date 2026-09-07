@@ -5024,17 +5024,12 @@ impl FsOps {
             file,
         });
         #[cfg(debug_assertions)]
-        if let Some(ready) = std::env::var_os("SYQ_TEST_BASIS_READY_FILE") {
-            fs::write(&ready, b"ready").with_context(|| {
-                format!("write basis-ready signal {}", Path::new(&ready).display())
-            })?;
-        }
-        #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_BASIS_MS") {
-            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
+        test_race_barrier(
+            "SYQ_TEST_BASIS_READY_FILE",
+            "SYQ_TEST_BASIS_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_BASIS_MS",
+            "basis-ready",
+        )?;
         // Hashing is intentionally limited to the source length. Report the
         // retained inode's length afterward so a file that grew since the
         // planner's stat cannot be mistaken for an exact content match.
