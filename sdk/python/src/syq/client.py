@@ -315,6 +315,7 @@ class _LineProcess:
         self.returncode: int | None = None
         self.stderr = b""
         self._closed = False
+        self._aborted = False
 
     @classmethod
     def start_results(
@@ -393,11 +394,12 @@ class _LineProcess:
         return self.returncode
 
     def abort(self) -> None:
-        if self._closed:
+        if self._aborted:
             return
         # Kill the owned group even if the leader just exited: a malformed
         # producer or callback failure must not leave an SSH/helper descendant.
         _kill_process_group(self._process)
+        self._aborted = True
         self.returncode = self._process.wait()
         self._capture_stderr()
         self._close_files()
