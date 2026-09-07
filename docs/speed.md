@@ -325,16 +325,19 @@ carries file data on one port from `47600–47699`; change it with
 use multiple network interfaces.
 
 If no TCP route is reachable, it reports `data over ssh`. Use `-vv` for
-the connection details. **The restricted
-remote-to-remote receiver requires encrypted TCP and fails instead.**
+the connection details. This also works for restricted server-to-server
+copies: SSH keeps file data on the source-to-destination route. Copies
+[authorized through another machine](remote-to-remote.md#start-a-copy-from-the-source-server)
+still require direct encrypted TCP and fail if it is unavailable.
 
-`--no-tcp` selects SSH data transport. `--tcp-plain` removes data encryption
-and authentication and should be used only on a trusted network. Neither
-option works with the restricted receiver.
+`--no-tcp` selects SSH data transport, including for enrolled restricted
+receivers. `--tcp-plain` removes data encryption and authentication and should
+be used only on a trusted network; restricted receivers refuse it.
 
 On Linux, `--tcp-congestion ALGO` chooses an available algorithm for syq's
 TCP sockets on both ends, without changing host defaults. Unsupported choices
-fail the copy; the restricted receiver refuses this option.
+fail the copy. Restricted receivers enforce the algorithm signed into the
+copy authorization.
 
 ## Local copies and NFS
 

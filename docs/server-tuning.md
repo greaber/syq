@@ -16,8 +16,11 @@ sudo ufw allow from <trusted-client-address> to any port 47600:47699 proto tcp
 ```
 
 Allow the port range in any cloud firewall too. Check the selected route with
-`syq cp -vv --stats`. Ordinary copies fall back to SSH when TCP is blocked;
-the default direct server-to-server mode requires encrypted TCP.
+`syq cp -vv --stats`. Copies, including the default direct server-to-server
+mode, fall back to SSH on the same route when TCP is blocked. Copies
+[authorized through another machine](remote-to-remote.md#start-a-copy-from-the-source-server)
+still require direct encrypted TCP; they never relay file data through the
+authorizing machine.
 
 ### Tailscale
 
