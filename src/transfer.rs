@@ -5871,10 +5871,10 @@ impl Planner<'_> {
                     continue;
                 }
                 if opts.restricted_receiver
-                    && self.implicit_dirs.contains(&p)
-                    && !self.mapping_explicit_parents.contains(&dst_rel)
                     && st.is_some()
                     && !is_dir
+                    && self.implicit_dirs.contains(&p)
+                    && !self.mapping_explicit_parents.contains(&dst_rel)
                 {
                     // Parent creation does not grant permission to replace a
                     // file or symlink. Use the stat already in this batch to

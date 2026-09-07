@@ -164,7 +164,7 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
     let mut reader = std::io::Cursor::new(&contents);
     let mut restricted_bounds_error = None;
     let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
-    let mut declared: std::collections::HashMap<PathBytes, usize> =
+    let mut declared: std::collections::HashMap<PathBytes, (Option<DeclaredKind>, bool)> =
         std::collections::HashMap::new();
     let mut line_number = 0u64;
     loop {
@@ -194,7 +194,10 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
                 crate::delegation::MAX_PATH_BYTES
             ));
         }
-        if declared.insert(entry.dst.clone(), entries.len()).is_some() {
+        if declared
+            .insert(entry.dst.clone(), (entry.kind, false))
+            .is_some()
+        {
             bail!(
                 "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
                 display(&entry.dst)
@@ -202,19 +205,14 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
         }
         entries.push((line_number, entry));
     }
-    let mut is_parent = vec![false; entries.len()];
     for (line_number, entry) in &entries {
         for (i, &byte) in entry.dst.iter().enumerate() {
             if byte != b'/' {
                 continue;
             }
-            if let Some(&index) = declared.get(&entry.dst[..i]) {
-                is_parent[index] = true;
-                if let Some(kind) = entries[index]
-                    .1
-                    .kind
-                    .filter(|kind| !matches!(kind, DeclaredKind::Dir))
-                {
+            if let Some((kind, is_parent)) = declared.get_mut(&entry.dst[..i]) {
+                *is_parent = true;
+                if let Some(kind) = kind.filter(|kind| !matches!(kind, DeclaredKind::Dir)) {
                     bail!(
                         "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
                         display(&entry.dst[..i]),
@@ -235,7 +233,7 @@ pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest>
         // expansion just to recognize explicit entries in later scan batches.
         explicit_parents: declared
             .into_iter()
-            .filter_map(|(path, index)| is_parent[index].then_some(path))
+            .filter_map(|(path, (_, is_parent))| is_parent.then_some(path))
             .collect(),
     })
 }
