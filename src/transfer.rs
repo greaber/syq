@@ -5515,6 +5515,14 @@ impl Planner<'_> {
     }
 
     fn retire_planning_state(&mut self) {
+        // Resolve late explicit directory promotions before discarding the
+        // implicit-parent index. Only the remaining implicit parents restore
+        // receiver modes; explicit entries already have their own metadata.
+        self.deferred.extend(
+            std::mem::take(&mut self.implicit_restorations)
+                .into_iter()
+                .filter(|(path, ..)| self.implicit_dirs.contains(path)),
+        );
         // The preflight maps are dead now — except the sidecar set, which
         // --delete needs (only its keys) to tell a live sidecar from an
         // orphan. On multi-million-file trees these are the difference
@@ -7397,11 +7405,6 @@ impl Planner<'_> {
     fn apply_deferred(&mut self) -> Result<()> {
         self.assert_mutation_root()?;
         let mut d = std::mem::take(&mut self.deferred);
-        d.extend(
-            std::mem::take(&mut self.implicit_restorations)
-                .into_iter()
-                .filter(|(path, ..)| self.implicit_dirs.contains(path)),
-        );
         d.sort_by(|a, b| b.3.cmp(&a.3));
         for chunk in d.chunks(1000) {
             let ops: Vec<Op> = chunk

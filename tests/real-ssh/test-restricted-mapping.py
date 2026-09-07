@@ -89,7 +89,7 @@ def direct():
         large = manifest([("file", f"group/file-{i}", "file") for i in range(10_000)] + [("directory", "group", "dir")])
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
-        run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp"], data=large)
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions"], data=large)
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
     print("Restricted mapping and timestamp selection passed", flush=True)
 
