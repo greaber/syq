@@ -366,8 +366,11 @@ jq -n --arg commit "$preflight_head" --arg tree "$preflight_tree" \
   '{schema:1,commit:$commit,tree:$tree,profile:"default",result:"success"}' \
   >"$preflight_repo/.git/syq-release/real-ssh/$preflight_tree.json"
 git -C "$preflight_repo" update-ref refs/remotes/origin/master "$preflight_head"
-ssh-keygen -q -t ed25519 -N '' -f "$work/tag-signing-key"
-signing_key=$(awk '{print $1 " " $2}' "$work/tag-signing-key.pub")
+signing_key=$(awk '$1 == "syq-release" {
+  for (i = 2; i < NF; i++) {
+    if ($i ~ /^ssh-/) {print $i " " $(i + 1); break}
+  }
+}' "$script_dir/release-tag-signers")
 git -C "$preflight_repo" config gpg.format ssh
 git -C "$preflight_repo" config user.signingkey "key::$signing_key"
 git -C "$preflight_repo" config tag.gpgsign true
@@ -438,6 +441,29 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+# Exercise preflight with allowlist options whose quoted whitespace changes
+# awk field positions. Keep the repository's real allowlist untouched.
+option_scripts="$work/tag-option-scripts"
+mkdir "$option_scripts"
+cp "$script_dir/release-preflight.sh" "$option_scripts/"
+ln -s "$script_dir/release-readiness.py" "$option_scripts/release-readiness.py"
+ln -s "$script_dir/verify-release-ci.sh" "$option_scripts/verify-release-ci.sh"
+for options in '' 'namespaces="git"' 'namespaces="git, file",valid-before="20990101"'; do
+  printf 'syq-release %s %s\n' "$options" "$signing_key" >"$option_scripts/release-tag-signers"
+  (cd "$preflight_repo" && env "${preflight_env[@]}" \
+    "$option_scripts/release-preflight.sh" v9.9.9) >"$work/preflight-options.out"
+done
+ssh-keygen -q -t ed25519 -N '' -f "$work/other-preflight-key"
+other_signing_key=$(awk '{print $1 " " $2}' "$work/other-preflight-key.pub")
+git -C "$preflight_repo" config user.signingkey "key::$other_signing_key"
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_SIGNING_KEY="$other_signing_key" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted another GitHub-registered signing key' >&2
+  exit 1
+fi
+grep -F 'not the pinned maintainer key' "$work/failure.out" >/dev/null
+git -C "$preflight_repo" config user.signingkey "key::$signing_key"
 checks_without_conformance=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_CHECKS_JSON="$checks_without_conformance" \

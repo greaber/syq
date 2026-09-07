@@ -91,6 +91,7 @@ syq cp --from server project     # fetch project into your current directory
 ```
 
 Endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
+Host names cannot start with a dash, including when using an `--rsh` wrapper.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
@@ -360,6 +361,12 @@ Sources must be relative to that root. A selection such as `../private` is
 refused; even with `--follow-src`, symlinks cannot lead outside the root.
 Unlike `-C`, this is a boundary, not just a starting directory. It does not
 constrain the destination.
+
+## Output and diagnostics
+
+Human output, including `persist status` and `persist receive status`, escapes
+terminal control characters, Unicode line separators, and directional marks
+in names and peer diagnostics. JSON status output keeps the original values.
 
 ## More options
 

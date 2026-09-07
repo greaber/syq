@@ -146,8 +146,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::On { ephemeral: false } => {
             let scope = ensure_global_scope()?;
             write_global_config(true)?;
-            println!("SSH connection persistence is on");
-            println!("scope: {}", scope.display());
+            crate::output::human_stdout!("SSH connection persistence is on");
+            crate::output::human_stdout!("scope: {}", scope.display());
         }
         PersistAction::Off {
             pscope: Some(scope),
@@ -158,7 +158,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 );
             }
             close_scope(&scope)?;
-            println!("persistence scope closed: {}", scope.display());
+            crate::output::human_stdout!("persistence scope closed: {}", scope.display());
         }
         PersistAction::Off { pscope: None } => {
             // Disable first so a later command cannot intentionally join the
@@ -173,14 +173,14 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                         .with_context(|| format!("inspect global scope {}", scope.display()));
                 }
             }
-            println!("SSH connection persistence is off");
+            crate::output::human_stdout!("SSH connection persistence is off");
         }
         PersistAction::Status {
             pscope: Some(scope),
         } => print_scope_status(&scope, Some("ephemeral"))?,
         PersistAction::Status { pscope: None } => {
             let enabled = global_enabled()?;
-            println!(
+            crate::output::human_stdout!(
                 "SSH connection persistence is {}",
                 if enabled { "on" } else { "off" }
             );
@@ -188,7 +188,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             match scope.symlink_metadata() {
                 Ok(_) => print_scope_status(&scope, Some("global"))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    println!("connections: 0");
+                    crate::output::human_stdout!("connections: 0");
                 }
                 Err(error) => {
                     return Err(error)
@@ -674,11 +674,11 @@ fn socket_is_live(path: &Path) -> bool {
 fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
     let records = scope_records(scope)?;
     if let Some(kind) = kind {
-        println!("scope ({kind}): {}", scope.display());
+        crate::output::human_stdout!("scope ({kind}): {}", scope.display());
     } else {
-        println!("scope: {}", scope.display());
+        crate::output::human_stdout!("scope: {}", scope.display());
     }
-    println!("connections: {}", records.len());
+    crate::output::human_stdout!("connections: {}", records.len());
     for (key, record) in records {
         let control = scope.join(&key);
         let state = if socket_is_live(&control) {
@@ -692,7 +692,7 @@ fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
             ""
         };
         let receiving = crate::receive_service::summary(&control);
-        println!("  {}  {state}{pool}{receiving}", record.label());
+        crate::output::human_stdout!("  {}  {state}{pool}{receiving}", record.label());
     }
     Ok(())
 }

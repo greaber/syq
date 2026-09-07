@@ -109,11 +109,13 @@ def tests():
                 if choice == "allow":
                     assert destination.read_bytes() == b"return\n"
                 app, summary, body, actions, expiry = observed[-1]
-                assert app == "syq" and summary == "syq: incoming copy"
+                assert app == "syq" and summary == "syq: Allow this copy?"
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "source" in body and "May create and overwrite" in body, body
-                assert "at most 0 deletions" in body and "not been inspected" in body, body
+                assert body.startswith("To: "), body
+                assert "Details: syq persist receive pending" in body, body
+                assert "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
                 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
@@ -133,9 +135,11 @@ def tests():
                 assert (process.wait(timeout=20) == 0) == (choice == "allow")
                 assert marker.exists() == (choice == "allow")
                 _, title, body, _, _ = observed[-1]
-                assert title == "syq: incoming command", title
-                assert "literal arguments" in body and "local user" in body, body
-                assert "Run this command once?" in body and "Allow this copy" not in body, body
+                assert title == "syq: Run this command?", title
+                assert body.startswith('"touch" '), body
+                assert "From:" in body and "In:" in body and "Runs with your permissions" in body, body
+                assert "Copy root and limits do not apply" in body, body
+                assert "Details: syq persist receive pending" in body and "Limits:" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)
             finally:
                 if process.poll() is None:

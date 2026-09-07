@@ -4671,7 +4671,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     );
     assert!(
         stderr.contains(
-            "a real transfer would start with 8 connections (auto-tuned); dry-run starts no workers"
+            "target 8 connections (auto-tuned); initial count limited by available work; dry-run starts no workers"
         ),
         "{stderr}"
     );
@@ -4863,6 +4863,55 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"in-place over reachable TCP");
+}
+
+#[test]
+fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let content = prng(64 << 20, 3241);
+    write(&t.path("src"), &content);
+    for (label, fixed, nonempty) in [
+        ("auto", false, false),
+        ("fixed", true, false),
+        ("nonempty", false, true),
+    ] {
+        let directory = t.path(&format!("dst-{label}"));
+        fs::create_dir_all(&directory).unwrap();
+        if nonempty {
+            write(&directory.join("src"), b"old destination contents");
+        }
+        let destination = format!("host:{}/", directory.display());
+        let events = t.path(&format!("events-{label}"));
+        let mut command = compat_command();
+        command
+            .arg("-e")
+            .arg(&rsh)
+            .arg("--rsync-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args(["--syq-no-tcp", "-a", "--no-progress"])
+            .arg(t.s("src"))
+            .arg(destination)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path(label));
+        if fixed {
+            command.args(["--syq-connections", "8"]);
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&directory.join("src")), content);
+        let connected = fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .count();
+        assert_eq!(
+            connected,
+            if fixed || nonempty { 8 } else { 2 },
+            "{label}: {out:?}"
+        );
+    }
 }
 
 #[test]
@@ -6046,6 +6095,9 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
     for tcp in [false, true] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
+        // Require the SSH arrival address even where Linux interface discovery
+        // could otherwise hide an incomplete fake SSH session.
+        executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
         let data = prng(1 << 20, 967);
         write(&t.path("source"), &data);
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
@@ -6074,6 +6126,9 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
             ])
             .env("SYQ_DEBUG", "1")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"));
         if tcp {
@@ -18966,4 +19021,128 @@ fn native_rm_double_verbose_logs_base_symlink_hops_and_final_identity() {
     );
     assert!(stdout.contains("resolved to non-directory"), "{stdout}");
     assert_eq!(read(&t.path("real/file")), b"keep");
+}
+
+#[test]
+fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &t.0)
+            .env("XDG_CONFIG_HOME", t.path("config"));
+        command
+    };
+    let output = command(&["persist", "on", "--ephemeral"]).run().unwrap();
+    assert_output_ok(&output);
+    let scope = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let digest = Sha256::digest(b"@example");
+    let key = format!(
+        "cm-{}",
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    write(
+        &scope.join(format!("{key}.json")),
+        br#"{"user":null,"host":"example","port":null}"#,
+    );
+    let listener = UnixListener::bind(scope.join(format!("{key}.recv"))).unwrap();
+    let error = "peer: \x1b]52;c;bad\x07\r\u{2028}\u{200f}";
+    let response = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "identity": "old-daemon-fixture", "pid": 1,
+        "endpoint": "example", "name": "laptop",
+        "connection": {"phase": "failed", "error": error, "ssh_pid": null}
+    }))
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let mut ready = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut ready, 1, 5000) },
+                1,
+                "status client did not connect within five seconds"
+            );
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(length) as usize];
+            socket.read_exact(&mut request).unwrap();
+            socket
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&response).unwrap();
+        }
+    });
+    for args in [
+        vec!["persist", "status", "--pscope", scope.to_str().unwrap()],
+        vec!["persist", "receive", "status"],
+    ] {
+        let output = command(&args).run().unwrap();
+        assert_output_ok(&output);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("peer: \\u{1b}]52;c;bad\\u{7}\\r\\u{2028}\\u{200f}"),
+            "{text}"
+        );
+    }
+    let output = command(&["persist", "receive", "status", "--json"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["connections"][0]["connection"]["error"], error);
+    server.join().unwrap();
+}
+
+#[test]
+fn native_ignores_internal_rsh_environment() {
+    for explicit_rsh in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        let rsh = fake_rsh(&t);
+        fs::create_dir_all(t.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+        write(&t.path("source"), b"data");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--from",
+            "example",
+            "--src",
+            &t.s("source"),
+            "--as",
+            &t.s("dest"),
+            "--syq-path",
+            "syq",
+            "--no-tcp",
+        ]);
+        if explicit_rsh {
+            command.arg("--rsh").arg(&rsh);
+        }
+        let output = command
+            .env("SYQ_INTERNAL_NATIVE_RSH", "/missing-internal-rsh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dest")), b"data");
+    }
 }

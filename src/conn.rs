@@ -1469,7 +1469,7 @@ impl SshMultiplexer {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SshConnection {
     Independent,
     Control,
@@ -1671,14 +1671,16 @@ impl RemoteSpec {
         cmd
     }
 
-    fn ssh_connection(&self, limited: bool) -> SshConnection {
+    fn ssh_connection(&self, limited: bool, first_worker: bool) -> SshConnection {
+        // Startup workers can begin on this copy's authenticated transport.
+        // The others retain independent cipher processes and TCP streams.
+        // Do not share a persistent master: workers must keep the current
+        // invocation's environment and not compete with unrelated copies.
         if !limited {
             SshConnection::Control
-        } else if self
-            .ssh_multiplexer
-            .as_ref()
-            .is_some_and(|multiplexer| multiplexer.reuse_for_workers())
-        {
+        } else if self.ssh_multiplexer.as_ref().is_some_and(|multiplexer| {
+            (first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers()
+        }) {
             SshConnection::Worker
         } else {
             SshConnection::Independent
@@ -1784,7 +1786,7 @@ impl RemoteSpec {
         } else {
             ConnectionRole::Control
         };
-        self.connect_with_role(compress, limited, role)
+        self.connect_with_role(compress, limited, role, false)
     }
 
     /// One non-retrying control connection for speculative shell completion.
@@ -1819,13 +1821,14 @@ impl RemoteSpec {
         compress: bool,
         limited: bool,
         role: ConnectionRole,
+        first_worker: bool,
     ) -> Result<RemoteConn> {
         if matches!(role, ConnectionRole::Control) && compress {
             if let Some(conn) = self.take_pooled_control(compress) {
                 return Ok(conn);
             }
         }
-        let first = self.connect_retried(compress, limited, role.clone());
+        let first = self.connect_retried(compress, limited, role.clone(), first_worker);
         let Err(first_error) = first else {
             return first;
         };
@@ -1834,7 +1837,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, role)
+        self.connect_retried(compress, limited, role, first_worker)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1849,6 +1852,7 @@ impl RemoteSpec {
         compress: bool,
         limited: bool,
         role: ConnectionRole,
+        mut first_worker: bool,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
@@ -1858,7 +1862,7 @@ impl RemoteSpec {
         let attempts = if limited { 6 } else { 1 };
         for attempt in 0..attempts {
             let _slot = limited.then(connect_slot);
-            let ssh_connection = self.ssh_connection(limited);
+            let ssh_connection = self.ssh_connection(limited, first_worker);
             match self.connect_once(compress, ssh_connection, role.clone()) {
                 Ok(c) => return Ok(c),
                 Err(e)
@@ -1870,6 +1874,7 @@ impl RemoteSpec {
                     // independently authenticated SSH connection. Disable
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
+                    first_worker = false;
                     if crate::transfer::debug() {
                         crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
@@ -2604,18 +2609,23 @@ impl RemoteSpec {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = cmd
-            .output()
+        let out = run_captured(&mut cmd, None)
             .with_context(|| format!("probe platform on {}", self.label()))?;
         if !out.status.success() {
             bail!(
                 "could not detect the platform on {} ({}){}",
                 self.label(),
                 out.status,
-                output_suffix(&out.stderr)
+                output_suffix(&out.stderr.bytes)
             );
         }
-        let text = String::from_utf8_lossy(&out.stdout);
+        if out.stdout.truncated {
+            bail!(
+                "{}: platform probe printed more than {MAX_BOOTSTRAP_OUTPUT_BYTES} bytes",
+                self.label()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout.bytes);
         let value = text
             .lines()
             .find_map(|line| line.strip_prefix("syq-helper-target:"))
@@ -2734,15 +2744,11 @@ impl RemoteSpec {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("remote helper download stdout was not piped"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("remote helper download stderr was not piped"))?;
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        });
+        let stderr_reader = capture_stream(stderr);
 
         let report = read_remote_download_report(&mut BufReader::new(stdout));
         let mut helper = None;
@@ -2798,7 +2804,9 @@ impl RemoteSpec {
             .with_context(|| format!("wait for helper download on {}", self.label()))?;
         let stderr = stderr_reader
             .join()
-            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?;
+            .map_err(|_| anyhow!("remote helper stderr reader panicked"))?
+            .map(|captured| captured.bytes)
+            .unwrap_or_default();
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
@@ -2847,26 +2855,19 @@ impl RemoteSpec {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("start helper upload to {}", self.label()))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("helper upload stdin was not piped"))?;
-        let write_result = stdin.write_all(binary);
-        drop(stdin);
-        let out = child
-            .wait_with_output()
-            .with_context(|| format!("wait for helper upload to {}", self.label()))?;
+        let out = run_captured(&mut cmd, Some(binary))
+            .with_context(|| format!("run helper upload to {}", self.label()))?;
         if !out.status.success() {
             bail!(
                 "remote helper upload exited {}{}",
                 out.status,
-                output_suffix(&out.stderr)
+                output_suffix(&out.stderr.bytes)
             );
         }
-        write_result.with_context(|| format!("upload helper to {}", self.label()))
+        match out.input_error {
+            Some(error) => Err(error).with_context(|| format!("upload helper to {}", self.label())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2894,12 +2895,118 @@ struct RemoteDownloadReport {
     sha256: String,
 }
 
+/// Bound on each captured stream of a bootstrap command: the platform probe,
+/// the remote download report's stderr, and the helper upload. Legitimate
+/// output is a few lines; the bound keeps a faulty or hostile remote from
+/// growing local memory without limit. Streams are drained past the bound so
+/// the child never blocks on a full pipe.
+const MAX_BOOTSTRAP_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Largest remote release manifest accepted from the download report.
+const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
+/// Longest report line buffered before it is checked. A manifest data line may
+/// carry the whole manifest after its framing prefix.
+const MAX_REPORT_LINE_BYTES: usize = MAX_MANIFEST_SIZE + 1024;
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    /// The stream produced more than the retained bytes; the rest was discarded.
+    truncated: bool,
+}
+
+/// Read a stream keeping at most `limit` bytes, then drain and discard the
+/// remainder so a child process writing to it never blocks.
+fn read_capped(mut reader: impl Read, limit: usize) -> std::io::Result<CapturedStream> {
+    let mut bytes = Vec::new();
+    reader.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    let discarded = std::io::copy(&mut reader, &mut std::io::sink())?;
+    Ok(CapturedStream {
+        bytes,
+        truncated: discarded > 0,
+    })
+}
+
+fn capture_stream(
+    reader: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<CapturedStream>> {
+    std::thread::spawn(move || read_capped(reader, MAX_BOOTSTRAP_OUTPUT_BYTES))
+}
+
+struct CapturedOutput {
+    status: std::process::ExitStatus,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    /// Writing `input` to the child's stdin failed. Reported after the exit
+    /// status, which usually explains why the child stopped reading.
+    input_error: Option<std::io::Error>,
+}
+
+/// Run a bootstrap command, feeding it `input` when given, with both output
+/// streams captured under `MAX_BOOTSTRAP_OUTPUT_BYTES`. The command must have
+/// piped stdout and stderr; stdin is piped when there is input.
+fn run_captured(cmd: &mut Command, input: Option<&[u8]>) -> Result<CapturedOutput> {
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("start command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("command stderr was not piped"))?;
+    let stdout_reader = capture_stream(stdout);
+    let stderr_reader = capture_stream(stderr);
+    let input_error = match input {
+        Some(bytes) => {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("command stdin was not piped"))?;
+            stdin.write_all(bytes).err()
+        }
+        None => None,
+    };
+    let status = child.wait().context("wait for command")?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("stdout reader panicked"))?
+        .context("read command stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("stderr reader panicked"))?
+        .context("read command stderr")?;
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+        input_error,
+    })
+}
+
+/// Read one report line into `line`, refusing lines longer than
+/// `MAX_REPORT_LINE_BYTES` before they are buffered in full.
+fn read_report_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<usize> {
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(MAX_REPORT_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', line)?;
+    if read > MAX_REPORT_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote helper report line exceeded the size limit",
+        ));
+    }
+    Ok(read)
+}
+
 fn read_remote_download_report(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<RemoteDownloadReport>> {
-    const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
     let mut line = Vec::new();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Ok(None);
     }
     if protocol_line(&line) != b"syq-helper-manifest-begin" {
@@ -2908,8 +3015,7 @@ fn read_remote_download_report(
 
     let mut manifest = Vec::new();
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        if read_report_line(reader, &mut line)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "remote manifest was not terminated",
@@ -2937,8 +3043,7 @@ fn read_remote_download_report(
         manifest.push(b'\n');
     }
 
-    line.clear();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "remote helper digest was missing",
@@ -2953,8 +3058,7 @@ fn read_remote_download_report(
             )
         })?;
     let sha256 = String::from_utf8_lossy(digest).into_owned();
-    line.clear();
-    if reader.read_until(b'\n', &mut line)? == 0 {
+    if read_report_line(reader, &mut line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "remote helper report was not terminated",
@@ -3042,15 +3146,20 @@ impl Endpoint {
     }
 
     pub(crate) fn connect_control(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::Control)
+        self.connect_with_role(compress, ConnectionRole::Control, false)
     }
 
     pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
         roots: Vec<RegisteredSourceRoot>,
+        first_worker: bool,
     ) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::SourceWorker { roots })
+        self.connect_with_role(
+            compress,
+            ConnectionRole::SourceWorker { roots },
+            first_worker,
+        )
     }
 
     pub(crate) fn connect_with_copy_capabilities(
@@ -3058,6 +3167,7 @@ impl Endpoint {
         compress: bool,
         destination: Option<DestinationRoot>,
         copy_sources: Vec<RegisteredSourceRoot>,
+        first_worker: bool,
     ) -> Result<Box<dyn Conn>> {
         self.connect_with_role(
             compress,
@@ -3065,10 +3175,16 @@ impl Endpoint {
                 destination,
                 copy_sources,
             },
+            first_worker,
         )
     }
 
-    fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
+    fn connect_with_role(
+        &self,
+        compress: bool,
+        role: ConnectionRole,
+        first_worker: bool,
+    ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
                 // Every connection clone for this logical local endpoint uses
@@ -3176,7 +3292,12 @@ impl Endpoint {
                     };
                     bail!("{}: {reason}", spec.label());
                 }
-                Ok(Box::new(spec.connect_with_role(compress, true, role)?))
+                Ok(Box::new(spec.connect_with_role(
+                    compress,
+                    true,
+                    role,
+                    first_worker,
+                )?))
             }
         }
     }
@@ -3394,9 +3515,11 @@ mod tests {
         // ticket with SCM_RIGHTS. The endpoint clone still succeeds because it
         // reaches the control connection's process-local registry instead.
         std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
-        endpoint.connect_with_sources(false, roots.clone()).unwrap();
+        endpoint
+            .connect_with_sources(false, roots.clone(), false)
+            .unwrap();
         let error = Endpoint::local()
-            .connect_with_sources(false, roots)
+            .connect_with_sources(false, roots, false)
             .err()
             .expect("a fresh local endpoint must not share another session");
         assert!(format!("{error:#}").contains("connect to descriptor broker"));
@@ -3428,7 +3551,7 @@ mod tests {
             panic!("unexpected source registration response: {response:?}")
         };
         let source_marker = roots[0].selection.join(b"marker").unwrap();
-        let mut source = endpoint.connect_with_sources(false, roots).unwrap();
+        let mut source = endpoint.connect_with_sources(false, roots, false).unwrap();
 
         let response = source
             .call(Request::ReadRange {
@@ -4235,6 +4358,41 @@ mod tests {
     }
 
     #[test]
+    fn remote_download_report_rejects_an_oversized_line() {
+        let mut input = b"syq-helper-manifest-begin\nsyq-helper-manifest-data:".to_vec();
+        input.resize(input.len() + MAX_REPORT_LINE_BYTES + 16, b'x');
+        let error = read_remote_download_report(&mut input.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line exceeded"), "{error}");
+    }
+
+    #[test]
+    fn capped_reads_keep_the_prefix_and_drain_the_rest() {
+        let captured = read_capped(std::io::repeat(b'x').take(5000), 100).unwrap();
+        assert_eq!(captured.bytes.len(), 100);
+        assert!(captured.truncated);
+        let captured = read_capped(&b"short"[..], 100).unwrap();
+        assert_eq!(captured.bytes, b"short");
+        assert!(!captured.truncated);
+    }
+
+    #[test]
+    fn captured_commands_bound_both_streams_and_feed_input() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("cat >/dev/null; head -c 3000000 /dev/zero; echo boom >&2; exit 3")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = run_captured(&mut cmd, Some(b"input")).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout.bytes.len(), MAX_BOOTSTRAP_OUTPUT_BYTES);
+        assert!(out.stdout.truncated);
+        assert_eq!(out.stderr.bytes, b"boom\n");
+        assert!(!out.stderr.truncated);
+        assert!(out.input_error.is_none());
+    }
+
+    #[test]
     fn remote_download_report_frames_manifest_and_digest() {
         let digest = "a".repeat(64);
         let bytes = format!(
@@ -4371,7 +4529,11 @@ mod tests {
         };
         let endpoint = Endpoint::Remote(spec.clone());
         assert!(endpoint
-            .connect_with_role(false, ConnectionRole::SourceWorker { roots: Vec::new() })
+            .connect_with_role(
+                false,
+                ConnectionRole::SourceWorker { roots: Vec::new() },
+                false
+            )
             .is_err());
         assert!(marker.exists(), "worker never attempted SSH fallback");
         assert!(spec.tcp.lock().unwrap().as_ref().unwrap().failed);
@@ -4413,12 +4575,27 @@ mod tests {
             .any(|pair| pair[0] == "-S" && pair[1] == control_path));
         assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
 
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
 
+        let first = args(spec.ssh_connection(true, true));
+        assert!(first
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+        assert!(!first.iter().any(|arg| arg == "ControlPath=none"));
+        assert_eq!(spec.ssh_connection(false, true), SshConnection::Control);
+        // The first worker's preference is per call, not an opt-in for peers.
+        assert_eq!(spec.ssh_connection(true, false), SshConnection::Independent);
+        let mut custom = spec.clone();
+        custom.ssh_multiplexer = None;
+        assert_eq!(
+            custom.ssh_connection(true, true),
+            SshConnection::Independent
+        );
+
         spec.set_ssh_multiplexing(true);
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker
             .windows(2)
@@ -4427,6 +4604,37 @@ mod tests {
 
         let independent = args(SshConnection::Independent);
         assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn first_ssh_worker_retries_independently_after_mux_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = crate::test_support::tempdir().unwrap();
+        let script = temporary.path().join("ssh");
+        let log = temporary.path().join("attempts");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = -S ]; then\n    echo shared >> {log}\n    exit 255\n  fi\ndone\necho independent >> {log}\nexit 127\n",
+                log = shell_words::quote(log.to_str().unwrap()),
+            ),
+        ).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut spec = RemoteSpec::local_receiver(true);
+        spec.local_process = false;
+        spec.rsh = vec![script.to_string_lossy().into_owned()];
+        spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer::new().unwrap()));
+        let result = spec.connect_retried(
+            false,
+            true,
+            ConnectionRole::SourceWorker { roots: Vec::new() },
+            true,
+        );
+        assert!(result.is_err()); // The independent attempt reports a missing helper.
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "shared\nindependent\n"
+        );
     }
 
     #[test]
@@ -4510,9 +4718,10 @@ mod tests {
         // Worker data channels never ride a cross-run master, even when the
         // small-file path asks for in-run multiplexing.
         spec.set_ssh_multiplexing(true);
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+        assert_eq!(spec.ssh_connection(true, true), SshConnection::Independent);
     }
 
     #[test]

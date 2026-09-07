@@ -589,7 +589,8 @@ def _copy_arguments(
     source_count = 0
     contents_count = 0
     for index, source in enumerate(sources):
-        argv.append(_argument(source, label=f"sources[{index}]"))
+        value = _argument(source, label=f"sources[{index}]")
+        argv.append(b"--src=" + value if isinstance(value, bytes) else f"--src={value}")
         source_count += 1
     for option, value in (
         ("--src", src),
@@ -742,7 +743,8 @@ def _rm_arguments(
     argv: list[Argument] = ["rm"]
     source_count = 0
     for index, source in enumerate(sources):
-        argv.append(_argument(source, label=f"sources[{index}]"))
+        value = _argument(source, label=f"sources[{index}]")
+        argv.append(b"--src=" + value if isinstance(value, bytes) else f"--src={value}")
         source_count += 1
     for option, value in (
         ("--src", src),

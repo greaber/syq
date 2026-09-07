@@ -28,6 +28,18 @@ def resolved_temporary_directory() -> tempfile.TemporaryDirectory[str]:
     "candidate compatibility requires SYQ_CANDIDATE_EXECUTABLE and version",
 )
 class CandidateCompatibilityTests(unittest.TestCase):
+    def test_positional_option_names_are_copied_and_removed_as_files(self) -> None:
+        with resolved_temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            client = syq.Client(executable=EXECUTABLE, process_cwd=root)
+            for index, name in enumerate(("--rsh=evil", "--prune", "--srcs-in=.")):
+                (root / name).write_bytes(b"literal filename")
+                destination = f"out-{index}"
+                client.cp(name, as_new=destination)
+                self.assertEqual((root / destination).read_bytes(), b"literal filename")
+                client.rm(name)
+                self.assertFalse((root / name).exists())
+
     def test_candidate_version_and_typed_native_surface(self) -> None:
         assert EXECUTABLE is not None
         assert EXPECTED_VERSION is not None
