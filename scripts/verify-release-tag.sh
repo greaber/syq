@@ -71,10 +71,14 @@ command -v ssh-keygen >/dev/null || { echo 'tag verification needs ssh-keygen' >
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 verification_dir=$(mktemp -d "${TMPDIR:-/tmp}/syq-tag-verification.XXXXXXXX")
 trap 'rm -rf "$verification_dir"' EXIT
-jq -ej '.verification.signature | select(type == "string" and length > 0)' \
-  <<<"$tag_object" >"$verification_dir/signature"
-jq -ej '.verification.payload | select(type == "string" and length > 0)' \
-  <<<"$tag_object" >"$verification_dir/payload"
+for field in signature payload; do
+  if ! jq -ej --arg field "$field" \
+    '.verification[$field] | select(type == "string" and length > 0)' \
+    <<<"$tag_object" >"$verification_dir/$field"; then
+    echo "release tag $tag has a missing, empty, or invalid verification $field" >&2
+    exit 1
+  fi
+done
 if ! ssh-keygen -Y verify -f "$script_dir/release-tag-signers" -I syq-release \
   -n git -s "$verification_dir/signature" <"$verification_dir/payload"; then
   echo "release tag $tag was not signed by the pinned maintainer key" >&2

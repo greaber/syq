@@ -105,10 +105,6 @@ an alias for the explicit receiving-machine selection.
 
 ## Progress
 
-Human output, including `persist status` and `persist receive status`, escapes
-terminal control characters, Unicode line separators, and directional marks
-in names and peer diagnostics. JSON status output keeps the original values.
-
 When stderr is a terminal, syq shows one progress bar for the whole copy.
 The bar stays in place as files and workers change. It shows bytes processed
 out of the discovered total; while syq is still scanning, the percentage is
@@ -358,6 +354,12 @@ Sources must be relative to that root. A selection such as `../private` is
 refused; even with `--follow-src`, symlinks cannot lead outside the root.
 Unlike `-C`, this is a boundary, not just a starting directory. It does not
 constrain the destination.
+
+## Output and diagnostics
+
+Human output, including `persist status` and `persist receive status`, escapes
+terminal control characters, Unicode line separators, and directional marks
+in names and peer diagnostics. JSON status output keeps the original values.
 
 ## More options
 

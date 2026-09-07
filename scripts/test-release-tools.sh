@@ -338,6 +338,21 @@ expect_failure 'required check linux-arm64 is missing' env \
   PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos,linux-arm64
 
+# Missing and malformed API fields must fail with a useful diagnostic.
+for field in signature payload; do
+  for value in missing null '""' 123; do
+    if [ "$value" = missing ]; then
+      invalid=$(jq --arg field "$field" 'del(.verification[$field])' <<<"$tag_json")
+    else
+      invalid=$(jq --arg field "$field" --argjson value "$value" \
+        '.verification[$field] = $value' <<<"$tag_json")
+    fi
+    expect_failure "missing, empty, or invalid verification $field" env \
+      SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$invalid" PATH="$fakebin:$PATH" \
+      "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
+  done
+done
+
 # A valid signature by another key is not release authority, even when GitHub
 # reports it as verified. Use an ephemeral test key, never a maintainer secret.
 ssh-keygen -q -t ed25519 -N '' -f "$work/other-tag-key"

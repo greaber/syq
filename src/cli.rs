@@ -1889,9 +1889,6 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
-    if args.rsh.is_none() {
-        args.rsh = utf8("SYQ_INTERNAL_NATIVE_RSH")?;
-    }
     if let Some(width) = utf8("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH")? {
         args.width = Some(
             width

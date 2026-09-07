@@ -18971,14 +18971,16 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
 }
 
 #[test]
-fn native_explicit_rsh_overrides_internal_environment() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    fs::create_dir_all(t.path("remote-bin")).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
-    write(&t.path("source"), b"data");
-    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
+fn native_ignores_internal_rsh_environment() {
+    for explicit_rsh in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        let rsh = fake_rsh(&t);
+        fs::create_dir_all(t.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+        write(&t.path("source"), b"data");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
             "cp",
             "--from",
             "example",
@@ -18986,18 +18988,25 @@ fn native_explicit_rsh_overrides_internal_environment() {
             &t.s("source"),
             "--as",
             &t.s("dest"),
-            "--rsh",
-            rsh.to_str().unwrap(),
             "--syq-path",
             "syq",
             "--no-tcp",
-        ])
-        .env("SYQ_INTERNAL_NATIVE_RSH", "/missing-internal-rsh")
-        .env("FAKE_REMOTE_HOME", &t.0)
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .run()
-        .unwrap();
-    assert_output_ok(&output);
-    assert_eq!(read(&t.path("dest")), b"data");
+        ]);
+        if explicit_rsh {
+            command.arg("--rsh").arg(&rsh);
+        }
+        let output = command
+            .env("SYQ_INTERNAL_NATIVE_RSH", "/missing-internal-rsh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("FAKE_REMOTE_HOME", &t.0)
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dest")), b"data");
+    }
 }
