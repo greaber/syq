@@ -1991,6 +1991,7 @@ impl RestrictedAuthority {
                 | Request::Scan { .. }
                 | Request::TcpListen { .. }
                 | Request::TransportStats
+                | Request::WriteStreamFence
                 | Request::Receipt
                 | Request::Shutdown
         );
@@ -2409,6 +2410,9 @@ impl RestrictedAuthority {
             }
             Request::CopyLocal { .. }
             | Request::ReadRange { .. }
+            | Request::ReadStream(_)
+            | Request::ShrinkReadStream { .. }
+            | Request::StopReadStream
             | Request::ReadSmallBatch(_)
             | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
@@ -2432,7 +2436,7 @@ impl RestrictedAuthority {
                     bail!("the receipt is issued only on the signed control connection");
                 }
             }
-            Request::TransportStats | Request::Shutdown => {}
+            Request::TransportStats | Request::Shutdown | Request::WriteStreamFence => {}
         }
         Ok(())
     }

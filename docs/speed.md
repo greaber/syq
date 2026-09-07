@@ -150,7 +150,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 |---|---|---|
 | `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
-| `copy-path` | `auto` | `auto` or `ranges` |
+| `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
@@ -178,7 +178,58 @@ native small-copy shortcut. Files larger than the batch byte limit use another
 copy path. File and byte limits are ceilings, and the scheduler can choose a
 smaller batch to share work among workers. With `--bwlimit`, worker batches
 contain at most one file. Batch controls cannot be combined with
-`copy-path=ranges`.
+`copy-path=ranges` or `copy-path=streaming`.
+
+### Streaming and request windows
+
+Syq automatically streams remote ranges larger than one normal request
+window (usually 16 MiB). Local ranges and shorter remote ranges use ordinary
+requests. Whole-file and small-file shortcuts keep their usual eligibility.
+No streaming or pipeline setting is needed for ordinary copies.
+The `syq: tuning:` diagnostic describes the selection policy: a pipeline depth
+applies only to ordinary ranges, and automatic remote selection also reports
+the size above which ranges stream. It does not claim which paths ran; use
+the observed range and streaming counters for that.
+
+Streaming sends
+checked source blocks and collects destination write replies concurrently,
+instead of limiting the number of blocks awaiting replies. It still verifies
+block hashes, checks all write errors before completion, and supports resume
+and parallel workers on different parts of one large file. It does not add
+a disk flush.
+
+For experiments, `copy-path=streaming` forces streaming even for local and
+short ranges, bypassing the same copy shortcuts as `copy-path=ranges`.
+`copy-path=auto-streaming` keeps the normal whole-file and small-file shortcuts,
+but forces streaming for all remaining ranges, including local and short ones.
+An explicit `pipeline-depth` uses ordinary requests instead of automatic
+streaming, allowing comparisons with the credit-window implementation.
+
+For a controlled comparison, use fresh scratch destinations:
+
+```sh
+syq cp data.bin --to host --as /scratch/pipeline.bin --connections 1 -v \
+  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
+syq cp data.bin --to host --as /scratch/streaming.bin --connections 1 -v \
+  --tuning-options copy-path=streaming,request-size=1M
+```
+
+Both streaming modes reject `pipeline-depth`. Forced `streaming` also rejects
+batch controls; `auto-streaming` allows them, with the usual effect on small
+copies. Their data queues remain
+bounded, but memory also depends on request size, worker count, compression
+and transport buffering. It may be slower on short or CPU-limited copies:
+starting/stopping streams and collecting replies add work. Work-stealing can
+also discard already-read source data when another worker takes a suffix.
+With `--bwlimit`, pacing happens before destination writes; a remote source
+can send ahead into bounded buffers. This also applies to automatically selected
+streaming, without any tuning override. On pulls, initial incoming traffic can
+include the response-reader queue and in-flight frames and socket buffers;
+it is not limited to one paced block or one request window. The limit controls
+the average accepted copy rate, not a strict source-side burst limit.
+Restricted receivers still enforce their signed limits.
+
+### Batch size and splitting
 
 For example, compare small-file batches with:
 
@@ -219,7 +270,8 @@ syq cp large-file --to server --as /scratch/benchmark-capped \
 ```
 
 Neither mode promises a maximum network burst or uninterrupted service for
-other traffic. They pace source requests; helper processing, queues,
+other traffic. Ordinary ranges pace source requests, while streamed ranges pace
+destination writes after receiving the source block; helper processing, queues,
 compression, and transport buffering affect when bytes actually cross a link.
 A deeper pipeline can accumulate more data before forwarding it. A restricted
 receiver also enforces its signed rate ceiling independently, including its
@@ -234,11 +286,14 @@ capped runs.
 With overrides, `-v` reports effective settings, including any reduction in
 request size or increase in the split threshold. A final `syq: tuning observed:`
 line contains diagnostic JSON with copy-path counts, range request count,
+streaming-range and streamed-block counts,
 largest requested range, and largest worker batch by file count and content
 bytes. These are observations of attempted work, so retries can contribute
 more than once. They are experimental diagnostics, separate from completion
 records. `--stats` also enables them, but currently bypasses the native
 small-copy shortcut; use `-v` to compare that shortcut with other paths.
+`SYQ_DEBUG=1` also records path counts without any tuning override, allowing
+automatic selection to be inspected without changing the tuning-cache policy.
 
 Use the same reporting options for every comparison, a fresh disposable
 destination, and explicit defaults for the baseline, such as

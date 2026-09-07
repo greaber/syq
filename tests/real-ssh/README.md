@@ -92,6 +92,10 @@ Range-transfer checks also copy a large file with a 64-request pipeline and
 source, destination, and local coordinators. Batch overrides also run through
 a restricted receiver. Each result is compared byte for byte with the original.
 
+The experimental streaming path also runs over TCP and SSH, with push, pull,
+source/destination coordination and a local relay. Each streaming copy has a
+25-second deadline and is compared byte for byte, including a signed receiver.
+
 This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. For release preparation, use

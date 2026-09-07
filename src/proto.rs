@@ -834,6 +834,57 @@ pub enum Request {
         limit: u16,
         symlink_policy: OperatorSymlinkPolicy,
     },
+    /// Experimental source-only stream. Start replies Ok, then emits Block
+    /// frames (or one error). StopReadStream is required even at the end of the
+    /// interval; ReadStreamDone fences every frame belonging to this stream.
+    ReadStream(ReadStreamRequest),
+    StopReadStream,
+    /// No filesystem operation: fence replies to preceding streaming writes.
+    WriteStreamFence,
+    /// One-way, monotonic reduction of an active source stream's read limit.
+    /// Keep original frame boundaries: a final block may straddle this limit.
+    /// StopReadStream is still required, even if the source has passed `end`.
+    ShrinkReadStream {
+        end: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReadStreamRequest {
+    pub path: PathBytes,
+    pub source: Option<RegisteredPath>,
+    pub attempt: u32,
+    pub off: u64,
+    pub end: u64,
+    pub block: u32,
+}
+
+impl ReadStreamRequest {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.off < self.end,
+            "read stream requires a nonempty increasing interval"
+        );
+        anyhow::ensure!(
+            self.end <= i64::MAX as u64,
+            "read stream offset exceeds the file offset limit"
+        );
+        anyhow::ensure!(
+            (512..=64 << 20).contains(&self.block),
+            "read stream block must be between 512 bytes and 64 MiB"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn next_request(&self) -> Request {
+        Request::ReadRange {
+            path: self.path.clone(),
+            source: self.source.clone(),
+            attempt: self.attempt,
+            off: self.off,
+            len: (self.end - self.off).min(u64::from(self.block)) as u32,
+        }
+    }
 }
 
 /// Bounds for one-turn small pushes. The receiver enforces them independently
@@ -932,6 +983,9 @@ impl Request {
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
                 | Request::ReadRange { .. }
+                | Request::ReadStream(_)
+                | Request::StopReadStream
+                | Request::ShrinkReadStream { .. }
                 | Request::ReadSmallBatch(_)
                 | Request::FileHash { .. }
                 | Request::TransportStats
@@ -1026,6 +1080,9 @@ pub enum Response {
         details: Vec<String>,
         truncated: bool,
     },
+    /// All data/error frames for the stopped source stream precede this marker.
+    ReadStreamDone,
+    WriteStreamDone,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1471,6 +1528,43 @@ impl<R: Read> FrameReader<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streaming_request_bounds_are_checked_before_starting() {
+        let valid = super::ReadStreamRequest {
+            path: Vec::new(),
+            source: None,
+            attempt: 0,
+            off: 0,
+            end: 1,
+            block: 512,
+        };
+        valid.validate().unwrap();
+        for (off, end, block) in [
+            (0, 0, 512),
+            (2, 1, 512),
+            (0, u64::MAX, 512),
+            (0, 1, 0),
+            (0, 1, 511),
+            (0, 1, (64 << 20) + 1),
+        ] {
+            assert!(super::ReadStreamRequest {
+                off,
+                end,
+                block,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err());
+        }
+        super::ReadStreamRequest {
+            off: i64::MAX as u64 - 1,
+            end: i64::MAX as u64,
+            block: 64 << 20,
+            ..valid
+        }
+        .validate()
+        .unwrap();
+    }
     use super::*;
 
     fn local_preamble_len() -> usize {
@@ -1622,6 +1716,21 @@ mod tests {
         assert!(diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR));
         assert!(diagnostic.contains("magic mismatch"));
         assert!(diagnostic.contains("may predate"));
+    }
+
+    #[test]
+    fn released_v040_preamble_keeps_its_build_identity_boundary() {
+        // v0.4.0's fixed preamble: magic, big-endian identity length, identity.
+        // Kept independent of the current encoder and current enum variants.
+        const V040: &[u8] = b"SYQWIRE\0\0\x06v0.4.0";
+        let result = FrameReader::new(V040).read_preamble();
+        if crate::identity::build() == "v0.4.0" {
+            result.unwrap();
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("build identity mismatch"), "{message}");
+            assert!(message.contains("remote v0.4.0"), "{message}");
+        }
     }
 
     #[test]

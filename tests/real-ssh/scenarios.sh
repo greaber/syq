@@ -798,6 +798,33 @@ EOF
     cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
 done
 
+printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
+streaming=copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average
+for transport in tcp ssh; do
+    if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
+    timeout --kill-after=5s 25s syq cp /tmp/syq-real-ssh-tuning.bin --to source \
+        --as "/tmp/syq-real-ssh/streaming-$transport" -j 2 --no-progress \
+        --bwlimit 8M --tuning-options "$streaming" "$@"
+    timeout --kill-after=5s 25s syq cp --from source "/tmp/syq-real-ssh/streaming-$transport" \
+        --as "/tmp/syq-real-ssh-streaming-$transport-download" -j 2 --no-progress \
+        --bwlimit 8M --tuning-options "$streaming" "$@"
+    cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-streaming-$transport-download"
+done
+for coordinator in src dst local; do
+    case "$coordinator" in
+        src) set -- ;;
+        dst) set -- --peer-auth broker --no-tcp ;;
+        local) set -- --no-tcp ;;
+    esac
+    timeout --kill-after=5s 25s syq cp --from source /tmp/syq-real-ssh/streaming-tcp --to destination \
+        --as "/tmp/syq-real-ssh/streaming-$coordinator" --coordinate-at "$coordinator" \
+        -j 2 --no-progress --bwlimit 8M --tuning-options "$streaming" "$@"
+    ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-streaming-check <<'EOF'
+cat "/tmp/syq-real-ssh/streaming-$1"
+EOF
+    cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-streaming-check
+done
+
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'
 syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \

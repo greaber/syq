@@ -18,6 +18,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub trait Conn: Send {
     fn send(&mut self, req: Request) -> Result<()>;
     fn recv(&mut self) -> Result<Response>;
+    /// The experimental writer must not retain one reply per sent block.
+    fn begin_streaming_writes(&mut self) -> Result<()> {
+        bail!("this connection does not support experimental streaming writes")
+    }
+    fn check_streaming_writes(&mut self) -> Result<()> {
+        bail!("no streaming writes are active")
+    }
+    /// Start the non-writing fence without waiting for its reply. Pass its
+    /// result to finish even after failure, so the collector is always joined.
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        bail!("no streaming writes are active")
+    }
+    fn finish_streaming_writes(&mut self, _sent: u64, _fence: Result<()>) -> Result<()> {
+        bail!("no streaming writes are active")
+    }
+    fn stop_read_stream(&mut self) -> Result<u64> {
+        self.send(Request::StopReadStream)?;
+        crate::streaming::drain_reads(|| self.recv())
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = match &req {
             Request::StatMany { paths, .. } => Some(("stat", paths.len())),
@@ -89,6 +108,21 @@ pub trait Conn: Send {
         trace: &mut dyn FnMut(Vec<String>) -> Result<()>,
         sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
     ) -> Result<()>;
+}
+
+/// Restore an ordinary range's request/reply boundary after an operation
+/// error. Endpoint errors still consume a response; a broken transport cannot
+/// be drained and must be recovered by the caller. Never send a new request.
+pub(crate) fn drain_range_replies(conn: &mut dyn Conn, count: usize, what: &str) -> Result<()> {
+    let mut error = None;
+    for _ in 0..count {
+        anyhow::ensure!(!conn.is_dead(), "cannot drain a failed range transport");
+        let response = conn.recv()?;
+        if let Err(failure) = ok(response, what) {
+            error.get_or_insert(failure);
+        }
+    }
+    error.map_or(Ok(()), Err)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -459,6 +493,10 @@ pub struct LocalConn {
     ops: FsOps,
     pending: VecDeque<Response>,
     role: LocalConnectionRole,
+    read_stream: Option<ReadStreamRequest>,
+    read_stream_limit: u64,
+    read_stream_done_sent: bool,
+    write_stream: Option<crate::streaming::Completions>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,12 +525,28 @@ impl LocalConn {
             ops: FsOps::with_descriptor_session(descriptor_session),
             pending: VecDeque::new(),
             role: role.into(),
+            read_stream: None,
+            read_stream_limit: 0,
+            read_stream_done_sent: false,
+            write_stream: None,
         }
     }
 }
 
 impl Conn for LocalConn {
     fn send(&mut self, req: Request) -> Result<()> {
+        anyhow::ensure!(
+            self.write_stream.is_none() || matches!(req, Request::WriteRange { .. }),
+            "only range writes are valid during streaming writes"
+        );
+        anyhow::ensure!(
+            self.read_stream.is_none()
+                || matches!(
+                    req,
+                    Request::StopReadStream | Request::ShrinkReadStream { .. }
+                ),
+            "only stop and shrink requests are valid during a read stream"
+        );
         if self.role != LocalConnectionRole::Control
             && matches!(
                 &req,
@@ -520,17 +574,112 @@ impl Conn for LocalConn {
             ));
             return Ok(());
         }
+        match req {
+            Request::ReadStream(stream) => {
+                if self.role != LocalConnectionRole::SourceWorker || self.read_stream.is_some() {
+                    self.pending.push_back(Response::Err(
+                        "read stream requires an idle source worker".into(),
+                    ));
+                } else if let Err(error) = stream.validate() {
+                    self.pending.push_back(Response::Err(error.to_string()));
+                } else {
+                    self.read_stream_limit = stream.end;
+                    self.read_stream_done_sent = false;
+                    self.read_stream = Some(stream);
+                    self.pending.push_back(Response::Ok);
+                }
+                return Ok(());
+            }
+            Request::ShrinkReadStream { end } => {
+                if self.read_stream.is_none() {
+                    self.pending
+                        .push_back(Response::Err("no read stream is active".into()));
+                    return Ok(());
+                }
+                return crate::streaming::shrink_limit(&mut self.read_stream_limit, end);
+            }
+            Request::StopReadStream => {
+                if self.read_stream.take().is_none() {
+                    self.pending
+                        .push_back(Response::Err("no read stream is active".into()));
+                } else if !self.read_stream_done_sent {
+                    self.pending.push_back(Response::ReadStreamDone);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let resp = self.ops.handle(&req);
+        if let Some(state) = &mut self.write_stream {
+            state.record(resp);
+            return Ok(());
+        }
         self.pending.push_back(resp);
         Ok(())
     }
     fn recv(&mut self) -> Result<Response> {
+        if self.pending.is_empty() {
+            if let Some(stream) = &mut self.read_stream {
+                if stream.off < self.read_stream_limit {
+                    let response = self.ops.handle(&stream.next_request());
+                    if let Response::Block { data, .. } = &response {
+                        stream.off += data.len() as u64;
+                    } else {
+                        stream.off = stream.end;
+                    }
+                    return Ok(response);
+                }
+                // Match the server's early completion without pre-reading data
+                // or adding a local producer thread. Stop still clears the
+                // active mode, and never queues a second completion marker.
+                if !self.read_stream_done_sent {
+                    self.read_stream_done_sent = true;
+                    return Ok(Response::ReadStreamDone);
+                }
+            }
+        }
         self.pending
             .pop_front()
             .ok_or_else(|| anyhow!("no pending response"))
     }
     fn supports_request_pipelining(&self) -> bool {
         false
+    }
+    fn begin_streaming_writes(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.pending.is_empty() && self.write_stream.is_none(),
+            "streaming writes require an idle connection"
+        );
+        self.write_stream = Some(crate::streaming::Completions::default());
+        Ok(())
+    }
+    fn check_streaming_writes(&mut self) -> Result<()> {
+        streaming_result(
+            self.write_stream
+                .as_ref()
+                .context("no streaming writes are active")?
+                .error
+                .clone(),
+        )
+    }
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.write_stream.is_some(),
+            "no streaming writes are active"
+        );
+        Ok(())
+    }
+    fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
+        let state = self
+            .write_stream
+            .take()
+            .context("no streaming writes are active")?;
+        fence?;
+        anyhow::ensure!(
+            state.count == sent,
+            "streaming write completion count mismatch"
+        );
+        streaming_result(state.error)
     }
     fn scan(
         &mut self,
@@ -626,6 +775,18 @@ pub struct RemoteConn {
     /// A session taken from the session pool: no child of ours to wait for,
     /// and a reader that ends when the remote closes the pipe.
     detached: bool,
+    write_stream: Option<crate::streaming::WriteReplies>,
+}
+
+fn streaming_result(error: Option<crate::streaming::Failure>) -> Result<()> {
+    match error {
+        None => Ok(()),
+        Some(crate::streaming::Failure::Endpoint(error)) => Err(endpoint_error(error)),
+        Some(
+            crate::streaming::Failure::Rejected(error)
+            | crate::streaming::Failure::Transport(error),
+        ) => Err(anyhow!(error)),
+    }
 }
 
 const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -751,6 +912,7 @@ impl RemoteConn {
             reader: Some(reader),
             label,
             dead: false,
+            write_stream: None,
             peer: None,
             tcp_socket: None,
             named_socket: None,
@@ -832,13 +994,18 @@ impl RemoteConn {
 
 impl Conn for RemoteConn {
     fn send(&mut self, req: Request) -> Result<()> {
+        anyhow::ensure!(
+            self.write_stream.is_none()
+                || matches!(req, Request::WriteRange { .. } | Request::WriteStreamFence),
+            "only writes and their fence are valid during streaming writes"
+        );
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
         match self
             .rx
             .as_ref()
-            .expect("reader receiver present")
+            .context("response reader is collecting streaming writes")?
             .recv()
             .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
         {
@@ -851,6 +1018,58 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn begin_streaming_writes(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.write_stream.is_none(),
+            "streaming writes already active"
+        );
+        self.write_stream = Some(crate::streaming::WriteReplies::spawn(
+            self.rx.take().context("response reader missing")?,
+        ));
+        Ok(())
+    }
+    fn check_streaming_writes(&mut self) -> Result<()> {
+        let state = self
+            .write_stream
+            .as_ref()
+            .context("no streaming writes are active")?
+            .status();
+        if matches!(state.error, Some(crate::streaming::Failure::Transport(_))) {
+            self.dead = true;
+        }
+        streaming_result(state.error)
+    }
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        // The non-writing marker fences every reply, even when a signed grant
+        // has expired and the destination is rejecting all further writes.
+        anyhow::ensure!(
+            self.write_stream.is_some(),
+            "no streaming writes are active"
+        );
+        if self.dead {
+            Err(anyhow!("streaming transport failed"))
+        } else {
+            self.send(Request::WriteStreamFence)
+        }
+    }
+    fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
+        let stream = self
+            .write_stream
+            .take()
+            .context("no streaming writes are active")?;
+        let (rx, state) = stream.finish(fence.is_err());
+        self.rx = Some(rx);
+        fence?;
+        if matches!(state.error, Some(crate::streaming::Failure::Transport(_)))
+            || !state.fenced
+            || state.count != sent
+        {
+            self.dead = true;
+            streaming_result(state.error)?;
+            bail!("streaming write completion fence/count mismatch");
+        }
+        streaming_result(state.error)
     }
     fn tcp_rtt_us(&self) -> Option<u64> {
         self.tcp_socket
@@ -938,6 +1157,12 @@ impl Conn for RemoteConn {
 
 impl Drop for RemoteConn {
     fn drop(&mut self) {
+        // Cancel the reply collector before joining the underlying response
+        // reader: otherwise it still owns the channel receiver on an unwind.
+        if let Some(stream) = self.write_stream.take() {
+            let (rx, _) = stream.finish(true);
+            self.rx = Some(rx);
+        }
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }
@@ -1720,6 +1945,7 @@ impl RemoteSpec {
                 reader: Some(reader),
                 label: self.label(),
                 dead: false,
+                write_stream: None,
                 peer: None,
                 tcp_socket: None,
                 named_socket: Some(stream),
@@ -1777,6 +2003,7 @@ impl RemoteSpec {
             reader: Some(reader),
             label: self.label(),
             dead: false,
+            write_stream: None,
             peer: None,
             tcp_socket: None,
             named_socket: None,
@@ -2107,6 +2334,7 @@ impl RemoteSpec {
                 reader: Some(reader),
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
+                write_stream: None,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 named_socket: None,
@@ -3106,6 +3334,7 @@ mod tests {
                     reader: Some(reader),
                     label: "hostile vector reply".into(),
                     dead: false,
+                    write_stream: None,
                     peer: None,
                     tcp_socket: None,
                     named_socket: None,
@@ -3212,13 +3441,83 @@ mod tests {
         let response = source
             .call(Request::ReadRange {
                 path: b"contradictory-path".to_vec(),
-                source: Some(source_marker),
+                source: Some(source_marker.clone()),
                 attempt: 0,
                 off: 0,
                 len: 6,
             })
             .unwrap();
         assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+
+        for reference in [Some(source_marker.clone()), None] {
+            source
+                .send(Request::ReadStream(ReadStreamRequest {
+                    path: marker.as_os_str().as_bytes().to_vec(),
+                    source: reference.clone(),
+                    attempt: 0,
+                    off: 0,
+                    end: 6,
+                    block: 512,
+                }))
+                .unwrap();
+            assert!(matches!(source.recv().unwrap(), Response::Ok));
+            let response = source.recv().unwrap();
+            if reference.is_some() {
+                assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+            } else {
+                assert!(matches!(response, Response::EndpointError(_)));
+            }
+            assert!(matches!(source.recv().unwrap(), Response::ReadStreamDone));
+            source.send(Request::ShrinkReadStream { end: 0 }).unwrap();
+            source.send(Request::StopReadStream).unwrap();
+            assert!(source.recv().is_err(), "Stop queued a second Done");
+        }
+
+        // One-way shrinking does not insert a response before the next block.
+        // Preserve the original frame boundary even if the new limit cuts it.
+        for end in [3, 0] {
+            assert!(matches!(
+                source
+                    .call(Request::ReadStream(ReadStreamRequest {
+                        path: marker.as_os_str().as_bytes().to_vec(),
+                        source: Some(source_marker.clone()),
+                        attempt: 0,
+                        off: 0,
+                        end: 6,
+                        block: 512,
+                    }))
+                    .unwrap(),
+                Response::Ok
+            ));
+            let range = std::sync::Arc::new(std::sync::Mutex::new(crate::sched::RangeState {
+                idx: 0,
+                pos: 0,
+                end,
+            }));
+            let mut announced = 6;
+            assert!(
+                crate::streaming::notify_shrunk_range(&range, &mut announced, &mut *source)
+                    .unwrap()
+            );
+            assert_eq!(announced, end);
+            assert!(
+                !crate::streaming::notify_shrunk_range(&range, &mut announced, &mut *source)
+                    .unwrap()
+            );
+            if end > 0 {
+                assert!(
+                    matches!(source.recv().unwrap(), Response::Block { data, .. } if data == b"marker")
+                );
+            }
+            assert!(matches!(source.recv().unwrap(), Response::ReadStreamDone));
+            source.send(Request::StopReadStream).unwrap();
+            // Invalid controls are ordinary replies outside stream mode on
+            // both local and server connections, not local-only send errors.
+            assert!(matches!(
+                source.call(Request::ShrinkReadStream { end: 0 }).unwrap(),
+                Response::Err(error) if error == "no read stream is active"
+            ));
+        }
 
         let response = source
             .call(Request::Apply {
@@ -3332,6 +3631,64 @@ mod tests {
         );
         assert!(OpenSshVersion { major: 9, minor: 0 } > CONSTRAINED_OPENSSH_MINIMUM);
         assert_eq!(CONSTRAINED_OPENSSH_MINIMUM.to_string(), "OpenSSH 8.9");
+    }
+
+    #[test]
+    fn ordinary_range_drain_consumes_errors_but_not_the_next_operation() {
+        let mut conn = LocalConn::new(&ConnectionRole::Control, Default::default());
+        conn.pending.extend([
+            Response::Err("first failed write".into()),
+            Response::Err("later failed write".into()),
+            Response::Path(b"next operation".to_vec()),
+        ]);
+        let error = drain_range_replies(&mut conn, 2, "write").unwrap_err();
+        assert!(error.to_string().contains("first failed write"));
+        assert!(matches!(conn.recv().unwrap(), Response::Path(path) if path == b"next operation"));
+        assert!(conn.pending.is_empty());
+        conn.begin_streaming_writes().unwrap();
+        let fence = conn.fence_streaming_writes();
+        conn.finish_streaming_writes(0, fence).unwrap();
+    }
+
+    #[test]
+    fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountWrites(Arc<AtomicUsize>);
+        impl Write for CountWrites {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut conn = RemoteConn {
+            child: None,
+            w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
+            rx: Some(rx),
+            reader: None,
+            label: "inactive stream test".into(),
+            dead: false,
+            write_stream: None,
+            peer: None,
+            tcp_socket: None,
+            named_socket: None,
+            multiplexed_ssh: false,
+            detached: true,
+        };
+        let fence = conn.fence_streaming_writes();
+        assert!(fence.is_err());
+        assert!(conn.finish_streaming_writes(0, fence).is_err());
+        assert!(conn.rx.is_some());
+        assert!(!conn.dead);
+        // Drop normally sends Shutdown; that is outside the operation under test.
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3535,6 +3892,7 @@ mod tests {
             reader: Some(reader),
             label: "pipelined hello test".into(),
             dead: false,
+            write_stream: None,
             peer: None,
             tcp_socket: None,
             named_socket: None,
@@ -3585,6 +3943,7 @@ mod tests {
             reader: Some(reader),
             label: "version-skew test".into(),
             dead: false,
+            write_stream: None,
             peer: None,
             tcp_socket: None,
             named_socket: None,
@@ -3627,6 +3986,7 @@ mod tests {
             reader: None,
             label: "retryable SSH test".into(),
             dead: false,
+            write_stream: None,
             peer: None,
             tcp_socket: None,
             named_socket: None,
@@ -3753,6 +4113,7 @@ mod tests {
                 reader: Some(reader),
                 label: "test tcp".into(),
                 dead: false,
+                write_stream: None,
                 peer: None,
                 tcp_socket: Some(tcp_socket),
                 named_socket: None,
@@ -3822,6 +4183,7 @@ mod tests {
                 reader: Some(reader),
                 label: "hostile source".into(),
                 dead: false,
+                write_stream: None,
                 peer: None,
                 tcp_socket: None,
                 named_socket: None,
