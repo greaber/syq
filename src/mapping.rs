@@ -444,7 +444,7 @@ mod tests {
         let mut admission = Admission::new(Authorization::from_contents(contents.as_bytes()), 3);
         assert!(admission.append(0, contents.as_bytes(), true).is_err());
         assert!(admission.permissions().is_err());
-        let long_path = entry("a", &"a/".repeat(2500));
+        let long_path = entry("a", &format!("{}z", "a/".repeat(2500)));
         let mut admission =
             Admission::new(Authorization::from_contents(long_path.as_bytes()), 10_000);
         assert!(admission.append(0, long_path.as_bytes(), true).is_err());
