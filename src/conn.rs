@@ -1325,6 +1325,7 @@ pub(crate) struct SshMultiplexer {
     idle_timeout: &'static str,
     automatic_receiving: bool,
     reuse_for_workers: AtomicBool,
+    workers_rejected: AtomicBool,
 }
 
 // Keepalives detect dead transports so a later command can reconnect. Durable
@@ -1444,6 +1445,7 @@ impl SshMultiplexer {
             idle_timeout: "no",
             automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         })
     }
 
@@ -1462,6 +1464,7 @@ impl SshMultiplexer {
             idle_timeout: if global { "yes" } else { "300" },
             automatic_receiving: global,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         })
     }
 
@@ -1699,7 +1702,8 @@ impl RemoteSpec {
         if !limited {
             SshConnection::Control
         } else if self.ssh_multiplexer.as_ref().is_some_and(|multiplexer| {
-            (first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers()
+            !multiplexer.workers_rejected.load(Ordering::Relaxed)
+                && ((first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers())
         }) {
             SshConnection::Worker
         } else {
@@ -1896,6 +1900,9 @@ impl RemoteSpec {
                     // independently authenticated SSH connection. Disable
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
+                    if let Some(multiplexer) = &self.ssh_multiplexer {
+                        multiplexer.workers_rejected.store(true, Ordering::Relaxed);
+                    }
                     first_worker = false;
                     if crate::transfer::debug() {
                         crate::output::diagnostic!(
@@ -1942,6 +1949,9 @@ impl RemoteSpec {
         ssh_connection: SshConnection,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        // The receiver child is on this machine, not across the network.
+        // Recompressing forwarded blocks here adds CPU work to downloads.
+        let compress = compress && !self.local_process;
         let return_stream = if let Some(approved) = &self.forwarded {
             if !matches!(role, ConnectionRole::Control) {
                 bail!("copies via a return connection require encrypted TCP workers");
@@ -2282,6 +2292,8 @@ impl RemoteSpec {
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        // Keep network compression, but not on the local receiver's data hop.
+        let compress = compress && !self.local_process;
         let n = info.addrs.len();
         let start = info.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
         let mut last = anyhow!("no data address");
@@ -3968,6 +3980,52 @@ mod tests {
     }
 
     #[test]
+    fn only_the_local_receiver_disables_requested_tcp_compression() {
+        for local_process in [false, true] {
+            for requested in [false, true] {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut id = [0; 4];
+                    socket.read_exact(&mut id).unwrap();
+                    let mut reader =
+                        FrameReader::new(RecordReader::new(socket.try_clone().unwrap(), None));
+                    let Request::Hello { compress, .. } = reader.read_msg().unwrap() else {
+                        panic!("expected Hello");
+                    };
+                    let mut writer = FrameWriter::new(RecordWriter::new(socket, None), false);
+                    writer.write_msg(&hello_ok()).unwrap();
+                    compress
+                });
+                let mut spec = RemoteSpec::local_receiver(false);
+                // Even an explicit SSH endpoint on loopback is not the
+                // in-process receiver and keeps the requested compression.
+                spec.local_process = local_process;
+                let info = TcpInfo {
+                    addrs: vec!["127.0.0.1".into()],
+                    port,
+                    key: None,
+                    token: Vec::new(),
+                    congestion_control: None,
+                    failed: false,
+                    failure: None,
+                    next: Default::default(),
+                };
+                let conn = spec
+                    .connect_tcp(&info, requested, ConnectionRole::Control)
+                    .unwrap();
+                let expected = requested && !local_process;
+                assert_eq!(conn.w.compress, expected);
+                assert_eq!(server.join().unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn rejected_worker_initialization_is_not_a_retryable_transport_error() {
         let error: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
         assert!(is_worker_initialization_error(&error));
@@ -4656,9 +4714,16 @@ mod tests {
         );
         assert!(result.is_err()); // The independent attempt reports a missing helper.
         assert_eq!(
-            std::fs::read_to_string(log).unwrap(),
+            std::fs::read_to_string(&log).unwrap(),
             "shared\nindependent\n"
         );
+        // Another startup worker's per-call preference must not override a
+        // rejection already observed by a peer sharing this control session.
+        let peer = spec.clone();
+        peer.set_ssh_multiplexing(true);
+        assert_eq!(peer.ssh_connection(true, true), SshConnection::Independent);
+        assert_eq!(peer.ssh_connection(true, false), SshConnection::Independent);
+        assert_eq!(peer.ssh_connection(false, true), SshConnection::Control);
     }
 
     #[test]
@@ -4767,6 +4832,7 @@ mod tests {
             idle_timeout: "300",
             automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         }));
         assert!(!verbose(&spec, true));
         assert!(!spec
@@ -4789,6 +4855,7 @@ mod tests {
             idle_timeout: "300",
             automatic_receiving: false,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         };
         let spec = RemoteSpec {
             local_process: false,

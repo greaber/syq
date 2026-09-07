@@ -4711,9 +4711,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         "{stderr}"
     );
     assert!(
-        stderr.contains(
-            "target 8 connections (auto-tuned); initial count limited by available work; dry-run starts no workers"
-        ),
+        stderr.contains("target 8 connections (auto-tuned); dry-run starts no workers"),
         "{stderr}"
     );
     assert_eq!(
@@ -4912,17 +4910,24 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
     let rsh = fake_rsh(&t);
     let content = prng(64 << 20, 3241);
     write(&t.path("src"), &content);
-    for (label, fixed, nonempty) in [
-        ("auto", false, false),
-        ("fixed", true, false),
-        ("nonempty", false, true),
+    for (label, fixed, nonempty, single_file) in [
+        ("auto", false, false, false),
+        ("fixed", true, false, false),
+        ("nonempty", false, true, false),
+        ("single", false, false, true),
+        ("single-fixed", true, false, true),
+        ("single-update", false, true, true),
     ] {
         let directory = t.path(&format!("dst-{label}"));
         fs::create_dir_all(&directory).unwrap();
         if nonempty {
             write(&directory.join("src"), b"old destination contents");
         }
-        let destination = format!("host:{}/", directory.display());
+        let destination = if single_file {
+            format!("host:{}/src", directory.display())
+        } else {
+            format!("host:{}/", directory.display())
+        };
         let events = t.path(&format!("events-{label}"));
         let mut command = compat_command();
         command
@@ -4930,7 +4935,7 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
             .arg(&rsh)
             .arg("--rsync-path")
             .arg(env!("CARGO_BIN_EXE_syq"))
-            .args(["--syq-no-tcp", "-a", "--no-progress"])
+            .args(["--syq-no-tcp", "-a", "-vv", "--no-progress"])
             .arg(t.s("src"))
             .arg(destination)
             .env("SYQ_TEST_WORKER_EVENTS", &events)
@@ -4941,6 +4946,12 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
+        assert_eq!(
+            stderr_of(&out).contains("SSH startup limited to 2 workers"),
+            !fixed && !nonempty,
+            "{label}: {out:?}"
+        );
+        assert!(!stderr_of(&out).contains("initial count limited by available work"));
         assert_eq!(read(&directory.join("src")), content);
         let connected = fs::read_to_string(events)
             .unwrap()
@@ -4953,6 +4964,67 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
             "{label}: {out:?}"
         );
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn automatic_ssh_restores_workers_for_a_single_file_partial() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let content = prng(64 << 20, 3242);
+    write(&t.path("src"), &content);
+    fs::create_dir_all(t.path("dest")).unwrap();
+    let destination = format!("host:{}/file", t.path("dest").display());
+    let source = t.s("src");
+    let args = [
+        "-e",
+        rsh.to_str().unwrap(),
+        "--rsync-path",
+        env!("CARGO_BIN_EXE_syq"),
+        "--syq-no-tcp",
+        "-a",
+        "-vv",
+        source.as_str(),
+        destination.as_str(),
+    ];
+    let failed = compat_command()
+        .args(args)
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("failed-cache"))
+        .run()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(23), "{failed:?}");
+    assert!(!t.path("dest/file").exists());
+    let partials = partial_files(&t.path("dest"));
+    assert_eq!(partials.len(), 1, "{failed:?}");
+    let partial = partials[0].clone();
+    // Eight disjoint missing blocks: size-based startup alone would leave
+    // only two workers, even though every missing block is independent work.
+    let mut resumed = content.clone();
+    for block in (0..16).step_by(2) {
+        resumed[block * (4 << 20)..(block + 1) * (4 << 20)].fill(0);
+    }
+    write(&partial, &resumed);
+    let events = t.path("events");
+    let out = compat_command()
+        .args(args)
+        .arg("--no-progress")
+        .env("SYQ_TEST_WORKER_EVENTS", &events)
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dest/file")), content);
+    assert!(!partial.exists());
+    let connected = fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("connected "))
+        .count();
+    assert_eq!(connected, 8, "{out:?}");
+    assert!(stderr_of(&out).contains("SSH startup limited to 2 workers"));
 }
 
 #[test]
@@ -11609,13 +11681,14 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    for _ in 0..200 {
-        if t.path("dst/file").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(t.path("dst/file").exists(), "first attempt never finalized");
+    // This includes copying the fixture in a debug build. Uncompressed local
+    // receiver traffic can take more than two seconds; wait for publication,
+    // not a throughput target, before changing the source during the hold.
+    wait_for(
+        "first attempt to finalize",
+        std::time::Duration::from_secs(10),
+        || t.path("dst/file").exists(),
+    );
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
@@ -11652,13 +11725,11 @@ fn changed_source_retry_still_uses_copy_file_range() {
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    for _ in 0..200 {
-        if t.path("dst/file").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(t.path("dst/file").exists(), "first attempt never finalized");
+    wait_for(
+        "first attempt to finalize",
+        std::time::Duration::from_secs(10),
+        || t.path("dst/file").exists(),
+    );
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();

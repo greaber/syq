@@ -9,9 +9,15 @@ two workers on the copy's existing SSH connection while the others open
 independent connections for parallel throughput. A fixed connection count
 reuses it for only one worker. This reuse does not apply to a cross-run
 persistent connection or a custom `--rsh` command. Automatic SSH copies into
-new or empty directories also limit their initial worker count to the available
-files and splittable ranges. Updates and resumed copies keep their usual count:
-one file can contain many separate changed regions.
+new or empty directories, or to missing single-file destinations, also limit
+their initial worker count to the available files and splittable ranges.
+Updates keep their usual count. If a missing file has a resumable partial,
+syq restores that count when it discovers the partial: one file can contain
+many separate changed regions.
+With automatic concurrency, syq divides a single large fresh file over SSH
+before copying starts, so workers that connect later can help without waiting for a large enough
+remaining range to split. Earlier workers can keep taking work while those
+connections start.
 When pushing into an
 existing directory, syq pipelines destination setup checks to reduce network
 round trips. For eligible small-file trees in an empty destination, TCP workers
@@ -354,7 +360,8 @@ a mixture of old and new contents while the copy runs. If interrupted, that
 incomplete version stays at the final filename until you finish the copy.
 
 `--no-compress` saves CPU at the cost of potentially sending more bytes; it
-does not affect file contents or integrity checks.
+does not affect file contents or integrity checks. Compression applies across
+the network, not between syq and its receiver process on the same machine.
 
 Examples use native options. In rsync mode, syq-specific options have a
 `--syq-` prefix, such as `--syq-connections` and `--syq-no-tcp`.
