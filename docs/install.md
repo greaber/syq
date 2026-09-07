@@ -140,8 +140,8 @@ closed and reopened; upgrading does not interrupt a working connection solely
 to change its timeout.
 
 `syq persist status --json` reports the persistence setting, scope, and one
-entry per endpoint. Each entry includes its state (`ready`, `connecting`,
-`reconnecting`, `failed`, or `inactive`), whether ordinary SSH is connected,
+entry per endpoint. Each entry includes its state (`starting`, `connecting`,
+`ready`, `reconnecting`, `failed`, or `inactive`), whether ordinary SSH is connected,
 and receiving state and errors. With receiving enabled, `ready` means that the
 return connection is online; ordinary SSH can reconnect on its next use.
 Inspecting status does not start connections. A configuration failure is shown
