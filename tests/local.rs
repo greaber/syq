@@ -11681,13 +11681,14 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    for _ in 0..200 {
-        if t.path("dst/file").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(t.path("dst/file").exists(), "first attempt never finalized");
+    // This includes copying the fixture in a debug build. Uncompressed local
+    // receiver traffic can take more than two seconds; wait for publication,
+    // not a throughput target, before changing the source during the hold.
+    wait_for(
+        "first attempt to finalize",
+        std::time::Duration::from_secs(10),
+        || t.path("dst/file").exists(),
+    );
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
@@ -11724,13 +11725,11 @@ fn changed_source_retry_still_uses_copy_file_range() {
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    for _ in 0..200 {
-        if t.path("dst/file").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(t.path("dst/file").exists(), "first attempt never finalized");
+    wait_for(
+        "first attempt to finalize",
+        std::time::Duration::from_secs(10),
+        || t.path("dst/file").exists(),
+    );
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
