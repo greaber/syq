@@ -123,8 +123,6 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
-python3 /usr/local/libexec/syq-test-restricted-mapping.py
-
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 
@@ -683,6 +681,8 @@ ssh destination '
     test ! -e ~/.local/share/syq/restricted
     test ! -e ~/.local/libexec/syq-receiver
 '
+
+python3 /usr/local/libexec/syq-test-restricted-mapping.py
 
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
