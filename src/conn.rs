@@ -2100,6 +2100,7 @@ impl RemoteSpec {
                 other => bail!("unexpected response {other:?}"),
             },
         };
+        validate_advertised_tcp_port(port, ports)?;
         if advertised.len() > MAX_ADVERTISED_TCP_ADDRESSES {
             bail!(
                 "TCP listener advertised too many addresses (limit {MAX_ADVERTISED_TCP_ADDRESSES})"
@@ -2455,6 +2456,18 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
                 undetermined -= 1;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_advertised_tcp_port(port: u16, requested: (u16, u16)) -> Result<()> {
+    // (0, 0) asks the operating system to allocate an ephemeral port.
+    if port == 0 || (requested != (0, 0) && !(requested.0..=requested.1).contains(&port)) {
+        bail!(
+            "TCP listener advertised port {port} outside requested range {}-{}",
+            requested.0,
+            requested.1
+        );
     }
     Ok(())
 }
@@ -3305,6 +3318,23 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advertised_tcp_port_must_match_requested_range() {
+        for port in [47_600, 47_650, 47_699] {
+            super::validate_advertised_tcp_port(port, (47_600, 47_699)).unwrap();
+        }
+        for port in [0, 22, 47_599, 47_700, u16::MAX] {
+            assert!(super::validate_advertised_tcp_port(port, (47_600, 47_699)).is_err());
+        }
+        super::validate_advertised_tcp_port(12345, (12345, 12345)).unwrap();
+        assert!(super::validate_advertised_tcp_port(12346, (12345, 12345)).is_err());
+        // Existing test and local listener callers use (0, 0) for OS allocation.
+        for port in [1, 47_650, u16::MAX] {
+            super::validate_advertised_tcp_port(port, (0, 0)).unwrap();
+        }
+        assert!(super::validate_advertised_tcp_port(0, (0, 0)).is_err());
+    }
+
     #[test]
     fn tcp_connection_ids_fail_at_nonce_space_exhaustion() {
         let next = std::sync::atomic::AtomicU32::new(crate::tcp_records::CONNECTION_ID_MAX);

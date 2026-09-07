@@ -48,6 +48,11 @@ finish within seven days of authorization.
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 
+TCP listeners must advertise a port in the requested range. An invalid port
+fails TCP setup before any address is probed. Special-file creation accepts
+only FIFO, socket, and device types; permission bits follow the grant's
+permission-preservation setting.
+
 ## Signed results
 
 The destination signs a receipt and your machine verifies it before reporting

@@ -2214,6 +2214,7 @@ dependencies = [
  "socket2",
  "ssh-agent-lib",
  "ssh-key",
+ "subtle",
  "tempfile",
  "ureq",
  "zeroize",
