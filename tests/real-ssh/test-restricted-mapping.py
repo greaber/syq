@@ -65,6 +65,12 @@ def direct():
         ssh("destination", f"import os; os.utime({destination + '/nested/renamed'!r},(1500000000,1500000000))")
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--skip-newer"], data=updating)
         ssh("destination", f"from pathlib import Path; assert Path({destination + '/nested/renamed'!r}).read_bytes()==b'mapped contents'")
+        # PR #275's only-new policy also preserves existing directory metadata.
+        only_new = root + "/only-new"
+        ssh("destination", f"from pathlib import Path; import os; p=Path({only_new!r}); p.mkdir(); (p/'kept').write_bytes(b'keep destination'); (p/'directory').mkdir(); (p/'directory').chmod(0o555); os.utime(p/'directory',(1500000000,1500000000))")
+        selected = manifest([("file", "kept", "file"), ("file", "fresh", "file"), ("directory", "directory", "dir")])
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", only_new, "--only-new"], data=selected)
+        ssh("destination", f"from pathlib import Path; p=Path({only_new!r}); assert (p/'kept').read_bytes()==b'keep destination'; assert (p/'fresh').read_bytes()==b'mapped contents'; d=(p/'directory').stat(); assert d.st_mode & 0o777 == 0o555; assert d.st_mtime_ns==1500000000000000000; (p/'directory').chmod(0o755)")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         large = manifest([("file", f"group/file-{i}", "file") for i in range(10_000)])
         assert len(large) > 1024 * 1024
