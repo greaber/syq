@@ -1384,18 +1384,26 @@ struct PathCompletionPolicy {
     follow_final_symlinks: bool,
 }
 
-impl From<OperatorSymlinkPolicy> for PathCompletionPolicy {
-    fn from(parents: OperatorSymlinkPolicy) -> Self {
+impl PathCompletionPolicy {
+    fn new(parents: OperatorSymlinkPolicy, follow_final_symlinks: bool) -> Self {
         Self {
             parents,
-            follow_final_symlinks: true,
+            follow_final_symlinks,
         }
     }
 }
 
-fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> PathCompletionPolicy {
+fn path_policy(
+    command: &str,
+    args: &[Vec<u8>],
+    source: bool,
+    follow_final_symlinks: bool,
+) -> PathCompletionPolicy {
     if command == "rsync" {
-        return OperatorSymlinkPolicy::TrustedOwner.into();
+        return PathCompletionPolicy::new(
+            OperatorSymlinkPolicy::TrustedOwner,
+            follow_final_symlinks,
+        );
     }
     if contains_option(args, b"--follow")
         || contains_option(
@@ -1407,9 +1415,9 @@ fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> PathCompletionP
             },
         )
     {
-        OperatorSymlinkPolicy::FollowAll.into()
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::FollowAll, follow_final_symlinks)
     } else {
-        OperatorSymlinkPolicy::Refuse.into()
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::Refuse, follow_final_symlinks)
     }
 }
 
@@ -1427,7 +1435,7 @@ fn complete_path_for(
             current,
             false,
             None,
-            path_policy(command, args, false),
+            path_policy(command, args, false, true),
         ));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
@@ -1435,7 +1443,7 @@ fn complete_path_for(
             current,
             false,
             None,
-            path_policy(command, args, false),
+            path_policy(command, args, false, true),
         ));
     };
     let authorizer = find_option_value(args, b"--auth-from");
@@ -1461,7 +1469,7 @@ fn complete_path_for(
         current,
         Vec::new(),
         None,
-        path_policy(command, args, false),
+        path_policy(command, args, false, true),
     )
 }
 
@@ -1471,10 +1479,9 @@ fn complete_source_path(
     current: &[u8],
     apply_base: bool,
 ) -> Result<Vec<Candidate>> {
-    let mut policy = path_policy(command, args, true);
     // Removal follows parent paths when requested, but selects the final link
     // itself. --cwd and --root still resolve their complete directory paths.
-    policy.follow_final_symlinks = command != "rm" || !apply_base;
+    let policy = path_policy(command, args, true, command != "rm" || !apply_base);
     let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
         return Ok(local_path_candidates_at(current, false, base, policy));
@@ -1516,14 +1523,14 @@ fn complete_rsync_operand(args: &[Vec<u8>], current: &[u8]) -> Result<Vec<Candid
             path,
             wrapper,
             None,
-            OperatorSymlinkPolicy::TrustedOwner.into(),
+            PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, true),
         );
     }
     let mut candidates = local_path_candidates_at(
         current,
         false,
         None,
-        OperatorSymlinkPolicy::TrustedOwner.into(),
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, true),
     );
     candidates.extend(endpoint_candidates(
         current,
@@ -1791,7 +1798,7 @@ fn local_path_candidates(current: &[u8], directories_only: bool) -> Vec<Candidat
         current,
         directories_only,
         None,
-        OperatorSymlinkPolicy::FollowAll.into(),
+        PathCompletionPolicy::new(OperatorSymlinkPolicy::FollowAll, true),
     )
 }
 
