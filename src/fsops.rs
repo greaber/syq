@@ -107,6 +107,7 @@ struct FileSystemTraits {
     is_nfs: bool,
     synchronous: bool,
     measured_local_source: bool,
+    local_userspace_copy: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -192,10 +193,15 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
             synchronous,
-            // Keep the automatic optimization confined to the source
-            // filesystems actually exercised by the ext-family and XFS NFS
-            // benchmarks. Unknown or network-backed sources retain adaptive
-            // range reads until measured independently.
+            // Keep unknown and network-backed filesystems on adaptive ranges.
+            // tmpfs also provides a real cross-filesystem control for this path.
+            local_userspace_copy: matches!(
+                file_system_type,
+                t if t == libc::EXT4_SUPER_MAGIC as u32
+                    || t == libc::XFS_SUPER_MAGIC as u32
+                    || t == libc::TMPFS_MAGIC as u32
+            ),
+            // Preserve the independently measured ext-family/XFS -> NFS scope.
             measured_local_source: matches!(
                 file_system_type,
                 t if t == libc::EXT4_SUPER_MAGIC as u32
@@ -243,12 +249,6 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
 fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystemKey)>> {
     static PAIRS: OnceLock<Mutex<HashSet<(FileSystemKey, FileSystemKey)>>> = OnceLock::new();
     PAIRS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[cfg(target_os = "linux")]
-fn copy_destination_mounts() -> &'static Mutex<HashMap<PathBuf, FileSystemKey>> {
-    static MOUNTS: OnceLock<Mutex<HashMap<PathBuf, FileSystemKey>>> = OnceLock::new();
-    MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(target_os = "linux")]
@@ -5159,10 +5159,10 @@ impl FsOps {
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
-    /// transport. Prefer copy_file_range; when a cross-mount copy into NFS
-    /// cannot be offloaded, use one sequential userspace writer instead. Other
-    /// unsupported filesystems return `CopyLocalOutcome::Unsupported` for the
-    /// parallel streaming path.
+    /// transport. Prefer copy_file_range; eligible local filesystems and the
+    /// measured asynchronous NFS destination case use a sequential userspace
+    /// writer when offload is unsupported. File workers still run in parallel;
+    /// other filesystem pairs retain the adaptive range path.
     #[cfg(target_os = "linux")]
     fn copy_local(
         &mut self,
@@ -5197,11 +5197,6 @@ impl FsOps {
         let dp = PathBuf::from(OsStr::from_bytes(dst));
         let destination_relative = RelativePath::new(dst)?;
         let destination_label = self.logical_destination_path(&dp);
-        let destination_parent = destination_label
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
         #[cfg(debug_assertions)]
         hold_copy_local_before_destination_open_for_test()?;
         let source_metadata = s.metadata()?;
@@ -5223,21 +5218,6 @@ impl FsOps {
             );
         }
         let source_key = file_system_key(&s, source_metadata.dev());
-        if !allow_sequential_nfs_fallback {
-            let known_destination = copy_destination_mounts()
-                .lock()
-                .unwrap()
-                .get(&destination_parent)
-                .copied();
-            if known_destination.is_some_and(|destination_key| {
-                unsupported_copy_pairs()
-                    .lock()
-                    .unwrap()
-                    .contains(&(source_key, destination_key))
-            }) {
-                return Ok(CopyLocalOutcome::Unsupported);
-            }
-        }
         self.uncache_rooted(&destination_root, &destination_relative);
         let (target_relative, target_label) = if inplace {
             (destination_relative, destination_label)
@@ -5316,10 +5296,6 @@ impl FsOps {
         let destination_metadata = d.metadata()?;
         let destination_dev = destination_metadata.dev();
         let destination_key = file_system_key(&d, destination_dev);
-        copy_destination_mounts()
-            .lock()
-            .unwrap()
-            .insert(destination_parent, destination_key);
         let source_fs = file_system_traits(&s, source_key);
         let destination_fs = file_system_traits(&d, destination_key);
         #[cfg(debug_assertions)]
@@ -5346,13 +5322,21 @@ impl FsOps {
             && source_fs.measured_local_source
             && destination_fs.is_nfs
             && !destination_fs.synchronous;
+        // Local files keep parallelism across files without paying transport
+        // and per-range hashing costs. Do not widen the NFS exception above.
+        let use_userspace_fallback = use_sequential_nfs_fallback
+            || (source_fs.local_userspace_copy
+                && destination_fs.local_userspace_copy
+                && !source_fs.is_nfs
+                && !destination_fs.is_nfs
+                && !destination_fs.synchronous);
         let copy_pair = (source_key, destination_key);
         let copy_pair_unsupported = unsupported_copy_pairs()
             .lock()
             .unwrap()
             .contains(&copy_pair);
-        let mut userspace_fallback = copy_pair_unsupported && use_sequential_nfs_fallback;
-        if copy_pair_unsupported && !use_sequential_nfs_fallback {
+        let mut userspace_fallback = copy_pair_unsupported && use_userspace_fallback;
+        if copy_pair_unsupported && !use_userspace_fallback {
             let partial_metadata = d.metadata()?;
             drop(d);
             if !inplace {
@@ -5368,7 +5352,8 @@ impl FsOps {
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
-            if use_sequential_nfs_fallback {
+            unsupported_copy_pairs().lock().unwrap().insert(copy_pair);
+            if use_userspace_fallback {
                 userspace_fallback = true;
             } else {
                 let partial_metadata = d.metadata()?;
@@ -5414,7 +5399,7 @@ impl FsOps {
                     if matches!(raw, libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP) {
                         unsupported_copy_pairs().lock().unwrap().insert(copy_pair);
                     }
-                    if use_sequential_nfs_fallback {
+                    if use_userspace_fallback {
                         userspace_fallback = true;
                         continue;
                     }
@@ -5468,6 +5453,19 @@ impl FsOps {
                 destination
                     .write_all(&buffer[..n])
                     .with_context(|| format!("write {}", target_label.display()))?;
+                #[cfg(debug_assertions)]
+                if remaining == size {
+                    test_race_barrier(
+                        "SYQ_TEST_COPY_LOCAL_WRITTEN_FILE",
+                        "SYQ_TEST_COPY_LOCAL_CONTINUE_FILE",
+                        "SYQ_TEST_HOLD_COPY_LOCAL_WRITTEN_MS",
+                        "local-copy first write",
+                    )?;
+                    if std::env::var_os("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE").is_some() {
+                        return Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                            .context("test local-copy write failure");
+                    }
+                }
                 remaining -= n as u64;
             }
             d.set_len(size)?;

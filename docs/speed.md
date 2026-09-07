@@ -341,10 +341,17 @@ copy authorization.
 
 ## Local copies and NFS
 
-Same-machine Linux copies can use kernel or NFS server-side copying. When
-that is unavailable, syq can still benefit from parallel file operations.
-It automatically uses a sequential destination writer for eligible local-disk
-to asynchronous-NFS copies; you usually need no special flags.
+Same-machine Linux copies first try kernel or NFS server-side copying. If
+that is unavailable between ext4, XFS, or tmpfs filesystems, syq copies each
+file directly through its open source and destination files. It runs file
+copies in parallel without sending their contents through local TCP connections.
+This happens automatically, without tuning options.
+
+Syq also uses a sequential destination writer for eligible local-disk to
+asynchronous-NFS copies. NFS sources, synchronous destinations, and other
+filesystems retain parallel range copying when offload is unavailable.
+Checksum comparisons, resumed data, and bandwidth limits keep their usual
+range-based behavior.
 
 ```sh
 syq cp /raid/data --into /mnt/nfs/backup
