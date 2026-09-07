@@ -46,6 +46,11 @@ RUN apt-get update \
     && install -d -m 0700 -o syq -g syq /home/syq/.ssh \
     && install -d -m 0755 /run/sshd
 
+# Its enrollment pathname exceeds Unix socket address limits on both platforms.
+RUN useradd --uid 1001 --gid syq --create-home --shell /bin/sh \
+        --home-dir /home/syq-real-ssh-long-account-home-for-restricted-worker-paths longhome \
+    && passwd --delete longhome
+
 COPY --from=builder /tmp/syq /usr/local/bin/syq
 COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build
 COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh

@@ -14,7 +14,7 @@ AuthenticationMethods publickey
 UsePAM no
 UseDNS no
 
-AllowUsers syq
+AllowUsers syq longhome
 AuthorizedKeysFile .ssh/authorized_keys /run/lab/authorized_keys
 StrictModes yes
 AllowAgentForwarding yes

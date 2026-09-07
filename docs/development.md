@@ -52,7 +52,7 @@ the corresponding flags are `--rsync-path` and `--syq-no-bootstrap`.
 ## Direct server-to-server copies
 
 These use a restricted receiver on the destination, separate from the ordinary
-SSH helper cache. Follow the SSH-agent, host-key, and TCP-port prerequisites in
+SSH helper cache. Follow the SSH-agent, host-key, and connectivity prerequisites in
 [Copy between servers](remote-to-remote.md#what-you-need).
 
 The first real copy can enroll the destination automatically, including with a
@@ -74,12 +74,14 @@ its receipt key. Use `receiver list` to find enrollment IDs and `receiver revoke
 ID` to remove access when finished. If setup needs a jump host, add `--via hostA`
 to `receiver enroll` or `receiver revoke`.
 
-Enrollment uploads the local executable, so it must run on hostB. This applies
-to official releases too: enrollment does not use the ordinary helper's
-cross-platform download mechanism, and `--syq-path` does not select the restricted
-receiver. Run the coordinating command from a compatible machine, or use
-`--coordinate-at local` to relay the copy through your machine using ordinary
-SSH helpers. For that relay, the manual helper selection above is available.
+For a source build, enrollment uploads the running executable after checking
+that hostB has a matching platform. The executable must also run there.
+Official releases also upload the running executable when the platforms match;
+for a different platform, they install the verified release executable for hostB. `--syq-path` does not select the restricted receiver. To develop
+across incompatible platforms, run the coordinating command from a compatible
+machine or explicitly choose `--coordinate-at local` to relay through your
+machine using ordinary SSH helpers. For that relay, the manual helper
+selection above is available.
 
 ## Before a pull request
 

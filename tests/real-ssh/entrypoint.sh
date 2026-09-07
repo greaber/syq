@@ -4,6 +4,11 @@ set -eu
 endpoint() {
     test -r /run/lab/authorized_keys
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
+    # The mounted public key belongs to UID 1000. Give the second test account
+    # its own correctly owned copy for sshd's StrictModes checks.
+    long_home=$(getent passwd longhome | cut -d: -f6)
+    install -d -m 0700 -o longhome -g syq "$long_home/.ssh"
+    install -m 0600 -o longhome -g syq /run/lab/authorized_keys "$long_home/.ssh/authorized_keys"
     install -d -m 0755 /run/sshd
     ssh-keygen -q -t ed25519 -N '' -f /run/sshd/ssh_host_ed25519_key
     if [ -n "${SYQ_REAL_SSH_BLOCKED_TCP_PORT:-}" ]; then

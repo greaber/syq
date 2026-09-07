@@ -95,8 +95,10 @@ use `--auth-from ssh` for completion through hostA's own SSH access.
   trusted. Connect with ordinary SSH once if either server is new to you.
 - An SSH agent on your machine, and OpenSSH 8.9 or newer on your machine,
   hostA's SSH client, and hostB's SSH server.
-- A [reachable TCP data port](server-tuning.md#make-tcp-reachable) on hostB,
-  normally in `47600–47699`. This direct mode cannot send data over SSH instead.
+- SSH connectivity from hostA to hostB. A [reachable TCP data port](server-tuning.md#make-tcp-reachable)
+  on hostB, normally in `47600–47699`, enables encrypted TCP workers. Otherwise
+  the copy uses SSH workers on the same hostA-to-hostB route. `--no-tcp` selects
+  SSH directly.
 - An existing parent directory for the destination.
 
 Keep your command running until the copy finishes. Use native `syq cp`;
@@ -155,7 +157,9 @@ planned, none are performed and the command exits 25. Preview first with
 
 ## Other routes and authentication
 
-If the servers cannot connect directly, relay through your machine:
+Syq may switch between encrypted TCP and SSH on the selected route. It never
+silently relays file data through your machine when a direct connection fails.
+If the servers cannot connect directly, explicitly relay through your machine:
 
 ```sh
 syq cp --coordinate-at local --from hostA --srcs-in data --to hostB --into /archive

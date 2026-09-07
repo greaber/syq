@@ -130,6 +130,7 @@ pub struct PeerInfo {
     pub identity: String,
     pub platform: String,
     pub supports_confined_socket_nodes: bool,
+    pub(crate) ssh_worker_ticket: Option<std::result::Result<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1512,8 +1513,8 @@ pub struct RemoteSpec {
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
     pub bootstrap_helper: bool,
     /// One-time signed authorization for a command-restricted receiver. It is
-    /// sent only on the SSH control connection; authenticated TCP workers are
-    /// children of that already-authorized receiver.
+    /// sent only on the SSH control connection; TCP and SSH workers join
+    /// that already-authorized receiver without redeeming the grant again.
     pub restricted_grant: Option<String>,
     /// Serializes a first-use install across control and worker clones.
     pub helper_install: std::sync::Arc<std::sync::Mutex<bool>>,
@@ -1614,7 +1615,17 @@ impl RemoteSpec {
 
     fn record_peer(&self, conn: &RemoteConn) {
         if let Some(peer) = &conn.peer {
-            self.diagnostics.lock().unwrap().peer = Some(peer.clone());
+            let mut diagnostics = self.diagnostics.lock().unwrap();
+            let mut peer = peer.clone();
+            // Worker Hello has no admission ticket. Keep the control's ticket
+            // for subsequent workers and retries within this same live copy.
+            if peer.ssh_worker_ticket.is_none() {
+                peer.ssh_worker_ticket = diagnostics
+                    .peer
+                    .as_ref()
+                    .and_then(|p| p.ssh_worker_ticket.clone());
+            }
+            diagnostics.peer = Some(peer);
         }
     }
 
@@ -1987,7 +1998,23 @@ impl RemoteSpec {
         }
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = &self.restricted_grant {
-            server_args.push(format!("--restricted-grant={grant}"));
+            if matches!(role, ConnectionRole::Control) {
+                server_args.push(format!("--restricted-grant={grant}"));
+            } else {
+                let ticket = self
+                    .diagnostics
+                    .lock()
+                    .unwrap()
+                    .peer
+                    .as_ref()
+                    .and_then(|peer| peer.ssh_worker_ticket.clone())
+                    .context(
+                        "restricted receiver did not authorize SSH workers; refresh its enrollment",
+                    )?
+                    .map_err(anyhow::Error::msg)
+                    .context("restricted SSH data transport is unavailable")?;
+                server_args.push(format!("--restricted-worker={ticket}"));
+            }
         }
         let mut cmd = if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
@@ -2585,11 +2612,13 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             identity,
             platform,
             supports_confined_socket_nodes,
+            ssh_worker_ticket,
         }) if identity == crate::identity::build() => {
             conn.peer = Some(PeerInfo {
                 identity,
                 platform,
                 supports_confined_socket_nodes,
+                ssh_worker_ticket,
             });
         }
         Ok(Response::HelloOk { identity, .. }) => {
@@ -3296,13 +3325,9 @@ impl Endpoint {
                             return Err(e)
                         }
                         Err(e) => {
-                            if spec.restricted_grant.is_some() {
+                            if spec.forwarded.is_some() {
                                 return Err(e).with_context(|| {
-                                    let reason = if spec.forwarded.is_some() {
-                                        "TCP data connection failed; return authorization requires direct encrypted TCP and cannot fall back to SSH data"
-                                    } else {
-                                        "signed receiver TCP data connection failed; its one-time SSH grant cannot be replayed as a fallback"
-                                    };
+                                    let reason = "TCP data connection failed; return authorization requires direct encrypted TCP and cannot fall back to SSH data";
                                     format!("{}: {reason}", spec.label())
                                 });
                             }
@@ -3331,14 +3356,9 @@ impl Endpoint {
                         }
                     }
                 }
-                if spec.restricted_grant.is_some()
-                    && !crate::destination::is_named(&spec.restricted_grant)
-                {
-                    let reason = if spec.forwarded.is_some() {
-                        "return authorization has no authorized encrypted TCP data connection"
-                    } else {
-                        "signed receiver has no authorized TCP data connection"
-                    };
+                if spec.forwarded.is_some() {
+                    let reason =
+                        "return authorization has no authorized encrypted TCP data connection";
                     bail!("{}: {reason}", spec.label());
                 }
                 Ok(Box::new(spec.connect_with_role(
@@ -3393,6 +3413,7 @@ mod tests {
             identity: crate::identity::build().into(),
             platform: crate::identity::platform(),
             supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
+            ssh_worker_ticket: None,
         }
     }
 
@@ -4103,6 +4124,7 @@ mod tests {
                     platform: crate::identity::platform(),
                     supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(
                     ),
+                    ssh_worker_ticket: None,
                 })
                 .unwrap();
         });

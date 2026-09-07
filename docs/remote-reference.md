@@ -27,9 +27,11 @@ receipt key. Revocation stops active receivers for that enrollment before
 removing its state; see [revocation and upgrades](remote-to-remote.md#first-copy-and-access-management)
 for interruption, retry, and older-receiver behavior.
 
-Enrollment uploads the executable running on your machine, which must also run
-on the destination. It does not use `--syq-path` or fetch a release for another
-platform. See [Developing syq](development.md#direct-server-to-server-copies)
+Enrollment detects the destination platform. When it matches your machine,
+setup uploads the running executable without a release download. For a different
+platform, official releases install the matching executable after verifying the
+signed release manifest and artifact. Source builds require matching platforms.
+Enrollment does not use `--syq-path`. See [Developing syq](development.md#direct-server-to-server-copies)
 for refreshing a receiver after rebuilding.
 
 ## Limits and unsupported options
@@ -42,13 +44,27 @@ finish within seven days of authorization.
 
 | Option or combination | Restricted receiver |
 |---|---|
-| `--no-tcp`, `--tcp-plain`, `--tcp-congestion` | Unsupported; encrypted TCP is required |
+| `--no-tcp` | Use SSH workers directly from source to destination |
+| `--tcp-congestion` | The receiver enforces the algorithm authorized for TCP |
+| `--tcp-plain` | Unsupported; data connections must be encrypted |
 | `--mapping`, `--min-size` | Unsupported |
 | `--max-size` with `--prune` | Unsupported |
 | Fixed `--connections` above 64 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
+
+Restricted copies use encrypted TCP when reachable and otherwise use SSH
+workers from the source to the destination. Both transports share the same
+copy authorization, limits, revocation, and signed receipt. A failed direct
+connection never selects a relay through your machine; choose
+`--coordinate-at local` explicitly to send data through it.
+
+After upgrading syq, repeat `syq receiver enroll hostB:/destination` to refresh
+an older installed receiver before using the new build. Refresh preserves the
+enrollment keys and replay records. Older clients need a matching receiver
+build too; clients of different builds cannot share one installed receiver
+concurrently.
 
 TCP listeners must advertise a port in the requested range. An invalid port
 fails TCP setup before any address is probed. Special-file creation accepts
