@@ -171,3 +171,7 @@ and check that it respects disabled receiving. An ephemeral connect establishes
 forward SSH without creating a return service or enabling durable persistence.
 Network interruption and heartbeat
 expiry cases verify automatic recovery and successful subsequent copies.
+
+The suite also revokes an enrollment while two restricted copies are writing,
+checks that both fail without publishing their files, and verifies that a fresh
+enrollment can resume their partials.

@@ -1,5 +1,7 @@
 //! End-to-end enrollment and signed restricted-transfer integration.
 
+mod active;
+
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
     self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
@@ -3136,6 +3138,7 @@ pub(crate) fn remote_install() -> Result<()> {
     // cannot leave a usable key, and a later state-write failure leaves only
     // inert private state that an idempotent retry can complete.
     let (state, _allowed_signers, _replay) = install_state_paths(&home, request.id)?;
+    active::require_not_revoked(&state)?;
     atomic_write(
         &state,
         "allowed-signers",
@@ -3224,6 +3227,10 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
     if account != request.target_login {
         bail!("revocation target login does not match the remote account");
     }
+    // Serialize revocation with both enrollment updates and receiver admission.
+    let ssh = ensure_directory_chain(home, &[".ssh"])?;
+    let directory = open_directory(&ssh)?;
+    lock_directory(&directory)?;
     let state_base = home.join(".local/share/syq/restricted");
     let state = state_base.join(request.id.to_string());
     let (receiver_path, remove_state) = match fs::symlink_metadata(&state) {
@@ -3251,15 +3258,17 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;
-    let ssh = ensure_directory_chain(home, &[".ssh"])?;
-    let directory = open_directory(&ssh)?;
-    lock_directory(&directory)?;
+    let leases = remove_state
+        .as_deref()
+        .map(active::open_leases)
+        .transpose()?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
     let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
     if let Some(state) = remove_state {
+        active::revoke(&state, leases.as_ref().expect("enrollment lease file"))?;
         fs::remove_dir_all(&state)
             .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
     }
@@ -4311,6 +4320,8 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
     let envelope = decode_receiver_command(&original)?;
     let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
+    let state = replay_path.parent().context("receiver state directory")?;
+    let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
@@ -4360,6 +4371,14 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         deadline,
         &protected,
     )?);
+    // Verification does not hold the lifecycle lock or permit mutations. A
+    // revoke during verification is caught when this receiver tries to enter.
+    active::watch(
+        &home,
+        state,
+        (observed_state.dev(), observed_state.ino()),
+        deadline,
+    )?;
     crate::server::run_restricted(authority)
 }
 
@@ -4525,6 +4544,20 @@ pub(crate) mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn receiver_configuration_preserves_released_v041_bytes() {
+        // Unmodified output of the checksum-verified released v0.4.1
+        // --restricted-install, produced in a disposable account/container.
+        let encoded = include_bytes!("../tests/fixtures/restricted-enrollment-v0.4.1.json");
+        let config: ReceiverEnrollment = serde_json::from_slice(encoded).unwrap();
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(
+            config.id,
+            EnrollmentId::parse("00112233445546778899aabbccddeeff").unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&config).unwrap(), encoded);
+    }
 
     #[test]
     fn enrollment_ssh_failures_distinguish_transport_from_remote_rejection() {

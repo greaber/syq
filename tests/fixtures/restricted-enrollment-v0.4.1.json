@@ -1,0 +1,1 @@
+{"version":3,"id":[0,17,34,51,68,85,70,119,136,153,170,187,204,221,238,255],"target_login":"syq","signer":"syq-enrollment-00112233445546778899aabbccddeeff","root":"/tmp/revoke-legacy-fixture","root_dev":63,"root_ino":8388682,"ssh_keygen":"/usr/bin/ssh-keygen","receiver_path":"/home/syq/.local/libexec/syq-receiver"}
