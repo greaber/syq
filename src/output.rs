@@ -51,9 +51,13 @@ impl Terminal {
     }
 
     fn diagnostic(&mut self, out: &mut impl Write, args: Arguments<'_>) -> io::Result<()> {
+        self.write_line(out, format_args!("{}", safe_message(args)))
+    }
+
+    fn write_line(&mut self, out: &mut impl Write, args: Arguments<'_>) -> io::Result<()> {
         let line = self.line.clone();
         self.clear(out)?;
-        writeln!(out, "{}", safe_message(args))?;
+        writeln!(out, "{args}")?;
         if let Some(line) = line {
             self.draw(out, line)?;
         }
@@ -84,6 +88,14 @@ pub(crate) fn emit_diagnostic(args: Arguments<'_>) {
         .lock()
         .unwrap()
         .diagnostic(&mut io::stderr().lock(), args);
+}
+
+/// Already serialized JSON must retain its encoding, including Unicode values.
+pub(crate) fn emit_json_stderr(args: Arguments<'_>) {
+    let _ = TERMINAL
+        .lock()
+        .unwrap()
+        .write_line(&mut io::stderr().lock(), args);
 }
 
 pub(crate) fn emit_human_stdout(args: Arguments<'_>) {
@@ -128,6 +140,20 @@ pub(crate) use human_stdout;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_output_preserves_unicode_and_json_escapes() {
+        let message = "quote \" slash \\ newline\n control \u{1b} separators \u{2028}\u{2029} bidi \u{061c}\u{202e}";
+        let warning = serde_json::json!({"type": "warning", "message": message});
+        let mut output = Vec::new();
+        Terminal::default()
+            .write_line(&mut output, format_args!("{warning}"))
+            .unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(decoded["message"], message);
+        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert!(!output.contains(&0x1b));
+    }
 
     #[test]
     fn peer_diagnostics_cannot_control_the_terminal() {

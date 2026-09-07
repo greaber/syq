@@ -1911,13 +1911,23 @@ impl RestrictedAuthority {
                 ..
             } => {
                 let kind = kind_from_mode(*mode);
+                if !matches!(
+                    kind,
+                    proto::Kind::Fifo
+                        | proto::Kind::Socket
+                        | proto::Kind::CharDev
+                        | proto::Kind::BlockDev
+                ) {
+                    bail!("special-file creation requires a FIFO, socket, or device mode");
+                }
+                #[cfg(target_os = "linux")]
+                let file_type = *mode & libc::S_IFMT;
+                #[cfg(not(target_os = "linux"))]
+                let file_type = *mode & libc::S_IFMT as u32;
+                *mode = file_type | (*mode & 0o7777);
                 self.constrain_creation(path, condition, false, index, pending)?;
                 if !self.copy.options.preserve_permissions {
                     self.remember_receiver_creation(path, false)?;
-                    #[cfg(target_os = "linux")]
-                    let file_type = *mode & libc::S_IFMT;
-                    #[cfg(not(target_os = "linux"))]
-                    let file_type = *mode & libc::S_IFMT as u32;
                     *mode = file_type | 0o600;
                 }
                 outcomes.push(PendingOutcome::Logical {
@@ -5532,6 +5542,65 @@ pub(crate) mod tests {
             flags: 0,
             condition: proto::TargetCondition::Any,
         }
+    }
+
+    #[test]
+    fn special_file_creation_checks_kind_and_masks_mode() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir(root.join("target")).unwrap();
+        for preserve_permissions in [false, true] {
+            for kind in [
+                libc::S_IFREG,
+                libc::S_IFDIR,
+                libc::S_IFLNK,
+                0,
+                libc::S_IFIFO,
+                libc::S_IFSOCK,
+                libc::S_IFCHR,
+                libc::S_IFBLK,
+            ] {
+                let mut authority = test_authority(root, DeletionPolicy::Forbid, 1024);
+                authority.copy.options.preserve_devices = true;
+                authority.copy.options.preserve_permissions = preserve_permissions;
+                #[allow(clippy::unnecessary_cast)]
+                let kind = kind as u32;
+                let mut request = apply(Op::Mknod {
+                    path: path_bytes(&root.join("target/node")),
+                    mode: kind | 0x8000_0000 | 0o6754,
+                    rdev: 0,
+                    condition: proto::TargetCondition::Any,
+                });
+                let allowed = matches!(
+                    kind_from_mode(kind),
+                    proto::Kind::Fifo
+                        | proto::Kind::Socket
+                        | proto::Kind::CharDev
+                        | proto::Kind::BlockDev
+                );
+                let result = authority.authorize(&mut request, false);
+                if !allowed {
+                    assert!(result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("special-file creation requires"));
+                    continue;
+                }
+                result.unwrap();
+                let Request::Apply { ops, .. } = request else {
+                    unreachable!()
+                };
+                let Op::Mknod { mode, .. } = ops[0] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    mode,
+                    kind | if preserve_permissions { 0o6754 } else { 0o600 }
+                );
+            }
+        }
+        assert!(!root.join("target/node").exists());
     }
 
     #[test]

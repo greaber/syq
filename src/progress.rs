@@ -192,7 +192,7 @@ impl Progress {
 
     pub fn warning(&self, code: &str, count: u64, message: &str) {
         if self.json {
-            crate::output::diagnostic!(
+            crate::output::emit_json_stderr(format_args!(
                 "{}",
                 serde_json::json!({
                     "type": "warning",
@@ -200,7 +200,7 @@ impl Progress {
                     "count": count,
                     "message": message,
                 })
-            );
+            ));
         } else {
             crate::output::diagnostic!("syq: warning: {message}");
         }
@@ -280,7 +280,7 @@ impl Progress {
                 .is_none_or(|l| now - l >= Duration::from_secs(1))
             {
                 t.last_json = Some(now);
-                crate::output::diagnostic!(
+                crate::output::emit_json_stderr(format_args!(
                     "{{\"bytes_done\":{done},\"bytes_total\":{total},\"bytes_unchanged\":{skipped},\"files_done\":{fdone},\"files_total\":{ftotal},\"files_unchanged\":{},\"files_excluded\":{},\"scanned\":{},\"scan_done\":{scan_done},\"rate\":{:.0},\"eta\":{},\"elapsed\":{:.1}}}",
                     self.files_unchanged.load(Relaxed),
                     self.files_excluded.load(Relaxed),
@@ -288,7 +288,7 @@ impl Progress {
                     rate,
                     eta.map_or("null".to_string(), |e| format!("{e:.0}")),
                     self.start.elapsed().as_secs_f64()
-                );
+                ));
             }
         }
         if !self.enabled {
