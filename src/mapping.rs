@@ -123,15 +123,44 @@ pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
     Ok(())
 }
 
+/// Immutable input shared by authorization and remote coordination. Bounds
+/// are checked while parsing, but enforced only when selecting a restricted
+/// receiver; ordinary mappings do not acquire new size limits.
+#[derive(Debug)]
+pub(crate) struct Input {
+    pub contents: Vec<u8>,
+    restricted_bounds_error: Option<String>,
+}
+
+impl Input {
+    pub(crate) fn validate_restricted_bounds(&self) -> Result<()> {
+        if let Some(error) = &self.restricted_bounds_error {
+            bail!("{error}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorization(&self) -> Result<Authorization> {
+        self.validate_restricted_bounds()?;
+        Ok(Authorization::from_contents(&self.contents))
+    }
+}
+
+pub(crate) struct ParsedManifest {
+    pub input: Input,
+    pub entries: Vec<(u64, ManifestEntry)>,
+}
+
 /// Phase-1 manifest read for `--mapping`: parse every line and run the
 /// parse-level preflight (duplicate destinations; an entry whose destination
 /// is a strict ancestor of another entry's destination must not declare a
 /// non-directory kind) before anything is written. Whether an undeclared
 /// ancestor really is a directory is only knowable from the source and is
 /// checked during execution.
-pub(crate) fn read_mapping_manifest(
-    reader: &mut dyn std::io::BufRead,
-) -> Result<Vec<(u64, ManifestEntry)>> {
+pub(crate) fn read_mapping_manifest(contents: Vec<u8>) -> Result<ParsedManifest> {
+    use std::io::BufRead;
+    let mut reader = std::io::Cursor::new(&contents);
+    let mut restricted_bounds_error = None;
     let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
     let mut declared: std::collections::HashMap<PathBytes, Option<DeclaredKind>> =
         std::collections::HashMap::new();
@@ -145,12 +174,24 @@ pub(crate) fn read_mapping_manifest(
             break;
         }
         line_number += 1;
+        if n > CHUNK_BYTES && restricted_bounds_error.is_none() {
+            restricted_bounds_error = Some(format!(
+                "--mapping line {line_number}: restricted mapping line exceeds 1 MiB"
+            ));
+        }
         let text = line.trim_end_matches('\n').trim_end_matches('\r');
         if text.is_empty() {
             continue;
         }
         let entry = parse_manifest_entry(text)
             .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
+        if entry.dst.len() > crate::delegation::MAX_PATH_BYTES && restricted_bounds_error.is_none()
+        {
+            restricted_bounds_error = Some(format!(
+                "--mapping line {line_number}: restricted mapping destination exceeds {} bytes",
+                crate::delegation::MAX_PATH_BYTES
+            ));
+        }
         if declared.insert(entry.dst.clone(), entry.kind).is_some() {
             bail!(
                 "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
@@ -176,7 +217,13 @@ pub(crate) fn read_mapping_manifest(
             }
         }
     }
-    Ok(entries)
+    Ok(ParsedManifest {
+        input: Input {
+            contents,
+            restricted_bounds_error,
+        },
+        entries,
+    })
 }
 
 /// The exact manifest authorized by the invoking/receiving machine. Contents
@@ -191,7 +238,7 @@ impl Authorization {
     pub(crate) fn from_contents(contents: &[u8]) -> Self {
         Self {
             bytes: contents.len() as u64,
-            digest: *blake3::hash(contents).as_bytes(),
+            digest: crate::fsops::content_digest(contents),
         }
     }
 }
@@ -215,8 +262,11 @@ impl Permissions {
     fn insert(&mut self, entry: ManifestEntry, max_entries: u64) -> Result<()> {
         // The grant's absolute paths already have this bound. Apply it before
         // expanding ancestor paths, whose total storage grows with depth.
-        if entry.dst.len() > 4096 {
-            bail!("restricted mapping destination exceeds 4096 bytes");
+        if entry.dst.len() > crate::delegation::MAX_PATH_BYTES {
+            bail!(
+                "restricted mapping destination exceeds {} bytes",
+                crate::delegation::MAX_PATH_BYTES
+            );
         }
         if self.entries.contains_key(&entry.dst) {
             bail!("duplicate mapping destination {}", display(&entry.dst));
@@ -391,6 +441,47 @@ mod tests {
             r#"{{"src":{{"encoding":"utf-8","value":"{src}"}},"dst":{{"encoding":"utf-8","value":"{dst}"}}}}
 "#
         )
+    }
+
+    #[test]
+    fn mapping_preflight_mirrors_receiver_bounds_with_line_numbers() {
+        for contents in [
+            "\n".to_owned() + &entry("a", &"d".repeat(crate::delegation::MAX_PATH_BYTES + 1)),
+            "\n".to_owned() + &entry(&"s".repeat(CHUNK_BYTES), "d"),
+            "\n".to_owned() + &"\r".repeat(CHUNK_BYTES + 1),
+        ] {
+            // Ordinary parsing still accepts these inputs. Only restricted
+            // authorization enforces the receiver bounds, before signing.
+            let parsed = read_mapping_manifest(contents.as_bytes().to_vec()).unwrap();
+            let error = parsed.input.authorization().unwrap_err().to_string();
+            assert!(error.contains("--mapping line 2:"), "{error}");
+            let mut admission =
+                Admission::new(Authorization::from_contents(contents.as_bytes()), 10000);
+            let result: Result<()> = contents
+                .as_bytes()
+                .chunks(CHUNK_BYTES)
+                .enumerate()
+                .try_for_each(|(i, chunk)| {
+                    admission.append(
+                        (i * CHUNK_BYTES) as u64,
+                        chunk,
+                        (i + 1) * CHUNK_BYTES >= contents.len(),
+                    )
+                });
+            assert!(result.is_err());
+        }
+        for ending in ["", "\n", "\r\n"] {
+            let base = entry("s", &"d".repeat(crate::delegation::MAX_PATH_BYTES));
+            let base = base.trim_end();
+            let contents = format!(
+                "{base}{}{ending}",
+                " ".repeat(CHUNK_BYTES - base.len() - ending.len())
+            );
+            let parsed = read_mapping_manifest(contents.as_bytes().to_vec()).unwrap();
+            let mut admission = Admission::new(parsed.input.authorization().unwrap(), 10000);
+            admission.append(0, contents.as_bytes(), true).unwrap();
+            assert_eq!(parsed.entries.len(), 1);
+        }
     }
 
     #[test]

@@ -17580,6 +17580,46 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
 }
 
 #[test]
+fn native_cp_mapping_restores_only_reopened_implicit_parents() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for mode in [0o550, 0o750] {
+        for preserve in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"same contents");
+            write(&t.path("dst/parent/file"), b"same contents");
+            set_mtime(&t.path("src/file"), 1_500_000_000);
+            set_mtime(&t.path("dst/parent/file"), 1_500_000_000);
+            fs::set_permissions(t.path("dst/parent"), fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::metadata(t.path("dst/parent")).unwrap();
+            let mut args = vec!["--mapping", "-", "-C", "src", "--into", "dst", "-q"];
+            if preserve {
+                args.push("--preserve=permissions");
+            }
+            let out = syq_cp_in(
+                &t.path(""),
+                &args,
+                Some(entry_line("file", "parent/file", Some("file")).as_bytes()),
+            );
+            assert_output_ok(&out);
+            let after = fs::metadata(t.path("dst/parent")).unwrap();
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!(
+                (after.mtime(), after.mtime_nsec()),
+                (before.mtime(), before.mtime_nsec())
+            );
+            if mode & 0o700 == 0o700 {
+                assert_eq!(
+                    (after.ctime(), after.ctime_nsec()),
+                    (before.ctime(), before.ctime_nsec()),
+                    "writable implicit parent received an unnecessary metadata update"
+                );
+            }
+            fs::set_permissions(t.path("dst/parent"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+#[test]
 fn native_cp_mapping_child_before_explicit_directory_is_order_independent() {
     let t = Tmp::new();
     write(&t.path("src/a.txt"), b"a");

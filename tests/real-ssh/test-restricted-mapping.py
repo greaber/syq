@@ -52,7 +52,7 @@ def direct():
                 assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
             if name == "fallback":
                 assert b"data over ssh" in result.stderr, result.stderr
-            ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
+            ssh("destination", f"from pathlib import Path; p=Path({destination!r}); assert (p/'nested'/'renamed').read_bytes()==b'mapped contents'; assert (p/'link').is_symlink(); assert (p/'nested').stat().st_mode & 0o777 == 0o755; assert (p/'directory').is_dir(); assert not (p/'directory'/'unselected').exists()")
         destination = root + "/tcp"
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", destination, "--verify-only"], data=contents)
         # Selection uses source mtimes; --only-existing remains independently enforced.
@@ -71,12 +71,26 @@ def direct():
         selected = manifest([("file", "kept", "file"), ("file", "fresh", "file"), ("directory", "directory", "dir")])
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", only_new, "--only-new"], data=selected)
         ssh("destination", f"from pathlib import Path; p=Path({only_new!r}); assert (p/'kept').read_bytes()==b'keep destination'; assert (p/'fresh').read_bytes()==b'mapped contents'; d=(p/'directory').stat(); assert d.st_mode & 0o777 == 0o555; assert d.st_mtime_ns==1500000000000000000; (p/'directory').chmod(0o755)")
+        # Implicit parents reopen only as needed, then recover receiver modes.
+        for extra in [[], ["--only-existing"], ["--preserve=permissions"]]:
+            readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--preserve=permissions" in extra else "")
+            ssh("destination", f"from pathlib import Path; p=Path({readonly!r}); (p/'parent').mkdir(parents=True); (p/'parent'/'item').write_bytes(b'old'); (p/'parent').chmod(0o2550)")
+            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp"] + extra,
+                data=manifest([("file", "parent/item", "file")]))
+            ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
+        # An untouched writable parent needs no chmod (ctime must stay intact).
+        stable = root + "/writable-parent"
+        before = ssh("destination", f"from pathlib import Path; p=Path({stable!r})/'parent'; p.mkdir(parents=True); (p/'item').write_bytes(b'mapped contents'); __import__('os').utime(p/'item',(1600000000,1600000000)); print(p.stat().st_ctime_ns)").stdout.strip()
+        run(prefix + ["--mapping", "-", "--to", "destination", "--into", stable, "--no-tcp"], data=manifest([("file", "parent/item", "file")]))
+        after = ssh("destination", f"from pathlib import Path; print((Path({stable!r})/'parent').stat().st_ctime_ns)").stdout.strip()
+        assert before == after, (before, after)
         # Exceeds both the old grant scope count and one mapping protocol chunk.
-        large = manifest([("file", f"group/file-{i}", "file") for i in range(10_000)])
+        ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")
+        large = manifest([("file", f"group/file-{i}", "file") for i in range(10_000)] + [("directory", "group", "dir")])
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
         run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp"], data=large)
-        ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files)")
+        ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
     print("Restricted mapping and timestamp selection passed", flush=True)
 
 

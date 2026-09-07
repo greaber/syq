@@ -1619,7 +1619,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut args = args;
     // The executing build consumes stdin once, then shares immutable bytes with
     // authorization and remote coordination. Neither may reopen the manifest.
-    if let Some(mapping) = args.native_mapping.as_deref() {
+    let mapping_entries = if let Some(mapping) = args.native_mapping.as_deref() {
         if args.detach {
             bail!("--mapping requires an attached copy");
         }
@@ -1633,9 +1633,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
                 .with_context(|| format!("--mapping {}", display(mapping)))?;
         }
-        read_mapping_manifest(&mut std::io::Cursor::new(&contents))?;
-        args.mapping_contents = Some(Arc::new(contents));
-    }
+        let parsed = read_mapping_manifest(contents)?;
+        args.mapping_contents = Some(Arc::new(parsed.input));
+        Some(parsed.entries)
+    } else {
+        None
+    };
     // Authorization failures settle the already-open automation stream too.
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
@@ -1754,6 +1757,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // local endpoints so the invoking machine neither reads its persistence
     // policy nor creates records for connections it will never open.
     if coordinator_is_remote {
+        // The remote coordinator parses its own immutable input. Release this
+        // process's preflight entries before waiting for the remote copy.
+        drop(mapping_entries);
         if args.rsh.is_some() {
             let rsh = parse_rsh(&args.rsh)?;
             if !rsh[0].ends_with("ssh")
@@ -2154,7 +2160,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     if args.restricted_grant.is_some() {
         if let Some(contents) = &mapping_contents {
-            crate::mapping::send(contents, &mut *dst_ctl)?;
+            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
         }
     }
     let destination_supports_confined_socket_nodes = match &dst_ep {
@@ -2935,6 +2941,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
+        implicit_restorations: Vec::new(),
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root && opts.preserve_existing_directory_metadata {
             std::collections::HashSet::from([dst_root.clone()])
@@ -2976,15 +2983,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut fresh_capacity_assessment = None;
     let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some(mapping_contents) = mapping_contents.as_deref() {
+    if let Some(mapping_entries) = mapping_entries {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        let mut reader = std::io::Cursor::new(mapping_contents);
-        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut reader) {
+        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, mapping_entries) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -4722,6 +4728,10 @@ struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     implicit_dirs: std::collections::HashSet<PathBytes>,
+    /// Only implicit parents actually reopened for writing need a final chmod.
+    /// Keep these separate until the manifest is complete: a later explicit
+    /// directory entry supplies its own deferred metadata instead.
+    implicit_restorations: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
     /// Directories this copy created may receive metadata from later sources.
     created_dirs: std::collections::HashSet<PathBytes>,
     /// This run consumes a --mapping manifest (identity entries included).
@@ -5218,8 +5228,7 @@ impl Planner<'_> {
     /// Consume an already-acquired NDJSON mapping manifest: each entry claims
     /// exactly one source object (relative to `src_root`) at an explicit
     /// destination (relative to `dst_root`). The caller buffers the complete
-    /// input before opening the destination, and this planner validates the
-    /// complete manifest before applying any entry. Destination ancestors with
+    /// input and validates it before opening the destination. Destination ancestors with
     /// no entries are synthesized as implicit directories with default
     /// metadata.
     fn scan_mapping(
@@ -5227,7 +5236,7 @@ impl Planner<'_> {
         src: &mut dyn Conn,
         src_root: &[u8],
         dst_root: &[u8],
-        reader: &mut dyn std::io::BufRead,
+        entries: Vec<(u64, ManifestEntry)>,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         self.mapping_mode = true;
@@ -5256,21 +5265,9 @@ impl Planner<'_> {
         }
         self.progress.scanned.fetch_add(1, Relaxed);
 
-        // Phase 1: read and validate the whole manifest before any entry is
-        // applied. Parse errors, duplicate destinations, and declared-kind
-        // ancestor conflicts refuse the run (the --into container was
-        // already created, as with --files-from); the price is memory
-        // proportional to the manifest, which the multi-source preflight
-        // already accepts. Conflicts only observable
-        // at execution (an undeclared ancestor that is not a directory,
-        // destination state) still fail entries individually below.
-        let entries = read_mapping_manifest(reader)?;
-
-        // Phase 2: stat sources and plan in chunks; as with any native
-        // copy, transfers begin once planning completes. `emitted`
-        // is what the planner was given for each destination path;
-        // `synthesized` are implicit ancestors an explicit entry may still
-        // upgrade.
+        // Stat sources and plan the already-validated entries in chunks.
+        // Conflicts that depend on source or destination state fail individual
+        // entries here. `synthesized` tracks ancestors a later entry can name.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
         let mut remaining = entries.into_iter().peekable();
@@ -5931,10 +5928,17 @@ impl Planner<'_> {
                         root_must_be_new
                             || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
-                    .map(|(p, _, e, _)| Op::Mkdir {
+                    .map(|(p, _, e, st)| Op::Mkdir {
                         path: p.clone(),
                         mode: e.mode,
-                        condition: self.exact_condition_for(p),
+                        condition: if opts.restricted_receiver
+                            && st.is_none()
+                            && self.implicit_dirs.contains(p)
+                        {
+                            TargetCondition::Absent
+                        } else {
+                            self.exact_condition_for(p)
+                        },
                     })
                     .collect();
                 if let Some(root_index) = new_dirs.iter().position(|op| {
@@ -5981,6 +5985,7 @@ impl Planner<'_> {
                         self.container_guard = Some(target_container(&self.dst_root, &created));
                     }
                 }
+                let mut reopened_dirs = std::collections::HashSet::new();
                 for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
                     let n = new_dirs.len();
                     let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
@@ -6020,6 +6025,9 @@ impl Planner<'_> {
                         if preexisting && succeeded {
                             // Reopened for writability only; nothing was made.
                             reopened += 1;
+                            if self.implicit_dirs.contains(name) {
+                                reopened_dirs.insert(name.clone());
+                            }
                             continue;
                         }
                         if let (Some(results), Some(dst_rel)) = (
@@ -6066,14 +6074,26 @@ impl Planner<'_> {
                     flags &= !flags::MODE;
                 }
                 for (p, _, e, s) in &planned {
-                    // Implicit --mapping ancestors keep the metadata their
-                    // creation gave them; only named entries stamp source
-                    // metadata. Missing-only copies stamp only successful
-                    // creations, never failed mkdirs or pre-existing directories.
-                    if self.implicit_dirs.contains(p)
-                        || (opts.preserve_existing_directory_metadata
-                            && !self.created_dirs.contains(p))
-                    {
+                    // New implicit parents already have their final modes.
+                    // Restore only those temporarily reopened for writing.
+                    if self.implicit_dirs.contains(p) {
+                        if reopened_dirs.contains(p) {
+                            let existing = s.as_ref().expect("reopened directory was observed");
+                            self.implicit_restorations.push((
+                                p.clone(),
+                                existing.meta(),
+                                if opts.restricted_receiver {
+                                    flags::RECEIVER_MODE
+                                } else {
+                                    flags::MODE
+                                },
+                                p.iter().filter(|&&c| c == b'/').count(),
+                                self.metadata_condition_for(p),
+                            ));
+                        }
+                        continue;
+                    }
+                    if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
                         continue;
                     }
                     let depth = p.iter().filter(|&&c| c == b'/').count();
@@ -7377,6 +7397,11 @@ impl Planner<'_> {
     fn apply_deferred(&mut self) -> Result<()> {
         self.assert_mutation_root()?;
         let mut d = std::mem::take(&mut self.deferred);
+        d.extend(
+            std::mem::take(&mut self.implicit_restorations)
+                .into_iter()
+                .filter(|(path, ..)| self.implicit_dirs.contains(path)),
+        );
         d.sort_by(|a, b| b.3.cmp(&a.3));
         for chunk in d.chunks(1000) {
             let ops: Vec<Op> = chunk

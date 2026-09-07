@@ -1226,7 +1226,7 @@ fn run_remote(
             let mut stdin = child.stdin.take().expect("piped mapping input");
             std::thread::spawn(move || {
                 use std::io::Write;
-                stdin.write_all(&contents)
+                stdin.write_all(&contents.contents)
             })
         });
         let relayed = match child.stdout.take() {

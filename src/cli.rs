@@ -123,7 +123,7 @@ pub struct Args {
     pub native_mapping: Option<Vec<u8>>,
     /// Frozen local manifest input shared with signing and remote coordination.
     #[arg(skip)]
-    pub mapping_contents: Option<std::sync::Arc<Vec<u8>>>,
+    pub mapping_contents: Option<std::sync::Arc<crate::mapping::Input>>,
     /// `--results` NDJSON outcome stream for native cp or rm.
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,

@@ -1311,7 +1311,6 @@ impl RestrictedAuthority {
         index: usize,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let policy = self.copy.policy.existing;
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
@@ -1330,6 +1329,27 @@ impl RestrictedAuthority {
             return Ok(());
         }
         let observed = self.rooted_metadata(path)?;
+        self.constrain_observed_creation(
+            path,
+            condition,
+            directory,
+            index,
+            pending,
+            (policy, observed),
+        )
+    }
+
+    fn constrain_observed_creation(
+        &self,
+        path: &[u8],
+        condition: &mut proto::TargetCondition,
+        directory: bool,
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+        (policy, observed): (ExistingDestinationPolicy, Option<RootMetadata>),
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let label = String::from_utf8_lossy(path);
         match policy {
             ExistingDestinationPolicy::MustExist => {
                 let metadata = match observed {
@@ -1554,6 +1574,21 @@ impl RestrictedAuthority {
     fn remember_receiver_creation(&self, path: &[u8], existing_directory_kept: bool) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let metadata = self.rooted_metadata(path)?;
+        Self::remember_receiver_creation_observed(
+            &mut state.receiver_modes,
+            path,
+            existing_directory_kept,
+            metadata,
+        );
+        Ok(())
+    }
+
+    fn remember_receiver_creation_observed(
+        modes: &mut HashMap<Vec<u8>, ReceiverModeState>,
+        path: &[u8],
+        existing_directory_kept: bool,
+        metadata: Option<RootMetadata>,
+    ) {
         let kind = if existing_directory_kept {
             ReceiverModeKind::Directory
         } else {
@@ -1572,14 +1607,12 @@ impl RestrictedAuthority {
             } else {
                 ReceiverModeState::New(kind)
             };
-        let mode = state
-            .receiver_modes
+        let mode = modes
             .get(path)
             .copied()
             .and_then(|existing| existing.carry_forward(initial))
             .unwrap_or(initial);
-        state.receiver_modes.insert(path.to_vec(), mode);
-        Ok(())
+        modes.insert(path.to_vec(), mode);
     }
 
     fn receiver_mode(
@@ -1748,6 +1781,17 @@ impl RestrictedAuthority {
         target: ReceiverModeTarget,
     ) -> Result<()> {
         self.check_flags(*flags)?;
+        self.apply_receiver_mode(path, meta, flags, condition, target)
+    }
+
+    fn apply_receiver_mode(
+        &self,
+        path: &[u8],
+        meta: &mut proto::Meta,
+        flags: &mut u8,
+        condition: &mut proto::TargetCondition,
+        target: ReceiverModeTarget,
+    ) -> Result<()> {
         if *flags & proto::flags::RECEIVER_MODE != 0 {
             let decision = self.receiver_mode(path, meta.mode, target)?;
             meta.mode = decision.mode;
@@ -1921,23 +1965,55 @@ impl RestrictedAuthority {
                 mode,
                 condition,
             } => {
-                self.constrain_creation(path, condition, true, index, pending)?;
                 if self.mapping_parent(path)? {
-                    // Parent access permits creating missing directories, but
-                    // cannot reopen or change an existing directory's mode.
-                    *condition = proto::TargetCondition::Absent;
-                    if !pending.iter().any(|creation| creation.path == *path) {
-                        self.state.lock().unwrap().provisional.insert(path.clone());
-                        pending.push(PendingCreation {
-                            index,
-                            path: path.clone(),
-                            persist: true,
-                        });
+                    // Observe once for both the existing-object constraint and
+                    // receiver-owned mode restoration. An existing implicit
+                    // parent may be reopened, but never replaced or recreated.
+                    // An explicit no-replace mkdir needs no preflight stat:
+                    // the filesystem checks absence atomically. This is the
+                    // planner's usual request for a missing implicit parent.
+                    let observed = if *condition == proto::TargetCondition::Absent {
+                        None
+                    } else {
+                        self.rooted_metadata(path)?
+                    };
+                    let policy = match self.copy.policy.existing {
+                        ExistingDestinationPolicy::Replace => {
+                            if observed.is_some()
+                                && !(self.root_existence == RootExistence::New
+                                    && *path == self.destination)
+                            {
+                                ExistingDestinationPolicy::MustExist
+                            } else {
+                                ExistingDestinationPolicy::Skip
+                            }
+                        }
+                        policy => policy,
+                    };
+                    self.constrain_observed_creation(
+                        path,
+                        condition,
+                        true,
+                        index,
+                        pending,
+                        (policy, observed),
+                    )?;
+                    Self::remember_receiver_creation_observed(
+                        &mut self.state.lock().unwrap().receiver_modes,
+                        path,
+                        true,
+                        observed,
+                    );
+                    // Implicit parents have no source mode. Let mkdir apply
+                    // HostB's umask and setgid inheritance directly, avoiding
+                    // a later stat/chmod for newly created parents.
+                    *mode = 0o755;
+                } else {
+                    self.constrain_creation(path, condition, true, index, pending)?;
+                    if !self.copy.options.preserve_permissions {
+                        self.remember_receiver_creation(path, true)?;
+                        *mode = 0o700;
                     }
-                }
-                if !self.copy.options.preserve_permissions {
-                    self.remember_receiver_creation(path, true)?;
-                    *mode = 0o700;
                 }
                 outcomes.push(PendingOutcome::Logical {
                     index,
@@ -1999,14 +2075,31 @@ impl RestrictedAuthority {
                 flags,
                 condition,
             } => {
-                if self.mapping_parent(path)?
-                    && !self.created_by_this_grant(path)
-                    && !pending.iter().any(|creation| creation.path == *path)
-                {
-                    bail!("mapping cannot change metadata of an existing implicit parent");
+                let implicit = self.mapping_parent(path)?;
+                if implicit {
+                    // A parent has no source metadata. Only receiver-derived
+                    // permissions may be finalized, including restoration after
+                    // reopening a read-only parent. Permission preservation on
+                    // explicit entries grants no chmod authority over parents.
+                    let remembered = self.state.lock().unwrap().receiver_modes.get(path).copied();
+                    if *flags & !(proto::flags::MODE | proto::flags::RECEIVER_MODE) != 0
+                        || remembered.is_none()
+                        || (!matches!(remembered, Some(ReceiverModeState::Existing { .. }))
+                            && !self.created_by_this_grant(path)
+                            && !pending.iter().any(|creation| creation.path == *path))
+                    {
+                        bail!("mapping cannot change metadata of an existing implicit parent");
+                    }
+                    meta.mode = 0o755;
+                    if *flags != 0 {
+                        *flags = proto::flags::RECEIVER_MODE;
+                    }
                 }
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.constrain_receiver_mode(
+                if !implicit {
+                    self.check_flags(*flags)?;
+                }
+                self.apply_receiver_mode(
                     path,
                     meta,
                     flags,
@@ -3903,6 +3996,9 @@ fn root_existence_for(existence: Existence) -> RootExistence {
 }
 
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
+    if let Some(input) = &args.mapping_contents {
+        input.validate_restricted_bounds()?;
+    }
     if args.tcp_plain {
         bail!("command-restricted transfers require encrypted data connections");
     }
@@ -4142,15 +4238,9 @@ fn filter_destination_roots(
 }
 
 fn mapping_authorization(args: &Args) -> Result<Option<crate::mapping::Authorization>> {
-    args.native_mapping
+    args.mapping_contents
         .as_ref()
-        .map(|_| {
-            let contents = args
-                .mapping_contents
-                .as_ref()
-                .context("mapping input was not acquired before authorization")?;
-            Ok(crate::mapping::Authorization::from_contents(contents))
-        })
+        .map(|input| input.authorization())
         .transpose()
 }
 
@@ -5991,6 +6081,255 @@ esac
                 .unwrap();
             fs::set_permissions(&raced, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    fn admit_test_mapping(authority: &mut RestrictedAuthority, destination: &str) {
+        let manifest = format!(r#"{{"src":{{"encoding":"utf-8","value":"source"}},"dst":{{"encoding":"utf-8","value":"{destination}"}}}}
+"#).into_bytes();
+        authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
+            crate::mapping::Authorization::from_contents(&manifest),
+            authority.copy.limits.max_entries,
+        )));
+        let settlement = authority
+            .authorize(
+                &mut Request::MappingChunk {
+                    offset: 0,
+                    data: manifest,
+                    finish: true,
+                },
+                true,
+            )
+            .unwrap();
+        authority.settle(settlement, &proto::Response::Ok);
+    }
+
+    #[test]
+    fn mapping_parents_cannot_be_recreated_under_only_existing() {
+        for nested in [false, true] {
+            let root = crate::test_support::tempdir().unwrap();
+            let target = root.path().join("target");
+            let parent = if nested {
+                target.join("parent")
+            } else {
+                target
+            };
+            fs::create_dir_all(&parent).unwrap();
+            let mut authority = existence_authority(
+                root.path(),
+                ExistingDestinationPolicy::MustExist,
+                DestinationPlacement::ExactPath,
+                RootExistence::Any,
+            )
+            .unwrap();
+            admit_test_mapping(&mut authority, if nested { "parent/item" } else { "item" });
+            let mut request = apply(mkdir(&parent));
+            let admitted = authority.authorize(&mut request, false);
+            // The independent remover acts after authorization. The request
+            // may be refused up front, but an admitted request cannot create.
+            fs::remove_dir(&parent).unwrap();
+            if let Ok(settlement) = admitted {
+                let response = crate::fsops::FsOps::new().handle(&request);
+                authority.settle(settlement, &response);
+                assert!(
+                    matches!(response, proto::Response::Applied(ref errors)
+                    if errors.iter().all(Option::is_some)),
+                    "{response:?}"
+                );
+            }
+            assert!(!parent.exists(), "only-existing recreated a mapping parent");
+            assert!(!authority.created_by_this_grant(&path_bytes(&parent)));
+        }
+    }
+
+    #[test]
+    fn mapping_parent_reopening_keeps_requested_identity() {
+        for fingerprint in [false, true] {
+            let root = crate::test_support::tempdir().unwrap();
+            let parent = root.path().join("target/parent");
+            fs::create_dir_all(&parent).unwrap();
+            let metadata = fs::metadata(&parent).unwrap();
+            let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+            admit_test_mapping(&mut authority, "parent/item");
+            let condition = if fingerprint {
+                proto::TargetCondition::MatchesFingerprint {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    ctime: metadata.ctime(),
+                    ctime_nsec: metadata.ctime_nsec() as u32,
+                }
+            } else {
+                proto::TargetCondition::Matches {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                }
+            };
+            let mut request = apply(Op::Mkdir {
+                path: path_bytes(&parent),
+                mode: 0o755,
+                condition,
+            });
+            let settlement = authority.authorize(&mut request, false).unwrap();
+            let Request::Apply { ops, .. } = &request else {
+                unreachable!()
+            };
+            assert!(matches!(&ops[0], Op::Mkdir { condition: actual, .. } if *actual == condition));
+            fs::remove_dir(&parent).unwrap();
+            let response = crate::fsops::FsOps::new().handle(&request);
+            authority.settle(settlement, &response);
+            assert!(
+                matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some)),
+                "{response:?}"
+            );
+            assert!(!parent.exists());
+        }
+    }
+
+    #[test]
+    fn mapping_parents_reopen_and_restore_receiver_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for preserve in [false, true] {
+            for policy in [
+                ExistingDestinationPolicy::Replace,
+                ExistingDestinationPolicy::MustExist,
+                ExistingDestinationPolicy::Skip,
+            ] {
+                let root = crate::test_support::tempdir().unwrap();
+                let parent = root.path().join("target/parent");
+                fs::create_dir_all(&parent).unwrap();
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o2550)).unwrap();
+                let original = fs::metadata(&parent).unwrap();
+                let mut authority = existence_authority(
+                    root.path(),
+                    policy,
+                    DestinationPlacement::ExactPath,
+                    RootExistence::Any,
+                )
+                .unwrap();
+                authority.copy.options.preserve_permissions = preserve;
+                authority.copy.options.receiver_managed_modes = !preserve;
+                admit_test_mapping(&mut authority, "parent/item");
+                let mut request = apply(mkdir(&parent));
+                let settlement = authority.authorize(&mut request, false).unwrap();
+                let response = crate::fsops::FsOps::new().handle(&request);
+                authority.settle(settlement, &response);
+                if policy == ExistingDestinationPolicy::Skip {
+                    assert!(
+                        matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some))
+                    );
+                    assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
+                    assert!(authority
+                        .authorize(&mut apply(set_meta(&parent)), false)
+                        .is_err());
+                } else {
+                    assert!(
+                        matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+                        "{response:?}"
+                    );
+                    assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o2750);
+                    let mut restore = apply(Op::SetMeta {
+                        path: path_bytes(&parent),
+                        meta: proto::Meta {
+                            mode: 0o7777,
+                            ..plain_meta()
+                        },
+                        flags: if preserve {
+                            proto::flags::MODE
+                        } else {
+                            proto::flags::RECEIVER_MODE
+                        },
+                        condition: proto::TargetCondition::Any,
+                    });
+                    let settlement = authority.authorize(&mut restore, false).unwrap();
+                    let response = crate::fsops::FsOps::new().handle(&restore);
+                    authority.settle(settlement, &response);
+                    assert!(
+                        matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+                        "{response:?}"
+                    );
+                    let restored = fs::metadata(&parent).unwrap();
+                    assert_eq!(restored.mode(), original.mode());
+                    assert_eq!(
+                        (restored.mtime(), restored.mtime_nsec()),
+                        (original.mtime(), original.mtime_nsec())
+                    );
+                    assert_eq!(restored.gid(), original.gid());
+                }
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_new_parents_have_final_modes_without_metadata_updates() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        for preserve in [false, true] {
+            let root = crate::test_support::tempdir().unwrap();
+            let target = root.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o2755)).unwrap();
+            // A sibling made with the same mkdir mode observes the process
+            // umask and kernel setgid inheritance without changing global state.
+            let expected = target.join("expected");
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(&expected)
+                .unwrap();
+            let parent = target.join("parent");
+            let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+            authority.copy.options.preserve_permissions = preserve;
+            authority.copy.options.receiver_managed_modes = !preserve;
+            admit_test_mapping(&mut authority, "parent/item");
+            let mut request = apply(Op::Mkdir {
+                path: path_bytes(&parent),
+                mode: 0o7777,
+                condition: proto::TargetCondition::Any,
+            });
+            let settlement = authority.authorize(&mut request, false).unwrap();
+            let response = crate::fsops::FsOps::new().handle(&request);
+            authority.settle(settlement, &response);
+            assert!(
+                matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+                "{response:?}"
+            );
+            assert_eq!(
+                fs::metadata(&parent).unwrap().mode(),
+                fs::metadata(&expected).unwrap().mode()
+            );
+            assert!(authority.created_by_this_grant(&path_bytes(&parent)));
+        }
+    }
+
+    #[test]
+    fn mapping_failed_parent_creation_cannot_authorize_foreign_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::tempdir().unwrap();
+        let parent = root.path().join("target/parent");
+        fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
+        admit_test_mapping(&mut authority, "parent/item");
+        let mut create = apply(Op::Mkdir {
+            path: path_bytes(&parent),
+            mode: 0o755,
+            condition: proto::TargetCondition::Absent,
+        });
+        let settlement = authority.authorize(&mut create, false).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o550)).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&create);
+        authority.settle(settlement, &response);
+        assert!(
+            matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some)),
+            "{response:?}"
+        );
+        let mut restore = apply(Op::SetMeta {
+            path: path_bytes(&parent),
+            meta: plain_meta(),
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+        });
+        assert!(authority.authorize(&mut restore, false).is_err());
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
