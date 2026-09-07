@@ -366,8 +366,7 @@ jq -n --arg commit "$preflight_head" --arg tree "$preflight_tree" \
   '{schema:1,commit:$commit,tree:$tree,profile:"default",result:"success"}' \
   >"$preflight_repo/.git/syq-release/real-ssh/$preflight_tree.json"
 git -C "$preflight_repo" update-ref refs/remotes/origin/master "$preflight_head"
-ssh-keygen -q -t ed25519 -N '' -f "$work/tag-signing-key"
-signing_key=$(awk '{print $1 " " $2}' "$work/tag-signing-key.pub")
+signing_key=$(awk '$1 == "syq-release" {print $3 " " $4}' "$script_dir/release-tag-signers")
 git -C "$preflight_repo" config gpg.format ssh
 git -C "$preflight_repo" config user.signingkey "key::$signing_key"
 git -C "$preflight_repo" config tag.gpgsign true
@@ -438,6 +437,17 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -f "$work/other-preflight-key"
+other_signing_key=$(awk '{print $1 " " $2}' "$work/other-preflight-key.pub")
+git -C "$preflight_repo" config user.signingkey "key::$other_signing_key"
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_SIGNING_KEY="$other_signing_key" \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/failure.out" 2>&1; then
+  echo 'preflight unexpectedly accepted another GitHub-registered signing key' >&2
+  exit 1
+fi
+grep -F 'not the pinned maintainer key' "$work/failure.out" >/dev/null
+git -C "$preflight_repo" config user.signingkey "key::$signing_key"
 checks_without_conformance=$(jq -cn '{check_runs:["rust","sdks","macos","linux-arm64"] | map({name:.,conclusion:"success"})}')
 if (cd "$preflight_repo" && env "${preflight_env[@]}" \
   SYQ_TEST_CHECKS_JSON="$checks_without_conformance" \

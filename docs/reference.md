@@ -91,6 +91,7 @@ syq cp --from server project     # fetch project into your current directory
 ```
 
 Endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
+Host names cannot start with a dash, including when using an `--rsh` wrapper.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
@@ -103,6 +104,10 @@ for ordering, supported options, and approval behavior. `--via @laptop` remains
 an alias for the explicit receiving-machine selection.
 
 ## Progress
+
+Human output, including `persist status` and `persist receive status`, escapes
+terminal control characters, Unicode line separators, and directional marks
+in names and peer diagnostics. JSON status output keeps the original values.
 
 When stderr is a terminal, syq shows one progress bar for the whole copy.
 The bar stays in place as files and workers change. It shows bytes processed

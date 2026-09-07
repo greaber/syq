@@ -94,6 +94,9 @@ signing_identity=$(awk '{print $1 " " $2}' <<<"$signing_key")
 [[ "$signing_identity" == ssh-*' '* ]] || die 'user.signingkey is not an inline SSH public key'
 signing_fingerprint=$(ssh-keygen -lf /dev/stdin <<<"$signing_identity" | awk '{print $2}') \
   || die 'cannot fingerprint user.signingkey'
+pinned_signing_identity=$(awk '$1 == "syq-release" {print $3 " " $4}' "$script_dir/release-tag-signers")
+[ "$signing_identity" = "$pinned_signing_identity" ] \
+  || die "tag signing key $signing_fingerprint is not the pinned maintainer key"
 github_login=$(gh api user --jq .login)
 github_signing_keys=$(gh api "users/$github_login/ssh_signing_keys?per_page=100")
 jq -e --arg key "$signing_identity" '

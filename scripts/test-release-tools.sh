@@ -207,12 +207,11 @@ case "$1:$2" in
 esac
 EOF
 chmod 755 "$fakebin/gh"
-commit=0123456789abcdef0123456789abcdef01234567
+commit=13fc7d1093b28aadd212e1a7ffabcfa277ba3b20
 tag_sha=89abcdef0123456789abcdef0123456789abcdef
 ref_json=$(jq -cn --arg sha "$tag_sha" '{object:{type:"tag",sha:$sha}}')
-tag_json=$(jq -cn --arg commit "$commit" '
-  {tag:"v0.1.0",object:{type:"commit",sha:$commit},
-   verification:{verified:true,reason:"valid"}}')
+# Unchanged published tag: verification must accept the existing maintainer key.
+tag_json=$(cat "$repo_dir/tests/fixtures/release-tag-v0.4.1.json")
 compare_json=$(jq -cn --arg commit "$commit" \
   '{base_commit:{sha:$commit},merge_base_commit:{sha:$commit}}')
 checks_json=$(jq -cn '{check_runs:[
@@ -227,7 +226,7 @@ workflow_runs_json=$(jq -cn --arg commit "$commit" '{workflow_runs:[{
 SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
   PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos >/dev/null
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos >/dev/null
 
 SYQ_TEST_WORKFLOW_RUNS_JSON="$workflow_runs_json" PATH="$fakebin:$PATH" \
   "$script_dir/verify-release-ci.sh" greaber/syq "$commit" >/dev/null
@@ -298,23 +297,23 @@ expect_failure 'macos.yml has no push or workflow_dispatch run' env \
 lightweight=$(jq -cn --arg sha "$commit" '{object:{type:"commit",sha:$sha}}')
 expect_failure 'is lightweight' env \
   SYQ_TEST_REF_JSON="$lightweight" SYQ_TEST_TAG_JSON="$tag_json" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 unsigned=$(jq -cn --arg commit "$commit" '
-  {tag:"v0.1.0",object:{type:"commit",sha:$commit},
+  {tag:"v0.4.1",object:{type:"commit",sha:$commit},
    verification:{verified:false,reason:"unsigned"}}')
 expect_failure 'reason: unsigned' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$unsigned" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 expect_failure 'not workflow commit' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 \
   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa master rust,macos
 unmerged_compare=$(jq -cn --arg commit "$commit" \
   '{base_commit:{sha:$commit},merge_base_commit:{sha:("b"*40)}}')
 expect_failure 'not reachable from protected branch master' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$unmerged_compare" PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 # A red, pending, or absent required check on the tagged commit blocks the
 # release even when the tag itself is valid and merged.
 failed_checks=$(jq -cn '{check_runs:[
@@ -324,7 +323,7 @@ expect_failure 'required check rust is failure' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$failed_checks" \
   PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 pending_checks=$(jq -cn '{check_runs:[
   {name:"rust",status:"in_progress",conclusion:null},
   {name:"macos",status:"completed",conclusion:"success"}]}')
@@ -332,12 +331,27 @@ expect_failure 'required check rust is pending' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$pending_checks" \
   PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 expect_failure 'required check linux-arm64 is missing' env \
   SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tag_json" \
   SYQ_TEST_COMPARE_JSON="$compare_json" SYQ_TEST_CHECKS_JSON="$checks_json" \
   PATH="$fakebin:$PATH" \
-  "$script_dir/verify-release-tag.sh" greaber/syq v0.1.0 "$commit" master rust,macos,linux-arm64
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos,linux-arm64
+
+# A valid signature by another key is not release authority, even when GitHub
+# reports it as verified. Use an ephemeral test key, never a maintainer secret.
+ssh-keygen -q -t ed25519 -N '' -f "$work/other-tag-key"
+jq -j '.verification.payload' <<<"$tag_json" >"$work/other-tag-payload"
+ssh-keygen -Y sign -f "$work/other-tag-key" -n git "$work/other-tag-payload"
+other_signer=$(jq --rawfile signature "$work/other-tag-payload.sig" \
+  '.verification.signature = $signature' <<<"$tag_json")
+expect_failure 'not signed by the pinned maintainer key' env \
+  SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$other_signer" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
+tampered=$(jq '.verification.payload += "tampered"' <<<"$tag_json")
+expect_failure 'not signed by the pinned maintainer key' env \
+  SYQ_TEST_REF_JSON="$ref_json" SYQ_TEST_TAG_JSON="$tampered" PATH="$fakebin:$PATH" \
+  "$script_dir/verify-release-tag.sh" greaber/syq v0.4.1 "$commit" master rust,macos
 
 # Published-release reruns compare content, not just asset names.
 local_assets="$work/local-assets"

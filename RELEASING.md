@@ -121,6 +121,10 @@ ssh-add -l -E sha256 | grep -F 'SHA256:y3++huNJminuTLAOkyb635Vohfph9TfrzbtmVzM0d
 gh auth status
 ```
 
+Release CI also verifies tag signatures against this key in
+`scripts/release-tag-signers`; GitHub verification by another signer is not
+sufficient. A tag-key rotation must update that public allowlist.
+
 Configure each fresh clone once to use the public half of that forwarded key:
 
 ```sh

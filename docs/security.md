@@ -165,8 +165,11 @@ host resolution. A copy never switches routes after selecting its destination.
 
 ## Code and transport integrity
 
-File data is encrypted and authenticated by default. `--tcp-plain` gives up
-that protection. Downloaded code for remote operations and explicit
+File data is encrypted and authenticated by default. `--tcp-plain` sends
+file contents, protocol messages, and the worker authentication token in
+plaintext. An observer can steal the token and connect as a worker while the
+transfer is active; a network attacker can also alter traffic. Use it only on
+a network you trust. Downloaded code for remote operations and explicit
 self-updates is verified against a signed release manifest before use.
 That verification cannot protect a machine whose trusted account or programs
 have already been compromised.

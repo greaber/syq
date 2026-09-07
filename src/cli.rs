@@ -1889,8 +1889,8 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
-    if let Some(rsh) = utf8("SYQ_INTERNAL_NATIVE_RSH")? {
-        args.rsh = Some(rsh);
+    if args.rsh.is_none() {
+        args.rsh = utf8("SYQ_INTERNAL_NATIVE_RSH")?;
     }
     if let Some(width) = utf8("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH")? {
         args.width = Some(
@@ -1998,6 +1998,9 @@ pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeE
     };
     if host.is_empty() {
         bail!("empty host in endpoint {spec:?}");
+    }
+    if host.starts_with('-') {
+        bail!("host in endpoint {spec:?} must not start with a dash");
     }
     if host
         .bytes()
@@ -2630,6 +2633,13 @@ mod tests {
                 port: Some(2200),
             })
         );
+        for host in ["-oProxyCommand=evil", "user@-oProxyCommand=evil", "[-evil]"] {
+            assert!(parse_native_endpoint(Some(host)).is_err(), "{host}");
+            assert!(
+                super::Location::parse(&format!("{host}:path")).is_err(),
+                "{host}"
+            );
+        }
         assert!(parse_native_endpoint(Some("host:path")).is_err());
         assert!(parse_native_endpoint(Some("2001:db8::1")).is_err());
         assert!(parse_native_endpoint(Some("host:0")).is_err());
@@ -2800,6 +2810,9 @@ impl Location {
             .to_string();
         if host.is_empty() {
             bail!("empty host in {s:?}");
+        }
+        if host.starts_with('-') {
+            bail!("host in {s:?} must not start with a dash");
         }
         let path = if path.is_empty() {
             b".".to_vec()

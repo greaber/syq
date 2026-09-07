@@ -346,6 +346,18 @@ class NativeClientTests(unittest.TestCase):
         self.assertNotIn("-base", argv)
         self.assertNotIn("-destination", argv)
 
+    def test_positional_sources_cannot_inject_options(self) -> None:
+        for source in ("--rsh=/tmp/evil", b"--rsh=/tmp/evil", Path("--prune"), "ordinary"):
+            for command in ("cp", "rm"):
+                with self.subTest(source=source, command=command):
+                    if command == "cp":
+                        self.client.cp(source, into="target")
+                    else:
+                        self.client.rm(source)
+                    argv = self.argv()
+                    self.assertIn("--src=" + os.fsdecode(source), argv)
+                    self.assertNotIn(os.fsdecode(source), argv)
+
     def test_mapping_precedes_the_destination(self) -> None:
         self.client.cp(mapping="manifest", into="target")
 

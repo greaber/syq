@@ -18886,3 +18886,118 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
     assert!(output.stdout.is_empty());
     assert!(!t.path("home/ssh-used").exists());
 }
+
+#[test]
+fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &t.0)
+            .env("XDG_CONFIG_HOME", t.path("config"));
+        command
+    };
+    let output = command(&["persist", "on", "--ephemeral"]).run().unwrap();
+    assert_output_ok(&output);
+    let scope = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let digest = Sha256::digest(b"@example");
+    let key = format!(
+        "cm-{}",
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    write(
+        &scope.join(format!("{key}.json")),
+        br#"{"user":null,"host":"example","port":null}"#,
+    );
+    let listener = UnixListener::bind(scope.join(format!("{key}.recv"))).unwrap();
+    let error = "peer: \x1b]52;c;bad\x07\r\u{2028}\u{200f}";
+    let response = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "identity": "old-daemon-fixture", "pid": 1,
+        "endpoint": "example", "name": "laptop",
+        "connection": {"phase": "failed", "error": error, "ssh_pid": null}
+    }))
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let mut ready = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut ready, 1, 5000) },
+                1,
+                "status client did not connect within five seconds"
+            );
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(length) as usize];
+            socket.read_exact(&mut request).unwrap();
+            socket
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&response).unwrap();
+        }
+    });
+    for args in [
+        vec!["persist", "status", "--pscope", scope.to_str().unwrap()],
+        vec!["persist", "receive", "status"],
+    ] {
+        let output = command(&args).run().unwrap();
+        assert_output_ok(&output);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("peer: \\u{1b}]52;c;bad\\u{7}\\r\\u{2028}\\u{200f}"),
+            "{text}"
+        );
+    }
+    let output = command(&["persist", "receive", "status", "--json"])
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["connections"][0]["connection"]["error"], error);
+    server.join().unwrap();
+}
+
+#[test]
+fn native_explicit_rsh_overrides_internal_environment() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    write(&t.path("source"), b"data");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--from",
+            "example",
+            "--src",
+            &t.s("source"),
+            "--as",
+            &t.s("dest"),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            "syq",
+            "--no-tcp",
+        ])
+        .env("SYQ_INTERNAL_NATIVE_RSH", "/missing-internal-rsh")
+        .env("FAKE_REMOTE_HOME", &t.0)
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dest")), b"data");
+}
