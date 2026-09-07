@@ -23,7 +23,8 @@ transport and performance details.
 
 To initiate a copy from a server to your laptop, use a [named receiving
 destination](receive.md), such as `syq cp results --to laptop`. `persist on`
-enables background receiving automatically. Bare names prefer live return
+enables background receiving with later SSH connections; ephemeral `--pscope`
+connections do not enable it. Bare names prefer live return
 connections; `@laptop` requires one and fails while offline.
 You can also [request a command on the receiving machine](exec.md), such as
 `syq exec --on @laptop --cwd work/project -- cargo test`, with local approval.
@@ -111,6 +112,8 @@ out of the discovered total; while syq is still scanning, the percentage is
 unknown. Wider terminals also show elapsed time, speed, ETA, and file counts.
 Use `--progress` to force the display or `--no-progress` to hide it. `--quiet`
 hides it too. `--progress-json` selects JSON progress instead of the bar.
+JSON progress and warning records preserve their original string values,
+including Unicode characters; terminal escaping applies only to human output.
 
 The bar advances when syq processes a block or completes a file. On a slow
 link, or during a local server-side copy, it can stay at the same position

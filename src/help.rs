@@ -200,7 +200,7 @@ pub(crate) fn receiver() -> Command {
             .subcommand(Command::new("list").about("List local active and pending enrollments"))
             .subcommand(
                 Command::new("revoke")
-                    .about("Remove the forced key and per-enrollment state from both machines")
+                    .about("Stop active receivers and remove their enrollment from both machines")
                     .arg(
                         Arg::new("id")
                             .required(true)

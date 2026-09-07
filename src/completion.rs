@@ -836,6 +836,11 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
+        ("persist", "connect") => Ok(endpoint_candidates(
+            current,
+            EndpointSyntax::Native,
+            pscope_from_args(command, args),
+        )),
         ("persist", "wait" | "forget")
             if args.first().is_some_and(|arg| arg == b"destinations") =>
         {

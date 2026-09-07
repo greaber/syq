@@ -147,7 +147,9 @@ class MappingContextTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS TMPDIR passes through /var, a symlink to /private/var.
+        # These fixtures test mappings, so give the native walker a real path.
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "source"
         self.source.mkdir()
         (self.source / "a").write_bytes(b"correct source")
@@ -249,7 +251,7 @@ class MappingContextTests(unittest.TestCase):
 class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_transform_and_sync_mapping_cross_client(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "source").mkdir()
             (root / "source/a").write_bytes(b"data")
             (root / "other").mkdir()
@@ -272,7 +274,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lazy_map_snapshots_producer_directory_and_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             for name in ("first", "second"):
                 (root / name).mkdir()
                 (root / name / "a").write_text(name)
@@ -292,7 +294,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_mapping_constructor_and_closed_stream(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "source").mkdir()
             (root / "source/a").write_bytes(b"data")
             client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
@@ -309,7 +311,7 @@ class AsyncMappingContextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_failed_or_cancelled_transform_leaves_destination_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "a").write_bytes(b"data")
             client = syq.AsyncClient(executable=EXECUTABLE, process_cwd=root)
             async def fail(entry):

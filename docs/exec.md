@@ -12,8 +12,8 @@ program installed on the receiving machine can be requested, including a
 native application or a version of syq you have just built there.
 
 Commands use the same background connection as [return copies](receive.md).
-Turn on persistence on the receiving machine and connect to the server with
-syq. No SSH server or incoming network port is needed on the receiving machine.
+Run `syq persist connect server` on the receiving machine to enable persistence
+and wait for the connection. No SSH server or incoming network port is needed on the receiving machine.
 Requests work from independent server shells, including existing tmux sessions.
 
 `--on` selects a receiving name. Both `laptop` and `@laptop` require a live

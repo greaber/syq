@@ -23,7 +23,9 @@ SSH configuration, programs, or enrollment state. Manage that state with
 
 Repeating `enroll` updates the receiver to match your local build. A pending
 enrollment can be retried or revoked. Revoke and enroll again to rotate its
-receipt key.
+receipt key. Revocation stops active receivers for that enrollment before
+removing its state; see [revocation and upgrades](remote-to-remote.md#first-copy-and-access-management)
+for interruption, retry, and older-receiver behavior.
 
 Enrollment uploads the executable running on your machine, which must also run
 on the destination. It does not use `--syq-path` or fetch a release for another
@@ -47,6 +49,11 @@ finish within seven days of authorization.
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
+
+TCP listeners must advertise a port in the requested range. An invalid port
+fails TCP setup before any address is probed. Special-file creation accepts
+only FIFO, socket, and device types; permission bits follow the grant's
+permission-preservation setting.
 
 ## Signed results
 

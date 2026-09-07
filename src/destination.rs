@@ -1105,7 +1105,7 @@ pub(crate) fn serve_background(
                 .and_then(|s| s.code())
                 .is_some_and(|code| (1..128).contains(&code) && code != RECONNECT_PENDING)
             {
-                bail!("server rejected return connection: {error}; reconnect with syq or change receiving settings with syq persist receive on to retry");
+                bail!("server rejected return connection: {error}; run syq persist connect {} on the receiving machine to retry", shell_words::quote(&spec.endpoint.label()));
             }
             *state.lock().unwrap() = crate::receive_service::ConnectionState {
                 phase: "reconnecting".into(),
@@ -1526,7 +1526,16 @@ mod tests {
         assert!(requester_closed(&socket));
         let (socket, peer) = UnixStream::pair().unwrap();
         drop(peer);
-        assert!(requester_closed(&socket));
+        // Another test's forked child can briefly inherit the peer until exec.
+        // Wait for actual EOF rather than assuming our drop closed its last fd.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !requester_closed(&socket) {
+            assert!(
+                Instant::now() < deadline,
+                "disconnected requester did not reach EOF"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

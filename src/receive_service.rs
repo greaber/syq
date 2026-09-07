@@ -402,19 +402,69 @@ pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
         );
     }
 }
-fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> {
+/// Return readiness for one owned endpoint; do not restart a healthy service.
+pub(crate) fn ensure_ready(
+    control: &Path,
+    remote: &crate::conn::RemoteSpec,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    if !ensure_inner(control, remote)? {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut progress = Instant::now();
+    loop {
+        let observed = match status(control, false) {
+            Ok(state) if state.connection.phase == "online" => return Ok(Some(state.name)),
+            Ok(state) => {
+                let observed = format!(
+                    "{}{}",
+                    state.connection.phase,
+                    state
+                        .connection
+                        .error
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+                if state.connection.phase == "failed" {
+                    bail!("{}: {observed}", remote.label());
+                }
+                observed
+            }
+            Err(error) => format!("receiving is starting or unavailable: {error:#}"),
+        };
+        if Instant::now() >= deadline {
+            bail!("{} is not ready: {observed}; check syq persist status (background reconnects continue while enabled)", remote.label());
+        }
+        if progress.elapsed() >= Duration::from_secs(5) {
+            crate::output::diagnostic!("syq: waiting for {}: {observed}", remote.label());
+            progress = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub(crate) fn connection_status(control: &Path) -> Option<(String, ConnectionState)> {
+    status(control, false)
+        .ok()
+        .map(|state| (state.name, state.connection))
+}
+
+fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
+    let scope = control.parent().context("persistence scope missing")?;
+    crate::persistence::validate_scope(scope)?;
+    // Ephemeral scopes only reuse forward SSH connections. Do not read or
+    // create receiving preferences for them.
+    if !crate::persistence::is_global_scope(scope)? || !crate::persistence::global_enabled()? {
+        return Ok(false);
+    }
+    if scope.join(CLOSING).exists() {
+        bail!("persistence scope is closing");
+    }
     // Persist v3 before reuse so older binaries reject a policy downgrade.
     let config = ensure_current_settings()?;
     if !config.enabled {
-        return Ok(());
-    }
-    let scope = control.parent().context("persistence scope missing")?;
-    crate::persistence::validate_scope(scope)?;
-    if scope.join(CLOSING).exists() {
-        return Ok(());
-    }
-    if crate::persistence::is_global_scope(scope)? && !crate::persistence::global_enabled()? {
-        return Ok(());
+        return Ok(false);
     }
     if is_running(control) {
         if status(control, false).is_ok_and(|state| {
@@ -422,7 +472,7 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> 
         }) {
             stop_inner(control, false)?;
         } else {
-            return Ok(());
+            return Ok(true);
         }
     }
     let spec = ServiceSpec {
@@ -436,7 +486,8 @@ fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<()> 
         program: remote.program_command(&[]),
     };
     atomic_json(&suffixed(control, RECORD), &spec)?;
-    spawn(control)
+    spawn(control)?;
+    Ok(true)
 }
 fn spawn(control: &Path) -> Result<()> {
     let mut command = Command::new(std::env::current_exe()?);
@@ -503,22 +554,6 @@ fn stop_inner(control: &Path, remove_record: bool) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn summary(control: &Path) -> String {
-    match status(control, false) {
-        Ok(state) => format!(
-            ", return {} ({}){}",
-            state.name,
-            state.connection.phase,
-            state
-                .connection
-                .error
-                .map(|e| format!(": {e}"))
-                .unwrap_or_default()
-        ),
-        Err(_) if suffixed(control, RECORD).exists() => ", return inactive".into(),
-        Err(_) => String::new(),
-    }
-}
 
 struct SocketCleanup {
     path: PathBuf,
@@ -546,7 +581,7 @@ impl Drop for Worker {
 fn run(control: &Path) -> Result<()> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
-    if scope.join(CLOSING).exists() {
+    if scope.join(CLOSING).exists() || !crate::persistence::is_global_scope(scope)? {
         return Ok(());
     }
     let Some(_lock) = try_lock(control, true)? else {
@@ -558,7 +593,6 @@ fn run(control: &Path) -> Result<()> {
     let spec = read_spec(control)?;
     let scope_meta = fs::metadata(scope)?;
     let scope_identity = (scope_meta.dev(), scope_meta.ino());
-    let global = crate::persistence::is_global_scope(scope)?;
     let socket = suffixed(control, SOCKET);
     match fs::symlink_metadata(&socket) {
         Ok(meta) if meta.file_type().is_socket() => fs::remove_file(&socket)?,
@@ -587,7 +621,7 @@ fn run(control: &Path) -> Result<()> {
             if last_check.elapsed() >= Duration::from_secs(1) {
                 if !fs::metadata(scope).is_ok_and(|m| (m.dev(), m.ino()) == scope_identity)
                     || scope.join(CLOSING).exists()
-                    || (global && !crate::persistence::global_enabled()?)
+                    || !crate::persistence::global_enabled()?
                 {
                     break;
                 }
@@ -737,7 +771,11 @@ fn configure(options: Configure) -> Result<()> {
     // readiness from a connection still using the previous name or directory.
     for control in all_controls()? {
         stop_inner(&control, false)?;
-        if read_spec(&control).is_ok() {
+        if crate::persistence::is_global_scope(
+            control.parent().context("persistence scope missing")?,
+        )? && crate::persistence::global_enabled()?
+            && read_spec(&control).is_ok()
+        {
             spawn(&control)?;
         }
     }

@@ -523,7 +523,7 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
             ""
         };
         crate::output::diagnostic!(
-            "syq: concurrency: target {} {unit} ({policy}); initial count limited by available work{dry}",
+            "syq: concurrency: target {} {unit} ({policy}){dry}",
             args.connections
         );
     } else if args.dry_run {
@@ -2554,19 +2554,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
-    // Only a fresh container rules out both final-file and resumable partial
-    // bases. Either basis can produce many disjoint changed ranges even in a
-    // file too small for work stealing, so its size cannot bound concurrency.
-    let fresh_container = dst_is_dir
-        && (dst_root_entry.is_none()
-            || (dst_entry_is_dir
-                && initial_destination_filesystem
-                    .as_ref()
-                    .is_some_and(|info| info.empty == Some(true))));
+    // A missing single-file target may still have a resumable sidecar. Bound
+    // its initial SSH workers speculatively, then restore concurrency if the
+    // worker discovers a basis with potentially disjoint changed ranges.
+    let fresh_destination = dst_root_entry.is_none()
+        || (dst_entry_is_dir
+            && initial_destination_filesystem
+                .as_ref()
+                .is_some_and(|info| info.empty == Some(true)));
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
-        let fresh = dst_root_entry.is_none()
-            || (dst_entry_is_dir && dst_root_entry.is_some() && info.empty == Some(true));
-        fresh.then_some(FreshCapacityPlan {
+        fresh_destination.then_some(FreshCapacityPlan {
             device: info.device,
             target: exact_capacity_target,
             root_existed: dst_root_entry.is_some(),
@@ -3236,7 +3233,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         args.connections
                     };
                     if autotune
-                        && fresh_container
+                        && fresh_destination
                         && !multiplex_small_files
                         && !all_remote_endpoints_use_tcp
                         && (src_ep.is_remote() || dst_ep.is_remote())
@@ -3250,6 +3247,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             jobs.iter().map(|job| job.entry.size),
                             sched.min_split,
                         );
+                        if initial < args.connections {
+                            sched.arm_direct_fallback(args.connections);
+                        }
+                        if jobs.len() == 1 {
+                            sched.reserve_initial_ranges(initial);
+                        }
                         if args.verbose >= 2 && initial < args.connections {
                             crate::output::diagnostic!(
                                 "syq: SSH startup limited to {initial} workers by available files and ranges"
@@ -8012,6 +8015,9 @@ impl Worker {
                 other => bail!("unexpected response {other:?}"),
             };
 
+            if partial_size.is_some() || final_is_file {
+                self.sched.request_direct_fallback();
+            }
             if inplace {
                 if final_is_file && size > 0 {
                     return Ok((self.diff_blocks(&job, Which::Final)?, true));

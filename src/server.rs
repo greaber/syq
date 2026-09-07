@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 struct RequestReader {
     rx: Option<std::sync::mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Request>>>>,
@@ -315,7 +316,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         } => {
             debug = d;
             if let Some(t) = &expect_token {
-                if &token != t {
+                if !bool::from(token.ct_eq(t)) {
                     bail!("bad token on data connection");
                 }
             }

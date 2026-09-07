@@ -13,6 +13,51 @@ from unittest import mock
 import syq
 
 
+class ProcessGroupCleanupTests(unittest.TestCase):
+    def test_exited_mapping_process_can_be_closed_without_consuming_output(self):
+        from syq.client import _LineProcess
+
+        # Leave the exited leader unreaped, as an abandoned mapping can do.
+        # On Darwin, signalling its zombie-only group may return EPERM.
+        for _ in range(10):
+            process = _LineProcess(
+                (sys.executable, "-c", "print('unconsumed mapping')"),
+                cwd=None, env=None, timeout=5,
+            )
+            try:
+                process._stderr_thread.join(timeout=5)
+                self.assertFalse(process._stderr_thread.is_alive())
+            finally:
+                process.abort()
+            self.assertIsNotNone(process.returncode)
+            self.assertTrue(process._closed)
+
+    def test_permission_error_reaps_exited_leader_and_retries_group(self):
+        from syq.client import _kill_process_group
+
+        process = mock.Mock(pid=123, poll=mock.Mock(return_value=0))
+        for retry in (None, ProcessLookupError()):
+            with self.subTest(retry=retry), mock.patch(
+                "syq.client.os.killpg", side_effect=[PermissionError(), retry]
+            ) as kill:
+                _kill_process_group(process)
+                self.assertEqual(kill.call_args_list, [
+                    mock.call(123, signal.SIGKILL), mock.call(123, signal.SIGKILL),
+                ])
+
+    def test_permission_errors_for_live_or_remaining_group_are_visible(self):
+        from syq.client import _kill_process_group
+
+        for returncode, attempts in ((None, 1), (0, 2)):
+            with self.subTest(returncode=returncode), mock.patch(
+                "syq.client.os.killpg", side_effect=PermissionError("denied")
+            ) as kill:
+                process = mock.Mock(pid=123, poll=mock.Mock(return_value=returncode))
+                with self.assertRaisesRegex(PermissionError, "denied"):
+                    _kill_process_group(process)
+                self.assertEqual(kill.call_count, attempts)
+
+
 FAKE_SYQ = """#!/bin/sh
 case "$1" in
   --version)

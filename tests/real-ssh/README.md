@@ -164,3 +164,14 @@ The disposable runner also checks privileged copies before dropping to its
 normal test user: foreign-owned partials are replaced without modifying their
 inodes, requested final ownership still works, and `--insecure-links` permits
 foreign-owned symlinks in typed local paths. No host files are used.
+
+The persistence cases establish receiving with `persist connect` without a copy,
+verify that repeating it preserves a pending approval and the service process,
+and check that it respects disabled receiving. An ephemeral connect establishes
+forward SSH without creating a return service or enabling durable persistence.
+Network interruption and heartbeat
+expiry cases verify automatic recovery and successful subsequent copies.
+
+The suite also revokes an enrollment while two restricted copies are writing,
+checks that both fail without publishing their files, and verifies that a fresh
+enrollment can resume their partials.

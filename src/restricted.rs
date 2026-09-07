@@ -1,5 +1,7 @@
 //! End-to-end enrollment and signed restricted-transfer integration.
 
+mod active;
+
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
     self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
@@ -1911,13 +1913,23 @@ impl RestrictedAuthority {
                 ..
             } => {
                 let kind = kind_from_mode(*mode);
+                if !matches!(
+                    kind,
+                    proto::Kind::Fifo
+                        | proto::Kind::Socket
+                        | proto::Kind::CharDev
+                        | proto::Kind::BlockDev
+                ) {
+                    bail!("special-file creation requires a FIFO, socket, or device mode");
+                }
+                #[cfg(target_os = "linux")]
+                let file_type = *mode & libc::S_IFMT;
+                #[cfg(not(target_os = "linux"))]
+                let file_type = *mode & libc::S_IFMT as u32;
+                *mode = file_type | (*mode & 0o7777);
                 self.constrain_creation(path, condition, false, index, pending)?;
                 if !self.copy.options.preserve_permissions {
                     self.remember_receiver_creation(path, false)?;
-                    #[cfg(target_os = "linux")]
-                    let file_type = *mode & libc::S_IFMT;
-                    #[cfg(not(target_os = "linux"))]
-                    let file_type = *mode & libc::S_IFMT as u32;
                     *mode = file_type | 0o600;
                 }
                 outcomes.push(PendingOutcome::Logical {
@@ -3126,6 +3138,7 @@ pub(crate) fn remote_install() -> Result<()> {
     // cannot leave a usable key, and a later state-write failure leaves only
     // inert private state that an idempotent retry can complete.
     let (state, _allowed_signers, _replay) = install_state_paths(&home, request.id)?;
+    active::require_not_revoked(&state)?;
     atomic_write(
         &state,
         "allowed-signers",
@@ -3214,6 +3227,10 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
     if account != request.target_login {
         bail!("revocation target login does not match the remote account");
     }
+    // Serialize revocation with both enrollment updates and receiver admission.
+    let ssh = ensure_directory_chain(home, &[".ssh"])?;
+    let directory = open_directory(&ssh)?;
+    lock_directory(&directory)?;
     let state_base = home.join(".local/share/syq/restricted");
     let state = state_base.join(request.id.to_string());
     let (receiver_path, remove_state) = match fs::symlink_metadata(&state) {
@@ -3241,15 +3258,17 @@ fn revoke_for_account(request: &RevokeRequest, account: &str, home: &Path) -> Re
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;
-    let ssh = ensure_directory_chain(home, &[".ssh"])?;
-    let directory = open_directory(&ssh)?;
-    lock_directory(&directory)?;
+    let leases = remove_state
+        .as_deref()
+        .map(active::open_leases)
+        .transpose()?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
     let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
     if let Some(state) = remove_state {
+        active::revoke(&state, leases.as_ref().expect("enrollment lease file"))?;
         fs::remove_dir_all(&state)
             .with_context(|| format!("remove revoked receiver state {}", state.display()))?;
     }
@@ -4301,6 +4320,8 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
     let envelope = decode_receiver_command(&original)?;
     let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
+    let state = replay_path.parent().context("receiver state directory")?;
+    let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
@@ -4350,6 +4371,14 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         deadline,
         &protected,
     )?);
+    // Verification does not hold the lifecycle lock or permit mutations. A
+    // revoke during verification is caught when this receiver tries to enter.
+    active::watch(
+        &home,
+        state,
+        (observed_state.dev(), observed_state.ino()),
+        deadline,
+    )?;
     crate::server::run_restricted(authority)
 }
 
@@ -4515,6 +4544,23 @@ pub(crate) mod tests {
     use super::*;
     use clap::Parser;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn receiver_configuration_preserves_released_v041_bytes() {
+        // Unmodified output of the checksum-verified released v0.4.1
+        // --restricted-install, produced in a disposable account/container.
+        let encoded = include_bytes!("../tests/fixtures/restricted-enrollment-v0.4.1.json");
+        let config: ReceiverEnrollment = serde_json::from_slice(encoded).unwrap();
+        assert_eq!(config.version, 3);
+        // The old representation is still readable, but cannot authorize a
+        // generation-4 receiver. Enrollment must be recreated after upgrade.
+        assert_ne!(config.version, CONFIG_VERSION);
+        assert_eq!(
+            config.id,
+            EnrollmentId::parse("00112233445546778899aabbccddeeff").unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&config).unwrap(), encoded);
+    }
 
     #[test]
     fn enrollment_ssh_failures_distinguish_transport_from_remote_rejection() {
@@ -5618,6 +5664,65 @@ pub(crate) mod tests {
                 .unwrap();
             fs::set_permissions(&raced, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn special_file_creation_checks_kind_and_masks_mode() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir(root.join("target")).unwrap();
+        for preserve_permissions in [false, true] {
+            for kind in [
+                libc::S_IFREG,
+                libc::S_IFDIR,
+                libc::S_IFLNK,
+                0,
+                libc::S_IFIFO,
+                libc::S_IFSOCK,
+                libc::S_IFCHR,
+                libc::S_IFBLK,
+            ] {
+                let mut authority = test_authority(root, DeletionPolicy::Forbid, 1024);
+                authority.copy.options.preserve_devices = true;
+                authority.copy.options.preserve_permissions = preserve_permissions;
+                #[allow(clippy::unnecessary_cast)]
+                let kind = kind as u32;
+                let mut request = apply(Op::Mknod {
+                    path: path_bytes(&root.join("target/node")),
+                    mode: kind | 0x8000_0000 | 0o6754,
+                    rdev: 0,
+                    condition: proto::TargetCondition::Any,
+                });
+                let allowed = matches!(
+                    kind_from_mode(kind),
+                    proto::Kind::Fifo
+                        | proto::Kind::Socket
+                        | proto::Kind::CharDev
+                        | proto::Kind::BlockDev
+                );
+                let result = authority.authorize(&mut request, false);
+                if !allowed {
+                    assert!(result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("special-file creation requires"));
+                    continue;
+                }
+                result.unwrap();
+                let Request::Apply { ops, .. } = request else {
+                    unreachable!()
+                };
+                let Op::Mknod { mode, .. } = ops[0] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    mode,
+                    kind | if preserve_permissions { 0o6754 } else { 0o600 }
+                );
+            }
+        }
+        assert!(!root.join("target/node").exists());
     }
 
     #[test]

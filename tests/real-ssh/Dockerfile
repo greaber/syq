@@ -66,4 +66,6 @@ COPY tests/real-ssh/test-return-handoff.py /usr/local/libexec/syq-test-return-ha
 
 COPY tests/real-ssh/test-root-security.py /usr/local/libexec/syq-test-root-security.py
 
+COPY tests/real-ssh/test-receiver-revoke.py /usr/local/libexec/syq-test-receiver-revoke.py
+
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

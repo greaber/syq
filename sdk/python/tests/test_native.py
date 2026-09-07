@@ -805,6 +805,27 @@ class NativeClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NUL"):
             syq.RelativePath(b"nul\0path")
 
+    def test_protocol_failure_kills_descendants_after_the_leader_exits(self) -> None:
+        from syq.client import _kill_process_group
+
+        marker = self.root / "post-exit-descendant"
+        client = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_DESCENDANT": os.fspath(marker),
+                 "SYQ_FAKE_SHAPE": "truncated"},
+        )
+
+        def kill_after_exit(process):
+            process.wait(timeout=5)
+            _kill_process_group(process)
+
+        with mock.patch("syq.client._kill_process_group", side_effect=kill_after_exit):
+            with self.assertRaisesRegex(syq.SyqProtocolError, "terminal result"):
+                client.cp("source", into="target")
+        self.assertTrue(marker.with_suffix(".ready").exists())
+        time.sleep(0.8)
+        self.assertFalse(marker.exists())
+
     def test_callback_failure_kills_the_owned_process_group(self) -> None:
         marker = self.root / "descendant"
         client = syq.Client(

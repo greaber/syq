@@ -16,6 +16,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 const CONFIG_FILE: &str = "persistence.json";
 const SCOPE_MARKER: &str = ".syq-persistence";
@@ -25,7 +27,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. The durable setting applies to later syq transfer commands. An ephemeral scope is isolated from that setting and is selected by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -38,7 +40,24 @@ enum PersistAction {
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
     Destinations(crate::destination::Destinations),
-    /// Enable reusable SSH control connections
+    /// Connect to an SSH server and wait until enabled receiving is ready
+    Connect {
+        /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
+        host: String,
+        /// Use this remote syq executable instead of installing a matching helper
+        #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
+        syq_path: Option<String>,
+        /// Use syq on the remote PATH instead of installing a matching helper
+        #[arg(long)]
+        no_bootstrap: bool,
+        /// Wait this many seconds for receiving after SSH/helper setup
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: u64,
+        /// Reuse forward SSH in an existing ephemeral scope, without enabling receiving
+        #[arg(long, value_name = "PATH")]
+        pscope: Option<PathBuf>,
+    },
+    /// Enable persistent connections for later syq commands
     On {
         /// Create an ephemeral scope and print its path instead of changing the user setting
         #[arg(long)]
@@ -50,8 +69,11 @@ enum PersistAction {
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
     },
-    /// Show the configured policy and live SSH control connections
+    /// Show connection readiness and any receiving problem
     Status {
+        /// Print structured connection state
+        #[arg(long)]
+        json: bool,
         /// Inspect this ephemeral persistence scope instead of the user setting
         #[arg(long, value_name = "PATH")]
         pscope: Option<PathBuf>,
@@ -135,6 +157,21 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     match command.action {
         PersistAction::Receive(command) => return crate::receive_service::run_command(command),
         PersistAction::Destinations(command) => return crate::destination::run_command(command),
+        PersistAction::Connect {
+            host,
+            syq_path,
+            no_bootstrap,
+            timeout,
+            pscope,
+        } => {
+            connect(
+                &host,
+                syq_path,
+                no_bootstrap,
+                Duration::from_secs(timeout),
+                pscope.as_deref(),
+            )?;
+        }
         PersistAction::On { ephemeral: true } => {
             let scope = create_ephemeral_scope()?;
             // This is a scripting contract: stdout is exactly the native path
@@ -177,18 +214,35 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         }
         PersistAction::Status {
             pscope: Some(scope),
-        } => print_scope_status(&scope, Some("ephemeral"))?,
-        PersistAction::Status { pscope: None } => {
+            json,
+        } => {
+            let kind = if is_global_scope(&scope)? {
+                "global"
+            } else {
+                "ephemeral"
+            };
+            print_scope_status(&scope, kind, json)?;
+        }
+        PersistAction::Status { pscope: None, json } => {
             let enabled = global_enabled()?;
-            crate::output::human_stdout!(
-                "SSH connection persistence is {}",
-                if enabled { "on" } else { "off" }
-            );
+            if !json {
+                crate::output::human_stdout!(
+                    "SSH connection persistence is {}",
+                    if enabled { "on" } else { "off" }
+                );
+            }
             let scope = global_scope_path()?;
             match scope.symlink_metadata() {
-                Ok(_) => print_scope_status(&scope, Some("global"))?,
+                Ok(_) => print_scope_status(&scope, "global", json)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    crate::output::human_stdout!("connections: 0");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": []})
+                        );
+                    } else {
+                        crate::output::human_stdout!("connections: 0");
+                    }
                 }
                 Err(error) => {
                     return Err(error)
@@ -198,6 +252,84 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Establish authority through ordinary SSH, without selecting or copying files.
+/// Repeated connects leave a healthy receiving process and its approvals alone.
+fn connect(
+    host: &str,
+    syq_path: Option<String>,
+    no_bootstrap: bool,
+    timeout: Duration,
+    scope: Option<&Path>,
+) -> Result<()> {
+    let endpoint =
+        crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
+    if endpoint.host.starts_with('@') {
+        bail!("persist connect needs an SSH server, not a receiving name");
+    }
+    let ephemeral = scope.is_some();
+    let scope = match scope {
+        Some(scope) => {
+            validate_scope(scope)?;
+            if is_global_scope(scope)? {
+                bail!("the global persistence scope is controlled by `syq persist connect HOST` without --pscope");
+            }
+            scope.to_path_buf()
+        }
+        None => {
+            let scope = ensure_global_scope()?;
+            if !global_enabled()? {
+                write_global_config(true)?;
+                crate::output::human_stdout!("SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)");
+            }
+            scope
+        }
+    };
+    let mut multiplexer = crate::conn::SshMultiplexer::persistent(
+        &scope,
+        endpoint.user.as_deref(),
+        &endpoint.host,
+        endpoint.port,
+    )?;
+    multiplexer.defer_receiving();
+    let multiplexer = Arc::new(multiplexer);
+    let remote = crate::conn::RemoteSpec {
+        local_process: false,
+        user: endpoint.user,
+        host: endpoint.host,
+        port: endpoint.port,
+        rsh: vec!["ssh".into()],
+        bootstrap_helper: syq_path.is_none() && !no_bootstrap,
+        syq_path,
+        restricted_grant: None,
+        helper_install: Default::default(),
+        ssh_multiplexer: Some(multiplexer.clone()),
+        quiet: false,
+        tcp: Default::default(),
+        diagnostics: Default::default(),
+        primed_control: Default::default(),
+        forwarded: None,
+        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+    };
+    crate::output::human_stdout!("Connecting to {}...", remote.label());
+    // This uses the same pinned-helper bootstrap and authentication as a copy.
+    // No source roots, data workers or filesystem operations are requested.
+    let connection = remote.connect_with(true, false)?;
+    let receiving =
+        crate::receive_service::ensure_ready(multiplexer.control_path(), &remote, timeout)?;
+    drop(connection);
+    match receiving {
+        Some(name) => {
+            crate::output::human_stdout!("{} ready; receiving as @{name}", remote.label())
+        }
+        None if ephemeral => crate::output::human_stdout!(
+            "{} ready; ephemeral scopes do not support receiving",
+            remote.label()
+        ),
+        None => crate::output::human_stdout!("{} ready; receiving is disabled", remote.label()),
+    }
+    Ok(())
 }
 
 /// Remember whether the command explicitly selected a scope without touching
@@ -671,28 +803,105 @@ fn socket_is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
-fn print_scope_status(scope: &Path, kind: Option<&str>) -> Result<()> {
+#[derive(Serialize)]
+struct ConnectionStatus {
+    endpoint: String,
+    state: String,
+    ssh_connected: bool,
+    receiving_enabled: Option<bool>,
+    receiving_name: Option<String>,
+    receiving: Option<crate::receive_service::ConnectionState>,
+    session_pool: bool,
+}
+
+fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     let records = scope_records(scope)?;
-    if let Some(kind) = kind {
-        crate::output::human_stdout!("scope ({kind}): {}", scope.display());
+    let receiving_setting = if kind == "global" {
+        crate::receive_service::settings().map(|settings| settings.enabled)
     } else {
-        crate::output::human_stdout!("scope: {}", scope.display());
-    }
-    crate::output::human_stdout!("connections: {}", records.len());
+        Ok(false)
+    };
+    let receiving_error = receiving_setting
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let receiving_enabled = receiving_setting.ok();
+    let mut connections = Vec::new();
     for (key, record) in records {
         let control = scope.join(&key);
-        let state = if socket_is_live(&control) {
-            "live"
-        } else {
-            "inactive"
+        let ssh_live = socket_is_live(&control);
+        let receiving = crate::receive_service::connection_status(&control);
+        let state = match &receiving {
+            _ if receiving_error.is_some() => "failed",
+            Some((_, connection)) if receiving_enabled == Some(true) => {
+                if connection.phase == "online" {
+                    "ready"
+                } else {
+                    &connection.phase
+                }
+            }
+            _ if receiving_enabled == Some(true) => "inactive",
+            _ if ssh_live => "ready",
+            _ => "inactive",
         };
-        let pool = if crate::session_pool::is_running(&control) {
-            ", session pool"
-        } else {
-            ""
-        };
-        let receiving = crate::receive_service::summary(&control);
-        crate::output::human_stdout!("  {}  {state}{pool}{receiving}", record.label());
+        connections.push(ConnectionStatus {
+            endpoint: record.label(),
+            state: state.to_owned(),
+            ssh_connected: ssh_live,
+            receiving_enabled,
+            receiving_name: receiving.as_ref().map(|(name, _)| name.clone()),
+            receiving: receiving.map(|(_, connection)| connection),
+            session_pool: crate::session_pool::is_running(&control),
+        });
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "enabled": if kind == "global" { global_enabled()? } else { true },
+                "scope": scope, "connections": connections, "receiving_error": receiving_error,
+            })
+        );
+        return Ok(());
+    }
+    crate::output::human_stdout!("scope ({kind}): {}", scope.display());
+    if let Some(error) = &receiving_error {
+        crate::output::human_stdout!("Receiving configuration failed: {error}");
+    }
+    crate::output::human_stdout!("connections: {}", connections.len());
+    for connection in connections {
+        let mut line = format!("  {}  {}", connection.endpoint, connection.state);
+        if kind == "ephemeral" {
+            line.push_str(" (ephemeral scope; receiving not supported)");
+        } else if receiving_enabled == Some(false) {
+            line.push_str(" (receiving disabled)");
+        } else if let Some(name) = connection
+            .receiving_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            line.push_str(&format!(" (receiving as @{name})"));
+        }
+        if let Some(error) = connection
+            .receiving
+            .as_ref()
+            .and_then(|state| state.error.as_deref())
+        {
+            line.push_str(&format!(": {error}"));
+        }
+        if connection.state == "inactive" {
+            line.push_str(&format!(
+                "; run syq persist connect {}",
+                shell_words::quote(&connection.endpoint)
+            ));
+            if kind != "global" {
+                line.push_str(&format!(
+                    " --pscope {}",
+                    shell_words::quote(&scope.to_string_lossy())
+                ));
+            }
+        }
+        crate::output::human_stdout!("{line}");
     }
     Ok(())
 }
@@ -847,7 +1056,7 @@ mod tests {
         let long = temporary.path().join("x".repeat(100));
         std::fs::rename(scope, &long).unwrap();
         assert!(validate_scope(&long).is_ok());
-        assert!(print_scope_status(&long, None).is_ok());
+        assert!(print_scope_status(&long, "ephemeral", false).is_ok());
         assert!(prepare_endpoint(&long, None, "example", None).is_err());
         close_scope(&long).unwrap();
         assert!(!long.exists());
