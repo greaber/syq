@@ -2935,7 +2935,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
-        created_dirs: if create_root && !defer_destination_mutations {
+        // Deferred root creation must succeed before mapped entries are applied.
+        created_dirs: if create_root && opts.preserve_existing_directory_metadata {
             std::collections::HashSet::from([dst_root.clone()])
         } else {
             std::collections::HashSet::new()
@@ -5750,9 +5751,6 @@ impl Planner<'_> {
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));
                 }
-            }
-            if is_destination_root && self.opts.preserve_existing_directory_metadata {
-                self.created_dirs.insert(self.dst_root.clone());
             }
         }
         // Validated: from here on they are ordinary entries (the one that is

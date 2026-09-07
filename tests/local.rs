@@ -3207,6 +3207,8 @@ fn native_rm_follow_preserves_final_symlink_identity() {
         for selector in ["--src-dir", "--srcs-in"] {
             let out = native_syq(&["rm", "--root", &t.s(""), follow, selector, "link"]);
             assert!(!out.status.success());
+            assert!(stderr_of(&out).contains("final symlinks are never followed"));
+            assert!(stderr_of(&out).contains("name the target directory explicitly"));
             assert_eq!(read(&t.path("real/file")), b"keep");
             assert!(t.path("link").is_symlink());
         }

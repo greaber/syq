@@ -1345,10 +1345,9 @@ impl RestrictedAuthority {
                             && metadata.is_dir()
                             && policy == ExistingDestinationPolicy::Skip =>
                     {
-                        // Refuse just this creation at execution, preserving siblings
-                        // in the batch and never reopening a foreign directory.
-                        *condition = Absent;
-                        return Ok(());
+                        // Keep the common no-replace condition and bookkeeping:
+                        // this directory may disappear before execution, allowing
+                        // our creation to succeed and need later metadata updates.
                     }
                     Some(_) => {
                         bail!("signed grant retains existing objects: {label} already exists")
@@ -3808,7 +3807,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
         );
     }
     if args.inplace
-        && (args.ignore_existing
+        && (args.only_new_native_entries()
             || args.existing
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
@@ -5606,6 +5605,34 @@ pub(crate) mod tests {
         authority.settle(settlement, &proto::Response::Applied(vec![None]));
         authority
             .authorize(&mut apply(set_meta(&new_dir)), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn signed_skip_records_directory_created_after_foreign_directory_disappears() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let dir = root.join("target/dir");
+        fs::create_dir_all(&dir).unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut create = apply(mkdir(&dir));
+        let settlement = authority.authorize(&mut create, false).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        let Request::Apply { ops, guard } = &create else {
+            unreachable!()
+        };
+        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        assert!(results.iter().all(Option::is_none), "{results:?}");
+        authority.settle(settlement, &proto::Response::Applied(results));
+        assert!(dir.is_dir());
+        authority
+            .authorize(&mut apply(set_meta(&dir)), false)
             .unwrap();
     }
 

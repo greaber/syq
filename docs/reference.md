@@ -150,7 +150,7 @@ These options apply to individual entries inside the copy:
 
 | Option | Behavior |
 |---|---|
-| `--only-new` | Copy missing entries; keep existing entries and their metadata |
+| `--only-new` | Copy entries found missing; keep entries found present and their metadata |
 | `--only-existing` | Update existing entries; create no missing entries or directories |
 | `--skip-newer` | Skip regular files whose destination modification time is newer |
 
@@ -162,16 +162,16 @@ syq cp --only-new --srcs-in incoming --into archive
 syq cp --only-existing --srcs-in project --into deployed
 ```
 
-`--only-new` still descends into existing directories to add missing children,
-but does not explicitly change their permissions, ownership, or timestamps.
-Adding children requires write access to those directories: `--only-new` does
-not temporarily widen their permissions. If access is denied, the entry fails
+With `--only-new`, directories already present when syq first checks them keep
+their permissions, ownership, and timestamps. Missing children are still added.
+Adding children requires write access to that directory; syq does not
+temporarily widen its permissions. If access is denied, the entry fails
 and the copy reports an error. A dry run previews intended changes without
 testing whether writes will be permitted.
 Adding or removing children can change directory timestamps through normal
-filesystem behavior. Newly created directories receive normal copy metadata.
-If several sources supply the same directory created by this copy, the last
-source supplies its metadata, as in a copy without `--only-new`.
+filesystem behavior. Directories copied as new receive normal copy metadata.
+If several sources supply the same new directory, the last source supplies
+its metadata, as in a copy without `--only-new`.
 If a source directory meets an existing non-directory,
 it keeps the destination entry and skips that source subtree.
 `--only-existing` also skips a source directory and its subtree when the destination

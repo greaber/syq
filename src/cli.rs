@@ -820,7 +820,7 @@ struct NativeCopyOperationalArgs {
     /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
-    /// Copy missing entries without changing existing metadata; adding children requires write access (permissions are not widened)
+    /// Copy entries found missing; keep metadata of entries found present; adding children requires write access
     #[arg(long = "only-new", conflicts_with_all = ["existing", "update", "inplace"])]
     ignore_existing: bool,
     /// Update only entries already present; create no missing entries or directories

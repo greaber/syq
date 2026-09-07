@@ -115,11 +115,12 @@ Typed remote-to-remote copies require an enrolled receiver or
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
-`only_new=True` traverses existing directories but does not explicitly update
-their metadata. Adding children may naturally change directory timestamps.
-New directories receive normal copy metadata. When several sources supply a
-directory created by this copy, the last source supplies its metadata, just
-as without `only_new=True`. Adding children to existing
+With `only_new=True`, directories already present when syq first checks them
+keep their metadata. Missing children are still added.
+Adding children may naturally change directory timestamps. Directories copied
+as new receive normal copy metadata. When several sources supply the same new
+directory, the last source supplies its metadata, just as without
+`only_new=True`. Adding children to those existing
 directories requires write access; permissions are not temporarily widened.
 Permission failures are reported in the result and raise `SyqOperationError`
 unless `check=False`. A dry run does not test write permission.
