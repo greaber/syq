@@ -4,7 +4,11 @@ Start with the defaults. Syq copies files in parallel, splits large files
 between workers, and adjusts connection count during the transfer. If a TCP
 data port is reachable, it sends data through separate encrypted connections.
 Otherwise, ordinary copies send their data over SSH. Small copies can stay
-on the SSH control connection to avoid extra setup. When pushing into an
+on the SSH control connection to avoid extra setup. For larger copies, one
+worker can start on the copy's existing SSH connection while the others open
+independent connections for parallel throughput. This does not reuse a
+cross-run persistent connection or override a custom `--rsh` command.
+When pushing into an
 existing directory, syq pipelines destination setup checks to reduce network
 round trips. For eligible small-file trees in an empty destination, TCP workers
 connect while destination planning finishes. These overlap setup work without

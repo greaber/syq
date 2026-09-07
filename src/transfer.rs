@@ -1015,7 +1015,7 @@ fn attempt_small_copy(
     }
 
     // Read through the engine's source-worker path.
-    let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec()) else {
+    let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true) else {
         return Ok(SmallCopy::Declined);
     };
     let reads: Vec<SmallRead> = srcs
@@ -1949,8 +1949,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         return Ok(());
                     }
                     let t0 = std::time::Instant::now();
+                    // Begin copying on one already-authenticated SSH transport
+                    // while the remaining workers open independent connections.
+                    // TCP and custom remote shells keep their existing policy.
                     let conns = src_ep
-                        .connect_with_sources(compress, initial_sources.clone())
+                        .connect_with_sources(compress, initial_sources.clone(), id == 0)
                         .and_then(|src| {
                             let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
                                 initial_sources.clone()
@@ -1963,6 +1966,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     compress,
                                     initial_destination.clone(),
                                     copy_sources,
+                                    id == 0,
                                 )?,
                             ))
                         });

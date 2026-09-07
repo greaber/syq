@@ -1469,7 +1469,7 @@ impl SshMultiplexer {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SshConnection {
     Independent,
     Control,
@@ -1671,14 +1671,16 @@ impl RemoteSpec {
         cmd
     }
 
-    fn ssh_connection(&self, limited: bool) -> SshConnection {
+    fn ssh_connection(&self, limited: bool, first_worker: bool) -> SshConnection {
+        // One bulk worker can start on this copy's authenticated transport.
+        // The others retain independent cipher processes and TCP streams.
+        // Do not share a persistent master: workers must keep the current
+        // invocation's environment and not compete with unrelated copies.
         if !limited {
             SshConnection::Control
-        } else if self
-            .ssh_multiplexer
-            .as_ref()
-            .is_some_and(|multiplexer| multiplexer.reuse_for_workers())
-        {
+        } else if self.ssh_multiplexer.as_ref().is_some_and(|multiplexer| {
+            (first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers()
+        }) {
             SshConnection::Worker
         } else {
             SshConnection::Independent
@@ -1784,7 +1786,7 @@ impl RemoteSpec {
         } else {
             ConnectionRole::Control
         };
-        self.connect_with_role(compress, limited, role)
+        self.connect_with_role(compress, limited, role, false)
     }
 
     /// One non-retrying control connection for speculative shell completion.
@@ -1819,13 +1821,14 @@ impl RemoteSpec {
         compress: bool,
         limited: bool,
         role: ConnectionRole,
+        first_worker: bool,
     ) -> Result<RemoteConn> {
         if matches!(role, ConnectionRole::Control) && compress {
             if let Some(conn) = self.take_pooled_control(compress) {
                 return Ok(conn);
             }
         }
-        let first = self.connect_retried(compress, limited, role.clone());
+        let first = self.connect_retried(compress, limited, role.clone(), first_worker);
         let Err(first_error) = first else {
             return first;
         };
@@ -1834,7 +1837,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, role)
+        self.connect_retried(compress, limited, role, first_worker)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1849,6 +1852,7 @@ impl RemoteSpec {
         compress: bool,
         limited: bool,
         role: ConnectionRole,
+        mut first_worker: bool,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
@@ -1858,7 +1862,7 @@ impl RemoteSpec {
         let attempts = if limited { 6 } else { 1 };
         for attempt in 0..attempts {
             let _slot = limited.then(connect_slot);
-            let ssh_connection = self.ssh_connection(limited);
+            let ssh_connection = self.ssh_connection(limited, first_worker);
             match self.connect_once(compress, ssh_connection, role.clone()) {
                 Ok(c) => return Ok(c),
                 Err(e)
@@ -1870,6 +1874,7 @@ impl RemoteSpec {
                     // independently authenticated SSH connection. Disable
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
+                    first_worker = false;
                     if crate::transfer::debug() {
                         crate::output::diagnostic!(
                             "syq: {}: multiplexed SSH worker rejected; using independent SSH connections",
@@ -3042,15 +3047,20 @@ impl Endpoint {
     }
 
     pub(crate) fn connect_control(&self, compress: bool) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::Control)
+        self.connect_with_role(compress, ConnectionRole::Control, false)
     }
 
     pub(crate) fn connect_with_sources(
         &self,
         compress: bool,
         roots: Vec<RegisteredSourceRoot>,
+        first_worker: bool,
     ) -> Result<Box<dyn Conn>> {
-        self.connect_with_role(compress, ConnectionRole::SourceWorker { roots })
+        self.connect_with_role(
+            compress,
+            ConnectionRole::SourceWorker { roots },
+            first_worker,
+        )
     }
 
     pub(crate) fn connect_with_copy_capabilities(
@@ -3058,6 +3068,7 @@ impl Endpoint {
         compress: bool,
         destination: Option<DestinationRoot>,
         copy_sources: Vec<RegisteredSourceRoot>,
+        first_worker: bool,
     ) -> Result<Box<dyn Conn>> {
         self.connect_with_role(
             compress,
@@ -3065,10 +3076,16 @@ impl Endpoint {
                 destination,
                 copy_sources,
             },
+            first_worker,
         )
     }
 
-    fn connect_with_role(&self, compress: bool, role: ConnectionRole) -> Result<Box<dyn Conn>> {
+    fn connect_with_role(
+        &self,
+        compress: bool,
+        role: ConnectionRole,
+        first_worker: bool,
+    ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
                 // Every connection clone for this logical local endpoint uses
@@ -3176,7 +3193,12 @@ impl Endpoint {
                     };
                     bail!("{}: {reason}", spec.label());
                 }
-                Ok(Box::new(spec.connect_with_role(compress, true, role)?))
+                Ok(Box::new(spec.connect_with_role(
+                    compress,
+                    true,
+                    role,
+                    first_worker,
+                )?))
             }
         }
     }
@@ -3394,9 +3416,11 @@ mod tests {
         // ticket with SCM_RIGHTS. The endpoint clone still succeeds because it
         // reaches the control connection's process-local registry instead.
         std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
-        endpoint.connect_with_sources(false, roots.clone()).unwrap();
+        endpoint
+            .connect_with_sources(false, roots.clone(), false)
+            .unwrap();
         let error = Endpoint::local()
-            .connect_with_sources(false, roots)
+            .connect_with_sources(false, roots, false)
             .err()
             .expect("a fresh local endpoint must not share another session");
         assert!(format!("{error:#}").contains("connect to descriptor broker"));
@@ -3428,7 +3452,7 @@ mod tests {
             panic!("unexpected source registration response: {response:?}")
         };
         let source_marker = roots[0].selection.join(b"marker").unwrap();
-        let mut source = endpoint.connect_with_sources(false, roots).unwrap();
+        let mut source = endpoint.connect_with_sources(false, roots, false).unwrap();
 
         let response = source
             .call(Request::ReadRange {
@@ -4371,7 +4395,11 @@ mod tests {
         };
         let endpoint = Endpoint::Remote(spec.clone());
         assert!(endpoint
-            .connect_with_role(false, ConnectionRole::SourceWorker { roots: Vec::new() })
+            .connect_with_role(
+                false,
+                ConnectionRole::SourceWorker { roots: Vec::new() },
+                false
+            )
             .is_err());
         assert!(marker.exists(), "worker never attempted SSH fallback");
         assert!(spec.tcp.lock().unwrap().as_ref().unwrap().failed);
@@ -4413,12 +4441,27 @@ mod tests {
             .any(|pair| pair[0] == "-S" && pair[1] == control_path));
         assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
 
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
 
+        let first = args(spec.ssh_connection(true, true));
+        assert!(first
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+        assert!(!first.iter().any(|arg| arg == "ControlPath=none"));
+        assert_eq!(spec.ssh_connection(false, true), SshConnection::Control);
+        // The first worker's preference is per call, not an opt-in for peers.
+        assert_eq!(spec.ssh_connection(true, false), SshConnection::Independent);
+        let mut custom = spec.clone();
+        custom.ssh_multiplexer = None;
+        assert_eq!(
+            custom.ssh_connection(true, true),
+            SshConnection::Independent
+        );
+
         spec.set_ssh_multiplexing(true);
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker
             .windows(2)
@@ -4427,6 +4470,37 @@ mod tests {
 
         let independent = args(SshConnection::Independent);
         assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
+    }
+
+    #[test]
+    fn first_ssh_worker_retries_independently_after_mux_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = crate::test_support::tempdir().unwrap();
+        let script = temporary.path().join("ssh");
+        let log = temporary.path().join("attempts");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = -S ]; then\n    echo shared >> {log}\n    exit 255\n  fi\ndone\necho independent >> {log}\nexit 127\n",
+                log = shell_words::quote(log.to_str().unwrap()),
+            ),
+        ).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut spec = RemoteSpec::local_receiver(true);
+        spec.local_process = false;
+        spec.rsh = vec![script.to_string_lossy().into_owned()];
+        spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer::new().unwrap()));
+        let result = spec.connect_retried(
+            false,
+            true,
+            ConnectionRole::SourceWorker { roots: Vec::new() },
+            true,
+        );
+        assert!(result.is_err()); // The independent attempt reports a missing helper.
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "shared\nindependent\n"
+        );
     }
 
     #[test]
@@ -4510,9 +4584,10 @@ mod tests {
         // Worker data channels never ride a cross-run master, even when the
         // small-file path asks for in-run multiplexing.
         spec.set_ssh_multiplexing(true);
-        let worker = args(spec.ssh_connection(true));
+        let worker = args(spec.ssh_connection(true, false));
         assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
         assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
+        assert_eq!(spec.ssh_connection(true, true), SshConnection::Independent);
     }
 
     #[test]
