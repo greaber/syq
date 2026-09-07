@@ -3199,8 +3199,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 if !workers_started {
                     // A same-machine file normally completes wholly inside one
                     // small-file or receiver-side copy request (copy_file_range,
-                    // or the sequential NFS fallback). Starting 32 loopback
-                    // connections cannot help that request. If a larger file
+                    // or an eligible sequential userspace fallback). Starting
+                    // 32 loopback connections cannot help that request. If a larger file
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
@@ -7933,7 +7933,7 @@ impl Worker {
             && job.target_condition == TargetCondition::Any
             && job.container_guard.is_none();
         // Same-machine copy: let the receiver move the bytes directly (kernel
-        // offload, or one sequential writer for cross-mount NFS) instead of
+        // offload, or an eligible sequential userspace writer) instead of
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
@@ -8132,11 +8132,15 @@ impl Worker {
             && job.container_guard.is_none();
         self.set_inplace(idx, inplace);
         let mode = self.create_mode(job);
+        // Keep range parallelism for a single-file copy. Read the planned
+        // file count before the RPC so no scheduler lock spans the copy.
+        let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
         let resp = self.dst.call(Request::CopyLocal {
             source: job.source.clone(),
             dst: job.dst.clone(),
             inplace,
             allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
+            allow_sequential_local_fallback,
             copy_id: self.copy_id(),
             size: job.entry.size,
             mode,
