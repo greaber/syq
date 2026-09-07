@@ -52,6 +52,24 @@ fn fast_batch_file_limit(
     }
 }
 
+/// Upper bound: each file needs one worker, and each simultaneous range must
+/// contain at least min_split bytes. Balanced/aligned splitting can use fewer.
+fn initial_range_workers(
+    limit: usize,
+    sizes: impl IntoIterator<Item = u64>,
+    min_split: u64,
+) -> usize {
+    assert!(min_split > 0);
+    let capacity = sizes.into_iter().fold(0u64, |total, size| {
+        total.saturating_add((size / min_split).max(1))
+    });
+    limit.min((capacity.min(usize::MAX as u64) as usize).max(1))
+}
+
+fn reuse_startup_ssh(id: usize, autotune: bool) -> bool {
+    id == 0 || (autotune && id == 1)
+}
+
 fn initial_fast_workers(
     max_connections: usize,
     file_jobs: usize,
@@ -491,7 +509,22 @@ fn print_transport_diagnostics(args: &Args, src: &Endpoint, dst: &Endpoint) {
     if !remote {
         crate::output::diagnostic!("syq: transport: local filesystem");
     }
-    if args.dry_run {
+    let automatic_ssh = args.connections_default
+        && [src, dst]
+            .into_iter()
+            .filter_map(real_remote_spec)
+            .any(|spec| spec.data_transport() == DataTransport::Ssh);
+    if automatic_ssh {
+        let dry = if args.dry_run {
+            "; dry-run starts no workers"
+        } else {
+            ""
+        };
+        crate::output::diagnostic!(
+            "syq: concurrency: target {} {unit} ({policy}); initial count limited by available work{dry}",
+            args.connections
+        );
+    } else if args.dry_run {
         crate::output::diagnostic!(
             "syq: concurrency: a real transfer would start with {} {unit} ({policy}); dry-run starts no workers",
             args.connections
@@ -1949,11 +1982,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         return Ok(());
                     }
                     let t0 = std::time::Instant::now();
-                    // Begin copying on one already-authenticated SSH transport
-                    // while the remaining workers open independent connections.
+                    // Automatic copies start two channels on the authenticated
+                    // SSH transport so file ranges can run in parallel before
+                    // the remaining independent connections finish logging in.
                     // TCP and custom remote shells keep their existing policy.
+                    let reuse_control = reuse_startup_ssh(id, autotune);
                     let conns = src_ep
-                        .connect_with_sources(compress, initial_sources.clone(), id == 0)
+                        .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
                             let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
                                 initial_sources.clone()
@@ -1966,7 +2001,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                     compress,
                                     initial_destination.clone(),
                                     copy_sources,
-                                    id == 0,
+                                    reuse_control,
                                 )?,
                             ))
                         });
@@ -2516,6 +2551,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         None
     };
+    // Only a fresh container rules out both final-file and resumable partial
+    // bases. Either basis can produce many disjoint changed ranges even in a
+    // file too small for work stealing, so its size cannot bound concurrency.
+    let fresh_container = dst_is_dir
+        && (dst_root_entry.is_none()
+            || (dst_entry_is_dir
+                && initial_destination_filesystem
+                    .as_ref()
+                    .is_some_and(|info| info.empty == Some(true))));
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
         let fresh = dst_root_entry.is_none()
             || (dst_entry_is_dir && dst_root_entry.is_some() && info.empty == Some(true));
@@ -3183,6 +3227,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     } else {
                         args.connections
                     };
+                    if autotune
+                        && fresh_container
+                        && !multiplex_small_files
+                        && !all_remote_endpoints_use_tcp
+                        && (src_ep.is_remote() || dst_ep.is_remote())
+                    {
+                        // A worker which cannot get a file or steal a range
+                        // still costs an SSH login, and joining its setup can
+                        // delay success after every byte has been copied.
+                        let jobs = sched.jobs.lock().unwrap();
+                        initial = initial_range_workers(
+                            initial,
+                            jobs.iter().map(|job| job.entry.size),
+                            sched.min_split,
+                        );
+                        if args.verbose >= 2 && initial < args.connections {
+                            crate::output::diagnostic!(
+                                "syq: SSH startup limited to {initial} workers by available files and ranges"
+                            );
+                        }
+                    }
                     if single_direct_candidate {
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;
@@ -9296,6 +9361,25 @@ mod tests {
             fast_batch_file_limit(None, None, true),
             HIGH_RTT_FAST_BATCH_FILES
         );
+    }
+
+    #[test]
+    fn ssh_startup_workers_are_bounded_by_files_and_splittable_ranges() {
+        const MIB: u64 = 1 << 20;
+        for (bytes, expected) in [(0, 1), (32, 1), (63, 1), (64, 2), (128, 4), (512, 8)] {
+            assert_eq!(initial_range_workers(8, [bytes * MIB], 32 * MIB), expected);
+        }
+        assert_eq!(initial_range_workers(8, [40 * MIB, 40 * MIB], 32 * MIB), 2);
+        assert_eq!(initial_range_workers(8, [0, 0, 0, 0], 32 * MIB), 4);
+        assert_eq!(initial_range_workers(8, [64 * MIB], 16 * MIB), 4);
+        assert_eq!(initial_range_workers(8, [u64::MAX, u64::MAX], 1), 8);
+        assert_eq!(initial_range_workers(1, [u64::MAX], 1), 1);
+        assert_eq!(initial_range_workers(0, [u64::MAX], 1), 0);
+        assert_eq!(initial_range_workers(8, [], 1), 1);
+        for id in 0..crate::tune::MAX {
+            assert_eq!(reuse_startup_ssh(id, true), id < 2);
+            assert_eq!(reuse_startup_ssh(id, false), id == 0);
+        }
     }
 
     #[test]

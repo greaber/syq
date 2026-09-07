@@ -1672,7 +1672,7 @@ impl RemoteSpec {
     }
 
     fn ssh_connection(&self, limited: bool, first_worker: bool) -> SshConnection {
-        // One bulk worker can start on this copy's authenticated transport.
+        // Startup workers can begin on this copy's authenticated transport.
         // The others retain independent cipher processes and TCP streams.
         // Do not share a persistent master: workers must keep the current
         // invocation's environment and not compete with unrelated copies.

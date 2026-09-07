@@ -81,7 +81,7 @@ bursts from unrelated clients, so choose limits that suit the server.
 
 `MaxSessions` is a different limit: channels sharing one SSH connection.
 Very low values can force extra logins when syq tries to reuse a connection.
-Syq can start one data worker through the copy's control connection; other
+Syq can start up to two data workers through the copy's control connection; other
 large-copy workers use independent connections. Raising this limit alone does
 not increase their capacity.
 
