@@ -3215,6 +3215,16 @@ fn native_rm_follow_preserves_final_symlink_identity() {
         run_native_ok(&["rm", "--root", &t.s(""), follow, "--src-non-dir", "link"]);
         assert!(!t.path("link").is_symlink());
         assert_eq!(read(&t.path("real/file")), b"keep");
+        for selector in [None, Some("--src")] {
+            symlink("real", t.path("link")).unwrap();
+            let root = t.s("");
+            let mut args = vec!["rm", "--root", &root, follow];
+            args.extend(selector);
+            args.push("link");
+            run_native_ok(&args);
+            assert!(!t.path("link").is_symlink());
+            assert_eq!(read(&t.path("real/file")), b"keep");
+        }
         symlink("real", t.path("parent")).unwrap();
         run_native_ok(&["rm", "--root", &t.s(""), follow, "parent/file"]);
         assert!(t.path("parent").is_symlink());
@@ -15297,6 +15307,27 @@ fn completion_source_bases_types_and_symlink_policies_match_operations() {
             &["syq", command, "--root", "base", "--follow-src", "escape/"],
             &[],
         );
+        for follow in ["--follow", "--follow-src"] {
+            for selector in ["--src-dir", "--src-dirs", "--srcs-in"] {
+                assert_completion_candidates(
+                    &t,
+                    &["syq", command, follow, selector, "li"],
+                    if command == "rm" { &[] } else { &["link/"] },
+                );
+            }
+            assert_completion_candidates(
+                &t,
+                &["syq", command, follow, "li"],
+                if command == "rm" {
+                    &["link"]
+                } else {
+                    &["link/"]
+                },
+            );
+            for base in ["--cwd", "--root"] {
+                assert_completion_candidates(&t, &["syq", command, follow, base, "li"], &["link/"]);
+            }
+        }
         assert_completion_candidates(&t, &["syq", command, "link/"], &[]);
         assert_completion_candidates(
             &t,
@@ -15792,7 +15823,9 @@ fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
     let link = format!("{}/in", t.s("remote-home/link"));
     let attached_base = format!("-C{base}");
     let remote_link = format!("fake.example:{link}");
-    for (words, expected) in [
+    let link_prefix = t.s("remote-home/li");
+    let link_path = t.s("remote-home/link");
+    let mut cases = vec![
         (
             vec![
                 "syq",
@@ -15863,7 +15896,47 @@ fn remote_completion_obeys_symlink_policy_types_and_literal_option_values() {
                 format!("{}side.txt", remote_link),
             ],
         ),
-    ] {
+    ];
+    for command in ["cp", "rm"] {
+        for follow in ["--follow", "--follow-src"] {
+            let endpoint = if command == "rm" { "--on" } else { "--from" };
+            let common = vec![
+                "syq",
+                command,
+                "--syq-path",
+                binary,
+                endpoint,
+                "fake.example",
+                follow,
+            ];
+            for selector in [
+                "--src-dir",
+                "--src-dirs",
+                "--srcs-in",
+                "--src",
+                "--cwd",
+                "--root",
+            ] {
+                let mut words = common.clone();
+                words.extend([selector, &link_prefix]);
+                let expected = if command != "rm" || ["--cwd", "--root"].contains(&selector) {
+                    vec![format!("{link_path}/")]
+                } else if selector == "--src" {
+                    vec![link_path.clone()]
+                } else {
+                    vec![]
+                };
+                cases.push((words, expected));
+            }
+            let mut words = common;
+            words.push(&link);
+            cases.push((
+                words,
+                vec![format!("{link}ner-dir/"), format!("{link}side.txt")],
+            ));
+        }
+    }
+    for (words, expected) in cases {
         let index = (words.len() - 1).to_string();
         let mut args = vec!["__complete", "bash", &index, "--"];
         args.extend_from_slice(&words);
@@ -16223,7 +16296,7 @@ fn remote_completion_uses_normal_ssh_and_learns_a_disposable_endpoint() {
             "syq",
             "rm",
             "--",
-            "--from",
+            "--on",
             "fake.example",
             &t.s("from-l"),
         ],

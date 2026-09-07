@@ -2796,6 +2796,7 @@ impl FsOps {
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
             | Request::ListDirDetails { .. }
+            | Request::ListDirNoFollowFinal { .. }
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
@@ -2820,13 +2821,13 @@ impl FsOps {
     }
 
     fn completion_entries(
-        &self,
         directory: &[u8],
         confined_root: Option<&[u8]>,
         prefix: &[u8],
         requested_limit: u16,
         symlink_policy: OperatorSymlinkPolicy,
         detailed: bool,
+        follow_final_symlinks: bool,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
         if directory.contains(&0)
@@ -2870,6 +2871,7 @@ impl FsOps {
             let file_type = item.file_type()?;
             let directory = file_type.is_dir()
                 || (file_type.is_symlink()
+                    && follow_final_symlinks
                     && check_completion_directory(
                         item.path().as_os_str().as_bytes(),
                         confined_root,
@@ -6057,13 +6059,14 @@ impl FsOps {
                 prefix,
                 limit,
                 symlink_policy,
-            } => self.completion_entries(
+            } => Self::completion_entries(
                 directory,
                 confined_root.as_deref(),
                 prefix,
                 *limit,
                 *symlink_policy,
                 false,
+                true,
             ),
             Request::ListDirDetails {
                 directory,
@@ -6071,13 +6074,30 @@ impl FsOps {
                 prefix,
                 limit,
                 symlink_policy,
-            } => self.completion_entries(
+            } => Self::completion_entries(
                 directory,
                 confined_root.as_deref(),
                 prefix,
                 *limit,
                 *symlink_policy,
                 true,
+                true,
+            ),
+            Request::ListDirNoFollowFinal {
+                directory,
+                confined_root,
+                prefix,
+                limit,
+                symlink_policy,
+                detailed,
+            } => Self::completion_entries(
+                directory,
+                confined_root.as_deref(),
+                prefix,
+                *limit,
+                *symlink_policy,
+                *detailed,
+                false,
             ),
             Request::StatMany {
                 paths,

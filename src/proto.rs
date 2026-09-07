@@ -851,6 +851,16 @@ pub enum Request {
     ShrinkReadStream {
         end: u64,
     },
+    /// Removal completion classifies final symlinks as non-directories while
+    /// retaining the requested following policy for the directory being listed.
+    ListDirNoFollowFinal {
+        directory: PathBytes,
+        confined_root: Option<PathBytes>,
+        prefix: PathBytes,
+        limit: u16,
+        symlink_policy: OperatorSymlinkPolicy,
+        detailed: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

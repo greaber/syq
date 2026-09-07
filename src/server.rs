@@ -481,6 +481,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 Request::TcpListen { .. }
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
+                    | Request::ListDirNoFollowFinal { .. }
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }

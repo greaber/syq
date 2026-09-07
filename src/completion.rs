@@ -1378,9 +1378,24 @@ fn option_candidates(command: &clap::Command, current: &[u8]) -> Vec<Candidate> 
         .collect()
 }
 
-fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> OperatorSymlinkPolicy {
+#[derive(Clone, Copy)]
+struct PathCompletionPolicy {
+    parents: OperatorSymlinkPolicy,
+    follow_final_symlinks: bool,
+}
+
+impl From<OperatorSymlinkPolicy> for PathCompletionPolicy {
+    fn from(parents: OperatorSymlinkPolicy) -> Self {
+        Self {
+            parents,
+            follow_final_symlinks: true,
+        }
+    }
+}
+
+fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> PathCompletionPolicy {
     if command == "rsync" {
-        return OperatorSymlinkPolicy::TrustedOwner;
+        return OperatorSymlinkPolicy::TrustedOwner.into();
     }
     if contains_option(args, b"--follow")
         || contains_option(
@@ -1392,9 +1407,9 @@ fn path_policy(command: &str, args: &[Vec<u8>], source: bool) -> OperatorSymlink
             },
         )
     {
-        OperatorSymlinkPolicy::FollowAll
+        OperatorSymlinkPolicy::FollowAll.into()
     } else {
-        OperatorSymlinkPolicy::Refuse
+        OperatorSymlinkPolicy::Refuse.into()
     }
 }
 
@@ -1456,42 +1471,23 @@ fn complete_source_path(
     current: &[u8],
     apply_base: bool,
 ) -> Result<Vec<Candidate>> {
+    let mut policy = path_policy(command, args, true);
+    // Removal follows parent paths when requested, but selects the final link
+    // itself. --cwd and --root still resolve their complete directory paths.
+    policy.follow_final_symlinks = command != "rm" || !apply_base;
     let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+        return Ok(local_path_candidates_at(current, false, base, policy));
     }
     let Some(endpoint_text) =
         find_option_value(args, if command == "rm" { b"--on" } else { b"--from" })
     else {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+        return Ok(local_path_candidates_at(current, false, base, policy));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(
-            current,
-            false,
-            base,
-            path_policy(command, args, true),
-        ));
+        return Ok(local_path_candidates_at(current, false, base, policy));
     };
-    remote_path_candidates(
-        command,
-        args,
-        endpoint,
-        current,
-        Vec::new(),
-        base,
-        path_policy(command, args, true),
-    )
+    remote_path_candidates(command, args, endpoint, current, Vec::new(), base, policy)
 }
 
 fn source_base(args: &[Vec<u8>]) -> Option<SourceBase<'_>> {
@@ -1520,11 +1516,15 @@ fn complete_rsync_operand(args: &[Vec<u8>], current: &[u8]) -> Result<Vec<Candid
             path,
             wrapper,
             None,
-            OperatorSymlinkPolicy::TrustedOwner,
+            OperatorSymlinkPolicy::TrustedOwner.into(),
         );
     }
-    let mut candidates =
-        local_path_candidates_at(current, false, None, OperatorSymlinkPolicy::TrustedOwner);
+    let mut candidates = local_path_candidates_at(
+        current,
+        false,
+        None,
+        OperatorSymlinkPolicy::TrustedOwner.into(),
+    );
     candidates.extend(endpoint_candidates(
         current,
         EndpointSyntax::Rsync,
@@ -1566,7 +1566,7 @@ fn remote_path_candidates(
     current: &[u8],
     wrapper: Vec<u8>,
     base: Option<SourceBase<'_>>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
 ) -> Result<Vec<Candidate>> {
     if has_explicit_rsh(command, args) {
         return Ok(Vec::new());
@@ -1612,7 +1612,7 @@ fn remote_path_candidates(
                     directory_for_thread.clone(),
                     root_for_thread.clone(),
                     prefix_for_thread.clone(),
-                    symlink_policy,
+                    policy,
                     false,
                 );
                 let names_available = result.is_ok();
@@ -1623,7 +1623,7 @@ fn remote_path_candidates(
                         directory_for_thread,
                         root_for_thread,
                         prefix_for_thread,
-                        symlink_policy,
+                        policy,
                         true,
                     );
                     let _ = sender.send(result);
@@ -1706,16 +1706,25 @@ fn list_remote_entries(
     directory: Vec<u8>,
     confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
     detailed: bool,
 ) -> Result<(Vec<CompletionEntry>, Vec<String>)> {
-    let request = if detailed {
+    let request = if !policy.follow_final_symlinks {
+        Request::ListDirNoFollowFinal {
+            directory,
+            confined_root,
+            prefix: prefix.clone(),
+            limit: MAX_DIRECTORY_CANDIDATES,
+            symlink_policy: policy.parents,
+            detailed,
+        }
+    } else if detailed {
         Request::ListDirDetails {
             directory,
             confined_root,
             prefix: prefix.clone(),
             limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy,
+            symlink_policy: policy.parents,
         }
     } else {
         Request::ListDir {
@@ -1723,7 +1732,7 @@ fn list_remote_entries(
             confined_root,
             prefix: prefix.clone(),
             limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy,
+            symlink_policy: policy.parents,
         }
     };
     match connection.call(request)? {
@@ -1782,7 +1791,7 @@ fn local_path_candidates(current: &[u8], directories_only: bool) -> Vec<Candidat
         current,
         directories_only,
         None,
-        OperatorSymlinkPolicy::FollowAll,
+        OperatorSymlinkPolicy::FollowAll.into(),
     )
 }
 
@@ -1790,7 +1799,7 @@ fn local_path_candidates_at(
     current: &[u8],
     directories_only: bool,
     base: Option<SourceBase<'_>>,
-    symlink_policy: OperatorSymlinkPolicy,
+    policy: PathCompletionPolicy,
 ) -> Vec<Candidate> {
     if current == b"~" && !matches!(base, Some(SourceBase::Root(_))) {
         return std::env::var_os("HOME")
@@ -1807,7 +1816,7 @@ fn local_path_candidates_at(
     if crate::fsops::check_completion_directory(
         &directory.path,
         directory.confined_root.as_deref(),
-        symlink_policy,
+        policy.parents,
     )
     .is_err()
     {
@@ -1827,10 +1836,11 @@ fn local_path_candidates_at(
         };
         let is_directory = file_type.is_dir()
             || (file_type.is_symlink()
+                && policy.follow_final_symlinks
                 && crate::fsops::check_completion_directory(
                     item.path().as_os_str().as_bytes(),
                     directory.confined_root.as_deref(),
-                    symlink_policy,
+                    policy.parents,
                 )
                 .is_ok());
         if directories_only && !is_directory {

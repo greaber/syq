@@ -5917,7 +5917,7 @@ impl Planner<'_> {
                     .filter(|(path, _, _, st)| {
                         let root_must_be_new = self.exact_condition == TargetCondition::Absent
                             && path == &self.dst_root;
-                        if opts.preserve_existing_directory_metadata && matches!(st, Some(d) if d.kind == Kind::Dir) {
+                        if opts.preserve_existing_directory_metadata && existing_dirs.contains(path) {
                             return false;
                         }
                         root_must_be_new

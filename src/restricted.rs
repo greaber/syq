@@ -1344,20 +1344,13 @@ impl RestrictedAuthority {
                 Ok(())
             }
             ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::Replace => {
-                match observed {
-                    Some(metadata)
-                        if directory
-                            && metadata.is_dir()
-                            && policy == ExistingDestinationPolicy::Skip =>
-                    {
-                        // Keep the common no-replace condition and bookkeeping:
-                        // this directory may disappear before execution, allowing
-                        // our creation to succeed and need later metadata updates.
-                    }
-                    Some(_) => {
-                        bail!("signed grant retains existing objects: {label} already exists")
-                    }
-                    None => {}
+                // An existing directory under Skip may disappear before execution.
+                // Keep the common no-replace condition and creation bookkeeping
+                // so a successful mkdir can receive its later metadata updates.
+                if observed.is_some_and(|metadata| {
+                    !(directory && metadata.is_dir() && policy == ExistingDestinationPolicy::Skip)
+                }) {
+                    bail!("signed grant retains existing objects: {label} already exists")
                 }
                 match *condition {
                     Any | Absent => *condition = Absent,
@@ -2433,7 +2426,9 @@ impl RestrictedAuthority {
             | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
-            Request::ListDir { .. } | Request::ListDirDetails { .. } => {
+            Request::ListDir { .. }
+            | Request::ListDirDetails { .. }
+            | Request::ListDirNoFollowFinal { .. } => {
                 bail!("directory completion is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
