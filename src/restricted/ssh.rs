@@ -6,7 +6,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig};
 use anyhow::{bail, Context, Result};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,13 +15,23 @@ use subtle::ConstantTimeEq;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) fn start(
-    state: &Path,
-    authority: Arc<RestrictedAuthority>,
-) -> Result<(PrivateBroker, String)> {
+/// Only the standalone forced-command receiver calls this, before starting
+/// its revocation watcher or data workers. Payload paths must be absolute.
+pub(super) fn enter_state_directory(state: &Path) -> Result<()> {
+    let directory = super::open_directory(state)?;
+    crate::delegation::validate_private_directory(&directory, state)?;
+    // Pin the validated directory as cwd; do not resolve the pathname again.
+    if unsafe { libc::fchdir(directory.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error()).context("enter receiver enrollment directory");
+    }
+    Ok(())
+}
+
+/// The standalone receiver keeps its protected enrollment directory as cwd.
+pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroker, String)> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("generate SSH worker admission")?;
-    let broker = PrivateBroker::start_in(
+    let broker = PrivateBroker::start_in_current_dir(
         PrivateBrokerConfig {
             directory_prefix: "w-",
             socket_name: "s",
@@ -30,7 +40,6 @@ pub(crate) fn start(
             max_connections: 128,
             io_timeout: TIMEOUT,
         },
-        state,
         move |mut stream, _| {
             let result = (|| -> Result<()> {
                 let deadline = Instant::now() + TIMEOUT;
@@ -117,16 +126,21 @@ pub(super) fn worker_command(original: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub(super) fn connect(state: &Path, ticket: &str) -> Result<()> {
+fn join(ticket: &str) -> Result<UnixStream> {
     let (directory, secret) = ticket_parts(ticket)?;
-    super::active::require_not_revoked(state)?;
-    let directory = state.join(directory);
-    crate::delegation::validate_private_directory_path(&directory)?;
+    super::active::require_not_revoked(Path::new("."))?;
+    let directory = Path::new(directory);
+    crate::delegation::validate_private_directory_path(directory)?;
     let mut socket =
         UnixStream::connect(directory.join("s")).context("join live restricted copy")?;
     socket.set_write_timeout(Some(TIMEOUT))?;
     socket.write_all(&secret)?;
     socket.set_write_timeout(None)?;
+    Ok(socket)
+}
+
+pub(super) fn connect(ticket: &str) -> Result<()> {
+    let mut socket = join(ticket)?;
     let mut input_socket = socket.try_clone()?;
     std::thread::Builder::new()
         .name("receiver-ssh-input".into())
@@ -164,17 +178,15 @@ mod tests {
     use super::*;
     use crate::proto::{ConnectionRole, FrameReader, FrameWriter, Request, Response};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
     fn worker(
-        broker: &PrivateBroker,
         ticket: &str,
         role: ConnectionRole,
     ) -> Result<(FrameReader<UnixStream>, FrameWriter<UnixStream>)> {
-        let (_, secret) = ticket_parts(ticket)?;
-        let mut socket = UnixStream::connect(broker.socket_path())?;
+        let socket = join(ticket)?;
         socket.set_read_timeout(Some(Duration::from_secs(2)))?;
         socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-        socket.write_all(&secret)?;
         let mut writer = FrameWriter::new(socket.try_clone()?, false);
         writer.write_msg(&Request::Hello {
             identity: crate::identity::build().into(),
@@ -199,15 +211,55 @@ mod tests {
         }
     }
 
+    fn in_receiver_process(name: &str) -> bool {
+        if let Some(state) = std::env::var_os("SYQ_TEST_SSH_RECEIVER_STATE") {
+            enter_state_directory(Path::new(&state)).unwrap();
+            return true;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let state = temporary
+            .path()
+            .join("long-home-".repeat(16))
+            .join(".local/share/syq/restricted")
+            .join("01".repeat(16));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(state.as_os_str().as_bytes().len() > 200);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("SYQ_TEST_SSH_RECEIVER_STATE", &state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&state).unwrap().count(),
+            0,
+            "broker directory was not cleaned up"
+        );
+        false
+    }
+
     #[test]
     fn ssh_workers_share_limits_scope_and_control_lifetime() {
+        if !in_receiver_process(
+            "restricted::ssh::tests::ssh_workers_share_limits_scope_and_control_lifetime",
+        ) {
+            return;
+        }
         let root = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         let mut authority = super::super::tests::tcp_test_authority(root.path());
         authority.copy.options.compressed_transport = false;
         let authority = Arc::new(authority);
-        let (broker, ticket) = start(root.path(), authority.clone()).unwrap();
-        assert!(worker(&broker, &ticket, ConnectionRole::Control).is_err());
+        let (broker, ticket) = start(authority.clone()).unwrap();
+        assert!(broker.socket_path().as_os_str().as_bytes().len() < 32);
+        assert!(!broker.socket_path().is_absolute());
+        assert!(worker(&ticket, ConnectionRole::Control).is_err());
         let (_, secret) = ticket_parts(&ticket).unwrap();
         let wrong = format!(
             "{}:{}",
@@ -217,10 +269,10 @@ mod tests {
                 .map(|byte| format!("{:02x}", byte ^ 1))
                 .collect::<String>()
         );
-        assert!(worker(&broker, &wrong, role()).is_err());
-        let (mut first_reader, mut first_writer) = worker(&broker, &ticket, role()).unwrap();
-        let (mut second_reader, mut second_writer) = worker(&broker, &ticket, role()).unwrap();
-        assert!(worker(&broker, &ticket, role()).is_err());
+        assert!(worker(&wrong, role()).is_err());
+        let (mut first_reader, mut first_writer) = worker(&ticket, role()).unwrap();
+        let (mut second_reader, mut second_writer) = worker(&ticket, role()).unwrap();
+        assert!(worker(&ticket, role()).is_err());
         let prepare = |name: &str, size| Request::Prepare {
             path: root.path().join(name).as_os_str().as_bytes().to_vec(),
             size,
@@ -240,6 +292,16 @@ mod tests {
         assert!(
             matches!(second_reader.read_msg::<Response>().unwrap(), Response::Err(message) if message.contains("byte"))
         );
+        let mut relative = prepare("target/relative", 1);
+        if let Request::Prepare { path, .. } = &mut relative {
+            *path = b"target/relative".to_vec();
+        }
+        second_writer.write_msg(&relative).unwrap();
+        assert!(matches!(
+            second_reader.read_msg::<Response>().unwrap(),
+            Response::Err(message) if message.contains("noncanonical path")
+        ));
+        assert!(!Path::new("target/relative").exists());
         second_writer.write_msg(&prepare("outside", 1)).unwrap();
         assert!(matches!(
             second_reader.read_msg::<Response>().unwrap(),
@@ -252,7 +314,7 @@ mod tests {
             Response::Err(_)
         ));
         authority.close_control();
-        assert!(worker(&broker, &ticket, role()).is_err());
+        assert!(worker(&ticket, role()).is_err());
         first_writer.write_msg(&prepare("target/c", 1)).unwrap();
         assert!(matches!(
             first_reader.read_msg::<Response>().unwrap(),
@@ -262,6 +324,48 @@ mod tests {
         drop(broker);
         assert!(!socket_path.exists());
         assert!(first_reader.read_msg::<Response>().is_err());
+    }
+
+    #[test]
+    fn worker_tickets_stay_inside_the_enrollment_with_long_homes() {
+        let name =
+            "restricted::ssh::tests::worker_tickets_stay_inside_the_enrollment_with_long_homes";
+        if !in_receiver_process(name) {
+            return;
+        }
+        if let Ok(ticket) = std::env::var("SYQ_TEST_FOREIGN_WORKER_TICKET") {
+            assert!(join(&ticket).is_err());
+            return;
+        }
+        let root = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        let authority = Arc::new(super::super::tests::tcp_test_authority(root.path()));
+        let (broker, ticket) = start(authority).unwrap();
+        let other = crate::test_support::tempdir().unwrap();
+        std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let refused = || {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("SYQ_TEST_SSH_RECEIVER_STATE", other.path())
+                .env("SYQ_TEST_FOREIGN_WORKER_TICKET", &ticket)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        refused();
+        let (directory, _) = ticket_parts(&ticket).unwrap();
+        std::os::unix::fs::symlink(
+            std::env::current_dir().unwrap().join(directory),
+            other.path().join(directory),
+        )
+        .unwrap();
+        refused();
+        drop(broker);
     }
 
     #[test]

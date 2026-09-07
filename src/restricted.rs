@@ -4351,10 +4351,8 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;
     if let Some(ticket) = ssh::worker_command(&original)? {
         let (_, _, replay) = receiver_config(enrollment)?;
-        return ssh::connect(
-            replay.parent().context("receiver state directory")?,
-            &ticket,
-        );
+        ssh::enter_state_directory(replay.parent().context("receiver state directory")?)?;
+        return ssh::connect(&ticket);
     }
     let envelope = decode_receiver_command(&original)?;
     let (config, allowed_signers, replay_path) = receiver_config(enrollment)?;
@@ -4409,6 +4407,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         deadline,
         &protected,
     )?);
+    ssh::enter_state_directory(state)?;
     // Verification does not hold the lifecycle lock or permit mutations. A
     // revoke during verification is caught when this receiver tries to enter.
     active::watch(
@@ -4417,7 +4416,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         (observed_state.dev(), observed_state.ino()),
         deadline,
     )?;
-    crate::server::run_restricted(authority, state)
+    crate::server::run_restricted(authority)
 }
 
 fn decode_receiver_command(original: &str) -> Result<Vec<u8>> {

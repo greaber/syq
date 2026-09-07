@@ -126,6 +126,21 @@ syq completion cache clear >/dev/null
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 
+printf 'case: long receiver home supports explicit SSH and blocked-TCP fallback\n'
+ssh longhome@destination 'test "${#HOME}" -gt 36; mkdir -p /tmp/syq-long-home'
+make_tree source /tmp/syq-real-ssh/long-home-source long-home
+syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+    --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
+    --to longhome@destination --into /tmp/syq-long-home/explicit
+assert_same_tree source /tmp/syq-real-ssh/long-home-source \
+    longhome@destination /tmp/syq-long-home/explicit long-home-explicit
+syq cp --no-progress -j 2 --preserve=permissions \
+    --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
+    --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
+    --to longhome@destination --into /tmp/syq-long-home/fallback
+assert_same_tree source /tmp/syq-real-ssh/long-home-source \
+    longhome@destination /tmp/syq-long-home/fallback long-home-fallback
+
 printf 'case: ephemeral connect only reuses forward SSH and leaves receiving off\n'
 ephemeral_connect_scope=$(syq persist on --ephemeral)
 syq persist connect source --pscope "$ephemeral_connect_scope"

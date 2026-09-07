@@ -84,7 +84,8 @@ The smoke suite currently covers rejection of a restricted destination that
 overlaps the receiver's SSH control plane, source-side direct coordination with
 automatic restricted-destination enrollment over encrypted TCP with an approved
 congestion algorithm, firewall-triggered fallback to restricted SSH workers,
-explicitly selected restricted SSH data channels, destination-side coordination through
+explicitly selected restricted SSH data channels (including receivers with long
+account-home paths for both SSH modes), destination-side coordination through
 the reversed constrained-agent edge, and an explicit local relay. Every path
 uses real SSH for control and bootstrap, and the suite compares the complete
 source and destination manifests afterward.

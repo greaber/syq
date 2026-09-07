@@ -187,11 +187,8 @@ pub fn run() -> Result<()> {
     result
 }
 
-pub(crate) fn run_restricted(
-    authority: Arc<crate::restricted::RestrictedAuthority>,
-    state: &std::path::Path,
-) -> Result<()> {
-    let (_workers, ticket) = match crate::restricted::start_ssh_workers(state, authority.clone()) {
+pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+    let (_workers, ticket) = match crate::restricted::start_ssh_workers(authority.clone()) {
         Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
         Err(error) => (
             None,

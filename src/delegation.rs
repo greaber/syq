@@ -1505,7 +1505,7 @@ impl Drop for TemporaryStateFile {
     }
 }
 
-fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
+pub(crate) fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
     let metadata = directory
         .metadata()
         .with_context(|| format!("inspect replay state directory {}", path.display()))?;

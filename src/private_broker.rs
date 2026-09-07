@@ -92,7 +92,7 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, true, None)
+        Self::start_inner(config, handler, true, false)
     }
 
     /// The caller owns signal handling and child cleanup.
@@ -100,26 +100,26 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, false, None)
+        Self::start_inner(config, handler, false, false)
     }
 
-    /// Keep receiver worker sockets inside its already protected enrollment state.
-    pub(crate) fn start_in<F>(
+    /// Bind a short address inside the current directory. The standalone
+    /// caller must keep this working directory for the broker's lifetime.
+    pub(crate) fn start_in_current_dir<F>(
         config: PrivateBrokerConfig<'_>,
-        directory: &Path,
         handler: F,
     ) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, false, Some(directory))
+        Self::start_inner(config, handler, false, true)
     }
 
     fn start_inner<F>(
         config: PrivateBrokerConfig<'_>,
         handler: F,
         signal_cleanup: bool,
-        directory: Option<&Path>,
+        in_current_dir: bool,
     ) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
@@ -129,13 +129,26 @@ impl PrivateBroker {
         }
         let mut builder = tempfile::Builder::new();
         builder.prefix(config.directory_prefix);
-        let socket_dir = match directory {
-            Some(directory) => builder.tempdir_in(directory),
-            None => builder.tempdir(),
+        let socket_dir = if in_current_dir {
+            builder.tempdir_in(".")
+        } else {
+            builder.tempdir()
         }
         .context("create private broker directory")?;
         std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
-        let socket_path = socket_dir.path().join(config.socket_name);
+        // TempDir keeps an absolute path for cleanup. bind/connect must use
+        // the relative spelling here so a long parent cannot exceed sun_path.
+        let socket_path = if in_current_dir {
+            Path::new(
+                socket_dir
+                    .path()
+                    .file_name()
+                    .context("broker directory name")?,
+            )
+            .join(config.socket_name)
+        } else {
+            socket_dir.path().join(config.socket_name)
+        };
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind private broker at {}", socket_path.display()))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
