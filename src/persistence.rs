@@ -268,6 +268,7 @@ fn connect(
     if endpoint.host.starts_with('@') {
         bail!("persist connect needs an SSH server, not a receiving name");
     }
+    let ephemeral = scope.is_some();
     let scope = match scope {
         Some(scope) => {
             validate_scope(scope)?;
@@ -320,6 +321,10 @@ fn connect(
     drop(connection);
     match receiving {
         Some(name) => println!("{} ready; receiving as @{name}", remote.label()),
+        None if ephemeral => println!(
+            "{} ready; ephemeral scopes do not support receiving",
+            remote.label()
+        ),
         None => println!("{} ready; receiving is disabled", remote.label()),
     }
     Ok(())
@@ -864,7 +869,9 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     println!("connections: {}", connections.len());
     for connection in connections {
         print!("  {}  {}", connection.endpoint, connection.state);
-        if receiving_enabled == Some(false) {
+        if kind == "ephemeral" {
+            print!(" (ephemeral scope; receiving not supported)");
+        } else if receiving_enabled == Some(false) {
             print!(" (receiving disabled)");
         } else if let Some(name) = connection
             .receiving_name

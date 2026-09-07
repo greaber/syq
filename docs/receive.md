@@ -33,7 +33,7 @@ syq cp results --to laptop
 syq cp report.pdf --to laptop --as reports/latest.pdf
 ```
 
-Receiving is enabled by default with persistence. Each incoming copy waits for
+Receiving is enabled by default with durable persistence. Each incoming copy waits for
 approval **on your laptop** before it can inspect or change destination entries.
 The prompt puts the destination first, followed by the connected server account
 and permission to change files. A positive deletion limit is shown too. Choose
@@ -165,7 +165,8 @@ syq persist off
 ```
 
 `persist receive off` stops receiving while keeping ordinary SSH persistence enabled.
-`persist receive on` enables it again and can restart previously connected endpoints.
+`persist receive on` enables it again and can restart previously connected endpoints
+in durable persistence.
 `persist off` stops both kinds of connection. Ephemeral scopes selected with
 `--pscope` only reuse forward SSH connections; they do not enable receiving.
 

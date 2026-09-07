@@ -161,7 +161,13 @@ minutes after their last session closes. An unused helper pool can hold a sessio
 for another five minutes, so an abandoned script leaves at most ten idle minutes
 of connection reuse. Closing the scope explicitly ends both immediately.
 
-For scopes created by an older binary, close them with
-`syq persist off --pscope PATH` and create new ones to apply this behavior.
-Already-running old services keep their old behavior until stopped; running an
-old binary can still start receiving in an ephemeral scope.
+Syq 0.4.1 also enabled receiving in ephemeral scopes. Replacing the executable
+does not replace background receivers that are already running, so those old
+receivers can keep working until stopped. Running an old executable can start
+them again. With the current executable, `syq persist receive on` stops existing
+receivers to apply the settings and restarts them only for durable persistence.
+
+To replace an old ephemeral scope, close it with
+`syq persist off --pscope PATH` and create a new one. If your script needs
+return copies or commands, use `syq persist connect server` without `--pscope`
+to establish a durable connection.

@@ -85,7 +85,8 @@ In addition to the shared arguments above, it accepts:
 | `connections` | Positive integer connection count |
 | `auth_from`, `via` | Credential source string; aliases, so use only one |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
-| `pscope`, `syq_path` | SSH persistence scope path and remote executable path |
+| `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
+| `syq_path` | Remote executable path |
 | `no_bootstrap`, `tcp_plain`, `no_tcp` | Boolean remote/transport controls |
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
 | `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
@@ -94,6 +95,18 @@ In addition to the shared arguments above, it accepts:
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
 and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
+
+The SDK passes `pscope` unchanged to the selected syq executable, which controls
+the scope and its background receivers. Ephemeral scopes in the current
+CLI reuse forward SSH connections only. For return copies or commands, establish
+durable persistence with `syq persist connect server` and omit `pscope`. This
+also applies to `AsyncClient` and to `rm`. If the SDK selects an older executable,
+its scope behavior still applies: syq 0.4.1 also enabled receiving in ephemeral
+scopes. See [connection persistence](https://greaber.github.io/syq/install.html#keep-connections-open)
+for lifetime, cleanup, and upgrade behavior, and
+[Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
+for executable selection.
+
 Typed remote-to-remote copies require an enrolled receiver or
 `coordinate_at="local"`. With `dry_run=True` or `verify_only=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.

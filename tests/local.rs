@@ -17103,7 +17103,10 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
     write(&receive, b"not json");
     fs::set_permissions(&receive, fs::Permissions::from_mode(0o600)).unwrap();
     let scope = ephemeral_scope(&t);
-    assert_output_ok(&connect(Some(&scope)));
+    let output = connect(Some(&scope));
+    assert_output_ok(&output);
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("ready; ephemeral scopes do not support receiving"));
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_eq!(read(&receive), b"not json");
     assert!(fs::read_dir(&scope).unwrap().all(|entry| !entry
@@ -17121,6 +17124,10 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
         .unwrap();
     assert_output_ok(&output);
     let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("ephemeral scope; receiving not supported"),
+        "{text}"
+    );
     assert!(
         text.contains(&format!(
             "run syq persist connect test-server --pscope {}",
