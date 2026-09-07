@@ -1324,6 +1324,7 @@ pub(crate) struct SshMultiplexer {
     /// handshake.
     persistent: bool,
     reuse_for_workers: AtomicBool,
+    workers_rejected: AtomicBool,
 }
 
 /// How long a persistent control master lingers after its last client, in
@@ -1437,6 +1438,7 @@ impl SshMultiplexer {
             path,
             persistent: false,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         })
     }
 
@@ -1452,6 +1454,7 @@ impl SshMultiplexer {
             path,
             persistent: true,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         })
     }
 
@@ -1679,7 +1682,8 @@ impl RemoteSpec {
         if !limited {
             SshConnection::Control
         } else if self.ssh_multiplexer.as_ref().is_some_and(|multiplexer| {
-            (first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers()
+            !multiplexer.workers_rejected.load(Ordering::Relaxed)
+                && ((first_worker && !multiplexer.persistent) || multiplexer.reuse_for_workers())
         }) {
             SshConnection::Worker
         } else {
@@ -1874,6 +1878,9 @@ impl RemoteSpec {
                     // independently authenticated SSH connection. Disable
                     // reuse for every later worker and retry immediately.
                     self.set_ssh_multiplexing(false);
+                    if let Some(multiplexer) = &self.ssh_multiplexer {
+                        multiplexer.workers_rejected.store(true, Ordering::Relaxed);
+                    }
                     first_worker = false;
                     if crate::transfer::debug() {
                         crate::output::diagnostic!(
@@ -4683,9 +4690,16 @@ mod tests {
         );
         assert!(result.is_err()); // The independent attempt reports a missing helper.
         assert_eq!(
-            std::fs::read_to_string(log).unwrap(),
+            std::fs::read_to_string(&log).unwrap(),
             "shared\nindependent\n"
         );
+        // Another startup worker's per-call preference must not override a
+        // rejection already observed by a peer sharing this control session.
+        let peer = spec.clone();
+        peer.set_ssh_multiplexing(true);
+        assert_eq!(peer.ssh_connection(true, true), SshConnection::Independent);
+        assert_eq!(peer.ssh_connection(true, false), SshConnection::Independent);
+        assert_eq!(peer.ssh_connection(false, true), SshConnection::Control);
     }
 
     #[test]
@@ -4794,6 +4808,7 @@ mod tests {
             path: PathBuf::from("/tmp/syq-test-socket"),
             persistent: true,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         }));
         assert!(!verbose(&spec, true));
         assert!(!spec
@@ -4814,6 +4829,7 @@ mod tests {
             path,
             persistent: true,
             reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
         };
         let spec = RemoteSpec {
             local_process: false,

@@ -146,8 +146,8 @@ impl Sched {
         inner.failed = HashSet::new();
     }
 
-    /// Wake the tuner when a speculative direct local copy discovers that it
-    /// needs the ordinary parallel userspace path after all.
+    /// Wake the tuner when a speculative low-concurrency start discovers
+    /// more parallel work (a local-copy fallback or a resumable basis).
     pub fn request_worker_count(&self, workers: usize) {
         // Share the scheduler mutex with the tuning wait predicate so a
         // request cannot land between the driver's check and its sleep.
