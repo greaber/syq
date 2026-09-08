@@ -8,10 +8,82 @@ pub(crate) fn configure(command: Command) -> Command {
     configure_at(command, &name)
 }
 
+fn advanced_description(path: &str) -> Option<&'static str> {
+    match path {
+        "syq map" => Some("Print source-to-destination mappings as NDJSON"),
+        "syq receiver" => Some("Manage manual receiver enrollment and recovery"),
+        "syq receiver enroll" => Some("Manually enroll or refresh a receiver"),
+        "syq persist destinations" => Some("Inspect or recover named return destinations"),
+        "syq persist receive wait" | "syq persist destinations wait" => {
+            Some("Wait for a connection with a deadline")
+        }
+        "syq completion cache" => Some("Inspect or clear cached endpoint suggestions"),
+        _ => None,
+    }
+}
+
 fn configure_at(mut command: Command, path: &str) -> Command {
     for child in command.get_subcommands_mut() {
         *child = configure_at(child.clone(), &format!("{path} {}", child.get_name()));
     }
+    // Keep every public command discoverable. Advanced commands get a brief
+    // label here; long help retains their full description.
+    if let Some(brief) = advanced_description(path) {
+        if command.get_long_about().is_none() {
+            if let Some(about) = command.get_about().cloned() {
+                command = command.long_about(about);
+            }
+        }
+        command = command.about(format!("Advanced: {brief}"));
+    }
+    // Filesystem commands are classified below. On the management commands,
+    // required operands stay visible and only everyday options enter short help.
+    if !matches!(path, "syq cp" | "syq rm" | "syq map" | "syq rsync") {
+        command = command.mut_args(|arg| {
+            let common = arg.is_positional()
+                || arg.is_required_set()
+                || matches!(arg.get_id().as_str(), "help" | "version" | "self_update")
+                || match path {
+                    "syq exec" => matches!(arg.get_id().as_str(), "on" | "cwd"),
+                    "syq persist connect" => arg.get_id() == "timeout",
+                    "syq persist receive on" => matches!(
+                        arg.get_id().as_str(),
+                        "approval" | "notifications" | "name" | "cwd" | "root"
+                    ),
+                    "syq persist receive pending" => {
+                        matches!(arg.get_id().as_str(), "wait" | "timeout")
+                    }
+                    "syq persist receive wait" | "syq persist destinations wait" => {
+                        arg.get_id() == "timeout"
+                    }
+                    _ => false,
+                };
+            arg.hide_short_help(!common)
+        });
+    }
+    let has_commands = command.get_subcommands().any(|child| !child.is_hide_set());
+    let more = if has_commands {
+        "All commands, options, and details"
+    } else {
+        "All options and details"
+    };
+    // Clap's command list always uses the brief `about`, even in long help.
+    // Expand advanced descriptions in the long footer using the same metadata.
+    let mut details = String::new();
+    for child in command
+        .get_subcommands()
+        .filter(|child| !child.is_hide_set())
+    {
+        if advanced_description(&format!("{path} {}", child.get_name())).is_some() {
+            if let Some(about) = child.get_long_about() {
+                if details.is_empty() {
+                    details.push_str("Advanced commands:\n");
+                }
+                details.push_str(&format!("  {path} {}: {about}\n\n", child.get_name()));
+            }
+        }
+    }
+    details.push_str("Documentation: https://greaber.github.io/syq/");
     let rsync = path == "syq rsync";
     command = command.disable_help_flag(true);
     let mut help = Arg::new("help")
@@ -49,8 +121,8 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                 .help("Show all options and details")
                 .help_heading("Help and version"),
         )
-        .after_help(format!("All options and details: {path} --help-all"))
-        .after_long_help("Documentation: https://greaber.github.io/syq/")
+        .after_help(format!("{more}: {path} --help-all"))
+        .after_long_help(details)
 }
 
 /// Presentation metadata references parser IDs, never a separate option list.
@@ -77,6 +149,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "ignore"
                     | "delete"
                     | "bwlimit"
+                    | "no_progress"
                     | "help"
                     | "version"
             )
@@ -88,7 +161,6 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "from"
                     | "cwd"
                     | "to"
-                    | "auth_from"
                     | "into"
                     | "as"
                     | "dry_run"
@@ -98,6 +170,11 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "preserve"
                     | "verify_only"
                     | "hash"
+                    | "bwlimit"
+                    | "no_progress"
+                    | "follow"
+                    | "follow_src"
+                    | "follow_dst"
                     | "prune"
                     | "help"
                     | "version"
@@ -112,8 +189,10 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "follow_dst" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
-                "connections" | "connections_opt" | "block_size" | "bwlimit" => "Performance",
-                "tuning_options" => "Benchmark tuning",
+                "bwlimit" => "Bandwidth",
+                "connections" | "connections_opt" | "block_size" | "tuning_options" => {
+                    "Performance troubleshooting"
+                }
                 "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",
@@ -128,6 +207,19 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 _ => "Copy policy and filtering",
             };
         let mut arg = arg.hide_short_help(!common).help_heading(heading);
+        // Keep detailed rsync semantics in the full reference.
+        if rsync && matches!(id, "ignore" | "delete") {
+            if arg.get_long_help().is_none() {
+                if let Some(help) = arg.get_help().cloned() {
+                    arg = arg.long_help(help);
+                }
+            }
+            arg = arg.help(if id == "ignore" {
+                "Skip paths matching a gitignore-style pattern (repeatable)"
+            } else {
+                "Remove destination-only paths after copying; ignored paths stay protected"
+            });
+        }
         // Shared parser fields need command-specific explanations.
         if rm && id == "syq_path" {
             arg = arg.help("Use this exact syq executable on the remote removal endpoint");
@@ -189,6 +281,8 @@ pub(crate) fn receiver() -> Command {
             .subcommand(
                 Command::new("enroll")
                     .about("Enroll a destination's existing parent, or refresh its receiver")
+                    .before_help("Copies normally enroll receivers automatically. Use this command for manual setup or refresh.")
+                    .long_about("Enroll a destination's existing parent, or refresh its receiver. Copies normally enroll receivers automatically. Use this command for manual setup or to refresh a receiver after rebuilding syq.")
                     .arg(
                         Arg::new("target")
                             .required(true)

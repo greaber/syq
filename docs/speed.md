@@ -150,8 +150,12 @@ through worker count. Short copies may finish before tuning has enough data.
 
 ## Benchmark tuning
 
-`syq cp` and `syq rsync` accept `--tuning-options` for controlled performance
-experiments. It appears in `--help-all`, outside the common options. Supply
+Normal copies tune automatically. Manual connection counts and
+`--tuning-options` appear in `--help-all` for troubleshooting performance issues
+and controlled experiments; leave them unset for everyday copies. `--bwlimit`
+appears in ordinary help because it sets your bandwidth budget.
+
+`syq cp` and `syq rsync` accept `--tuning-options`. Supply
 comma-separated `KEY=VALUE` pairs:
 
 ```sh

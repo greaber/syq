@@ -229,7 +229,7 @@ pub struct Args {
     /// Transfer/hash block size (e.g. 4M)
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
-    /// Override transfer internals for benchmarking (see --help-all)
+    /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
     /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
@@ -433,7 +433,7 @@ impl Args {
     pub fn parse_args(argv: &[OsString]) -> Result<Args> {
         let Some(command) = argv.first().and_then(|arg| arg.to_str()) else {
             if argv.is_empty() {
-                print_root_help();
+                print_root_help(false);
                 std::process::exit(0);
             }
             bail!("command name is not valid UTF-8");
@@ -444,7 +444,7 @@ impl Args {
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" | "--help-all" => {
-                print_root_help();
+                print_root_help(command == "--help-all");
                 std::process::exit(0);
             }
             "--version" | "-V" => {
@@ -664,8 +664,14 @@ fn read_ignore_inputs(
     Ok(lines)
 }
 
-fn print_root_help() {
-    crate::help::root().print_help().unwrap_or_else(|error| {
+fn print_root_help(full: bool) {
+    let mut command = crate::help::root();
+    let result = if full {
+        command.print_long_help()
+    } else {
+        command.print_help()
+    };
+    result.unwrap_or_else(|error| {
         crate::output::diagnostic!("syq: {error}");
         std::process::exit(1);
     });
@@ -838,7 +844,7 @@ struct NativeCopyOperationalArgs {
     /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     bwlimit: Option<String>,
-    /// Override transfer internals for benchmarking (see --help-all)
+    /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
     tuning_options: Option<crate::transfer_tuning::TransferTuning>,
     /// Print transfer statistics at the end
