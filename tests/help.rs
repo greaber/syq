@@ -47,6 +47,7 @@ fn short_and_long_help_spellings_are_identical_at_every_public_level() {
         vec!["persist", "receive"],
         vec!["persist", "receive", "on"],
         vec!["persist", "receive", "off"],
+        vec!["persist", "receive", "remove"],
         vec!["persist", "receive", "status"],
         vec!["persist", "receive", "wait"],
         vec!["persist", "receive", "pending"],

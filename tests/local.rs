@@ -11899,7 +11899,11 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     write(&t.path("src/file"), &original);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
-    let child = compat_command()
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    let ready = t.path("finalize-ready");
+    let continuation = t.path("finalize-continue");
+    let mut child = compat_command()
         .args([
             "-a",
             "--stats",
@@ -11909,22 +11913,39 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    // This includes copying the fixture in a debug build. Uncompressed local
-    // receiver traffic can take more than two seconds; wait for publication,
-    // not a throughput target, before changing the source during the hold.
+    // Wait for an acknowledged publication, then release it after replacing
+    // the source. The test must not race a fixed one-second sleep.
+    let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to finalize",
-        std::time::Duration::from_secs(10),
-        || t.path("dst/file").exists(),
+        "first attempt to acknowledge finalization",
+        std::time::Duration::from_secs(60),
+        || {
+            if ready.exists() {
+                return true;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "copy exited before finalization"
+            );
+            if progress.elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    child.id()
+                );
+                progress = std::time::Instant::now();
+            }
+            false
+        },
     );
-    write(&t.path("replacement"), &changed);
-    set_mtime(&t.path("replacement"), 1_600_000_001);
+    assert!(t.path("dst/file").exists());
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
+    release_confinement_barrier(&continuation);
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -11950,22 +11971,44 @@ fn changed_source_retry_still_uses_copy_file_range() {
     write(&t.path("src/file"), &original);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
-    let child = compat_command()
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    let ready = t.path("finalize-ready");
+    let continuation = t.path("finalize-continue");
+    let mut child = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
-        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
         .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
+    let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to finalize",
-        std::time::Duration::from_secs(10),
-        || t.path("dst/file").exists(),
+        "first attempt to acknowledge finalization",
+        std::time::Duration::from_secs(60),
+        || {
+            if ready.exists() {
+                return true;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "copy exited before finalization"
+            );
+            if progress.elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    child.id()
+                );
+                progress = std::time::Instant::now();
+            }
+            false
+        },
     );
-    write(&t.path("replacement"), &changed);
-    set_mtime(&t.path("replacement"), 1_600_000_001);
+    assert!(t.path("dst/file").exists());
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
+    release_confinement_barrier(&continuation);
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -19213,11 +19256,11 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
         "max_entries",
         "max_delete",
     ] {
-        assert_eq!(migrated[field], original[field], "{field}");
+        assert_eq!(migrated["profiles"][0][field], original[field], "{field}");
     }
-    assert_eq!(migrated["version"], 3);
-    assert_eq!(migrated["approval"], "ask");
-    assert_eq!(migrated["notifications"], "desktop");
+    assert_eq!(migrated["version"], 4);
+    assert_eq!(migrated["profiles"][0]["approval"], "ask");
+    assert_eq!(migrated["profiles"][0]["notifications"], "desktop");
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_output_ok(&run(&["persist", "receive", "off"]));
 }
@@ -20003,3 +20046,153 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
 }
 
 mod local_copy_selection;
+
+#[test]
+fn receiving_profiles_preserve_independent_settings_and_select_names() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("project")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let status = || {
+        let output = run(&["persist", "receive", "status", "--json"]);
+        assert_output_ok(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_output_ok(&run(&[
+        "persist",
+        "receive",
+        "on",
+        "--name",
+        "laptop",
+        "--approve",
+        "always",
+    ]));
+    let first = status()["profiles"][0].clone();
+    assert_output_ok(&run(&[
+        "persist", "receive", "on", "--name", "project", "--root", "project",
+    ]));
+    let state = status();
+    assert_eq!(state["profiles"].as_array().unwrap().len(), 2);
+    assert_eq!(state["profiles"][0], first);
+    assert_eq!(state["profiles"][1]["approval"], "ask");
+    assert_eq!(state["profiles"][1]["root"], t.s("project"));
+    assert_output_ok(&run(&["persist", "receive", "off", "--name", "project"]));
+    assert_eq!(status()["profiles"][0], first);
+    assert_eq!(status()["profiles"][1]["enabled"], false);
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    for args in [
+        vec!["off", "--name", "typo"],
+        vec!["remove", "typo"],
+        vec!["on", "--name", "../bad"],
+        vec!["status", "--name", "typo"],
+    ] {
+        let mut command = vec!["persist", "receive"];
+        command.extend(args);
+        assert!(!run(&command).status.success());
+        assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    }
+    assert_output_ok(&run(&["persist", "receive", "on", "--name", "project"]));
+    assert_eq!(status()["profiles"][1]["root"], t.s("project"));
+    let completion = run(&[
+        "completion",
+        "__complete",
+        "fish",
+        "5",
+        "--",
+        "syq",
+        "persist",
+        "receive",
+        "off",
+        "--name",
+        "proj",
+    ]);
+    assert_output_ok(&completion);
+    assert_eq!(completion.stdout, b"project\0");
+    assert_output_ok(&run(&["persist", "receive", "remove", "laptop"]));
+    assert_eq!(status()["settings"]["name"], "project");
+    assert!(!run(&["persist", "receive", "remove", "project"])
+        .status
+        .success());
+    assert_output_ok(&run(&["persist", "receive", "off"]));
+    assert_eq!(status()["settings"]["enabled"], false);
+}
+
+#[test]
+fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("project")).unwrap();
+    fs::write(t.path("file"), b"not a directory").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["persist", "receive"])
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["on", "--name", "project", "--root", "project"]));
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    for name in ["project", "new-profile"] {
+        for option in ["--cwd", "--root"] {
+            let output = run(&["on", "--name", name, option, "file"]);
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains(&format!("{option} must name a directory")),
+                "{output:?}"
+            );
+            assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+        }
+    }
+    // Losing a saved directory must not prevent inspecting or disabling profiles.
+    fs::remove_dir(t.path("project")).unwrap();
+    assert_output_ok(&run(&["status", "--json"]));
+    assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    assert_output_ok(&run(&["off", "--name", "project"]));
+}
+
+#[test]
+fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates() {
+    let t = Tmp::new();
+    let path = t.path("config/syq/receive.json");
+    // Captured from the released v0.5.1 executable, not generated by this writer.
+    let old = include_bytes!("fixtures/receive-v3-v0.5.1.json");
+    write(&path, old);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["persist", "receive", "status", "--json"]));
+    assert_eq!(fs::read(&path).unwrap(), old);
+    assert_output_ok(&run(&["persist", "receive", "on", "--name", "new-profile"]));
+    let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(old).unwrap();
+    assert_eq!(saved["version"], 4);
+    assert_eq!(saved["profiles"][0], original);
+    assert_eq!(saved["profiles"][1]["approval"], "ask");
+    saved["profiles"][1]["name"] = saved["profiles"][0]["name"].clone();
+    write(&path, &serde_json::to_vec(&saved).unwrap());
+    let failed = run(&["persist", "receive", "status", "--json"]);
+    assert!(!failed.status.success());
+    assert!(stderr_of(&failed).contains("duplicate receiving profile"));
+}

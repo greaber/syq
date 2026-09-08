@@ -197,6 +197,7 @@ syq cp --from source --srcs-in /tmp/syq-real-ssh/return-source --into /tmp/syq-r
 # shellcheck disable=SC2029
 ssh source "syq persist destinations wait $(hostname) --timeout 5"
 syq persist receive on --name laptop --root "$receive_root"
+syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
 printf 'case: return copies await local approval and denial leaves no destination\n'
@@ -406,6 +407,7 @@ ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as 
 printf 'return\n' | cmp - /tmp/syq-return-outside
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
 printf 'return\n' | cmp - /tmp/syq-return-absolute
+python3 /usr/local/libexec/syq-test-receive-profiles.py
 printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
 syq persist receive off
 syq persist connect source

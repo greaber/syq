@@ -8735,11 +8735,12 @@ impl Worker {
             }
         }
         #[cfg(debug_assertions)]
-        if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_AFTER_FINALIZE_MS") {
-            if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
+        crate::fsops::test_race_barrier(
+            "SYQ_TEST_FINALIZE_READY_FILE",
+            "SYQ_TEST_FINALIZE_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_AFTER_FINALIZE_MS",
+            "finalize-ready",
+        )?;
         self.complete_file(idx, job, false)
     }
 
