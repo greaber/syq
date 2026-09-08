@@ -125,7 +125,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
             opts.tuning
                 .request_size(opts.block, bwlimit, opts.restricted_receiver),
         );
-    if opts.same_host && !opts.checksum && bwlimit.is_none() {
+    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
         limit

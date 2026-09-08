@@ -26,11 +26,21 @@ fn local_batch_boundary_and_scheduler_agree() {
                 &t.s("dst/"),
             ])
             .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()
             .unwrap();
         assert_output_ok(&out);
+        let workers = fs::read_to_string(t.path("workers")).unwrap();
+        assert_eq!(
+            workers
+                .lines()
+                .filter(|line| line.starts_with("connected "))
+                .count(),
+            connections.parse::<usize>().unwrap(),
+            "{workers}"
+        );
         assert_same_tree(&t.path("src"), &t.path("dst"));
         let observed = tuning_observed(&out);
         assert_eq!(observed["local_whole_files"], 3, "{out:?}");
@@ -185,4 +195,28 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
     assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn platforms_without_direct_copy_keep_medium_batches() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(1 << 20, 82));
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+    assert_eq!(observed["small_batches"], 1);
 }
