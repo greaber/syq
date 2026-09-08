@@ -239,13 +239,17 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
     }
 
     let mut command = compat_command();
-    command.args(["-a", "--syq-connections", "1", "--no-progress"]);
+    command.args(["-a", "--stats", "--syq-connections", "1", "--no-progress"]);
     command.args(&sources);
     command.arg(t.s("destination/"));
     command.env("SYQ_DEBUG", "1");
     set_child_nofile_limit(&mut command, 128);
     let output = command.run().unwrap();
     assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("tcp connection lifetimes sampled:"),
+        "low descriptor limits should keep the receiver separate: {output:?}"
+    );
     for index in 0..sources.len() {
         let name = format!("source-{index:02}");
         assert_eq!(

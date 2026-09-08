@@ -345,8 +345,9 @@ copy authorization.
 
 ## Local copies and NFS
 
-Local destinations use the same process as the copy coordinator. They do not
-need a local TCP connection or a separate receiver process.
+Local destinations normally run in the copy coordinator, without a local TCP
+connection. With a low open-file limit, syq keeps the receiver in a separate
+process so source and destination files have independent descriptor allowances.
 
 Same-machine Linux copies first try kernel or NFS server-side copying. If
 that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file

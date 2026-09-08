@@ -1813,16 +1813,34 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let src_ep = endpoint(&srcs[0], &args)?;
-    let dst_ep = endpoint(dst, &args)?;
+    let mut dst_ep = endpoint(dst, &args)?;
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
         bail!(
             "{} applies only to copies with a remote endpoint",
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
-    // Local workers use the registered directory descriptors directly. No
-    // destination operation changes the coordinator's working directory.
-    // Remote endpoints still negotiate TCP, with SSH fallback as requested.
+    // Descriptor-relative operations need no private cwd. Keep the receiver
+    // separate only when its roots and caches would crowd the coordinator's
+    // descriptor allowance; the two processes then retain independent limits.
+    let local_source_roots = if src_ep.is_remote() { 0 } else { srcs.len() };
+    let planned_workers = if args.connections_default {
+        tune::MAX
+    } else {
+        args.connections
+    };
+    if matches!(dst_ep, Endpoint::Local { .. })
+        && !crate::fsops::local_destination_fits_descriptor_limit(
+            local_source_roots,
+            planned_workers,
+        )?
+    {
+        let mut receiver = RemoteSpec::local_receiver(args.quiet);
+        receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
+        dst_ep = Endpoint::Remote(receiver);
+    }
+    // Remote endpoints and a separate local receiver negotiate TCP, with SSH
+    // fallback as requested. In-process local workers need neither transport.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
