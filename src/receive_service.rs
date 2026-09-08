@@ -1058,10 +1058,12 @@ fn configure(options: Configure) -> Result<()> {
     }
     if let Some(cwd) = options.cwd {
         config.cwd = fs::canonicalize(cwd)?;
+        anyhow::ensure!(config.cwd.is_dir(), "--cwd must name a directory");
         config.root = None;
     }
     if let Some(root) = options.root {
         config.cwd = fs::canonicalize(root)?;
+        anyhow::ensure!(config.cwd.is_dir(), "--root must name a directory");
         config.root = Some(config.cwd.clone());
     }
     if let Some(bytes) = options.max_bytes {

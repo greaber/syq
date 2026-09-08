@@ -188,11 +188,13 @@ syq persist receive on --name laptop --root ~/Downloads/server
 `--root` sets both the starting directory and the boundary. It rejects absolute
 paths and `..`, and copies cannot traverse symlinks to escape that directory.
 The root itself cannot be replaced with `--as .`. Changing to `--cwd` removes
-containment. Settings apply globally to receiving connections; changing them
-closes existing return copies before restarting with the new settings.
+containment. Changing a profile’s settings closes its existing return copies
+before restarting that profile with the new settings. Other profiles keep running.
 
-The receiving directory must exist and have a UTF-8 path. Names inside it may
-use normal Unix filename bytes. Syq protects its own receiving control files,
+Explicit `--cwd` and `--root` paths must name existing directories with UTF-8
+paths; invalid paths leave saved settings unchanged. If a saved directory later
+disappears, you can still inspect, disable, or reconfigure its profile. Names
+inside receiving directories may use normal Unix filename bytes. Syq protects its own receiving control files,
 executable, and SSH authority files from return copies even without `--root`.
 
 ## Copy permissions and limits

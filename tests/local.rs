@@ -20127,6 +20127,44 @@ fn receiving_profiles_preserve_independent_settings_and_select_names() {
 }
 
 #[test]
+fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("project")).unwrap();
+    fs::write(t.path("file"), b"not a directory").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["persist", "receive"])
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["on", "--name", "project", "--root", "project"]));
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    for name in ["project", "new-profile"] {
+        for option in ["--cwd", "--root"] {
+            let output = run(&["on", "--name", name, option, "file"]);
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains(&format!("{option} must name a directory")),
+                "{output:?}"
+            );
+            assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+        }
+    }
+    // Losing a saved directory must not prevent inspecting or disabling profiles.
+    fs::remove_dir(t.path("project")).unwrap();
+    assert_output_ok(&run(&["status", "--json"]));
+    assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    assert_output_ok(&run(&["off", "--name", "project"]));
+}
+
+#[test]
 fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates() {
     let t = Tmp::new();
     let path = t.path("config/syq/receive.json");
