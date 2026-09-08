@@ -111,6 +111,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     finish(command)
 
     print("case: two clients can receive; duplicate name fails only that profile", flush=True)
+    (root / "runtime").mkdir(mode=0o700)
     other_env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"), XDG_RUNTIME_DIR=str(root / "runtime"))
     other_root = root / "other"
     other_root.mkdir()
