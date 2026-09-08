@@ -66,9 +66,20 @@ _LINE_LIMIT = 16 * 1024 * 1024
 _STDERR_LIMIT = 8 * 1024
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except PermissionError:
+            # Darwin can reject a zombie-only group. Give its child watcher one
+            # turn to reap the exited leader, then retry so descendants still
+            # receive the signal. A live process keeps the original permission
+            # failure visible.
+            if process.returncode is None:
+                await asyncio.sleep(0)
+            if process.returncode is None:
+                raise
+            os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
@@ -190,7 +201,7 @@ async def _run(
     except asyncio.CancelledError:
         if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
             process = spawn.result()
-            _kill_process_group(process)
+            await _kill_process_group(process)
             await _wait_for_exit(process)
         raise
     try:
@@ -200,7 +211,7 @@ async def _run(
         else:
             stdout, stderr = await asyncio.wait_for(communication, timeout)
     except BaseException:
-        _kill_process_group(process)
+        await _kill_process_group(process)
         await _wait_for_exit(process)
         raise
     result = Result(
@@ -268,7 +279,7 @@ class _AsyncLineProcess:
         except asyncio.CancelledError:
             if spawn.done() and not spawn.cancelled() and spawn.exception() is None:
                 process = spawn.result()
-                _kill_process_group(process)
+                await _kill_process_group(process)
                 await _wait_for_exit(process)
             raise
         assert process.stdout is not None
@@ -315,7 +326,7 @@ class _AsyncLineProcess:
                     and spawn.exception() is None
                 ):
                     process = spawn.result()
-                    _kill_process_group(process)
+                    await _kill_process_group(process)
                     await _wait_for_exit(process)
                 raise
         except BaseException:
@@ -367,7 +378,7 @@ class _AsyncLineProcess:
     async def abort(self) -> None:
         if not self._aborted:
             self._aborted = True
-            _kill_process_group(self._process)
+            await _kill_process_group(self._process)
         if self.returncode is None:
             self.returncode = await _wait_for_exit(self._process)
         if not self._closed:

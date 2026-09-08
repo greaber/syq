@@ -58,6 +58,32 @@ class ProcessGroupCleanupTests(unittest.TestCase):
                 self.assertEqual(kill.call_count, attempts)
 
 
+class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_error_reaps_exited_leader_and_retries_group(self):
+        from syq.async_client import _kill_process_group
+
+        process = mock.Mock(pid=123, returncode=0)
+        for retry in (None, ProcessLookupError()):
+            with self.subTest(retry=retry), mock.patch(
+                "syq.async_client.os.killpg", side_effect=[PermissionError(), retry]
+            ) as kill:
+                await _kill_process_group(process)
+                self.assertEqual(kill.call_args_list, [
+                    mock.call(123, signal.SIGKILL), mock.call(123, signal.SIGKILL),
+                ])
+
+    async def test_live_process_permission_error_is_visible(self):
+        from syq.async_client import _kill_process_group
+
+        process = mock.Mock(pid=123, returncode=None)
+        with mock.patch(
+            "syq.async_client.os.killpg", side_effect=PermissionError("denied")
+        ) as kill:
+            with self.assertRaisesRegex(PermissionError, "denied"):
+                await _kill_process_group(process)
+            self.assertEqual(kill.call_count, 1)
+
+
 FAKE_SYQ = """#!/bin/sh
 case "$1" in
   --version)
