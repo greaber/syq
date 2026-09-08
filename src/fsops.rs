@@ -2713,16 +2713,15 @@ impl FsOps {
         }))
     }
 
-    fn map_request(&self, req: &Request) -> Result<Request> {
+    fn map_request(&self, req: &mut Request) -> Result<()> {
         if self.destination_prefix.is_none() {
-            return Ok(req.clone());
+            return Ok(());
         }
-        let mut req = req.clone();
         let map = |path: &mut PathBytes| -> Result<()> {
             *path = self.destination_relative(path)?;
             Ok(())
         };
-        match &mut req {
+        match req {
             Request::Scan { root, guard, .. } => {
                 if guard.is_none() {
                     map(root)?;
@@ -2815,7 +2814,7 @@ impl FsOps {
             | Request::MappingChunk { .. }
             | Request::StopReadStream => {}
         }
-        Ok(req)
+        Ok(())
     }
 
     pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
@@ -6051,18 +6050,25 @@ impl FsOps {
         })
     }
 
-    /// Dispatch a request that has a single response (everything except Scan).
+    // Borrowed test fixtures may be reused across calls. Production dispatch
+    // always maps its already-owned request without cloning payload buffers.
+    #[cfg(test)]
     pub fn handle(&mut self, req: &Request) -> Response {
+        self.handle_in_place(&mut req.clone())
+    }
+
+    /// Dispatch a single-response request, rewriting its paths in place.
+    /// The caller must not dispatch the mapped request again.
+    pub fn handle_in_place(&mut self, req: &mut Request) -> Response {
         if let Err(error) = self
             .validate_source_session_request(req)
             .and_then(|()| self.validate_destination_session_request(req))
         {
             return Response::Err(errstr(&error));
         }
-        let req = match self.map_request(req) {
-            Ok(req) => req,
-            Err(error) => return Response::EndpointError(wire_error(&error)),
-        };
+        if let Err(error) = self.map_request(req) {
+            return Response::EndpointError(wire_error(&error));
+        }
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
@@ -10388,3 +10394,7 @@ mod completion_details_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "fsops_dispatch_tests.rs"]
+mod dispatch_tests;

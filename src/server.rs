@@ -579,7 +579,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         continue;
                     }
                     let t0 = std::time::Instant::now();
-                    let response = ops.handle(&stream.next_request());
+                    let response = ops.handle_in_place(&mut stream.next_request());
                     t[1] += t0.elapsed().as_secs_f64();
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
@@ -823,9 +823,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     "receipts are issued only by a command-restricted receiver".into(),
                 ))?,
             },
-            other => {
+            mut other => {
                 let t0 = std::time::Instant::now();
-                let resp = ops.handle(&other);
+                let resp = ops.handle_in_place(&mut other);
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }
