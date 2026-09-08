@@ -1190,9 +1190,17 @@ pub struct DirectoryAnchor {
 pub trait SizeHint {
     fn size_hint(&self) -> usize;
     fn frame_limit(&self) -> usize;
+    /// Two passes are cheap for a block's byte slice, but substantially more
+    /// expensive for metadata encoded one field/byte at a time.
+    fn direct_payload(&self) -> bool {
+        false
+    }
 }
 
 impl SizeHint for Request {
+    fn direct_payload(&self) -> bool {
+        matches!(self, Request::WriteRange { .. })
+    }
     fn frame_limit(&self) -> usize {
         match self {
             Request::Hello { .. } => MAX_HANDSHAKE_FRAME,
@@ -1254,6 +1262,9 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
+    fn direct_payload(&self) -> bool {
+        matches!(self, Response::Block { .. })
+    }
     fn frame_limit(&self) -> usize {
         match self {
             Response::HelloOk { .. } => MAX_HANDSHAKE_FRAME,
@@ -1411,7 +1422,7 @@ impl<W: Write> FrameWriter<W> {
 
     pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
         self.write_preamble()?;
-        if !self.compress {
+        if !self.compress && msg.direct_payload() {
             // serde_bytes payloads contribute their length without visiting
             // each byte. The second pass writes those slices directly.
             let size = postcard::experimental::serialized_size(msg)
@@ -1774,10 +1785,39 @@ mod tests {
     }
 
     #[test]
+    fn metadata_keeps_single_pass_serialization() {
+        struct Metadata(std::cell::Cell<usize>);
+        impl Serialize for Metadata {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.set(self.0.get() + 1);
+                serializer.serialize_u8(0)
+            }
+        }
+        impl SizeHint for Metadata {
+            fn size_hint(&self) -> usize {
+                1
+            }
+            fn frame_limit(&self) -> usize {
+                MAX_FRAME
+            }
+        }
+        let message = Metadata(std::cell::Cell::new(0));
+        FrameWriter::new(io::sink(), false)
+            .write_msg(&message)
+            .unwrap();
+        assert_eq!(message.0.get(), 1);
+        assert!(!Response::ScanBatch(Vec::new()).direct_payload());
+        assert!(!Request::PutSmallBatch(Vec::new()).direct_payload());
+    }
+
+    #[test]
     fn direct_frame_checks_size_before_writing_header() {
         #[derive(Serialize)]
         struct Limited(u64);
         impl SizeHint for Limited {
+            fn direct_payload(&self) -> bool {
+                true
+            }
             fn size_hint(&self) -> usize {
                 0
             }
@@ -1868,6 +1908,9 @@ mod tests {
             }
         }
         impl SizeHint for Changing {
+            fn direct_payload(&self) -> bool {
+                true
+            }
             fn size_hint(&self) -> usize {
                 16
             }
