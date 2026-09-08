@@ -543,7 +543,12 @@ set -euo pipefail
 case "$1:$2" in
   run:list) jq -cn --arg sha "$SYQ_TEST_STATUS_COMMIT" \
     --arg status "${SYQ_TEST_STATUS_RUN_STATUS:-in_progress}" \
-    --arg conclusion "${SYQ_TEST_STATUS_RUN_CONCLUSION:-}" '[
+    --arg conclusion "${SYQ_TEST_STATUS_RUN_CONCLUSION:-}" \
+    --argjson include_failed "${SYQ_TEST_STATUS_INCLUDE_FAILED_RUN:-false}" '[
+    (if $include_failed then
+      {conclusion:"failure",databaseId:302,event:"push",headSha:$sha,status:"completed",
+       url:"https://example.test/302",workflowName:"release"}
+    else empty end),
     {conclusion:($conclusion | if length == 0 then null else . end),
      databaseId:303,event:"push",headSha:$sha,status:$status,
      url:"https://example.test/303",workflowName:"release"}]' ;;
@@ -608,6 +613,24 @@ SYQ_TEST_STATUS_RUN_STATUS=completed \
 SYQ_TEST_STATUS_RUN_CONCLUSION=success \
   "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-complete.json"
 jq -e '.complete == true' "$work/status-complete.json" >/dev/null
+
+# A failed provisional attempt does not make a later successful publication
+# incomplete. Keep both runs in the report for auditability.
+PATH="$status_bin:$PATH" \
+SYQ_TEST_STATUS_COMMIT="$status_commit" \
+SYQ_TEST_STATUS_TAG_OBJECT="$status_tag_object" \
+SYQ_TEST_STATUS_TAG="$status_tag" \
+SYQ_TEST_STATUS_VERSION="$status_version" \
+SYQ_TEST_STATUS_FORMULA_B64="$status_formula_b64" \
+SYQ_TEST_STATUS_INCLUDE_FAILED_RUN=true \
+SYQ_TEST_STATUS_RUN_STATUS=completed \
+SYQ_TEST_STATUS_RUN_CONCLUSION=success \
+  "$script_dir/release-status.sh" --json "$status_tag" >"$work/status-retried.json"
+jq -e '
+  .complete == true and
+  ([.release_runs[] | select(.conclusion == "failure")] | length) == 1 and
+  ([.release_runs[] | select(.conclusion == "success")] | length) == 1
+' "$work/status-retried.json" >/dev/null
 
 PATH="$status_bin:$PATH" \
 SYQ_TEST_STATUS_COMMIT="$status_commit" \

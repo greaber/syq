@@ -141,7 +141,7 @@ result=$(jq -n \
    . + {complete:(
      .tag_state == "verified" and
      .github_release.state == "published" and .github_release.immutable and
-     (.release_runs | length > 0 and all(.[]; .status == "completed" and .conclusion == "success")) and
+     (.release_runs | any(.[]; .status == "completed" and .conclusion == "success")) and
      .publications.crates_io.state == "published" and
      .publications.pypi.state == "published" and
      .publications.homebrew.state == "published")}
