@@ -1820,27 +1820,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
-    // Descriptor-relative operations need no private cwd. Keep the receiver
-    // separate only when its roots and caches would crowd the coordinator's
-    // descriptor allowance; the two processes then retain independent limits.
-    let local_source_roots = if src_ep.is_remote() { 0 } else { srcs.len() };
-    let planned_workers = if args.connections_default {
-        tune::MAX
-    } else {
-        args.connections
-    };
-    if matches!(dst_ep, Endpoint::Local { .. })
-        && !crate::fsops::local_destination_fits_descriptor_limit(
-            local_source_roots,
-            planned_workers,
-        )?
-    {
+    if matches!(dst_ep, Endpoint::Local { .. }) {
         let mut receiver = RemoteSpec::local_receiver(args.quiet);
         receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
         dst_ep = Endpoint::Remote(receiver);
     }
-    // Remote endpoints and a separate local receiver negotiate TCP, with SSH
-    // fallback as requested. In-process local workers need neither transport.
+    // TCP data connections are the default (auto-selecting the fastest reachable
+    // NIC and falling back to ssh if unreachable); the interface's no-TCP
+    // option forces SSH data.
+    // A local receiver uses one child process and a loopback data listener so
+    // every worker shares its retained destination cwd without changing the
+    // coordinator process's cwd.
     let use_tcp = !args.no_tcp && (src_ep.has_data_server() || dst_ep.has_data_server());
     // Without -j the worker count is tuned while the transfer runs (see tune.rs);
     // start conservatively until TCP reachability has been established below.
@@ -3242,7 +3232,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // A same-machine file normally completes wholly inside one
                     // small-file or receiver-side copy request (copy_file_range,
                     // or an eligible sequential userspace fallback). Starting
-                    // Extra workers cannot help that request. If a larger file
+                    // 32 loopback connections cannot help that request. If a larger file
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.

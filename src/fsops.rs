@@ -1430,40 +1430,6 @@ fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
     Ok(open)
 }
 
-/// Keep the local receiver separate when combining its caches and roots with
-/// the source would exceed this process's descriptor allowance. The existing
-/// source admission check still runs in either arrangement.
-pub(crate) fn local_destination_fits_descriptor_limit(
-    local_source_roots: usize,
-    workers: usize,
-) -> Result<bool> {
-    let limit = nofile_limits().context("read local copy file limit")?;
-    if limit.rlim_cur == libc::RLIM_INFINITY {
-        return Ok(true);
-    }
-    let current_open = current_open_descriptor_count(limit.rlim_cur)?;
-    let copy_roots = if cfg!(target_os = "linux") {
-        local_source_roots
-    } else {
-        0
-    };
-    let claims = if copy_roots > 0 { workers } else { 0 };
-    let source = source_descriptor_requirement(current_open, local_source_roots, workers, claims)?;
-    // A destination worker holds its root, cache, basis and temporary open
-    // files. Metadata batches can additionally open parents on PAR_THREADS
-    // threads. Linux whole-file workers retain the source capabilities too.
-    let destination = copy_roots
-        .checked_mul(2)
-        .and_then(|roots| roots.checked_add(FD_CACHE_MAX + 8))
-        .and_then(|per_worker| per_worker.checked_mul(workers))
-        .and_then(|workers| workers.checked_add(PAR_THREADS * 3))
-        .context("local destination descriptor requirement overflow")?;
-    let required = source
-        .checked_add(destination)
-        .context("local copy descriptor requirement overflow")?;
-    Ok(required as u128 <= limit.rlim_cur as u128)
-}
-
 fn require_source_descriptor_capacity(
     root_count: usize,
     shared_workers: usize,
@@ -4474,14 +4440,19 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
         return items.iter().map(&f).collect();
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
-    std::thread::scope(|s| {
-        let handles: Vec<_> = items
-            .chunks(chunk)
-            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>()))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("stat thread"))
+    use rayon::prelude::*;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(PAR_THREADS)
+            .thread_name(|index| format!("syq-metadata-{index}"))
+            .build()
+            .expect("metadata worker pool")
+    });
+    pool.install(|| {
+        items
+            .par_chunks(chunk)
+            .flat_map_iter(|chunk| chunk.iter().map(&f))
             .collect()
     })
 }

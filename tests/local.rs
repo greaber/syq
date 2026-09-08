@@ -239,17 +239,13 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
     }
 
     let mut command = compat_command();
-    command.args(["-a", "--stats", "--syq-connections", "1", "--no-progress"]);
+    command.args(["-a", "--syq-connections", "1", "--no-progress"]);
     command.args(&sources);
     command.arg(t.s("destination/"));
     command.env("SYQ_DEBUG", "1");
     set_child_nofile_limit(&mut command, 128);
     let output = command.run().unwrap();
     assert!(output.status.success(), "{}", stderr_of(&output));
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("tcp connection lifetimes sampled:"),
-        "low descriptor limits should keep the receiver separate: {output:?}"
-    );
     for index in 0..sources.len() {
         let name = format!("source-{index:02}");
         assert_eq!(
@@ -6022,31 +6018,6 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
         assert!(out.status.success(), "{out:?}");
         assert!(out.stderr.is_empty(), "{dst}: {out:?}");
     }
-}
-
-#[test]
-fn local_copy_does_not_open_tcp_data_connections() {
-    let t = Tmp::new();
-    for index in 0..4 {
-        write(
-            &t.path(&format!("source/file-{index}")),
-            &prng(128 << 10, index),
-        );
-    }
-    let output = run_ok(&[
-        "-a",
-        "--stats",
-        "--syq-connections",
-        "4",
-        &t.s("source/"),
-        &t.s("destination/"),
-    ]);
-    assert_same_tree(&t.path("source"), &t.path("destination"));
-    assert!(output.contains("files to transfer: 4"), "{output}");
-    assert!(
-        !output.contains("tcp connection lifetimes sampled:"),
-        "local filesystem work unexpectedly used TCP: {output}"
-    );
 }
 
 #[test]

@@ -345,14 +345,11 @@ copy authorization.
 
 ## Local copies and NFS
 
-Local destinations normally run in the copy coordinator, without a local TCP
-connection. With a low open-file limit, syq keeps the receiver in a separate
-process so source and destination files have independent descriptor allowances.
-
 Same-machine Linux copies first try kernel or NFS server-side copying. If
 that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
 copy, syq copies eligible files larger than 64 KiB directly through their open
-source and destination files. It runs these file copies in parallel. Files up to 64 KiB still
+source and destination files. It runs these file copies in parallel without
+sending their contents through local TCP connections. Files up to 64 KiB still
 use batches, subject to the hash block, request-size and batch-byte limits.
 This local batch ceiling does not reduce the size of ordinary range requests.
 This happens automatically, without tuning options. Single-file copies retain parallel range copying when offload
@@ -382,7 +379,7 @@ incomplete version stays at the final filename until you finish the copy.
 
 `--no-compress` saves CPU at the cost of potentially sending more bytes; it
 does not affect file contents or integrity checks. Compression applies across
-the network; local filesystem reads and writes are not compressed.
+the network, not between syq and its receiver process on the same machine.
 
 Examples use native options. In rsync mode, syq-specific options have a
 `--syq-` prefix, such as `--syq-connections` and `--syq-no-tcp`.
