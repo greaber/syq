@@ -220,3 +220,50 @@ fn platforms_without_direct_copy_keep_medium_batches() {
     assert_eq!(observed["range_requests"], 0);
     assert_eq!(observed["small_batches"], 1);
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
+    let t = Tmp::new();
+    let mut contents = prng(2 << 20, 83);
+    write(&t.path("src/file"), &contents);
+    write(
+        &t.path("src/tiny"),
+        b"another file enables the local sequential fallback",
+    );
+    let run = || {
+        let mut command = compat_command();
+        command
+            .args([
+                "-a",
+                "--syq-no-tcp",
+                "--no-progress",
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local");
+        command
+    };
+    let failed = run()
+        .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
+        .run()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(stderr_of(&failed).contains("test local-copy write failure"));
+    assert!(!t.path("dst/file").exists());
+    let partials = partial_files(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    assert_eq!(fs::metadata(&partials[0]).unwrap().len(), 1 << 20);
+
+    contents[..1 << 20].fill(b'x');
+    write(&t.path("src/file"), &contents);
+    let resumed = run().run().unwrap();
+    assert_output_ok(&resumed);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.path("dst")).is_empty());
+    let observed = tuning_observed(&resumed);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 0);
+}
