@@ -98,3 +98,14 @@ enrollment, receiver, transport, and remote-coordinator changes need
 `scripts/test-real-ssh.sh`; see the [real-SSH test setup](../tests/real-ssh/README.md).
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.
+
+## Machine-facing completion commands
+
+The generated shell adapters invoke `syq completion __complete SHELL INDEX -- WORDS...`
+or the Bash-specific `syq completion __complete-bash REPLACEMENT -- LINE`.
+`INDEX` is the zero-based cursor-word index; `WORDS` are dequoted command words
+including `syq`. `REPLACEMENT` is Readline's current fragment and `LINE` is the
+command line through the cursor. These entry points serve the generated adapters
+and are omitted from user help. For interactive use, generate an adapter with
+`syq completion bash`, `zsh`, or `fish`; use `syq completion cache` to inspect or
+clear endpoint suggestions.

@@ -380,5 +380,18 @@ in names and peer diagnostics. JSON status output keeps the original values.
 Use `--min-size` and `--max-size` to select regular files by size.
 
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,
-see [Automation results](automation.md). `syq cp --help` gives common examples;
-`syq cp --help-all` lists every option.
+see [Automation results](automation.md).
+
+At each command, `--help` (or `-h`) shows everyday options and lists the public
+subcommands. Commands for manual setup, recovery, or scripting have brief
+“Advanced” descriptions; `--help-all` expands their descriptions and lists all
+public options. For example, `syq receiver enroll --help` explains manual
+enrollment, and `syq receiver enroll --help-all` also shows the jump-host option.
+Use `syq help COMMAND` to read the same help without invoking the command.
+In `syq rsync`, `-h` means human-readable sizes; use `--help` for help.
+
+Helper overrides, ephemeral connection scopes, JSON status output, specialized
+receiving limits, and performance tuning appear in `--help-all`. Copies tune
+performance automatically; manual tuning is for troubleshooting and controlled
+experiments. `--bwlimit` stays in ordinary help because it sets how much
+bandwidth you want to use.

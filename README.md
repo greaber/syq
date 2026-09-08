@@ -2,7 +2,7 @@
 
 Syq (pronounced "sick") copies and removes files in parallel, on one machine
 or over SSH.
-It is built for large files, large trees, and fast networks.
+It aims to perform well across file sizes, directory sizes, and network speeds.
 
 - **Parallel copies and removal**, with automatic connection tuning.
 - **Resume interrupted copies** by rerunning the command.
@@ -12,6 +12,24 @@ It is built for large files, large trees, and fast networks.
 
 [Documentation](https://greaber.github.io/syq/) ·
 [Benchmarks](https://greaber.github.io/syq-bench/)
+
+## Install
+
+On Linux or macOS (x86-64 or ARM64):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+```
+
+Installs into `~/.local/bin` without `sudo`; make sure it is on your `PATH`.
+Or install with Homebrew:
+
+```sh
+brew install greaber/tap/syq
+```
+
+See [installation details](https://greaber.github.io/syq/install.html) for
+updates and shell completion.
 
 ## Developing syq
 
