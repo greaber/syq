@@ -1548,6 +1548,7 @@ pub(crate) enum PrimedControl {
 }
 
 impl RemoteSpec {
+    #[cfg(test)]
     pub fn local_receiver(quiet: bool) -> Self {
         Self {
             local_process: true,
