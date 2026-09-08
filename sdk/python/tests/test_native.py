@@ -38,8 +38,11 @@ if pause:
     time.sleep(float(pause))
 log = os.environ.get("SYQ_FAKE_ARGV")
 if log:
-    with open(log, "w", encoding="utf-8") as output:
+    # Existence is the async tests' readiness signal: publish only complete JSON.
+    temporary_log = log + "." + str(os.getpid()) + ".tmp"
+    with open(temporary_log, "w", encoding="utf-8") as output:
         json.dump(args, output)
+    os.replace(temporary_log, log)
 stderr_bytes = int(os.environ.get("SYQ_FAKE_STDERR_BYTES", "0"))
 if stderr_bytes:
     sys.stderr.buffer.write(b"x" * stderr_bytes)
