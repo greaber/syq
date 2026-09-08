@@ -425,6 +425,29 @@ impl Sched {
         out
     }
 
+    /// Claim a bounded set of short ranges from the same file. Keeping their
+    /// outstanding shares until every write is acknowledged prevents another
+    /// worker from publishing the file while this batch is still in flight.
+    pub fn take_short_ranges(&self, idx: usize, max_size: u64, max_n: usize) -> Vec<RangeHandle> {
+        let mut g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        if g.abort || g.failed.contains(&idx) {
+            return out;
+        }
+        let mut i = g.ranges.len();
+        while i > 0 && out.len() < max_n {
+            i -= 1;
+            let (file, off, end) = g.ranges[i];
+            if file == idx && end - off <= max_size {
+                g.ranges.remove(i);
+                let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
+                g.inflight.push(h.clone());
+                out.push(h);
+            }
+        }
+        out
+    }
+
     /// After probing a file: register its ranges. Returns the handle for the
     /// first range (already marked in flight) or None if nothing to transfer.
     pub fn ranges_ready(&self, idx: usize, mut ranges: Vec<(u64, u64)>) -> Option<RangeHandle> {
@@ -521,6 +544,35 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_range_batch_preserves_other_files_limits_and_outstanding_work() {
+        let sched = Sched::new(512, 8192);
+        sched.inner.lock().unwrap().probing = 2;
+        let first = sched
+            .ranges_ready(0, vec![(0, 512), (1024, 1536), (2048, 2560), (4096, 8192)])
+            .unwrap();
+        let other = sched.ranges_ready(1, vec![(0, 512), (1024, 1536)]).unwrap();
+        assert!(sched.take_short_ranges(0, 512, 0).is_empty());
+        let batch = sched.take_short_ranges(0, 512, 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].lock().unwrap().idx, 0);
+        assert_eq!(sched.inner.lock().unwrap().outstanding[&0], 4);
+        assert!(!sched.range_done(&batch[0]));
+        sched.release_rest(&first);
+        assert_eq!(sched.inner.lock().unwrap().outstanding[&0], 4);
+        assert!(!sched.range_done(&first));
+        assert!(!sched.range_done(&other));
+        let inner = sched.inner.lock().unwrap();
+        assert!(inner.ranges.contains(&(1, 1024, 1536)));
+        assert!(inner.ranges.contains(&(0, 4096, 8192)));
+        assert!(inner.ranges.contains(&(0, 0, 512)));
+        drop(inner);
+        sched.fail_file(0);
+        assert!(sched.take_short_ranges(0, 512, 10).is_empty());
+        sched.abort();
+        assert!(sched.take_short_ranges(1, 512, 10).is_empty());
+    }
 
     #[test]
     fn initial_ranges_preserve_coverage_alignment_and_split_floor() {

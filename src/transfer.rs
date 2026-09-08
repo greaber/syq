@@ -8156,6 +8156,7 @@ impl Worker {
                         path: job.dst.clone(),
                         copy_id: self.copy_id(),
                         len: size,
+                        reuse: ranges.iter().map(|(off, end)| end - off).sum::<u64>() < size,
                         attempt: job.attempt,
                         guard: job.container_guard.clone(),
                     })?,
@@ -8451,25 +8452,74 @@ impl Worker {
         } else {
             1
         };
+        // Fill one existing request window with disjoint ranges of this file.
+        // Large contiguous ranges retain their normal stealing and streaming
+        // paths. No additional request or byte budget is introduced.
+        let extra = if bytes <= block && self.gate.allowed(self.id) {
+            self.sched.take_short_ranges(
+                idx,
+                block,
+                read_window.max(write_window).saturating_sub(1),
+            )
+        } else {
+            Vec::new()
+        };
+        let extra_starts: Vec<_> = extra.iter().map(|h| h.lock().unwrap().pos).collect();
+        let handles: Vec<_> = std::iter::once(h).chain(extra.iter()).collect();
+        let result =
+            self.transfer_range_batch(&job, &handles, credited, block, read_window, write_window);
+        for (handle, start) in extra.iter().zip(extra_starts) {
+            if result.is_err() && self.transport_dead() {
+                self.sched.retry_range(handle, start);
+            } else {
+                // The caller still owns h, so completing an extra range cannot
+                // complete the file. Its caller also rolls back all credited
+                // bytes from this batch when a connection dies.
+                let done = self.sched.range_done(handle);
+                debug_assert!(!done);
+            }
+        }
+        result
+    }
+
+    fn transfer_range_batch(
+        &mut self,
+        job: &FileJob,
+        handles: &[&RangeHandle],
+        credited: &mut u64,
+        block: u64,
+        read_window: usize,
+        write_window: usize,
+    ) -> Result<()> {
+        let idx = handles[0].lock().unwrap().idx;
+        let mut current = 0;
         let inplace = job.inplace;
         let mut pending_reads = std::collections::VecDeque::new();
         let mut writes_out = 0usize;
         let result = (|| -> Result<()> {
             loop {
                 if self.sched.is_failed(idx) || self.sched.is_aborted() {
-                    self.sched.release_rest(h);
+                    for h in handles {
+                        self.sched.release_rest(h);
+                    }
                     break;
                 }
                 if !self.gate.allowed(self.id) {
                     // Being parked: give the rest of this range back so an active
                     // worker picks it up; what's already requested still completes.
-                    self.sched.release_rest(h);
+                    for h in handles {
+                        self.sched.release_rest(h);
+                    }
                 }
                 while pending_reads.len() < read_window {
+                    let Some(h) = handles.get(current) else {
+                        break;
+                    };
                     let (off, n) = {
                         let mut g = h.lock().unwrap();
                         if g.pos >= g.end {
-                            break;
+                            current += 1;
+                            continue;
                         }
                         let n = (g.end - g.pos).min(block);
                         let off = g.pos;
@@ -8479,7 +8529,7 @@ impl Worker {
                     self.limit(n);
                     self.src.send(Request::ReadRange {
                         path: job.src.clone(),
-                        source: self.source_reference(&job),
+                        source: self.source_reference(job),
                         attempt: job.attempt,
                         off,
                         len: n as u32,
@@ -8977,11 +9027,21 @@ mod tests {
         requests: Vec<Request>,
         replies: std::collections::VecDeque<Response>,
         received: usize,
+        sent_at_receive: Vec<usize>,
+        synchronous: bool,
+        fail_receive: Option<usize>,
+        dead: bool,
     }
 
     struct PipelineConn(Arc<Mutex<PipelineState>>);
 
     impl Conn for PipelineConn {
+        fn supports_request_pipelining(&self) -> bool {
+            !self.0.lock().unwrap().synchronous
+        }
+        fn is_dead(&self) -> bool {
+            self.0.lock().unwrap().dead
+        }
         fn begin_streaming_writes(&mut self) -> Result<()> {
             Ok(())
         }
@@ -8995,6 +9055,12 @@ mod tests {
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
             state.received += 1;
+            let sent = state.requests.len();
+            state.sent_at_receive.push(sent);
+            if state.dead || state.fail_receive == Some(state.received) {
+                state.dead = true;
+                bail!("injected connection loss");
+            }
             Ok(state.replies.pop_front().expect("unexpected receive"))
         }
         fn scan(
@@ -9181,6 +9247,190 @@ mod tests {
                         matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
                     );
                     assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scattered_ranges_pipeline_and_recover_as_one_bounded_batch() {
+        for (source_sync, destination_sync) in [(false, false), (true, false), (false, true)] {
+            for failure in [
+                "none",
+                "source-error",
+                "destination-error",
+                "source-drop",
+                "destination-drop",
+                "mismatch",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("source");
+                std::fs::write(&path, vec![0; 4096]).unwrap();
+                let sched = Arc::new(Sched::new(512, 8192));
+                let job = FileJob {
+                    src: b"source".to_vec(),
+                    source: RegisteredPath {
+                        root: serde_json::from_str("0").unwrap(),
+                        relative: b"source".to_vec(),
+                    },
+                    dst: b"destination".to_vec(),
+                    rel: "source".into(),
+                    entry: crate::fsops::lstat_entry(Vec::new(), &path).unwrap(),
+                    dst_entry: None,
+                    target_condition: TargetCondition::Any,
+                    container_guard: None,
+                    attempt: 0,
+                    done: Arc::new(AtomicU64::new(0)),
+                    inplace: false,
+                    rel_bytes: b"source".to_vec(),
+                    src_rel: None,
+                };
+                sched.push_file(job);
+                sched.scan_done();
+                assert!(matches!(sched.next(), Item::File(0)));
+                let h = sched
+                    .ranges_ready(0, vec![(0, 512), (1024, 1536), (2048, 2560), (3072, 3584)])
+                    .unwrap();
+                let src = Arc::new(Mutex::new(PipelineState {
+                    synchronous: source_sync,
+                    ..Default::default()
+                }));
+                let dst = Arc::new(Mutex::new(PipelineState {
+                    synchronous: destination_sync,
+                    ..Default::default()
+                }));
+                for (i, off) in [0, 3072, 2048, 1024].into_iter().enumerate() {
+                    let data = vec![i as u8; 512];
+                    src.lock()
+                        .unwrap()
+                        .replies
+                        .push_back(if failure == "source-error" && i == 1 {
+                            Response::Err("injected source error".into())
+                        } else {
+                            Response::Block {
+                                off: if failure == "mismatch" && i == 1 {
+                                    999
+                                } else {
+                                    off
+                                },
+                                hash: content_digest(&data),
+                                data,
+                            }
+                        });
+                    dst.lock().unwrap().replies.push_back(
+                        if failure == "destination-error" && i == 0 {
+                            Response::Err("injected write error".into())
+                        } else {
+                            Response::Ok
+                        },
+                    );
+                }
+                if failure == "source-drop" {
+                    src.lock().unwrap().fail_receive = Some(2);
+                }
+                if failure == "destination-drop" {
+                    dst.lock().unwrap().fail_receive = Some(1);
+                }
+                let opts = Arc::new(Opts {
+                    block: 512,
+                    tuning: crate::transfer_tuning::TransferTuning {
+                        copy_path: Some(crate::transfer_tuning::CopyPath::Ranges),
+                        pipeline_depth: Some(4),
+                        ..Default::default()
+                    },
+                    benchmark: None,
+                    flags: 0,
+                    recursive: true,
+                    links: false,
+                    perms: false,
+                    devices: false,
+                    checksum: false,
+                    verify_only: false,
+                    inplace: false,
+                    same_host: false,
+                    allow_sequential_nfs_fallback: false,
+                    dst_remote: true,
+                    restricted_receiver: false,
+                    dry_run: false,
+                    quiet: true,
+                    verbose: 0,
+                    umask: 0,
+                    copy_id: std::sync::OnceLock::from([0; 16]),
+                    ignore: Vec::new(),
+                    delete: false,
+                    delete_excluded: false,
+                    max_delete: None,
+                    update: false,
+                    ignore_existing: false,
+                    preserve_existing_directory_metadata: false,
+                    existing: false,
+                    insecure_links: false,
+                    operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+                    max_size: None,
+                    min_size: None,
+                });
+                let mut worker = Worker {
+                    id: 0,
+                    src: Box::new(PipelineConn(src.clone())),
+                    dst: Box::new(PipelineConn(dst.clone())),
+                    sched: sched.clone(),
+                    progress: Progress::new(false, false, None, false),
+                    opts,
+                    bwlimit: None,
+                    gate: Gate::new(1),
+                    t: [0.0; 4],
+                    fast: FastTiming::default(),
+                    benchmark: Default::default(),
+                    fast_batch_files: 1,
+                };
+
+                let mut credited = 0;
+                let result = worker.transfer_range(&h, &mut credited);
+                assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+                if failure == "none" {
+                    assert_eq!(credited, 2048);
+                    let source = src.lock().unwrap();
+                    let destination = dst.lock().unwrap();
+                    assert_eq!(source.requests.len(), 4);
+                    assert_eq!(destination.requests.len(), 4);
+                    assert_eq!(source.sent_at_receive[0], if source_sync { 1 } else { 4 });
+                    assert_eq!(
+                        destination.sent_at_receive[0],
+                        if destination_sync { 1 } else { 4 }
+                    );
+                    assert!(sched.range_done(&h));
+                    assert!(sched.finished());
+                } else if worker.transport_dead() {
+                    worker.undo_progress(0, credited);
+                    sched.retry_range(&h, 0);
+                    let mut spans = Vec::new();
+                    for i in 0..4 {
+                        let Item::Range(range) = sched.next() else {
+                            panic!("lost retry range");
+                        };
+                        let r = range.lock().unwrap();
+                        spans.push((r.pos, r.end));
+                        drop(r);
+                        assert_eq!(sched.range_done(&range), i == 3);
+                    }
+                    spans.sort_unstable();
+                    assert_eq!(
+                        spans,
+                        vec![(0, 512), (1024, 1536), (2048, 2560), (3072, 3584)]
+                    );
+                    assert_eq!(sched.jobs.lock().unwrap()[0].done.load(Relaxed), 0);
+                    assert!(sched.finished());
+                } else {
+                    if failure == "mismatch" {
+                        assert!(result.unwrap_err().is::<RangeReplyMismatch>());
+                        assert_eq!(src.lock().unwrap().received, 2);
+                    } else {
+                        let source = src.lock().unwrap();
+                        let destination = dst.lock().unwrap();
+                        assert_eq!(source.received, source.requests.len());
+                        assert_eq!(destination.received, destination.requests.len());
+                    }
+                    assert!(sched.range_done(&h));
                 }
             }
         }

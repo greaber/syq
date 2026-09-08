@@ -188,6 +188,23 @@ travel back. Both increase potential buffering. In-process endpoints handle
 one request at a time; the response queue on worker connections follows the
 pipeline depth. These settings do not change hash blocks or partial identities.
 
+For existing remote copies with scattered small edits, try smaller comparison
+blocks while keeping larger transfer requests:
+
+```sh
+syq rsync -a -B 64K --tuning-options request-size=4M source/ host:destination/
+```
+
+The default comparison block is 4 MiB; one changed byte makes that whole block
+need copying. Smaller blocks can reduce the data sent, but require more hashes
+and requests. Syq pipelines short changed ranges from the same file within the
+existing request window. This can help on high-latency links, though the result
+depends on the edits and connection. Both endpoints still read the full file
+to compare it. Staged updates also copy the existing destination before applying
+changes when any blocks match; a complete rewrite skips that old-data copy.
+The smallest supported comparison block is 64 KiB. `-B` is part of the partial
+file identity, so keep it the same when resuming an interrupted copy.
+
 `copy-path=ranges` makes file contents use range requests, bypassing both
 small-file batches and whole-file copying, including local kernel offload.
 Matching data can still be skipped or reused. With `auto`, syq chooses the copy

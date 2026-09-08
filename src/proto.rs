@@ -743,6 +743,9 @@ pub enum Request {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
+        /// False when no destination blocks match; still consume the held
+        /// inode and create the full-sized private sidecar.
+        reuse: bool,
         attempt: u32,
         guard: Option<ContainerGuard>,
     },

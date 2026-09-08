@@ -5111,6 +5111,7 @@ impl FsOps {
         path: &[u8],
         copy_id: &CopyId,
         len: u64,
+        reuse: bool,
         attempt: u32,
         guard: Option<&ContainerGuard>,
     ) -> Result<()> {
@@ -5145,11 +5146,13 @@ impl FsOps {
             dst.set_len(0)?;
         }
         self.preallocate_new_partial(&dst, len)?;
-        held.file.seek(SeekFrom::Start(0))?;
-        let mut writer = &dst;
-        writer.seek(SeekFrom::Start(0))?;
-        io::copy(&mut held.file.take(len), &mut writer)
-            .with_context(|| format!("seed partial from {}", held.label.display()))?;
+        if reuse {
+            held.file.seek(SeekFrom::Start(0))?;
+            let mut writer = &dst;
+            writer.seek(SeekFrom::Start(0))?;
+            io::copy(&mut held.file.take(len), &mut writer)
+                .with_context(|| format!("seed partial from {}", held.label.display()))?;
+        }
         self.cache_file(location, attempt, true, dst);
         Ok(())
     }
@@ -6261,10 +6264,11 @@ impl FsOps {
                 path,
                 copy_id,
                 len,
+                reuse,
                 attempt,
                 guard,
             } => self
-                .seed_basis(path, copy_id, *len, *attempt, guard.as_ref())
+                .seed_basis(path, copy_id, *len, *reuse, *attempt, guard.as_ref())
                 .map(|_| Response::Ok),
             Request::CopyLocal {
                 source,
@@ -8172,6 +8176,39 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_basis_creates_private_empty_stage_without_copying_old_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("basis");
+        fs::write(&path, b"old contents").unwrap();
+        let copy_id = [42; 16];
+        let mut operations = FsOps::new();
+        operations
+            .hash_and_hold(
+                &path_bytes(&path),
+                &copy_id,
+                MIN_HASH_BLOCK_BYTES,
+                12,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+        operations
+            .seed_basis(&path_bytes(&path), &copy_id, 12, false, 0, None)
+            .unwrap();
+        let partial = partial_path(&path, &copy_id).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old contents");
+        assert_eq!(fs::read(&partial).unwrap(), vec![0; 12]);
+        assert_eq!(
+            fs::metadata(&partial).unwrap().permissions().mode() & 0o777,
+            PRIVATE_PARTIAL_MODE
+        );
+        assert!(operations.held_basis.is_none());
+        assert!(operations
+            .seed_basis(&path_bytes(&path), &copy_id, 12, false, 0, None)
+            .is_err());
+    }
+
+    #[test]
     fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
         let dir = test_dir();
         let selected = dir.join("selected");
@@ -8205,7 +8242,7 @@ mod tests {
         assert_eq!(hashes, vec![content_digest(b"held")]);
         assert_eq!(held_len, 4);
         operations
-            .seed_basis(b"basis", &copy_id, 4, 0, None)
+            .seed_basis(b"basis", &copy_id, 4, true, 0, None)
             .unwrap();
         let basis_partial = partial_path(&moved.join("basis"), &copy_id).unwrap();
         assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
