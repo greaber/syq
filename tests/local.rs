@@ -19952,3 +19952,5 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
         }
     }
 }
+
+mod local_copy_selection;

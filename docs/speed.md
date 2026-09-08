@@ -343,9 +343,11 @@ copy authorization.
 
 Same-machine Linux copies first try kernel or NFS server-side copying. If
 that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
-copy, syq copies eligible large files directly through their open source and destination files. It runs
-these file copies in parallel without sending their contents through local TCP
-connections. Small files still use batches. This happens automatically, without
+copy, syq copies eligible files larger than 64 KiB directly through their open
+source and destination files. It runs these file copies in parallel without
+sending their contents through local TCP connections. Files up to 64 KiB still
+use batches, subject to the hash block, request-size and batch-byte limits.
+This local batch ceiling does not reduce the size of ordinary range requests. This happens automatically, without
 tuning options. Single-file copies retain parallel range copying when offload
 is unavailable.
 
