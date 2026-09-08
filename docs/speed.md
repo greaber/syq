@@ -162,7 +162,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 | Key | Default | Accepted values |
 |---|---|---|
-| `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
+| `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 1 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
