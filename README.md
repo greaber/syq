@@ -9,8 +9,8 @@ It aims to perform well across file sizes, directory sizes, and network speeds.
 
 Quick links to docs for common tasks:
 
-- [Send files home](https://greaber.github.io/syq/receive.html)
-- [Run commands at home](https://greaber.github.io/syq/exec.html)
+- [Send files to your laptop from a server you’re SSHed into](https://greaber.github.io/syq/receive.html)
+- [Run commands on your laptop from a server](https://greaber.github.io/syq/exec.html)
 - [Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
 - [Script file placement](https://greaber.github.io/syq/mappings.html)
 - [Python SDK](https://greaber.github.io/syq/python.html)
