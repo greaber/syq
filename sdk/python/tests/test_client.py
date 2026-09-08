@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -62,7 +63,8 @@ class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_permission_error_reaps_exited_leader_and_retries_group(self):
         from syq.async_client import _kill_process_group
 
-        process = mock.Mock(pid=123, returncode=0)
+        process = mock.Mock(pid=123, returncode=None)
+        process.wait = mock.AsyncMock(return_value=0)
         for retry in (None, ProcessLookupError()):
             with self.subTest(retry=retry), mock.patch(
                 "syq.async_client.os.killpg", side_effect=[PermissionError(), retry]
@@ -76,12 +78,14 @@ class AsyncProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
         from syq.async_client import _kill_process_group
 
         process = mock.Mock(pid=123, returncode=None)
+        process.wait = mock.AsyncMock(side_effect=asyncio.TimeoutError)
         with mock.patch(
             "syq.async_client.os.killpg", side_effect=PermissionError("denied")
         ) as kill:
             with self.assertRaisesRegex(PermissionError, "denied"):
                 await _kill_process_group(process)
             self.assertEqual(kill.call_count, 1)
+            process.wait.assert_awaited_once()
 
 
 FAKE_SYQ = """#!/bin/sh
