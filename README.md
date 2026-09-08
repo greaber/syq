@@ -2,7 +2,7 @@
 
 Syq (pronounced "sick") copies and removes files in parallel, on one machine
 or over SSH.
-It is built for large files, large trees, and fast networks.
+It aims to perform well across file sizes, directory sizes, and network speeds.
 
 - **Parallel copies and removal**, with automatic connection tuning.
 - **Resume interrupted copies** by rerunning the command.
