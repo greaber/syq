@@ -197,13 +197,22 @@ syq rsync -a -B 64K --tuning-options request-size=4M source/ host:destination/
 
 The default comparison block is 4 MiB; one changed byte makes that whole block
 need copying. Smaller blocks can reduce the data sent, but require more hashes
-and requests. Syq pipelines short changed ranges from the same file within the
-existing request window. This can help on high-latency links, though the result
-depends on the edits and connection. Both endpoints still read the full file
-to compare it. Staged updates also copy the existing destination before applying
-changes when any blocks match; a complete rewrite skips that old-data copy.
-The smallest supported comparison block is 64 KiB. `-B` is part of the partial
-file identity, so keep it the same when resuming an interrupted copy.
+and requests. Keep `request-size=4M`: request size otherwise defaults to the
+comparison block, so `-B 64K` alone also shrinks requests and lowers the automatic
+streaming threshold to 256 KiB. New-file batching follows the request and batch
+limits, independently of the comparison block.
+
+Syq fills available request windows with changed ranges from the same file,
+leaving queued work for other workers. This can help on high-latency links,
+though the result depends on the edits and connection. Both endpoints still
+read the full file to compare it. By default, syq builds the updated file beside
+the destination and then replaces it. When any blocks match, this includes
+copying the existing destination before applying changes; a complete rewrite
+skips that old-data copy. With `--inplace`, changes are written directly to the
+destination instead.
+
+The smallest supported comparison block is 64 KiB. A partial file left by an
+interrupted copy can only be reused with the same `-B` value.
 
 `copy-path=ranges` makes file contents use range requests, bypassing both
 small-file batches and whole-file copying, including local kernel offload.
@@ -367,7 +376,7 @@ that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
 copy, syq copies eligible files larger than 64 KiB directly through their open
 source and destination files. It runs these file copies in parallel without
 sending their contents through local TCP connections. Files up to 64 KiB still
-use batches, subject to the hash block, request-size and batch-byte limits.
+use batches, subject to the request-size and batch-byte limits.
 This local batch ceiling does not reduce the size of ordinary range requests.
 This happens automatically, without tuning options. Single-file copies retain parallel range copying when offload
 is unavailable.

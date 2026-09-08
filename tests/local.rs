@@ -5337,7 +5337,10 @@ fn sparse_updates_recover_batched_reads_and_writes_without_losing_unchanged_byte
         assert_output_ok(&output);
         assert!(marker.exists());
         assert_eq!(read(&t.path("dst")), edited);
-        assert!(String::from_utf8_lossy(&output.stderr).contains("connection dropped; reopening"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("connection dropped; reopening"),
+            "{output:?}"
+        );
     }
 }
 

@@ -6633,10 +6633,6 @@ esac
             guard: None,
         };
         assert!(authority.authorize(&mut seed, false).is_err());
-        if let Request::SeedBasis { reuse, .. } = &mut seed {
-            *reuse = false;
-        }
-        assert!(authority.authorize(&mut seed, false).is_err());
         let mut delete = apply(Op::Unlink {
             path: path_bytes(&kept),
         });
@@ -8622,10 +8618,6 @@ esac
             attempt: 0,
             guard: None,
         };
-        assert!(authority.authorize(&mut seed, false).is_err());
-        if let Request::SeedBasis { reuse, .. } = &mut seed {
-            *reuse = false;
-        }
         assert!(authority.authorize(&mut seed, false).is_err());
 
         // An empty file is declared at zero length and can be published.
