@@ -73,4 +73,6 @@ COPY tests/real-ssh/test-root-security.py /usr/local/libexec/syq-test-root-secur
 
 COPY tests/real-ssh/test-receiver-revoke.py /usr/local/libexec/syq-test-receiver-revoke.py
 
+COPY tests/real-ssh/test-restricted-mapping.py /usr/local/libexec/syq-test-restricted-mapping.py
+
 ENTRYPOINT ["/usr/local/libexec/syq-real-ssh-entrypoint"]

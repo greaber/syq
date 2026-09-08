@@ -30,7 +30,7 @@ for name in ("laptop", "@laptop"):
 
 print("case: handoff preserves inherited results fd and raw path bytes", flush=True)
 script = r'''
-import json, os, subprocess, tempfile
+import base64, json, os, subprocess, tempfile
 base = b'/tmp/syq-real-ssh/handoff-source'
 os.mkdir(base)
 name = b'raw-\xff\n$(false)'
@@ -48,19 +48,34 @@ with tempfile.TemporaryFile() as results:
     assert sum(record.get('type') == 'result' for record in records) == 1, records
     assert records[-1]['status'] == 'success', records
 
-print('case: unsupported return mappings still settle results after handoff', flush=True)
+print('case: mapping stdin and results survive return handoff', flush=True)
+manifest = json.dumps({'src': {'encoding': 'base64', 'value': base64.b64encode(name).decode()},
+                       'dst': {'encoding': 'utf-8', 'value': 'nested/mapped'}}).encode() + b'\n'
+with tempfile.TemporaryFile() as results:
+    result = subprocess.run(['syq-other-build', 'cp', '-C', os.fsdecode(base), '--mapping', '-',
+                             '--to', '@laptop', '--into', 'skew-mapping',
+                             '--results-fd', str(results.fileno())],
+                            input=manifest, capture_output=True, pass_fds=(results.fileno(),), timeout=30)
+    assert result.returncode == 0, result
+    results.seek(0)
+    records = [json.loads(line) for line in results]
+    assert records[-1]['status'] == 'success', records
+
+print('case: invalid return mappings still settle results after handoff', flush=True)
 with tempfile.TemporaryFile() as results:
     result = subprocess.run(['syq-other-build', 'cp', '--mapping', '-', '--to', '@laptop',
-                             '--into', 'skew-mapping', '--results-fd', str(results.fileno())],
-                            input=b'', capture_output=True, pass_fds=(results.fileno(),), timeout=30)
-    assert result.returncode != 0 and b'not yet independently enforceable' in result.stderr, result
+                             '--into', 'skew-invalid-mapping', '--results-fd', str(results.fileno())],
+                            input=b'invalid JSON\n', capture_output=True,
+                            pass_fds=(results.fileno(),), timeout=30)
+    assert result.returncode != 0 and b'--mapping' in result.stderr, result
     results.seek(0)
     records = [json.loads(line) for line in results]
     assert records[-1]['status'] == 'failed', records
 '''
 run("ssh", "source", "python3 -c " + shlex.quote(script))
 assert (root / "skew-argv").read_bytes() == b"raw handoff\x00\xff"
-assert not (root / "skew-mapping").exists()
+assert (root / "skew-mapping" / "nested" / "mapped").read_bytes() == b"raw handoff\x00\xff"
+assert not (root / "skew-invalid-mapping").exists()
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 
 print("case: piped and single-writer FIFO ignore rules survive handoff and protect pruning", flush=True)

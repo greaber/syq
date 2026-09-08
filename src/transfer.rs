@@ -10,6 +10,8 @@ use crate::conn::{
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
 use crate::fsops::{content_digest, is_partial_name, join};
+pub(crate) use crate::mapping::validate_manifest_path;
+use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
@@ -1615,6 +1617,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
     let mut args = args;
+    // The executing build consumes stdin once, then shares immutable bytes with
+    // authorization and remote coordination. Neither may reopen the manifest.
+    let mapping_entries = if let Some(mapping) = args.native_mapping.as_deref() {
+        if args.detach {
+            bail!("--mapping requires an attached copy");
+        }
+        let mut contents = Vec::new();
+        if mapping == b"-" {
+            std::io::stdin()
+                .read_to_end(&mut contents)
+                .context("--mapping -: read stdin")?;
+        } else {
+            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
+                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
+                .with_context(|| format!("--mapping {}", display(mapping)))?;
+        }
+        let parsed = read_mapping_manifest(contents)?;
+        args.mapping_contents = Some(Arc::new(parsed.input));
+        Some((parsed.entries, parsed.explicit_parents))
+    } else {
+        None
+    };
     // Authorization failures settle the already-open automation stream too.
     if args.interface == Interface::NativeCp {
         crate::destination::prepare(&mut args)?;
@@ -1733,6 +1757,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // local endpoints so the invoking machine neither reads its persistence
     // policy nor creates records for connections it will never open.
     if coordinator_is_remote {
+        // The remote coordinator parses its own immutable input. Release this
+        // process's preflight entries before waiting for the remote copy.
+        drop(mapping_entries);
         if args.rsh.is_some() {
             let rsh = parse_rsh(&args.rsh)?;
             if !rsh[0].ends_with("ssh")
@@ -1861,25 +1888,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
-    // Acquire the entire mapping through its retained selection before any
-    // destination root can be created. The planner already consumes the whole
-    // manifest; retaining these bytes also makes later namespace replacement
-    // irrelevant.
-    let mapping_contents = if let Some(mapping) = args.native_mapping.as_deref() {
-        let mut contents = Vec::new();
-        if mapping == b"-" {
-            std::io::stdin()
-                .read_to_end(&mut contents)
-                .context("--mapping -: read stdin")?;
-        } else {
-            crate::fsops::open_operator_file_read(mapping, control_operator_symlink_policy(&args))
-                .and_then(|mut input| input.read_to_end(&mut contents).map_err(Into::into))
-                .map_err(|error| anyhow::anyhow!("--mapping {}: {error}", display(mapping)))?;
-        }
-        Some(contents)
-    } else {
-        None
-    };
+    let mapping_contents = args.mapping_contents.clone();
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
     // Workers connect on their own threads once the control connections are
@@ -2148,6 +2157,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: control connections up in {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    if args.restricted_grant.is_some() {
+        if let Some(contents) = &mapping_contents {
+            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
+        }
     }
     let destination_supports_confined_socket_nodes = match &dst_ep {
         Endpoint::Remote(spec) => {
@@ -2927,6 +2941,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         fresh_capacity,
         src_overrides: std::collections::HashMap::new(),
         implicit_dirs: std::collections::HashSet::new(),
+        mapping_explicit_parents: std::collections::HashSet::new(),
+        blocked_mapping_parents: std::collections::HashSet::new(),
+        implicit_restorations: Vec::new(),
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root && opts.preserve_existing_directory_metadata {
             std::collections::HashSet::from([dst_root.clone()])
@@ -2968,15 +2985,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut fresh_capacity_assessment = None;
     let mut fresh_capacity_shortage = None;
     let mut dry_run_mappings = Vec::with_capacity(srcs.len());
-    if let Some(mapping_contents) = mapping_contents.as_deref() {
+    if let Some((mapping_entries, explicit_parents)) = mapping_entries {
         let src = &srcs[0];
         st.active_source = Some(
             source_roots.get().expect("source roots registered")[0]
                 .selection
                 .clone(),
         );
-        let mut reader = std::io::Cursor::new(mapping_contents);
-        match st.scan_mapping(&mut *src_ctl, &src.path, &dst_root, &mut reader) {
+        match st.scan_mapping(
+            &mut *src_ctl,
+            &src.path,
+            &dst_root,
+            mapping_entries,
+            explicit_parents,
+        ) {
             Ok(()) => dry_run_mappings.push(DryRunMapping {
                 target: dst_root.clone(),
                 semantics: "entries selected by --mapping",
@@ -4714,6 +4736,15 @@ struct Planner<'a> {
     /// --mapping: full destination paths of implicit ancestor directories no
     /// entry names, created with default metadata (no deferred stamping).
     implicit_dirs: std::collections::HashSet<PathBytes>,
+    /// Manifest-relative parents with their own entry, even in a later batch.
+    /// The signed mapping permits replacing these, unlike implicit parents.
+    mapping_explicit_parents: std::collections::HashSet<PathBytes>,
+    /// Observed obstructions at implicit parents fail only mapped descendants.
+    blocked_mapping_parents: std::collections::HashSet<PathBytes>,
+    /// Only implicit parents actually reopened for writing need a final chmod.
+    /// Keep these separate until the manifest is complete: a later explicit
+    /// directory entry supplies its own deferred metadata instead.
+    implicit_restorations: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
     /// Directories this copy created may receive metadata from later sources.
     created_dirs: std::collections::HashSet<PathBytes>,
     /// This run consumes a --mapping manifest (identity entries included).
@@ -5210,8 +5241,7 @@ impl Planner<'_> {
     /// Consume an already-acquired NDJSON mapping manifest: each entry claims
     /// exactly one source object (relative to `src_root`) at an explicit
     /// destination (relative to `dst_root`). The caller buffers the complete
-    /// input before opening the destination, and this planner validates the
-    /// complete manifest before applying any entry. Destination ancestors with
+    /// input and validates it before opening the destination. Destination ancestors with
     /// no entries are synthesized as implicit directories with default
     /// metadata.
     fn scan_mapping(
@@ -5219,10 +5249,16 @@ impl Planner<'_> {
         src: &mut dyn Conn,
         src_root: &[u8],
         dst_root: &[u8],
-        reader: &mut dyn std::io::BufRead,
+        entries: Vec<(u64, ManifestEntry)>,
+        explicit_parents: std::collections::HashSet<PathBytes>,
     ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         self.mapping_mode = true;
+        if self.opts.restricted_receiver {
+            self.mapping_explicit_parents = explicit_parents;
+        } else {
+            drop(explicit_parents);
+        }
         let source_base = self
             .active_source
             .clone()
@@ -5248,21 +5284,9 @@ impl Planner<'_> {
         }
         self.progress.scanned.fetch_add(1, Relaxed);
 
-        // Phase 1: read and validate the whole manifest before any entry is
-        // applied. Parse errors, duplicate destinations, and declared-kind
-        // ancestor conflicts refuse the run (the --into container was
-        // already created, as with --files-from); the price is memory
-        // proportional to the manifest, which the multi-source preflight
-        // already accepts. Conflicts only observable
-        // at execution (an undeclared ancestor that is not a directory,
-        // destination state) still fail entries individually below.
-        let entries = read_mapping_manifest(reader)?;
-
-        // Phase 2: stat sources and plan in chunks; as with any native
-        // copy, transfers begin once planning completes. `emitted`
-        // is what the planner was given for each destination path;
-        // `synthesized` are implicit ancestors an explicit entry may still
-        // upgrade.
+        // Stat sources and plan the already-validated entries in chunks.
+        // Conflicts that depend on source or destination state fail individual
+        // entries here. `synthesized` tracks ancestors a later entry can name.
         let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
         let mut synthesized: HashSet<PathBytes> = HashSet::new();
         let mut remaining = entries.into_iter().peekable();
@@ -5510,6 +5534,14 @@ impl Planner<'_> {
     }
 
     fn retire_planning_state(&mut self) {
+        // Resolve late explicit directory promotions before discarding the
+        // implicit-parent index. Only the remaining implicit parents restore
+        // receiver modes; explicit entries already have their own metadata.
+        self.deferred.extend(
+            std::mem::take(&mut self.implicit_restorations)
+                .into_iter()
+                .filter(|(path, ..)| self.implicit_dirs.contains(path)),
+        );
         // The preflight maps are dead now — except the sidecar set, which
         // --delete needs (only its keys) to tell a live sidecar from an
         // orphan. On multi-million-file trees these are the difference
@@ -5526,6 +5558,8 @@ impl Planner<'_> {
         // alone still needs the destination claims and live sidecar names.
         self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
+        self.mapping_explicit_parents = std::collections::HashSet::new();
+        self.blocked_mapping_parents = std::collections::HashSet::new();
         self.dry_run_replaced_dirs = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
         // Dry-run directory traces are intentionally deferred until after
@@ -5594,6 +5628,9 @@ impl Planner<'_> {
             let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
                 continue;
             };
+            if claim != Claim::Weak && self.fail_blocked_mapping_entry(&dst, &dst_rel, e.kind) {
+                continue;
+            }
             self.record_fresh_entry(&dst, &e, new_capacity_object);
             let src = match self.src_overrides.get(&e.path) {
                 Some(actual) => join(src_root, actual),
@@ -5770,7 +5807,7 @@ impl Planner<'_> {
         let Mapped {
             dst_root,
             dirs,
-            others,
+            mut others,
             dir_stats,
             mut other_stats,
         } = mapped;
@@ -5789,6 +5826,9 @@ impl Planner<'_> {
             };
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
             for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
+                if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
+                    continue;
+                }
                 // Keep the parent-first overlay invariant explicit here too:
                 // a directory below a replacement is missing in the virtual
                 // destination tree.
@@ -5828,6 +5868,18 @@ impl Planner<'_> {
                         ));
                     }
                     self.missing_dirs.insert(p);
+                    continue;
+                }
+                if opts.restricted_receiver
+                    && st.is_some()
+                    && !is_dir
+                    && self.implicit_dirs.contains(&p)
+                    && !self.mapping_explicit_parents.contains(&dst_rel)
+                {
+                    // Parent creation does not grant permission to replace a
+                    // file or symlink. Use the stat already in this batch to
+                    // fail affected entries before sending any mkdir request.
+                    self.blocked_mapping_parents.insert(p);
                     continue;
                 }
                 if opts.dry_run && st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
@@ -5923,10 +5975,17 @@ impl Planner<'_> {
                         root_must_be_new
                             || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
                     })
-                    .map(|(p, _, e, _)| Op::Mkdir {
+                    .map(|(p, _, e, st)| Op::Mkdir {
                         path: p.clone(),
                         mode: e.mode,
-                        condition: self.exact_condition_for(p),
+                        condition: if opts.restricted_receiver
+                            && st.is_none()
+                            && self.implicit_dirs.contains(p)
+                        {
+                            TargetCondition::Absent
+                        } else {
+                            self.exact_condition_for(p)
+                        },
                     })
                     .collect();
                 if let Some(root_index) = new_dirs.iter().position(|op| {
@@ -5973,6 +6032,7 @@ impl Planner<'_> {
                         self.container_guard = Some(target_container(&self.dst_root, &created));
                     }
                 }
+                let mut reopened_dirs = std::collections::HashSet::new();
                 for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
                     let n = new_dirs.len();
                     let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
@@ -6012,6 +6072,9 @@ impl Planner<'_> {
                         if preexisting && succeeded {
                             // Reopened for writability only; nothing was made.
                             reopened += 1;
+                            if self.implicit_dirs.contains(name) {
+                                reopened_dirs.insert(name.clone());
+                            }
                             continue;
                         }
                         if let (Some(results), Some(dst_rel)) = (
@@ -6058,14 +6121,26 @@ impl Planner<'_> {
                     flags &= !flags::MODE;
                 }
                 for (p, _, e, s) in &planned {
-                    // Implicit --mapping ancestors keep the metadata their
-                    // creation gave them; only named entries stamp source
-                    // metadata. Missing-only copies stamp only successful
-                    // creations, never failed mkdirs or pre-existing directories.
-                    if self.implicit_dirs.contains(p)
-                        || (opts.preserve_existing_directory_metadata
-                            && !self.created_dirs.contains(p))
-                    {
+                    // New implicit parents already have their final modes.
+                    // Restore only those temporarily reopened for writing.
+                    if self.implicit_dirs.contains(p) {
+                        if reopened_dirs.contains(p) {
+                            let existing = s.as_ref().expect("reopened directory was observed");
+                            self.implicit_restorations.push((
+                                p.clone(),
+                                existing.meta(),
+                                if opts.restricted_receiver {
+                                    flags::RECEIVER_MODE
+                                } else {
+                                    flags::MODE
+                                },
+                                p.iter().filter(|&&c| c == b'/').count(),
+                                self.metadata_condition_for(p),
+                            ));
+                        }
+                        continue;
+                    }
+                    if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
                         continue;
                     }
                     let depth = p.iter().filter(|&&c| c == b'/').count();
@@ -6100,6 +6175,9 @@ impl Planner<'_> {
             }
         }
 
+        if !self.blocked_mapping_parents.is_empty() {
+            others.retain(|p| !self.fail_blocked_mapping_entry(&p.dst, &p.dst_rel, p.e.kind));
+        }
         if others.is_empty() {
             return Ok(());
         }
@@ -6765,6 +6843,41 @@ impl Planner<'_> {
                 .cloned()
                 .unwrap_or_else(|| dst_rel.to_vec()),
         )
+    }
+
+    /// Report only real manifest entries beneath a protected obstruction;
+    /// synthesized directories have no source object or retry record.
+    fn fail_blocked_mapping_entry(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) -> bool {
+        if !Self::under_any(&self.blocked_mapping_parents, dst, &self.dst_root) {
+            return false;
+        }
+        if !self.implicit_dirs.contains(dst) {
+            let message = format!(
+                "syq: {}: a file or symlink blocks an implicit mapping parent",
+                display(dst)
+            );
+            self.progress
+                .error_classified(&message, Some("conflict"), None);
+            self.emit_mapping_entry_failed(
+                &ManifestEntry {
+                    src: self
+                        .mapping_source_rel(dst_rel)
+                        .expect("mapping parent failure"),
+                    dst: dst_rel.to_vec(),
+                    kind: Some(match kind {
+                        Kind::Dir => DeclaredKind::Dir,
+                        Kind::File => DeclaredKind::File,
+                        Kind::Symlink => DeclaredKind::Symlink,
+                        _ => DeclaredKind::Special,
+                    }),
+                },
+                "unknown",
+                "conflict",
+                None,
+                &message,
+            );
+        }
+        true
     }
 
     /// A mapping entry that failed before any job existed (missing source,
@@ -8797,6 +8910,47 @@ impl Worker {
     }
 }
 
+/// A destination ancestor directory no manifest entry names: created with
+/// default metadata (mode through the umask, natural mtime; see
+/// `Planner::implicit_dirs`).
+fn implicit_dir_entry(path: PathBytes) -> Entry {
+    Entry {
+        path,
+        kind: Kind::Dir,
+        size: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        dev: 0,
+        ino: 0,
+        ctime: 0,
+        ctime_nsec: 0,
+        link: None,
+    }
+}
+
+/// A queued symlink/special creation: the display string for -v plus the
+/// machine-readable identity `--results` records need.
+struct QueuedLeafOp {
+    dst_rel: PathBytes,
+    action: &'static str,
+    kind: &'static str,
+    name: String,
+}
+
+/// The container-relative spelling of a full destination path; None for the
+/// container itself.
+fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
+    if path == dst_root {
+        return None;
+    }
+    let rest = path.strip_prefix(dst_root)?;
+    Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9586,217 +9740,4 @@ mod tests {
         assert!(output.contains("receive unavailable, send-buffer unavailable"));
         assert!(output.contains("tcp ECN CE deliveries: unavailable"));
     }
-}
-
-/// One parsed `--mapping` manifest entry.
-struct ManifestEntry {
-    src: PathBytes,
-    dst: PathBytes,
-    kind: Option<DeclaredKind>,
-}
-
-/// The manifest's `kind` field: disambiguation of the request, not a
-/// precondition. A mismatch fails that entry the way a missing source does.
-#[derive(Clone, Copy)]
-enum DeclaredKind {
-    File,
-    Dir,
-    Symlink,
-    Special,
-}
-
-impl DeclaredKind {
-    fn matches(self, kind: Kind) -> bool {
-        match self {
-            DeclaredKind::File => kind == Kind::File,
-            DeclaredKind::Dir => kind == Kind::Dir,
-            DeclaredKind::Symlink => kind == Kind::Symlink,
-            DeclaredKind::Special => matches!(
-                kind,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
-            ),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DeclaredKind::File => "file",
-            DeclaredKind::Dir => "dir",
-            DeclaredKind::Symlink => "symlink",
-            DeclaredKind::Special => "special",
-        }
-    }
-}
-
-fn parse_manifest_entry(text: &str) -> Result<ManifestEntry> {
-    use base64::Engine as _;
-    // Unknown keys are rejected so a typo cannot be silently dropped; the
-    // known informational fields (`size`, `mtime`, a tagged path's `display`)
-    // are accepted and ignored so `syq map` output and future automation
-    // records round-trip.
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WirePath {
-        encoding: String,
-        value: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        display: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct WireEntry {
-        src: WirePath,
-        dst: WirePath,
-        #[serde(default)]
-        kind: Option<String>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        size: Option<u64>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        mtime: Option<i64>,
-    }
-    let entry: WireEntry = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let decode = |path: WirePath, which: &str| -> Result<PathBytes> {
-        let bytes = match path.encoding.as_str() {
-            "utf-8" => path.value.into_bytes(),
-            "base64" => base64::engine::general_purpose::STANDARD
-                .decode(path.value.as_bytes())
-                .map_err(|e| anyhow::anyhow!("{which}: invalid base64 path: {e}"))?,
-            other => bail!("{which}: unknown path encoding {other:?}"),
-        };
-        validate_manifest_path(&bytes, which)?;
-        Ok(bytes)
-    };
-    let src = decode(entry.src, "src")?;
-    let dst = decode(entry.dst, "dst")?;
-    let kind = match entry.kind.as_deref() {
-        None => None,
-        Some("file") => Some(DeclaredKind::File),
-        Some("dir") => Some(DeclaredKind::Dir),
-        Some("symlink") => Some(DeclaredKind::Symlink),
-        Some("special") => Some(DeclaredKind::Special),
-        Some(other) => bail!("unknown kind {other:?}"),
-    };
-    Ok(ManifestEntry { src, dst, kind })
-}
-
-pub(crate) fn validate_manifest_path(path: &[u8], which: &str) -> Result<()> {
-    if path.is_empty() {
-        bail!("{which} path is empty");
-    }
-    if path[0] == b'/' {
-        bail!(
-            "{which} path {:?} is absolute; mapping entries are root-relative",
-            String::from_utf8_lossy(path)
-        );
-    }
-    if path.contains(&0) {
-        bail!("{which} path contains NUL");
-    }
-    for component in path.split(|&byte| byte == b'/') {
-        if component.is_empty() || component == b"." || component == b".." {
-            bail!(
-                "{which} path {:?} contains an empty, `.`, or `..` component",
-                String::from_utf8_lossy(path)
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A destination ancestor directory no manifest entry names: created with
-/// default metadata (mode through the umask, natural mtime; see
-/// `Planner::implicit_dirs`).
-fn implicit_dir_entry(path: PathBytes) -> Entry {
-    Entry {
-        path,
-        kind: Kind::Dir,
-        size: 0,
-        mtime: 0,
-        mtime_nsec: 0,
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        dev: 0,
-        ino: 0,
-        ctime: 0,
-        ctime_nsec: 0,
-        link: None,
-    }
-}
-
-/// A queued symlink/special creation: the display string for -v plus the
-/// machine-readable identity `--results` records need.
-struct QueuedLeafOp {
-    dst_rel: PathBytes,
-    action: &'static str,
-    kind: &'static str,
-    name: String,
-}
-
-/// The container-relative spelling of a full destination path; None for the
-/// container itself.
-fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
-    if path == dst_root {
-        return None;
-    }
-    let rest = path.strip_prefix(dst_root)?;
-    Some(rest.strip_prefix(b"/").unwrap_or(rest))
-}
-
-/// Phase-1 manifest read for `--mapping`: parse every line and run the
-/// parse-level preflight (duplicate destinations; an entry whose destination
-/// is a strict ancestor of another entry's destination must not declare a
-/// non-directory kind) before anything is written. Whether an undeclared
-/// ancestor really is a directory is only knowable from the source and is
-/// checked during execution.
-fn read_mapping_manifest(reader: &mut dyn std::io::BufRead) -> Result<Vec<(u64, ManifestEntry)>> {
-    let mut entries: Vec<(u64, ManifestEntry)> = Vec::new();
-    let mut declared: std::collections::HashMap<PathBytes, Option<DeclaredKind>> =
-        std::collections::HashMap::new();
-    let mut line_number = 0u64;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| anyhow::anyhow!("--mapping: read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        line_number += 1;
-        let text = line.trim_end_matches('\n').trim_end_matches('\r');
-        if text.is_empty() {
-            continue;
-        }
-        let entry = parse_manifest_entry(text)
-            .map_err(|e| anyhow::anyhow!("--mapping line {line_number}: {e}"))?;
-        if declared.insert(entry.dst.clone(), entry.kind).is_some() {
-            bail!(
-                "--mapping line {line_number}: duplicate destination {} (duplicate entries are errors; deduplicate in the generator)",
-                display(&entry.dst)
-            );
-        }
-        entries.push((line_number, entry));
-    }
-    for (line_number, entry) in &entries {
-        for (i, &byte) in entry.dst.iter().enumerate() {
-            if byte != b'/' {
-                continue;
-            }
-            if let Some(Some(kind)) = declared.get(&entry.dst[..i]) {
-                if !matches!(kind, DeclaredKind::Dir) {
-                    bail!(
-                        "--mapping line {line_number}: destination ancestor {} of {} is mapped with kind {:?}, not dir",
-                        display(&entry.dst[..i]),
-                        display(&entry.dst),
-                        kind.label()
-                    );
-                }
-            }
-        }
-    }
-    Ok(entries)
 }

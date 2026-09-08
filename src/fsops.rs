@@ -2812,6 +2812,7 @@ impl FsOps {
             | Request::ReadStream(_)
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
+            | Request::MappingChunk { .. }
             | Request::StopReadStream => {}
         }
         Ok(req)
@@ -6426,6 +6427,7 @@ impl FsOps {
             | Request::ReadStream(_)
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
+            | Request::MappingChunk { .. }
             | Request::StopReadStream => Err(anyhow!("unexpected request")),
         };
         match r {

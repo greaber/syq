@@ -88,7 +88,10 @@ explicitly selected restricted SSH data channels (including receivers with long
 account-home paths for both SSH modes), destination-side coordination through
 the reversed constrained-agent edge, and an explicit local relay. Every path
 uses real SSH for control and bootstrap, and the suite compares the complete
-source and destination manifests afterward.
+source and destination manifests afterward. Mapping checks cover file and stdin
+manifests across these routes, more than 1,024 mapped destinations, chunked
+manifest delivery, nonrecursive directory entries, verification, timestamp
+skipping, and named receiving destinations.
 
 Range-transfer checks also copy a large file with a 64-request pipeline and
 2 MiB requests with average bandwidth pacing over TCP and SSH, then through

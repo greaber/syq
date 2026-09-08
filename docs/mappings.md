@@ -96,6 +96,31 @@ Any program can generate this format:
 syq cp --mapping pairs.ndjson -C photos --to nas --into /archive
 ```
 
+## Copy between servers
+
+The manifest is read on the machine where you run the command. Its source
+paths resolve on the source server, and its destination paths resolve beneath
+the destination container:
+
+```sh
+syq cp --from hostA -C /data --mapping pairs.ndjson --to hostB --into /archive
+```
+
+`--mapping -` reads the manifest from stdin. File contents follow the selected
+copy route. The restricted receiver verifies the authorized manifest and permits
+writes only at its listed destinations, plus creation of necessary parent
+directories. New implicit parents use normal directory permissions subject to
+the receiver’s umask. Existing implicit parents keep their permissions, including
+restoration if copying temporarily requires write access. A listed directory
+still selects only that directory, not its unlisted children. If a file or symlink
+blocks an implicit parent, the affected entries fail and unrelated mappings
+continue. Replacing that obstruction requires a directory entry for the parent
+in the manifest.
+Restricted receivers count mapped destinations and their parent directories
+against the copy’s entry limit. Each manifest line can be up to 1 MiB, and each
+destination path up to 4096 bytes. There is no separate limit on the total
+manifest size.
+
 ## Emitting a mapping
 
 ```sh
@@ -113,7 +138,7 @@ Copy options and filters belong to the later `cp` command or your transform.
 
 - `--mapping` replaces `cp` source selectors. Use `--into`, `--into-new`, or
   `--into-existing` for the destination. It cannot combine with `--as` or
-  `--prune`, and a mapping copy requires at least one local endpoint.
+  `--prune` or `--detach`. Both endpoints may be remote.
 - A contents selection emits paths relative to the selected directory. Use
   that same directory as the consuming copy's `-C` base. Named `map`
   selectors must be relative and resolve inside their base; a contents
@@ -163,3 +188,8 @@ The filter skips non-retryable entries, including failed implicit parent
 creation without a source path. It does not guarantee that retrying will
 succeed; fix the underlying error first. Unchanged and excluded files appear
 only in summary totals, not as individual results.
+
+For command-restricted copies between servers, `--results` contains verified
+[receiver receipts](remote-reference.md#signed-results). These describe
+destination changes rather than source entry failures; retry the original
+mapping instead of applying the `operation_result` filter above.

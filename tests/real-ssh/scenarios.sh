@@ -289,6 +289,8 @@ diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
 ssh source 'syq cp --verify-only --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 ssh source 'syq cp --only-new /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
+ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
+
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as escape/escaped'; then
@@ -680,6 +682,8 @@ ssh destination '
     test ! -e ~/.local/libexec/syq-receiver
 '
 
+python3 /usr/local/libexec/syq-test-restricted-mapping.py
+
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
@@ -729,14 +733,9 @@ syq cp --verify-only --no-progress -j 2 \
     --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
 test "$policy_status" -eq 23
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
-policy_status=0
-syq cp --skip-newer --no-progress -j 2 \
-    --from source --srcs-in /tmp/syq-real-ssh/direct-source \
-    --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
-test "$policy_status" -ne 0
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'
-syq cp --skip-newer --coordinate-at local --no-progress -j 2 \
+syq cp --skip-newer --no-progress -j 2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'

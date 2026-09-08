@@ -121,6 +121,9 @@ pub struct Args {
     /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
     pub native_mapping: Option<Vec<u8>>,
+    /// Frozen local manifest input shared with signing and remote coordination.
+    #[arg(skip)]
+    pub mapping_contents: Option<std::sync::Arc<crate::mapping::Input>>,
     /// `--results` NDJSON outcome stream for native cp or rm.
     #[arg(skip)]
     pub native_results: Option<Vec<u8>>,
@@ -1019,7 +1022,7 @@ struct NativeCopyFields {
     /// Map one named source exactly to PATH; its final entry must exist and is never followed
     #[arg(long, value_name = "PATH", group = "placement")]
     as_existing: Option<OsString>,
-    /// Copy the entries of an NDJSON mapping manifest (`-` reads stdin), acquired before
+    /// Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before
     /// destination changes, instead of selecting sources; entry src paths are relative to
     /// -C and dst paths are relative to the --into container
     #[arg(long, value_name = "FILE")]
@@ -1416,16 +1419,6 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     args.native_follow = copy.selection.source.follow;
     args.native_follow_src = copy.selection.source.follow_src;
     args.native_follow_dst = copy.follow_dst;
-    if args.native_mapping.is_some() {
-        // The manifest is read on this machine and its entries are stat'ed
-        // through the source connection; a direct remote-to-remote copy has
-        // no way to carry either.
-        let src_remote = args.locations.first().is_some_and(|l| l.host.is_some());
-        let dst_remote = args.locations.last().is_some_and(|l| l.host.is_some());
-        if src_remote && dst_remote {
-            bail!("--mapping with a remote-to-remote copy is not supported; one end must be local");
-        }
-    }
     apply_native_copy_operational(&mut args, copy.operational, &matches)?;
     apply_native_remote(&mut args, remote)?;
     if args.receiver_max_entries.is_some()

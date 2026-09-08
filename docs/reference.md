@@ -187,9 +187,10 @@ Combine it with `--only-existing` to avoid creating missing entries too.
 in-place write could otherwise leave an incomplete file that the next run skips.
 
 These options do not disable `--prune`; requested pruning still removes extras.
-For command-restricted remote-to-remote copies, `--skip-newer` is refused because
-the receiver cannot independently enforce the source timestamp claim.
-Use `--coordinate-at local` to make that comparison on your machine.
+Command-restricted copies support `--skip-newer` too. The comparison uses source
+timestamps, which a compromised source can invent. The receiver still enforces
+the permitted destination paths, operations, and limits; `--only-existing --skip-newer`
+also keeps the receiver's independent existing-object protection.
 The restricted path also refuses `--only-existing --inplace`.
 
 ## Preview changes
