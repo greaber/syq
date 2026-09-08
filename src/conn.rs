@@ -535,7 +535,7 @@ impl LocalConn {
 }
 
 impl Conn for LocalConn {
-    fn send(&mut self, req: Request) -> Result<()> {
+    fn send(&mut self, mut req: Request) -> Result<()> {
         anyhow::ensure!(
             self.write_stream.is_none() || matches!(req, Request::WriteRange { .. }),
             "only range writes are valid during streaming writes"
@@ -611,7 +611,7 @@ impl Conn for LocalConn {
             }
             _ => {}
         }
-        let resp = self.ops.handle(&req);
+        let resp = self.ops.handle_in_place(&mut req);
         if let Some(state) = &mut self.write_stream {
             state.record(resp);
             return Ok(());
@@ -623,7 +623,7 @@ impl Conn for LocalConn {
         if self.pending.is_empty() {
             if let Some(stream) = &mut self.read_stream {
                 if stream.off < self.read_stream_limit {
-                    let response = self.ops.handle(&stream.next_request());
+                    let response = self.ops.handle_in_place(&mut stream.next_request());
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
                     } else {
