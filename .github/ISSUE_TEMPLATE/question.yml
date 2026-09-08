@@ -1,0 +1,22 @@
+name: Usage question
+description: Ask for help using syq
+labels: ["question"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe your task and what you would like help with.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: What command did you try?
+      description: If you have tried a command, paste it here with any relevant output. Remove credentials and private information.
+      render: shell
+  - type: textarea
+    id: question
+    attributes:
+      label: What happened, or what is unclear?
+      description: Include your syq version and operating system if they are relevant.
