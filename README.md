@@ -9,11 +9,13 @@ It aims to perform well across file sizes, directory sizes, and network speeds.
 
 Quick links to docs for common tasks:
 
-- [Send files to your laptop from a server you’re SSHed into](https://greaber.github.io/syq/receive.html)
+- [Send files to your laptop from a server you’re SSHed into](https://greaber.github.io/syq/receive.html).
+  Your laptop needs no SSH server or incoming network port.
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/exec.html)
 - [Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
-- [Script file placement](https://greaber.github.io/syq/mappings.html)
-- [Python SDK](https://greaber.github.io/syq/python.html)
+- [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
+- Use syq from [scripts](https://greaber.github.io/syq/automation.html) or
+  [Python](https://greaber.github.io/syq/python.html).
 
 ## Install
 
@@ -32,6 +34,20 @@ brew install greaber/tap/syq
 
 See [installation details](https://greaber.github.io/syq/install.html) for
 updates and shell completion.
+
+## Try a copy
+
+Replace `server` with an SSH hostname or alias you normally connect to,
+and `project` with a local directory:
+
+```sh
+syq cp project --to server --into backup
+```
+
+This creates or updates `backup/project` in your home directory on the server.
+Add `--dry-run` to preview the copy. If interrupted, rerun the same command to
+resume. See [Copy files](https://greaber.github.io/syq/reference.html) for more
+examples.
 
 ## Developing syq
 
