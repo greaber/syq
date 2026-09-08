@@ -11899,7 +11899,11 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     write(&t.path("src/file"), &original);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
-    let child = compat_command()
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    let ready = t.path("finalize-ready");
+    let continuation = t.path("finalize-continue");
+    let mut child = compat_command()
         .args([
             "-a",
             "--stats",
@@ -11909,22 +11913,39 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    // This includes copying the fixture in a debug build. Uncompressed local
-    // receiver traffic can take more than two seconds; wait for publication,
-    // not a throughput target, before changing the source during the hold.
+    // Wait for an acknowledged publication, then release it after replacing
+    // the source. The test must not race a fixed one-second sleep.
+    let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to finalize",
-        std::time::Duration::from_secs(10),
-        || t.path("dst/file").exists(),
+        "first attempt to acknowledge finalization",
+        std::time::Duration::from_secs(60),
+        || {
+            if ready.exists() {
+                return true;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "copy exited before finalization"
+            );
+            if progress.elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    child.id()
+                );
+                progress = std::time::Instant::now();
+            }
+            false
+        },
     );
-    write(&t.path("replacement"), &changed);
-    set_mtime(&t.path("replacement"), 1_600_000_001);
+    assert!(t.path("dst/file").exists());
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
+    release_confinement_barrier(&continuation);
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -11950,22 +11971,44 @@ fn changed_source_retry_still_uses_copy_file_range() {
     write(&t.path("src/file"), &original);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
-    let child = compat_command()
+    write(&t.path("replacement"), &changed);
+    set_mtime(&t.path("replacement"), 1_600_000_001);
+    let ready = t.path("finalize-ready");
+    let continuation = t.path("finalize-continue");
+    let mut child = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
-        .env("SYQ_TEST_HOLD_AFTER_FINALIZE_MS", "1000")
+        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
         .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
+    let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to finalize",
-        std::time::Duration::from_secs(10),
-        || t.path("dst/file").exists(),
+        "first attempt to acknowledge finalization",
+        std::time::Duration::from_secs(60),
+        || {
+            if ready.exists() {
+                return true;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "copy exited before finalization"
+            );
+            if progress.elapsed() >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    child.id()
+                );
+                progress = std::time::Instant::now();
+            }
+            false
+        },
     );
-    write(&t.path("replacement"), &changed);
-    set_mtime(&t.path("replacement"), 1_600_000_001);
+    assert!(t.path("dst/file").exists());
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
+    release_confinement_barrier(&continuation);
 
     let output = child.wait_with_output().unwrap();
     assert!(
