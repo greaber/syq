@@ -205,6 +205,12 @@ applies only to ordinary ranges, and automatic remote selection also reports
 the size above which ranges stream. It does not claim which paths ran; use
 the observed range and streaming counters for that.
 
+Streaming uses blocks of at most 1 MiB by default, reducing the payload held
+in each buffered frame. Smaller hash blocks still bound the streaming block
+size. This does not change hash/resume blocks, ordinary request sizes, or which
+ranges automatically stream. An explicit `request-size` overrides streaming
+block size too; bandwidth pacing and receiver limits can reduce either size.
+
 Streaming sends
 checked source blocks and collects destination write replies concurrently,
 instead of limiting the number of blocks awaiting replies. It still verifies
@@ -297,8 +303,8 @@ capped runs.
 
 ### Recording a comparison
 
-With overrides, `-v` reports effective settings, including any reduction in
-request size or increase in the split threshold. A final `syq: tuning observed:`
+With overrides, `-v` reports effective ordinary request and streaming block
+sizes, including any reduction in request size or increase in the split threshold. A final `syq: tuning observed:`
 line contains diagnostic JSON with copy-path counts, range request count,
 streaming-range and streamed-block counts,
 largest requested range, and largest worker batch by file count and content
