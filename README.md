@@ -1,17 +1,17 @@
 # syq
 
-Syq (pronounced "sick") copies and removes files in parallel, on one machine
-or over SSH.
+Syq (pronounced "sick") copies, reorganizes, and removes files—locally or
+across machines. Resume interrupted transfers, send files home or request
+commands on your desktop from a remote shell, and automate with JSON.
 It aims to perform well across file sizes, directory sizes, and network speeds.
 
-- **Parallel copies and removal**, with automatic connection tuning.
-- **Resume interrupted copies** by rerunning the command.
-- **Direct server-to-server transfers** without forwarding your SSH agent.
-- **Approved commands on your receiving machine**, for local builds and opening artifacts.
-- **Gitignore-style filters**, programmable file placement, and JSON results.
-
 [Documentation](https://greaber.github.io/syq/) ·
-[Benchmarks](https://greaber.github.io/syq-bench/)
+[Benchmarks](https://greaber.github.io/syq-bench/) ·
+[Send files home](https://greaber.github.io/syq/receive.html) ·
+[Run commands at home](https://greaber.github.io/syq/exec.html) ·
+[Copy between servers](https://greaber.github.io/syq/remote-to-remote.html) ·
+[Script file placement](https://greaber.github.io/syq/mappings.html) ·
+[Python SDK](https://greaber.github.io/syq/python.html)
 
 ## Install
 
