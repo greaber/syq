@@ -13,7 +13,7 @@ server or incoming network port.
 <a href="https://greaber.github.io/syq-bench/">Benchmarks ↗</a>
 <a href="receive.html">Send files to your laptop</a>
 <a href="exec.html">Run commands on your laptop</a>
-<a href="remote-to-remote.html">Copy between servers</a>
+<a href="remote-to-remote.html">Copy directly between servers without forwarding your SSH agent</a>
 <a href="mappings.html">Rename and reorganize files during a copy</a>
 <a href="automation.html">Use syq from scripts</a>
 <a href="python.html">Use syq from Python</a>
