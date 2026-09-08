@@ -6183,14 +6183,14 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 "{out:?}"
             );
             if route != "local" {
-                assert!(stderr_of(&out).contains("streaming-block-size=1048576 bytes"));
+                assert!(stderr_of(&out).contains("streaming-block-size=2097152 bytes"));
                 if label == "short" {
                     assert_eq!(observed["range_requests"], 4, "{out:?}");
                     assert_eq!(observed["max_request_bytes"], 4 << 20, "{out:?}");
                 } else {
                     assert_eq!(observed["range_requests"], 0, "{out:?}");
-                    assert_eq!(observed["max_request_bytes"], 1 << 20, "{out:?}");
-                    assert_eq!(observed["streamed_blocks"], 21, "{out:?}");
+                    assert_eq!(observed["max_request_bytes"], 2 << 20, "{out:?}");
+                    assert_eq!(observed["streamed_blocks"], 11, "{out:?}");
                 }
             }
         }

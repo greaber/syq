@@ -10,7 +10,7 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 1M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -164,7 +164,7 @@ impl TransferTuning {
         if self.request_size.is_some() {
             size
         } else {
-            size.min(1 << 20)
+            size.min(2 << 20)
         }
     }
 
@@ -344,11 +344,20 @@ mod tests {
     #[test]
     fn streaming_block_default_preserves_ordinary_selection_and_hash_sizes() {
         let tuning = TransferTuning::default();
-        for hash in [512, 64 << 10, 1 << 20, 4 << 20, 64 << 20] {
+        for hash in [
+            512,
+            64 << 10,
+            1 << 20,
+            (2 << 20) - 1,
+            2 << 20,
+            (2 << 20) + 1,
+            4 << 20,
+            64 << 20,
+        ] {
             assert_eq!(tuning.request_size(hash, None, false), hash);
             assert_eq!(
                 tuning.streaming_request_size(hash, None, false),
-                hash.min(1 << 20)
+                hash.min(2 << 20)
             );
             let ordinary = tuning.request_size(hash, None, false);
             assert!(!tuning.stream_range(false, 4 * ordinary, ordinary));
@@ -386,7 +395,7 @@ mod tests {
                 if tuning.request_size.is_some() {
                     3 << 20
                 } else {
-                    1 << 20
+                    2 << 20
                 }
             );
         }
