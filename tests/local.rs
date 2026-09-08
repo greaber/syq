@@ -19591,8 +19591,56 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
             .output()
             .unwrap();
         assert!(!output.status.success());
+        if matches!(name, "absent" | "@absent") {
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("no receiving machine named @absent is registered"),
+                "{error}"
+            );
+            assert!(error.contains("Registered names: @laptop"), "{error}");
+            assert!(error.contains("syq persist destinations list"), "{error}");
+            assert!(
+                !error.contains(".syq-destinations") && !error.contains("os error"),
+                "{error}"
+            );
+        }
         assert!(!t.path("home/ssh-used").exists());
     }
+    // An empty registry gives setup instructions instead of suggesting a name.
+    fs::remove_file(t.path("home/.syq-destinations-v3/laptop.json")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["exec", "--on", "@laptop", "--", "true"])
+        .env("HOME", t.path("home"))
+        .env("PATH", t.path("bin"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("On the receiving machine, run `syq persist connect SERVER`"),
+        "{error}"
+    );
+    assert!(!error.contains("Registered names:"), "{error}");
+    // Other read failures still explain their cause rather than claiming absence.
+    write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v3/laptop.json"),
+        fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["exec", "--on", "@laptop", "--", "true"])
+        .env("HOME", t.path("home"))
+        .env("PATH", t.path("bin"))
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        error.contains("cannot read the registration for @laptop"),
+        "{error}"
+    );
+    assert!(!error.contains("no receiving machine"), "{error}");
     let output = completion_command(
         &t,
         &[

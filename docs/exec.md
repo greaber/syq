@@ -16,6 +16,12 @@ Run `syq persist connect server` on the receiving machine to enable persistence
 and wait for the connection. No SSH server or incoming network port is needed on the receiving machine.
 Requests work from independent server shells, including existing tmux sessions.
 
+Exec needs no separate enablement beyond receiving and its connection.
+`@laptop` in these examples is a name, not an alias for any connected laptop.
+Run `syq persist destinations list` on the server to find your receiving
+machine's actual name and connection status. On the receiving machine,
+`syq persist receive status` shows its advertised name.
+
 `--on` selects a receiving name. Both `laptop` and `@laptop` require a live
 return connection; neither falls back to DNS or an SSH connection. If the server
 command is a different build, it automatically invokes the matching helper
