@@ -6021,6 +6021,31 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
 }
 
 #[test]
+fn local_copy_does_not_open_tcp_data_connections() {
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(
+            &t.path(&format!("source/file-{index}")),
+            &prng(128 << 10, index),
+        );
+    }
+    let output = run_ok(&[
+        "-a",
+        "--stats",
+        "--syq-connections",
+        "4",
+        &t.s("source/"),
+        &t.s("destination/"),
+    ]);
+    assert_same_tree(&t.path("source"), &t.path("destination"));
+    assert!(output.contains("files to transfer: 4"), "{output}");
+    assert!(
+        !output.contains("tcp connection lifetimes sampled:"),
+        "local filesystem work unexpectedly used TCP: {output}"
+    );
+}
+
+#[test]
 fn tuning_options_force_ranges_for_small_and_whole_local_files() {
     let t = Tmp::new();
     for (file, size) in [("small", 1024), ("large", 6 << 20), ("empty", 0)] {

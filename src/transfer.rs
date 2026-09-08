@@ -3224,7 +3224,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // A same-machine file normally completes wholly inside one
                     // small-file or receiver-side copy request (copy_file_range,
                     // or an eligible sequential userspace fallback). Starting
-                    // 32 loopback connections cannot help that request. If a larger file
+                    // Extra workers cannot help that request. If a larger file
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
