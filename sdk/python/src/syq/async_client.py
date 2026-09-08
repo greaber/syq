@@ -64,21 +64,24 @@ AsyncEventCallback = Callable[[AutomationEvent], object | Awaitable[object]]
 _T = TypeVar("_T")
 _LINE_LIMIT = 16 * 1024 * 1024
 _STDERR_LIMIT = 8 * 1024
+_REAP_WAIT_TIMEOUT = 0.5
 
 
 async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
     try:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except PermissionError:
-            # Darwin can reject a zombie-only group. Give its child watcher one
-            # turn to reap the exited leader, then retry so descendants still
-            # receive the signal. A live process keeps the original permission
-            # failure visible.
-            if process.returncode is None:
-                await asyncio.sleep(0)
-            if process.returncode is None:
-                raise
+        except PermissionError as error:
+            # Darwin can reject a zombie-only group before the child watcher
+            # reaps its exited leader. Wait briefly for that reaping, then
+            # retry so descendants still receive the signal. A live process
+            # keeps the original permission failure visible.
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(process.wait()), timeout=_REAP_WAIT_TIMEOUT
+                )
+            except asyncio.TimeoutError as timeout:
+                raise error from timeout
             os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
