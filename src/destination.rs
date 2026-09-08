@@ -289,10 +289,21 @@ pub(crate) fn registered_names() -> Vec<String> {
 fn load_registration(name: &str) -> Result<Registration> {
     validate_name(name)?;
     let path = registry()?.join(format!("{name}.json"));
-    let encoded = crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE)
-        .with_context(|| {
-            format!("destination @{name} is unavailable; connect from the laptop with syq while persist is on")
-        })?;
+    let encoded = match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
+        Ok(encoded) => encoded,
+        Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => {
+            let names = registered_names();
+            let advice = if names.is_empty() {
+                "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
+            } else {
+                let shown = names.iter().take(8).map(|name| format!("@{name}")).collect::<Vec<_>>().join(", ");
+                format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
+            };
+            bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
+        }
+        Err(error) => return Err(error).with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine")),
+    };
     let registration: Registration = serde_json::from_slice(&encoded)?;
     if registration.version != REGISTRATION_VERSION {
         bail!("unsupported destination registration; reconnect from the receiving machine");
@@ -316,7 +327,7 @@ fn exchange(
         );
     }
     let mut stream = UnixStream::connect(&registration.socket).context(
-        "receiving machine is offline; it must reconnect before this transfer can start",
+        "receiving machine is offline; run `syq persist connect SERVER` on that machine to reconnect to this server account",
     )?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
