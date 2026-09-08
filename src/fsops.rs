@@ -44,7 +44,7 @@ const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
-fn test_race_barrier(
+pub(crate) fn test_race_barrier(
     ready_env: &str,
     continue_env: &str,
     hold_env: &str,

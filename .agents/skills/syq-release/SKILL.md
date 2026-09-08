@@ -82,6 +82,15 @@ publication is incomplete, including a missing matching PyPI version. Apply the
 provisional/permanent tag rules in `AGENTS.md`; never move a permanent tag,
 including any pushed Go module tag.
 
+When the release host does not have Homebrew, verify the Homebrew install path
+in a disposable Docker container instead of asking the user to install Homebrew
+on the host. Use the official x86-64 Linux Homebrew image pinned as
+`homebrew/brew@sha256:b0072bfdebf5934ae24b93b44a1928a88057399b3283ffa0177bb86084fdedfd`,
+run `brew install greaber/tap/syq` inside it, check the released version, and
+exercise a local copy with the installed binary. The container must be removed
+when it exits. Update the pinned digest deliberately when that image becomes
+unavailable or no longer supports the release check.
+
 Run `scripts/release-timings.py v<version>` at completion and include its
 observable GitHub window and slowest phases in the release report. The phases
 can overlap, so use the window as wall time and job durations as optimization

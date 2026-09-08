@@ -1190,9 +1190,20 @@ pub struct DirectoryAnchor {
 pub trait SizeHint {
     fn size_hint(&self) -> usize;
     fn frame_limit(&self) -> usize;
+    /// Two passes are cheap for a block's byte slice, but substantially more
+    /// expensive for metadata encoded one field/byte at a time. Measurements
+    /// of CopySmallFiles, PutSmallBatch, and SmallBlocks found mixed results:
+    /// larger payloads can benefit, but tiny-file and path-heavy batches slow
+    /// down. Keep those variants buffered rather than opting in whole batches.
+    fn direct_payload(&self) -> bool {
+        false
+    }
 }
 
 impl SizeHint for Request {
+    fn direct_payload(&self) -> bool {
+        matches!(self, Request::WriteRange { .. })
+    }
     fn frame_limit(&self) -> usize {
         match self {
             Request::Hello { .. } => MAX_HANDSHAKE_FRAME,
@@ -1254,6 +1265,9 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
+    fn direct_payload(&self) -> bool {
+        matches!(self, Response::Block { .. })
+    }
     fn frame_limit(&self) -> usize {
         match self {
             Response::HelloOk { .. } => MAX_HANDSHAKE_FRAME,
@@ -1316,6 +1330,50 @@ impl SizeHint for Response {
     }
 }
 
+// Keep transport errors intact: postcard's stock I/O flavor replaces them
+// with SerializeBufferFull. Also enforce the length announced in the header.
+struct MessageOutput<'a, W> {
+    writer: &'a mut W,
+    remaining: usize,
+    error: &'a mut Option<io::Error>,
+}
+
+impl<W: Write> postcard::ser_flavors::Flavor for MessageOutput<'_, W> {
+    type Output = ();
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.try_extend(&[byte])
+    }
+
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        let result = if bytes.len() > self.remaining {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serialized message length changed",
+            ))
+        } else {
+            self.writer.write_all(bytes)
+        };
+        if let Err(error) = result {
+            *self.error = Some(error);
+            return Err(postcard::Error::SerializeBufferFull);
+        }
+        self.remaining -= bytes.len();
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        if self.remaining != 0 {
+            *self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serialized message length changed",
+            ));
+            return Err(postcard::Error::SerializeBufferFull);
+        }
+        Ok(())
+    }
+}
+
 pub struct FrameWriter<W: Write> {
     w: BufWriter<W>,
     pub compress: bool,
@@ -1365,16 +1423,56 @@ impl<W: Write> FrameWriter<W> {
         Ok(())
     }
 
-    pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
-        self.write_preamble()?;
-        let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if payload.len() >= msg.frame_limit() {
+    fn check_message_size(size: usize, limit: usize) -> io::Result<()> {
+        if size >= limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "outgoing message exceeds its size limit",
             ));
         }
+        Ok(())
+    }
+
+    fn write_frame_header(&mut self, body_size: usize, flag: u8) -> io::Result<()> {
+        let len = body_size
+            .checked_add(1)
+            .filter(|len| *len <= MAX_FRAME)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "outgoing frame exceeds limit")
+            })?;
+        self.w.write_all(&len.to_le_bytes())?;
+        self.w.write_all(&[flag])
+    }
+
+    pub fn write_msg<T: Serialize + SizeHint>(&mut self, msg: &T) -> io::Result<()> {
+        self.write_preamble()?;
+        if !self.compress && msg.direct_payload() {
+            // serde_bytes payloads contribute their length without visiting
+            // each byte. The second pass writes those slices directly.
+            let size = postcard::experimental::serialized_size(msg)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Self::check_message_size(size, msg.frame_limit())?;
+            self.write_frame_header(size, 0)?;
+            let mut error = None;
+            let result = postcard::serialize_with_flavor(
+                msg,
+                MessageOutput {
+                    writer: &mut self.w,
+                    remaining: size,
+                    error: &mut error,
+                },
+            );
+            result.map_err(|serialization_error| {
+                error.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, serialization_error)
+                })
+            })?;
+            return self.w.flush();
+        }
+        let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Self::check_message_size(payload.len(), msg.frame_limit())?;
         let mut flag = 0u8;
         let mut body = payload;
         if self.compress && body.len() > COMPRESS_MIN {
@@ -1385,16 +1483,7 @@ impl<W: Write> FrameWriter<W> {
                 }
             }
         }
-        let len = body
-            .len()
-            .checked_add(1)
-            .filter(|len| *len <= MAX_FRAME)
-            .and_then(|len| u32::try_from(len).ok())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "outgoing frame exceeds limit")
-            })?;
-        self.w.write_all(&len.to_le_bytes())?;
-        self.w.write_all(&[flag])?;
+        self.write_frame_header(body.len(), flag)?;
         self.w.write_all(&body)?;
         self.w.flush()
     }
@@ -1596,14 +1685,18 @@ mod tests {
         WIRE_PREAMBLE_FIXED_LEN + crate::identity::build().len()
     }
 
+    fn block_message(data: Vec<u8>) -> Response {
+        Response::Block {
+            off: 7,
+            hash: [11; 32],
+            data,
+        }
+    }
+
     fn block_frame(data: Vec<u8>, compress: bool) -> Vec<u8> {
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, compress)
-            .write_msg(&Response::Block {
-                off: 7,
-                hash: [11; 32],
-                data,
-            })
+            .write_msg(&block_message(data))
             .unwrap();
         frame
     }
@@ -1617,6 +1710,241 @@ mod tests {
         bytes.push(flag);
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    #[test]
+    fn direct_frames_preserve_buffered_encoding_and_released_payloads() {
+        // The previous writer (also in v0.5.1) materializes postcard bytes
+        // before adding this header. Compare entire consecutive frames.
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        FrameWriter::new(&mut expected, false)
+            .write_preamble()
+            .unwrap();
+        {
+            let mut writer = FrameWriter::new(&mut actual, false);
+            for size in [0, 127, 128, 16384, (1 << 20) - 40, 1 << 20, 4 << 20] {
+                let response = Response::Block {
+                    off: 1234567,
+                    hash: [11; 32],
+                    data: vec![0xab; size],
+                };
+                let payload = postcard::to_stdvec(&response).unwrap();
+                expected.extend_from_slice(&raw_frame(&payload, 0)[local_preamble_len()..]);
+                writer.write_msg(&response).unwrap();
+            }
+        }
+        assert_eq!(actual, expected);
+        let fixture = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
+        let request: Request = postcard::from_bytes(fixture).unwrap();
+        let mut actual = Vec::new();
+        FrameWriter::new(&mut actual, false)
+            .write_msg(&request)
+            .unwrap();
+        assert_eq!(
+            &actual[local_preamble_len()..],
+            &raw_frame(fixture, 0)[local_preamble_len()..]
+        );
+    }
+
+    #[test]
+    fn direct_frame_passes_large_payload_to_transport_without_copying() {
+        struct ObservePayload {
+            pointer: *const u8,
+            length: usize,
+            seen: bool,
+        }
+        impl Write for ObservePayload {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.as_ptr() == self.pointer && bytes.len() == self.length {
+                    self.seen = true;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let data = vec![17; 4 << 20];
+        let mut output = ObservePayload {
+            pointer: data.as_ptr(),
+            length: data.len(),
+            seen: false,
+        };
+        FrameWriter::new(&mut output, false)
+            .write_msg(&Response::Block {
+                off: 0,
+                hash: [0; 32],
+                data,
+            })
+            .unwrap();
+        assert!(
+            output.seen,
+            "transport did not receive the original payload slice"
+        );
+    }
+
+    #[test]
+    fn metadata_keeps_single_pass_serialization() {
+        struct Metadata(std::cell::Cell<usize>);
+        impl Serialize for Metadata {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.set(self.0.get() + 1);
+                serializer.serialize_u8(0)
+            }
+        }
+        impl SizeHint for Metadata {
+            fn size_hint(&self) -> usize {
+                1
+            }
+            fn frame_limit(&self) -> usize {
+                MAX_FRAME
+            }
+        }
+        let message = Metadata(std::cell::Cell::new(0));
+        FrameWriter::new(io::sink(), false)
+            .write_msg(&message)
+            .unwrap();
+        assert_eq!(message.0.get(), 1);
+        assert!(!Response::ScanBatch(Vec::new()).direct_payload());
+        assert!(!Request::PutSmallBatch(Vec::new()).direct_payload());
+    }
+
+    #[test]
+    fn frames_check_uncompressed_size_before_writing_header() {
+        #[derive(Serialize)]
+        struct Limited {
+            #[serde(skip)]
+            direct: bool,
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        }
+        impl SizeHint for Limited {
+            fn direct_payload(&self) -> bool {
+                self.direct
+            }
+            fn size_hint(&self) -> usize {
+                self.data.len() + 2
+            }
+            fn frame_limit(&self) -> usize {
+                1024
+            }
+        }
+        for direct in [false, true] {
+            for compress in [false, true] {
+                // The encoded length is exactly the exclusive limit. Even
+                // though these bytes compress well, reject before the header.
+                let message = Limited {
+                    direct,
+                    data: vec![0; 1022],
+                };
+                assert_eq!(
+                    postcard::experimental::serialized_size(&message).unwrap(),
+                    1024
+                );
+                let mut bytes = Vec::new();
+                let error = FrameWriter::new(&mut bytes, compress)
+                    .write_msg(&message)
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("size limit"));
+                assert_eq!(bytes.len(), local_preamble_len());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_frame_preserves_payload_io_error() {
+        struct FailPayload;
+        impl Write for FailPayload {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() >= 1 << 20 {
+                    Err(io::Error::from_raw_os_error(libc::EPIPE))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = FrameWriter::new(FailPayload, false)
+            .write_msg(&Response::Block {
+                off: 0,
+                hash: [0; 32],
+                data: vec![0; 2 << 20],
+            })
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn direct_frame_handles_short_writes_and_flush_errors() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            fail_flush: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let n = bytes.len().min(31);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut output = ShortWriter {
+            bytes: Vec::new(),
+            fail_flush: false,
+        };
+        FrameWriter::new(&mut output, false)
+            .write_msg(&block_message(vec![4; 2 << 20]))
+            .unwrap();
+        assert_eq!(output.bytes, block_frame(vec![4; 2 << 20], false));
+        output.fail_flush = true;
+        let error = FrameWriter::with_preamble_written(&mut output, false)
+            .write_msg(&block_message(vec![4; 2 << 20]))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn direct_frame_bounds_a_serializer_that_changes_length() {
+        struct Changing(std::cell::Cell<bool>, bool);
+        impl Serialize for Changing {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let second = self.0.replace(true);
+                serializer.serialize_bytes(if second == self.1 { b"long" } else { b"s" })
+            }
+        }
+        impl SizeHint for Changing {
+            fn direct_payload(&self) -> bool {
+                true
+            }
+            fn size_hint(&self) -> usize {
+                16
+            }
+            fn frame_limit(&self) -> usize {
+                MAX_FRAME
+            }
+        }
+        for grows in [false, true] {
+            let mut bytes = Vec::new();
+            let error = FrameWriter::new(&mut bytes, false)
+                .write_msg(&Changing(std::cell::Cell::new(false), grows))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("length changed"));
+            let offset = local_preamble_len();
+            let announced =
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            assert!(bytes.len() < offset + 4 + announced);
+        }
     }
 
     #[test]

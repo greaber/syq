@@ -851,6 +851,14 @@ fn management_candidates(
                 .map(Candidate::text)
                 .collect())
         }
+        ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => {
+            Ok(crate::receive_service::profile_names()
+                .into_iter()
+                .map(String::into_bytes)
+                .filter(|name| name.starts_with(current))
+                .map(Candidate::text)
+                .collect())
+        }
         ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
         _ => Ok(Vec::new()),
     }
@@ -863,6 +871,7 @@ enum EndpointSyntax {
 }
 
 enum ValueCompletion {
+    ReceivingProfile,
     AuthFrom,
     ReturnName,
     NamedOrSshDestination,
@@ -1269,6 +1278,7 @@ fn value_completion(
             _ => None,
         },
         "persist" => match option {
+            b"--name" => Some(ValueCompletion::ReceivingProfile),
             b"--pscope" | b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
             }),
@@ -1321,6 +1331,12 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
+        ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names()
+            .into_iter()
+            .map(String::into_bytes)
+            .filter(|name| name.starts_with(current))
+            .map(Candidate::text)
+            .collect()),
         ValueCompletion::AuthFrom => Ok([b"auto".to_vec(), b"ssh".to_vec()]
             .into_iter()
             .filter(|value| value.starts_with(current))

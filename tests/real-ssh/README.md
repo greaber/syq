@@ -161,6 +161,12 @@ using piped rules and a named FIFO with a single writer. They check ordered
 patterns, reinclusion, and protection of ignored destination entries during
 pruning, plus piped filters with automatic and explicit remote authorization.
 
+Multiple-profile checks keep a pending copy and an approved command alive while
+another profile is added, changed, and stopped. They verify independent copy
+roots and approval decisions, then connect a second isolated client to the same
+server account: distinct names receive successfully, a duplicate name is rejected,
+and retrying that failure preserves the healthy profile.
+
 Desktop approval checks verify that compact prompts keep the destination or
 command prominent and preserve escaped remote text through the notification
 service. Full copy limits and permission details remain available through

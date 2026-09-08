@@ -46,15 +46,79 @@ shell or that the files contain what you intended.
 You can also [run commands on the receiving machine](exec.md), with separate
 local approval, to build a project there or open a copied artifact.
 
+## Multiple receiving profiles
+
+Give different receiving locations their own names:
+
+```sh
+syq persist receive on --name laptop --cwd ~
+syq persist receive on --name project --root ~/work/project
+syq persist connect server
+```
+
+Both names work from the same server account: `syq cp results --to @project`
+and `syq cp report.pdf --to @laptop`. Each profile has its own directory, copy
+root, limits, approval policy, and background connection to each connected server.
+New profiles start with the usual defaults, including asking for approval; they
+do not inherit another profile's trust or confinement settings. Up to 32 profiles
+can be saved.
+
+`receive on --name NAME` creates a profile or updates that name's settings.
+Without `--name`, `receive on` updates the first saved profile, shown first by
+`receive status`. The initial hostname profile becomes a saved profile when
+persistence first connects; adding a new name then keeps that original profile.
+If no preferences have been saved yet, the first explicitly chosen name replaces
+the implicit hostname default.
+
+```sh
+syq persist receive status
+syq persist receive status --name project
+syq persist receive off --name project
+syq persist receive on --name project
+syq persist receive remove project
+syq persist receive wait server --name laptop --timeout 30
+```
+
+Updating, stopping, or removing a profile cancels only that profile's copies,
+commands, and pending approvals. Other profiles keep working. `receive off`
+without a name stops all profiles; `receive on` enables the first profile, and
+`receive on --name NAME` enables another. Removing the first profile makes the
+next saved profile the default. The last profile can be disabled but cannot be
+removed. `pending`, `approve`, and `deny` work across all profiles; prompts name
+the receiving profile. Without `--name`, `receive wait` waits for every enabled
+profile on that server.
+
+Names belong to a server account. Different laptops can receive through the same
+account under different names. If a name already has a live connection, another
+client's attempt is rejected without disturbing the existing connection. Other
+profiles remain usable. Choose a different name, or stop the original connection
+and run `syq persist connect server` on the waiting client to retry.
+
+Existing single-profile preferences become the first profile, preserving their
+settings. The new preferences format cannot be read by syq 0.5.1 or earlier;
+use the newer binary to manage it. After upgrading, run `syq persist connect
+server` for each server to replace older background services. This does not
+change saved enrollments, grants, receipts, or partial copies.
+
 ## Approving copies
 
 On Linux, desktop prompts use `/usr/bin/notify-send` with action support
 (libnotify 0.7.10 or later) and your desktop notification service. On macOS,
-syq opens a native dialog through `/usr/bin/osascript`; Deny is the default
-button in both the short and detailed views. Opening Details does not approve
+syq opens a native dialog through `/usr/bin/osascript`, with Allow once on the
+left and Deny on the right. Deny remains the highlighted default and the
+Return/Escape action in both the short and detailed views. Opening Details does not approve
 the request or extend its five-minute deadline. The background connection
-inherits the desktop session in which you start it. After changing desktop sessions, run `syq persist receive on` from a terminal
-in the current session to restart it.
+inherits the desktop session in which you start it. After changing desktop sessions, run `syq persist receive off`, then enable the
+profiles you need from a terminal in the current session to restart receiving.
+
+The short copy prompt warns about overwrites when a destination entry already
+exists, including a merge into an existing directory. It omits that warning
+when a quick local check finds all the requested destination names absent.
+Syq checks only a small number of names, without scanning directory contents;
+it shows a caution if the request is too large or inspection fails. For a copy
+to another SSH host, the destination is not checked before approval.
+The check is advisory: entries can change before the copy runs. Details and
+`persist receive pending` always show the full permitted copy policy and limits.
 
 You can also decide from any local terminal:
 
@@ -69,7 +133,7 @@ Use the complete ID printed by `pending`. Each ID works once for that request.
 Requests expire after five minutes. Disconnecting the sender, losing the return
 connection, changing receiving settings, or stopping receiving cancels pending
 requests. An approval cannot carry over to a reconnected or retried copy.
-One request may await approval per server connection; other senders must retry.
+One request may await approval per profile per server connection; other senders must retry.
 
 If a desktop prompt is unavailable or dismissed without a decision, the copy
 stays pending for a local command until it expires. `persist receive pending` shows prompt
@@ -124,11 +188,13 @@ syq persist receive on --name laptop --root ~/Downloads/server
 `--root` sets both the starting directory and the boundary. It rejects absolute
 paths and `..`, and copies cannot traverse symlinks to escape that directory.
 The root itself cannot be replaced with `--as .`. Changing to `--cwd` removes
-containment. Settings apply globally to receiving connections; changing them
-closes existing return copies before restarting with the new settings.
+containment. Changing a profile’s settings closes its existing return copies
+before restarting that profile with the new settings. Other profiles keep running.
 
-The receiving directory must exist and have a UTF-8 path. Names inside it may
-use normal Unix filename bytes. Syq protects its own receiving control files,
+Explicit `--cwd` and `--root` paths must name existing directories with UTF-8
+paths; invalid paths leave saved settings unchanged. If a saved directory later
+disappears, you can still inspect, disable, or reconfigure its profile. Names
+inside receiving directories may use normal Unix filename bytes. Syq protects its own receiving control files,
 executable, and SSH authority files from return copies even without `--root`.
 
 ## Copy permissions and limits

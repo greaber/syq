@@ -63,6 +63,9 @@ pub(crate) struct Summary {
     pub from: String,
     pub expires_at: u64,
     pub notification: String,
+    // Local desktop presentation only: preserve the released pending JSON shape.
+    #[serde(skip)]
+    desktop_copy_notice: Option<String>,
     #[serde(flatten)]
     pub details: Details,
 }
@@ -96,6 +99,7 @@ impl Summary {
         from: &str,
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
+        inspect_local_destination: bool,
     ) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
@@ -131,6 +135,7 @@ impl Summary {
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                 + lifetime.as_secs(),
             notification: "starting".into(),
+            desktop_copy_notice: copy_notice(request, inspect_local_destination),
         })
     }
     pub(crate) fn kind(&self) -> Kind {
@@ -143,8 +148,11 @@ impl Summary {
     /// the macOS Details view and in `persist receive pending` on both platforms.
     fn desktop_description(&self) -> String {
         match &self.details {
-            Details::Copy { destination, permission, max_delete, .. } => {
-                let mut body = format!("To: {destination}\nFrom: {}\n\n{permission}", self.from);
+            Details::Copy { destination, max_delete, .. } => {
+                let mut body = format!("To: {destination}\nFrom: {}", self.from);
+                if let Some(notice) = &self.desktop_copy_notice {
+                    body.push_str(&format!("\n\n{notice}"));
+                }
                 if *max_delete > 0 {
                     body.push_str(&format!("\nDeletion limit (files or folders): {max_delete}."));
                 }
@@ -177,6 +185,65 @@ impl Summary {
         )
     }
 }
+/// Inspect only the named mutation roots, never their children or contents.
+/// This is a local hint, not a restriction on the approved policy or a promise
+/// that names cannot change before execution. Remote destinations are not
+/// contacted using the receiving machine's credentials before approval.
+fn copy_notice(
+    request: &crate::destination::CopyRequest,
+    inspect_local_destination: bool,
+) -> Option<String> {
+    use crate::delegation::{ExistingDestinationPolicy, RootExistence};
+    if request.copy.options.dry_run {
+        return Some("Preview only; no filesystem changes".into());
+    }
+    if request.copy.options.verify_only {
+        return Some("Compare contents only; no filesystem changes".into());
+    }
+    if request.copy.policy.existing == ExistingDestinationPolicy::Skip
+        || request.constraints.root_existence == RootExistence::New
+    {
+        return None;
+    }
+    let unchecked = || {
+        Some("Destination entries were not checked; existing entries may be overwritten.".into())
+    };
+    // Keep work small even for a request containing many source names or very
+    // deep paths. Existing directory scopes need no recursive inspection:
+    // merging into them can overwrite children whose names are not yet known.
+    if !inspect_local_destination
+        || request.copy.mutation_scopes.is_empty()
+        || request.copy.mutation_scopes.len() > 32
+    {
+        return unchecked();
+    }
+    let Ok(root) = crate::rooted::Root::open(std::path::Path::new("/")) else {
+        return unchecked();
+    };
+    for scope in &request.copy.mutation_scopes {
+        let Some(relative) = scope.path.strip_prefix(b"/") else {
+            return unchecked();
+        };
+        if relative.split(|byte| *byte == b'/').count() > 32 {
+            return unchecked();
+        }
+        let Ok(relative) = crate::rooted::RelativePath::new(relative) else {
+            return unchecked();
+        };
+        match root.metadata(&relative) {
+            Ok(_) => return Some("Existing destination entries may be overwritten.".into()),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
+            Err(_) => return unchecked(),
+        }
+    }
+    None
+}
+
 struct Pending {
     summary: Summary,
     deadline: Instant,
@@ -225,7 +292,7 @@ impl Queue {
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, request, TIMEOUT)?,
+            Summary::new(from, request, TIMEOUT, true)?,
             notifications,
             TIMEOUT,
             cancelled,
@@ -239,7 +306,7 @@ impl Queue {
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
-        let mut summary = Summary::new(from, request, TIMEOUT)?;
+        let mut summary = Summary::new(from, request, TIMEOUT, false)?;
         if let Details::Copy {
             destination,
             permission,
@@ -252,6 +319,11 @@ impl Queue {
             );
             permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
         }
+        let notice = summary.desktop_copy_notice.get_or_insert_with(String::new);
+        if !notice.is_empty() {
+            notice.push(' ');
+        }
+        notice.push_str("Connect using this machine's SSH access and install the matching syq helper if needed.");
         self.wait(summary, notifications, TIMEOUT, cancelled)
     }
     pub(crate) fn request_command(
@@ -269,6 +341,7 @@ impl Queue {
             from: format!("{from:?}"),
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
+            desktop_copy_notice: None,
             details: Details::Command {
                 kind: CommandKind::Command,
                 argv: argv.iter().map(|arg| format!("{:?}", std::ffi::OsStr::from_bytes(arg))).collect(),
@@ -412,7 +485,7 @@ const APPLESCRIPT: &str = r#"on run argv
     try
         set expiresAt to (current date) + (item 2 of argv as integer)
         set body to item 1 of argv
-        set choices to {"Deny", "Details", "Allow once"}
+        set choices to {"Allow once", "Details", "Deny"}
         repeat
             set remainingSeconds to (expiresAt - (current date)) as integer
             if remainingSeconds <= 0 then return "expired"
@@ -421,10 +494,10 @@ const APPLESCRIPT: &str = r#"on run argv
             set choice to button returned of answer
             if choice is "Details" then
                 set body to item 4 of argv
-                set choices to {"Deny", "Back", "Allow once"}
+                set choices to {"Allow once", "Back", "Deny"}
             else if choice is "Back" then
                 set body to item 1 of argv
-                set choices to {"Deny", "Details", "Allow once"}
+                set choices to {"Allow once", "Details", "Deny"}
             else if choice is "Allow once" then
                 return "allow"
             else
@@ -574,8 +647,150 @@ mod tests {
             },
             expires_at: 0,
             notification: String::new(),
+            desktop_copy_notice: Some("Existing destination entries may be overwritten.".into()),
         }
     }
+    fn copy_request(path: &std::path::Path) -> crate::destination::CopyRequest {
+        use crate::delegation::*;
+        let path = path.as_os_str().as_bytes().to_vec();
+        crate::destination::CopyRequest {
+            destination: path.clone(),
+            copy: CopyOperation {
+                destination: path.clone(),
+                mutation_scopes: vec![MutationScope {
+                    path,
+                    descendants: true,
+                }],
+                policy: CopyPolicy {
+                    placement: DestinationPlacement::ExactPath,
+                    existing: ExistingDestinationPolicy::Replace,
+                    deletion: DeletionPolicy::Forbid,
+                    publication: PublicationPolicy::AtomicStaged,
+                },
+                options: CopyOptions {
+                    recursive: true,
+                    preserve_symlinks: true,
+                    preserve_permissions: false,
+                    receiver_managed_modes: true,
+                    preserve_times: true,
+                    preserve_owner: false,
+                    preserve_group: false,
+                    preserve_devices: false,
+                    compare_existing_by_content: false,
+                    dry_run: false,
+                    verify_only: false,
+                    compressed_transport: true,
+                    tcp_port_lo: 47600,
+                    tcp_port_hi: 47699,
+                },
+                limits: CopyLimits {
+                    max_entries: 100,
+                    max_total_bytes: 1000,
+                    max_file_bytes: 1000,
+                    hash_block_bytes: 4096,
+                    max_connections: 1,
+                    max_deletions: 0,
+                },
+            },
+            constraints: GrantConstraints::default(),
+        }
+    }
+
+    #[test]
+    fn copy_notice_checks_names_without_scanning_or_following_links() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let missing = root.join("missing");
+        let request = copy_request(&missing);
+        assert_eq!(copy_notice(&request, true), None);
+        assert_eq!(
+            copy_notice(&copy_request(&missing.join("child")), true),
+            None
+        );
+        let mut summary = Summary::new("server", &request, TIMEOUT, true).unwrap();
+        assert!(!summary.desktop_description().contains("overwrite"));
+        assert!(summary
+            .details_description()
+            .contains("May create and overwrite matching entries"));
+        // No presentation-only field enters the released pending JSON contract.
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 10);
+        assert_eq!(
+            json["permission"],
+            "May create and overwrite matching entries"
+        );
+        let old_shape: Summary = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old_shape).unwrap(), json);
+        summary.desktop_copy_notice = Some("local hint".into());
+        assert_eq!(serde_json::to_value(summary).unwrap(), json);
+
+        let file = root.join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let link = root.join("link");
+        symlink(&missing, &link).unwrap();
+        for path in [&file, &directory, &link] {
+            assert!(copy_notice(&copy_request(path), true)
+                .unwrap()
+                .contains("Existing destination"));
+        }
+        // A parent symlink is not followed, even when its target is missing.
+        assert!(copy_notice(&copy_request(&link.join("child")), true)
+            .unwrap()
+            .contains("not checked"));
+        assert!(copy_notice(&copy_request(&file.join("child")), true)
+            .unwrap()
+            .contains("not checked"));
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+
+        let mut mixed = request.clone();
+        mixed
+            .copy
+            .mutation_scopes
+            .push(copy_request(&link).copy.mutation_scopes.remove(0));
+        assert!(copy_notice(&mixed, true)
+            .unwrap()
+            .contains("Existing destination"));
+        assert!(copy_notice(&request, false)
+            .unwrap()
+            .contains("not checked"));
+        let mut many = request.clone();
+        many.copy.mutation_scopes = vec![request.copy.mutation_scopes[0].clone(); 33];
+        assert!(copy_notice(&many, true).unwrap().contains("not checked"));
+    }
+
+    #[test]
+    fn non_overwriting_policies_do_not_warn_about_existing_entries() {
+        use crate::delegation::{ExistingDestinationPolicy, RootExistence};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("file");
+        std::fs::write(&path, b"keep").unwrap();
+        let mut request = copy_request(&path);
+        request.copy.options.dry_run = true;
+        assert!(copy_notice(&request, true)
+            .unwrap()
+            .starts_with("Preview only"));
+        request.copy.options.dry_run = false;
+        request.copy.options.verify_only = true;
+        assert!(copy_notice(&request, true)
+            .unwrap()
+            .starts_with("Compare contents only"));
+        request.copy.options.verify_only = false;
+        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
+        assert_eq!(copy_notice(&request, true), None);
+        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
+        request.constraints.root_existence = RootExistence::New;
+        assert_eq!(copy_notice(&request, true), None);
+        request.constraints.root_existence = RootExistence::Any;
+        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
+        assert!(copy_notice(&request, true)
+            .unwrap()
+            .contains("Existing destination"));
+    }
+
     fn wait_pending(queue: &Queue) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while queue.snapshots().is_empty() {
@@ -591,7 +806,7 @@ mod tests {
                 *max_delete = limit;
             }
             let compact = summary.desktop_description();
-            assert!(compact.contains("May create and overwrite"));
+            assert!(compact.contains("Existing destination entries may be overwritten."));
             assert!(compact.contains(&format!("Deletion limit (files or folders): {limit}.")));
             assert!(!compact.contains("100 bytes"));
         }
