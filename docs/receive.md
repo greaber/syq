@@ -50,11 +50,21 @@ local approval, to build a project there or open a copied artifact.
 
 On Linux, desktop prompts use `/usr/bin/notify-send` with action support
 (libnotify 0.7.10 or later) and your desktop notification service. On macOS,
-syq opens a native dialog through `/usr/bin/osascript`; Deny is the default
-button in both the short and detailed views. Opening Details does not approve
+syq opens a native dialog through `/usr/bin/osascript`, with Allow once on the
+left and Deny on the right. Deny remains the highlighted default and the
+Return/Escape action in both the short and detailed views. Opening Details does not approve
 the request or extend its five-minute deadline. The background connection
 inherits the desktop session in which you start it. After changing desktop sessions, run `syq persist receive on` from a terminal
 in the current session to restart it.
+
+The short copy prompt warns about overwrites when a destination entry already
+exists, including a merge into an existing directory. It omits that warning
+when a quick local check finds all the requested destination names absent.
+Syq checks only a small number of names, without scanning directory contents;
+it shows a caution if the request is too large or inspection fails. For a copy
+to another SSH host, the destination is not checked before approval.
+The check is advisory: entries can change before the copy runs. Details and
+`persist receive pending` always show the full permitted copy policy and limits.
 
 You can also decide from any local terminal:
 
