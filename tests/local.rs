@@ -19213,11 +19213,11 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
         "max_entries",
         "max_delete",
     ] {
-        assert_eq!(migrated[field], original[field], "{field}");
+        assert_eq!(migrated["profiles"][0][field], original[field], "{field}");
     }
-    assert_eq!(migrated["version"], 3);
-    assert_eq!(migrated["approval"], "ask");
-    assert_eq!(migrated["notifications"], "desktop");
+    assert_eq!(migrated["version"], 4);
+    assert_eq!(migrated["profiles"][0]["approval"], "ask");
+    assert_eq!(migrated["profiles"][0]["notifications"], "desktop");
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_output_ok(&run(&["persist", "receive", "off"]));
 }
@@ -20003,3 +20003,82 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
 }
 
 mod local_copy_selection;
+
+#[test]
+fn receiving_profiles_preserve_independent_settings_and_select_names() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("project")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .output()
+            .unwrap()
+    };
+    let status = || {
+        let output = run(&["persist", "receive", "status", "--json"]);
+        assert_output_ok(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_output_ok(&run(&[
+        "persist",
+        "receive",
+        "on",
+        "--name",
+        "laptop",
+        "--approve",
+        "always",
+    ]));
+    let first = status()["profiles"][0].clone();
+    assert_output_ok(&run(&[
+        "persist", "receive", "on", "--name", "project", "--root", "project",
+    ]));
+    let state = status();
+    assert_eq!(state["profiles"].as_array().unwrap().len(), 2);
+    assert_eq!(state["profiles"][0], first);
+    assert_eq!(state["profiles"][1]["approval"], "ask");
+    assert_eq!(state["profiles"][1]["root"], t.s("project"));
+    assert_output_ok(&run(&["persist", "receive", "off", "--name", "project"]));
+    assert_eq!(status()["profiles"][0], first);
+    assert_eq!(status()["profiles"][1]["enabled"], false);
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    for args in [
+        vec!["off", "--name", "typo"],
+        vec!["remove", "typo"],
+        vec!["on", "--name", "../bad"],
+        vec!["status", "--name", "typo"],
+    ] {
+        let mut command = vec!["persist", "receive"];
+        command.extend(args);
+        assert!(!run(&command).status.success());
+        assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    }
+    assert_output_ok(&run(&["persist", "receive", "on", "--name", "project"]));
+    assert_eq!(status()["profiles"][1]["root"], t.s("project"));
+    let completion = run(&[
+        "completion",
+        "__complete",
+        "fish",
+        "5",
+        "--",
+        "syq",
+        "persist",
+        "receive",
+        "off",
+        "--name",
+        "proj",
+    ]);
+    assert_output_ok(&completion);
+    assert_eq!(completion.stdout, b"project\0");
+    assert_output_ok(&run(&["persist", "receive", "remove", "laptop"]));
+    assert_eq!(status()["settings"]["name"], "project");
+    assert!(!run(&["persist", "receive", "remove", "project"])
+        .status
+        .success());
+    assert_output_ok(&run(&["persist", "receive", "off"]));
+    assert_eq!(status()["settings"]["enabled"], false);
+}

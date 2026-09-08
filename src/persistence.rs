@@ -320,8 +320,12 @@ fn connect(
         crate::receive_service::ensure_ready(multiplexer.control_path(), &remote, timeout)?;
     drop(connection);
     match receiving {
-        Some(name) => {
-            crate::output::human_stdout!("{} ready; receiving as @{name}", remote.label())
+        Some(names) => {
+            crate::output::human_stdout!(
+                "{} ready; receiving as @{}",
+                remote.label(),
+                names.join(", @")
+            )
         }
         None if ephemeral => crate::output::human_stdout!(
             "{} ready; ephemeral scopes do not support receiving",
@@ -810,6 +814,7 @@ struct ConnectionStatus {
     ssh_connected: bool,
     receiving_enabled: Option<bool>,
     receiving_name: Option<String>,
+    receiving_profiles: Vec<crate::receive_service::NamedConnection>,
     receiving: Option<crate::receive_service::ConnectionState>,
     session_pool: bool,
 }
@@ -817,7 +822,7 @@ struct ConnectionStatus {
 fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     let records = scope_records(scope)?;
     let receiving_setting = if kind == "global" {
-        crate::receive_service::settings().map(|settings| settings.enabled)
+        crate::receive_service::enabled()
     } else {
         Ok(false)
     };
@@ -849,6 +854,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             state: state.to_owned(),
             ssh_connected: ssh_live,
             receiving_enabled,
+            receiving_profiles: crate::receive_service::connection_profiles(&control),
             receiving_name: receiving.as_ref().map(|(name, _)| name.clone()),
             receiving: receiving.map(|(_, connection)| connection),
             session_pool: crate::session_pool::is_running(&control),
@@ -888,6 +894,12 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             .and_then(|state| state.error.as_deref())
         {
             line.push_str(&format!(": {error}"));
+        }
+        for profile in &connection.receiving_profiles {
+            line.push_str(&format!("; @{} {}", profile.name, profile.connection.phase));
+            if let Some(error) = &profile.connection.error {
+                line.push_str(&format!(": {error}"));
+            }
         }
         if connection.state == "inactive" {
             line.push_str(&format!(

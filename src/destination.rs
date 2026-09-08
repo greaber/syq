@@ -988,7 +988,11 @@ pub(crate) fn serve_background(
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
-        requester: spec.endpoint.label(),
+        requester: format!(
+            "{} (receiving profile @{})",
+            spec.endpoint.label(),
+            config.name
+        ),
         approval_mode: config.approval,
         notifications: config.notifications,
         approvals,
