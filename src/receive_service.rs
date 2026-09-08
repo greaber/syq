@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -446,12 +446,37 @@ fn query_retry(
             retry,
         },
     )?;
-    let result: Status = crate::destination::read_message(&mut socket)?;
+    let result: Status = read_status(&mut socket)?;
     if result.version != VERSION {
         bail!("unsupported background receive protocol; stop its original build before upgrading");
     }
     Ok(result)
 }
+// Status contains up to 32 full approval summaries, both aggregated and per
+// profile. Keep its local-only bound separate from the remote request envelope.
+const MAX_STATUS: usize = 16 * 1024 * 1024;
+fn read_status(reader: &mut impl Read) -> Result<Status> {
+    let mut length = [0; 4];
+    reader.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_STATUS {
+        bail!("invalid receiving status size");
+    }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn write_status(writer: &mut impl Write, status: &Status) -> Result<()> {
+    let bytes = serde_json::to_vec(status)?;
+    if bytes.len() > MAX_STATUS {
+        bail!("receiving status exceeds size limit");
+    }
+    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {
     let file = OpenOptions::new()
         .read(true)
@@ -552,29 +577,29 @@ pub(crate) fn ensure_ready(
     }
 }
 
-pub(crate) fn connection_status(control: &Path) -> Option<(String, ConnectionState)> {
-    status(control, false)
-        .ok()
-        .map(|state| (state.name, state.connection))
+pub(crate) struct ReceivingStatus {
+    pub name: String,
+    pub connection: ConnectionState,
+    pub profiles: Vec<NamedConnection>,
 }
-
 #[derive(Serialize)]
 pub(crate) struct NamedConnection {
     pub name: String,
     pub connection: ConnectionState,
 }
-pub(crate) fn connection_profiles(control: &Path) -> Vec<NamedConnection> {
-    status(control, false)
-        .map(|s| {
-            s.profiles
-                .into_iter()
-                .map(|p| NamedConnection {
-                    name: p.settings.name,
-                    connection: p.connection,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
+    status(control, false).ok().map(|s| ReceivingStatus {
+        name: s.name,
+        connection: s.connection,
+        profiles: s
+            .profiles
+            .into_iter()
+            .map(|p| NamedConnection {
+                name: p.settings.name,
+                connection: p.connection,
+            })
+            .collect(),
+    })
 }
 pub(crate) fn profile_names() -> Vec<String> {
     preferences()
@@ -950,7 +975,7 @@ fn run(control: &Path) -> Result<()> {
                                 profiles,
                                 decision_error,
                             };
-                            let _ = crate::destination::write_message(&mut client, &response);
+                            let _ = write_status(&mut client, &response);
                         }
                     }
                 }
@@ -1186,7 +1211,22 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
             }
-            let connections = statuses()?;
+            let mut connections = statuses()?;
+            if let Some(name) = name.as_ref() {
+                connections.retain_mut(|s| {
+                    if s.profiles.is_empty() {
+                        return &s.name == name;
+                    }
+                    s.profiles.retain(|p| &p.settings.name == name);
+                    if s.profiles.is_empty() {
+                        return false;
+                    }
+                    (s.name, s.connection) = aggregate(&s.profiles);
+                    s.approval = s.profiles.first().map(|p| p.settings.approval);
+                    s.pending = s.profiles.iter().flat_map(|p| p.pending.clone()).collect();
+                    true
+                });
+            }
             let selected: Vec<_> = config
                 .profiles
                 .iter()
@@ -1215,9 +1255,15 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                 for state in connections {
                     if state.profiles.is_empty() {
                         crate::output::human_stdout!(
-                            "  {}: {}",
+                            "  {}: {}{}",
                             state.endpoint,
-                            state.connection.phase
+                            state.connection.phase,
+                            state
+                                .connection
+                                .error
+                                .as_ref()
+                                .map(|e| format!(" ({e})"))
+                                .unwrap_or_default()
                         );
                     }
                     for profile in state
@@ -1313,6 +1359,57 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_profile_status_exceeds_remote_envelope_but_stays_bounded() {
+        let config =
+            decode_preferences(include_bytes!("../tests/fixtures/receive-v3-v0.5.1.json")).unwrap();
+        let profiles: Vec<_> = (0..MAX_PROFILES)
+            .map(|i| {
+                let mut settings = config.profiles[0].clone();
+                settings.name = format!("profile-{i}");
+                ProfileStatus {
+                    settings,
+                    pending: Vec::new(),
+                    connection: ConnectionState {
+                        phase: "failed".into(),
+                        error: Some("e".repeat(8192)),
+                        ssh_pid: None,
+                    },
+                }
+            })
+            .collect();
+        let (name, connection) = aggregate(&profiles);
+        let status = Status {
+            version: VERSION,
+            identity: "test".into(),
+            pid: 1,
+            endpoint: "server".into(),
+            name,
+            connection,
+            approval: None,
+            pending: Vec::new(),
+            decision_error: None,
+            profiles,
+        };
+        let mut bytes = Vec::new();
+        write_status(&mut bytes, &status).unwrap();
+        assert!(bytes.len() > 256 * 1024);
+        let decoded = read_status(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.profiles.len(), MAX_PROFILES);
+        assert_eq!(
+            decoded.profiles[31]
+                .connection
+                .error
+                .as_ref()
+                .unwrap()
+                .len(),
+            8192
+        );
+        for size in [0, MAX_STATUS as u32 + 1] {
+            assert!(read_status(&mut size.to_be_bytes().as_slice()).is_err());
+        }
+    }
 
     #[test]
     fn released_copy_decision_remains_copy_only() {

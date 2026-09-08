@@ -143,7 +143,7 @@ fn pre_handoff_registry_is_ignored_without_rewriting_it() {
     assert_eq!(fs::read(directory.join("laptop.json")).unwrap(), old);
     assert_failure(
         &fixture.run(&["cp", "source", "--to", "@laptop"]),
-        "unavailable",
+        "no receiving machine named @laptop is registered",
     );
 }
 

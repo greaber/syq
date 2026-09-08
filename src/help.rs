@@ -50,11 +50,14 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                         arg.get_id().as_str(),
                         "approval" | "notifications" | "name" | "cwd" | "root"
                     ),
+                    "syq persist receive off" | "syq persist receive status" => {
+                        arg.get_id() == "name"
+                    }
                     "syq persist receive pending" => {
                         matches!(arg.get_id().as_str(), "wait" | "timeout")
                     }
                     "syq persist receive wait" | "syq persist destinations wait" => {
-                        arg.get_id() == "timeout"
+                        matches!(arg.get_id().as_str(), "timeout" | "name")
                     }
                     _ => false,
                 };

@@ -838,11 +838,11 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         let receiving = crate::receive_service::connection_status(&control);
         let state = match &receiving {
             _ if receiving_error.is_some() => "failed",
-            Some((_, connection)) if receiving_enabled == Some(true) => {
-                if connection.phase == "online" {
+            Some(receiving) if receiving_enabled == Some(true) => {
+                if receiving.connection.phase == "online" {
                     "ready"
                 } else {
-                    &connection.phase
+                    &receiving.connection.phase
                 }
             }
             _ if receiving_enabled == Some(true) => "inactive",
@@ -854,9 +854,9 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             state: state.to_owned(),
             ssh_connected: ssh_live,
             receiving_enabled,
-            receiving_profiles: crate::receive_service::connection_profiles(&control),
-            receiving_name: receiving.as_ref().map(|(name, _)| name.clone()),
-            receiving: receiving.map(|(_, connection)| connection),
+            receiving_name: receiving.as_ref().map(|s| s.name.clone()),
+            receiving: receiving.as_ref().map(|s| s.connection.clone()),
+            receiving_profiles: receiving.map(|s| s.profiles).unwrap_or_default(),
             session_pool: crate::session_pool::is_running(&control),
         });
     }

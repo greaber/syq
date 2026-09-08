@@ -407,6 +407,7 @@ ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as 
 printf 'return\n' | cmp - /tmp/syq-return-outside
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
 printf 'return\n' | cmp - /tmp/syq-return-absolute
+python3 /usr/local/libexec/syq-test-receive-profiles.py
 printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
 syq persist receive off
 syq persist connect source
