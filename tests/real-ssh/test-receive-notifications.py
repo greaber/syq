@@ -112,7 +112,7 @@ def tests():
                 assert app == "syq" and summary == "syq: Allow this copy?"
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
-                assert "source" in body and "May create and overwrite" in body, body
+                assert "source" in body and "overwritten" not in body and "May create" not in body, body
                 assert body.startswith("To: "), body
                 assert "Details: syq persist receive pending" in body, body
                 assert "Limits:" not in body and "not been inspected" not in body, body
@@ -127,6 +127,18 @@ def tests():
                     pass
                 copy.wait()
         assert len(observed) == 5, observed
+        # An existing target needs a warning, even if the copy is later denied.
+        choice = "deny"
+        destination = Path("/tmp/syq-real-ssh-receive/desktop-existing")
+        destination.write_bytes(b"keep this")
+        command = shlex.join([
+            "syq", "cp", "/tmp/syq-real-ssh/return-source/message.txt",
+            "--to", "@laptop", "--as", destination.name,
+        ])
+        result = subprocess.run(["ssh", "source", command], timeout=20)
+        assert result.returncode != 0
+        assert destination.read_bytes() == b"keep this"
+        assert "Existing destination entries may be overwritten" in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
@@ -145,7 +157,7 @@ def tests():
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-        assert len(observed) == 7, observed
+        assert len(observed) == 8, observed
     except BaseException:
         errors.append(traceback.format_exc())
     finally:
