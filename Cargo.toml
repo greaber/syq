@@ -29,7 +29,6 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
 jwalk = "0.9"
-rayon = "1.12"
 ignore = "0.4"
 blake3 = "1"
 zstd = "0.13"

@@ -4440,19 +4440,14 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
         return items.iter().map(&f).collect();
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
-    use rayon::prelude::*;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(PAR_THREADS)
-            .thread_name(|index| format!("syq-metadata-{index}"))
-            .build()
-            .expect("metadata worker pool")
-    });
-    pool.install(|| {
-        items
-            .par_chunks(chunk)
-            .flat_map_iter(|chunk| chunk.iter().map(&f))
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("stat thread"))
             .collect()
     })
 }
