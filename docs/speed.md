@@ -345,6 +345,10 @@ copy authorization.
 
 ## Local copies and NFS
 
+Check [source and destination storage placement](server-tuning.md#check-local-storage-placement):
+copies within a filesystem that supports cloning can share data extents instead
+of physically copying every byte.
+
 Same-machine Linux copies first try kernel or NFS server-side copying. If
 that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
 copy, syq copies eligible files larger than 64 KiB directly through their open
