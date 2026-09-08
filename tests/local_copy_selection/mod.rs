@@ -1,0 +1,269 @@
+//! Selection coverage, kept separate from receiver dispatch tests.
+use super::*;
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_batch_boundary_and_scheduler_agree() {
+    for connections in ["1", "4"] {
+        let t = Tmp::new();
+        let sizes = [0, 1, 65535, 65536, 65537, 1 << 20, 4 << 20];
+        for (index, size) in sizes.into_iter().enumerate() {
+            write(
+                &t.path(&format!("src/file{index}")),
+                &prng(size, index as u64),
+            );
+        }
+        let out = compat_command()
+            .args([
+                "-a",
+                "--syq-no-tcp",
+                "--syq-connections",
+                connections,
+                "--block-size=4M",
+                "--tuning-options=request-size=4M",
+                "--no-progress",
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let workers = fs::read_to_string(t.path("workers")).unwrap();
+        assert_eq!(
+            workers
+                .lines()
+                .filter(|line| line.starts_with("connected "))
+                .count(),
+            connections.parse::<usize>().unwrap(),
+            "{workers}"
+        );
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["local_whole_files"], 3, "{out:?}");
+        assert_eq!(observed["range_requests"], 0);
+        assert!(observed["small_batches"].as_u64().unwrap() > 0);
+        assert!(partial_files(&t.0).is_empty());
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_medium_unsupported_keeps_full_size_range_requests() {
+    let t = Tmp::new();
+    for i in 0..2 {
+        write(&t.path(&format!("src/file{i}")), &prng(4 << 20, i));
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--syq-connections=2",
+            "--block-size=4M",
+            "--tuning-options=request-size=4M",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["small_batches"], 0);
+    assert_eq!(observed["max_request_bytes"], 4 << 20);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
+fn checksum_and_paced_medium_files_keep_batches() {
+    for control in ["--checksum", "--bwlimit=1G"] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &prng(1 << 20, 80));
+        let out = compat_command()
+            .args([
+                "-a",
+                "--syq-no-tcp",
+                "--syq-connections=1",
+                "--no-progress",
+                control,
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["local_whole_files"], 0);
+        assert_eq!(observed["range_requests"], 0);
+        assert_eq!(observed["small_batches"], 1);
+    }
+}
+
+#[test]
+fn remote_medium_files_keep_batches() {
+    for pull in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        write(&t.path("src/file"), &prng(4 << 20, 81));
+        let src = if pull {
+            format!("fake:{}/", t.s("src"))
+        } else {
+            t.s("src/")
+        };
+        let dst = if pull {
+            t.s("dst/")
+        } else {
+            format!("fake:{}/", t.s("dst"))
+        };
+        let out = remote_syq_command(
+            &t,
+            &rsh,
+            &[
+                "-a",
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-no-bootstrap",
+                "--block-size=4M",
+                "--tuning-options=request-size=4M",
+                &src,
+                &dst,
+            ],
+        )
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["local_whole_files"], 0);
+        assert_eq!(observed["range_requests"], 0);
+        assert_eq!(observed["small_batches"], 1);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
+    let t = Tmp::new();
+    write(&t.path("src/small"), b"parallel file work");
+    let original = prng(2 << 20, 456);
+    write(&t.path("src/file"), &original);
+    write(&t.path("dst/file"), b"old destination");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stderr_of(&out).contains("test local-copy write failure"));
+    assert_eq!(read(&t.path("dst/file")), b"old destination");
+    let partials = partial_files(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    assert_eq!(fs::metadata(&partials[0]).unwrap().len(), 1 << 20);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+
+    // The failed userspace write is a resumable basis, not authority to skip
+    // checking bytes that changed in the source before the retry.
+    let mut changed = original;
+    changed[..1 << 20].fill(b'c');
+    write(&t.path("src/file"), &changed);
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), changed);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 0);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn platforms_without_direct_copy_keep_medium_batches() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(1 << 20, 82));
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+    assert_eq!(observed["small_batches"], 1);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
+    let t = Tmp::new();
+    let mut contents = prng(2 << 20, 83);
+    write(&t.path("src/file"), &contents);
+    write(
+        &t.path("src/tiny"),
+        b"another file enables the local sequential fallback",
+    );
+    let run = || {
+        let mut command = compat_command();
+        command
+            .args([
+                "-a",
+                "--syq-no-tcp",
+                "--no-progress",
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local");
+        command
+    };
+    let failed = run()
+        .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1")
+        .run()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(stderr_of(&failed).contains("test local-copy write failure"));
+    assert!(!t.path("dst/file").exists());
+    let partials = partial_files(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    assert_eq!(fs::metadata(&partials[0]).unwrap().len(), 1 << 20);
+
+    contents[..1 << 20].fill(b'x');
+    write(&t.path("src/file"), &contents);
+    let resumed = run().run().unwrap();
+    assert_output_ok(&resumed);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.path("dst")).is_empty());
+    let observed = tuning_observed(&resumed);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 0);
+}

@@ -113,13 +113,23 @@ fn record_setup_event_for_test(event: &str) -> Result<()> {
     Ok(())
 }
 
-fn fast_file_size_limit(opts: &Opts) -> u64 {
-    opts.block
+// Keep tiny files batched, but let eligible local medium files reach the
+// guarded receiver-side copy path without shrinking ordinary range requests.
+const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
+
+fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
+    let limit = opts
+        .block
         .min(opts.tuning.batch_bytes())
         .min(
             opts.tuning
-                .request_size(opts.block, None, opts.restricted_receiver),
-        )
+                .request_size(opts.block, bwlimit, opts.restricted_receiver),
+        );
+    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
+        limit.min(LOCAL_FAST_FILE_BYTES)
+    } else {
+        limit
+    }
 }
 
 pub struct Opts {
@@ -3119,7 +3129,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             {
                 files += 1;
                 bytes = bytes.saturating_add(entry.size);
-                all_small &= entry.size <= fast_file_size_limit(&opts);
+                all_small &= entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref());
             }
         }
         if files > 0 && all_small {
@@ -3198,7 +3208,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
                             && jobs.iter().all(|job| {
-                                job.entry.size <= fast_file_size_limit(&opts)
+                                job.entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref())
                                     && job.dst_entry.is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any
@@ -7621,16 +7631,11 @@ impl Worker {
                         // accumulate locally and then hit the network in a burst.
                         if self.bwlimit.is_none() {
                             let first_bytes = self.job(idx).entry.size;
-                            batch.extend(
-                                self.sched.take_small(
-                                    self.opts
-                                        .block
-                                        .min(self.transfer_block())
-                                        .min(self.opts.tuning.batch_bytes()),
-                                    target - batch.len(),
-                                    self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
-                                ),
-                            );
+                            batch.extend(self.sched.take_small(
+                                fast_file_size_limit(&self.opts, self.bwlimit.as_deref()),
+                                target - batch.len(),
+                                self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
+                            ));
                         }
                         let (fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
@@ -7730,12 +7735,7 @@ impl Worker {
         let j = &jobs[idx];
         !self.opts.verify_only
             && !self.opts.tuning.force_ranges()
-            && j.entry.size
-                <= self
-                    .opts
-                    .block
-                    .min(self.transfer_block())
-                    .min(self.opts.tuning.batch_bytes())
+            && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && j.dst_entry.is_none()
             && (!self.opts.inplace
                 || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))

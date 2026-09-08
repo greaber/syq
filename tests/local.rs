@@ -6516,10 +6516,11 @@ fn streaming_read_errors_do_not_publish_a_file() {
 #[test]
 fn tuning_options_batch_limits_include_the_first_file() {
     let t = Tmp::new();
+    // Stay inside the local tiny-file ceiling while exercising both batch limits.
     for i in 0..7 {
-        write(&t.path(&format!("source/{i}")), &prng(600 << 10, i));
+        write(&t.path(&format!("source/{i}")), &prng(60 << 10, i));
     }
-    for (files, bytes, expected_files) in [(3, 2 << 20, 3), (10, 1 << 20, 1)] {
+    for (files, bytes, expected_files) in [(3, 200 << 10, 3), (10, 100 << 10, 1)] {
         let destination = t.s(&format!("destination-{files}"));
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
@@ -19952,3 +19953,5 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
         }
     }
 }
+
+mod local_copy_selection;
