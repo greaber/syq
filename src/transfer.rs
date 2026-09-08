@@ -1889,8 +1889,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     });
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (after pacing and receiver limits), pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
@@ -8559,7 +8560,11 @@ impl Worker {
             return Ok(());
         }
         let job = self.job(idx);
-        let block = self.transfer_block();
+        let block = self.opts.tuning.streaming_request_size(
+            self.opts.block,
+            self.bwlimit.as_deref(),
+            self.opts.restricted_receiver,
+        );
         // Do not advance the scheduler's claimed position when opening the
         // stream. Other workers may still steal the unread suffix. At a split
         // we notify the source at the next consumer block boundary, then

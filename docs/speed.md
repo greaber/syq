@@ -166,7 +166,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 | Key | Default | Accepted values |
 |---|---|---|
-| `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
+| `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
@@ -208,6 +208,12 @@ The `syq: tuning:` diagnostic describes the selection policy: a pipeline depth
 applies only to ordinary ranges, and automatic remote selection also reports
 the size above which ranges stream. It does not claim which paths ran; use
 the observed range and streaming counters for that.
+
+Streaming uses blocks of at most 2 MiB by default, reducing the payload retained
+per block. Smaller hash blocks still bound the streaming block
+size. This does not change hash/resume blocks, ordinary request sizes, or which
+ranges automatically stream. An explicit `request-size` overrides streaming
+block size too; bandwidth pacing and receiver limits can reduce either size.
 
 Streaming sends
 checked source blocks and collects destination write replies concurrently,
@@ -301,8 +307,8 @@ capped runs.
 
 ### Recording a comparison
 
-With overrides, `-v` reports effective settings, including any reduction in
-request size or increase in the split threshold. A final `syq: tuning observed:`
+With overrides, `-v` reports effective ordinary request and streaming block
+sizes, including any reduction in request size or increase in the split threshold. A final `syq: tuning observed:`
 line contains diagnostic JSON with copy-path counts, range request count,
 streaming-range and streamed-block counts,
 largest requested range, and largest worker batch by file count and content

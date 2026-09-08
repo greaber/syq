@@ -6130,7 +6130,7 @@ fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
 fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    for (label, size) in [("short", 8 << 20), ("long", 20 << 20)] {
+    for (label, size) in [("short", 16 << 20), ("long", (20 << 20) + 123)] {
         write(&t.path(label), &prng(size, 947));
         for route in ["local", "push", "pull"] {
             let destination = t.s(&format!("dst-{label}-{route}"));
@@ -6182,8 +6182,16 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 label == "long" && route != "local",
                 "{out:?}"
             );
-            if label == "short" && route != "local" {
-                assert!(observed["range_requests"].as_u64().unwrap() > 0, "{out:?}");
+            if route != "local" {
+                assert!(stderr_of(&out).contains("streaming-block-size=2097152 bytes"));
+                if label == "short" {
+                    assert_eq!(observed["range_requests"], 4, "{out:?}");
+                    assert_eq!(observed["max_request_bytes"], 4 << 20, "{out:?}");
+                } else {
+                    assert_eq!(observed["range_requests"], 0, "{out:?}");
+                    assert_eq!(observed["max_request_bytes"], 2 << 20, "{out:?}");
+                    assert_eq!(observed["streamed_blocks"], 11, "{out:?}");
+                }
             }
         }
     }
