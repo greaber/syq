@@ -12,10 +12,10 @@ Quick links to docs for common tasks:
 - [Send files to your laptop from a server you’re SSHed into](https://greaber.github.io/syq/receive.html).
   Your laptop needs no SSH server or incoming network port.
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/exec.html)
-- [Copy between servers](https://greaber.github.io/syq/remote-to-remote.html)
+- [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
-- Use syq from [scripts](https://greaber.github.io/syq/automation.html) or
-  [Python](https://greaber.github.io/syq/python.html).
+- Script syq using the [JSON API](https://greaber.github.io/syq/automation.html) or
+  [Python SDK](https://greaber.github.io/syq/python.html).
 
 ## Install
 
