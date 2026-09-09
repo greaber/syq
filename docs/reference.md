@@ -21,14 +21,6 @@ syq cp -vv --stats project --into backup
 See [diagnosing a slow copy](speed.md#diagnose-a-slow-copy) for interpreting
 transport and performance details.
 
-To initiate a copy from a server to your laptop, use a [named receiving
-destination](receive.md), such as `syq cp results --to laptop`. `persist on`
-enables background receiving with later SSH connections; ephemeral `--pscope`
-connections do not enable it. Bare names prefer live return
-connections; `@laptop` requires one and fails while offline.
-You can also [request a command on the receiving machine](exec.md), such as
-`syq exec --on @laptop --cwd work/project -- cargo test`, with local approval.
-
 ## See where files go
 
 A named directory brings its name along. `--srcs-in` copies its contents;
@@ -97,34 +89,23 @@ Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
 For two remote endpoints, see [Copy between servers](remote-to-remote.md).
-From a server shell, `syq cp results --to hostB` automatically looks for a live
-receiving machine that can authorize the copy while data flows directly to
-hostB. Use `--auth-from @laptop` to select one, or `--auth-from ssh` to use
-SSH from this machine. See [authorization selection](remote-to-remote.md#start-a-copy-from-the-source-server)
-for ordering, supported options, and approval behavior. `--via @laptop` remains
-an alias for the explicit receiving-machine selection.
+To send files to your laptop from a server shell, see
+[Send files home from a server](receive.md).
 
 ## Progress
 
-When stderr is a terminal, syq shows one progress bar for the whole copy.
-The bar stays in place as files and workers change. It shows bytes processed
-out of the discovered total; while syq is still scanning, the percentage is
-unknown. Wider terminals also show elapsed time, speed, ETA, and file counts.
+Syq shows a progress bar when running in a terminal. It tracks bytes processed;
+while files are still being discovered, the percentage is unknown. Wider
+terminals also show elapsed time, speed, ETA, and file counts.
+
 Use `--progress` to force the display or `--no-progress` to hide it. `--quiet`
-hides it too. `--progress-json` selects JSON progress instead of the bar.
-JSON progress and warning records preserve their original string values,
-including Unicode characters; terminal escaping applies only to human output.
+hides it too. After five seconds without a byte update, `no update` shows how
+long it has been; this does not by itself mean the connection has failed.
+Wait for the final summary to confirm success, even if the byte bar looks full.
 
-The bar advances when syq processes a block or completes a file. On a slow
-link, or during a local server-side copy, it can stay at the same position
-for a while. After five seconds without a byte update, `no update` shows how
-long it has been; this does not mean the connection has failed. Syq does not
-guess extra completed bytes between updates. A final `done` or `incomplete`
-bar stays visible when the copy settles. Reaching the end of the byte bar
-alone does not mean all files have finished or that the copy succeeded.
-
-The bar also covers `syq rm`, counting entries instead of bytes. For scripts,
-use [results records](automation.md) rather than parsing the terminal bar.
+The bar also covers `syq rm`, counting entries instead of bytes.
+`--progress-json` provides JSON progress for displays; use
+[results records](automation.md) to track completion in scripts.
 
 ## Choose a destination
 
@@ -162,36 +143,27 @@ syq cp --only-new --srcs-in incoming --into archive
 syq cp --only-existing --srcs-in project --into deployed
 ```
 
-With `--only-new`, directories already present when syq first checks them keep
-their permissions, ownership, and timestamps. Missing children are still added.
-Adding children requires write access to that directory; syq does not
-temporarily widen its permissions. If access is denied, the entry fails
-and the copy reports an error. A dry run previews intended changes without
-testing whether writes will be permitted.
-Adding or removing children can change directory timestamps through normal
-filesystem behavior. Directories copied as new receive normal copy metadata.
-If several sources supply the same new directory, the last source supplies
-its metadata, as in a copy without `--only-new`.
-If a source directory meets an existing non-directory,
-it keeps the destination entry and skips that source subtree.
-`--only-existing` also skips a source directory and its subtree when the destination
-is missing or is not a directory. `--only-existing` cannot combine with
-`--into-new` or `--as-new`. These policies differ from
-`--into-existing` and `--as-existing`, which check the placement path only.
+`--only-new` keeps existing entries and their metadata, while adding missing
+children to existing directories. Those directories must be writable; syq
+does not change their permissions to add files. Adding children can still
+change directory timestamps. A dry run does not test write access.
+
+If a source directory meets an existing non-directory, `--only-new` skips that
+subtree. `--only-existing` skips a subtree when its destination is missing or
+is not a directory. It cannot combine with `--into-new` or `--as-new`.
+The placement options `--into-existing` and `--as-existing` check only the
+placement path, rather than every copied entry.
 
 `--skip-newer` compares timestamps, not the age of the contents. It affects only
-regular-file pairs: replacing a different entry type still occurs.
-Combine it with `--only-existing` to avoid creating missing entries too.
-`--only-new` cannot combine with either policy. Neither
-`--only-new` nor `--skip-newer` can combine with `--inplace`: an interrupted
-in-place write could otherwise leave an incomplete file that the next run skips.
+regular-file pairs; replacing a different entry type still occurs. Combine it
+with `--only-existing` to avoid creating missing entries too.
+
+`--only-new` cannot combine with either policy. Neither `--only-new` nor
+`--skip-newer` can combine with `--inplace`: an interrupted write could leave
+an incomplete file that the next run skips. Restricted receivers also refuse
+`--only-existing --inplace`.
 
 These options do not disable `--prune`; requested pruning still removes extras.
-Command-restricted copies support `--skip-newer` too. The comparison uses source
-timestamps, which a compromised source can invent. The receiver still enforces
-the permitted destination paths, operations, and limits; `--only-existing --skip-newer`
-also keeps the receiver's independent existing-object protection.
-The restricted path also refuses `--only-existing --inplace`.
 
 ## Preview changes
 
@@ -254,10 +226,7 @@ Ignored directories are not scanned. To keep part of one, include the parent:
 syq cp --ignore 'logs/*' --ignore '!logs/keep/' --srcs-in project --into backup
 ```
 
-Ignored paths are also protected from pruning. When pulling from another
-machine, syq independently checks the returned names and their ancestors.
-A source that returns an excluded path causes the copy to fail before that
-entry is planned.
+Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
@@ -265,12 +234,10 @@ Rerun the same command. Completed files are skipped; partially copied files
 reuse matching blocks. By default, syq writes a partial file beside the
 destination and replaces the final file only when complete.
 
-Do not run the same logical copy twice concurrently: the runs share partial
-files. To abandon a copy, stop it and delete its hidden partial files from the
-destination. They are named `.FILENAME.syq-part.ID`, beside the intended final
-file; long names may be shortened or hashed. For example, a partial for
-`video.mp4` is `.video.mp4.syq-part.ID`. Use `ls -a` to see it, then `rm --`
-with its exact name. Keep partials belonging to copies still running.
+Running the same copy twice at once can cause errors as the runs share temporary
+files. Wait for it to finish or stop it before restarting. To abandon a copy,
+stop all its runs before removing hidden files with `.syq-part.` in their names
+at the destination.
 
 ## Check file contents
 
@@ -296,23 +263,30 @@ To compare without writing, use `--verify-only`:
 syq cp --verify-only --srcs-in project --into backup
 ```
 
-This hashes selected regular files even when size and modification time match,
-compares symlink targets, and checks selected directory and special-file types
-(and device identity). It reports differences and missing entries; either a
-difference or an inspection error makes the run fail. It does not compare
-permissions, ownership, or timestamps, or look for destination-only entries.
-Special files are selected only with `--preserve=specials`.
+This compares file contents, symlink targets, and entry types without writing.
+Missing or different entries make the command fail. It does not compare metadata
+or look for extra destination files.
 
-Source and destination contents stay unchanged; a requested results file is
-still written and remote helper setup may write cache files. Verification
-cannot combine with `--dry-run`, `--prune`, `--inplace`, or overwrite policies.
-Filters and size limits still select what is compared. Matching regular files
-appear as unchanged in [automation results](automation.md); no files or bytes
-are reported as transferred.
+For two servers, add `--coordinate-at local` to compare through your machine
+using ordinary SSH access, with no restricted receiver enrollment. This also
+supports `--results`. See [remote verification](remote-reference.md#verification).
 
-Restricted remote-to-remote verification requires an existing receiver
-enrollment; it will not install one. Use `--coordinate-at local` to compare
-through your machine, including when you need comparison results in JSON.
+## In-place writes
+
+By default, syq builds an updated file beside the old one and replaces it when
+complete. `--inplace` writes directly into the destination file instead:
+
+```sh
+syq cp --inplace large-file --to server --into /backup
+```
+
+This saves temporary disk space and can avoid copying unchanged data into a
+new file. Readers can see a mixture of old and new contents during the copy.
+If interrupted, the incomplete file stays at its final name until you finish
+the copy. Writes through a hard link also affect its other names.
+
+Use the default when other programs need to read a complete file throughout
+an update. [Copies sent back to your laptop](receive.md) do not support `--inplace`.
 
 ## Preserve metadata
 
@@ -382,16 +356,7 @@ Use `--min-size` and `--max-size` to select regular files by size.
 For parallelism and bandwidth controls, see [Speed](speed.md). For scripts,
 see [Automation results](automation.md).
 
-At each command, `--help` (or `-h`) shows everyday options and lists the public
-subcommands. Commands for manual setup, recovery, or scripting have brief
-“Advanced” descriptions; `--help-all` expands their descriptions and lists all
-public options. For example, `syq receiver enroll --help` explains manual
-enrollment, and `syq receiver enroll --help-all` also shows the jump-host option.
-Use `syq help COMMAND` to read the same help without invoking the command.
-In `syq rsync`, `-h` means human-readable sizes; use `--help` for help.
-
-Helper overrides, ephemeral connection scopes, JSON status output, specialized
-receiving limits, and performance tuning appear in `--help-all`. Copies tune
-performance automatically; manual tuning is for troubleshooting and controlled
-experiments. `--bwlimit` stays in ordinary help because it sets how much
-bandwidth you want to use.
+Use `--help` (or `-h`) for everyday options and `--help-all` for the full list,
+including tuning, scripting, and manual setup. `syq help COMMAND` shows the
+same help without running the command. In `syq rsync`, `-h` means
+human-readable sizes; use `--help` for help.

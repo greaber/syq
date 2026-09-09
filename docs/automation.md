@@ -248,3 +248,20 @@ Within a schema version, required fields keep their types and meanings;
 existing types, actions, dispositions, statuses, classes, and reasons are not
 renamed or reused. New record types and optional fields may be added. Human
 messages may change at any time.
+
+## Connection status
+
+`syq persist status --json` reports the persistence setting, scope, and endpoints
+without starting connections. Endpoint states are `starting`, `connecting`,
+`ready`, `reconnecting`, `failed`, or `inactive`. Each entry also reports whether
+SSH is connected and the receiving state and errors.
+
+With receiving enabled, `ready` means the return connection is online; SSH can
+reconnect on its next use. If receiving preferences cannot be read, SSH entries
+are still listed, `receiving_error` explains the failure, and each entry's
+`receiving_enabled` is `null`.
+
+Command approvals in `syq persist receive pending --json` use `kind: "command"`
+and include `argv`, `cwd`, and `permission`. Argument and directory strings in
+this summary are escaped for display. Use an up-to-date syq binary to inspect
+and approve commands; clients that only support copy requests omit them.

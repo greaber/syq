@@ -6058,7 +6058,8 @@ fn tuning_observed(out: &Output) -> serde_json::Value {
         .lines()
         .find_map(|line| line.strip_prefix("syq: tuning observed: "))
         .unwrap_or_else(|| panic!("missing benchmark observations: {diagnostic}"));
-    serde_json::from_str(line).unwrap()
+    serde_json::from_str(line)
+        .unwrap_or_else(|error| panic!("invalid benchmark observations ({error}): {diagnostic}"))
 }
 
 #[test]
