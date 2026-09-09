@@ -26,8 +26,9 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-Choose a local or SSH copy and a workload. The script automatically sizes
-throwaway data with syq and cleans up afterward. No syq-bench install is needed;
+The default sends 1,024 small throwaway files to an SSH host you choose and
+compares syq with rsync over three rounds. Local copies, large files, and
+automatic sizing are optional. It cleans up afterward. No syq-bench install is needed;
 if syq is missing, it offers to install it.
 
 <figure class="benchmark-example">
@@ -37,25 +38,25 @@ if syq is missing, it offers to install it.
 <dl class="benchmark-choices">
 <dt>Copy where?</dt><dd>local</dd>
 <dt>Workloads?</dt><dd>both</dd>
-<dt>Test size</dt><dd>automatic by default</dd>
+<dt>Test size</dt><dd>quick</dd>
 </dl>
 <p class="visual-note">Results pictured: fixed-size sample<br>64 MiB + 1,024 files of 8 KiB</p>
 </section>
 <section aria-label="Example benchmark results">
 <div class="visual-step">2 <span>Compare the results</span></div>
 <table>
-<caption>Mean MB/s · higher is faster · 3 trials</caption>
+<caption>Approximate seconds · lower is faster</caption>
 <thead><tr><th scope="col">Tool</th><th scope="col">Large file</th><th scope="col">Small files</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>710.0</td><td>50.1</td></tr>
-<tr><th scope="row">rsync</th><td>567.3</td><td>71.1</td></tr>
-<tr><th scope="row">cp</th><td>1379.1</td><td>160.4</td></tr>
+<tr><th scope="row">syq</th><td>0.095</td><td>0.167</td></tr>
+<tr><th scope="row">rsync</th><td>0.118</td><td>0.118</td></tr>
+<tr><th scope="row">cp</th><td>0.049</td><td>0.052</td></tr>
 </tbody>
 </table>
 <p class="visual-note">✓ Copied contents checked</p>
 </section>
 </div>
-<figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
+<figcaption>Optional local comparison, converted from a fixed-size sample. Filesystem cloning can shorten copy times; these are not disk bandwidth measurements. Your results will differ.</figcaption>
 </figure>
 
 For requirements, options and how to read the results, see

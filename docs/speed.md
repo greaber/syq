@@ -39,7 +39,8 @@ comparison without installing a benchmark package. After downloading the
 script, you can repeat the same choices explicitly:
 
 ```sh
-bash try-benchmark.sh --yes --mode push --host server --workload both --rounds 3
+bash try-benchmark.sh --yes --host server
+bash try-benchmark.sh --yes --host server --workload both --size auto
 bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
 ```
 
@@ -55,8 +56,18 @@ Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
 scratch parent, including when pulling; `--source-dir` is always the local
 scratch parent.
 
-By default, the script starts with 64 MiB for the large file and 1,024 files
-of 8 KiB for the small-file workload. It makes verified, unscored syq copies
+The default is a push to a second machine, with 1,024 files of 8 KiB each
+and three rounds. Supply an SSH host when prompted, or use `--host` with
+`--yes`. Choose a fast link with some latency to exercise parallel network
+copying; reachable TCP data ports `47600–47699` allow the default encrypted
+TCP path. The script uses normal syq settings and fresh SSH connections for
+both tools. A faster result is not guaranteed. `--mode local` compares local
+copies, and `--workload large` or `--workload both` includes large files.
+Large files measure sustained throughput; small files also exercise per-file
+overhead, so the two workloads can have very different results.
+
+With `--size auto`, the script starts with 64 MiB for the large file and 1,024
+files of 8 KiB for the small-file workload. It makes verified, unscored syq copies
 and increases each workload until syq's copying interval reaches about five
 seconds. Each increase is between 25% and tenfold, avoiding repeated
 near-identical tests when timings fluctuate. Available space at both ends limits
@@ -71,7 +82,8 @@ cp). Choosing both workloads doubles those counts. A faster cp result does not
 cause further growth.
 
 Automatic sizing requires syq to report `copying_elapsed_ms` in its automation
-results. Older builds can use `--size quick`, `--size medium`, or `--size large`
+results. Fixed sizes need no timing field: use `--size quick` (the default),
+`--size medium`, or `--size large`
 for fixed workloads: respectively 64 MiB / 1,024 files, 1 GiB / 4,096 files,
 and 8 GiB / 16,384 files. Small files remain 8 KiB each. These flags also let
 you repeat a fixed-size comparison.
@@ -81,10 +93,18 @@ hard to compress. Every trial has an empty, pre-created destination; interrupted
 never resumed. On Ctrl-C the script stops its local workers, moves remote
 scratch out of the transfer path, and deletes its temporary data. If SSH
 is unavailable, it reports the remote path for later cleanup. The script rotates
-tool order and reports speeds in decimal MB/s (1 MB = 1,000,000 bytes):
-each trial’s copied bytes divided by its elapsed time, followed by the mean,
-minimum and maximum trial speeds. Higher is faster. It uses
-syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
+tool order. Network tests report speeds in decimal MB/s (1 MB = 1,000,000
+bytes): each trial’s copied bytes divided by its elapsed time, followed by the
+mean, minimum and maximum trial speeds. Higher is faster. Local tests instead
+report elapsed seconds, where lower is faster. A filesystem clone creates an
+independent copy that initially shares storage with its source; changing either
+file keeps the other intact. Its time measures that useful operation, not
+physical data transfer. The script permits each tool’s normal optimizations.
+To compare copying between storage devices, choose scratch parents on those
+devices. Generation and checks use explicit paths without entering the
+scratch directories, so they keep the launch directory visible to tmux.
+
+The script uses syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
 These copy the same regular files and request permissions and modification
 times; the tools still differ in compression, integrity checks, and filesystem
 optimizations.

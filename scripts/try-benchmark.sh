@@ -13,11 +13,12 @@ Compare syq with rsync, and cp for local copies, using disposable synthetic data
 Usage: bash try-benchmark.sh [OPTIONS]
 Without --yes, unanswered choices are prompted through /dev/tty (also with curl | bash).
 
-  --mode local|push|pull    Copy locally, to an SSH host, or from an SSH host
+  --mode local|push|pull    Copy locally, to an SSH host (default), or from one
   --host USER@HOST          SSH host or config alias (configure ports in ~/.ssh/config)
   --workload large|small|both
+                           Small files by default; large tests are opt-in.
   --size auto|quick|medium|large
-                           Auto sizes with syq (default). Quick: 64 MiB + 1,024 files;
+                           Quick (default): 64 MiB or 1,024 files; auto sizes with syq;
                            medium: 1 GiB + 4,096;
                            large: 8 GiB + 16,384. Small files are 8 KiB each.
   --source-dir DIR         Local scratch parent (default: current directory)
@@ -34,6 +35,9 @@ sizing needs Perl with its core JSON::PP module; terminal runs also need Perl. R
 also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
+The default push needs --host with --yes. Use a second machine, preferably
+on a fast link with some latency and reachable TCP data ports 47600-47699.
+Local results report seconds: filesystem clones do not measure byte throughput.
 Only newly created syq-bench.* directories are used. Existing data is not copied.
 HELP
 }
@@ -151,14 +155,19 @@ run() {
 # shellcheck disable=SC2016 # This is a literal program for bash -c on each host.
 manifest_command='set -eu
 export LC_ALL=C
-set --
-for file in *; do
+root=$1
+shift
+for file in "$root"/*; do
     set -- "$@" "$file"
     if [ "$#" -eq 128 ]; then cksum "$@" || exit; set --; fi
 done
 if [ "$#" -gt 0 ]; then cksum "$@"; fi'
-manifest() { (cd "$1"; bash -c "$manifest_command"); }
-remote_manifest() { remote "cd $(quote "$1") && $manifest_command"; }
+# Generated filenames have no whitespace. Strip the parent from cksum output
+# after checking its exit status through pipefail; never enter the scratch tree.
+manifest_names() { sed 's@ /.*\(/[^/]*\)$@ \1@'; }
+manifest() { bash -c "$manifest_command" manifest "$1" | manifest_names; }
+remote_manifest() { remote "set -- $(quote "$1")
+$manifest_command" | manifest_names; }
 
 make_data() {
     local workload=$1 amount=$2
@@ -171,7 +180,7 @@ make_data() {
     else
         dd if=/dev/zero bs=8192 count="$amount" 2>/dev/null |
             openssl enc -aes-256-ctr -nosalt -K "$key" -iv "$iv" |
-            (cd "$local_root/$workload"; split -b 8192 -a 6 - file-)
+            split -b 8192 -a 6 - "$local_root/$workload/file-"
     fi
 }
 copy_with() {
@@ -258,11 +267,11 @@ calibration_interval() {
 }
 
 summarize_results() {
-    awk '{key=$1 " " $2;
+    awk -v metric="${2:-speed}" '{key=$1 " " $2;
           if (!(key in n)) order[++count]=key;
           n[key]++;
           if ($3 <= 0) {unmeasurable[key]=1; next}
-          speed=$4 / $3 / 1000000;
+          speed=(metric == "seconds" ? $3 : $4 / $3 / 1000000);
           if (!(key in total)) {low[key]=speed; high[key]=speed}
           total[key]+=speed;
           if (speed < low[key]) low[key]=speed; if (speed > high[key]) high[key]=speed}
@@ -274,7 +283,7 @@ summarize_results() {
                       note=1;
                   } else printf "%-18s %10.3f %10.3f %10.3f %8d\n", key, total[key]/n[key], low[key], high[key], n[key];
               }
-              if (note) print "n/a: a copy finished below timer resolution; try a larger test.";
+              if (note) print "n/a: a copy finished below timer resolution (0.001 s); elapsed time is <0.001 s. Try a larger test.";
          }' "$1"
 }
 
@@ -309,9 +318,9 @@ main() {
         fail 'No terminal. Pass --yes and your choices (see --help).'
     fi
     if ! $yes; then
-        if [[ -z $mode ]]; then ask 'Copy where? local / push / pull' local; mode=$REPLY; fi
+        if [[ -z $mode ]]; then ask 'Copy where? push / pull / local' push; mode=$REPLY; fi
         if [[ $mode != local && -z $host ]]; then ask 'SSH host or config alias' ''; host=$REPLY; fi
-        if [[ -z $workload ]]; then ask 'Workloads? large / small / both' both; workload=$REPLY; fi
+        if [[ -z $workload ]]; then ask 'Workloads? small / large / both' small; workload=$REPLY; fi
         if [[ -z $source_dir ]]; then ask 'Local scratch parent' "$PWD"; source_dir=$REPLY; fi
         if [[ -z $dest_dir ]]; then
             if [[ $mode == local ]]; then ask 'Destination scratch parent (can be another disk or NFS mount)' "$source_dir"
@@ -319,7 +328,7 @@ main() {
             dest_dir=$REPLY
         fi
     fi
-    mode=${mode:-local}; workload=${workload:-both}; size=${size:-auto}
+    mode=${mode:-push}; workload=${workload:-small}; size=${size:-quick}
     source_dir=${source_dir:-$PWD}; dest_dir=${dest_dir:-.}
     case $mode in local|push|pull) ;; *) fail 'Mode must be local, push or pull.' ;; esac
     case $workload in large|small|both) ;; *) fail 'Workload must be large, small or both.' ;; esac
@@ -339,6 +348,7 @@ main() {
         perl -MJSON::PP -e 1 || fail 'Automatic sizing needs Perl with JSON::PP.'
     fi
     if [[ $mode != local ]]; then
+        [[ -n $host ]] || fail 'Network benchmarks need an SSH host. Pass --host USER@HOST, or --mode local for a local comparison.'
         need ssh
         [[ $host =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] || fail 'Use an SSH config alias or USER@HOST; configure ports/IPv6 in ~/.ssh/config.'
     fi
@@ -394,6 +404,11 @@ main() {
     if [[ $mode == local ]]; then printf 'Destination scratch: %s\n' "$dest_root"
     else printf 'Remote scratch: %s\n' "$remote_root"; fi
     printf 'Each trial copies fresh test data and checks the result. Dataset preparation and checks are not timed.\n'
+    if [[ $mode == local ]]; then
+        printf 'Local copies may use filesystem cloning (copy-on-write). Times measure completed copies, not physical data throughput.\n'
+    else
+        printf 'Use a second machine; a fast link with some latency can expose the benefit of parallel copying. TCP data ports 47600-47699 must be reachable to test the default TCP path.\n'
+    fi
     [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
     exec 4>&1 5>&2
     local tools=(syq rsync) workloads=(large small)
@@ -507,7 +522,11 @@ main() {
                     if (seconds > 0) printf "%.3f", bytes / seconds / 1000000;
                     else printf "n/a";
                 }')
-                printf 'Verified contents; speed %s MB/s.\n' "$speed"
+                if [[ $mode == local ]]; then
+                    printf 'Verified contents; elapsed %s seconds.\n' "$seconds"
+                else
+                    printf 'Verified contents; speed %s MB/s; elapsed %s seconds.\n' "$speed" "$seconds"
+                fi
                 if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
                 else rm -rf -- "$destination"; fi
             done
@@ -515,9 +534,16 @@ main() {
         rm -rf -- "${local_root:?}/$case_name"
         [[ $mode != pull ]] || remote "rm -rf $(quote "$source") $(quote "$remote_root/probe")"
     done
-    printf '\nResults (MB/s; higher is faster; all copies checked):\n'
+    local metric=speed
+    if [[ $mode == local ]]; then
+        metric=seconds
+        printf '\nResults (seconds; lower is faster; all copies checked):\n'
+        printf 'Filesystem cloning may avoid moving file data; these are copy times, not disk bandwidth.\n'
+    else
+        printf '\nResults (MB/s; higher is faster; all copies checked):\n'
+    fi
     [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
-    summarize_results "$local_root/results"
+    summarize_results "$local_root/results" "$metric"
     printf '\nCompare the trial range as well as the mean; small differences may be noise.\n'
     printf 'Results depend on your machines and workload.\n'
 }

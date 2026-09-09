@@ -102,7 +102,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def invoke(self, *args, env=None):
         return subprocess.run(
-            ['/bin/bash', str(SCRIPT), '--yes', '--source-dir', str(self.scratch),
+            ['/bin/bash', str(SCRIPT), '--yes', '--mode', 'local', '--source-dir', str(self.scratch),
              '--dest-dir', str(self.scratch), '--rounds', '1', '--workload', 'large', '--size', 'quick', *args],
             env=env or self.env, capture_output=True, text=True, timeout=60,
         )
@@ -110,6 +110,54 @@ class BenchmarkTests(unittest.TestCase):
     def assert_clean(self):
         self.assertEqual(self.sentinel.read_text(), 'existing user data')
         self.assertEqual(list(self.scratch.iterdir()), [self.sentinel])
+
+    def test_default_noninteractive_requires_host_before_creating_scratch(self):
+        result = subprocess.run(
+            ['/bin/bash', str(SCRIPT), '--yes', '--source-dir', str(self.scratch)],
+            env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Pass --host USER@HOST', result.stderr)
+        self.assert_clean()
+
+    def test_generation_and_checks_keep_launch_directory(self):
+        log = self.root / 'working-directories'
+        for name in ['cksum', 'split']:
+            executable = shutil.which(name)
+            path = self.bin / name
+            path.unlink()
+            path.write_text('#!/bin/bash\npwd -P >> ' + shlex.quote(str(log)) +
+                            '\nexec ' + shlex.quote(executable) + ' "$@"\n')
+            path.chmod(0o755)
+        result = self.invoke('--workload', 'small')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(log.read_text().splitlines())
+        self.assertEqual(set(log.read_text().splitlines()), {str(Path.cwd().resolve())})
+        self.assert_clean()
+
+    def test_checksum_command_failure_is_not_hidden_by_path_normalization(self):
+        executable = shutil.which('cksum')
+        path = self.bin / 'cksum'
+        path.unlink()
+        path.write_text('#!/bin/bash\nif [[ $* == */trial/* ]]; then exit 23; fi\nexec ' +
+                        shlex.quote(executable) + ' "$@"\n')
+        path.chmod(0o755)
+        for mode in ['local', 'push']:
+            with self.subTest(mode=mode):
+                result = self.invoke('--mode', mode, '--host', 'test-host')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('Results (', result.stdout)
+                self.assert_clean()
+
+    def test_local_summary_reports_seconds_even_for_a_fast_clone(self):
+        records = self.root / 'results'
+        records.write_text('large cp 0.002 6710886400\nlarge cp 0.004 6710886400\n')
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        result = subprocess.run(['/bin/bash', '-c', definitions +
+                                 '\nsummarize_results "$1" seconds', 'summary-test', str(records)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(['large', 'cp', '0.003', '0.002', '0.004', '2'],
+                      [line.split() for line in result.stdout.splitlines()])
 
     def test_auto_sizes_with_syq_for_each_direction(self):
         for mode in ['local', 'push', 'pull']:
@@ -199,7 +247,7 @@ class BenchmarkTests(unittest.TestCase):
             match = re.match(r'(large|small): (syq|rsync|cp), trial', line)
             if match:
                 current = tuple(match.groups())
-            match = re.match(r'Verified contents; speed ([0-9.]+) MB/s', line)
+            match = re.match(r'Verified contents; elapsed ([0-9.]+) seconds', line)
             if match:
                 trials.setdefault(current, []).append(float(match[1]))
         summaries = 0
@@ -434,8 +482,8 @@ class BenchmarkTests(unittest.TestCase):
             os.execvpe('/bin/bash', ['/bin/bash', '-c', f'cat {shlex.quote(str(SCRIPT))} | /bin/bash'], dict(self.env, BENCH_TEST_ASK='1'))
         output = b''
         prompts_answered = 0
-        # All four default answers are read from /dev/tty, not the script pipe.
-        os.write(fd, b'\n' * 4)
+        # Accept push and small, supply a host and remote scratch parent.
+        os.write(fd, b'\ntest-host\n\n\n' + str(self.scratch).encode() + b'\n')
         deadline = time.monotonic() + 90
         try:
             while time.monotonic() < deadline:
@@ -455,6 +503,8 @@ class BenchmarkTests(unittest.TestCase):
             _, status = os.waitpid(pid, 0)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0, output.decode())
             self.assertIn(b'Results (MB/s', output)
+            self.assertIn(b'Mode: push; workloads: small; size: quick', output)
+            self.assertNotIn(b'Generating one ', output)
             self.assert_clean()
         finally:
             os.close(fd)
