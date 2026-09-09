@@ -61,7 +61,10 @@ pub(crate) fn test_race_barrier(
             .with_context(|| format!("write {label} signal {}", Path::new(&ready).display()))?;
     }
     if let Some(continuation) = continuation {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Some race tests finish a competing copy before releasing this worker.
+        // Leave room for that work under suite load, especially on macOS. This
+        // is a deadlock safety bound, not an assertion about transfer speed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             match File::open(&continuation) {
                 Ok(_) => return Ok(()),
