@@ -1993,7 +1993,12 @@ fn clone_data_only_eligible(file: &File) -> Result<bool> {
     let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
     if count < 0 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOTSUP) {
+        // Data can be readable even when inspecting xattrs is forbidden.
+        // Cloning is optional; the normal path only needs the data access.
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EACCES | libc::EPERM)
+        ) {
             return Ok(false);
         }
         return Err(error).context("inspect clone source extended attributes");
@@ -2967,6 +2972,25 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o044)).unwrap();
         let source = File::open(&path).unwrap();
         let root = Root::open(t.path()).unwrap();
+        assert!(root
+            .clone_file(&source, &relative(b"no-xattr-access"), 4)
+            .unwrap()
+            .is_none());
+        assert!(Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow read,readattr,readextattr,readsecurity"
+            ])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
         let clone = root
             .clone_file(&source, &relative(b"partial"), 4)
             .unwrap()
