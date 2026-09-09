@@ -7805,12 +7805,15 @@ impl Worker {
         };
         // Connection setup supplies a conservative latency allowance even
         // for SSH, which has no kernel RTT observation. Do not mistake an
-        // ordinary WAN response for a stalled source read.
+        // ordinary WAN response for a stalled source read. The first payload
+        // can require several congestion-window growth rounds; allow sixteen
+        // RTTs before reducing read-ahead, including for large whole files.
+        let source_rtt_us = self.src.tcp_rtt_us().unwrap_or(0);
         let read_stall_budget = self
             .setup_elapsed
             .max(std::time::Duration::from_millis(100))
             .max(std::time::Duration::from_micros(
-                self.src.tcp_rtt_us().unwrap_or(0).saturating_mul(4),
+                source_rtt_us.saturating_mul(16),
             ));
         let mut reads = std::collections::VecDeque::new();
         let mut writes = std::collections::VecDeque::new();
@@ -7855,7 +7858,14 @@ impl Worker {
                 };
                 let waited = phase.elapsed();
                 self.fast.source += waited.as_secs_f64();
-                if waited > read_stall_budget && self.gate.active() > 1 {
+                if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
+                    if debug() {
+                        crate::output::diagnostic!(
+                            "syq: worker {}: source wait {:.3}s exceeded {:.3}s allowance (RTT {}us, setup {:.3}s); draining read-ahead",
+                            self.id, waited.as_secs_f64(), read_stall_budget.as_secs_f64(),
+                            source_rtt_us, self.setup_elapsed.as_secs_f64()
+                        );
+                    }
                     // Drain existing read-ahead before claiming more. Unissued
                     // groups stay stealable, so one slow source file cannot
                     // keep a window of further work away from idle peers.
