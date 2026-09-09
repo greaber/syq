@@ -178,9 +178,8 @@ Automatic new-file batches use the first file's size to limit how much is read
 before sending. Medium files are grouped into roughly 4 MiB batches; larger
 files can be grouped four at a time, within the 16 MiB byte limit. Tiny files
 keep the transport-dependent count limit. Explicit batch controls override
-this sizing. Larger batches overlap reads and writes in groups of whole files,
-usually up to 4 MiB per group. Hash comparison size does not determine new-file
-batching.
+this sizing. Larger batches overlap reads and writes in bounded groups of whole
+files. Hash comparison size does not determine new-file batching.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote

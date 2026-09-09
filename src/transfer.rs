@@ -7945,7 +7945,8 @@ impl Worker {
         // than reading their entire payload before the first write.
         let group_bytes =
             if self.src.supports_request_pipelining() || self.dst.supports_request_pipelining() {
-                FAST_BATCH_READ_BYTES
+                // Return the first group before collecting a full read window.
+                FAST_BATCH_READ_BYTES / crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64
             } else {
                 // Both calls run synchronously: splitting cannot overlap work.
                 u64::MAX
