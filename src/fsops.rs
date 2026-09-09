@@ -1464,7 +1464,6 @@ pub struct FsOps {
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
-    source_stats: SourceStatPool,
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
@@ -1618,7 +1617,6 @@ impl FsOps {
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
-            source_stats: SourceStatPool::default(),
             allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
@@ -3138,7 +3136,36 @@ impl FsOps {
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            return self.source_stats.stat(targets);
+            return parallel_map(&targets, |target| {
+                let Some(expected) = target.expected_leaf.as_ref() else {
+                    let Some(metadata) = target.root.metadata(&target.relative).ok() else {
+                        return Ok(None);
+                    };
+                    return Ok(
+                        rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok(),
+                    );
+                };
+                let metadata = target
+                    .root
+                    .metadata(&target.relative)
+                    .context("inspect registered source leaf")?;
+                require_source_leaf_identity(expected, metadata)?;
+                let entry = rooted_source_entry(
+                    &target.root,
+                    &target.relative,
+                    Vec::new(),
+                    metadata,
+                    Some(expected),
+                )?;
+                let after = target
+                    .root
+                    .metadata(&target.relative)
+                    .context("recheck registered source leaf")?;
+                require_source_leaf_identity(expected, after)?;
+                Ok(Some(entry))
+            })
+            .into_iter()
+            .collect();
         }
         if self.destination_root.is_none()
             && !self.source_roots.is_empty()
@@ -4407,133 +4434,6 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
 
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
-
-fn stat_registered_source(target: &RegisteredSourceTarget) -> Result<Option<Entry>> {
-    let Some(expected) = target.expected_leaf.as_ref() else {
-        let Some(metadata) = target.root.metadata(&target.relative).ok() else {
-            return Ok(None);
-        };
-        return Ok(rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok());
-    };
-    let metadata = target
-        .root
-        .metadata(&target.relative)
-        .context("inspect registered source leaf")?;
-    require_source_leaf_identity(expected, metadata)?;
-    let entry = rooted_source_entry(
-        &target.root,
-        &target.relative,
-        Vec::new(),
-        metadata,
-        Some(expected),
-    )?;
-    let after = target
-        .root
-        .metadata(&target.relative)
-        .context("recheck registered source leaf")?;
-    require_source_leaf_identity(expected, after)?;
-    Ok(Some(entry))
-}
-
-struct SourceStatTask {
-    targets: Vec<RegisteredSourceTarget>,
-    reply: std::sync::mpsc::Sender<Vec<Result<Option<Entry>>>>,
-}
-
-struct SourceStatThread {
-    tasks: Option<std::sync::mpsc::Sender<SourceStatTask>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl SourceStatThread {
-    fn new() -> Result<Self> {
-        let (tasks, pending) = std::sync::mpsc::channel::<SourceStatTask>();
-        let thread = std::thread::Builder::new()
-            .name("source-stat".into())
-            .spawn(move || {
-                for task in pending {
-                    let results = task.targets.iter().map(stat_registered_source).collect();
-                    let _ = task.reply.send(results);
-                }
-            })
-            .context("start source metadata worker")?;
-        Ok(Self {
-            tasks: Some(tasks),
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for SourceStatThread {
-    fn drop(&mut self) {
-        self.tasks.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Source rechecks use the same parallelism as other metadata batches, but
-/// repeat after every small-file batch. Keep their threads for this filesystem
-/// worker's lifetime; channel receives park them between requests.
-#[derive(Default)]
-struct SourceStatPool {
-    workers: Vec<SourceStatThread>,
-}
-
-impl SourceStatPool {
-    fn stat(&mut self, targets: Vec<RegisteredSourceTarget>) -> Result<Vec<Option<Entry>>> {
-        let result = self.stat_inner(targets);
-        if result.is_err() {
-            // Join outstanding work and replace any worker that stopped before
-            // replying. A later request cannot consume an earlier batch's data.
-            self.workers.clear();
-        }
-        result
-    }
-
-    fn stat_inner(&mut self, targets: Vec<RegisteredSourceTarget>) -> Result<Vec<Option<Entry>>> {
-        if targets.len() < PAR_MIN {
-            return targets.iter().map(stat_registered_source).collect();
-        }
-        let chunk = targets.len().div_ceil(PAR_THREADS);
-        let n = targets.len().div_ceil(chunk);
-        while self.workers.len() < n {
-            self.workers.push(SourceStatThread::new()?);
-        }
-        let mut targets = targets.into_iter();
-        let mut replies = Vec::with_capacity(n);
-        for worker in &self.workers[..n] {
-            let (reply, results) = std::sync::mpsc::channel();
-            worker
-                .tasks
-                .as_ref()
-                .expect("live source metadata worker")
-                .send(SourceStatTask {
-                    targets: targets.by_ref().take(chunk).collect(),
-                    reply,
-                })
-                .map_err(|_| anyhow!("source metadata worker stopped before receiving work"))?;
-            replies.push(results);
-        }
-        // Drain every chunk, including later chunks after an earlier file's
-        // error, before allowing the next request to use these workers.
-        let results = replies
-            .into_iter()
-            .map(|reply| {
-                reply
-                    .recv()
-                    .context("source metadata worker stopped before replying")
-            })
-            .collect::<Vec<_>>();
-        results
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-}
 
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     if items.len() < PAR_MIN {
@@ -9971,7 +9871,74 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_pool_returns_fresh_ordered_batches_and_joins_on_drop() {
+    fn parallel_metadata_batches_share_a_bounded_pool() {
+        let callers = 4;
+        let start = std::sync::Barrier::new(callers);
+        let threads: std::collections::HashSet<_> = std::thread::scope(|scope| {
+            let batches: Vec<_> = (0..callers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let items: Vec<_> = (0..128).collect();
+                        parallel_map(&items, |&index| (index, std::thread::current().id()))
+                    })
+                })
+                .collect();
+            batches
+                .into_iter()
+                .flat_map(|batch| {
+                    let results = batch.join().unwrap();
+                    assert_eq!(
+                        results.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
+                        (0..128).collect::<Vec<_>>()
+                    );
+                    results.into_iter().map(|(_, thread)| thread)
+                })
+                .collect()
+        });
+        assert!(!threads.is_empty());
+        assert!(
+            threads.len() <= PAR_THREADS,
+            "metadata concurrency must not multiply by caller count"
+        );
+    }
+
+    #[test]
+    fn parallel_metadata_batches_drain_errors_and_propagate_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed = AtomicUsize::new(0);
+        let items: Vec<_> = (0..128).collect();
+        let results: Vec<std::result::Result<usize, usize>> = parallel_map(&items, |&index| {
+            completed.fetch_add(1, Ordering::Relaxed);
+            if index == 1 || index == 64 {
+                Err(index)
+            } else {
+                Ok(index)
+            }
+        });
+        assert_eq!(completed.load(Ordering::Relaxed), items.len());
+        assert_eq!(
+            results
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>(),
+            Err(1)
+        );
+
+        let panic = std::panic::catch_unwind(|| {
+            parallel_map(&items, |&index| {
+                if index == 64 {
+                    std::panic::panic_any("metadata test panic");
+                }
+                index
+            })
+        })
+        .expect_err("worker panics must reach the caller");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"metadata test panic"));
+        assert_eq!(parallel_map(&items, |&index| index), items);
+    }
+
+    #[test]
+    fn source_stat_batches_preserve_order_confinement_and_release_capabilities() {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
@@ -9979,7 +9946,6 @@ mod tests {
         let outside = crate::test_support::tempdir().unwrap();
         fs::write(outside.path().join("secret"), b"secret").unwrap();
         std::os::unix::fs::symlink(outside.path(), temporary.path().join("link")).unwrap();
-        let mut first_threads = Vec::new();
         for (round, count) in [31, 32, 65, 128, 7, 512].into_iter().enumerate() {
             for idx in 0..64 {
                 fs::write(
@@ -10002,12 +9968,18 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
+            let root_refs = Arc::strong_count(&root);
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
                 sources: Some(sources),
                 follow: true,
                 guard: None,
             });
+            assert_eq!(
+                Arc::strong_count(&root),
+                root_refs,
+                "release batch capabilities before replying"
+            );
             let Response::Stats(entries) = response else {
                 panic!("unexpected response: {response:?}");
             };
@@ -10018,33 +9990,17 @@ mod tests {
                     (idx != 3).then_some((idx % 64 + round) as u64)
                 );
             }
-            let threads: Vec<_> = worker
-                .source_stats
-                .workers
-                .iter()
-                .map(|worker| worker.thread.as_ref().unwrap().thread().id())
-                .collect();
-            if round == 0 {
-                assert!(threads.is_empty(), "short batches must not start threads");
-            } else if round == 1 {
-                first_threads = threads;
-            } else {
-                assert_eq!(
-                    threads, first_threads,
-                    "reuse workers across different batch sizes"
-                );
-            }
         }
         drop(worker);
         assert_eq!(
             Arc::strong_count(&root),
             1,
-            "shutdown must release all task capabilities"
+            "closing the filesystem worker must release its source root"
         );
     }
 
     #[test]
-    fn source_stat_pool_reports_failed_workers_and_recovers_without_stale_replies() {
+    fn source_stat_batches_recover_after_exact_leaf_identity_errors() {
         let temporary = crate::test_support::tempdir().unwrap();
         let path = temporary.path().join("selected");
         fs::write(&path, b"original").unwrap();
@@ -10055,30 +10011,27 @@ mod tests {
             follow: false,
             guard: None,
         };
-        let (tasks, pending) = std::sync::mpsc::channel();
-        drop(pending);
-        worker.source_stats.workers.push(SourceStatThread {
-            tasks: Some(tasks),
-            thread: None,
-        });
-        assert!(matches!(
-            worker.handle(&request),
-            Response::EndpointError(_)
-        ));
-        assert!(worker.source_stats.workers.is_empty());
         assert!(matches!(worker.handle(&request), Response::Stats(entries) if entries.len() == 64));
 
-        // Exact-leaf identity errors must also drain the entire batch. Restoring
-        // the retained original then permits a fresh, correctly ordered reply.
+        let leaf = worker.source_roots[&selections[0].root()]
+            ._leaf_object
+            .as_ref()
+            .unwrap()
+            .clone();
+        let leaf_refs = Arc::strong_count(&leaf);
+        // A failed batch must release its exact-leaf capabilities before replying.
+        // Restoring the selected inode then permits a fresh successful batch.
         fs::rename(&path, temporary.path().join("original")).unwrap();
         fs::write(&path, b"replacement").unwrap();
         assert!(
             matches!(worker.handle(&request), Response::EndpointError(error)
             if error.message.contains("registered source leaf changed identity"))
         );
+        assert_eq!(Arc::strong_count(&leaf), leaf_refs);
         fs::rename(temporary.path().join("original"), &path).unwrap();
         assert!(matches!(worker.handle(&request), Response::Stats(entries)
             if entries.len() == 64 && entries.iter().all(|entry| entry.as_ref().is_some_and(|e| e.size == 8))));
+        assert_eq!(Arc::strong_count(&leaf), leaf_refs);
     }
 
     #[test]
