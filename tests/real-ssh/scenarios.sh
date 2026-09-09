@@ -910,13 +910,13 @@ mkdir "$benchmark_parent"
 ssh destination "mkdir -p \"/tmp/benchmark scratch's\""
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload both --size quick \
+        --mode "$benchmark_mode" --host destination --workload both --size quick --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 # Automatic sizing uses the real terminal timing from each remote direction.
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload small --size auto \
+        --mode "$benchmark_mode" --host destination --workload small --size auto --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 # One scored syq copy with transport and batch overrides in each direction.
@@ -925,6 +925,25 @@ for benchmark_mode in push pull; do
         --mode "$benchmark_mode" --host destination --workload small --size quick \
         --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
         -- --no-tcp --connections 2 --tuning-options batch-files=256,batch-bytes=2M
+done
+# A new route can learn during warm-up before the first scored copy. Speed up
+# only the debug tuner's sample clock and cap traffic to keep this lab bounded.
+# These are correctness checks, not performance measurements.
+for benchmark_mode in push pull; do
+    benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
+    SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \
+        bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --bwlimit 2M
+    python3 - "$benchmark_cache" "$benchmark_mode" <<'PY'
+import json, pathlib, sys
+cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
+key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
+assert 1 <= cache['paths'][key] <= 64, cache
+print('Verified a learned starting count for', key)
+PY
+    rm -f "$benchmark_cache" "$benchmark_cache.lock"
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
@@ -938,7 +957,7 @@ cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
-    --workload large --size quick --rounds 1 --source-dir "$cancel_parent" \
+    --workload large --size quick --warmup off --rounds 1 --source-dir "$cancel_parent" \
     --dest-dir /tmp/benchmark-cancel &
 benchmark_pid=$!
 attempt=0

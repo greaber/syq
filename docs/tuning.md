@@ -19,8 +19,10 @@ connection persistence. Its temporary file paths do not change the cache key.
 Learning takes time: syq samples every 2.5 seconds and needs a warm-up interval
 plus two stable samples for one measurement. Saving a count requires a
 successful copy with at least two measured worker counts and an unchanged
-transport. Short copies may only use their starting count; the benchmark's
-five-second automatic sizing target does not ensure tuning has settled.
+transport. Short copies may only use their starting count. The benchmark's
+[untimed warm-up](speed.md#quick-comparison) allows more time before scoring;
+neither its 30-second target nor the separate five-second automatic sizing
+target guarantees tuning has settled.
 
 `--connections N` disables automatic adjustment and cache use. Supplying
 `--tuning-options` bypasses reading and updating learned counts, but live

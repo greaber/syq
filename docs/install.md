@@ -27,7 +27,8 @@ curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/
 ```
 
 The default sends 1,024 small throwaway files to an SSH host you choose and
-compares syq with rsync over three rounds. Local copies, large files, and
+compares syq with rsync over three rounds, following an untimed tuning warm-up
+(`--warmup off` skips it). Local copies, large files, and
 automatic sizing are optional. The script checks the copied contents and cleans up afterward.
 If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
 to download the script and run it again.

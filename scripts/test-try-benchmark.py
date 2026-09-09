@@ -58,6 +58,8 @@ if '--results' in args:
     if not os.environ.get('BENCH_TEST_OLD'):
         if dst.name == 'calibration':
             copy_ms=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
+        if dst.name == 'warmup':
+            copy_ms=1000 if os.environ.get('BENCH_TEST_SHORT_WARMUP') else 30000
         result['copying_elapsed_ms']=copy_ms
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
         result['copying_elapsed_ms']=999999999
@@ -68,6 +70,8 @@ if '--quiet' not in args and '--suppress-summary' not in args:
     print('test double: copy statistics')
 if mode == 'corrupt':
     next(dst.iterdir()).write_bytes(b'bad')
+if dst.name == 'warmup' and os.environ.get('BENCH_TEST_CORRUPT_WARMUP'):
+    next(dst.iterdir()).write_bytes(b'bad')
 '''
 FAKE_SSH = '''#!/usr/bin/env bash
 set -eu
@@ -77,6 +81,7 @@ fi
 while [[ $1 == -o ]]; do shift 2; done
 shift
 if [[ ${BENCH_TEST_CLEANUP_FAIL:-} == 1 && $* == *cleanup_dir=* ]]; then exit 255; fi
+if [[ ${BENCH_TEST_GENERATION_FAIL:-} == 1 && $* == *'openssl enc'* ]]; then exit 23; fi
 exec /bin/sh -c "$*"
 '''
 
@@ -138,6 +143,67 @@ class BenchmarkTests(unittest.TestCase):
             self.assertIn('--no-tcp', args)
             self.assertEqual(args[args.index('--connections')+1], '4')
             self.assertEqual(args[args.index('--tuning-options')+1], tuning)
+        self.assert_clean()
+
+    def test_warmup_precedes_scored_copies_in_both_directions(self):
+        import json
+        for mode in ['push', 'pull']:
+            with self.subTest(mode=mode):
+                log = self.root / ('warmup-' + mode + '.jsonl')
+                result = self.invoke('--mode', mode, '--host', 'test-host', '--tool', 'syq',
+                                     '--workload', 'both', '--', '--no-tcp',
+                                     env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                copies = [a for a in map(json.loads, log.read_text().splitlines()) if a[0] == 'cp']
+                destinations = [Path(a[a.index('--into-existing')+1]).name for a in copies]
+                self.assertEqual(destinations, ['probe', 'warmup', 'trial', 'warmup', 'trial'])
+                self.assertTrue(all('--no-tcp' in a for a in copies))
+                self.assertEqual(result.stdout.count('Verified warm-up;'), 2)
+                self.assertEqual(result.stdout.count(', trial 1/1'), 2)
+                self.assertIn('small: 65536 bytes per trial', result.stdout)
+                if mode == 'pull':
+                    self.assertEqual(result.stdout.count('Generating matching remote warm-up data'), 2)
+                    self.assertEqual(result.stdout.count('Staging source on remote host'), 2)
+                self.assert_clean()
+
+    def test_warmup_can_be_skipped_and_manual_tuning_skips_it(self):
+        options = [('--warmup', 'off'), ('--', '--connections', '1'), ('--', '-j1'),
+                   ('--', '--connections=1'), ('--', '--tuning-options', 'request-size=1M'),
+                   ('--', '--tuning-options=request-size=1M'), ('--tool', 'rsync')]
+        for args in options:
+            with self.subTest(args=args):
+                result = self.invoke('--mode', 'push', '--host', 'test-host', *args)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn('Warming up syq', result.stdout)
+                self.assertIn('Results (MB/s', result.stdout)
+                self.assert_clean()
+
+    def test_short_warmup_stops_at_limit_and_keeps_scored_size(self):
+        result = self.invoke('--mode', 'pull', '--host', 'test-host', '--tool', 'syq',
+                             '--workload', 'small',
+                             env=dict(self.env, BENCH_TEST_SHORT_WARMUP='1'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('Verified warm-up;'), 2)
+        self.assertIn('limit before 30 copying seconds', result.stdout)
+        self.assertIn('small: 65536 bytes per trial', result.stdout)
+        self.assert_clean()
+
+    def test_warmup_failures_stop_before_scoring(self):
+        for failure in ['BENCH_TEST_CORRUPT_WARMUP', 'BENCH_TEST_GENERATION_FAIL']:
+            with self.subTest(failure=failure):
+                result = self.invoke('--mode', 'pull', '--host', 'test-host',
+                                     env=dict(self.env, **{failure: '1'}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(', trial 1/', result.stdout)
+                self.assertNotIn('Results (', result.stdout)
+                self.assert_clean()
+
+    def test_warmup_missing_old_timing_does_not_claim_it_settled(self):
+        result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
+                             env=dict(self.env, BENCH_TEST_OLD='1'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('cannot report copying time; tuning may not have settled', result.stdout)
+        self.assertIn('Results (MB/s', result.stdout)
         self.assert_clean()
 
     def test_single_baseline_tool(self):

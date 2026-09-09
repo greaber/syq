@@ -27,6 +27,8 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
                            For pull, --source-dir is the local destination parent.
   --tool all|syq|rsync|cp   Tools to time (default: all; cp requires local mode)
   --rounds N               Trials per tool/workload, rotating order (default: 3)
+  --warmup on|off          Untimed syq tuning warm-up before each network workload
+                           (default: on). Skip with manual tuning or other tools.
   --install                Install syq locally if missing, using its official installer
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
@@ -34,10 +36,10 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
 After --, tune syq with --connections/-j, --tuning-options, --bwlimit,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
 --tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
-These options also apply to syq setup/calibration; rsync and cp are unchanged.
+These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
 Add -v/-vv/--verbose after -- to show full commands and scratch paths.
 Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
-The untimed setup copy and content checks still run. Source/destination,
+The untimed setup copy, eligible warm-up, and content checks still run. Source/destination,
 removal and output-file options are not accepted after --.
 
 Requires Bash, rsync, OpenSSL, and standard Unix utilities locally. Syq timing
@@ -46,6 +48,10 @@ also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
 Auto-tuning and remembered counts stay active unless overridden by tuning options.
+Warm-up aims for 30 copying seconds, using up to four growing copies of at most
+1 GiB each, space permitting. This is not a wall-time limit or proof tuning settled.
+Pull warm-ups generate matching source data remotely (needs Bash and OpenSSL).
+Use --warmup off for a short comparison using the existing cached/default count.
 Syq also reports copying time, copying MB/s, and other time (setup/finish).
 A note flags >=20% outside copying or copying under one second: total-time
 speeds may not show sustained throughput.
@@ -183,20 +189,97 @@ manifest() { bash -c "$manifest_command" manifest "$1" | manifest_names; }
 remote_manifest() { remote "set -- $(quote "$1")
 $manifest_command" | manifest_names; }
 
-make_data() {
-    local workload=$1 amount=$2
-    mkdir "$local_root/$workload"
+data_command() {
+    local workload=$1 amount=$2 root=$3 block=8192
     # Fixed AES-CTR stream: deterministic, dense and effectively incompressible.
-    # No keys or user data are involved. Generation is outside measured time.
+    # One generator for local and remote data. Paths are quoted, and the program
+    # stays on one line for transport through the remote shell.
+    [[ $workload != large ]] || block=1048576
+    printf 'set -euo pipefail; mkdir %s; dd if=/dev/zero bs=%s count=%s 2>/dev/null | openssl enc -aes-256-ctr -nosalt -K %s -iv %s' \
+        "$(quote "$root/$workload")" "$block" "$amount" "$key" "$iv"
     if [[ $workload == large ]]; then
-        dd if=/dev/zero bs=1048576 count="$amount" 2>/dev/null |
-            openssl enc -aes-256-ctr -nosalt -K "$key" -iv "$iv" > "$local_root/$workload/data"
+        printf ' > %s\n' "$(quote "$root/$workload/data")"
     else
-        dd if=/dev/zero bs=8192 count="$amount" 2>/dev/null |
-            openssl enc -aes-256-ctr -nosalt -K "$key" -iv "$iv" |
-            split -b 8192 -a 6 - "$local_root/$workload/file-"
+        printf ' | split -b 8192 -a 6 - %s\n' "$(quote "$root/$workload/file-")"
     fi
 }
+make_data() { bash -c "$(data_command "$1" "$2" "$local_root")"; }
+prepare_dataset() {
+    local workload=$1 amount=$2
+    if [[ $workload == large ]]; then
+        printf 'Generating one %s MiB file...\n' "$amount"
+        bytes=$((amount * 1048576))
+    else
+        printf 'Generating %s files of 8 KiB each...\n' "$amount"
+        bytes=$((amount * 8192))
+    fi
+    run make_data "$workload" "$amount"
+    printf 'Preparing content checks...\n'
+    manifest "$local_root/$workload" > "$local_root/expected"
+    source=$local_root/$workload
+    if [[ $mode == pull ]]; then
+        if [[ ${3:-} == warmup ]]; then
+            # Avoid uploading a large tuning fixture over the laptop uplink
+            # before testing its downlink. Generate the identical byte stream.
+            printf 'Generating matching remote warm-up data (untimed)...\n'
+            run remote "bash -c $(quote "$(data_command "$workload" "$amount" "$remote_root")")"
+        else
+            printf 'Staging source on remote host (untimed)...\n'
+            run rsync -rpt -- "$source/" "$host:$(quote "$remote_root/$workload/")"
+        fi
+        source=$remote_root/$workload
+        remote_manifest "$source" > "$local_root/actual"
+        cmp "$local_root/expected" "$local_root/actual" || fail 'Remote staging verification failed.'
+    fi
+}
+
+warm_up() {
+    local workload=$1 amount capacity next copying_ms attempt limit
+    if [[ $workload == large ]]; then amount=64; limit=1024
+    else amount=1024; limit=131072; fi
+    if [[ ${SYQ_BENCHMARK_TEST_SMALL_FIXTURES:-} == 1 ]]; then
+        if [[ $workload == large ]]; then amount=1; limit=4
+        else amount=8; limit=32; fi
+    fi
+    capacity=$(space_capacity "$workload")
+    [[ $capacity -le $limit ]] || capacity=$limit
+    if [[ $capacity -lt 1 ]]; then
+        printf 'Note: no room for the %s warm-up; using existing cached/default tuning.\n' "$workload"
+        return
+    fi
+    [[ $amount -le $capacity ]] || amount=$capacity
+    printf '\nWarming up syq for %s (untimed; target 30 copying seconds, up to 4 copies, 1 GiB per dataset)...\n' "$workload"
+    for ((attempt=1; attempt<=4; attempt++)); do
+        prepare_dataset "$workload" "$amount" warmup
+        destination=$dest_root/warmup
+        if [[ $mode == push ]]; then destination=$remote_root/warmup; remote "mkdir $(quote "$destination")"
+        else mkdir "$destination"; fi
+        rm -f -- "$local_root/warmup.json"
+        run copy_with syq "$source" "$destination" warmup || fail 'Syq warm-up failed.'
+        if [[ $mode == push ]]; then remote_manifest "$destination" > "$local_root/actual"
+        else manifest "$destination" > "$local_root/actual"; fi
+        cmp "$local_root/expected" "$local_root/actual" || fail 'Warm-up content check failed.'
+        copying_ms=$(copying_interval "$local_root/warmup.json") || fail 'Cannot read syq warm-up timing.'
+        if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
+        else rm -rf -- "$destination"; fi
+        # Check space before removing the source, as for automatic sizing.
+        capacity=$(space_capacity "$workload")
+        [[ $capacity -le $limit ]] || capacity=$limit
+        rm -rf -- "${local_root:?}/${workload:?}"
+        [[ $mode != pull ]] || remote "rm -rf $(quote "$source")"
+        if [[ $copying_ms == n/a ]]; then
+            printf 'Note: warm-up verified, but this syq cannot report copying time; tuning may not have settled.\n'
+            return
+        fi
+        awk -v ms="$copying_ms" 'BEGIN {printf "Verified warm-up; copying interval %.3f seconds.\n", ms/1000}'
+        [[ $copying_ms -lt 30000 ]] || return 0
+        next=$(next_amount "$amount" "$copying_ms" "$capacity" 30000)
+        [[ $next -gt $amount && $attempt -lt 4 ]] || break
+        amount=$next
+    done
+    printf 'Note: %s warm-up reached its size, space or attempt limit before 30 copying seconds; tuning may not have settled.\n' "$workload"
+}
+
 copy_with() {
     local tool=$1 source=$2 destination=$3
     local command=() syq_options=(--preserve=permissions --results "$local_root/trial.json")
@@ -206,6 +289,7 @@ copy_with() {
     # by the released v0.3.2 CLI as well as current builds.
     [[ ${4:-} != setup ]] || syq_options=(--preserve=permissions --suppress-summary --no-progress)
     [[ ${4:-} != calibration ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/calibration.json")
+    [[ ${4:-} != warmup ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/warmup.json")
     if $has_syq_options; then syq_options+=("${syq_extra[@]}"); fi
     case $tool in
         syq)
@@ -257,8 +341,8 @@ available_kib() {
          END {if (!found) exit 1; print available}'
 }
 next_amount() {
-    awk -v current="$1" -v ms="$2" -v capacity="$3" 'BEGIN {
-        estimate=current * 5000 / (ms > 0 ? ms : 1);
+    awk -v current="$1" -v ms="$2" -v capacity="$3" -v target="${4:-5000}" 'BEGIN {
+        estimate=current * target / (ms > 0 ? ms : 1);
         amount=int(estimate); if (amount < estimate) amount++;
         minimum=int(current * 1.25); if (minimum < current * 1.25) minimum++;
         if (amount < minimum) amount=minimum;
@@ -354,6 +438,7 @@ main() {
     local mode='' workload='' size='' source_dir='' dest_dir='' rounds=3 yes=false install=false
     local option tool round index offset source destination case_name bytes seconds speed local_parent remote_parent
     local large_mib small_files syq_identity selected_tool=all has_syq_options=false verbose=false show_syq_summary=false
+    local warmup=on warmup_enabled=false manual_tuning=false
     local syq_extra=()
     local key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     local iv=000102030405060708090a0b0c0d0e0f
@@ -369,8 +454,10 @@ main() {
                     case $1 in
                         --connections|-j|--tuning-options|--bwlimit|--tcp-ports|--tcp-congestion)
                             [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
+                            case $1 in --connections|-j|--tuning-options) manual_tuning=true ;; esac
                             syq_extra+=("$1" "$2"); shift 2 ;;
                         --connections=?*|--tuning-options=?*|--bwlimit=?*|--tcp-ports=?*|--tcp-congestion=?*|-j[0-9]*)
+                            case $1 in --connections=*|--tuning-options=*|-j[0-9]*) manual_tuning=true ;; esac
                             syq_extra+=("$1"); shift ;;
                         -v|-vv|--verbose)
                             verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;
@@ -383,12 +470,12 @@ main() {
                     has_syq_options=true
                 done
                 break ;;
-            --mode|--host|--workload|--size|--source-dir|--dest-dir|--rounds|--tool)
+            --mode|--host|--workload|--size|--source-dir|--dest-dir|--rounds|--tool|--warmup)
                 [[ $# -ge 2 && -n $2 ]] || fail "$option needs a value"
                 case $option in
                     --mode) mode=$2 ;; --host) host=$2 ;; --workload) workload=$2 ;;
                     --size) size=$2 ;; --source-dir) source_dir=$2 ;; --dest-dir) dest_dir=$2 ;;
-                    --rounds) rounds=$2 ;; --tool) selected_tool=$2 ;;
+                    --rounds) rounds=$2 ;; --tool) selected_tool=$2 ;; --warmup) warmup=$2 ;;
                 esac
                 shift 2 ;;
             *) fail "Unknown option: $option (see --help)" ;;
@@ -420,6 +507,10 @@ main() {
         fail 'Syq tuning options require --tool syq or --tool all.'
     fi
     case $workload in large|small|both) ;; *) fail 'Workload must be large, small or both.' ;; esac
+    case $warmup in on|off) ;; *) fail 'Warmup must be on or off.' ;; esac
+    if [[ $warmup == on && $mode != local && ( $selected_tool == all || $selected_tool == syq ) ]] && ! $manual_tuning; then
+        warmup_enabled=true
+    fi
     case $size in auto|quick) large_mib=64; small_files=1024 ;; medium) large_mib=1024; small_files=4096 ;; large) large_mib=8192; small_files=16384 ;; *) fail 'Size must be auto, quick, medium or large.' ;; esac
     # The script tests exercise real generation, copies, checksums, ordering,
     # and cleanup. Smaller private fixtures keep that coverage without making
@@ -431,7 +522,7 @@ main() {
     [[ $rounds =~ ^[1-9]$ ]] || fail 'Rounds must be between 1 and 9.'
     for tool in bash rsync openssl dd split cksum cmp awk mktemp mkdir rm cat ps sleep sed; do need "$tool"; done
     [[ $mode != local ]] || need cp
-    [[ $size != auto ]] || need df
+    if [[ $size == auto ]] || $warmup_enabled; then need df; fi
     if [[ $size == auto || $selected_tool == all || $selected_tool == syq ]]; then
         need perl
         perl -MJSON::PP -e 1 || fail 'Syq timing needs Perl with JSON::PP.'
@@ -480,6 +571,10 @@ main() {
     else
         printf '\nChecking SSH access and remote tools (normal SSH authentication applies)...\n'
         remote 'command -v rsync >/dev/null && command -v cksum >/dev/null && command -v mktemp >/dev/null && rsync --version' | sed -n '1p' || fail 'Remote needs rsync, cksum and mktemp, and working SSH access.'
+        if $warmup_enabled && [[ $mode == pull ]]; then
+            remote 'command -v bash >/dev/null && command -v openssl >/dev/null && command -v dd >/dev/null && command -v split >/dev/null' ||
+                fail 'Pull warm-up needs Bash, OpenSSL, dd and split remotely; install them or use --warmup off.'
+        fi
         [[ $dest_dir == /* ]] || dest_dir=./$dest_dir
         remote_parent=$(remote "cd $(quote "$dest_dir") && pwd -P")
         [[ $remote_parent == /* && $remote_parent != *$'\n'* ]] || fail 'Remote shell must print only the requested output.'
@@ -534,6 +629,7 @@ main() {
             fi
         fi
         local amount capacity next copying_ms
+        if $warmup_enabled; then warm_up "$case_name"; fi
         if [[ $case_name == large ]]; then amount=$large_mib; else amount=$small_files; fi
         if [[ $size == auto ]]; then
             capacity=$(space_capacity "$case_name")
@@ -542,24 +638,7 @@ main() {
             printf '\nChoosing the %s workload size with syq (aiming for 5 seconds of copying)...\n' "$case_name"
         fi
         while :; do
-            if [[ $case_name == large ]]; then
-                printf 'Generating one %s MiB file...\n' "$amount"
-                bytes=$((amount * 1048576))
-            else
-                printf 'Generating %s files of 8 KiB each...\n' "$amount"
-                bytes=$((amount * 8192))
-            fi
-            run make_data "$case_name" "$amount"
-            printf 'Preparing content checks...\n'
-            manifest "$local_root/$case_name" > "$local_root/expected"
-            source=$local_root/$case_name
-            if [[ $mode == pull ]]; then
-                printf 'Staging source on remote host (untimed)...\n'
-                run rsync -rpt -- "$source/" "$host:$(quote "$remote_root/$case_name/")"
-                source=$remote_root/$case_name
-                remote_manifest "$source" > "$local_root/actual"
-                cmp "$local_root/expected" "$local_root/actual" || fail 'Remote staging verification failed.'
-            fi
+            prepare_dataset "$case_name" "$amount"
             [[ $size == auto ]] || break
             destination=$dest_root/calibration
             if [[ $mode == push ]]; then destination=$remote_root/calibration; remote "mkdir $(quote "$destination")"

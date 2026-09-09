@@ -19,6 +19,22 @@ with rsync over three rounds. Use `--mode pull` for downloads or `--mode local`
 to include cp. `--workload large` selects one 64 MiB file; `--workload both`
 runs both workloads. The script checks every copy and cleans up afterward.
 
+Before scoring each network workload, an untimed syq warm-up gives automatic
+tuning time to refine the remembered connection count. It uses the same
+direction, transport options and file type as the scored copies. It starts
+with 64 MiB or 1,024 small files and grows toward 30 seconds of copying,
+stopping after at most four copies or at 1 GiB per dataset, subject to free
+space. A slow copy can take longer than 30 seconds; preparation and checks
+also add time. The script reports the measured duration and warns if it hits
+a limit before the target. Reaching the target does not prove tuning settled.
+
+Use `--warmup off` for a short comparison using the existing cached or default
+count. Warm-up is skipped for local copies, comparisons without scored syq
+trials, and manual `--connections` or `--tuning-options` overrides. The scored
+dataset size stays the same. For pull warm-ups, identical data is generated
+locally and remotely and checked, avoiding a large preliminary upload; the
+remote host needs Bash, OpenSSL, dd and split for that step.
+
 For one scored syq copy with your own options:
 
 ```sh
@@ -27,7 +43,7 @@ bash try-benchmark.sh --yes --mode pull --host j5 --tool syq --rounds 1 \
 ```
 
 An untimed tiny copy still prepares the helper. Options after `--` apply to
-syq's setup, calibration and scored copies; path, removal and output-file
+syq's setup, warm-up, calibration and scored copies; path, removal and output-file
 options are excluded to keep copies inside the disposable dataset. Use
 `--tool rsync` for a separate rsync comparison, omitting syq options after `--`.
 Full commands and scratch paths appear only with `-v`, `-vv`, or `--verbose`
@@ -48,7 +64,7 @@ rsync on the other machine. Scratch parents must exist: `--source-dir` is
 always local and `--dest-dir` is the remote scratch parent for push and pull.
 Generation and checks keep the launch directory visible to tmux.
 
-Generation, helper preparation and content checks are untimed. Each scored
+Generation, helper preparation, warm-up and content checks are untimed. Each scored
 copy uses an empty destination, with permissions and modification times
 preserved. Syq persistence is disabled in private settings and rsync uses fresh
 SSH connections, so the total timer includes connection startup. This leaves
