@@ -125,7 +125,11 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
             opts.tuning
                 .request_size(opts.block, bwlimit, opts.restricted_receiver),
         );
-    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
+    if cfg!(any(target_os = "linux", target_os = "macos"))
+        && opts.same_host
+        && !opts.checksum
+        && bwlimit.is_none()
+    {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
         limit
@@ -2006,11 +2010,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
-                                initial_sources.clone()
-                            } else {
-                                Vec::new()
-                            };
+                            let copy_sources =
+                                if cfg!(any(target_os = "linux", target_os = "macos"))
+                                    && opts.same_host
+                                {
+                                    initial_sources.clone()
+                                } else {
+                                    Vec::new()
+                                };
                             Ok((
                                 src,
                                 dst_ep.connect_with_copy_capabilities(
@@ -2201,11 +2208,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // source capabilities from the source endpoint's broker before reporting
     // ready. These are foreign-session claims even when both logical endpoints
     // are local to the coordinator process.
-    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
-        maximum_workers
-    } else {
-        0
-    };
+    let copy_local_claim_workers =
+        if cfg!(any(target_os = "linux", target_os = "macos")) && opts.same_host {
+            maximum_workers
+        } else {
+            0
+        };
     let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;

@@ -1044,6 +1044,102 @@ impl Root {
         Ok(file)
     }
 
+    /// Clone data into a new private sidecar. Source xattrs and BSD flags are
+    /// outside syq's metadata contract; use the byte-copy path for those files.
+    /// The private directory hides the source mode until it has been normalized.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clone_file(
+        &self,
+        source: &File,
+        path: &RelativePath,
+        size: u64,
+    ) -> Result<Option<File>> {
+        if !clone_data_only_eligible(source)? {
+            return Ok(None);
+        }
+        let parent = self.resolve_parent(path)?;
+        let temporary = create_temporary(&parent, |fd, name| {
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
+        })?;
+        let directory = open_directory_at(&parent.directory, temporary.as_bytes())?;
+        let leaf = c"data";
+        let result = (|| -> Result<Option<File>> {
+            // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
+            // function but not this constant. Do not request source ACLs.
+            const CLONE_NOOWNERCOPY: u32 = 0x0002;
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
+                return Ok(None);
+            }
+            let cloned = unsafe {
+                libc::fclonefileat(
+                    source.as_raw_fd(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    CLONE_NOOWNERCOPY,
+                )
+            };
+            if cloned != 0 {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS | libc::EINVAL)
+                ) {
+                    return Ok(None);
+                }
+                return Err(error).context("clone local file");
+            }
+            let file = open_at(
+                directory.as_raw_fd(),
+                leaf,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            // Recheck the clone itself: source metadata may have changed since
+            // the eligibility check. Never publish copied xattrs or flags.
+            if !clone_data_only_eligible(&file)? {
+                retry_zero(|| unsafe { libc::fchflags(file.as_raw_fd(), 0) })?;
+                return Ok(None);
+            }
+            if file.metadata()?.len() != size {
+                bail!("source size changed while cloning {}", path.label());
+            }
+            retry_zero(|| unsafe { libc::fchmod(file.as_raw_fd(), 0o600) })?;
+            retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
+            // Do not replace an existing resumable partial, including one that
+            // appeared after the caller checked. Both directory fds stay pinned.
+            let published = unsafe {
+                libc::renameatx_np(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if published != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(None);
+                }
+                return Err(error).context("stage cloned local file");
+            }
+            Ok(Some(file))
+        })();
+        let cleanup = (|| -> Result<()> {
+            match unlink_at(directory.as_raw_fd(), leaf, 0) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("remove unpublished clone"),
+            }
+            unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
+                .context("remove private clone directory")
+        })();
+        // Cleanup failures must remain visible even after a successful clone.
+        cleanup?;
+        result
+    }
+
     /// Create exactly one directory. Parents must already exist and be real
     /// directories beneath this root.
     pub(crate) fn create_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
@@ -1712,6 +1808,23 @@ impl Root {
 struct ResolvedParent {
     directory: File,
     leaf: CString,
+}
+
+#[cfg(target_os = "macos")]
+fn clone_data_only_eligible(file: &File) -> Result<bool> {
+    use std::os::macos::fs::MetadataExt;
+    if file.metadata()?.st_flags() != 0 {
+        return Ok(false);
+    }
+    let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTSUP) {
+            return Ok(false);
+        }
+        return Err(error).context("inspect clone source extended attributes");
+    }
+    Ok(count == 0)
 }
 
 fn component_cstring(component: &[u8]) -> CString {
@@ -2521,6 +2634,80 @@ mod tests {
 
     fn relative(path: &[u8]) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_is_private_independent_and_never_replaces_a_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TestDir::new("clone");
+        let source_path = t.path().join("source");
+        fs::write(&source_path, b"original data").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        let clone = root
+            .clone_file(&source, &relative(b"partial"), 13)
+            .unwrap()
+            .expect("macOS clone tests require a clone-capable filesystem (APFS)");
+        assert_eq!(clone.metadata().unwrap().mode() & 0o7777, 0o600);
+        assert_ne!(
+            source.metadata().unwrap().ino(),
+            clone.metadata().unwrap().ino()
+        );
+        assert!(root
+            .clone_file(&source, &relative(b"partial"), 13)
+            .unwrap()
+            .is_none());
+        fs::write(t.path().join("partial"), b"changed clone").unwrap();
+        assert_eq!(fs::read(&source_path).unwrap(), b"original data");
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+        assert!(root
+            .clone_file(&source, &relative(b"wrong-size"), 14)
+            .is_err());
+        assert!(!t.path().join("wrong-size").exists());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_falls_back_for_xattrs_and_flags() {
+        let t = TestDir::new("clone-metadata");
+        let source_path = t.path().join("source");
+        fs::write(&source_path, b"data").unwrap();
+        let source = File::open(&source_path).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    source.as_raw_fd(),
+                    c"user.syq-test".as_ptr(),
+                    b"x".as_ptr().cast(),
+                    1,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        assert!(root
+            .clone_file(&source, &relative(b"partial"), 4)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            unsafe { libc::fremovexattr(source.as_raw_fd(), c"user.syq-test".as_ptr(), 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_NODUMP) },
+            0
+        );
+        assert!(root
+            .clone_file(&source, &relative(b"partial"), 4)
+            .unwrap()
+            .is_none());
+        assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
     }
 
     #[cfg(target_os = "linux")]

@@ -117,18 +117,19 @@ enum FileSystemKey {
     Device(u64),
 }
 
-// The same-machine copy fast path exists only on Linux; other platforms
-// report every request as unsupported without reading the policy.
+// Whole-file copying uses Linux offload or macOS cloning.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy {
     inplace: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allow_sequential_nfs_fallback: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allow_sequential_local_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 enum CopyLocalOutcome {
     Copied,
     Unsupported,
@@ -156,7 +157,7 @@ fn discard_rooted_copy_partial(
     Ok(())
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
     if let Some(ready) = std::env::var_os("SYQ_TEST_COPY_LOCAL_READY_FILE") {
         fs::write(&ready, b"ready").with_context(|| {
@@ -2263,7 +2264,7 @@ impl FsOps {
     /// intentionally belong to the source endpoint session rather than this
     /// destination endpoint, so claim their exact descriptors from that
     /// session's private broker during worker initialization.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn initialize_copy_sources(
         &mut self,
         sources: &[RegisteredSourceRoot],
@@ -2277,12 +2278,12 @@ impl FsOps {
         self.initialize_source_capabilities(sources, true)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn initialize_copy_sources(
         &mut self,
         _sources: &[RegisteredSourceRoot],
     ) -> Result<()> {
-        bail!("same-machine local copy capabilities require Linux")
+        bail!("same-machine local copy capabilities require Linux or macOS")
     }
 
     fn initialize_source_capabilities(
@@ -5488,7 +5489,64 @@ impl FsOps {
         Ok(CopyLocalOutcome::Copied)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn copy_local(
+        &mut self,
+        source: &RegisteredPath,
+        dst: &[u8],
+        policy: CopyLocalPolicy,
+        copy_id: &CopyId,
+        size: u64,
+        _mode: u32,
+    ) -> Result<CopyLocalOutcome> {
+        if policy.inplace {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
+        let source_target = self.registered_source_target(source)?;
+        let source = open_registered_source(&source_target)?;
+        let root = self
+            .destination_root
+            .clone()
+            .context("local clone requires a registered destination root")?;
+        let relative = RelativePath::new(dst)?;
+        #[cfg(debug_assertions)]
+        hold_copy_local_before_destination_open_for_test()?;
+        let metadata = source.metadata()?;
+        if root
+            .metadata_optional(&relative)?
+            .is_some_and(|dst| dst.dev == metadata.dev() && dst.ino == metadata.ino())
+        {
+            bail!("source and destination are the same file");
+        }
+        let target = RootedTarget {
+            root: root.clone(),
+            relative,
+            label: self.logical_destination_path(Path::new(OsStr::from_bytes(dst))),
+            create_missing_parents: false,
+        };
+        let (partial, label) = rooted_partial_target(&target, copy_id)?;
+        self.uncache_rooted(&root, &target.relative);
+        self.uncache_rooted(&root, &partial);
+        if root.metadata_optional(&partial)?.is_some() {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
+        let Some(file) = root.clone_file(&source, &partial, size)? else {
+            return Ok(CopyLocalOutcome::Unsupported);
+        };
+        require_safe_rooted_named_partial(&root, &partial, &label, &file)?;
+        self.cache_file(
+            FileLocation::Rooted {
+                root: root.identity(),
+                relative: partial,
+            },
+            0,
+            true,
+            file,
+        );
+        Ok(CopyLocalOutcome::Copied)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn copy_local(
         &mut self,
         _source: &RegisteredPath,

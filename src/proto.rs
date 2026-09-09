@@ -746,8 +746,8 @@ pub enum Request {
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
-    /// Receiver-side copy of a same-machine file (copy_file_range when
-    /// possible, otherwise an eligible sequential userspace fallback).
+    /// Receiver-side copy of a same-machine file (Linux copy_file_range,
+    /// macOS cloning, or an eligible sequential userspace fallback).
     /// Local and NFS fallback policies are independent. `CopyLocalUnsupported`
     /// tells the caller to use the normal streaming path.
     CopyLocal {

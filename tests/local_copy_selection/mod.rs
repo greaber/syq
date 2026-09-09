@@ -197,7 +197,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     assert!(partial_files(&t.path("dst")).is_empty());
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn platforms_without_direct_copy_keep_medium_batches() {
     let t = Tmp::new();
@@ -266,4 +266,92 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
     let observed = tuning_observed(&resumed);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_copies_without_reading_ranges_and_preserves_metadata() {
+    for native in [false, true] {
+        for tcp in [false, true] {
+            let t = Tmp::new();
+            let data = prng(5 << 20, 990);
+            write(&t.path("src/file"), &data);
+            fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o440)).unwrap();
+            set_mtime(&t.path("src/file"), 1_600_000_000);
+            let mut command = if native {
+                Command::new(env!("CARGO_BIN_EXE_syq"))
+            } else {
+                compat_command()
+            };
+            if native {
+                command.args(["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")]);
+            } else {
+                command.args(["-a", &t.s("src/"), &t.s("dst/")]);
+            }
+            if !tcp {
+                command.arg(if native { "--no-tcp" } else { "--syq-no-tcp" });
+            }
+            let out = command
+                .args(["--no-progress", "--stats"])
+                .env("SYQ_DEBUG", "1")
+                .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert_eq!(read(&t.path("dst/file")), data);
+            assert_eq!(
+                fs::metadata(t.path("dst/file")).unwrap().mode() & 0o777,
+                0o440
+            );
+            assert_eq!(
+                fs::metadata(t.path("dst/file")).unwrap().mtime(),
+                1_600_000_000
+            );
+            let observed = tuning_observed(&out);
+            assert_eq!(observed["local_whole_files"], 1);
+            assert_eq!(observed["range_requests"], 0);
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
+    for args in [
+        vec!["--inplace"],
+        vec!["--checksum"],
+        vec!["--bwlimit=1G"],
+        vec!["--tuning-options=copy-path=ranges"],
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src"), &prng(5 << 20, 991));
+        let out = compat_command()
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .args(args)
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("src")), read(&t.path("dst")));
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 992));
+    write(&t.path("dst"), b"old destination");
+    set_mtime(&t.path("src"), 1_600_000_000);
+    fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o640)).unwrap();
+    let out = compat_command()
+        .args(["--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
+    assert_eq!(read(&t.path("src")), read(&t.path("dst")));
+    let metadata = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(metadata.mode() & 0o777, 0o640);
+    assert!(metadata.mtime() > 1_600_000_000);
 }

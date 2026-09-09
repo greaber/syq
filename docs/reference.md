@@ -7,6 +7,17 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay.
 
+On macOS, eligible local files larger than 64 KiB use filesystem cloning when
+both paths are on the same APFS volume. The copy initially shares disk blocks
+with the source; later changes to either file are independent. Reported bytes
+count the file's size, so the displayed rate can exceed the disk's physical
+throughput. Other filesystems and cross-volume copies use normal copying.
+
+Cloning keeps the usual overwrite and metadata rules. Copies with a resumable
+partial, in-place writes, checksum comparison, a bandwidth limit, or forced
+range transfer use the existing copy path. Files with macOS file flags or
+extended attributes also use normal copying. Small files remain batched.
+
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.
 

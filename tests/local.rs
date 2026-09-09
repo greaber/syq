@@ -320,8 +320,12 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
     // Conservatively budget every selector as parent + exact object for the
     // registry, control, and all 64 shared workers, plus worker/cache reserve.
     // Same-machine destination workers claim exact source capabilities only
-    // on Linux, where the descriptor-copy fast path exists.
-    let copy_local_claims = if cfg!(target_os = "linux") { 64 * 3 } else { 0 };
+    // on Linux and macOS, where the descriptor-copy fast paths exist.
+    let copy_local_claims = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        64 * 3
+    } else {
+        0
+    };
     assert_eq!(
         required,
         current_open + 1572 + copy_local_claims,
@@ -881,10 +885,13 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
     }
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_uses_registered_source_after_path_replacement() {
-    for userspace in [false, true] {
+    for userspace in [false, true]
+        .into_iter()
+        .filter(|userspace| !userspace || cfg!(target_os = "linux"))
+    {
         let t = Tmp::new();
         let original = vec![b'o'; 8 << 20];
         write(&t.path("src/file"), &original);
@@ -936,10 +943,13 @@ fn copy_local_uses_registered_source_after_path_replacement() {
     }
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_refuses_a_replaced_destination_parent() {
-    for userspace in [false, true] {
+    for userspace in [false, true]
+        .into_iter()
+        .filter(|userspace| !userspace || cfg!(target_os = "linux"))
+    {
         let t = Tmp::new();
         write(&t.path("src/tree/file"), &vec![b's'; 8 << 20]);
         write(&t.path("src/tree/other"), &vec![b'o'; 5 << 20]);
@@ -11440,7 +11450,7 @@ fn writable_interrupted_partial_is_made_private_before_reuse() {
     child.wait().unwrap();
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_exdev_fallback_leaves_no_partial() {
     let t = Tmp::new();
