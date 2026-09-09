@@ -2202,6 +2202,7 @@ dependencies = [
  "jwalk",
  "libc",
  "postcard",
+ "rayon",
  "semver",
  "serde",
  "serde_bytes",
