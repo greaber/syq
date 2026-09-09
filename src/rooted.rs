@@ -1062,8 +1062,12 @@ impl Root {
             retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
         })?;
         let directory = open_directory_at(&parent.directory, temporary.as_bytes())?;
-        let leaf = c"data";
+        let leaf = &c"data".to_owned();
         let result = (|| -> Result<Option<File>> {
+            let metadata = directory.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+                bail!("private clone directory changed before opening");
+            }
             // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
             // function but not this constant. Do not request source ACLs.
             const CLONE_NOOWNERCOPY: u32 = 0x0002;
@@ -1103,6 +1107,11 @@ impl Root {
             }
             if file.metadata()?.len() != size {
                 bail!("source size changed while cloning {}", path.label());
+            }
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYQ_TEST_FAIL_CLONE_AFTER_CREATE").is_some() {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                    .context("test clone failure");
             }
             retry_zero(|| unsafe { libc::fchmod(file.as_raw_fd(), 0o600) })?;
             retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;

@@ -355,3 +355,40 @@ fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
     assert_eq!(metadata.mode() & 0o777, 0o640);
     assert!(metadata.mtime() > 1_600_000_000);
 }
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_failure_keeps_destination_and_cleans_temporary_files() {
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 993));
+    write(&t.path("dst"), b"old destination");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "1")
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stderr_of(&out).contains("test clone failure"), "{out:?}");
+    assert_eq!(read(&t.path("dst")), b"old destination");
+    assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_leaves_existing_partial_for_verified_resume() {
+    let t = Tmp::new();
+    let data = prng(8 << 20, 994);
+    write(&t.path("src"), &data);
+    let partial = interrupted_partial(&["-a", "--bwlimit=1G", &t.s("src"), &t.s("dst")], &t.0);
+    write(&partial, &data[..4 << 20]);
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+    assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+    assert!(partial_files(&t.0).is_empty());
+}
