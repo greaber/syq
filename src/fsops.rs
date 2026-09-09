@@ -5155,39 +5155,18 @@ impl FsOps {
         Ok(())
     }
 
-    /// Copy a whole same-machine file without routing its bytes through the
-    /// transport. Prefer copy_file_range; eligible local filesystems and the
-    /// measured asynchronous NFS destination case use a sequential userspace
-    /// writer when offload is unsupported. File workers still run in parallel;
-    /// other filesystem pairs retain the adaptive range path.
-    #[cfg(target_os = "linux")]
-    fn copy_local(
-        &mut self,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prepare_local_copy(
+        &self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
-        copy_id: &CopyId,
-        size: u64,
-        mode: u32,
-    ) -> Result<CopyLocalOutcome> {
-        let CopyLocalPolicy {
-            inplace,
-            allow_sequential_nfs_fallback,
-            allow_sequential_local_fallback,
-        } = policy;
+    ) -> Result<(File, RootedTarget)> {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
         let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
         let s = open_registered_source(&source_target)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
-        // The kernel copy reads the source through the page cache, so the
-        // larger readahead window this hint enables is what keeps a cold
-        // source disk streaming (cp does the same; measured 10-20 % faster
-        // on a cold 4 GiB file). Advisory only: a failure changes nothing.
-        unsafe {
-            libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        }
         let destination_root = self
             .destination_root
             .clone()
@@ -5215,6 +5194,50 @@ impl FsOps {
                 destination_label.display()
             );
         }
+        Ok((
+            s,
+            RootedTarget {
+                root: destination_root,
+                relative: destination_relative,
+                label: destination_label,
+                create_missing_parents: false,
+            },
+        ))
+    }
+
+    /// Copy a whole same-machine file without routing its bytes through the
+    /// transport. Prefer copy_file_range; eligible local filesystems and the
+    /// measured asynchronous NFS destination case use a sequential userspace
+    /// writer when offload is unsupported. File workers still run in parallel;
+    /// other filesystem pairs retain the adaptive range path.
+    #[cfg(target_os = "linux")]
+    fn copy_local(
+        &mut self,
+        source: &RegisteredPath,
+        dst: &[u8],
+        policy: CopyLocalPolicy,
+        copy_id: &CopyId,
+        size: u64,
+        mode: u32,
+    ) -> Result<CopyLocalOutcome> {
+        let CopyLocalPolicy {
+            inplace,
+            allow_sequential_nfs_fallback,
+            allow_sequential_local_fallback,
+        } = policy;
+        let (s, target) = self.prepare_local_copy(source, dst)?;
+        let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
+        let source_metadata = s.metadata()?;
+        // Advisory sequential readahead for the kernel copy on Linux.
+        unsafe {
+            libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+        let RootedTarget {
+            root: destination_root,
+            relative: destination_relative,
+            label: destination_label,
+            ..
+        } = target;
         let source_key = file_system_key(&s, source_metadata.dev());
         self.uncache_rooted(&destination_root, &destination_relative);
         let (target_relative, target_label) = if inplace {
@@ -5504,28 +5527,8 @@ impl FsOps {
         if policy.inplace || process_umask() & 0o700 != 0 {
             return Ok(CopyLocalOutcome::Unsupported);
         }
-        let source_target = self.registered_source_target(source)?;
-        let source = open_registered_source(&source_target)?;
-        let root = self
-            .destination_root
-            .clone()
-            .context("local clone requires a registered destination root")?;
-        let relative = RelativePath::new(dst)?;
-        #[cfg(debug_assertions)]
-        hold_copy_local_before_destination_open_for_test()?;
-        let metadata = source.metadata()?;
-        if root
-            .metadata_optional(&relative)?
-            .is_some_and(|dst| dst.dev == metadata.dev() && dst.ino == metadata.ino())
-        {
-            bail!("source and destination are the same file");
-        }
-        let target = RootedTarget {
-            root: root.clone(),
-            relative,
-            label: self.logical_destination_path(Path::new(OsStr::from_bytes(dst))),
-            create_missing_parents: false,
-        };
+        let (source, target) = self.prepare_local_copy(source, dst)?;
+        let root = target.root.clone();
         let (partial, label) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);

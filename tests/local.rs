@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[path = "support/macos_clone.rs"]
+mod macos_clone_support;
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Successful host-native TCP tests must not share the product's fixed default

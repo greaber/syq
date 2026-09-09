@@ -271,6 +271,9 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
 fn macos_clone_copies_without_reading_ranges_and_preserves_metadata() {
+    if !macos_clone_support::available() {
+        return;
+    }
     for native in [false, true] {
         for tcp in [false, true] {
             let t = Tmp::new();
@@ -318,6 +321,9 @@ fn macos_clone_copies_without_reading_ranges_and_preserves_metadata() {
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
 fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
+    if !macos_clone_support::available() {
+        return;
+    }
     for args in [
         vec!["--inplace"],
         vec!["--checksum"],
@@ -359,6 +365,9 @@ fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
 fn macos_clone_failure_keeps_destination_and_cleans_temporary_files() {
+    if !macos_clone_support::available() {
+        return;
+    }
     let t = Tmp::new();
     write(&t.path("src"), &prng(5 << 20, 993));
     write(&t.path("dst"), b"old destination");
@@ -376,6 +385,9 @@ fn macos_clone_failure_keeps_destination_and_cleans_temporary_files() {
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
 fn macos_clone_leaves_existing_partial_for_verified_resume() {
+    if !macos_clone_support::available() {
+        return;
+    }
     let t = Tmp::new();
     let data = prng(8 << 20, 994);
     write(&t.path("src"), &data);
@@ -390,5 +402,107 @@ fn macos_clone_leaves_existing_partial_for_verified_resume() {
     assert_eq!(read(&t.path("dst")), data);
     assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
     assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    for (hook, success) in [
+        ("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR", false),
+        ("SYQ_TEST_CLONE_PUBLIC_DIRECTORY", true),
+    ] {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 995);
+        write(&t.path("src"), &data);
+        write(&t.path("dst"), b"old destination");
+        let out = compat_command()
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env(hook, "1")
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_eq!(out.status.success(), success, "{out:?}");
+        if success {
+            assert_eq!(read(&t.path("dst")), data);
+            assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+        } else {
+            assert!(
+                stderr_of(&out).contains("test clone directory failure"),
+                "{out:?}"
+            );
+            assert_eq!(read(&t.path("dst")), b"old destination");
+        }
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_memoizes_unsupported_volume_pairs() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    for i in 0..4 {
+        write(&t.path(&format!("src/file{i}")), &prng(1 << 20, i));
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--syq-connections=1",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+    assert_eq!(
+        fs::read_to_string(t.path("attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_source_growth_requeues_without_a_file_error() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 996));
+    let ready = t.path("ready");
+    let mut child = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
+        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "local clone source growth");
+    OpenOptions::new()
+        .append(true)
+        .open(t.path("src"))
+        .unwrap()
+        .write_all(&prng(1 << 20, 997))
+        .unwrap();
+    let out = wait_for_control_path_output(child);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), read(&t.path("src")));
     assert!(partial_files(&t.0).is_empty());
 }

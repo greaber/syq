@@ -189,7 +189,7 @@ one request at a time; the response queue on worker connections follows the
 pipeline depth. These settings do not change hash blocks or partial identities.
 
 `copy-path=ranges` makes file contents use range requests, bypassing both
-small-file batches and whole-file copying, including local kernel offload.
+small-file batches and whole-file copying, including local kernel offload and APFS cloning.
 Matching data can still be skipped or reused. With `auto`, syq chooses the copy
 method as usual. Explicit batch controls select worker batching instead of the
 native small-copy shortcut. Files larger than the batch byte limit use another
@@ -354,6 +354,12 @@ copy authorization.
 Check [source and destination storage placement](server-tuning.md#check-local-storage-placement):
 copies within a filesystem that supports cloning can share data extents instead
 of physically copying every byte.
+
+On macOS, eligible same-machine files larger than 64 KiB use APFS cloning
+when source and destination are on the same volume. Their contents bypass
+local TCP connections, and the reported logical byte rate can exceed physical
+disk throughput. Small files stay batched. Cloning preserves the usual copy
+rules; see [copy files](reference.md#copy-files) for eligibility and fallbacks.
 
 Same-machine Linux copies first try kernel or NFS server-side copying. If
 that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file

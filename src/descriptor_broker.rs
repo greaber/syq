@@ -768,10 +768,9 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     message.msg_controllen = FD_CONTROL_LEN as _;
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
-    // Darwin does not expose an atomic close-on-exec receive flag. The future
-    // worker protocol must therefore request its roots during single-threaded
-    // initialization, before it can spawn children, and acknowledge startup
-    // only after this function has applied FD_CLOEXEC.
+    // Darwin does not expose an atomic close-on-exec receive flag. Root and
+    // same-host source claims apply FD_CLOEXEC below, after recvmsg; unlike
+    // Linux, that leaves a window if another thread concurrently spawns a child.
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
     loop {
