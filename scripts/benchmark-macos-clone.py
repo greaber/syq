@@ -46,7 +46,9 @@ def main():
     print(json.dumps({"platform": platform.platform(), "binary": str(binary),
                       "rounds": args.rounds, "cache": "warm", "destination": "fresh"}), flush=True)
     with tempfile.TemporaryDirectory(prefix="syq-clone-benchmark-") as temporary:
-        root = Path(temporary)
+        # macOS TMPDIR commonly traverses the /var -> /private/var symlink.
+        # Give syq canonical fixture paths without changing its symlink policy.
+        root = Path(temporary).resolve(strict=True)
         for case, count, mib in [("large", 1, 512), ("tree", 64, 8), ("medium", 64, 1)]:
             source = root / "source"
             source.mkdir()
