@@ -26,40 +26,25 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-Choose a local or SSH copy and a workload. The script automatically sizes
-throwaway data with syq and cleans up afterward. No syq-bench install is needed;
-if syq is missing, it offers to install it.
+Choose an SSH copy to compare syq with rsync, or a local copy to include cp.
+The script creates test data, checks the copied contents, and cleans up afterward.
+If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
+to download the script and run it again.
 
 <figure class="benchmark-example">
-<div class="benchmark-example-grid">
-<section aria-label="Example benchmark choices">
-<div class="visual-step">1 <span>Choose your test</span></div>
-<dl class="benchmark-choices">
-<dt>Copy where?</dt><dd>local</dd>
-<dt>Workloads?</dt><dd>both</dd>
-<dt>Test size</dt><dd>automatic by default</dd>
-</dl>
-<p class="visual-note">Results pictured: fixed-size sample<br>64 MiB + 1,024 files of 8 KiB</p>
-</section>
-<section aria-label="Example benchmark results">
-<div class="visual-step">2 <span>Compare the results</span></div>
 <table>
-<caption>Mean MB/s · higher is faster · 3 trials</caption>
-<thead><tr><th scope="col">Tool</th><th scope="col">Large file</th><th scope="col">Small files</th></tr></thead>
+<caption>Published example: Germany → US East Coast</caption>
+<thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>710.0</td><td>50.1</td></tr>
-<tr><th scope="row">rsync</th><td>567.3</td><td>71.1</td></tr>
-<tr><th scope="row">cp</th><td>1379.1</td><td>160.4</td></tr>
+<tr><th scope="row">syq</th><td>159.1 MB/s</td></tr>
+<tr><th scope="row">syq over SSH</th><td>87.2 MB/s</td></tr>
+<tr><th scope="row">rsync</th><td>18.0 MB/s</td></tr>
 </tbody>
 </table>
-<p class="visual-note">✓ Copied contents checked</p>
-</section>
-</div>
-<figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
+<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
+From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
+which provides more extensive benchmarks. Your results will depend on your machines and connection.</figcaption>
 </figure>
-
-For requirements, options and how to read the results, see
-[the benchmark guide](speed.md#quick-comparison).
 
 ## Updates
 

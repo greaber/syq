@@ -234,12 +234,10 @@ Rerun the same command. Completed files are skipped; partially copied files
 reuse matching blocks. By default, syq writes a partial file beside the
 destination and replaces the final file only when complete.
 
-Do not run the same logical copy twice concurrently: the runs share partial
-files. To abandon a copy, stop it and delete its hidden partial files from the
-destination. They are named `.FILENAME.syq-part.ID`, beside the intended final
-file; long names may be shortened or hashed. For example, a partial for
-`video.mp4` is `.video.mp4.syq-part.ID`. Use `ls -a` to see it, then `rm --`
-with its exact name. Keep partials belonging to copies still running.
+Running the same copy twice at once can cause errors as the runs share temporary
+files. Wait for it to finish or stop it before restarting. To abandon a copy,
+stop all its runs before removing hidden files with `.syq-part.` in their names
+at the destination.
 
 ## Check file contents
 
@@ -265,23 +263,30 @@ To compare without writing, use `--verify-only`:
 syq cp --verify-only --srcs-in project --into backup
 ```
 
-This hashes selected regular files even when size and modification time match,
-compares symlink targets, and checks selected directory and special-file types
-(and device identity). It reports differences and missing entries; either a
-difference or an inspection error makes the run fail. It does not compare
-permissions, ownership, or timestamps, or look for destination-only entries.
-Special files are selected only with `--preserve=specials`.
+This compares file contents, symlink targets, and entry types without writing.
+Missing or different entries make the command fail. It does not compare metadata
+or look for extra destination files.
 
-Source and destination contents stay unchanged; a requested results file is
-still written and remote helper setup may write cache files. Verification
-cannot combine with `--dry-run`, `--prune`, `--inplace`, or overwrite policies.
-Filters and size limits still select what is compared. Matching regular files
-appear as unchanged in [automation results](automation.md); no files or bytes
-are reported as transferred.
+For two servers, add `--coordinate-at local` to compare through your machine
+using ordinary SSH access, with no restricted receiver enrollment. This also
+supports `--results`. See [remote verification](remote-reference.md#verification).
 
-Restricted remote-to-remote verification requires an existing receiver
-enrollment; it will not install one. Use `--coordinate-at local` to compare
-through your machine, including when you need comparison results in JSON.
+## In-place writes
+
+By default, syq builds an updated file beside the old one and replaces it when
+complete. `--inplace` writes directly into the destination file instead:
+
+```sh
+syq cp --inplace large-file --to server --into /backup
+```
+
+This saves temporary disk space and can avoid copying unchanged data into a
+new file. Readers can see a mixture of old and new contents during the copy.
+If interrupted, the incomplete file stays at its final name until you finish
+the copy. Writes through a hard link also affect its other names.
+
+Use the default when other programs need to read a complete file throughout
+an update. [Copies sent back to your laptop](receive.md) do not support `--inplace`.
 
 ## Preserve metadata
 

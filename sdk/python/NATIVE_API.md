@@ -98,7 +98,7 @@ and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
 
 `pscope` selects an isolated scope for reusing SSH connections. For return
 copies or commands, use `syq persist connect server` and omit `pscope`. See
-[persistence in scripts](https://greaber.github.io/syq/receive.html#persistence-in-scripts)
+[persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes)
 for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
 for executable selection.

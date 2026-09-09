@@ -130,7 +130,7 @@ system settings:
 
 - **Transport and parallelism:** inspect the selected transport and connection
   count with `-vv --stats`. For a controlled worker-count comparison, use
-  `--connections N`; see [benchmark tuning](speed.md#benchmark-tuning). Use the
+  `--connections N`; see [benchmark tuning](tuning.md). Use the
   same reporting options in each run, and start with defaults for everyday
   copies. More workers need not help once storage or an NFS service is saturated;
   compare repeated runs before choosing a lower count.

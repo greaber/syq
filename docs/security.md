@@ -145,8 +145,6 @@ host resolution. A copy never switches routes after selecting its destination.
   durability guarantee.
 - **Preserving authority is a choice.** Leave `--preserve=ownership` and
   `--preserve=permissions` off when copying from an untrusted source.
-- **Persistent logins stay usable.** Processes running as your local user
-  can reuse them until they close. Use `syq persist off` to end the window.
 - **Protocol assurance is still developing.** Syq's process protocol has
   not been fuzzed as extensively as rsync's.
 
@@ -199,3 +197,17 @@ and interruption behavior.
 
 Human copy listings escape control characters in filenames. Diagnostics also
 escape terminal control sequences from peers; NDJSON keeps its JSON encoding.
+
+## Persistent connections
+
+An open SSH login can be reused by other processes running as your local user
+without another key touch or agent approval. Persistence keeps that access
+available until the connection closes. `syq persist off` ends it; use
+`syq persist receive off` to stop incoming requests while keeping SSH reuse.
+
+Persistence also enables [receiving](#named-receiving-destinations) by default.
+Its approvals and copy limits are separate from the SSH login's authority.
+
+[Isolated script scopes](persistence-reference.md#isolated-script-scopes) reuse
+SSH logins without enabling receiving. Stop background services when upgrading;
+replacing a binary does not change services already running it.

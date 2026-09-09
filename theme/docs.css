@@ -126,17 +126,8 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
 
 /* Readable, theme-aware walkthroughs; no JavaScript or text baked into images. */
 .benchmark-example,.transfer-flow{margin:28px 0;font:16px/1.5 var(--display)}
-.benchmark-example-grid{display:grid;grid-template-columns:1fr 1.45fr;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
-.benchmark-example section{padding:22px;min-width:0}
-.benchmark-example section+section{background:var(--bg);border-left:1px solid var(--line)}
-.visual-step{display:flex;align-items:center;gap:12px;color:var(--syq);font:600 20px var(--mono)}
-.visual-step span{color:var(--ink);font:600 16px var(--display)}
-.benchmark-choices{display:grid;grid-template-columns:1fr auto;gap:12px;margin:24px 0}
-.benchmark-choices dt{color:var(--muted)}
-.benchmark-choices dd{margin:0;font-family:var(--mono);color:var(--syq)}
-.content .visual-note{font-size:14px;color:var(--muted);line-height:1.6;margin:18px 0 0}
-.content .benchmark-example table{display:table;width:100%;margin-top:18px;font-size:14px}
-.benchmark-example caption{text-align:left;color:var(--muted);padding-bottom:8px}
+.content .benchmark-example table{display:table;width:100%;margin:0;font-size:16px;table-layout:fixed}
+.benchmark-example caption{text-align:left;color:var(--muted);padding-bottom:12px;font-size:16px}
 .content .benchmark-example th,.content .benchmark-example td{padding:8px 6px;background:transparent;border:0;border-bottom:1px solid var(--line)}
 .benchmark-example td{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
 .benchmark-example th{text-align:left;white-space:nowrap}
@@ -152,9 +143,6 @@ a:focus-visible,button:focus-visible,label:focus-visible {outline:2px solid var(
 .flow-arrow{display:flex;flex-direction:column;align-items:center;color:var(--syq);font-size:14px}
 .flow-arrow b{font-size:44px;line-height:1;font-weight:400}
 @media(max-width:600px){
-  .benchmark-example-grid{grid-template-columns:1fr}
-  .benchmark-example section+section{border-left:0;border-top:1px solid var(--line)}
-  .benchmark-example section{padding:18px}
   .transfer-flow{padding:16px 10px}.flow-data{gap:6px}.flow-machine{padding:12px 6px}
 }
 
