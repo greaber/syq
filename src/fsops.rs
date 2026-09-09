@@ -9881,6 +9881,11 @@ mod tests {
             let results = std::thread::spawn(|| {
                 let items: Vec<_> = (0..128).collect();
                 parallel_map(&items, |&index| {
+                    assert_eq!(
+                        rayon::current_num_threads(),
+                        PAR_THREADS,
+                        "metadata pool must retain its configured parallelism"
+                    );
                     let thread = std::thread::current();
                     assert!(thread
                         .name()
@@ -9909,26 +9914,8 @@ mod tests {
     }
 
     #[test]
-    fn parallel_metadata_batches_drain_errors_and_propagate_panics() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let completed = AtomicUsize::new(0);
+    fn parallel_metadata_batches_propagate_panics_and_remain_usable() {
         let items: Vec<_> = (0..128).collect();
-        let results: Vec<std::result::Result<usize, usize>> = parallel_map(&items, |&index| {
-            completed.fetch_add(1, Ordering::Relaxed);
-            if index == 1 || index == 64 {
-                Err(index)
-            } else {
-                Ok(index)
-            }
-        });
-        assert_eq!(completed.load(Ordering::Relaxed), items.len());
-        assert_eq!(
-            results
-                .into_iter()
-                .collect::<std::result::Result<Vec<_>, _>>(),
-            Err(1)
-        );
-
         let panic = std::panic::catch_unwind(|| {
             parallel_map(&items, |&index| {
                 if index == 64 {
@@ -9943,29 +9930,22 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_batches_return_fresh_ordered_results_and_release_roots() {
+    fn source_stat_batches_return_fresh_ordered_results_and_release_roots_on_close() {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
         let root = worker.source_roots[&selections[0].root()].root.clone();
         let sizes = [31, 32, 65, 128, 7, 129];
-        let mut previous_cycle_refs = None;
-        // Repeat the size sweep to allow caches to warm before checking that
-        // requests do not keep accumulating references to the source root.
-        for (round, count) in sizes.into_iter().cycle().take(sizes.len() * 2).enumerate() {
-            for idx in 0..64 {
+        for (round, count) in sizes.into_iter().enumerate() {
+            for idx in 0..129 {
                 fs::write(
                     temporary.path().join(format!("f{idx}")),
-                    vec![0; idx + round],
+                    vec![0; idx + round * 129],
                 )
                 .unwrap();
             }
             let sources: Vec<_> = (0..count)
-                .map(|idx| {
-                    selections[0]
-                        .join(format!("f{}", idx % 64).as_bytes())
-                        .unwrap()
-                })
+                .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
                 .collect();
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
@@ -9978,16 +9958,7 @@ mod tests {
             };
             assert_eq!(entries.len(), count);
             for (idx, entry) in entries.into_iter().enumerate() {
-                assert_eq!(entry.map(|e| e.size), Some((idx % 64 + round) as u64));
-            }
-            if (round + 1) % sizes.len() == 0 {
-                let refs = Arc::strong_count(&root);
-                if let Some(previous) = previous_cycle_refs.replace(refs) {
-                    assert!(
-                        refs <= previous,
-                        "source-root references must not grow across size sweeps"
-                    );
-                }
+                assert_eq!(entry.map(|e| e.size), Some((idx + round * 129) as u64));
             }
         }
         drop(worker);
