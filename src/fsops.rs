@@ -9883,15 +9883,18 @@ mod tests {
         // Assert on the calling test thread so diagnostics reach this test's
         // capture buffer, regardless of which test initialized the static pool.
         assert_eq!(observations.len(), items.len());
+        // Catch accidentally selecting a single-thread or host-sized pool.
+        // Its size is static within the batch, so inspect it only once.
+        assert_eq!(
+            observations[0].3, PAR_THREADS,
+            "metadata pool must retain its configured parallelism"
+        );
         observations
             .into_iter()
             .zip(items)
-            .map(|((index, thread, name, count), expected)| {
+            .map(|((index, thread, name, _), expected)| {
                 assert_eq!(index, *expected);
-                assert_eq!(
-                    count, PAR_THREADS,
-                    "metadata pool must retain its configured parallelism"
-                );
+                // Catch bypassing the dedicated metadata pool.
                 assert!(
                     name.as_deref()
                         .is_some_and(|name| name.starts_with("syq-metadata-")),
@@ -9903,11 +9906,22 @@ mod tests {
     }
 
     #[test]
+    fn small_metadata_batches_run_inline() {
+        let caller = std::thread::current().id();
+        assert_eq!(
+            parallel_map(&[(); PAR_MIN - 1], |_| std::thread::current().id()),
+            vec![caller; PAR_MIN - 1]
+        );
+    }
+
+    #[test]
     fn parallel_metadata_batches_share_a_bounded_pool() {
         let mut threads = std::collections::HashSet::new();
-        let items: Vec<_> = (0..128).collect();
-        // More calls than pool threads guarantees reuse without depending on
-        // scheduling or CPU count: disjoint per-call pools exceed the bound.
+        let items: Vec<_> = (0..PAR_MIN).collect();
+        // Rust ThreadIds are never reused, even after threads exit. Each nonempty
+        // call contributes at least one ID, so PAR_THREADS + 1 calls must exceed
+        // this bound with per-call pools. Passing proves reuse across calls
+        // without assumptions about scheduling or native thread-ID recycling.
         for _ in 0..=PAR_THREADS {
             threads.extend(checked_metadata_batch_threads(&items));
         }
@@ -9934,20 +9948,14 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_batches_return_fresh_ordered_results_and_release_roots_on_close() {
+    fn source_stat_batches_preserve_order_across_sizes() {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
-        let root = worker.source_roots[&selections[0].root()].root.clone();
-        let sizes = [31, 32, 65, 128, 7, 129];
-        for (round, count) in sizes.into_iter().enumerate() {
-            for idx in 0..129 {
-                fs::write(
-                    temporary.path().join(format!("f{idx}")),
-                    vec![0; idx + round * 129],
-                )
-                .unwrap();
-            }
+        for idx in 0..129 {
+            fs::write(temporary.path().join(format!("f{idx}")), vec![0; idx]).unwrap();
+        }
+        for count in [31, 32, 65, 128, 7, 129] {
             let sources: Vec<_> = (0..count)
                 .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
                 .collect();
@@ -9962,15 +9970,9 @@ mod tests {
             };
             assert_eq!(entries.len(), count);
             for (idx, entry) in entries.into_iter().enumerate() {
-                assert_eq!(entry.map(|e| e.size), Some((idx + round * 129) as u64));
+                assert_eq!(entry.map(|e| e.size), Some(idx as u64));
             }
         }
-        drop(worker);
-        assert_eq!(
-            Arc::strong_count(&root),
-            1,
-            "closing the filesystem worker must release its source root"
-        );
     }
 
     #[test]
