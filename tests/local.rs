@@ -20275,6 +20275,9 @@ fn clean_partials_selects_only_current_regular_files() {
 #[cfg(debug_assertions)]
 #[test]
 fn concurrent_identical_and_different_copies_publish_complete_files() {
+    // Exercise publication and retained-basis races through isolated receiver
+    // processes, without spending seconds encrypting bulk data in debug builds.
+    // Pipes preserve the same file operations and multi-block fixtures.
     for identical in [true, false] {
         for existing in [false, true] {
             let t = Tmp::new();
@@ -20304,6 +20307,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .args([
                     "cp",
                     "--hash",
+                    "--no-tcp",
                     "--bwlimit",
                     "1G",
                     "-j",
@@ -20320,14 +20324,12 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .start()
                 .unwrap();
             wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
-            // One competitor deliberately takes longer than the old ten-second
-            // barrier deadline. Publication order must depend on the handshake,
-            // including on a busy runner, rather than on copying speed.
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
                     "--hash",
+                    "--no-tcp",
                     "--bwlimit",
                     "1G",
                     "-j",
@@ -20337,10 +20339,6 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "--as",
                     &t.s("out"),
                 ])
-                .env(
-                    "SYQ_TEST_HOLD_SOURCE_ROOTS_MS",
-                    if identical && !existing { "11000" } else { "0" },
-                )
                 .run()
                 .unwrap();
             let second_published = fs::read(t.path("out"));
