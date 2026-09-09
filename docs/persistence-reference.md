@@ -125,10 +125,19 @@ enable the profiles you need from a terminal in the new session.
 Overwrite warnings are advisory; destination entries can change before copying.
 `--notify off` selects terminal approval; `--notify desktop` restores prompts.
 
-Receiving uses syq's managed SSH connections. A second SSH hop does not carry
-your laptop's receiving name to another host. The server command uses the
-matching helper installed by the receiving connection. If it is missing or an
-option is unsupported, update syq on both machines and reconnect from the laptop.
+Start the connection from your laptop with `syq persist connect server`.
+Opening a plain SSH session does not enable receiving, and connecting onward
+from that server to another host does not carry your laptop's receiving name
+with you.
+
+For automatic reconnection to work, your SSH key or agent must be available and
+the server's host key must already be trusted. The background service cannot
+ask for a password. The server must allow remote Unix socket forwarding;
+OpenSSH 9.2 also requires permission for remote TCP forwarding.
+
+The server command uses the matching helper installed by the receiving
+connection. If that helper is missing or does not recognize an option, update
+syq on both machines and reconnect from your laptop.
 
 ## Updating connections
 

@@ -21,7 +21,10 @@ feature. Put detailed option interactions and machine-output contracts in the
 owning reference; link security consequences to the relevant security section.
 Delete algorithm narration, patch histories, defensive explanations of ordinary
 behavior, repeated material, and unsupported tuning advice. Moving every excess
-paragraph into reference is not a substitute for editing it.
+paragraph into reference is not a substitute for editing it. Shorten by removing
+unnecessary ideas, not by stripping sentences into terse fragments. Read the
+result as connected prose: explain how an instruction relates to the reader's
+task instead of stacking isolated facts or command names.
 
 Revise the existing explanation when a feature changes. Do not turn each bug fix
 or edge case into another paragraph. Prefer a brief introduction with a link over

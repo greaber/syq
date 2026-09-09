@@ -11,19 +11,16 @@ The second command uses macOS's `open` program to display an artifact. Any
 program installed on the receiving machine can be requested, including a
 native application or a version of syq you have just built there.
 
-Commands use the same background connection as [return copies](receive.md).
-Run `syq persist connect server` on the receiving machine to enable persistence
-and wait for the connection. No SSH server or incoming network port is needed on the receiving machine.
-Requests work from independent server shells, including existing tmux sessions.
+If you have already set up [receiving files](receive.md), you can request
+commands through the same connection. Otherwise, run `syq persist connect server`
+on your desktop first. Your desktop needs no SSH server or incoming network
+port, and you can make requests from any shell on the server, including an
+existing tmux session.
 
-Exec needs no separate enablement beyond receiving and its connection.
-`@laptop` in these examples is a name, not an alias for any connected laptop.
-Run `syq persist destinations list` on the server to find your receiving
-machine's actual name and connection status. On the receiving machine,
-`syq persist receive status` shows its advertised name.
-
-`--on` requires a live receiving name. Both `laptop` and `@laptop` fail while
-offline; neither tries an SSH host instead.
+Replace `@laptop` with your desktop's receiving name. You can find it by running
+`syq persist destinations list` on the server or `syq persist receive status`
+on your desktop. The desktop must be connected: both `--on laptop` and
+`--on @laptop` fail while it is offline.
 
 ## Approve each command locally
 

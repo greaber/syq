@@ -10,14 +10,12 @@ With syq installed on both machines, connect from your laptop:
 syq persist connect server
 ```
 
-This enables persistence and waits until receiving is ready. You can run it
-again to reuse a working connection or recover a stopped service. Alternatively,
-`syq persist on` starts receiving with later ordinary syq connections.
+This keeps a connection open so the server can send files back to your laptop.
+Once the command finishes, you can close the terminal and continue working on
+the server. By default, your laptop is available under its short hostname, and
+received files go into your home directory.
 
-When syq connects to an SSH server, it also starts a background return
-connection. The default destination name is your laptop's short hostname,
-and files go into your home directory. No receiving terminal needs to stay open.
-To choose a name and a different starting directory:
+To give it the name `laptop` and choose a different starting directory:
 
 ```sh
 mkdir -p ~/Downloads/server
@@ -89,15 +87,14 @@ for the trust boundary.
 
 ## Names and paths
 
-A bare name uses a live return connection before trying an SSH host of the same
-name. When the laptop is offline, the name falls back to ordinary SSH resolution
-and authentication. Use `--to @laptop` to require a return connection: that form
-fails while offline and never tries SSH. After selecting a return connection,
-a denied or interrupted copy fails; it does not switch destinations.
+When you use `--to laptop`, syq looks for a connected receiving machine with
+that name. If it is offline, syq tries an SSH host called `laptop` instead.
+Use `--to @laptop` when you want the command to fail if your laptop is offline.
+Once a copy starts, it keeps the same destination even if the connection fails.
 
-`--cwd` chooses the starting directory. Destination `--into` and `--as` paths
-are relative to it, but absolute paths and `..` can select other locations.
-With no placement, `--to laptop` means `--into .` there.
+The directory you set with `--cwd` is where incoming copies start. You can
+choose a path relative to it with `--into` or `--as`, or use an absolute path
+to copy elsewhere. Without either option, files go into the starting directory.
 
 To contain copies within a directory instead:
 
@@ -105,11 +102,13 @@ To contain copies within a directory instead:
 syq persist receive on --name laptop --root ~/Downloads/server
 ```
 
-`--root` sets both the starting directory and the boundary. It rejects absolute
-paths and `..`, and copies cannot traverse symlinks to escape that directory.
-The root itself cannot be replaced with `--as .`. Changing to `--cwd` removes
-containment. Changing a profile’s settings closes its existing return copies
-before restarting that profile with the new settings. Other profiles keep running.
+With `--root`, all incoming copies must stay inside that directory. Absolute
+paths and `..` are rejected, and symlinks cannot lead outside it. A copy cannot
+replace the root itself with `--as .`. Switching back to `--cwd` removes this
+restriction.
+
+Changing a profile's settings stops its active copies so the new settings can
+take effect. Other profiles keep working.
 
 Syq also protects its own receiving files, executable, and SSH authority files
 from incoming copies. See [directory requirements](persistence-reference.md#directories)
@@ -125,33 +124,20 @@ Most copy options work here; ownership and special-file preservation,
 `--inplace`, and `--min-size` are unsupported. See
 [copy limits](persistence-reference.md#copy-limits) for details.
 
+<a id="ssh-setup"></a>
+<a id="persistence-in-scripts"></a>
+<a id="updating-receiving-connections"></a>
+
 ## Background connections
 
-Use `syq persist status` to inspect connections. `syq persist receive off`
-stops receiving; `syq persist off` also closes reusable SSH logins.
+You can inspect your connections with `syq persist status`. To stop receiving
+while keeping SSH connections open for your own copies, run
+`syq persist receive off`. Use `syq persist off` to close both directions.
 
-Receiving reconnects after a network interruption or laptop sleep. Rerun an
-interrupted copy to resume it. After reboot, run `syq persist connect server`
-again. If status reports a failure, fix the reported problem and run that
-command to retry.
+After a network interruption or laptop sleep, syq reconnects automatically.
+An interrupted copy still needs to be rerun so it can resume. After rebooting
+your laptop, run `syq persist connect server` again.
 
-### Persistence in scripts
-
-Scripts can use isolated SSH connection scopes and wait for destinations to
-become available. See [persistence details](persistence-reference.md).
-
-## SSH setup
-
-Start receiving with syq from your laptop; an unrelated `ssh` session does not
-start it. Reconnection needs an available SSH key or agent and a trusted host
-key. Background receiving cannot ask for a password.
-
-The server must permit remote Unix socket forwarding. OpenSSH 9.2 also needs
-remote TCP forwarding permission. If receiving cannot start, inspect
-`syq persist receive status`; see [setup and recovery](persistence-reference.md#setup-and-recovery).
-
-### Updating receiving connections
-
-Stop persistence before upgrading, then reconnect with the updated syq.
-See [updating connections](persistence-reference.md#updating-connections) for
-script scopes and saved settings.
+If a connection fails to start, `syq persist receive status` shows the error.
+The [persistence reference](persistence-reference.md) covers troubleshooting,
+upgrading, and using connections in scripts.

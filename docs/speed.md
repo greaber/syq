@@ -61,10 +61,11 @@ use it only on a trusted network. Restricted receivers refuse it.
 
 ## Local copies and NFS
 
-Syq uses kernel or NFS server-side copying when available. Filesystems that
-support cloning can avoid physically copying every byte. These choices are
-automatic; [storage placement](server-tuning.md#check-local-storage-placement)
-can make a large difference.
+For local copies, syq uses the filesystem's copy optimizations automatically
+when it can. On filesystems that support cloning, this can avoid physically
+copying every byte. You can also copy to or from a mounted NFS directory using
+its local path. See [storage placement](server-tuning.md#check-local-storage-placement)
+for how the source and destination filesystems affect performance.
 
 ## Limit bandwidth
 
