@@ -112,14 +112,16 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
 
     print("case: two clients can receive; duplicate name fails only that profile", flush=True)
     (root / "runtime").mkdir(mode=0o700)
-    other_env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"), XDG_RUNTIME_DIR=str(root / "runtime"))
+    other_home = root / "other-home"
+    other_home.mkdir(mode=0o700)
+    other_env = dict(os.environ, HOME=str(other_home), XDG_CONFIG_HOME=str(root / "config"), XDG_RUNTIME_DIR=str(root / "runtime"))
     other_root = root / "other"
     other_root.mkdir()
     try:
         receive("on", "--name", "laptop", "--root", str(other_root), "--notify", "off", env=other_env)
         receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--approve", "always", env=other_env)
         conflict = run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env, ok=False)
-        assert conflict.returncode != 0 and "already registered" in conflict.stderr, conflict
+        assert conflict.returncode != 0 and "different receiver" in conflict.stderr, conflict
         receive("wait", "source", "--name", "other-client", "--timeout", "30", env=other_env)
         assert profile("laptop", other_env)["connection"]["phase"] == "failed"
         assert profile("laptop")["connection"]["ssh_pid"] == original
