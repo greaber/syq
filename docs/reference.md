@@ -254,8 +254,9 @@ source files or change their spelling.
 
 Replacing an entry with a directory, symlink or special file stages the new
 entry before publication. If the filesystem cannot perform an atomic type
-change, the operation fails with the old entry preserved. An interrupted type change can leave the previous entry beside its
-replacement under a `.syq-swap-...` name; inspect it before removing it.
+change, the operation fails with the old entry preserved. An interrupted type
+change can leave the previous entry beside its replacement under a
+`.syq-swap-...` name; inspect it before removing it.
 
 Concurrent copies use separate partials. With unchanged sources, each completed
 file comes from one copy; different copies may win for different files. This

@@ -2469,11 +2469,12 @@ fn filename_rules(directory: &File) -> FilenameRules {
     if kind == libc::EXT4_SUPER_MAGIC as u32
         || kind == libc::F2FS_SUPER_MAGIC as u32
         || kind == libc::BTRFS_SUPER_MAGIC as u32
+        || kind == libc::TMPFS_MAGIC as u32
     {
         let Ok(readable) = open_readable_directory_at(directory, b".") else {
             return conservative;
         };
-        let mut flags: libc::c_long = 0;
+        let mut flags: libc::c_int = 0;
         if unsafe { libc::ioctl(readable.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
             return conservative;
         }
@@ -2485,9 +2486,6 @@ fn filename_rules(directory: &File) -> FilenameRules {
         } else {
             FilenameRules::Bytes
         };
-    }
-    if kind == libc::TMPFS_MAGIC as u32 {
-        return FilenameRules::Bytes;
     }
     // XFS also has an optional legacy case-insensitive format. Network and
     // other filesystems can implement server- or mount-specific

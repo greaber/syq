@@ -2764,7 +2764,7 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::DestinationNameKeys { paths, guard } => {
+            | Request::DestinationNameKeys { paths, guard, .. } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -3214,10 +3214,24 @@ impl FsOps {
     }
 
     fn destination_name_keys(
-        &self,
+        &mut self,
         paths: &[PathBytes],
+        partial_copy_id: Option<&CopyId>,
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<PathBytes>> {
+        // The request names final paths so exact-file grants can authorize it.
+        // Resolve sidecars here without widening the receiver's observations.
+        let partials;
+        let paths = if let Some(copy_id) = partial_copy_id {
+            partials = self
+                .partial_paths(paths, copy_id, guard)
+                .into_iter()
+                .map(|result| result.map_err(anyhow::Error::msg))
+                .collect::<Result<Vec<_>>>()?;
+            &partials
+        } else {
+            paths
+        };
         paths
             .iter()
             .map(|path| {
@@ -6416,8 +6430,12 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
-            Request::DestinationNameKeys { paths, guard } => self
-                .destination_name_keys(paths, guard.as_ref())
+            Request::DestinationNameKeys {
+                paths,
+                partial_copy_id,
+                guard,
+            } => self
+                .destination_name_keys(paths, partial_copy_id.as_ref(), guard.as_ref())
                 .map(Response::DestinationNameKeys),
             Request::PartialPaths {
                 paths,

@@ -894,6 +894,8 @@ pub enum Request {
     /// Read-only receiver filename identities, for collision and prune checks.
     DestinationNameKeys {
         paths: Vec<PathBytes>,
+        /// Derive sidecars from these authorized final paths when present.
+        partial_copy_id: Option<CopyId>,
         guard: Option<ContainerGuard>,
     },
 }

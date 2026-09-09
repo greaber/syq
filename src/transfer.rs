@@ -3744,6 +3744,7 @@ fn check_operator_directory(
 fn destination_name_keys(
     conn: &mut dyn Conn,
     paths: Vec<PathBytes>,
+    partial_copy_id: Option<CopyId>,
     guard: Option<ContainerGuard>,
 ) -> Result<Vec<PathBytes>> {
     if paths.is_empty() {
@@ -3751,7 +3752,11 @@ fn destination_name_keys(
     }
     let count = paths.len();
     match ok(
-        conn.call(Request::DestinationNameKeys { paths, guard })?,
+        conn.call(Request::DestinationNameKeys {
+            paths,
+            partial_copy_id,
+            guard,
+        })?,
         "inspect destination filenames",
     )? {
         Response::DestinationNameKeys(keys) if keys.len() == count => Ok(keys),
@@ -5328,7 +5333,8 @@ impl Planner<'_> {
             .iter()
             .map(|entry| join(dst_root, &join(sub, &entry.path)))
             .collect();
-        let keys = destination_name_keys(self.dst, paths.clone(), self.container_guard.clone())?;
+        let keys =
+            destination_name_keys(self.dst, paths.clone(), None, self.container_guard.clone())?;
         for (path, key) in paths.iter().zip(keys) {
             if self.partial_claims.contains_key(&key) {
                 self.collision = true;
@@ -6677,7 +6683,13 @@ impl Planner<'_> {
             .collect();
         let sidecar_keys = destination_name_keys(
             self.dst,
-            sidecar_paths.clone(),
+            files
+                .iter()
+                .zip(&sidecars)
+                .filter(|(_, sidecar)| sidecar.is_ok())
+                .map(|((path, _), _)| path.clone())
+                .collect(),
+            Some(self.opts.copy_id),
             self.container_guard.clone(),
         )?;
         for (sidecar, key) in sidecar_paths.into_iter().zip(sidecar_keys) {
@@ -6978,6 +6990,22 @@ impl Planner<'_> {
     /// real run agree. Partials are recorded separately: whether one is
     /// garbage depends on how its file fares this run.
     fn plan_deletes(&mut self) -> Result<()> {
+        // Directory creation or permission repair can make more precise naming
+        // rules available than during planning. Compare both source claims and
+        // destination entries using the receiver's current view before pruning.
+        self.filename_claims.clear();
+        let claimed_paths: Vec<_> = self.dst_seen.keys().cloned().collect();
+        for paths in claimed_paths.chunks(512) {
+            let keys = destination_name_keys(
+                self.dst,
+                paths.to_vec(),
+                None,
+                self.container_guard.clone(),
+            )?;
+            for (path, key) in paths.iter().zip(keys) {
+                self.filename_claims.insert(key, path.clone());
+            }
+        }
         let mut roots = std::mem::take(&mut self.delete_roots);
         roots.sort();
         roots.dedup();
@@ -7052,6 +7080,7 @@ impl Planner<'_> {
                 let keys = destination_name_keys(
                     self.dst,
                     batch.iter().map(|(path, _)| join(&root, path)).collect(),
+                    None,
                     self.container_guard.clone(),
                 )?;
                 for ((entry_path, entry_kind), key) in batch.iter().zip(keys) {

@@ -159,3 +159,22 @@ fn prune_protects_an_exact_source_beneath_another_sources_destination() {
     assert_eq!(read(&t.path("backup/import/file")), b"selected source");
     assert!(!t.path("backup/other").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prune_rechecks_names_after_destination_permissions_are_repaired() {
+    let t = Tmp::new();
+    write(&t.path("src/Report.txt"), b"keep these contents");
+    write(&t.path("dst/extra"), b"remove this extra");
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o311)).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--prune",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/Report.txt")), b"keep these contents");
+    assert!(!t.path("dst/extra").exists());
+}

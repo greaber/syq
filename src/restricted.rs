@@ -2325,7 +2325,7 @@ impl RestrictedAuthority {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
             Request::PartialPaths { paths, guard, .. }
-            | Request::DestinationNameKeys { paths, guard } => {
+            | Request::DestinationNameKeys { paths, guard, .. } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
@@ -5534,6 +5534,32 @@ esac
         assert!(!directory.join("pending.json").exists());
         assert!(directory.join("metadata.json").is_file());
         assert!(directory.join("enrollment-key").is_file());
+    }
+
+    #[test]
+    fn exact_file_grants_can_inspect_their_derived_partial_names() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 4);
+        authority.copy.mutation_scopes[0].descendants = false;
+        let target = root.join("target");
+        let copy_id = [7; 16];
+        let mut request = Request::DestinationNameKeys {
+            paths: vec![target.as_os_str().as_bytes().to_vec()],
+            partial_copy_id: Some(copy_id),
+            guard: None,
+        };
+        authority.authorize(&mut request, false).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&request);
+        let proto::Response::DestinationNameKeys(keys) = response else {
+            panic!("partial name inspection failed: {response:?}")
+        };
+        let partial = crate::fsops::partial_path(&target, &copy_id).unwrap();
+        let mut expected = partial.file_name().unwrap().as_bytes().to_vec();
+        expected.push(0);
+        assert_eq!(keys, vec![expected]);
+        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
     }
 
     #[test]
