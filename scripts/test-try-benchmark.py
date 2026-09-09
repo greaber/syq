@@ -59,7 +59,7 @@ if '--results' in args:
         if dst.name == 'calibration':
             copy_ms=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
         if dst.name == 'warmup':
-            copy_ms=1000 if os.environ.get('BENCH_TEST_SHORT_WARMUP') else 30000
+            copy_ms=1000 if os.environ.get('BENCH_TEST_SHORT_WARMUP') else int(os.environ.get('BENCH_TEST_WARMUP_MS', '60000'))
         result['copying_elapsed_ms']=copy_ms
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
         result['copying_elapsed_ms']=999999999
@@ -184,7 +184,7 @@ class BenchmarkTests(unittest.TestCase):
                              env=dict(self.env, BENCH_TEST_SHORT_WARMUP='1'))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count('Verified warm-up;'), 2)
-        self.assertIn('limit before 30 copying seconds', result.stdout)
+        self.assertIn('limit before 60 copying seconds', result.stdout)
         self.assertIn('small: 65536 bytes per trial', result.stdout)
         self.assert_clean()
 
@@ -197,6 +197,16 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn(', trial 1/', result.stdout)
                 self.assertNotIn('Results (', result.stdout)
                 self.assert_clean()
+
+    def test_thirty_seconds_no_longer_finishes_warmup(self):
+        result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
+                             '--workload', 'small',
+                             env=dict(self.env, BENCH_TEST_WARMUP_MS='30000'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('Verified warm-up;'), 3)
+        self.assertIn('limit before 60 copying seconds', result.stdout)
+        self.assertIn('small: 65536 bytes per trial', result.stdout)
+        self.assert_clean()
 
     def test_warmup_missing_old_timing_does_not_claim_it_settled(self):
         result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',

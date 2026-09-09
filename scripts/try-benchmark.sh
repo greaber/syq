@@ -48,7 +48,7 @@ also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
 Auto-tuning and remembered counts stay active unless overridden by tuning options.
-Warm-up aims for 30 copying seconds, using up to four growing copies of at most
+Warm-up aims for 60 copying seconds, using up to four growing copies of at most
 1 GiB each, space permitting. This is not a wall-time limit or proof tuning settled.
 Pull warm-ups generate matching source data remotely (needs Bash and OpenSSL).
 Use --warmup off for a short comparison using the existing cached/default count.
@@ -248,7 +248,7 @@ warm_up() {
         return
     fi
     [[ $amount -le $capacity ]] || amount=$capacity
-    printf '\nWarming up syq for %s (untimed; target 30 copying seconds, up to 4 copies, 1 GiB per dataset)...\n' "$workload"
+    printf '\nWarming up syq for %s (untimed; target 60 copying seconds, up to 4 copies, 1 GiB per dataset)...\n' "$workload"
     for ((attempt=1; attempt<=4; attempt++)); do
         prepare_dataset "$workload" "$amount" warmup
         destination=$dest_root/warmup
@@ -272,12 +272,12 @@ warm_up() {
             return
         fi
         awk -v ms="$copying_ms" 'BEGIN {printf "Verified warm-up; copying interval %.3f seconds.\n", ms/1000}'
-        [[ $copying_ms -lt 30000 ]] || return 0
-        next=$(next_amount "$amount" "$copying_ms" "$capacity" 30000)
+        [[ $copying_ms -lt 60000 ]] || return 0
+        next=$(next_amount "$amount" "$copying_ms" "$capacity" 60000)
         [[ $next -gt $amount && $attempt -lt 4 ]] || break
         amount=$next
     done
-    printf 'Note: %s warm-up reached its size, space or attempt limit before 30 copying seconds; tuning may not have settled.\n' "$workload"
+    printf 'Note: %s warm-up reached its size, space or attempt limit before 60 copying seconds; tuning may not have settled.\n' "$workload"
 }
 
 copy_with() {

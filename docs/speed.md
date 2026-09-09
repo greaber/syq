@@ -22,14 +22,15 @@ runs both workloads. The script checks every copy and cleans up afterward.
 Before scoring each network workload, an untimed syq warm-up gives automatic
 tuning time to refine the remembered connection count. It uses the same
 direction, transport options and file type as the scored copies. It starts
-with 64 MiB or 1,024 small files and grows toward 30 seconds of copying,
+with 64 MiB or 1,024 small files and grows toward 60 seconds of copying,
 stopping after at most four copies or at 1 GiB per dataset, subject to free
-space. A slow copy can take longer than 30 seconds; preparation and checks
+space. A slow copy can take longer than 60 seconds; preparation and checks
 also add time. The script reports the measured duration and warns if it hits
 a limit before the target. Reaching the target does not prove tuning settled.
 
 Use `--warmup off` for a short comparison using the existing cached or default
-count. Warm-up is skipped for local copies, comparisons without scored syq
+count. A cached count alone does not currently skip the warm-up automatically.
+Warm-up is skipped for local copies, comparisons without scored syq
 trials, and manual `--connections` or `--tuning-options` overrides. The scored
 dataset size stays the same. For pull warm-ups, identical data is generated
 locally and remotely and checked, avoiding a large preliminary upload; the
