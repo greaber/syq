@@ -2053,40 +2053,30 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Only exact placement onto bare `~` needs the receiver's canonical
     // spelling: it names HOME rather than a literal leaf. Other placements
     // keep the operator's spelling; registration handles their path policy.
-    let exact_native_destination =
-        args.interface != Interface::Rsync && args.placement == Placement::As;
-    let expand_exact_home =
-        exact_native_destination && args.restricted_grant.is_none() && operator_dst_root == b"~";
-    let (dst_root, dst_root_entry) = if expand_exact_home {
-        let (entry, canonical) = stat_and_canonicalize(
-            &mut *dst_ctl,
-            &operator_dst_root,
-            &operator_dst_root,
-            dst.is_remote(),
-        )?;
+    let expand_exact_home = args.interface != Interface::Rsync
+        && args.placement == Placement::As
+        && args.restricted_grant.is_none()
+        && operator_dst_root == b"~";
+    let (dst_root, mut dst_root_entry) = if expand_exact_home {
+        let (entry, canonical) = stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root)?;
         (canonical.as_os_str().as_bytes().to_vec(), entry)
     } else {
-        (
-            operator_dst_root.clone(),
-            stat_one(&mut *dst_ctl, &operator_dst_root, false)?,
-        )
-    };
-    // Rsync retains its destination-directory compatibility rule. Native
-    // container placement keeps the named symlink by default or resolves its
-    // complete chain under the destination follow policy. Exact native
-    // placement always selects the final directory entry; destination
-    // following applies only to its parent path.
-    let (dst_root, mut dst_root_entry) = match args.interface {
-        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?,
-        _ if args.follows_native_destination_paths() && args.placement == Placement::Into => {
+        let entry = stat_one(&mut *dst_ctl, &operator_dst_root, false)?;
+        // Rsync retains its destination-directory compatibility rule. Native
+        // container placement follows links only under the destination policy;
+        // exact placement preserves the final directory entry.
+        if args.interface == Interface::Rsync {
+            follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, entry)?
+        } else if args.follows_native_destination_paths() && args.placement == Placement::Into {
             follow_container_symlink(
                 &mut *dst_ctl,
                 &operator_dst_root,
-                dst_root_entry,
+                entry,
                 args.target_existence != Existence::Existing,
             )?
+        } else {
+            (operator_dst_root.clone(), entry)
         }
-        _ => (dst_root, dst_root_entry),
     };
     if debug() {
         crate::output::diagnostic!(
@@ -3852,24 +3842,16 @@ fn parent_path(path: &[u8]) -> PathBytes {
 /// avoids an extra RTT when expanding a remote bare-home destination.
 fn stat_and_canonicalize(
     conn: &mut dyn Conn,
-    stat_path: &[u8],
-    canonical_path: &[u8],
-    remote: bool,
+    path: &[u8],
 ) -> Result<(Option<Entry>, std::path::PathBuf)> {
-    if !remote {
-        return Ok((
-            stat_one(conn, stat_path, false)?,
-            crate::fsops::normalize(&crate::fsops::resolve(canonical_path)),
-        ));
-    }
     conn.send(Request::StatMany {
-        paths: vec![stat_path.to_vec()],
+        paths: vec![path.to_vec()],
         sources: None,
         follow: false,
         guard: None,
     })?;
     conn.send(Request::Canonicalize {
-        path: canonical_path.to_vec(),
+        path: path.to_vec(),
         guard: None,
     })?;
     // Consume both replies before interpreting either endpoint error so the

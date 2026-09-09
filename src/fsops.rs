@@ -5271,35 +5271,35 @@ impl FsOps {
         }
         // A cached donor can disappear or become unsuitable before opening.
         // Freshly allocated zeros are not old copy data worth scanning.
-        let reusable_len = if input.is_some() || basis_size.unwrap_or(0) > 0 {
-            len
-        } else {
-            0
-        };
-        let mut hashes = Vec::with_capacity(reusable_len.div_ceil(block) as usize);
-        let mut buffer = vec![0; block.min(reusable_len) as usize];
-        let reader = input.as_ref().unwrap_or(&output);
-        for index in 0..reusable_len.div_ceil(block) {
-            let off = index * block;
-            let bytes = &mut buffer[..(len - off).min(block) as usize];
-            if reader.read_exact_at(bytes, off).is_err() {
-                // The controller treats an absent hash as a block to transfer.
-                break;
+        let reader = input
+            .as_ref()
+            .or_else(|| (basis_size.unwrap_or(0) > 0).then_some(&output));
+        let mut hashes = Vec::new();
+        if let Some(reader) = reader {
+            hashes.reserve(len.div_ceil(block) as usize);
+            let mut buffer = vec![0; block.min(len) as usize];
+            for index in 0..len.div_ceil(block) {
+                let off = index * block;
+                let bytes = &mut buffer[..(len - off).min(block) as usize];
+                if reader.read_exact_at(bytes, off).is_err() {
+                    // The controller treats an absent hash as a block to transfer.
+                    break;
+                }
+                let hash = content_digest(bytes);
+                if input.is_some() {
+                    #[cfg(debug_assertions)]
+                    test_race_barrier(
+                        "SYQ_TEST_REUSE_READY_FILE",
+                        "SYQ_TEST_REUSE_CONTINUE_FILE",
+                        "SYQ_TEST_HOLD_REUSE_MS",
+                        "reuse buffered bytes",
+                    )?;
+                    output
+                        .write_all_at(bytes, off)
+                        .context("write reused block")?;
+                }
+                hashes.push(hash);
             }
-            let hash = content_digest(bytes);
-            if input.is_some() {
-                #[cfg(debug_assertions)]
-                test_race_barrier(
-                    "SYQ_TEST_REUSE_READY_FILE",
-                    "SYQ_TEST_REUSE_CONTINUE_FILE",
-                    "SYQ_TEST_HOLD_REUSE_MS",
-                    "reuse buffered bytes",
-                )?;
-                output
-                    .write_all_at(bytes, off)
-                    .context("write reused block")?;
-            }
-            hashes.push(hash);
         }
         if output.metadata()?.len() != len {
             output.set_len(len)?;
