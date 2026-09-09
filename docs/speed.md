@@ -169,10 +169,16 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `request-size` | Hash block size, normally 4 MiB | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
-| `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
+| `batch-files` | Adapts to file size, up to 128 or 512 depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
+
+Automatic new-file batches use the first file's size to limit how much is read
+before sending. Medium files are grouped into roughly 4 MiB batches; larger
+files can be grouped four at a time, within the 16 MiB byte limit. Tiny files
+keep the transport-dependent count limit. Explicit batch controls override
+this sizing. Hash comparison size does not determine new-file batching.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote

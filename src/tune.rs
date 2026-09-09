@@ -741,6 +741,16 @@ impl Gate {
         self.active.load(Relaxed)
     }
 
+    /// Connected workers eligible to take work now, excluding SSH setup.
+    pub fn ready(&self) -> usize {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .iter()
+            .take(self.active())
+            .filter(|slot| slot.phase == SlotPhase::Ready)
+            .count()
+    }
+
     pub fn set_active(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
         self.active.store(n, Relaxed);
@@ -1458,12 +1468,16 @@ mod tests {
         let gate = Gate::new(2);
         assert_eq!(gate.begin_warming(2), vec![0, 1]);
         assert!(!gate.ready_through(2));
+        assert_eq!(gate.ready(), 0);
         gate.mark_ready(0);
+        assert_eq!(gate.ready(), 1);
         assert!(!gate.ready_through(2));
         gate.mark_ready(1);
         assert!(gate.ready_through(2));
+        assert_eq!(gate.ready(), 2);
 
         gate.set_active(1);
+        assert_eq!(gate.ready(), 1);
         gate.set_retain(1);
         assert!(gate.allowed(0));
         assert!(!gate.allowed(1));

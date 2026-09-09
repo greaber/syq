@@ -114,12 +114,23 @@ pub trait Conn: Send {
 /// error. Endpoint errors still consume a response; a broken transport cannot
 /// be drained and must be recovered by the caller. Never send a new request.
 pub(crate) fn drain_range_replies(conn: &mut dyn Conn, count: usize, what: &str) -> Result<()> {
+    drain_range_replies_with(conn, count, what, |_| {})
+}
+
+pub(crate) fn drain_range_replies_with(
+    conn: &mut dyn Conn,
+    count: usize,
+    what: &str,
+    mut acknowledged: impl FnMut(usize),
+) -> Result<()> {
     let mut error = None;
-    for _ in 0..count {
+    for i in 0..count {
         anyhow::ensure!(!conn.is_dead(), "cannot drain a failed range transport");
         let response = conn.recv()?;
         if let Err(failure) = ok(response, what) {
             error.get_or_insert(failure);
+        } else {
+            acknowledged(i);
         }
     }
     error.map_or(Ok(()), Err)
@@ -3851,6 +3862,20 @@ mod tests {
         conn.begin_streaming_writes().unwrap();
         let fence = conn.fence_streaming_writes();
         conn.finish_streaming_writes(0, fence).unwrap();
+    }
+
+    #[test]
+    fn range_drain_reports_acknowledgements_before_a_receive_failure() {
+        let mut conn = LocalConn::new(&ConnectionRole::Control, Default::default());
+        conn.pending
+            .extend([Response::Err("failed write".into()), Response::Ok]);
+        let mut acknowledged = Vec::new();
+        // The third receive fails with no pending response. LocalConn does not
+        // mark itself dead; draining must still stop at that transport error.
+        assert!(drain_range_replies_with(&mut conn, 4, "write", |i| acknowledged.push(i)).is_err());
+        assert_eq!(acknowledged, [1]);
+        assert!(!conn.is_dead());
+        assert!(conn.pending.is_empty());
     }
 
     #[test]
