@@ -20316,6 +20316,9 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 ])
                 .env(ready_env, &ready)
                 .env(continue_env, &continuation)
+                // This barrier covers the second complete copy, including
+                // hashing and publication on a loaded macOS CI runner.
+                .env("SYQ_TEST_BARRIER_TIMEOUT_MS", "60000")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .start()

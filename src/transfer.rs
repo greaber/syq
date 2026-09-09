@@ -7076,6 +7076,9 @@ impl Planner<'_> {
                 },
             );
             res?;
+            if self.delete_walk_failed {
+                return Ok(());
+            }
             for batch in entries.chunks(512) {
                 let keys = destination_name_keys(
                     self.dst,

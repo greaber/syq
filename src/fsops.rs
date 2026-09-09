@@ -61,7 +61,18 @@ pub(crate) fn test_race_barrier(
             .with_context(|| format!("write {label} signal {}", Path::new(&ready).display()))?;
     }
     if let Some(continuation) = continuation {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let timeout_ms = std::env::var("SYQ_TEST_BARRIER_TIMEOUT_MS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("parse test barrier timeout")?
+            .unwrap_or(10_000);
+        if !(1..=60_000).contains(&timeout_ms) {
+            bail!("test barrier timeout must be between 1 and 60000 milliseconds");
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(timeout_ms);
+        let mut next_progress = started + std::time::Duration::from_secs(5);
         loop {
             match File::open(&continuation) {
                 Ok(_) => return Ok(()),
@@ -80,6 +91,13 @@ pub(crate) fn test_race_barrier(
                     "timed out waiting for {label} continuation {}",
                     Path::new(&continuation).display()
                 );
+            }
+            if std::time::Instant::now() >= next_progress {
+                eprintln!(
+                    "syq: waiting for {label} continuation {}",
+                    Path::new(&continuation).display()
+                );
+                next_progress += std::time::Duration::from_secs(5);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
