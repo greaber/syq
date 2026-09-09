@@ -608,3 +608,79 @@ fn macos_clone_reports_copy_and_cleanup_errors() {
     assert_eq!(read(&t.path("dst")), b"old destination");
     assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
 }
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_strips_quarantine_without_reading_ranges() {
+    use std::os::fd::AsRawFd;
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    let data = prng(5 << 20, 1001);
+    write(&t.path("src"), &data);
+    let source = File::open(t.path("src")).unwrap();
+    let value = b"0081;66000000;syq;";
+    assert_eq!(
+        unsafe {
+            libc::fsetxattr(
+                source.as_raw_fd(),
+                c"com.apple.quarantine".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        },
+        0
+    );
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
+    assert_eq!(tuning_observed(&out)["range_requests"], 0);
+    let destination = File::open(t.path("dst")).unwrap();
+    assert_eq!(
+        unsafe { libc::flistxattr(destination.as_raw_fd(), std::ptr::null_mut(), 0, 0) },
+        0
+    );
+    assert!(unsafe { libc::flistxattr(source.as_raw_fd(), std::ptr::null_mut(), 0, 0) } > 0);
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_compressed_source_keeps_logical_bytes_through_fallback() {
+    use std::os::macos::fs::MetadataExt;
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    let data = b"compressible test data\n".repeat(250_000);
+    write(&t.path("original"), &data);
+    let compressed = Command::new("/usr/bin/ditto")
+        .arg("--hfsCompression")
+        .args([&t.s("original"), &t.s("compressed")])
+        .run()
+        .unwrap();
+    assert_output_ok(&compressed);
+    assert_ne!(
+        fs::metadata(t.path("compressed")).unwrap().st_flags() & libc::UF_COMPRESSED,
+        0,
+        "fixture must actually use filesystem compression"
+    );
+    assert_eq!(read(&t.path("compressed")), data);
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("compressed"), &t.s("dst")])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(read(&t.path("compressed")), data);
+}
