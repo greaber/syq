@@ -92,6 +92,7 @@ for the trust boundary.
 When you use `--to laptop`, syq looks for a connected receiving machine with
 that name. If it is offline, syq tries an SSH host called `laptop` instead.
 Use `--to @laptop` when you want the command to fail if your laptop is offline.
+If an advertised receiver fails its identity check, the copy fails.
 Once a copy starts, it keeps the same destination even if the connection fails.
 
 The directory you set with `--cwd` is where incoming copies start. You can
