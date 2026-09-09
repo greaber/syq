@@ -916,7 +916,7 @@ done
 # Automatic sizing uses the real terminal timing from each remote direction.
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload small \
+        --mode "$benchmark_mode" --host destination --workload small --size auto \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
