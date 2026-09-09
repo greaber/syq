@@ -260,5 +260,8 @@ records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").s
 assert records[-1]["type"] == "result", records
 assert records[-1]["bytes_unchanged"] >= 4 * 1024 * 1024, records[-1]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
+assert len(remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'").splitlines()) == 1
+run("syq", "clean-partials", "--on", "destination", "/tmp/syq-real-ssh/forward")
 assert not remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
 print("source-shell remote copy checks passed", flush=True)
