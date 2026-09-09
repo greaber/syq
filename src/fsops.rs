@@ -469,12 +469,29 @@ impl OperatorDirectorySelection {
             }
         }
 
-        opened_directory_relation(
+        let destination_metadata = directory.metadata()?;
+        let relation = opened_directory_relation(
             directory,
             source_metadata.dev(),
             source_metadata.ino(),
             !virtual_components.is_empty(),
-        )
+        )?;
+        if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
+            match opened_directory_relation(
+                source.try_clone()?,
+                destination_metadata.dev(),
+                destination_metadata.ino(),
+                false,
+            ) {
+                Ok(DirectoryRelation::Descendant) => return Ok(DirectoryRelation::Ancestor),
+                Ok(_) => {}
+                Err(error) if error_is_kind(&error, io::ErrorKind::PermissionDenied) => {
+                    return Ok(DirectoryRelation::SourceUnsearchable);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(relation)
     }
 }
 
@@ -1616,22 +1633,58 @@ impl FsOps {
                 checks.len()
             );
         }
-        let selection = self
-            .operator_selection
-            .as_ref()
-            .context("destination directory was not checked on this connection")?;
+        let registered_selection;
+        let selection = if let Some(selection) = &self.operator_selection {
+            selection
+        } else {
+            let root = self
+                .destination_root
+                .as_ref()
+                .context("destination directory was not checked on this connection")?;
+            registered_selection = OperatorDirectorySelection {
+                path: Vec::new(),
+                directory: root.open_directory(&RelativePath::new(b"")?)?,
+                missing: VecDeque::new(),
+            };
+            &registered_selection
+        };
         checks
             .iter()
             .map(|check| {
                 if !check.source_root.is_directory() {
                     bail!("destination ancestry requires a source directory ticket");
                 }
-                let source = acquire_descriptor(&check.source_root)
-                    .context("claim exact source directory for destination ancestry")?;
+                let source = match acquire_descriptor(&check.source_root) {
+                    Ok(source) => source,
+                    Err(error)
+                        if check.allow_missing_source_broker
+                            && error_is_kind(&error, io::ErrorKind::NotFound) =>
+                    {
+                        return Ok(vec![
+                            DirectoryRelation::SourceUnavailable;
+                            check.suffixes.len()
+                        ]);
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("claim exact source directory for destination ancestry")
+                    }
+                };
                 check
                     .suffixes
                     .iter()
-                    .map(|suffix| selection.relation_to_source(&source, suffix))
+                    .map(|suffix| {
+                        let relation = selection.relation_to_source(&source, suffix)?;
+                        Ok(if check.source_is_directory {
+                            relation
+                        } else {
+                            match relation {
+                                DirectoryRelation::Same => DirectoryRelation::Ancestor,
+                                DirectoryRelation::Descendant => DirectoryRelation::Separate,
+                                other => other,
+                            }
+                        })
+                    })
                     .collect()
             })
             .collect()
@@ -1751,8 +1804,23 @@ impl FsOps {
                 }
             }
         }
-        // Match the engine's size + whole-second mtime quick check. A
-        // nanosecond difference alone does not cause a content transfer.
+        let naming_root = Root::from_directory(selection.directory.try_clone()?)?;
+        let mut missing_prefix = Vec::new();
+        for component in &selection.missing {
+            missing_prefix = join(&missing_prefix, component);
+        }
+        let mut filename_keys = std::collections::HashSet::new();
+        for name in &names {
+            let key =
+                naming_root.filename_key(&RelativePath::new(&join(&missing_prefix, name))?)?;
+            if !filename_keys.insert(key) {
+                bail!(
+                    "source filenames cannot safely be distinguished on the destination filesystem"
+                );
+            }
+        }
+        // This fused path serves native copies: use all available timestamp
+        // precision, matching the native planner's quick check.
         let mut unchanged: Vec<bool> = request
             .files
             .iter()
@@ -1762,6 +1830,7 @@ impl FsOps {
                     request.flags & flags::TIMES != 0
                         && stat.st_size as u64 == file.data.len() as u64
                         && stat.st_mtime == file.meta.mtime
+                        && stat.st_mtime_nsec as u32 == file.meta.mtime_nsec
                 })
             })
             .collect();
@@ -2401,6 +2470,7 @@ impl FsOps {
             Request::Scan { guard, .. }
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
+            | Request::DestinationNameKeys { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -2692,7 +2762,9 @@ impl FsOps {
                     map(root)?;
                 }
             }
-            Request::StatMany { paths, guard, .. } | Request::PartialPaths { paths, guard, .. } => {
+            Request::StatMany { paths, guard, .. }
+            | Request::PartialPaths { paths, guard, .. }
+            | Request::DestinationNameKeys { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -3139,6 +3211,45 @@ impl FsOps {
             bail!("source stat omitted its registered source references");
         }
         Ok(self.stat_many(paths, follow, guard))
+    }
+
+    fn destination_name_keys(
+        &self,
+        paths: &[PathBytes],
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Vec<PathBytes>> {
+        paths
+            .iter()
+            .map(|path| {
+                if let Some(target) = self.rooted_destination_target(path, guard)? {
+                    return target.root.filename_key(&target.relative);
+                }
+                let selection = self
+                    .operator_selection
+                    .as_ref()
+                    .context("destination directory has not been selected")?;
+                let requested = resolve(path);
+                let requested = if requested.is_absolute() {
+                    requested
+                } else {
+                    std::env::current_dir()?.join(requested)
+                };
+                let suffix = requested
+                    .strip_prefix(Path::new(OsStr::from_bytes(&selection.path)))
+                    .context("filename inspection is outside the selected destination")?;
+                let root = Root::from_directory(selection.directory.try_clone()?)?;
+                let mut virtual_path = Vec::new();
+                for component in &selection.missing {
+                    virtual_path = join(&virtual_path, component);
+                }
+                let virtual_prefix = root.filename_key(&RelativePath::new(&virtual_path)?)?;
+                let key = root.filename_key(&RelativePath::new(&join(
+                    &virtual_path,
+                    suffix.as_os_str().as_bytes(),
+                ))?)?;
+                Ok(key[virtual_prefix.len()..].to_vec())
+            })
+            .collect()
     }
 
     pub fn partial_paths(
@@ -3664,10 +3775,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     "destination {} cannot change type under a matched condition",
                     target.label.display()
                 ),
-                Some(_) => {
-                    root.unlink(path)?;
-                    create_rooted_directory_or_existing(target, *mode)
-                }
+                Some(_) => root.replace_directory(path, *mode),
                 None => create_rooted_directory_or_existing(target, *mode),
             }
         }
@@ -3703,14 +3811,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     root.replace_symlink_if_same(path, link, metadata.dev, metadata.ino)
                 }
-                Some(metadata) => {
-                    if metadata.is_dir() {
-                        root.remove_directory(path)?;
-                    } else {
-                        root.unlink(path)?;
-                    }
-                    root.create_symlink(path, link)
-                }
+                Some(_) => root.replace_symlink(path, link),
                 None => root.create_symlink(path, link),
             }
         }
@@ -3744,14 +3845,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     root.replace_node_if_same(path, *mode, *rdev, metadata.dev, metadata.ino)
                 }
-                Some(metadata) => {
-                    if metadata.is_dir() {
-                        root.remove_directory(path)?;
-                    } else {
-                        root.unlink(path)?;
-                    }
-                    root.create_node(path, *mode, *rdev)
-                }
+                Some(_) => root.replace_node(path, *mode, *rdev),
                 None => root.create_node(path, *mode, *rdev),
             }
         }
@@ -5593,7 +5687,7 @@ impl FsOps {
                 });
             }
             if n == 0 {
-                break; // source shorter than expected; finalize what we have
+                bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
         }
@@ -6322,6 +6416,9 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
+            Request::DestinationNameKeys { paths, guard } => self
+                .destination_name_keys(paths, guard.as_ref())
+                .map(Response::DestinationNameKeys),
             Request::PartialPaths {
                 paths,
                 copy_id,
@@ -6906,14 +7003,15 @@ fn mkdir_with_parent_fallback(p: &Path, mode: u32) -> Result<()> {
     }
 }
 
-fn remove_non_directory_or_empty_directory(p: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(p)?;
-    if metadata.is_dir() {
-        fs::remove_dir(p)?;
-    } else {
-        fs::remove_file(p)?;
-    }
-    Ok(())
+fn replacement_parent(path: &Path) -> Result<(Root, RelativePath)> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let leaf = path
+        .file_name()
+        .context("replacement requires a named entry")?;
+    Ok((Root::open(parent)?, RelativePath::new(leaf.as_bytes())?))
 }
 
 fn create_symlink_any(path: &Path, target: &[u8]) -> Result<()> {
@@ -6921,9 +7019,8 @@ fn create_symlink_any(path: &Path, target: &[u8]) -> Result<()> {
     match std::os::unix::fs::symlink(target, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            remove_non_directory_or_empty_directory(path)?;
-            std::os::unix::fs::symlink(target, path)
-                .with_context(|| format!("symlink {}", path.display()))
+            let (root, relative) = replacement_parent(path)?;
+            root.replace_symlink(&relative, target.as_bytes())
         }
         Err(error) => Err(error).with_context(|| format!("symlink {}", path.display())),
     }
@@ -6947,8 +7044,8 @@ fn create_node_any(path: &Path, mode: u32, rdev: u64) -> Result<()> {
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
         {
-            remove_non_directory_or_empty_directory(path)?;
-            create().with_context(|| format!("mknod {}", path.display()))
+            let (root, relative) = replacement_parent(path)?;
+            root.replace_node(&relative, mode, rdev)
         }
         Err(error) => Err(error).with_context(|| format!("mknod {}", path.display())),
     }
@@ -6972,8 +7069,8 @@ fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
             match fs::symlink_metadata(p) {
                 Ok(md) if md.is_dir() => make_dir_writable(p, &md),
                 Ok(_) => {
-                    fs::remove_file(p)?;
-                    mkdir_with_parent_fallback(p, mode)
+                    let (root, relative) = replacement_parent(p)?;
+                    root.replace_directory(&relative, mode)
                 }
                 Err(_) => Err(err),
             }
@@ -7195,6 +7292,36 @@ mod tests {
         // Return the control endpoint so tests retain the complete session
         // lifecycle in addition to each worker's own root and leaf clones.
         (worker, selections, control)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_copy_rejects_eof_before_the_planned_size() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"short").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("file"), b"old complete file").unwrap();
+        let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+        worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+        let result = worker.copy_local(
+            &sources[0],
+            b"file",
+            CopyLocalPolicy {
+                inplace: false,
+                allow_sequential_nfs_fallback: false,
+                allow_sequential_local_fallback: true,
+            },
+            &[37; 16],
+            100,
+            0o600,
+        );
+        assert!(result.is_err(), "a short copy cannot be finalized");
+        assert_eq!(
+            fs::read(destination.join("file")).unwrap(),
+            b"old complete file"
+        );
     }
 
     #[test]
@@ -7557,6 +7684,13 @@ mod tests {
                 .relation_to_source(&source, b"..")
                 .unwrap(),
             DirectoryRelation::Same
+        );
+
+        assert_eq!(
+            select(&dir, false)
+                .relation_to_source(&source, b"")
+                .unwrap(),
+            DirectoryRelation::Ancestor
         );
 
         fs::remove_dir_all(&dir).unwrap();

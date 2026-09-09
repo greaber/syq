@@ -194,9 +194,10 @@ Pruning stays inside the copied directories. Copying named directories `a`
 and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone.
 Ignored paths and files skipped by size limits are protected.
 
-Scan errors prevent deletion. An interruption after deletion starts can leave
-some extras removed. Do not prune while another copy is writing into the same
-tree: its completed files can be treated as extras. Recognized partial files
+Scan or copy errors prevent deletion. Syq refuses to prune a destination
+that contains its source on the same host. An interruption after deletion starts
+can leave some extras removed. Do not prune while another copy is writing into
+the same tree: its completed files can be treated as extras. Recognized partial files
 and directories containing them are protected from pruning. With `-v`, syq
 lists each extra file it keeps because its name matches the partial-file format.
 
@@ -244,6 +245,18 @@ Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
 a small amount remains to transfer.
 
+Syq checks destination filename equivalence before copying each batch. It
+refuses source names that could address the same destination entry, including
+case or Unicode spelling differences. On filesystems whose exact naming rules
+are unavailable, the checks are conservative: an ambiguous copy can be refused,
+and pruning can keep a possible source counterpart. These checks do not rename
+source files or change their spelling.
+
+Replacing an entry with a directory, symlink or special file stages the new
+entry before publication. If the filesystem cannot perform an atomic type
+change, the operation fails with the old entry preserved. An interrupted type change can leave the previous entry beside its
+replacement under a `.syq-swap-...` name; inspect it before removing it.
+
 Concurrent copies use separate partials. With unchanged sources, each completed
 file comes from one copy; different copies may win for different files. This
 does not make a whole tree a snapshot. `--inplace` still exposes unfinished
@@ -275,8 +288,14 @@ formats are neither reused nor selected by this command; remove those manually.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match.
-`--hash` checks contents even when those two attributes match:
+Syq normally skips files whose size and modification time match, including
+fractional seconds. It preserves the source timestamp at the destination, so
+the machines' clocks do not need to agree. A changed timestamp triggers checking
+even when it is older than the destination's, unless you request `--skip-newer`.
+
+Matching metadata is a shortcut, not proof that contents match. An edit can
+preserve both size and timestamp, and some filesystems record timestamps with
+less precision. `--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup

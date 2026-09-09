@@ -489,6 +489,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
                     | Request::CopySmallFiles(_)
+                    | Request::DestinationNameKeys { .. }
                     | Request::Receipt
                     | Request::MappingChunk { .. }
             )

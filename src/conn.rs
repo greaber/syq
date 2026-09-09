@@ -42,6 +42,9 @@ pub trait Conn: Send {
             Request::StatMany { paths, .. } => Some(("stat", paths.len())),
             Request::Apply { ops, .. } => Some(("apply", ops.len())),
             Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
+            Request::DestinationNameKeys { paths, .. } => {
+                Some(("destination filename keys", paths.len()))
+            }
             _ => None,
         };
         self.send(req)?;
@@ -51,6 +54,7 @@ pub trait Conn: Send {
                 Response::Stats(values) => Some(values.len()),
                 Response::Applied(values) => Some(values.len()),
                 Response::PathResults(values) => Some(values.len()),
+                Response::DestinationNameKeys(values) => Some(values.len()),
                 _ => None,
             };
             if actual.is_some_and(|actual| actual != expected) {
@@ -562,6 +566,7 @@ impl Conn for LocalConn {
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
                     | Request::CopySmallFiles(_)
+                    | Request::DestinationNameKeys { .. }
                     | Request::Receipt
             )
         {

@@ -14,7 +14,7 @@ for its named behavior, not a score for compatibility as a whole.
 | `--delete` scope: only inside the directories being synced; a single-file source deletes nothing | measured | `delete_only_inside_directories_the_sources_map_onto`, `delete_with_nested_roots_deletes_once` |
 | Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; syq: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
-| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Compatible subsets or approximations" 1 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
+| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; copy errors also suppress deletion | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
 | Files the source has but a rule skips (`-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D`) are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
 | `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Compatible subsets or approximations" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
 | `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_reports_no_missing_directory_changes`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
@@ -70,7 +70,8 @@ for its named behavior, not a score for compatibility as a whole.
 
 *Tests:
    `unreadable_source_root_disables_delete`,
-   `delete_is_skipped_when_the_source_scan_has_errors`.*
+   `delete_is_skipped_when_the_source_scan_has_errors`,
+   `data_safety::prune_is_suppressed_after_an_ordinary_file_read_failure`.*
 
 ### File-list option restrictions
 

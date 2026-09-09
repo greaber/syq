@@ -2324,7 +2324,8 @@ impl RestrictedAuthority {
             Request::DestinationFilesystemInfo { .. } => {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
-            Request::PartialPaths { paths, guard, .. } => {
+            Request::PartialPaths { paths, guard, .. }
+            | Request::DestinationNameKeys { paths, guard } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }

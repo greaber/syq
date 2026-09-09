@@ -522,7 +522,13 @@ impl SourceRootBase {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DirectoryAncestryCheck {
     pub source_root: DescriptorTicket,
+    /// False for an exact file or symlink: the ticket then names its parent.
+    pub source_is_directory: bool,
     pub suffixes: Vec<PathBytes>,
+    /// Different endpoint spellings may still name this machine. A missing
+    /// broker is expected only when the coordinator has not identified them
+    /// as the same endpoint; a present broker must authenticate normally.
+    pub allow_missing_source_broker: bool,
 }
 
 /// Relationship of one effective destination directory to its source root.
@@ -531,6 +537,10 @@ pub enum DirectoryRelation {
     Separate,
     Same,
     Descendant,
+    /// The source lies beneath the effective destination directory.
+    Ancestor,
+    SourceUnavailable,
+    SourceUnsearchable,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -881,6 +891,11 @@ pub enum Request {
         data: Vec<u8>,
         finish: bool,
     },
+    /// Read-only receiver filename identities, for collision and prune checks.
+    DestinationNameKeys {
+        paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1113,6 +1128,7 @@ pub enum Response {
     ReadStreamDone,
     WriteStreamDone,
     Prepared(Preparation),
+    DestinationNameKeys(Vec<PathBytes>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]

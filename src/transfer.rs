@@ -142,6 +142,7 @@ pub struct Opts {
     pub perms: bool,
     pub devices: bool,
     pub checksum: bool,
+    pub precise_mtime: bool,
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
@@ -1675,6 +1676,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         perms: args.perms,
         devices: args.devices,
         checksum: args.checksum,
+        precise_mtime: !matches!(args.placement, Placement::Rsync),
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
@@ -2419,15 +2421,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // pathname for this decision.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
-    if same_machine {
+    if same_machine || !opts.restricted_receiver {
         let roots = source_roots.get().expect("source roots registered");
         let mut source_checks = Vec::new();
         let mut ancestry_checks = Vec::new();
+        let may_prune = opts.delete && roots.iter().any(|root| root.selection.relative.is_empty());
         for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
             // Registration represents every selected directory as an empty
             // path beneath that directory descriptor. Exact files and
-            // symlinks retain a non-empty leaf and cannot recurse.
-            if !root.selection.relative.is_empty() {
+            // symlinks cannot recurse, but pruning another source's copied
+            // directory must not remove an exact source selected beneath it.
+            let source_is_directory = root.selection.relative.is_empty();
+            if !source_is_directory && !may_prune {
                 continue;
             }
             let primary_suffix = if expand_exact_home || dst_is_dir {
@@ -2449,7 +2454,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             source_checks.push((source_index, suffixes.len()));
             ancestry_checks.push(DirectoryAncestryCheck {
                 source_root: root.ticket.clone(),
+                source_is_directory,
                 suffixes,
+                allow_missing_source_broker: !same_machine,
             });
         }
 
@@ -2479,6 +2486,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             for relation in relations {
                 match relation {
                     DirectoryRelation::Separate => {}
+                    DirectoryRelation::SourceUnsearchable => {
+                        if opts.delete {
+                            progress.error("syq: source directory cannot be searched to check pruning overlap");
+                        }
+                    }
+                    DirectoryRelation::SourceUnavailable if !same_machine => {}
+                    DirectoryRelation::SourceUnavailable => bail!("source directory capability became unavailable during overlap checking"),
+                    DirectoryRelation::Ancestor if !opts.delete => {}
+                    DirectoryRelation::Ancestor => bail!(
+                        "cannot prune destination {:?}: it contains source {:?}",
+                        display(&dst.path), display(&source.path)
+                    ),
                     DirectoryRelation::Same => bail!(
                         "source and destination are the same directory {:?}",
                         display(&source.path)
@@ -2725,6 +2744,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         destination_supports_confined_socket_nodes,
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
+        filename_claims: std::collections::HashMap::new(),
+        partial_claims: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         dry_run_replaced_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
@@ -3160,6 +3181,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if st.scan_warned {
             delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
+        } else if progress.errors.load(Relaxed) != 0 {
+            delete_plan = DeletePlan::Skipped("copy errors");
+            progress.eprintln("syq: copy reported errors; skipping deletions");
         } else {
             match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
                 Ok(()) if st.delete_walk_failed => {
@@ -3714,6 +3738,24 @@ fn check_operator_directory(
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
         other => bail!("unexpected response {other:?}"),
+    }
+}
+
+fn destination_name_keys(
+    conn: &mut dyn Conn,
+    paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+) -> Result<Vec<PathBytes>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = paths.len();
+    match ok(
+        conn.call(Request::DestinationNameKeys { paths, guard })?,
+        "inspect destination filenames",
+    )? {
+        Response::DestinationNameKeys(keys) if keys.len() == count => Ok(keys),
+        other => bail!("unexpected destination filename response {other:?}"),
     }
 }
 
@@ -4490,6 +4532,9 @@ struct Planner<'a> {
     destination_supports_confined_socket_nodes: bool,
     /// Destination paths claimed by source entries (see `Claim`).
     dst_seen: std::collections::HashMap<PathBytes, Claim>,
+    /// Receiver filename keys to original planned spellings, including parents.
+    filename_claims: std::collections::HashMap<PathBytes, PathBytes>,
+    partial_claims: std::collections::HashMap<PathBytes, PathBytes>,
     /// Directories this run will not create — --existing: they don't exist
     /// (or aren't directories); --ignore-existing: an existing non-directory
     /// sits at their path. Nothing under them is touched.
@@ -5279,6 +5324,52 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
+        let paths: Vec<_> = batch
+            .iter()
+            .map(|entry| join(dst_root, &join(sub, &entry.path)))
+            .collect();
+        let keys = destination_name_keys(self.dst, paths.clone(), self.container_guard.clone())?;
+        for (path, key) in paths.iter().zip(keys) {
+            if self.partial_claims.contains_key(&key) {
+                self.collision = true;
+                self.progress.error(&format!(
+                    "syq: destination {} conflicts with a copy's partial filename",
+                    display(path)
+                ));
+            }
+            // Check parent aliases as well, including implicit mapping parents.
+            let components: Vec<_> = path.split(|b| *b == b'/').collect();
+            let key_ends: Vec<_> = key
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| (*b == 0).then_some(i + 1))
+                .collect();
+            let base = components
+                .len()
+                .checked_sub(key_ends.len())
+                .context("invalid destination filename key")?;
+            let prefixes: Vec<_> = if key_ends.is_empty() {
+                vec![(key.clone(), path.clone())]
+            } else {
+                key_ends
+                    .iter()
+                    .enumerate()
+                    .map(|(i, end)| (key[..*end].to_vec(), components[..base + i + 1].join(&b'/')))
+                    .collect()
+            };
+            for (key, spelling) in prefixes {
+                if let Some(previous) = self.filename_claims.get(&key) {
+                    if *previous != spelling {
+                        self.collision = true;
+                        self.progress.error(&format!(
+                            "syq: destination filenames {} and {} cannot safely be distinguished on the destination filesystem",
+                            display(previous), display(&spelling)));
+                    }
+                } else {
+                    self.filename_claims.insert(key, spelling);
+                }
+            }
+        }
         let namespace_files = self.collect_namespace_files(&batch, src_root, sub, dst_root);
         if !namespace_files.is_empty() {
             self.sched.anticipate_file_work();
@@ -5349,6 +5440,7 @@ impl Planner<'_> {
         );
         self.payload_paths = std::collections::HashMap::new();
         self.sidecar_paths = std::collections::HashMap::new();
+        self.partial_claims = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -5367,6 +5459,7 @@ impl Planner<'_> {
         }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
+            self.filename_claims = std::collections::HashMap::new();
             self.delete_roots = Vec::new();
         }
     }
@@ -6094,6 +6187,7 @@ impl Planner<'_> {
                         d.kind == Kind::File
                             && d.size == e.size
                             && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
+                            && (!opts.precise_mtime || d.mtime_nsec == e.mtime_nsec)
                     });
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {
@@ -6577,6 +6671,31 @@ impl Planner<'_> {
                 mapped.other_stats = Some(other_paths.into_iter().zip(stats).collect());
             }
         }
+        let sidecar_paths: Vec<_> = sidecars
+            .iter()
+            .filter_map(|result| result.as_ref().ok().cloned())
+            .collect();
+        let sidecar_keys = destination_name_keys(
+            self.dst,
+            sidecar_paths.clone(),
+            self.container_guard.clone(),
+        )?;
+        for (sidecar, key) in sidecar_paths.into_iter().zip(sidecar_keys) {
+            if let Some(payload) = self.filename_claims.get(&key) {
+                self.collision = true;
+                self.progress.error(&format!(
+                    "syq: destination payload {} conflicts with partial filename {}",
+                    display(payload),
+                    display(&sidecar)
+                ));
+            }
+            if let Some(previous) = self.partial_claims.insert(key, sidecar.clone()) {
+                if previous != sidecar {
+                    self.collision = true;
+                    self.progress.error(&format!("syq: partial filenames {} and {} cannot safely be distinguished on the destination filesystem", display(&previous), display(&sidecar)));
+                }
+            }
+        }
         for ((dst_path, file_rel), sidecar) in files.into_iter().zip(sidecars) {
             let sidecar = match sidecar {
                 Ok(sidecar) => sidecar,
@@ -6890,13 +7009,13 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
-            let seen = &self.dst_seen;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
             // it — and gutting the directory underneath would be touching it.
             let mut shielded: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
+            let mut entries = Vec::new();
             let res = self.dst.scan(
                 &root,
                 None,
@@ -6904,62 +7023,12 @@ impl Planner<'_> {
                 &ignore,
                 true,
                 &mut |batch: Vec<Entry>| {
-                    for e in batch {
-                        if e.path.is_empty() {
-                            continue;
-                        }
-                        let full = join(&root, &e.path);
-                        if nested.iter().any(|n| *n == full || inside(&full, n))
-                            || Planner::under_any(&shielded, &full, &root)
-                        {
-                            continue;
-                        }
-                        match seen.get(&full) {
-                            Some(Claim::Dir) => continue,
-                            Some(_) => {
-                                if e.kind == Kind::Dir {
-                                    shielded.insert(full);
-                                }
-                                continue;
-                            }
-                            None => {}
-                        }
-                        let dst_rel = join(&sub, &e.path);
-                        let rel = display(&dst_rel);
-                        let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
-                        if e.kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
-                            if self.opts.verbose > 0 {
-                                self.progress.eprintln(&format!(
-                                    "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"
-                                ));
-                            }
-                            for (index, byte) in full.iter().enumerate() {
-                                if *byte == b'/' {
-                                    partial_parents
-                                        .entry(full[..index].to_vec())
-                                        .or_insert_with(|| rel.clone());
-                                }
-                            }
-                        } else {
-                            if e.kind == Kind::Dir {
-                                let depth = full.iter().filter(|&&c| c == b'/').count();
-                                found.dirs.entry(depth).or_default().push((
-                                    full,
-                                    format!("{rel}/"),
-                                    "dir",
-                                ));
-                            } else {
-                                let kind = match e.kind {
-                                    Kind::Symlink => "symlink",
-                                    Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                                        "special"
-                                    }
-                                    _ => "file",
-                                };
-                                found.leaves.push((full, rel, kind));
-                            }
-                        }
-                    }
+                    entries.extend(
+                        batch
+                            .into_iter()
+                            .filter(|e| !e.path.is_empty())
+                            .map(|e| (e.path, e.kind)),
+                    );
                     Ok(())
                 },
                 &mut |paths: Vec<PathBytes>| {
@@ -6979,6 +7048,79 @@ impl Planner<'_> {
                 },
             );
             res?;
+            for batch in entries.chunks(512) {
+                let keys = destination_name_keys(
+                    self.dst,
+                    batch.iter().map(|(path, _)| join(&root, path)).collect(),
+                    self.container_guard.clone(),
+                )?;
+                for ((entry_path, entry_kind), key) in batch.iter().zip(keys) {
+                    let entry_kind = *entry_kind;
+
+                    if entry_path.is_empty() {
+                        continue;
+                    }
+                    let full = join(&root, entry_path);
+                    if nested.iter().any(|n| *n == full || inside(&full, n))
+                        || Planner::under_any(&shielded, &full, &root)
+                    {
+                        continue;
+                    }
+                    let claimed = self
+                        .filename_claims
+                        .get(&key)
+                        .and_then(|spelling| self.dst_seen.get(spelling));
+                    match claimed {
+                        Some(Claim::Dir) => continue,
+                        Some(_) => {
+                            if entry_kind == Kind::Dir {
+                                shielded.insert(full);
+                            }
+                            continue;
+                        }
+                        None => {}
+                    }
+                    let dst_rel = join(&sub, entry_path);
+                    let rel = display(&dst_rel);
+                    let name = entry_path
+                        .rsplit(|&c| c == b'/')
+                        .next()
+                        .unwrap_or(entry_path);
+                    if entry_kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                        if self.opts.verbose > 0 {
+                            self.progress.eprintln(&format!(
+                                    "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"
+                                ));
+                        }
+                        for (index, byte) in full.iter().enumerate() {
+                            if *byte == b'/' {
+                                partial_parents
+                                    .entry(full[..index].to_vec())
+                                    .or_insert_with(|| rel.clone());
+                            }
+                        }
+                    } else {
+                        if entry_kind == Kind::Dir {
+                            let depth = full.iter().filter(|&&c| c == b'/').count();
+                            found.dirs.entry(depth).or_default().push((
+                                full,
+                                format!("{rel}/"),
+                                "dir",
+                            ));
+                        } else {
+                            let kind = match entry_kind {
+                                Kind::Symlink => "symlink",
+                                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                                    "special"
+                                }
+                                _ => "file",
+                            };
+                            found.leaves.push((full, rel, kind));
+                        }
+                    }
+                }
+            }
+
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
@@ -7472,8 +7614,10 @@ impl Worker {
                             self.sched.retry_range(&h, start);
                             return Err(e);
                         }
-                        self.sched.range_done(&h);
+                        // Keep this range outstanding until failure is visible:
+                        // another worker must not elect itself to publish it.
                         self.file_error(idx, e)?;
+                        self.sched.range_done(&h);
                         continue;
                     }
                     let done = self.sched.range_done(&h);
@@ -7758,7 +7902,7 @@ impl Worker {
         if e.is::<RangeReplyMismatch>() || self.transport_dead() {
             return Err(e);
         }
-        if !self.sched.is_failed(idx) {
+        if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
             let message = format!("{e:#}");
@@ -7768,7 +7912,6 @@ impl Worker {
                 os_kind,
             );
             self.emit_file_result_failed(&job, "unknown", os_kind, &message);
-            self.sched.fail_file(idx);
             if capacity_os_kind(os_kind) {
                 self.sched.abort();
             }
@@ -7966,8 +8109,9 @@ impl Worker {
                         self.sched.retry_range(&h, start);
                         return Err(e);
                     }
+                    self.file_error(idx, e)?;
                     self.sched.range_done(&h);
-                    return Err(e);
+                    return Ok(());
                 }
                 if self.sched.range_done(&h) {
                     if let Err(e) = self.finish_file(idx) {
@@ -8256,8 +8400,9 @@ impl Worker {
         let result = (|| -> Result<()> {
             loop {
                 if self.sched.is_failed(idx) || self.sched.is_aborted() {
-                    self.sched.release_rest(h);
-                    break;
+                    // Issued reads have advanced pos but may not have been
+                    // written. Draining them is cancellation, not completion.
+                    bail!("copy cancelled before this range completed");
                 }
                 if !self.gate.allowed(self.id) {
                     // Being parked: give the rest of this range back so an active
@@ -8495,10 +8640,13 @@ impl Worker {
     }
 
     fn finish_file(&mut self, idx: usize) -> Result<()> {
-        if self.sched.is_failed(idx) {
+        if self.sched.is_failed(idx) || self.sched.is_aborted() {
             return Ok(());
         }
         let job = self.job(idx);
+        if job.done.load(Relaxed) != job.entry.size {
+            bail!("refusing to publish an incomplete file");
+        }
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
         let flags = publication_metadata_flags(self.opts.flags);
@@ -8908,6 +9056,7 @@ mod tests {
                         perms: false,
                         devices: false,
                         checksum: false,
+                        precise_mtime: true,
                         verify_only: false,
                         inplace: false,
                         same_host: false,

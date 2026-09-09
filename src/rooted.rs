@@ -1193,6 +1193,41 @@ impl Root {
         Ok(names)
     }
 
+    /// Conservative filename identity for planning and pruning. Byte-sensitive
+    /// filesystems retain byte identity; Unicode filesystems use a deliberately
+    /// broader equivalence so an uncertain spelling can only refuse a copy or
+    /// protect an extra, never silently overwrite or delete a source claim.
+    /// This is read-only, including for missing destination directories.
+    pub(crate) fn filename_key(&self, path: &RelativePath) -> Result<Vec<u8>> {
+        let mut directory = self.directory.try_clone()?;
+        let mut rules = filename_rules(&directory);
+        let mut missing = false;
+        let mut key = Vec::new();
+        for component in &path.components {
+            let name = filename_component_key(component, rules)?;
+            key.extend_from_slice(&name);
+            key.push(0); // Input path components cannot contain NUL.
+            if !missing {
+                match open_directory_at(&directory, component) {
+                    Ok(child) => {
+                        directory = child;
+                        rules = filename_rules(&directory);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                        ) =>
+                    {
+                        missing = true
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(key)
+    }
+
     /// Component limit for a sidecar beside `path`. Missing or non-directory
     /// suffixes are walked back to the nearest existing real directory, never
     /// through a symlink.
@@ -1355,6 +1390,102 @@ impl Root {
             )
         })
         .with_context(|| format!("set times on confined path {}", path.label()))
+    }
+
+    /// Stage replacements before touching the old entry. Cross-type directory
+    /// changes need an atomic exchange; the displaced object remains recoverable
+    /// until cleanup succeeds. Never fall back to unlink-before-create.
+    pub(crate) fn replace_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
+        self.replace_entry(path, |fd, name| {
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), mode as libc::mode_t) })
+        })
+    }
+
+    pub(crate) fn replace_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
+        let target = CString::new(target).context("symlink target contains NUL")?;
+        self.replace_entry(path, |fd, name| {
+            retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+        })
+    }
+
+    pub(crate) fn replace_node(&self, path: &RelativePath, mode: u32, rdev: u64) -> Result<()> {
+        self.replace_entry(path, |fd, name| {
+            retry_zero(|| unsafe {
+                libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
+            })
+        })
+    }
+
+    fn replace_entry(
+        &self,
+        path: &RelativePath,
+        create: impl Fn(RawFd, &CString) -> io::Result<()>,
+    ) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
+        if before.is_dir() && !self.read_directory(path)?.is_empty() {
+            bail!("refusing to replace nonempty directory {}", path.label());
+        }
+        let temporary = create_temporary(&parent, create)?;
+        let replacement = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        let cleanup_new = || {
+            unlink_at(
+                parent.directory.as_raw_fd(),
+                &temporary,
+                if replacement.is_dir() {
+                    libc::AT_REMOVEDIR
+                } else {
+                    0
+                },
+            )
+        };
+        if before.is_dir() == replacement.is_dir() {
+            let result = retry_zero(|| unsafe {
+                libc::renameat(
+                    parent.directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                )
+            });
+            if result.is_err() {
+                let _ = cleanup_new();
+            }
+            return result.with_context(|| format!("publish replacement for {}", path.label()));
+        }
+        if let Err(error) = rename_exchange(
+            parent.directory.as_raw_fd(),
+            &temporary,
+            parent.directory.as_raw_fd(),
+            &parent.leaf,
+        ) {
+            let _ = cleanup_new();
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot atomically change the type of {}; original entry was preserved",
+                    path.label()
+                )
+            });
+        }
+        // The old entry now has the temporary name. Nonrecursive cleanup can
+        // never discard a directory that acquired children during publication.
+        let displaced = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+        unlink_at(
+            parent.directory.as_raw_fd(),
+            &temporary,
+            if displaced.is_dir() {
+                libc::AT_REMOVEDIR
+            } else {
+                0
+            },
+        )
+        .with_context(|| {
+            format!(
+                "replacement published for {}; previous entry remains beside it as {:?}",
+                path.label(),
+                temporary
+            )
+        })
     }
 
     pub(crate) fn replace_symlink_if_same(
@@ -2278,6 +2409,109 @@ fn stat_rdev(stat: &libc::stat) -> u64 {
     stat.st_rdev as u64
 }
 
+#[derive(Clone, Copy)]
+enum FilenameRules {
+    // Only Linux currently provides a proven byte-comparison branch here.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    Bytes,
+    Unicode {
+        fold: bool,
+        trim: bool,
+    },
+}
+
+fn filename_component_key(name: &[u8], rules: FilenameRules) -> Result<Vec<u8>> {
+    let FilenameRules::Unicode { fold, trim } = rules else {
+        return Ok(name.to_vec());
+    };
+    let name = std::str::from_utf8(name)
+        .context("cannot safely compare a non-UTF-8 filename on this destination filesystem")?;
+    let normalize = icu_normalizer::DecomposingNormalizer::new_nfkd();
+    let ignored =
+        icu_properties::CodePointSetData::new::<icu_properties::props::DefaultIgnorableCodePoint>();
+    let decomposed = normalize.normalize(name);
+    // Full Unicode folding handles expansions (including capital sharp S).
+    // Uppercase first also covers the simple uppercase tables used by FAT.
+    // Compatibility decomposition and ignored format controls deliberately
+    // err toward collisions across older filesystem Unicode tables.
+    let folded: String = if fold {
+        let uppercase: String = decomposed.chars().flat_map(char::to_uppercase).collect();
+        icu_casemap::CaseMapper::new()
+            .fold_string(&uppercase)
+            .into_owned()
+    } else {
+        decomposed.into_owned()
+    };
+    let normalized: String = normalize
+        .normalize(&folded)
+        .chars()
+        .filter(|c| !ignored.contains(*c))
+        .collect();
+    let normalized = if trim {
+        normalized.trim_end_matches(['.', ' '])
+    } else {
+        &normalized
+    };
+    Ok(normalized.as_bytes().to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn filename_rules(directory: &File) -> FilenameRules {
+    let conservative = FilenameRules::Unicode {
+        fold: true,
+        trim: true,
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return conservative;
+    }
+    let kind = unsafe { stats.assume_init() }.f_type as u32;
+    if kind == libc::EXT4_SUPER_MAGIC as u32
+        || kind == libc::F2FS_SUPER_MAGIC as u32
+        || kind == libc::BTRFS_SUPER_MAGIC as u32
+    {
+        let Ok(readable) = open_readable_directory_at(directory, b".") else {
+            return conservative;
+        };
+        let mut flags: libc::c_long = 0;
+        if unsafe { libc::ioctl(readable.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
+            return conservative;
+        }
+        return if flags & 0x4000_0000 != 0 {
+            FilenameRules::Unicode {
+                fold: true,
+                trim: false,
+            }
+        } else {
+            FilenameRules::Bytes
+        };
+    }
+    if kind == libc::TMPFS_MAGIC as u32 {
+        return FilenameRules::Bytes;
+    }
+    // XFS also has an optional legacy case-insensitive format. Network and
+    // other filesystems can implement server- or mount-specific
+    // name equivalence. Never assume byte sensitivity from the client OS.
+    conservative
+}
+
+#[cfg(target_os = "macos")]
+fn filename_rules(directory: &File) -> FilenameRules {
+    let sensitive = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
+    FilenameRules::Unicode {
+        fold: sensitive != 1,
+        trim: false,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn filename_rules(_directory: &File) -> FilenameRules {
+    FilenameRules::Unicode {
+        fold: true,
+        trim: true,
+    }
+}
+
 fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {
     retry_zero(|| unsafe { libc::unlinkat(parent, name.as_ptr(), flags) })
 }
@@ -2531,6 +2765,63 @@ mod tests {
             }
             Err(error) => panic!("openat2 fast path failed unexpectedly: {error}"),
         }
+    }
+
+    #[test]
+    fn filename_safety_keys_preserve_byte_names_and_cover_unicode_aliases() {
+        let folded = FilenameRules::Unicode {
+            fold: true,
+            trim: false,
+        };
+        for (a, b) in [
+            ("Report", "report"),
+            ("é", "e\u{301}"),
+            ("Straße", "STRASSE"),
+            ("ẞ", "ss"),
+            ("Σ", "ς"),
+            ("K", "k"),
+            ("a\u{200b}", "a"),
+        ] {
+            assert_eq!(
+                filename_component_key(a.as_bytes(), folded).unwrap(),
+                filename_component_key(b.as_bytes(), folded).unwrap()
+            );
+        }
+        assert_ne!(
+            filename_component_key(b"A", FilenameRules::Bytes).unwrap(),
+            filename_component_key(b"a", FilenameRules::Bytes).unwrap()
+        );
+        assert_eq!(
+            filename_component_key(&[0xff], FilenameRules::Bytes).unwrap(),
+            [0xff]
+        );
+        assert!(filename_component_key(&[0xff], folded).is_err());
+    }
+
+    #[test]
+    fn staged_type_replacements_preserve_old_entries_on_failure() {
+        let tree = TestDir::new("staged-types");
+        fs::write(tree.path().join("item"), b"previous contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        let path = relative(b"item");
+        let error = root.replace_entry(&path, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            fs::read(tree.path().join("item")).unwrap(),
+            b"previous contents"
+        );
+        root.replace_symlink(&path, b"target").unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("item")).unwrap(),
+            Path::new("target")
+        );
+        root.replace_directory(&path, 0o700).unwrap();
+        assert!(tree.path().join("item").is_dir());
+        fs::write(tree.path().join("item/child"), b"keep").unwrap();
+        assert!(root.replace_symlink(&path, b"other").is_err());
+        assert_eq!(fs::read(tree.path().join("item/child")).unwrap(), b"keep");
     }
 
     #[test]

@@ -23,10 +23,14 @@ syq rsync -av project/ server:backup/project/
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
 
-A failed source or destination scan prevents deletion. A per-file read failure
-during transfer does not by itself prevent deletion: that source entry remains
-present, so its destination counterpart is not an extra. Preview deletion
-scope with `--dry-run -v`; see [deletion rules](reference.md#mirror-a-directory).
+Scan and copy errors prevent deletion. A destination that contains its source
+on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
+see [deletion rules](reference.md#mirror-a-directory).
+
+The compatibility command uses rsync's default size-and-whole-second timestamp
+quick check. Native `syq cp` also compares fractional seconds. Use `-c` to compare
+contents when size and timestamp match; source timestamps are preserved, so
+ordinary clock skew does not require the source timestamp to be newer.
 
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
