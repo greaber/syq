@@ -78,6 +78,14 @@ When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
 outlive its premise and steer later work in the wrong direction.
 
+## GitHub issues
+
+The user reserves GitHub issues for outside contributors to communicate with
+the project. Agents must not create issues unless the user explicitly asks
+for an issue to be created. Discovering a bug, deferring work, or identifying
+a follow-up does not authorize opening an issue; report it to the user in
+the conversation instead.
+
 ## Branch synchronization and handoff
 
 - Open regular pull requests by default. Use a draft only when the user asks
