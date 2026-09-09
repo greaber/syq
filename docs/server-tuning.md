@@ -1,7 +1,7 @@
 # Server setup
 
-A few server settings can make a substantial difference, especially on
-long-distance links or when syq must carry data over SSH.
+Server settings and storage placement can make a substantial difference,
+especially on long-distance links or when syq must carry data over SSH.
 
 ## Make TCP reachable
 
@@ -92,8 +92,57 @@ Validate configuration changes with `sshd -t`, then reload SSH using your
 system's normal procedure. Keep an administrative session open while doing
 so. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
 
+## Check local storage placement
+
+For a local copy, identify the filesystems containing the actual source and
+destination. Two directories on one server can use different disks, filesystems,
+or an NFS mount. On Linux, inspect each path with:
+
+```sh
+findmnt -T /path/to/source -o TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt -T /path/to/destination-parent -o TARGET,SOURCE,FSTYPE,OPTIONS
+```
+
+Use an existing destination parent if the destination does not exist yet.
+For remote paths, run these checks on the machine that owns the path. An NFS
+mount's type does not identify the server's backing filesystem.
+
+Eligible local copies use the filesystem's copy support automatically. Within
+a filesystem that supports cloning, such as XFS with reflink enabled, the
+filesystem can share data extents between source and destination instead of
+copying every byte. The files remain independently writable. Reported throughput
+then measures logical file bytes, not physical disk traffic.
+
+If your storage requirements allow it, keeping a local source and destination
+on the same filesystem can make this optimization available. Copying between
+filesystems cannot share those extents. This does not mean XFS is always faster
+than ext4: the devices, workload, and available copy operations also matter.
+See [local copies and NFS](speed.md#local-copies-and-nfs) for syq's other copy
+paths and NFS mount considerations.
+
 ## Measure and track improvements
 
 Use [syq-bench](https://greaber.github.io/syq-bench/reproduce.html) to compare
 settings on your machines and save repeatable results over time. Test the
-workloads and transfer directions you actually use.
+workloads and transfer directions you actually use. Record elapsed time and
+throughput alongside tool versions and commands.
+
+When results differ between servers, check these conditions before changing
+system settings:
+
+- **Transport and parallelism:** inspect the selected transport and connection
+  count with `-vv --stats`. For a controlled worker-count comparison, use
+  `--connections N`; see [benchmark tuning](speed.md#benchmark-tuning). Use the
+  same reporting options in each run, and start with defaults for everyday
+  copies. More workers need not help once storage or an NFS service is saturated;
+  compare repeated runs before choosing a lower count.
+- **Storage and cache:** record both mounts, whether source data is cached, and
+  whether timing includes a final storage flush. Buffered copy completion and
+  completion after flushing measure different things; compare like with like.
+- **Other work:** check CPU, local disk, and network activity at both ends.
+  With shared NFS, other clients can compete for the same service even when
+  your own machine is otherwise idle.
+- **CPU policy:** record the governor and observed clock speeds where available.
+  A governor change can affect tools differently, so a gain for rsync does not
+  establish a gain for syq. Compare your workload before making a persistent
+  change; `performance` is not a general requirement for syq.
