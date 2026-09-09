@@ -96,14 +96,10 @@ In addition to the shared arguments above, it accepts:
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
 and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
 
-The SDK passes `pscope` unchanged to the selected syq executable, which controls
-the scope and its background receivers. Ephemeral scopes in the current
-CLI reuse forward SSH connections only. For return copies or commands, establish
-durable persistence with `syq persist connect server` and omit `pscope`. This
-also applies to `AsyncClient` and to `rm`. If the SDK selects an older executable,
-its scope behavior still applies: syq 0.4.1 also enabled receiving in ephemeral
-scopes. See [connection persistence](https://greaber.github.io/syq/install.html#keep-connections-open)
-for lifetime, cleanup, and upgrade behavior, and
+`pscope` selects an isolated scope for reusing SSH connections. For return
+copies or commands, use `syq persist connect server` and omit `pscope`. See
+[persistence in scripts](https://greaber.github.io/syq/receive.html#persistence-in-scripts)
+for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
 for executable selection.
 
@@ -604,11 +600,9 @@ Python exceptions. Exceptions from application callbacks or mapping iterators
 are re-raised unchanged. Async cancellation remains `asyncio.CancelledError`.
 These exceptions are not wrapped in `SyqError`.
 
-Timeout, cancellation, early mapping exit, and streaming failures terminate and
-reap the local process group, including SSH children. Closing a mapping whose
-producer has already exited still cleans up its children; the exited producer
-alone does not cause a cleanup permission error on macOS. Filesystem changes
-already completed are not rolled back.
+Timeout, cancellation, early mapping exit, and streaming failures stop the
+local process group, including SSH children. Filesystem changes already
+completed are not rolled back.
 
 <a id="deliberate-exclusions"></a>
 

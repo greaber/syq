@@ -33,15 +33,11 @@ syq cp results --to laptop
 syq cp report.pdf --to laptop --as reports/latest.pdf
 ```
 
-Receiving is enabled by default with durable persistence. Each incoming copy waits for
-approval **on your laptop** before it can inspect or change destination entries.
-The prompt puts the destination first, followed by the connected server account
-and permission to change files. A positive deletion limit is shown too. Choose
-**Allow once** or **Deny**. On macOS, **Details** shows the full explanation,
-including size and entry limits; **Back** returns to the short view. On either
-platform, `syq persist receive pending` shows the complete request. Allowing a
-copy trusts the server to supply its contents: syq cannot prove what you typed in the remote
-shell or that the files contain what you intended.
+Each incoming copy waits for approval **on your laptop** before it can inspect
+or change destination entries. Review the destination and permissions, then
+choose **Allow once** or **Deny**. Use **Details** on macOS or
+`syq persist receive pending` in a local terminal to see the complete request.
+Approving a copy trusts the server to supply its contents.
 
 You can also [run commands on the receiving machine](exec.md), with separate
 local approval, to build a project there or open a copied artifact.
@@ -94,31 +90,17 @@ client's attempt is rejected without disturbing the existing connection. Other
 profiles remain usable. Choose a different name, or stop the original connection
 and run `syq persist connect server` on the waiting client to retry.
 
-Existing single-profile preferences become the first profile, preserving their
-settings. The new preferences format cannot be read by syq 0.5.1 or earlier;
-use the newer binary to manage it. After upgrading, run `syq persist connect
-server` for each server to replace older background services. This does not
-change saved enrollments, grants, receipts, or partial copies.
-
 ## Approving copies
 
-On Linux, desktop prompts use `/usr/bin/notify-send` with action support
-(libnotify 0.7.10 or later) and your desktop notification service. On macOS,
-syq opens a native dialog through `/usr/bin/osascript`, with Allow once on the
-left and Deny on the right. Deny remains the highlighted default and the
-Return/Escape action in both the short and detailed views. Opening Details does not approve
-the request or extend its five-minute deadline. The background connection
-inherits the desktop session in which you start it. After changing desktop sessions, run `syq persist receive off`, then enable the
-profiles you need from a terminal in the current session to restart receiving.
+Desktop approval needs a running notification service on Linux (libnotify
+0.7.10 or later); macOS uses a native dialog. Start receiving from a terminal
+in your desktop session. After changing sessions, run `syq persist receive off`,
+then enable the profiles you need from a terminal in the new session.
 
-The short copy prompt warns about overwrites when a destination entry already
-exists, including a merge into an existing directory. It omits that warning
-when a quick local check finds all the requested destination names absent.
-Syq checks only a small number of names, without scanning directory contents;
-it shows a caution if the request is too large or inspection fails. For a copy
-to another SSH host, the destination is not checked before approval.
-The check is advisory: entries can change before the copy runs. Details and
-`persist receive pending` always show the full permitted copy policy and limits.
+An overwrite warning means the destination exists or could not be checked.
+The check is only advisory: files can change before the copy runs. Review
+**Details** or `persist receive pending` for the full permissions and limits,
+especially before allowing overwrites or deletion.
 
 You can also decide from any local terminal:
 
@@ -170,11 +152,6 @@ and authentication. Use `--to @laptop` to require a return connection: that form
 fails while offline and never tries SSH. After selecting a return connection,
 a denied or interrupted copy fails; it does not switch destinations.
 
-Names belong to live connections, not permanent registrations. A second live
-connection cannot advertise the same name on the same server account. When a
-connection closes, its name becomes available again. Choose distinct names for
-different laptops.
-
 `--cwd` chooses the starting directory. Destination `--into` and `--as` paths
 are relative to it, but absolute paths and `..` can select other locations.
 With no placement, `--to laptop` means `--into .` there.
@@ -199,15 +176,12 @@ executable, and SSH authority files from return copies even without `--root`.
 
 ## Copy permissions and limits
 
-Each request is checked on the laptop before syq issues permission for that
-copy. The restricted filesystem executor then checks individual operations.
-Directory recursion, symlinks, modification times, filters, hashing, resume,
-and staged publication work as in other syq copies. `--preserve=permissions`,
-`--verify-only`, `--only-new`, `--only-existing`, `--skip-newer`, and mappings
-are supported. Ownership, special-file preservation, `--inplace`, and
-`--min-size` are refused. Timestamp selection uses source-supplied modification
-times; a compromised source can invent those times. The receiver still enforces
-the approved destination paths, operations, and limits.
+Copies support directories, symlinks, modification times, filters, hashing,
+resume, mappings, `--preserve=permissions`, `--verify-only`, and the
+[overwrite policies](reference.md#choose-which-existing-files-to-update).
+Ownership and special-file preservation, `--inplace`, and `--min-size` are
+unsupported. Timestamp comparisons trust the source's reported modification
+times.
 
 Each copy is limited to 100 GiB and one million touched entries by default.
 Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries 100000`.
@@ -231,36 +205,49 @@ syq persist receive on
 syq persist off
 ```
 
-`persist receive off` stops receiving while keeping ordinary SSH persistence enabled.
-`persist receive on` enables it again and can restart previously connected endpoints
-in durable persistence.
-`persist off` stops both kinds of connection. Ephemeral scopes selected with
-`--pscope` only reuse forward SSH connections; they do not enable receiving.
+`persist receive off` stops receiving while keeping SSH persistence enabled.
+`persist receive on` enables it again. `persist off` closes both directions.
+You can also enable persistence ahead of your next copy with `syq persist on`.
 
-To wait for receiving without starting or restarting a connection, use:
+Connections have no idle expiry. Receiving reconnects after network interruptions
+or laptop sleep; other SSH connections reopen on their next use. Interrupted
+copies fail and are not queued or retried automatically. Rerun the copy after
+reconnection to resume it. A copy must finish within seven days of approval.
+After reboot, run `syq persist connect server` again; syq does not install a
+login service.
+
+Other processes running as your local user can reuse an open SSH login without
+another key touch or agent approval. Use `syq persist off` to close it.
+Incoming requests still need their own approval.
+
+If `syq persist status` reports a failure, correct the reported problem and run
+`syq persist connect server` to retry. Healthy connections and their requests
+keep working. `connect --timeout 30` limits the wait for receiving after SSH
+and helper setup; it does not limit authentication or installation. A failed
+connection leaves persistence enabled.
+
+To wait without starting or restarting a connection:
 
 ```sh
 syq persist receive wait server --timeout 30
 ```
 
-Return connections have no idle expiry. After a network interruption or laptop
-sleep, the laptop reconnects with delays of one to thirty seconds, including
-when a return-connection heartbeat times out. Ordinary
-reusable SSH logins in durable persistence also have no idle expiry and reconnect on the next use.
-An interrupted copy fails: rerun it after reconnection to reuse eligible partial files. Copies are
-not queued while offline. A copy must open its control channel within sixty
-seconds of authorization and finish within seven days. Closing that control
-channel revokes its workers and prevents further requests.
-
-If `syq persist status` reports a failed return connection, fix the reported
-configuration or permission problem and run `syq persist connect server` to retry
-that endpoint. A healthy connection is reused without cancelling its copies,
-commands, or pending approvals. There is no need to toggle receiving or persistence.
-
 On the server, `syq persist destinations list` shows availability and
-`syq persist destinations wait laptop --timeout 30` waits with a deadline. Stale records
-left by a crash do not reserve a name; `syq persist destinations forget laptop` removes
-one while its connection is stopped.
+`syq persist destinations wait laptop --timeout 30` waits for a destination.
+`syq persist destinations forget laptop` removes a stale entry while its
+connection is stopped. For scripts, see [JSON connection status](automation.md#connection-status).
+
+### Persistence in scripts
+
+`syq persist on --ephemeral` prints a scope path. Pass it as `--pscope PATH`
+to `syq persist connect server` and subsequent copy commands, then close it
+with `syq persist off --pscope PATH`. This does not change your user setting.
+
+Ephemeral scopes reuse SSH logins only; they do not enable receiving,
+authorization through your machine, or commands on it. Idle connections close
+within ten minutes, including helper sessions. Close the scope explicitly to
+end reuse immediately. For return copies or commands, use
+`syq persist connect server` without `--pscope`.
 
 ## SSH setup
 
@@ -275,35 +262,18 @@ server configuration. `persist receive status` reports setup errors; after corre
 run `syq persist connect server` to retry. A failed return setup does not
 invalidate an ordinary copy.
 
-The server command can be a different syq build from the receiving machine.
-It automatically hands the command to the matching helper already installed
-by the receiving machine's connection, including an explicit `--syq-path`.
-Arguments, working directory, stdin, and output streams are preserved.
-`--ignore-from` inputs are read once by the executing build after handoff,
-before requesting approval or opening result files. Inline patterns and input
-files keep their command-line order. The helper then requests approval and runs
-the copy using the receiving machine's build. A missing or replaced helper produces an error; reconnect with syq from
-the receiving machine to refresh it. An option unknown to that helper is
-rejected before approval.
+The server can run a different syq build: it uses the matching helper installed
+by your receiving connection. If that helper is missing or an option is
+unsupported, update syq on both machines and reconnect from the receiving
+machine.
 
-Handoff requires support in both installations. When upgrading from a build
-that required matching server and client commands, run `syq persist off` on
-the receiving machine before replacing the binaries on both machines. Then
-run `syq persist on` and connect to the server with syq again. This refreshes
-the helper and return registration without deleting preferences or enrollments.
+### Updating receiving connections
 
-Receiving preferences live in `receive.json` beside the ordinary persistence
-preferences, under `$XDG_CONFIG_HOME/syq` or `~/.config/syq`. Runtime services
-belong to their persistence scope. Transient server advertisements live in the
-private directory `~/.syq-destinations-v3`. These files do not change restricted
-receiver enrollments or signed-grant replay records.
+Before upgrading, run `syq persist off` on the receiving machine to stop its
+background services. Replacing the executable alone does not update running
+services. Close any script scopes with `syq persist off --pscope PATH` too.
+After upgrading both machines, run `syq persist connect server` for each server.
 
-Receiving settings from the earlier automatic-only format keep their name,
-directory, and limits when upgraded, but require approval. Syq saves the new
-format before starting or reusing a return service. After upgrading, run
-`syq persist receive on` to stop old receiving services, then connect to each server with
-the new syq build. Merely replacing the executable or inspecting status does
-not change a service that is already running. Older binaries reject the new
-preferences; use the newer binary to manage receiving, including `persist receive off`, before
-switching versions. Pending requests and approval decisions exist only in the
-running service, never in preference files.
+Saved receiving names, directories, and limits carry over. Settings that predate
+approval prompts require approval after upgrading. Older binaries may be unable
+to read updated preferences; use the newer binary to manage receiving.

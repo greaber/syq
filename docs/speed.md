@@ -1,28 +1,12 @@
 # Speed
 
-Start with the defaults. Syq copies files in parallel, splits large files
-between workers, and adjusts connection count during the transfer. If a TCP
-data port is reachable, it sends data through separate encrypted connections.
-Otherwise, ordinary copies send their data over SSH. Small copies can stay
-on the SSH control connection to avoid extra setup. Larger copies start up to
-two workers on the copy's existing SSH connection while the others open
-independent connections for parallel throughput. A fixed connection count
-reuses it for only one worker. This reuse does not apply to a cross-run
-persistent connection or a custom `--rsh` command. Automatic SSH copies into
-new or empty directories, or to missing single-file destinations, also limit
-their initial worker count to the available files and splittable ranges.
-Updates keep their usual count. If a missing file has a resumable partial,
-syq restores that count when it discovers the partial: one file can contain
-many separate changed regions.
-With automatic concurrency, syq divides a single large fresh file over SSH
-before copying starts, so workers that connect later can help without waiting for a large enough
-remaining range to split. Earlier workers can keep taking work while those
-connections start.
-When pushing into an
-existing directory, syq pipelines destination setup checks to reduce network
-round trips. For eligible small-file trees in an empty destination, TCP workers
-connect while destination planning finishes. These overlap setup work without
-skipping destination checks.
+Start with the defaults. Syq copies files in parallel and adjusts the connection
+count during a transfer. It uses encrypted TCP for data when reachable and SSH
+otherwise. Small copies avoid extra connections when setup would cost more
+than it saves.
+
+Measure your own workload before changing settings. Network distance, storage,
+file sizes, and how much data already exists at the destination all affect speed.
 
 ## Benchmarks
 
@@ -43,61 +27,39 @@ bash try-benchmark.sh --yes --mode push --host server --workload both --rounds 3
 bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
 ```
 
-The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
-automatic sizing uses Perl with its core JSON::PP module. Terminal runs also
-use Perl to keep SSH prompts interruptible. Remote tests
-need SSH access and rsync on the other machine. Syq prepares a helper matching
-your local build and shows installation progress when one is needed.
-Use an SSH config alias for custom ports or IPv6. `--install` installs syq
-locally if missing; `--help` lists the choices.
+The script needs Bash, rsync, OpenSSL, Perl (with JSON::PP), and standard Unix
+utilities locally. Remote tests also need SSH access and rsync on the other
+machine. Use an SSH config alias for custom ports or IPv6. `--install` installs
+syq locally if missing; `--help` lists the choices.
 
-Scratch parents must already exist. For SSH tests, `--dest-dir` is the remote
-scratch parent, including when pulling; `--source-dir` is always the local
-scratch parent.
+Scratch parents must already exist. `--source-dir` is the local scratch parent;
+for SSH tests, `--dest-dir` is the remote one, including when pulling.
 
-By default, the script starts with 64 MiB for the large file and 1,024 files
-of 8 KiB for the small-file workload. It makes verified, unscored syq copies
-and increases each workload until syq's copying interval reaches about five
-seconds. Each increase is between 25% and tenfold, avoiding repeated
-near-identical tests when timings fluctuate. Available space at both ends limits
-growth, with room reserved for the copies and filesystem overhead; if space
-prevents a long enough copy, the script warns and uses the tested size.
-There is no fixed total-data or runtime limit. A slow first copy can take longer
-than five seconds, and generation and verification also take time.
+Automatic sizing increases throwaway data until a syq copy takes about five
+seconds, subject to available space. Setup and verification take additional
+time, and there is no fixed total runtime limit. To use a fixed workload:
 
-All tools then copy the same dataset into empty destinations. Three rounds mean
-six scored copies per workload over SSH (syq and rsync), or nine locally (also
-cp). Choosing both workloads doubles those counts. A faster cp result does not
-cause further growth.
+| Option | Large file | Small files (8 KiB each) |
+|---|---|---|
+| `--size quick` | 64 MiB | 1,024 |
+| `--size medium` | 1 GiB | 4,096 |
+| `--size large` | 8 GiB | 16,384 |
 
-Automatic sizing requires syq to report `copying_elapsed_ms` in its automation
-results. Older builds can use `--size quick`, `--size medium`, or `--size large`
-for fixed workloads: respectively 64 MiB / 1,024 files, 1 GiB / 4,096 files,
-and 8 GiB / 16,384 files. Small files remain 8 KiB each. These flags also let
-you repeat a fixed-size comparison.
+Each tool copies the same reproducible, hard-to-compress data into an empty
+destination. The script rotates tool order and checks contents after every
+trial. It compares syq's defaults with permissions preserved, `rsync -rpt`,
+and local `cp -pR`. A failed copy or content check stops the comparison.
 
-Data comes from a fixed AES-CTR byte stream, making it reproducible and
-hard to compress. Every trial has an empty, pre-created destination; interrupted trials are
-never resumed. On Ctrl-C the script stops its local workers, moves remote
-scratch out of the transfer path, and deletes its temporary data. If SSH
-is unavailable, it reports the remote path for later cleanup. The script rotates
-tool order and reports speeds in decimal MB/s (1 MB = 1,000,000 bytes):
-each trial’s copied bytes divided by its elapsed time, followed by the mean,
-minimum and maximum trial speeds. Higher is faster. It uses
-syq's defaults with permissions preserved, `rsync -rpt`, and local `cp -pR`.
-These copy the same regular files and request permissions and modification
-times; the tools still differ in compression, integrity checks, and filesystem
-optimizations.
+Results show mean, minimum, and maximum speed in decimal MB/s; higher is
+faster. Timings include process startup and buffered writes, but exclude data
+generation, sizing, and verification. Caches are not flushed, and copies do
+not wait for durable storage. Small tests can mostly measure startup costs;
+filesystem cloning can favor cp. Syq may be slower on your workload.
 
-Generation, preparation, calibration, and POSIX `cksum` comparisons are
-outside the scored timers. Preparation shows helper installation messages without
-a throughput result. A failed command or content check stops the comparison.
-Caches are not flushed, so this is a cache-friendly test rather than a cold
-disk benchmark. Times include process startup and buffered writes, without
-waiting for durable storage. Small tests can mostly measure startup costs;
-local filesystem cloning can favor cp. Results do not predict every workload,
-and syq may be slower. Use the full published benchmark methodology for more
-controlled measurements.
+The script cleans up its test data, including after Ctrl-C. If SSH is unavailable
+during cleanup, it reports the remote path to remove later. See the
+[published methodology](https://greaber.github.io/syq-bench/) for more controlled
+measurements.
 
 ## When rsync or cp is faster
 
@@ -116,14 +78,9 @@ controlled measurements.
 syq cp -vv --stats data --to server --into /backup
 ```
 
-`-vv` shows helper selection, reachable addresses, the chosen transport, and
-initial parallelism. `--stats` shows totals, connection count, and TCP
-statistics where available. It also reports the copying interval when bytes moved:
-the span from first file work to last completed file work across all workers.
-This includes per-file checks, finalization and gaps; it may overlap planning
-and connection setup. It is not pure network time or a separate phase you can
-add to setup time. `SYQ_DEBUG=1` adds engineering timings for a
-detailed investigation.
+`-vv` shows the chosen transport and connections. `--stats` adds totals and
+available TCP statistics. Its copying interval measures file work, which can
+overlap setup; use total elapsed time when comparing complete commands.
 
 | Symptom | Try |
 |---|---|
@@ -150,10 +107,9 @@ through worker count. Short copies may finish before tuning has enough data.
 
 ## Benchmark tuning
 
-Normal copies tune automatically. Manual connection counts and
-`--tuning-options` appear in `--help-all` for troubleshooting performance issues
-and controlled experiments; leave them unset for everyday copies. `--bwlimit`
-appears in ordinary help because it sets your bandwidth budget.
+Use `--tuning-options` for controlled comparisons when the defaults perform
+poorly. These experimental controls appear in `--help-all`; their keys and
+bounds may change between releases.
 
 `syq cp` and `syq rsync` accept `--tuning-options`. Supply
 comma-separated `KEY=VALUE` pairs:
@@ -181,53 +137,27 @@ the remembered connection count. Connection auto-tuning still runs unless you
 fix `--connections` (`--syq-connections` with `syq rsync`). These are experimental
 controls whose keys and bounds may change between releases.
 
-Request size limits the payload of one range read or write. A final request or
-a range selected for repair can be smaller. Larger requests reduce overhead
-per byte; deeper pipelines allow more work to remain outstanding while replies
-travel back. Both increase potential buffering. In-process endpoints handle
-one request at a time; the response queue on worker connections follows the
-pipeline depth. These settings do not change hash blocks or partial identities.
+Larger requests reduce overhead per byte; deeper pipelines allow more requests
+to await replies at once. Both can increase memory use. Neither changes the
+hash blocks used for integrity checks and resume.
 
-`copy-path=ranges` makes file contents use range requests, bypassing both
-small-file batches and whole-file copying, including local kernel offload.
-Matching data can still be skipped or reused. With `auto`, syq chooses the copy
-method as usual. Explicit batch controls select worker batching instead of the
-native small-copy shortcut. Files larger than the batch byte limit use another
-copy path. File and byte limits are ceilings, and the scheduler can choose a
-smaller batch to share work among workers. With `--bwlimit`, worker batches
-contain at most one file. Batch controls cannot be combined with
-`copy-path=ranges` or `copy-path=streaming`.
+`copy-path=ranges` disables small-file batches and whole-file shortcuts,
+including local kernel copying. Matching data can still be skipped or reused.
+`auto` lets syq choose normally.
 
 ### Streaming and request windows
 
-Syq automatically streams remote ranges larger than one normal request
-window (usually 16 MiB). Local ranges and shorter remote ranges use ordinary
-requests. Whole-file and small-file shortcuts keep their usual eligibility.
-No streaming or pipeline setting is needed for ordinary copies.
-The `syq: tuning:` diagnostic describes the selection policy: a pipeline depth
-applies only to ordinary ranges, and automatic remote selection also reports
-the size above which ranges stream. It does not claim which paths ran; use
-the observed range and streaming counters for that.
+Syq automatically streams larger remote ranges (usually above 16 MiB), using
+blocks of at most 2 MiB by default. Streaming still checks contents and write
+errors and supports resume. No setting is needed for everyday copies.
 
-Streaming uses blocks of at most 2 MiB by default, reducing the payload retained
-per block. Smaller hash blocks still bound the streaming block
-size. This does not change hash/resume blocks, ordinary request sizes, or which
-ranges automatically stream. An explicit `request-size` overrides streaming
-block size too; bandwidth pacing and receiver limits can reduce either size.
+For comparisons, `copy-path=streaming` forces streaming and disables whole-file
+and small-file shortcuts. `copy-path=auto-streaming` keeps those shortcuts and
+streams the remaining ranges. Both include local and short ranges.
 
-Streaming sends
-checked source blocks and collects destination write replies concurrently,
-instead of limiting the number of blocks awaiting replies. It still verifies
-block hashes, checks all write errors before completion, and supports resume
-and parallel workers on different parts of one large file. It does not add
-a disk flush.
-
-For experiments, `copy-path=streaming` forces streaming even for local and
-short ranges, bypassing the same copy shortcuts as `copy-path=ranges`.
-`copy-path=auto-streaming` keeps the normal whole-file and small-file shortcuts,
-but forces streaming for all remaining ranges, including local and short ones.
-An explicit `pipeline-depth` uses ordinary requests instead of automatic
-streaming, allowing comparisons with the credit-window implementation.
+An explicit `request-size` also sets the streaming block size; bandwidth and
+receiver limits may reduce it. An explicit `pipeline-depth` disables automatic
+streaming. Neither forced streaming mode accepts `pipeline-depth`.
 
 For a controlled comparison, use fresh scratch destinations:
 
@@ -238,20 +168,10 @@ syq cp data.bin --to host --as /scratch/streaming.bin --connections 1 -v \
   --tuning-options copy-path=streaming,request-size=1M
 ```
 
-Both streaming modes reject `pipeline-depth`. Forced `streaming` also rejects
-batch controls; `auto-streaming` allows them, with the usual effect on small
-copies. Their data queues remain
-bounded, but memory also depends on request size, worker count, compression
-and transport buffering. It may be slower on short or CPU-limited copies:
-starting/stopping streams and collecting replies add work. Work-stealing can
-also discard already-read source data when another worker takes a suffix.
-With `--bwlimit`, pacing happens before destination writes; a remote source
-can send ahead into bounded buffers. This also applies to automatically selected
-streaming, without any tuning override. On pulls, initial incoming traffic can
-include the response-reader queue and in-flight frames and socket buffers;
-it is not limited to one paced block or one request window. The limit controls
-the average accepted copy rate, not a strict source-side burst limit.
-Restricted receivers still enforce their signed limits.
+Streaming can be slower on short or CPU-limited copies. Memory use depends on
+request size, worker count, compression, and transport buffering. With
+`--bwlimit`, a remote source can send ahead of paced destination writes, so the
+limit is an average copy rate, not a strict cap on incoming bursts.
 
 ### Batch size and splitting
 
@@ -262,28 +182,28 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
   --connections 1 -v --tuning-options batch-files=256,batch-bytes=8M
 ```
 
-`split-min-size` controls when an idle worker can take part of another worker's
-remaining file region. Lower values permit smaller divisions; higher values
-avoid small assignments. A division remains aligned to hash blocks. The
-scheduler divides a region only when at least twice the effective minimum
-remains. This is a work-assignment threshold, separate from request size.
+Explicit batch controls replace the small-copy shortcut with worker batches.
+File and byte limits are ceilings; syq may choose smaller batches. Files larger
+than the byte limit use another copy method. With `--bwlimit`, each batch
+contains at most one file. Batch controls cannot combine with `copy-path=ranges`
+or `copy-path=streaming`; `auto-streaming` accepts them.
+
+`split-min-size` sets the smallest file region an idle worker can take from
+another worker. Lower values allow finer sharing; higher values avoid small
+assignments. Splits align to hash blocks and need at least twice the minimum
+remaining size.
 
 ### Average rate and burst patterns
 
-`--bwlimit` budgets logical file-data bytes across the copy's workers, before
-compression, encryption, and protocol overhead. It caps a rate, not a total
-byte count. The request pacing modes make different trade-offs:
+`--bwlimit` caps logical file-data bytes per second across workers, before
+compression, encryption, and protocol overhead.
 
-- **Timed pacing**, such as `bw-pacing=125ms`, limits request size to the smaller
-  of the configured request size and `max(rate * interval, 512 bytes)`. Workers
-  wait for the start of each reserved interval. The first request can start
-  immediately, so a short copy can exceed the configured average by that
-  initial request. The default `125ms` retains the existing sizing and pacing.
-- **Average pacing**, `bw-pacing=average`, leaves request size independent of
-  `--bwlimit`. Workers wait for the *end* of each reservation before issuing the
-  request, including the first one. A single 2 MiB request at 1 MiB/s therefore
-  waits about two seconds before it is issued. Large requests can then travel
-  in bursts, while their full byte budgets have already been paid.
+- **Timed pacing** (`bw-pacing=125ms`, the default) sends smaller requests at
+  regular intervals. The first request can start immediately, so a short copy
+  can exceed the average by that initial request.
+- **Average pacing** (`bw-pacing=average`) waits for each request's byte budget
+  before sending it, including the first. It allows larger requests, which can
+  arrive in bursts. A 2 MiB request at 1 MiB/s waits about two seconds.
 
 For example, to test larger requests under an average rate cap:
 
@@ -293,39 +213,26 @@ syq cp large-file --to server --as /scratch/benchmark-capped \
   --tuning-options copy-path=ranges,request-size=4M,bw-pacing=average
 ```
 
-Neither mode promises a maximum network burst or uninterrupted service for
-other traffic. Ordinary ranges pace source requests, while streamed ranges pace
-destination writes after receiving the source block; helper processing, queues,
-compression, and transport buffering affect when bytes actually cross a link.
-A deeper pipeline can accumulate more data before forwarding it. A restricted
-receiver also enforces its signed rate ceiling independently, including its
-existing `max(rate * 125ms, 512 bytes)` request-size ceiling. Both tuning modes
-respect that additional ceiling; `-v` shows the effective size. Average pacing
-decouples size from rate where this signed receiver constraint does not apply.
-Measure both sustained throughput and short-interval traffic when evaluating
-capped runs.
+Neither mode limits the size of every network burst. Streaming, queues, and
+transport buffering affect when bytes cross the link. Restricted receivers
+also enforce their authorized rate and request-size limits. Measure both
+sustained throughput and short-interval traffic when comparing capped runs.
 
 ### Recording a comparison
 
-With overrides, `-v` reports effective ordinary request and streaming block
-sizes, including any reduction in request size or increase in the split threshold. A final `syq: tuning observed:`
-line contains diagnostic JSON with copy-path counts, range request count,
-streaming-range and streamed-block counts,
-largest requested range, and largest worker batch by file count and content
-bytes. These are observations of attempted work, so retries can contribute
-more than once. They are experimental diagnostics, separate from completion
-records. `--stats` also enables them, but currently bypasses the native
-small-copy shortcut; use `-v` to compare that shortcut with other paths.
-`SYQ_DEBUG=1` also records path counts without any tuning override, allowing
-automatic selection to be inspected without changing the tuning-cache policy.
+With overrides, `-v` reports effective request sizes and a final
+`syq: tuning observed:` diagnostic with copy-method counts and request and batch
+sizes. Retries can count more than once. These experimental diagnostics are
+separate from [completion records](automation.md).
 
-Use the same reporting options for every comparison, a fresh disposable
-destination, and explicit defaults for the baseline, such as
-`--tuning-options copy-path=auto`. Record the source data, transport, connection
-count, effective settings, elapsed time, CPU use, and peak memory. Check the
-exit status and copied contents. Leave `--bwlimit` unset when measuring
-unrestricted throughput. Default request size and pipeline depth are not
-automatically tuned.
+Use the same reporting options and fresh disposable destinations for each
+comparison. Prefer `-v`: `--stats` bypasses the small-copy shortcut and can
+change what you measure. Use explicit defaults for the baseline, such as
+`--tuning-options copy-path=auto`.
+
+Record the source data, transport, connections, settings, elapsed time, CPU use,
+and peak memory. Check exit status and copied contents. Leave `--bwlimit` unset
+when measuring unrestricted throughput.
 
 ## TCP data connections
 
@@ -355,21 +262,9 @@ Check [source and destination storage placement](server-tuning.md#check-local-st
 copies within a filesystem that supports cloning can share data extents instead
 of physically copying every byte.
 
-Same-machine Linux copies first try kernel or NFS server-side copying. If
-that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
-copy, syq copies eligible files larger than 64 KiB directly through their open
-source and destination files. It runs these file copies in parallel without
-sending their contents through local TCP connections. Files up to 64 KiB still
-use batches, subject to the hash block, request-size and batch-byte limits.
-This local batch ceiling does not reduce the size of ordinary range requests.
-This happens automatically, without tuning options. Single-file copies retain parallel range copying when offload
-is unavailable.
-
-Syq also uses a sequential destination writer for eligible local-disk to
-asynchronous-NFS copies. NFS sources, synchronous destinations, and other
-filesystems retain parallel range copying when offload is unavailable.
-Checksum comparisons, resumed data, and bandwidth limits keep their usual
-range-based behavior.
+Syq uses kernel or NFS server-side copying when available, and otherwise copies
+files in parallel. These choices are automatic. Check elapsed time as well as
+reported throughput: storage optimizations can avoid moving every logical byte.
 
 ```sh
 syq cp /raid/data --into /mnt/nfs/backup
