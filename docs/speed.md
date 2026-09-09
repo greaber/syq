@@ -44,6 +44,26 @@ bash try-benchmark.sh --yes --host server --workload both --size auto
 bash try-benchmark.sh --yes --mode local --source-dir /data --dest-dir /mnt/nfs --workload small
 ```
 
+For one scored copy with syq and your own tuning options:
+
+```sh
+bash try-benchmark.sh --yes --mode push --host j5 --tool syq --rounds 1 \
+  -- --no-tcp --connections 4
+```
+
+Change `push` to `pull` for downloads. The default small workload is 1,024 files
+of 8 KiB, with no automatic sizing. The script still prepares the helper with
+an untimed tiny copy, checks every copied file, and cleans up. `--size auto`
+also makes unscored calibration copies. Use `--tool rsync` for a separate rsync
+comparison, omitting the syq options after `--`.
+
+Options after `--` apply to syq's setup, calibration and scored copies. They
+accept connection count, transport, compression, bandwidth and batching controls,
+in-place copying, and diagnostics; `--help` lists them. For example, append
+`--tuning-options batch-files=256,batch-bytes=2M` or `-vv`.
+Path selection, removal and output-file options are excluded so all copies stay
+inside the disposable dataset. With `--tool all`, tuning applies only to syq.
+
 The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
 automatic sizing uses Perl with its core JSON::PP module. Terminal runs also
 use Perl to keep SSH prompts interruptible. Remote tests

@@ -20,6 +20,8 @@ SCRIPT = Path(__file__).resolve().with_name('try-benchmark.sh')
 FAKE_SYQ = r'''#!/usr/bin/env python3
 import json, os, pathlib, shutil, subprocess, sys, time
 args=sys.argv[1:]
+if os.environ.get('BENCH_TEST_ARGS_LOG'):
+    with open(os.environ['BENCH_TEST_ARGS_LOG'], 'a') as log: log.write(json.dumps(args)+'\n')
 if args in (['--version'], ['--build-identity']):
     print('syq test double'); sys.exit(0)
 config=pathlib.Path(os.environ['XDG_CONFIG_HOME'])/'syq'/'persistence.json'
@@ -110,6 +112,46 @@ class BenchmarkTests(unittest.TestCase):
     def assert_clean(self):
         self.assertEqual(self.sentinel.read_text(), 'existing user data')
         self.assertEqual(list(self.scratch.iterdir()), [self.sentinel])
+
+    def test_single_syq_trial_with_literal_tuning_options(self):
+        import json
+        log = self.root / 'args.jsonl'
+        tuning = 'batch-files=256,batch-bytes=2M'
+        result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
+                             '--', '--no-tcp', '--connections', '4', '--tuning-options', tuning,
+                             env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('Command:'), 1)
+        self.assertEqual(result.stdout.count(', trial 1/1'), 1)
+        self.assertNotIn('large rsync', result.stdout)
+        copies = [args for args in map(json.loads, log.read_text().splitlines()) if args[0] == 'cp']
+        self.assertEqual(len(copies), 2)  # setup and one scored copy
+        for args in copies:
+            self.assertIn('--no-tcp', args)
+            self.assertEqual(args[args.index('--connections')+1], '4')
+            self.assertEqual(args[args.index('--tuning-options')+1], tuning)
+        self.assert_clean()
+
+    def test_single_baseline_tool(self):
+        for tool in ['rsync', 'cp']:
+            with self.subTest(tool=tool):
+                result = self.invoke('--tool', tool)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.count('Command:'), 1)
+                self.assertIn('Command: ' + tool, result.stdout)
+                self.assertNotIn('large syq', result.stdout)
+                self.assert_clean()
+
+    def test_tuning_cannot_redirect_copy_or_output(self):
+        for args in [('--', '--as', str(self.scratch)), ('--', '--results', str(self.sentinel)),
+                     ('--', '--prune'), ('--', '--connections'),
+                     ('--tool', 'cp', '--mode', 'push', '--host', 'test-host'),
+                     ('--tool', 'rsync', '--', '--no-tcp')]:
+            with self.subTest(args=args):
+                result = self.invoke(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('Versions:', result.stdout)
+                self.assert_clean()
 
     def test_default_noninteractive_requires_host_before_creating_scratch(self):
         result = subprocess.run(

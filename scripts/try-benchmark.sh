@@ -10,7 +10,7 @@ usage() {
     cat <<'HELP'
 Compare syq with rsync, and cp for local copies, using disposable synthetic data.
 
-Usage: bash try-benchmark.sh [OPTIONS]
+Usage: bash try-benchmark.sh [OPTIONS] [-- SYQ_OPTIONS...]
 Without --yes, unanswered choices are prompted through /dev/tty (also with curl | bash).
 
   --mode local|push|pull    Copy locally, to an SSH host (default), or from one
@@ -25,10 +25,19 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --dest-dir DIR           Destination scratch parent (default: current directory)
                            For push/pull this is the REMOTE scratch parent.
                            For pull, --source-dir is the local destination parent.
+  --tool all|syq|rsync|cp   Tools to time (default: all; cp requires local mode)
   --rounds N               Trials per tool/workload, rotating order (default: 3)
   --install                Install syq locally if missing, using its official installer
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
+
+After --, tune syq with --connections/-j, --tuning-options, --bwlimit,
+--tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
+--tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
+These options also apply to syq setup/calibration; rsync and cp are unchanged.
+Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
+The untimed setup copy and content checks still run. Source/destination,
+removal and output-file options are not accepted after --.
 
 Requires Bash, rsync, OpenSSL, and standard Unix utilities locally. Automatic
 sizing needs Perl with its core JSON::PP module; terminal runs also need Perl. Remote tests
@@ -191,6 +200,7 @@ copy_with() {
     # by the released v0.3.2 CLI as well as current builds.
     [[ ${4:-} != setup ]] || syq_options=(--preserve=permissions --suppress-summary --no-progress)
     [[ ${4:-} != calibration ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/calibration.json")
+    if $has_syq_options; then syq_options+=("${syq_extra[@]}"); fi
     case $tool in
         syq)
             case $mode in
@@ -290,7 +300,8 @@ summarize_results() {
 main() {
     local mode='' workload='' size='' source_dir='' dest_dir='' rounds=3 yes=false install=false
     local option tool round index offset source destination case_name bytes seconds speed local_parent remote_parent
-    local large_mib small_files syq_identity
+    local large_mib small_files syq_identity selected_tool=all has_syq_options=false
+    local syq_extra=()
     local key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     local iv=000102030405060708090a0b0c0d0e0f
     while [[ $# -gt 0 ]]; do
@@ -299,12 +310,28 @@ main() {
             --help|-h) usage; return ;;
             --yes) yes=true; shift; continue ;;
             --install) install=true; shift; continue ;;
-            --mode|--host|--workload|--size|--source-dir|--dest-dir|--rounds)
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    case $1 in
+                        --connections|-j|--tuning-options|--bwlimit|--tcp-ports|--tcp-congestion)
+                            [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
+                            syq_extra+=("$1" "$2"); shift 2 ;;
+                        --connections=?*|--tuning-options=?*|--bwlimit=?*|--tcp-ports=?*|--tcp-congestion=?*|-j[0-9]*)
+                            syq_extra+=("$1"); shift ;;
+                        --no-tcp|--no-compress|--tcp-plain|--inplace|--stats|--no-progress|-v|-vv|--verbose)
+                            syq_extra+=("$1"); shift ;;
+                        *) fail "Unsupported syq benchmark option: $1 (see --help for tuning options)" ;;
+                    esac
+                    has_syq_options=true
+                done
+                break ;;
+            --mode|--host|--workload|--size|--source-dir|--dest-dir|--rounds|--tool)
                 [[ $# -ge 2 && -n $2 ]] || fail "$option needs a value"
                 case $option in
                     --mode) mode=$2 ;; --host) host=$2 ;; --workload) workload=$2 ;;
                     --size) size=$2 ;; --source-dir) source_dir=$2 ;; --dest-dir) dest_dir=$2 ;;
-                    --rounds) rounds=$2 ;;
+                    --rounds) rounds=$2 ;; --tool) selected_tool=$2 ;;
                 esac
                 shift 2 ;;
             *) fail "Unknown option: $option (see --help)" ;;
@@ -331,6 +358,11 @@ main() {
     mode=${mode:-push}; workload=${workload:-small}; size=${size:-quick}
     source_dir=${source_dir:-$PWD}; dest_dir=${dest_dir:-.}
     case $mode in local|push|pull) ;; *) fail 'Mode must be local, push or pull.' ;; esac
+    case $selected_tool in all|syq|rsync|cp) ;; *) fail 'Tool must be all, syq, rsync or cp.' ;; esac
+    [[ $selected_tool != cp || $mode == local ]] || fail 'cp requires --mode local.'
+    if $has_syq_options && [[ $selected_tool != all && $selected_tool != syq ]]; then
+        fail 'Syq tuning options require --tool syq or --tool all.'
+    fi
     case $workload in large|small|both) ;; *) fail 'Workload must be large, small or both.' ;; esac
     case $size in auto|quick) large_mib=64; small_files=1024 ;; medium) large_mib=1024; small_files=4096 ;; large) large_mib=8192; small_files=16384 ;; *) fail 'Size must be auto, quick, medium or large.' ;; esac
     # The script tests exercise real generation, copies, checksums, ordering,
@@ -413,6 +445,7 @@ main() {
     exec 4>&1 5>&2
     local tools=(syq rsync) workloads=(large small)
     [[ $mode != local ]] || tools+=(cp)
+    [[ $selected_tool == all ]] || tools=("$selected_tool")
     [[ $workload == both ]] || workloads=("$workload")
     : > "$local_root/results"
     for case_name in "${workloads[@]}"; do

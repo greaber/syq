@@ -919,6 +919,13 @@ for benchmark_mode in push pull; do
         --mode "$benchmark_mode" --host destination --workload small --size auto \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
+# One scored syq copy with transport and batch overrides in each direction.
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --connections 2 --tuning-options batch-files=256,batch-bytes=2M
+done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
 rmdir "$benchmark_parent"
