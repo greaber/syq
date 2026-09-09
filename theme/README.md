@@ -51,15 +51,14 @@ end-of-page navigation provide the chapter routes.
 Documentation walkthroughs use semantic HTML styled in `docs.css`, keeping text
 selectable and readable without JavaScript, in both palettes and on narrow
 screens. Prefer a compact example or flow diagram where it replaces a long
-explanation; keep detailed benchmark methodology on the speed page rather than
-the installation path. The benchmark figure is a condensed real local quick
-run (release-profile syq `9e73649`, three trials, 1 × 64 MiB and 1,024 × 8 KiB;
-original mean times: syq 0.095/0.167 s, rsync 0.118/0.118 s, cp 0.049/0.052 s).
-The figure shows arithmetic mean trial speeds in decimal MB/s, calculated
-from the individual recorded durations rather than those rounded mean times. It illustrates
-the workflow, not comparative performance evidence. The choices now show automatic
-sizing; the example speeds still come from that fixed-size sample: the run shared the machine
-with other work. Preserve the example caption if updating its presentation.
+explanation; keep tuning details in the tuning reference rather than
+the installation path. The install-page table uses the public syq-bench
+Germany → US East Coast large-file comparison: one 1.07 GB file in memory,
+three verified runs per tool, with reported speeds of 159.1 MB/s for syq,
+87.2 MB/s for syq over SSH, and 18.0 MB/s for rsync. The caption links to
+`all-results.html#public-wan-forward` and identifies syq-bench as a separate
+project; these are not results from the quick script. Keep the measured
+workload and source attached to any replacement figures.
 
 Anchor navigation scrolls smoothly, matching benchmarks. The reduced-motion
 preference disables this animation. Both sites use 20px Open Sans main prose
