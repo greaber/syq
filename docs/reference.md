@@ -252,9 +252,8 @@ updates, and pruning can delete another copy's completed files.
 Partials are named `.FILENAME.syq-tmp.RANDOM`, with 16 random characters at the
 end. The filename portion is shortened or omitted when space is tight. Syq
 removes its own partial when it publishes the completed file. Interrupted runs
-can leave partials behind, including after a later successful retry. Automatic
-reuse looks for complete filename matches; partials with shortened or omitted
-filenames may not be reused.
+can leave partials behind, including after a later successful retry. Partials
+with shortened or omitted filenames may not be reused.
 
 To remove leftover partials, stop copies writing into the tree, then preview
 and run:

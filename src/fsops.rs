@@ -4799,8 +4799,8 @@ impl FsOps {
         )
     }
 
-    /// Bounded, best-effort discovery. Only complete readable basenames are
-    /// matched: a shortened or omitted prefix must not redirect unrelated files.
+    /// Bounded, best-effort discovery using equality on the readable prefix.
+    /// A truncated prefix is currently indistinguishable from a full basename.
     fn candidate_partials(&mut self, path: &[u8], rooted: Option<&RootedTarget>) -> Vec<PathBytes> {
         let label = rooted
             .map(|target| path_bytes(&target.relative.to_path_buf()))
