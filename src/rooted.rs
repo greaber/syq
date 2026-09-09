@@ -1197,15 +1197,29 @@ impl Root {
                 }
                 return Err(error).context("clone local file");
             }
-            // Open a metadata-only handle before permissions are normalized.
-            // User immutable/append flags must be cleared before chmod or a
-            // writable open. This handle does not require data-read access.
+            // Normalize owner access before opening the caller-owned clone.
+            // Immutable/append-only clones can refuse chmod; those retain
+            // owner-read access (checked before cloning), so open them to clear
+            // the flags first. O_EVTONLY still requires access on Darwin.
+            if let Err(error) = retry_zero(|| unsafe {
+                libc::fchmodat(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0o600,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }) {
+                if error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(error).context("set private clone permissions");
+                }
+            }
             let metadata_file = open_at(
                 directory.as_raw_fd(),
                 leaf,
                 libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
-            )?;
+            )
+            .context("open clone metadata handle")?;
             if !clone_flags_can_be_removed(&metadata_file)? {
                 return Ok(None);
             }
@@ -2041,7 +2055,11 @@ fn clone_flags_can_be_removed(file: &File) -> Result<bool> {
     // Compressed-file xattrs can hold the actual data, so stripping them is
     // not equivalent to copying logical bytes. System flags may require root
     // to clear, including flags that prevent deleting an unpublished clone.
-    Ok(file.metadata()?.st_flags() & (!libc::UF_SETTABLE | libc::UF_COMPRESSED) == 0)
+    let metadata = file.metadata()?;
+    let flags = metadata.st_flags();
+    let cannot_open_to_unlock =
+        metadata.mode() & 0o400 == 0 && flags & (libc::UF_IMMUTABLE | libc::UF_APPEND) != 0;
+    Ok(flags & (!libc::UF_SETTABLE | libc::UF_COMPRESSED) == 0 && !cannot_open_to_unlock)
 }
 
 #[cfg(target_os = "macos")]
@@ -3080,6 +3098,14 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        assert_eq!(
+            unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_IMMUTABLE) },
+            0
+        );
+        let locked = root.clone_file(&source, &relative(b"locked"), 4);
+        assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+        assert!(locked.unwrap().is_none());
+        assert!(!t.path().join("locked").exists());
         let clone = root
             .clone_file(&source, &relative(b"partial"), 4)
             .unwrap()
