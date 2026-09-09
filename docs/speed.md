@@ -177,7 +177,10 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 Remote new-file copies keep files batched to reduce network round trips, while
 allowing up to one worker per file within the selected connection count.
 Workers overlap reads and writes in bounded groups of whole files inside
-each batch. Idle workers can take groups whose reads have not started. Hash comparison size does not determine new-file batching.
+each batch. Tiny files share workers to avoid unnecessary connection setup.
+Idle workers can take groups whose reads have not started. After a source read
+stalls, the worker drains its read-ahead before claiming more groups. Hash
+comparison size does not determine new-file batching.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote
