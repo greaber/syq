@@ -174,6 +174,15 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
 
+Remote new-file copies keep files batched to reduce network round trips, while
+allowing up to one worker per file within the selected connection count.
+Workers overlap reads and writes in bounded groups of whole files inside
+each batch. Tiny files share workers to avoid unnecessary connection setup.
+Idle workers can take groups whose reads have not started. After a source read
+stalls, the worker drains its read-ahead before claiming more groups. With
+request and batch limits held fixed, changing comparison size does not change
+new-file batching.
+
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote
 coordinator too. They are not saved, and these runs neither read nor update
@@ -187,6 +196,32 @@ per byte; deeper pipelines allow more work to remain outstanding while replies
 travel back. Both increase potential buffering. In-process endpoints handle
 one request at a time; the response queue on worker connections follows the
 pipeline depth. These settings do not change hash blocks or partial identities.
+
+For existing remote copies with scattered small edits, try smaller comparison
+blocks while keeping larger transfer requests:
+
+```sh
+syq rsync -a -B 64K --tuning-options request-size=4M source/ host:destination/
+```
+
+The default comparison block is 4 MiB; one changed byte makes that whole block
+need copying. Smaller blocks can reduce the data sent, but require more hashes
+and requests. Keep `request-size=4M`: request size otherwise defaults to the
+comparison block, so `-B 64K` alone also shrinks requests and lowers the automatic
+streaming threshold to 256 KiB. New-file batching follows the request and batch
+limits, independently of the comparison block.
+
+Syq fills available request windows with changed ranges from the same file,
+leaving queued work for other workers. This can help on high-latency links,
+though the result depends on the edits and connection. Both endpoints still
+read the full file to compare it. By default, syq builds the updated file beside
+the destination and then replaces it. When any blocks match, this includes
+copying the existing destination before applying changes; a complete rewrite
+skips that old-data copy. With `--inplace`, changes are written directly to the
+destination instead.
+
+The smallest supported comparison block is 64 KiB. A partial file left by an
+interrupted copy can only be reused with the same `-B` value.
 
 `copy-path=ranges` makes file contents use range requests, bypassing both
 small-file batches and whole-file copying, including local kernel offload.
@@ -360,7 +395,7 @@ that is unavailable between ext4, XFS, or tmpfs filesystems during a multi-file
 copy, syq copies eligible files larger than 64 KiB directly through their open
 source and destination files. It runs these file copies in parallel without
 sending their contents through local TCP connections. Files up to 64 KiB still
-use batches, subject to the hash block, request-size and batch-byte limits.
+use batches, subject to the request-size and batch-byte limits.
 This local batch ceiling does not reduce the size of ordinary range requests.
 This happens automatically, without tuning options. Single-file copies retain parallel range copying when offload
 is unavailable.

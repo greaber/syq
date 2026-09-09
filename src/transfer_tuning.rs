@@ -104,14 +104,21 @@ impl TransferTuning {
     /// Local copies have no network credit latency to hide. A short remote
     /// range fits in one ordinary window, so streaming would only add fences.
     /// Explicit depth/range controls retain the old engine for experiments.
-    pub fn stream_range(self, same_host: bool, bytes: u64, block: u64) -> bool {
+    pub fn ordinary_range_limit(self, same_host: bool, block: u64) -> u64 {
         if self.streaming() {
-            return true;
+            0
+        } else if same_host
+            || self.copy_path == Some(CopyPath::Ranges)
+            || self.pipeline_depth.is_some()
+        {
+            u64::MAX
+        } else {
+            block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
         }
-        if same_host || self.copy_path == Some(CopyPath::Ranges) || self.pipeline_depth.is_some() {
-            return false;
-        }
-        bytes > block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
+    }
+
+    pub fn stream_range(self, same_host: bool, bytes: u64, block: u64) -> bool {
+        self.streaming() || bytes > self.ordinary_range_limit(same_host, block)
     }
     /// This line describes selection policy before ranges have been planned,
     /// not an observed engine. Use the actual range predicate at its bounds

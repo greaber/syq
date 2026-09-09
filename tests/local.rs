@@ -5291,6 +5291,59 @@ fn dropped_write_connection_is_reopened_and_uncertain_range_is_retried() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn sparse_updates_recover_batched_reads_and_writes_without_losing_unchanged_bytes() {
+    for (pull, drop_request) in [(false, "write"), (true, "read")] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        fs::create_dir_all(t.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+        let original = vec![17; 2 * 1024 * 1024];
+        let mut edited = original.clone();
+        for offset in (0..edited.len()).step_by(256 * 1024) {
+            edited[offset..offset + 4096].fill(91);
+        }
+        write(&t.path("src"), &edited);
+        write(&t.path("dst"), &original);
+        let source = if pull {
+            format!("fake:{}", t.s("src"))
+        } else {
+            t.s("src")
+        };
+        let destination = if pull {
+            t.s("dst")
+        } else {
+            format!("fake:{}", t.s("dst"))
+        };
+        let marker = t.path("drop-once");
+        let output = remote_syq_command(
+            &t,
+            &rsh,
+            &[
+                "-ac",
+                "--stats",
+                "--syq-no-bootstrap",
+                "--block-size=64K",
+                "--tuning-options=copy-path=ranges,request-size=4M",
+                &source,
+                &destination,
+            ],
+        )
+        .env("SYQ_TEST_DROP_AFTER_REQUEST", drop_request)
+        .env("SYQ_TEST_DROP_MARKER", &marker)
+        .run()
+        .unwrap();
+        assert_output_ok(&output);
+        assert!(marker.exists());
+        assert_eq!(read(&t.path("dst")), edited);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("connection dropped; reopening"),
+            "{output:?}"
+        );
+    }
+}
+
 // The expected tuner trajectory depends on measured loopback throughput and
 // is calibrated for Linux runners.
 #[cfg(all(debug_assertions, target_os = "linux"))]

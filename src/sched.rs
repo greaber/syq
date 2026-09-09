@@ -2,7 +2,7 @@
 
 use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -44,6 +44,22 @@ pub struct RangeState {
 
 pub type RangeHandle = Arc<Mutex<RangeState>>;
 
+pub struct FastBatchState {
+    files: Vec<(u64, usize)>,
+    groups: VecDeque<std::ops::Range<usize>>,
+    owned: Vec<bool>,
+}
+
+impl FastBatchState {
+    /// Claim immediately before issuing the source request. Once claimed, a
+    /// group cannot be stolen, even while its read or write is outstanding.
+    pub fn claim(&mut self) -> Option<std::ops::Range<usize>> {
+        self.groups.pop_front()
+    }
+}
+
+pub type FastBatchHandle = Arc<Mutex<FastBatchState>>;
+
 pub enum Item {
     File(usize),
     Range(RangeHandle),
@@ -51,9 +67,67 @@ pub enum Item {
     Exit,
 }
 
+/// Two indexes allow largest-first scheduling and same-file claims without
+/// scanning unrelated files or shifting the queue under the scheduler lock.
+#[derive(Default)]
+struct RangeQueue {
+    largest: BTreeSet<(u64, usize, u64)>,
+    by_file: HashMap<usize, BTreeSet<(u64, u64)>>,
+}
+
+impl RangeQueue {
+    fn push(&mut self, (idx, off, end): (usize, u64, u64)) {
+        assert!(self.largest.insert((end - off, idx, off)));
+        assert!(self
+            .by_file
+            .entry(idx)
+            .or_default()
+            .insert((end - off, off)));
+    }
+
+    fn remove(&mut self, len: u64, idx: usize, off: u64) -> (usize, u64, u64) {
+        assert!(self.largest.remove(&(len, idx, off)));
+        let file = self.by_file.get_mut(&idx).expect("queued file");
+        assert!(file.remove(&(len, off)));
+        if file.is_empty() {
+            self.by_file.remove(&idx);
+        }
+        (idx, off, off + len)
+    }
+
+    fn pop(&mut self) -> Option<(usize, u64, u64)> {
+        let &(len, idx, off) = self.largest.last()?;
+        Some(self.remove(len, idx, off))
+    }
+
+    fn take_short(&mut self, idx: usize, max_size: u64) -> Option<(usize, u64, u64)> {
+        let &(len, off) = self.by_file.get(&idx)?.first()?;
+        (len <= max_size).then(|| self.remove(len, idx, off))
+    }
+
+    fn len(&self) -> usize {
+        self.largest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.largest.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
+        self.largest
+            .iter()
+            .map(|&(len, idx, off)| (idx, off, off + len))
+    }
+
+    #[cfg(test)]
+    fn contains(&self, &(idx, off, end): &(usize, u64, u64)) -> bool {
+        self.largest.contains(&(end - off, idx, off))
+    }
+}
+
 struct Inner {
     files: BinaryHeap<(u64, Reverse<usize>)>,
-    ranges: Vec<(usize, u64, u64)>,
+    ranges: RangeQueue,
     finishes: Vec<(usize, bool)>,
     inflight: Vec<RangeHandle>,
     outstanding: HashMap<usize, u32>,
@@ -64,6 +138,7 @@ struct Inner {
     fast_probing: usize,
     /// Workers currently processing one pipelined small-file batch.
     fast_batches: usize,
+    fast_groups: Vec<FastBatchHandle>,
     /// Planning has observed at least one regular file, before destination
     /// namespace checks and directory creation make it runnable.
     file_work_anticipated: bool,
@@ -99,7 +174,7 @@ impl Sched {
         Sched {
             inner: Mutex::new(Inner {
                 files: BinaryHeap::new(),
-                ranges: Vec::new(),
+                ranges: RangeQueue::default(),
                 finishes: Vec::new(),
                 inflight: Vec::new(),
                 outstanding: HashMap::new(),
@@ -107,6 +182,7 @@ impl Sched {
                 probing: 0,
                 fast_probing: 0,
                 fast_batches: 0,
+                fast_groups: Vec::new(),
                 file_work_anticipated: false,
                 scan_done: false,
                 abort: false,
@@ -141,9 +217,10 @@ impl Sched {
         *self.jobs.lock().unwrap() = Vec::new();
         let mut inner = self.inner.lock().unwrap();
         inner.files = BinaryHeap::new();
-        inner.ranges = Vec::new();
+        inner.ranges = RangeQueue::default();
         inner.finishes = Vec::new();
         inner.inflight = Vec::new();
+        inner.fast_groups = Vec::new();
         inner.outstanding = HashMap::new();
         inner.failed = HashSet::new();
     }
@@ -249,16 +326,17 @@ impl Sched {
         self.inner.lock().unwrap().finished()
     }
 
-    /// Whether useful capacity is queued or about to emerge from an ordinary
-    /// large-file probe. A pipelined small-file batch already has an owner and
-    /// will never expose ranges, so it does not justify replacing a worker
-    /// that retired after draining the queue.
+    /// Whether queued work, unread file groups, or an ordinary file probe can
+    /// use another worker. Already-issued small-file requests cannot be stolen.
     pub fn needs_worker_capacity(&self) -> bool {
         let g = self.inner.lock().unwrap();
         !g.files.is_empty()
             || !g.ranges.is_empty()
             || !g.finishes.is_empty()
             || g.probing > g.fast_probing
+            || g.fast_groups
+                .iter()
+                .any(|h| !h.lock().unwrap().groups.is_empty())
             || g.inflight.iter().any(|handle| {
                 let range = handle.lock().unwrap();
                 range.pos < range.end
@@ -286,6 +364,55 @@ impl Sched {
         let mut g = self.inner.lock().unwrap();
         g.fast_probing += n;
         debug_assert!(g.fast_probing <= g.probing);
+    }
+
+    /// Share only unread groups. The first group stays with the original
+    /// owner, which must retire at least one file and one fast-batch slot.
+    pub fn share_fast_groups(
+        &self,
+        files: Vec<(u64, usize)>,
+        mut groups: VecDeque<std::ops::Range<usize>>,
+    ) -> (std::ops::Range<usize>, FastBatchHandle) {
+        let first = groups.pop_front().expect("nonempty fast batch");
+        let handle = Arc::new(Mutex::new(FastBatchState {
+            owned: vec![true; files.len()],
+            files,
+            groups,
+        }));
+        self.inner.lock().unwrap().fast_groups.push(handle.clone());
+        self.cv.notify_all();
+        (first, handle)
+    }
+
+    /// Stop stealing before the caller checks sources, reports results, or
+    /// retries after an error. Only still-owned files belong to that caller.
+    pub fn finish_fast_groups(&self, handle: &FastBatchHandle) -> Vec<bool> {
+        let mut g = self.inner.lock().unwrap();
+        g.fast_groups.retain(|h| !Arc::ptr_eq(h, handle));
+        handle.lock().unwrap().owned.clone()
+    }
+
+    fn steal_fast_group(&self, g: &mut Inner) -> Option<usize> {
+        for handle in &g.fast_groups {
+            let mut batch = handle.lock().unwrap();
+            let Some(group) = batch.groups.pop_back() else {
+                continue;
+            };
+            batch.owned[group.clone()].fill(false);
+            let files = &batch.files[group];
+            // All files were already counted as probes for the old owner.
+            // Keep the returned file as a probe; return its siblings to the
+            // ordinary queue and remove every stolen file from fast ownership.
+            g.fast_probing -= files.len();
+            g.probing -= files.len() - 1;
+            let (_, first) = files[0];
+            for &(size, idx) in &files[1..] {
+                g.files.push((size, Reverse(idx)));
+            }
+            self.cv.notify_all();
+            return Some(first);
+        }
+        None
     }
 
     /// Finish all scheduler bookkeeping for one fast batch at once.
@@ -338,7 +465,6 @@ impl Sched {
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
         g.ranges.push((idx, pos, end));
-        g.ranges.sort_by_key(|(_, o, e)| e - o);
         self.cv.notify_all();
     }
 
@@ -364,6 +490,9 @@ impl Sched {
                 }
                 if let Some(h) = self.steal(&mut g) {
                     return Item::Range(h);
+                }
+                if let Some(idx) = self.steal_fast_group(&mut g) {
+                    return Item::File(idx);
                 }
             }
             if g.scan_done && g.probing == 0 && g.inflight.is_empty() {
@@ -425,6 +554,31 @@ impl Sched {
         out
     }
 
+    /// Claim one same-file range only when a worker can issue its next read.
+    /// Leave one queued range per peer so a small backlog keeps its parallelism.
+    pub fn take_short_range(
+        &self,
+        idx: usize,
+        max_size: u64,
+        workers: usize,
+    ) -> Option<RangeHandle> {
+        if max_size == 0 {
+            return None;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.abort
+            || g.failed.contains(&idx)
+            || g.outstanding.get(&idx).copied().unwrap_or(0) <= 1
+            || g.ranges.len() < workers
+        {
+            return None;
+        }
+        let (idx, off, end) = g.ranges.take_short(idx, max_size)?;
+        let h = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
+        g.inflight.push(h.clone());
+        Some(h)
+    }
+
     /// After probing a file: register its ranges. Returns the handle for the
     /// first range (already marked in flight) or None if nothing to transfer.
     pub fn ranges_ready(&self, idx: usize, mut ranges: Vec<(u64, u64)>) -> Option<RangeHandle> {
@@ -468,8 +622,6 @@ impl Sched {
         for (off, end) in it {
             g.ranges.push((idx, off, end));
         }
-        // Largest ranges first for the queue (pop takes from the back).
-        g.ranges.sort_by_key(|(_, o, e)| e - o);
         self.cv.notify_all();
         first
     }
@@ -498,7 +650,6 @@ impl Sched {
         let range = h.lock().unwrap();
         if start < range.end {
             g.ranges.push((range.idx, start, range.end));
-            g.ranges.sort_by_key(|(_, off, end)| end - off);
         } else {
             let n = g.outstanding.get_mut(&range.idx).expect("outstanding");
             *n -= 1;
@@ -523,6 +674,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_range_claim_preserves_other_files_limits_and_shares() {
+        let sched = Sched::new(512, 8192);
+        sched.inner.lock().unwrap().probing = 2;
+        let first = sched
+            .ranges_ready(0, vec![(0, 512), (1024, 1536), (2048, 2560), (4096, 8192)])
+            .unwrap();
+        let other = sched.ranges_ready(1, vec![(0, 512), (1024, 1536)]).unwrap();
+        assert!(sched.take_short_range(0, 0, 1).is_none());
+        assert!(sched.take_short_range(0, 512, 5).is_none());
+        let extra = sched.take_short_range(0, 512, 4).unwrap();
+        assert_eq!(extra.lock().unwrap().pos, 1024);
+        assert_eq!(sched.inner.lock().unwrap().outstanding[&0], 4);
+        assert!(!sched.range_done(&extra));
+        assert!(sched.take_short_range(0, 512, 4).is_none());
+        let extra = sched.take_short_range(0, 512, 1).unwrap();
+        assert!(!sched.range_done(&extra));
+        assert!(sched.take_short_range(0, 512, 1).is_none());
+        sched.release_rest(&first);
+        assert!(!sched.range_done(&first));
+        assert!(!sched.range_done(&other));
+        let inner = sched.inner.lock().unwrap();
+        assert!(inner.ranges.contains(&(1, 1024, 1536)));
+        assert!(inner.ranges.contains(&(0, 4096, 8192)));
+        assert!(inner.ranges.contains(&(0, 0, 512)));
+        drop(inner);
+        sched.fail_file(0);
+        assert!(sched.take_short_range(0, 512, 1).is_none());
+        sched.abort();
+        assert!(sched.take_short_range(1, 512, 1).is_none());
+    }
+
+    #[test]
+    fn range_queue_indexes_agree_after_interleaved_claims() {
+        let mut queue = RangeQueue::default();
+        for idx in 0..200 {
+            for i in 0..1000 {
+                queue.push((idx, i * 8192, i * 8192 + 512 * (1 + i % 8)));
+            }
+        }
+        for idx in (0..200).rev() {
+            for _ in 0..125 {
+                let (_, off, end) = queue.take_short(idx, 512).unwrap();
+                assert_eq!(end - off, 512);
+            }
+            assert!(queue.take_short(idx, 512).is_none());
+        }
+        let mut previous = u64::MAX;
+        while let Some((_, off, end)) = queue.pop() {
+            assert!(end - off <= previous);
+            previous = end - off;
+        }
+        assert!(queue.by_file.is_empty());
+    }
+
+    #[test]
     fn initial_ranges_preserve_coverage_alignment_and_split_floor() {
         for size in [
             1,
@@ -543,7 +749,7 @@ mod tests {
                     vec![(r.pos, r.end)]
                 };
                 let inner = sched.inner.lock().unwrap();
-                spans.extend(inner.ranges.iter().map(|(_, off, end)| (*off, *end)));
+                spans.extend(inner.ranges.iter().map(|(_, off, end)| (off, end)));
                 spans.sort_unstable();
                 let count = workers.min((size / sched.min_split) as usize).max(1);
                 assert_eq!(spans.len(), count);
@@ -735,6 +941,34 @@ mod tests {
     }
 
     #[test]
+    fn claimed_file_groups_cannot_be_stolen_or_request_spare_workers() {
+        let sched = Sched::new(512, 8192);
+        {
+            let mut g = sched.inner.lock().unwrap();
+            g.probing = 6;
+            g.fast_probing = 6;
+            g.fast_batches = 1;
+            g.scan_done = true;
+        }
+        let (first, groups) = sched.share_fast_groups(
+            (0..6).map(|i| (512, i)).collect(),
+            [0..2, 2..4, 4..6].into(),
+        );
+        assert_eq!(first, 0..2);
+        assert!(sched.needs_worker_capacity());
+        assert_eq!(groups.lock().unwrap().claim(), Some(2..4));
+        assert_eq!(groups.lock().unwrap().claim(), Some(4..6));
+        assert!(!sched.needs_worker_capacity());
+        assert_eq!(
+            sched.steal_fast_group(&mut sched.inner.lock().unwrap()),
+            None
+        );
+        assert_eq!(sched.finish_fast_groups(&groups), vec![true; 6]);
+        sched.complete_fast_batch(6);
+        assert!(sched.finished());
+    }
+
+    #[test]
     fn retry_range_replaces_the_failed_inflight_share() {
         let sched = Sched::new(64, 128);
         let range = Arc::new(Mutex::new(RangeState {
@@ -750,7 +984,7 @@ mod tests {
         sched.retry_range(&range, 128);
         let inner = sched.inner.lock().unwrap();
         assert!(inner.inflight.is_empty());
-        assert_eq!(inner.ranges, vec![(4, 128, 256)]);
+        assert_eq!(inner.ranges.iter().collect::<Vec<_>>(), vec![(4, 128, 256)]);
         assert_eq!(inner.outstanding.get(&4), Some(&1));
     }
 
