@@ -1060,14 +1060,30 @@ impl Root {
     ) -> Result<Option<File>> {
         let parent = self.resolve_parent(path)?;
         let pair = (source.metadata()?.dev(), parent.directory.metadata()?.dev());
-        // Process-local negative cache: file metadata and directory ACL failures
+        // Process-local capability cache: file metadata and directory ACL failures
         // are not properties of a filesystem pair and must never enter it.
-        let unsupported = unsupported_clone_pairs();
-        if unsupported.lock().unwrap().contains(&pair) {
-            return Ok(None);
-        }
-        if pair.0 != pair.1 {
-            unsupported.lock().unwrap().insert(pair);
+        let pairs = clone_volume_pairs();
+        let cached = pairs.lock().unwrap().get(&pair).copied();
+        let supported = if let Some(supported) = cached {
+            supported
+        } else {
+            // This optimization targets APFS. Reject exFAT/SMB and other
+            // destinations before probing ACLs or creating staging directories.
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            let supported = if pair.0 != pair.1 {
+                false
+            } else {
+                retry_zero(|| unsafe {
+                    libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
+                })?;
+                let stats = unsafe { stats.assume_init() };
+                unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
+                    == b"apfs"
+            };
+            pairs.lock().unwrap().insert(pair, supported);
+            supported
+        };
+        if !supported {
             return Ok(None);
         }
         if !clone_data_only_eligible(source)? {
@@ -1125,7 +1141,7 @@ impl Root {
             }
             #[cfg(debug_assertions)]
             if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
-                unsupported.lock().unwrap().insert(pair);
+                pairs.lock().unwrap().insert(pair, false);
                 return Ok(None);
             }
             let cloned = unsafe {
@@ -1146,7 +1162,7 @@ impl Root {
                         error.raw_os_error(),
                         Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS)
                     ) {
-                        unsupported.lock().unwrap().insert(pair);
+                        pairs.lock().unwrap().insert(pair, false);
                     }
                     return Ok(None);
                 }
@@ -1895,9 +1911,9 @@ struct ResolvedParent {
 }
 
 #[cfg(target_os = "macos")]
-fn unsupported_clone_pairs() -> &'static Mutex<std::collections::HashSet<(u64, u64)>> {
-    static PAIRS: OnceLock<Mutex<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
-    PAIRS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+fn clone_volume_pairs() -> &'static Mutex<HashMap<(u64, u64), bool>> {
+    static PAIRS: OnceLock<Mutex<HashMap<(u64, u64), bool>>> = OnceLock::new();
+    PAIRS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Darwin's ACL functions and constants from <sys/acl.h> are not exposed by
