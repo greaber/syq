@@ -305,7 +305,9 @@ impl ForwardChild {
             match reply {
                 Ok(Reply::Approved(approved)) => return Ok((child, approved)),
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
-                Ok(Reply::Ready) => bail!("invalid destination setup response"),
+                Ok(Reply::Ready | Reply::Identity(_)) => {
+                    bail!("invalid destination setup response")
+                }
                 Err(error) => {
                     // Match ordinary bootstrap: a missing helper or an exec
                     // failure may retry setup once, before a copy is approved.

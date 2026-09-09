@@ -109,6 +109,14 @@ are validated before prompting; the restricted filesystem executor checks
 every operation after approval. The server receives no SSH agent.
 [Commands](exec.md) need separate approval.
 
+Receiving names stay assigned to a persistent receiver public key. Reconnecting
+requires proof of the corresponding private key; knowing the public key does
+not let another receiver claim the name. This prevents accidental reassignment
+and impersonation through registration, but the server account controls the
+assignment files and can replace them. It is not a security boundary against
+someone who controls that account. The receiver private key stays on the
+receiving machine and does not grant SSH login access.
+
 Approval permits that pending copy's destination, overwrite policy, and limits.
 It does not authenticate what you typed on a remote server or attest to source
 contents. The receiving user and desktop session remain trusted. Request IDs

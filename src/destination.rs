@@ -1,8 +1,8 @@
 //! Named, permission-checked return channels over laptop-initiated SSH.
 //!
-//! This protocol uses transient advertisements maintained by persistence,
-//! independent of durable receiver enrollments. The remote account is the requester identity: shells
-//! and jobs under that account intentionally share access to its registrations.
+//! Persistence maintains transient advertisements and durable name ownership,
+//! independent of restricted receiver enrollments. The remote account is the
+//! requester identity: shells and jobs under it share access to registrations.
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -30,9 +30,10 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
+mod identity;
 
 // Discovery is independent of the build-pinned request protocol. Keep the
-// Ping/Ready JSON envelope and this version stable across helper wire changes.
+// Ping/Ready and Identify/Identity JSON envelopes stable across helper wire changes.
 const DISCOVERY_VERSION: u16 = 2;
 const VERSION: u16 = 2;
 const REGISTRATION_VERSION: u16 = 3;
@@ -125,6 +126,10 @@ struct Envelope {
 #[derive(Serialize, Deserialize)]
 enum Message {
     Ping,
+    Identify {
+        name: String,
+        challenge: String,
+    },
     Exec(exec::ExecRequest),
     Request(Box<CopyRequest>),
     Forward {
@@ -139,6 +144,7 @@ enum Message {
 #[derive(Serialize, Deserialize)]
 enum Reply {
     Ready,
+    Identity(identity::Proof),
     Approved(Approved),
     Error(String),
 }
@@ -231,6 +237,13 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Protect the actual identity location, including an explicitly supplied HOME.
+/// Merely computing the path must not create receiver state.
+pub(crate) fn receiver_identity_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is unset")?;
+    Ok(fs::canonicalize(home)?.join(".syq-receiver-identity"))
+}
+
 fn registry() -> Result<PathBuf> {
     private_directory(".syq-destinations-v3")
 }
@@ -272,17 +285,18 @@ pub(crate) fn registered_names() -> Vec<String> {
     };
     let mut names: Vec<_> = entries
         .filter_map(|entry| {
-            let name = entry
-                .ok()?
-                .file_name()
-                .to_str()?
-                .strip_suffix(".json")?
+            let file = entry.ok()?.file_name();
+            let file = file.to_str()?;
+            let name = file
+                .strip_suffix(".json")
+                .or_else(|| file.strip_suffix(".owner"))?
                 .to_owned();
             validate_name(&name).ok()?;
             Some(name)
         })
         .collect();
     names.sort();
+    names.dedup();
     names
 }
 
@@ -293,6 +307,9 @@ fn load_registration(name: &str) -> Result<Registration> {
         Ok(encoded) => encoded,
         Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => {
+            if identity::owner(&registry()?, name)?.is_some() {
+                bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
+            }
             let names = registered_names();
             let advice = if names.is_empty() {
                 "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
@@ -314,6 +331,9 @@ fn load_registration(name: &str) -> Result<Registration> {
     {
         bail!("invalid destination helper registration; reconnect from the receiving machine");
     }
+    if let Some(owner) = identity::owner(&registry()?, name)? {
+        identity::verify_receiver(name, &registration, Some(&owner))?;
+    }
     Ok(registration)
 }
 fn exchange(
@@ -321,7 +341,9 @@ fn exchange(
     message: Message,
     timeout: Duration,
 ) -> Result<(UnixStream, Reply)> {
-    if !matches!(message, Message::Ping) && registration.identity != crate::identity::build() {
+    if !matches!(message, Message::Ping | Message::Identify { .. })
+        && registration.identity != crate::identity::build()
+    {
         bail!(
             "named destination requires its matching helper; reconnect from the receiving machine"
         );
@@ -334,13 +356,13 @@ fn exchange(
     write_message(
         &mut stream,
         &Envelope {
-            version: if matches!(message, Message::Ping) {
+            version: if matches!(message, Message::Ping | Message::Identify { .. }) {
                 DISCOVERY_VERSION
             } else {
                 VERSION
             },
-            // Ping is the fixed discovery contract. All authoritative requests
-            // above still require this executable to match the receiving build.
+            // Discovery and identity proofs are stable across builds. Copy,
+            // command, and forwarding requests still require a matching helper.
             identity: registration.identity.clone(),
             secret: registration.secret.clone(),
             message,
@@ -545,6 +567,11 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
         {
             return forward::select(args);
         }
+        if !registry()?.join(format!("{name}.json")).try_exists()?
+            && handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
+        {
+            return forward::select(args);
+        }
         let registration = load_registration(&name)?;
         if handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
             && exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err()
@@ -718,6 +745,8 @@ struct Prompt {
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
+    name: String,
+    identity_key: ssh_key::PrivateKey,
     requester: String,
     approval_mode: crate::receive_approval::Mode,
     notifications: crate::receive_approval::Notifications,
@@ -787,12 +816,15 @@ impl Receiver {
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let envelope: Envelope =
             read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
-        let version = if matches!(envelope.message, Message::Ping) {
+        let version = if matches!(envelope.message, Message::Ping | Message::Identify { .. }) {
             DISCOVERY_VERSION
         } else {
             VERSION
         };
-        if envelope.version != version || envelope.identity != crate::identity::build() {
+        if envelope.version != version
+            || (!matches!(envelope.message, Message::Identify { .. })
+                && envelope.identity != crate::identity::build())
+        {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
         if envelope.secret != self.secret {
@@ -801,6 +833,13 @@ impl Receiver {
         match envelope.message {
             Message::Exec(request) => self.execute(request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
+            Message::Identify { name, challenge } => {
+                if name != self.name {
+                    bail!("receiver identity requested for a different profile");
+                }
+                let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
+                write_message(&mut stream, &Reply::Identity(proof))
+            }
             Message::Forward { target, request } => self.forward(target, *request, stream),
             Message::Request(request) => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
@@ -988,6 +1027,8 @@ pub(crate) fn serve_background(
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
+        name: config.name.clone(),
+        identity_key: identity::load_key()?,
         requester: format!(
             "{} (receiving profile @{})",
             spec.endpoint.label(),
@@ -1233,6 +1274,9 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         }
         bail!("destination @{name} is already registered by another connection");
     }
+    let owner = identity::owner(&directory, name)?;
+    let public_key = identity::verify_receiver(name, &registration, owner.as_deref())?;
+    identity::claim(&directory, name, &public_key)?;
     let path = directory.join(format!("{name}.json"));
     let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
     temporary.write_all(&serde_json::to_vec(&registration)?)?;
@@ -1283,14 +1327,19 @@ fn destinations(action: DestinationAction) -> Result<i32> {
         DestinationAction::List => {
             let mut names = Vec::new();
             for entry in fs::read_dir(registry()?)? {
-                let name = entry?.file_name().to_string_lossy().into_owned();
-                if let Some(name) = name.strip_suffix(".json") {
+                let file = entry?.file_name();
+                let file = file.to_string_lossy();
+                if let Some(name) = file
+                    .strip_suffix(".json")
+                    .or_else(|| file.strip_suffix(".owner"))
+                {
                     if validate_name(name).is_ok() {
                         names.push(name.to_owned());
                     }
                 }
             }
             names.sort();
+            names.dedup();
             for name in names {
                 println!(
                     "@{name}\t{}",
@@ -1314,7 +1363,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
-            fs::remove_file(directory.join(format!("{name}.json")))?;
+            identity::forget(&directory, &name)?;
             println!("syq: forgot offline destination @{name}");
             Ok(0)
         }
@@ -1448,6 +1497,8 @@ mod tests {
     ) {
         let (prompts, requests) = mpsc::sync_channel(1);
         let receiver = Arc::new(Receiver {
+            name: "laptop".into(),
+            identity_key: identity::generate_key().unwrap(),
             requester: "test-server".into(),
             approval_mode: crate::receive_approval::Mode::Always,
             notifications: crate::receive_approval::Notifications::Off,

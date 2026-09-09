@@ -428,6 +428,8 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 test ! -e "$receive_root/after-stop"
 ssh source 'test ! -e ~/.syq-destinations-v3/laptop.json'
+printf 'case: offline names require the original receiver identity or explicit replacement\n'
+python3 /usr/local/libexec/syq-test-receiver-identity.py
 # Unrelated pooling scenarios count SSH commands; explicitly disable receiving.
 syq persist receive off
 syq completion cache clear >/dev/null

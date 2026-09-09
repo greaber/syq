@@ -60,7 +60,7 @@ The source sshd permits remote Unix socket forwarding for named return transfers
 keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
 copies from independent source shells without a forwarded agent, destination
 background startup through persistence, `--root` traversal refusal, unconfined
-`--cwd` paths, conflicting names, reconnection after killing the owned SSH
+`--cwd` paths, conflicting names, offline ownership and explicit receiver replacement, reconnection after killing the owned SSH
 transport, recovery after a server heartbeat times out while the client is
 paused, and stopping receiving with persistence. Approval cases cover local
 allow/deny, one-use IDs, disconnect and settings cancellation, and explicit

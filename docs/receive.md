@@ -51,7 +51,9 @@ syq persist connect server
 
 Then run `syq cp results --to @project` on the server. The directory must already
 exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination.
+project separate from your general `laptop` destination. Names stay assigned to
+their receiving machine while it is offline; see [replacing a receiver](persistence-reference.md#names-and-profiles)
+when moving a name to another laptop.
 
 Use `syq persist receive status` to list profiles and
 `syq persist receive off --name project` to stop one. See
