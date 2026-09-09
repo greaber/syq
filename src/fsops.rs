@@ -5499,7 +5499,9 @@ impl FsOps {
         size: u64,
         _mode: u32,
     ) -> Result<CopyLocalOutcome> {
-        if policy.inplace {
+        // A mask that removes owner access would make the private clone
+        // directory unusable. Keep the normal file-copy semantics for it.
+        if policy.inplace || process_umask() & 0o700 != 0 {
             return Ok(CopyLocalOutcome::Unsupported);
         }
         let source_target = self.registered_source_target(source)?;

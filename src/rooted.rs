@@ -1067,7 +1067,7 @@ impl Root {
         })?;
         let directory = open_directory_at(&parent.directory, temporary.as_bytes())?;
         let metadata = directory.metadata()?;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o5777 != 0o700 {
             // Do not clean up an untrusted replacement directory.
             bail!("private clone directory changed before opening");
         }
@@ -2702,6 +2702,9 @@ mod tests {
     fn apfs_clone_is_private_independent_and_never_replaces_a_partial() {
         use std::os::unix::fs::PermissionsExt;
         let t = TestDir::new("clone");
+        // A setgid destination may pass its group and setgid bit to the
+        // private directory; that does not make the directory public.
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o2700)).unwrap();
         let source_path = t.path().join("source");
         fs::write(&source_path, b"original data").unwrap();
         fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
