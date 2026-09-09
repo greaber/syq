@@ -300,7 +300,7 @@ pub(crate) fn registered_names() -> Vec<String> {
     names
 }
 
-fn load_registration(name: &str) -> Result<Registration> {
+fn read_registration(name: &str) -> Result<Registration> {
     validate_name(name)?;
     let path = registry()?.join(format!("{name}.json"));
     let encoded = match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
@@ -331,6 +331,11 @@ fn load_registration(name: &str) -> Result<Registration> {
     {
         bail!("invalid destination helper registration; reconnect from the receiving machine");
     }
+    Ok(registration)
+}
+
+fn load_registration(name: &str) -> Result<Registration> {
+    let registration = read_registration(name)?;
     if let Some(owner) = identity::owner(&registry()?, name)? {
         identity::verify_receiver(name, &registration, Some(&owner))?;
     }
@@ -1266,9 +1271,17 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         .open(directory.join(format!("{name}.lock")))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         // A laptop may reconnect before the server has noticed the old TCP
-        // session died. Only the same ephemeral credential gets a retry; it
-        // still cannot displace an active registration or obtain its lock.
-        if load_registration(name).is_ok_and(|previous| previous.secret == secret) {
+        // session died. A retry still cannot displace an active registration
+        // or obtain its lock.
+        // Read only the saved credential: the old transport may be unresponsive.
+        if read_registration(name).is_ok_and(|previous| previous.secret == secret) {
+            crate::output::diagnostic!("syq: previous return connection is still closing");
+            return Ok(RECONNECT_PENDING);
+        }
+        if let Some(owner) = identity::owner(&directory, name)? {
+            // A restarted service has a new connection credential but keeps
+            // its receiver key. Verify the new connection, never the dying one.
+            identity::verify_receiver(name, &registration, Some(&owner))?;
             crate::output::diagnostic!("syq: previous return connection is still closing");
             return Ok(RECONNECT_PENDING);
         }
@@ -1284,7 +1297,7 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     let meta = fs::symlink_metadata(&path)?;
     guard.record = Some((path, (meta.dev(), meta.ino())));
     // Drop the advertisement before releasing its name lock, including on a
-    // normal disconnect. A crash can leave a stale record, never a reservation.
+    // normal disconnect. Ownership survives; a crash cannot keep the live lock.
     let _guard = guard;
     write_message(&mut std::io::stdout(), &Reply::Ready)?;
     let mut input = std::io::stdin();
@@ -1294,7 +1307,7 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
             events: libc::POLLIN,
             revents: 0,
         };
-        // A quiet, half-open SSH transport must not reserve a name forever.
+        // A quiet, half-open SSH transport must not block reconnection forever.
         let ready = unsafe { libc::poll(&mut descriptor, 1, 15_000) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();

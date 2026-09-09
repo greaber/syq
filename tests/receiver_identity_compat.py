@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 candidate, previous = map(lambda arg: str(Path(arg).resolve()), sys.argv[1:])
 
@@ -42,10 +43,11 @@ def read_frame(stream):
 
 
 @contextlib.contextmanager
-def registration(binary, home, key, *, success=True, legacy=False):
+def registration(binary, home, key, *, success=True, legacy=False, retry=False, messages=None,
+                 secret="test-connection-secret"):
     """A local test peer exercises the binary's actual registration entry point."""
     env = dict(os.environ, HOME=str(home), SYQ_NO_UPDATE_CHECK="1")
-    path = home / "return.sock"
+    path = home / ("return-" + uuid.uuid4().hex + ".sock")
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(path))
     path.chmod(0o600)
@@ -64,8 +66,10 @@ def registration(binary, home, key, *, success=True, legacy=False):
                 with stream:
                     stream.settimeout(10)
                     envelope = read_frame(stream)
-                    assert envelope["secret"] == "test-connection-secret"
+                    assert envelope["secret"] == secret
                     message = envelope["message"]
+                    if messages is not None:
+                        messages.append(message)
                     if message == "Ping":
                         reply = "Ready"
                     elif legacy:
@@ -89,10 +93,13 @@ def registration(binary, home, key, *, success=True, legacy=False):
     thread = threading.Thread(target=serve)
     thread.start()
     process = subprocess.Popen([binary, "--destination-register", "laptop", str(path),
-                                "test-connection-secret"], env=env, stdin=subprocess.PIPE,
+                                secret], env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        if success:
+        if retry:
+            _, stderr = process.communicate(timeout=15)
+            assert process.returncode == 75 and b"still closing" in stderr, stderr
+        elif success:
             assert read_frame(process.stdout) == "Ready"
         else:
             _, stderr = process.communicate(timeout=15)
@@ -126,8 +133,19 @@ with tempfile.TemporaryDirectory(prefix="syq-id-compat-") as directory:
         assert advertisement.read_bytes() == old_bytes and not owner.exists()
     print("PASS: new binary reads unchanged v0.5.2 advertisement and discovery", flush=True)
 
-    with registration(candidate, home, key_one) as env:
+    messages = []
+    with registration(candidate, home, key_one, messages=messages) as env:
         owned_bytes = owner.read_bytes()
+        before_retry = list(messages)
+        with registration(candidate, home, key_one, retry=True):
+            assert messages == before_retry, messages
+            assert owner.read_bytes() == owned_bytes
+        with registration(candidate, home, key_one, retry=True, secret="restarted-service"):
+            assert messages == before_retry, messages
+            assert owner.read_bytes() == owned_bytes
+        with registration(candidate, home, key_two, success=False, secret="other-receiver"):
+            assert owner.read_bytes() == owned_bytes
+        print("PASS: reconnects and service restarts wait without contacting or displacing the old transport", flush=True)
         run(previous, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
         run(candidate, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
     assert owner.read_bytes() == owned_bytes and not advertisement.exists()

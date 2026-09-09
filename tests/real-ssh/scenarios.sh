@@ -306,8 +306,8 @@ fi
 
 printf 'case: duplicate named return cannot displace the existing laptop\n'
 (
-    export XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
-    mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    export HOME=/tmp/syq-duplicate-home XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
+    mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
     trap 'syq persist off' EXIT
     syq persist on
     syq persist receive on --name laptop --root /tmp/syq-real-ssh-receive-other
@@ -316,7 +316,7 @@ printf 'case: duplicate named return cannot displace the existing laptop\n'
         echo 'duplicate named destination unexpectedly succeeded' >&2
         exit 1
     fi
-    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
+    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "different receiver" in s["connection"]["error"] for s in states), states'
 )
 ssh source 'syq persist destinations wait laptop --timeout 5'
 
