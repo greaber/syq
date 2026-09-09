@@ -54,19 +54,8 @@ fn fast_batch_file_limit(
     }
 }
 
-// Read a modest payload before sending, while keeping enough files together
-// to amortize metadata round trips for larger files. Tiny files retain the
-// existing transport-dependent count ceiling. This does not depend on hashes.
+// Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
-const FAST_BATCH_MIN_FILES: usize = 4;
-
-fn fast_batch_size_limit(max_files: usize, file_size: u64) -> usize {
-    max_files.min(
-        usize::try_from(FAST_BATCH_READ_BYTES / file_size.max(1))
-            .unwrap_or(usize::MAX)
-            .max(FAST_BATCH_MIN_FILES),
-    )
-}
 
 /// Upper bound: each file needs one worker, and each simultaneous range must
 /// contain at least min_split bytes. Balanced/aligned splitting can use fewer.
@@ -86,27 +75,10 @@ fn reuse_startup_ssh(id: usize, autotune: bool) -> bool {
     id == 0 || (autotune && id == 1)
 }
 
-fn initial_fast_workers(
-    max_connections: usize,
-    file_jobs: usize,
-    file_bytes: u64,
-    tuning: crate::transfer_tuning::TransferTuning,
-) -> usize {
-    let mut batch_files = tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
-    let mut batch_bytes = tuning.batch_bytes();
-    if !tuning.batch_override() {
-        let average_size = file_bytes.div_ceil(file_jobs.max(1) as u64);
-        batch_files = fast_batch_size_limit(batch_files, average_size);
-        batch_bytes = batch_bytes.min(
-            FAST_BATCH_READ_BYTES.max(average_size.saturating_mul(FAST_BATCH_MIN_FILES as u64)),
-        );
-    }
-    // A batch is independently bounded by its entry count and its payload.
-    // Provision enough fixed workers for whichever ceiling yields more work;
-    // automatic runs may still tune from this bounded starting point.
-    let file_batches = file_jobs.div_ceil(batch_files);
-    let byte_batches = usize::try_from(file_bytes.div_ceil(batch_bytes)).unwrap_or(usize::MAX);
-    max_connections.min(file_batches.max(byte_batches).max(1))
+fn initial_fast_workers(max_connections: usize, file_jobs: usize) -> usize {
+    // A batch is a ceiling, not an indivisible unit of source work. Filling
+    // fewer large batches must not serialize reads that can run concurrently.
+    max_connections.min(file_jobs.max(1))
 }
 
 #[cfg(debug_assertions)]
@@ -3140,7 +3112,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && bwlimit.is_none()
     {
         let mut files = 0;
-        let mut bytes = 0u64;
         let mut all_small = true;
         for planned in st.buffer.iter().flatten().flat_map(|mapped| &mapped.others) {
             let entry = &planned.e;
@@ -3149,17 +3120,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 && opts.min_size.is_none_or(|min| entry.size >= min)
             {
                 files += 1;
-                bytes = bytes.saturating_add(entry.size);
                 all_small &= entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref());
             }
         }
         if files > 0 && all_small {
-            spawn_workers(initial_fast_workers(
-                args.connections,
-                files,
-                bytes,
-                opts.tuning,
-            ));
+            spawn_workers(initial_fast_workers(args.connections, files));
             workers_started = true;
         }
     }
@@ -3221,7 +3186,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                let (multiplex_small_files, file_jobs, file_bytes) = {
+                let (multiplex_small_files, file_jobs) = {
                     let jobs = sched.jobs.lock().unwrap();
                     (
                         !opts.verify_only
@@ -3235,8 +3200,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                             && job.container_guard.is_none()))
                             }),
                         jobs.len(),
-                        jobs.iter()
-                            .fold(0u64, |total, job| total.saturating_add(job.entry.size)),
                     )
                 };
                 if multiplex_small_files {
@@ -3267,7 +3230,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
                     let mut initial = if multiplex_small_files {
-                        initial_fast_workers(args.connections, file_jobs, file_bytes, opts.tuning)
+                        initial_fast_workers(args.connections, file_jobs)
                     } else {
                         args.connections
                     };
@@ -7656,12 +7619,9 @@ impl Worker {
                     let _copying = progress.copying_interval();
                     if self.fast_eligible(idx) {
                         let first_bytes = self.job(idx).entry.size;
-                        let max_files = if self.opts.tuning.batch_override() {
-                            self.fast_batch_files
-                        } else {
-                            fast_batch_size_limit(self.fast_batch_files, first_bytes)
-                        };
-                        let target = self.sched.begin_fast_batch(self.gate.active(), max_files);
+                        let target = self
+                            .sched
+                            .begin_fast_batch(self.gate.active(), self.fast_batch_files);
                         let mut batch = vec![idx];
                         // Keep rate-limited batches to one file so a push can't
                         // accumulate locally and then hit the network in a burst.
@@ -10249,37 +10209,12 @@ mod tests {
     }
 
     #[test]
-    fn initial_fast_workers_respect_file_and_byte_batch_limits() {
-        assert_eq!(
-            initial_fast_workers(32, 100, 100 * (4 << 20), Default::default()),
-            25
-        );
-        assert_eq!(
-            initial_fast_workers(8, 100, 100 * (4 << 20), Default::default()),
-            8
-        );
-        assert_eq!(initial_fast_workers(32, 300, 300, Default::default()), 3);
-    }
-
-    #[test]
-    fn automatic_file_batches_preserve_concurrency_and_large_file_amortization() {
-        assert_eq!(fast_batch_size_limit(128, 256 << 10), 16);
-        assert_eq!(fast_batch_size_limit(512, 4 << 20), 4);
-        assert_eq!(fast_batch_size_limit(128, 4096), 128);
-        assert_eq!(fast_batch_size_limit(512, 4096), 512);
-        assert_eq!(fast_batch_size_limit(128, 0), 128);
-        assert_eq!(
-            initial_fast_workers(8, 256, 64 << 20, Default::default()),
-            8
-        );
-        assert_eq!(
-            initial_fast_workers(8, 32, 128 << 20, Default::default()),
-            8
-        );
-        assert_eq!(
-            initial_fast_workers(8, 256, 64 << 20, "batch-bytes=16M".parse().unwrap()),
-            4
-        );
+    fn small_file_workers_are_bounded_by_files_not_full_batches() {
+        assert_eq!(initial_fast_workers(8, 256), 8);
+        assert_eq!(initial_fast_workers(8, 4), 4);
+        assert_eq!(initial_fast_workers(8, 1), 1);
+        assert_eq!(initial_fast_workers(8, 0), 1);
+        assert_eq!(initial_fast_workers(0, 100), 0);
     }
 
     #[test]
