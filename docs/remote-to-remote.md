@@ -31,21 +31,16 @@ ls -lh results
 syq cp results --to hostB --into /archive
 ```
 
-Syq looks for a live receiving machine automatically before trying SSH from
-hostA. It checks names in alphabetical order, allowing up to two seconds for
-each readiness reply, and uses the first available registration. If its build
-differs, the command automatically hands off to that machine's registered
-helper. Offline or unsupported registrations are skipped. With none available,
-it uses ordinary SSH. Options this route cannot support also use ordinary SSH automatically.
-A copy addressed to a live receiving name still goes to that machine itself.
+Syq uses the first available receiving machine in alphabetical name order.
+If none is available, or the requested options are unsupported on this route,
+it uses hostA's SSH access. A copy addressed to a live receiving name goes to
+that machine itself.
 
-These choices apply to `syq cp` with local sources and an SSH destination.
-To choose explicitly, use `--auth-from @laptop` (or `--auth-from laptop`).
-`--auth-from ssh` uses hostA's SSH access and interprets `--to` as an SSH
-endpoint, even if its bare name matches a receiving name. `--auth-from auto`
-is the default. Names `ssh` and `auto` need `@` with this option.
-The older `--via NAME` spelling remains an alias for `--auth-from @NAME`;
-every bare `--via` value is still a receiving name.
+Use `--auth-from @laptop` to choose your laptop explicitly, or `--auth-from ssh`
+to use hostA's SSH access. The default is `--auth-from auto`. `--via NAME` is
+an alias for choosing a receiving machine. See
+[authorization selection](remote-reference.md#authorization-selection) for
+name rules and route restrictions.
 
 The selected laptop asks for approval before contacting hostB. Approve with the desktop
 prompt or `syq persist receive pending` and `syq persist receive approve REQUEST_ID` on the laptop.
@@ -64,30 +59,15 @@ encrypted TCP. HostB must expose a [reachable data port](server-tuning.md#make-t
 to hostA. Failure to reach it fails the copy without switching to SSH data.
 
 The prompt shows the requested SSH endpoint and destination path. Relative
-destination paths start in that account's home directory on hostB. A quoted
-`~` or `~/archive` also uses hostB's home directory; use `./~/archive` to name a
-literal directory called `~`. On this route, `~//archive` also stays under that
-home directory. Automatic selection leaves `~//archive` on ordinary SSH,
-where that spelling resolves to `/archive`. Receiving `--cwd` and `--root` govern copies onto the laptop;
-they do not describe hostB's filesystem. Receiving byte, entry, and deletion
-ceilings still apply. The helper on hostB checks the approved copy permissions and protects its own
-control and SSH authority files. The source verifies its signed receipt before
-reporting success. No durable receiver enrollment or reusable grant is created.
+paths start in that account's home directory on hostB. Your laptop's receiving
+root does not contain this copy, but its byte, entry, and deletion limits still
+apply.
 
-The source command may be a different build: it invokes the laptop's registered
-helper before requesting approval. That helper and the helper started on hostB
-use the laptop's build. Keep the source command and the laptop's return
-connection alive until completion. Stopping receiving or
-losing that connection cancels the copy. After hostB approves setup, the source
-has 60 seconds to start its handshake and then 10 seconds to complete it.
-Retry with a new approval to resume eligible partial files. This route accepts
-local sources and an ordinary SSH `--to` endpoint. It does not accept `--detach`, custom `--rsh`/`--syq-path`,
-`--no-bootstrap`, `--pscope`, alternative `--peer-auth`/`--coordinate-at`,
-`--no-tcp`, or `--tcp-plain`. Copy permissions and supported filesystem options
-match [return copies](receive.md#copy-permissions-and-limits). These restrictions
-also determine whether automatic selection can use a receiving machine.
-Destination path completion never asks a receiving machine for authorization;
-use `--auth-from ssh` for completion through hostA's own SSH access.
+Keep the source command and your laptop's connection alive until completion.
+Stopping receiving or losing that connection cancels the copy. Retry with a
+new approval to resume it. Supported copy options match
+[return copies](receive.md#copy-permissions-and-limits), with additional
+[route restrictions](remote-reference.md#authorization-selection).
 
 ## What you need
 
@@ -117,12 +97,6 @@ syq receiver enroll hostB:/archive
 syq cp --dry-run -v --from hostA --srcs-in data --to hostB --into /archive
 ```
 
-After an incompatible upgrade, syq installs a fresh receiver on the next
-eligible copy. You can also prepare it explicitly with `syq receiver enroll`.
-Installing the receiver requires ordinary SSH access. Enrollments from an
-incompatible older version are not shown by `syq receiver list` or removed by re-enrollment; they require
-manual cleanup on both machines.
-
 Inspect or remove this access with:
 
 ```sh
@@ -141,10 +115,8 @@ If receivers have not stopped within ten seconds, revocation reports failure
 and keeps the enrollment marked revoked. Retry `receiver revoke` to finish
 cleanup; an enrollment with unfinished revocation cannot be refreshed.
 
-Before upgrading from released v0.4.1 or an older binary, stop its active copies:
-those running processes have no shutdown watcher. Updating the installed
-executable does not add revocation support to a process already running it.
-The seven-day finish window is unchanged.
+For upgrading or sharing a receiver between installations, see
+[enrollment details](remote-reference.md#enrollment).
 
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 `revoke`.

@@ -11,35 +11,22 @@ The second command uses macOS's `open` program to display an artifact. Any
 program installed on the receiving machine can be requested, including a
 native application or a version of syq you have just built there.
 
-Commands use the same background connection as [return copies](receive.md).
-Run `syq persist connect server` on the receiving machine to enable persistence
-and wait for the connection. No SSH server or incoming network port is needed on the receiving machine.
-Requests work from independent server shells, including existing tmux sessions.
+If you have already set up [receiving files](receive.md), you can request
+commands through the same connection. Otherwise, run `syq persist connect server`
+on your desktop first. Your desktop needs no SSH server or incoming network
+port, and you can make requests from any shell on the server, including an
+existing tmux session.
 
-Exec needs no separate enablement beyond receiving and its connection.
-`@laptop` in these examples is a name, not an alias for any connected laptop.
-Run `syq persist destinations list` on the server to find your receiving
-machine's actual name and connection status. On the receiving machine,
-`syq persist receive status` shows its advertised name.
-
-`--on` selects a receiving name. Both `laptop` and `@laptop` require a live
-return connection; neither falls back to DNS or an SSH connection. If the server
-command is a different build, it automatically invokes the matching helper
-registered by the receiving machine before requesting approval. Names and
-options complete from local information; completion does not contact the
-receiving machine or request approval.
+Replace `@laptop` with your desktop's receiving name. You can find it by running
+`syq persist destinations list` on the server or `syq persist receive status`
+on your desktop. The desktop must be connected: both `--on laptop` and
+`--on @laptop` fail while it is offline.
 
 ## Approve each command locally
 
-Each command waits for approval on the receiving machine. Its desktop prompt
-puts the program and literal arguments first, followed by the requesting server,
-working directory, and a reminder that it runs with your permissions outside the
-copy root and limits. On
-macOS, **Details** shows the fuller permission explanation and **Back** returns
-to the short view. Opening Details does not approve or extend the request.
-Desktop notifications may truncate long commands and hide trailing arguments.
-Use `syq persist receive pending` on the receiving machine to inspect the complete request before approving a command whose full
-text is not visible. You can inspect and decide requests from a terminal there:
+Each command waits for approval on the receiving machine. Review the program,
+arguments, requesting server, and working directory. Desktop notifications may
+truncate long commands; inspect the complete request from a local terminal:
 
 ```sh
 syq persist receive pending
@@ -58,14 +45,7 @@ An approved command runs with your local user's permissions, including access
 to files and credentials. **The receiving `--root` and copy limits do not
 contain commands.** Build tools and scripts can execute code from their input
 files; approving a displayed command does not establish that those files are
-safe. Commands have a separate approval type in `persist receive pending --json`, with
-`kind: "command"`, `argv`, `cwd`, and `permission` fields. Argument and directory
-strings in that summary are escaped for display.
-
-Older clients that only understand copies cannot approve command requests.
-Use the matching new binary to list and approve them; old clients omit command
-requests from their pending list. They can still list and approve copies from
-other server connections, and their stop request still works.
+safe.
 
 ## Arguments and working directories
 
@@ -100,13 +80,11 @@ signal and returns `128 + signal`. A setup error or connection failure is a
 nonzero result. A connection that closes before delivering the exit status is
 an error even if some output arrived successfully.
 
-Interrupting the requesting syq process, losing the connection, changing
-receiving settings, `persist receive off`, or `persist off` cancels execution. Syq kills
-the command's process group with `SIGKILL` and reaps its leader. It also kills
-remaining processes in that group when the foreground program exits, without
-giving them time to run cleanup handlers. A program that deliberately creates a
-separate process session, or an application launched through macOS `open`, can
-outlive that group. Syq does not manage detached jobs.
+Interrupting the request, losing the connection, changing receiving settings,
+or stopping receiving cancels execution. Syq forcibly stops the command's
+process group, including remaining children when the foreground program exits;
+cleanup handlers do not run. Detached processes and applications launched
+through macOS `open` can outlive the request. Syq does not manage detached jobs.
 
 A command may already have changed files when interrupted. It is never retried
 automatically after a lost connection. Inspect the outcome before requesting
