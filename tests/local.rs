@@ -20275,6 +20275,9 @@ fn clean_partials_selects_only_current_regular_files() {
 #[cfg(debug_assertions)]
 #[test]
 fn concurrent_identical_and_different_copies_publish_complete_files() {
+    // Exercise publication and retained-basis races through isolated receiver
+    // processes, without spending seconds encrypting bulk data in debug builds.
+    // Pipes preserve the same file operations and multi-block fixtures.
     for identical in [true, false] {
         for existing in [false, true] {
             let t = Tmp::new();
@@ -20304,6 +20307,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .args([
                     "cp",
                     "--hash",
+                    "--no-tcp",
                     "--bwlimit",
                     "1G",
                     "-j",
@@ -20320,10 +20324,12 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .start()
                 .unwrap();
             wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
                     "--hash",
+                    "--no-tcp",
                     "--bwlimit",
                     "1G",
                     "-j",
@@ -20335,10 +20341,21 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 ])
                 .run()
                 .unwrap();
+            let second_published = fs::read(t.path("out"));
             release_confinement_barrier(&continuation);
             let first = first.wait_with_output().unwrap();
             assert_output_ok(&second);
-            assert_output_ok(&first);
+            assert!(
+                first.status.success(),
+                "first copy failed: identical={identical}, existing={existing}, \
+                 competitor elapsed={:?}, first={first:?}, second={second:?}",
+                second_started.elapsed(),
+            );
+            assert_eq!(
+                second_published.unwrap(),
+                second_data,
+                "competitor publication: identical={identical}, existing={existing}"
+            );
             assert_eq!(
                 read(&t.path("out")),
                 first_data,
