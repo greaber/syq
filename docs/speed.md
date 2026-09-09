@@ -174,10 +174,10 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
 
-New-file copies keep files batched to reduce network round trips, while
+Remote new-file copies keep files batched to reduce network round trips, while
 allowing up to one worker per file within the selected connection count.
 Workers overlap reads and writes in bounded groups of whole files inside
-each batch. Hash comparison size does not determine new-file batching.
+each batch. Idle workers can take groups whose reads have not started. Hash comparison size does not determine new-file batching.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote

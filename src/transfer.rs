@@ -3229,7 +3229,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             let jobs = sched.jobs.lock().unwrap();
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
-                    let mut initial = if multiplex_small_files {
+                    let mut initial = if multiplex_small_files && opts.same_host {
+                        // Both endpoints execute synchronously, so there is no
+                        // network window to fill. Keep the existing batched
+                        // startup for local copies, including tiny trees.
+                        let jobs = sched.jobs.lock().unwrap();
+                        let bytes = jobs
+                            .iter()
+                            .fold(0u64, |total, job| total.saturating_add(job.entry.size));
+                        let file_batches =
+                            file_jobs.div_ceil(opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES));
+                        let byte_batches =
+                            usize::try_from(bytes.div_ceil(opts.tuning.batch_bytes()))
+                                .unwrap_or(usize::MAX);
+                        args.connections.min(file_batches.max(byte_batches).max(1))
+                    } else if multiplex_small_files {
                         initial_fast_workers(args.connections, file_jobs)
                     } else {
                         args.connections
@@ -7632,10 +7646,10 @@ impl Worker {
                                 self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
                             ));
                         }
-                        let (fast, slow): (Vec<usize>, Vec<usize>) =
+                        let (mut fast, slow): (Vec<usize>, Vec<usize>) =
                             batch.into_iter().partition(|&i| self.fast_eligible(i));
                         self.sched.mark_fast(fast.len() - 1);
-                        let fast_result = self.fast_batch(&fast);
+                        let fast_result = self.fast_batch(&mut fast);
                         self.sched.complete_fast_batch(fast.len());
                         if let Err(e) = fast_result {
                             if self.transport_dead() {
@@ -7752,7 +7766,7 @@ impl Worker {
     fn transfer_small_batches(
         &mut self,
         jobs: &[FileJob],
-        groups: &[std::ops::Range<usize>],
+        mut groups: impl Iterator<Item = std::ops::Range<usize>>,
     ) -> Result<Vec<Result<()>>> {
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let read_window = if self.src.supports_request_pipelining() {
@@ -7765,7 +7779,6 @@ impl Worker {
         } else {
             1
         };
-        let mut groups = groups.iter();
         let mut reads = std::collections::VecDeque::new();
         let mut writes = std::collections::VecDeque::new();
         let mut results: Vec<Result<()>> = (0..jobs.len()).map(|_| Ok(())).collect();
@@ -7885,12 +7898,12 @@ impl Worker {
         Ok(results)
     }
 
-    fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
+    fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
         #[cfg(debug_assertions)]
         record_worker_event_for_test("batch", self.id, batch.len())?;
         self.fast.batches += 1;
         self.fast.files += batch.len();
-        let jobs: Vec<FileJob> = {
+        let mut jobs: Vec<FileJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all[i].clone()).collect()
         };
@@ -7925,7 +7938,29 @@ impl Worker {
         if start < jobs.len() {
             groups.push(start..jobs.len());
         }
-        let results = self.transfer_small_batches(&jobs, &groups)?;
+        let (first, shared) = self.sched.share_fast_groups(
+            jobs.iter()
+                .zip(batch.iter())
+                .map(|(job, &idx)| (job.entry.size, idx))
+                .collect(),
+            groups.into(),
+        );
+        let groups =
+            std::iter::once(first).chain(std::iter::from_fn(|| shared.lock().unwrap().claim()));
+        let result = self.transfer_small_batches(&jobs, groups);
+        let owned = self.sched.finish_fast_groups(&shared);
+        // Fix the caller's ownership even on transport loss, before its retry
+        // loop can requeue files that another worker has already taken.
+        let original_len = batch.len();
+        let mut keep = owned.iter();
+        batch.retain(|_| *keep.next().unwrap());
+        self.fast.files -= original_len - batch.len();
+        let mut keep = owned.iter();
+        jobs.retain(|_| *keep.next().unwrap());
+        let results = result?
+            .into_iter()
+            .zip(owned)
+            .filter_map(|(r, own)| own.then_some(r));
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
         let phase = std::time::Instant::now();
@@ -7936,7 +7971,7 @@ impl Worker {
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
-            .zip(results.into_iter().zip(now.into_iter()))
+            .zip(results.zip(now.into_iter()))
         {
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
@@ -9154,6 +9189,8 @@ mod tests {
         synchronous: bool,
         fail_receive: Option<usize>,
         gate_changes: Vec<(usize, Arc<Gate>, usize)>,
+        steal_on_receive: Option<Arc<Sched>>,
+        stolen_file: Option<usize>,
         dead: bool,
     }
 
@@ -9180,6 +9217,12 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             anyhow::ensure!(!state.dead, "injected dead connection");
             state.received += 1;
+            if let Some(sched) = state.steal_on_receive.take() {
+                let Item::File(idx) = sched.next() else {
+                    panic!("expected unread file group")
+                };
+                state.stolen_file = Some(idx);
+            }
             for (at, gate, active) in &state.gate_changes {
                 if *at == state.received {
                     gate.set_active(*active);
@@ -9669,7 +9712,7 @@ mod tests {
                     512,
                     false,
                 );
-                let result = worker.transfer_small_batches(&jobs, &groups);
+                let result = worker.transfer_small_batches(&jobs, groups.into_iter());
                 if matches!(failure, "none" | "read-file" | "write-file") {
                     let results = result.unwrap();
                     assert_eq!(results.len(), 8);
@@ -9710,6 +9753,93 @@ mod tests {
     }
 
     #[test]
+    fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
+        for failure in ["none", "source-drop", "destination-drop"] {
+            let sched = Arc::new(Sched::new(512, 8192));
+            let jobs: Vec<_> = (0..12)
+                .map(|i| pipeline_job(format!("file{i}").as_bytes(), 256 << 10))
+                .collect();
+            for job in &jobs {
+                sched.push_file(job.clone());
+            }
+            sched.scan_done();
+            assert!(matches!(sched.next(), Item::File(0)));
+            assert_eq!(sched.begin_fast_batch(1, 12), 12);
+            let mut batch = vec![0];
+            batch.extend(sched.take_small(256 << 10, 11, u64::MAX));
+            sched.mark_fast(11);
+            let src = Arc::new(Mutex::new(PipelineState {
+                synchronous: true,
+                steal_on_receive: Some(sched.clone()),
+                fail_receive: (failure == "source-drop").then_some(2),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                fail_receive: (failure == "destination-drop").then_some(1),
+                ..Default::default()
+            }));
+            for _ in 0..2 {
+                src.lock().unwrap().replies.push_back(Response::SmallBlocks(
+                    (0..4)
+                        .map(|_| {
+                            let data = vec![0; 256 << 10];
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        })
+                        .collect(),
+                ));
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Applied(vec![None; 4]));
+            }
+            src.lock().unwrap().replies.push_back(Response::Stats(
+                jobs[..8].iter().map(|j| Some(j.entry.clone())).collect(),
+            ));
+            let mut worker = pipeline_worker(sched.clone(), src.clone(), dst, 512, false);
+            let result = worker.fast_batch(&mut batch);
+            assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+            assert_eq!(src.lock().unwrap().stolen_file, Some(8));
+            assert_eq!(batch, (0..8).collect::<Vec<_>>());
+            assert_eq!(
+                worker.progress.files_done.load(Relaxed),
+                if failure == "none" { 8 } else { 0 }
+            );
+            if failure == "none" {
+                let source = src.lock().unwrap();
+                let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
+                    panic!("source recheck")
+                };
+                assert_eq!(
+                    paths,
+                    &jobs[..8].iter().map(|j| j.src.clone()).collect::<Vec<_>>()
+                );
+            }
+            sched.complete_fast_batch(batch.len());
+            if result.is_err() {
+                for idx in batch {
+                    sched.requeue(idx);
+                }
+            }
+            // The peer already owns file 8. Its three siblings were returned
+            // to the file queue; no retry may duplicate that ownership.
+            assert!(sched.ranges_ready(8, vec![]).is_none());
+            let expected: Vec<_> = if failure == "none" {
+                (9..12).collect()
+            } else {
+                (0..8).chain(9..12).collect()
+            };
+            for idx in expected {
+                assert!(matches!(sched.next(), Item::File(i) if i == idx));
+                assert!(sched.ranges_ready(idx, vec![]).is_none());
+            }
+            assert!(sched.finished());
+        }
+    }
+
+    #[test]
     fn empty_file_groups_need_no_source_reads() {
         let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)];
         let src = Arc::new(Mutex::new(PipelineState::default()));
@@ -9726,7 +9856,7 @@ mod tests {
             false,
         );
         assert!(worker
-            .transfer_small_batches(&jobs, std::slice::from_ref(&(0..2)))
+            .transfer_small_batches(&jobs, std::iter::once(0..2))
             .unwrap()
             .iter()
             .all(Result::is_ok));

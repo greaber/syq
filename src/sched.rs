@@ -2,7 +2,7 @@
 
 use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -43,6 +43,22 @@ pub struct RangeState {
 }
 
 pub type RangeHandle = Arc<Mutex<RangeState>>;
+
+pub struct FastBatchState {
+    files: Vec<(u64, usize)>,
+    groups: VecDeque<std::ops::Range<usize>>,
+    owned: Vec<bool>,
+}
+
+impl FastBatchState {
+    /// Claim immediately before issuing the source request. Once claimed, a
+    /// group cannot be stolen, even while its read or write is outstanding.
+    pub fn claim(&mut self) -> Option<std::ops::Range<usize>> {
+        self.groups.pop_front()
+    }
+}
+
+pub type FastBatchHandle = Arc<Mutex<FastBatchState>>;
 
 pub enum Item {
     File(usize),
@@ -122,6 +138,7 @@ struct Inner {
     fast_probing: usize,
     /// Workers currently processing one pipelined small-file batch.
     fast_batches: usize,
+    fast_groups: Vec<FastBatchHandle>,
     /// Planning has observed at least one regular file, before destination
     /// namespace checks and directory creation make it runnable.
     file_work_anticipated: bool,
@@ -165,6 +182,7 @@ impl Sched {
                 probing: 0,
                 fast_probing: 0,
                 fast_batches: 0,
+                fast_groups: Vec::new(),
                 file_work_anticipated: false,
                 scan_done: false,
                 abort: false,
@@ -202,6 +220,7 @@ impl Sched {
         inner.ranges = RangeQueue::default();
         inner.finishes = Vec::new();
         inner.inflight = Vec::new();
+        inner.fast_groups = Vec::new();
         inner.outstanding = HashMap::new();
         inner.failed = HashSet::new();
     }
@@ -307,16 +326,17 @@ impl Sched {
         self.inner.lock().unwrap().finished()
     }
 
-    /// Whether useful capacity is queued or about to emerge from an ordinary
-    /// large-file probe. A pipelined small-file batch already has an owner and
-    /// will never expose ranges, so it does not justify replacing a worker
-    /// that retired after draining the queue.
+    /// Whether queued work, unread file groups, or an ordinary file probe can
+    /// use another worker. Already-issued small-file requests cannot be stolen.
     pub fn needs_worker_capacity(&self) -> bool {
         let g = self.inner.lock().unwrap();
         !g.files.is_empty()
             || !g.ranges.is_empty()
             || !g.finishes.is_empty()
             || g.probing > g.fast_probing
+            || g.fast_groups
+                .iter()
+                .any(|h| !h.lock().unwrap().groups.is_empty())
             || g.inflight.iter().any(|handle| {
                 let range = handle.lock().unwrap();
                 range.pos < range.end
@@ -344,6 +364,55 @@ impl Sched {
         let mut g = self.inner.lock().unwrap();
         g.fast_probing += n;
         debug_assert!(g.fast_probing <= g.probing);
+    }
+
+    /// Share only unread groups. The first group stays with the original
+    /// owner, which must retire at least one file and one fast-batch slot.
+    pub fn share_fast_groups(
+        &self,
+        files: Vec<(u64, usize)>,
+        mut groups: VecDeque<std::ops::Range<usize>>,
+    ) -> (std::ops::Range<usize>, FastBatchHandle) {
+        let first = groups.pop_front().expect("nonempty fast batch");
+        let handle = Arc::new(Mutex::new(FastBatchState {
+            owned: vec![true; files.len()],
+            files,
+            groups,
+        }));
+        self.inner.lock().unwrap().fast_groups.push(handle.clone());
+        self.cv.notify_all();
+        (first, handle)
+    }
+
+    /// Stop stealing before the caller checks sources, reports results, or
+    /// retries after an error. Only still-owned files belong to that caller.
+    pub fn finish_fast_groups(&self, handle: &FastBatchHandle) -> Vec<bool> {
+        let mut g = self.inner.lock().unwrap();
+        g.fast_groups.retain(|h| !Arc::ptr_eq(h, handle));
+        handle.lock().unwrap().owned.clone()
+    }
+
+    fn steal_fast_group(&self, g: &mut Inner) -> Option<usize> {
+        for handle in &g.fast_groups {
+            let mut batch = handle.lock().unwrap();
+            let Some(group) = batch.groups.pop_back() else {
+                continue;
+            };
+            batch.owned[group.clone()].fill(false);
+            let files = &batch.files[group];
+            // All files were already counted as probes for the old owner.
+            // Keep the returned file as a probe; return its siblings to the
+            // ordinary queue and remove every stolen file from fast ownership.
+            g.fast_probing -= files.len();
+            g.probing -= files.len() - 1;
+            let (_, first) = files[0];
+            for &(size, idx) in &files[1..] {
+                g.files.push((size, Reverse(idx)));
+            }
+            self.cv.notify_all();
+            return Some(first);
+        }
+        None
     }
 
     /// Finish all scheduler bookkeeping for one fast batch at once.
@@ -421,6 +490,9 @@ impl Sched {
                 }
                 if let Some(h) = self.steal(&mut g) {
                     return Item::Range(h);
+                }
+                if let Some(idx) = self.steal_fast_group(&mut g) {
+                    return Item::File(idx);
                 }
             }
             if g.scan_done && g.probing == 0 && g.inflight.is_empty() {
@@ -866,6 +938,34 @@ mod tests {
         assert!(matches!(sched.next(), Item::File(_)));
         let second_target = sched.begin_fast_batch(32, 128);
         assert_eq!(second_target, 63);
+    }
+
+    #[test]
+    fn claimed_file_groups_cannot_be_stolen_or_request_spare_workers() {
+        let sched = Sched::new(512, 8192);
+        {
+            let mut g = sched.inner.lock().unwrap();
+            g.probing = 6;
+            g.fast_probing = 6;
+            g.fast_batches = 1;
+            g.scan_done = true;
+        }
+        let (first, groups) = sched.share_fast_groups(
+            (0..6).map(|i| (512, i)).collect(),
+            [0..2, 2..4, 4..6].into(),
+        );
+        assert_eq!(first, 0..2);
+        assert!(sched.needs_worker_capacity());
+        assert_eq!(groups.lock().unwrap().claim(), Some(2..4));
+        assert_eq!(groups.lock().unwrap().claim(), Some(4..6));
+        assert!(!sched.needs_worker_capacity());
+        assert_eq!(
+            sched.steal_fast_group(&mut sched.inner.lock().unwrap()),
+            None
+        );
+        assert_eq!(sched.finish_fast_groups(&groups), vec![true; 6]);
+        sched.complete_fast_batch(6);
+        assert!(sched.finished());
     }
 
     #[test]
