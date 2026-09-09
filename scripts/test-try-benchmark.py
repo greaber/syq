@@ -209,21 +209,26 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_timing_breakdown_and_short_or_setup_heavy_notes(self):
         records = self.root / 'timings'
-        records.write_text('large 10 8000\nlarge 14 10000\n'
-                           'small 10 3000\nshort 0.4 100\nzero 0.01 0\n'
-                           'old 5 n/a\nold 7 5000\n')
+        records.write_text('large 10 8000 80000000\nlarge 14 10000 80000000\n'
+                           'small 10 3000 6000000\nshort 0.4 100 1000000\n'
+                           'zero 0.01 0 1000\nzero 1 500 1000\n'
+                           'old 5 n/a 1000000\nold 7 5000 1000000\n'
+                           'boundary 10 8000 8000000\nbelow 10 8001 8000000\n')
         definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
         result = subprocess.run(['/bin/bash', '-c', definitions +
                                  '\nsummarize_syq_timings "$1"', 'timing-test', str(records)],
                                 env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [line.split() for line in result.stdout.splitlines()]
-        self.assertIn(['large', '12.000', '9.000', '3.000'], rows)
-        self.assertIn(['old', '6.000', 'n/a', 'n/a'], rows)
-        self.assertIn(['zero', '0.010', '0.000', '0.010'], rows)
+        self.assertIn(['large', '12.000', '9.000', '3.000', '9.000'], rows)
+        self.assertIn(['old', '6.000', 'n/a', 'n/a', 'n/a'], rows)
+        self.assertIn(['zero', '0.505', '0.250', '0.255', 'n/a'], rows)
+        self.assertIn('Note (zero): copying speed unavailable', result.stdout)
         self.assertIn('Note (small): 70%', result.stdout)
         self.assertIn('Note (short): syq copying averaged under 1 second', result.stdout)
-        self.assertNotIn('Note (large)', result.stdout)
+        self.assertIn('Note (large): 25%', result.stdout)
+        self.assertIn('Note (boundary): 20%', result.stdout)
+        self.assertNotIn('Note (below)', result.stdout)
         self.assertIn('not pure network time', result.stdout)
 
     def test_fixed_size_with_old_syq_keeps_total_results(self):

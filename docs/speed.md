@@ -158,14 +158,17 @@ outside the scored timers. Preparation shows helper installation messages withou
 a throughput result. A failed command or content check stops the comparison.
 
 The main table always uses total command time, including connection startup.
-A separate syq table shows mean total time, its copying interval, and other time
-(total minus copying). Other time covers work outside that interval, such as
+A separate syq table shows mean total time, its copying interval, other time
+(total minus copying), and copying speed in decimal MB/s. Copying speed is
+copied bytes divided by copying seconds and 1,000,000, averaged across trial
+speeds. It also appears after each syq trial. A copying interval below timer
+resolution makes copying speed unavailable. Other time covers work outside that interval, such as
 setup and finishing. Copying spans the first file work through the last completed
 work: it includes waiting and per-file overhead, and can overlap planning and
 connection setup. It is neither pure network time nor an exact separation of
 setup from transfer. The script does not estimate this breakdown for rsync or cp.
 
-The script adds a note when at least half of syq's total time falls outside
+The script adds a note when at least 20% of syq's total time falls outside
 copying, or its mean copying interval is under one second. These are diagnostic
 thresholds, not guarantees that longer tests saturate the link. Short jobs still
 measure useful completion time; use `--workload large --size auto` or a larger

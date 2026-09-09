@@ -44,8 +44,9 @@ uses Perl with its core JSON::PP module; terminal runs also need Perl. Remote te
 also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
-Syq also reports its copying interval and other time (setup/finish). Short or
-setup-heavy trials get a note: total-time speeds may not show sustained throughput.
+Syq also reports copying time, copying MB/s, and other time (setup/finish).
+A note flags >=20% outside copying or copying under one second: total-time
+speeds may not show sustained throughput.
 The default push needs --host with --yes. Use a second machine, preferably
 on a fast link with some latency and reachable TCP data ports 47600-47699.
 Local results report seconds: filesystem clones do not measure byte throughput.
@@ -287,30 +288,37 @@ copying_interval() {
 
 summarize_syq_timings() {
     [[ -s $1 ]] || return 0
-    printf '\nSyq timing breakdown (mean seconds per trial):\n'
+    printf '\nSyq timing breakdown (means per trial):\n'
     awk '{
         key=$1; if (!(key in n)) order[++count]=key;
         n[key]++; total[key]+=$2;
         if ($3 == "n/a") unavailable[key]=1;
-        else copying[key]+=$3 / 1000;
+        else {
+            copying[key]+=$3 / 1000;
+            if ($3 > 0) speed[key]+=$4 / $3 / 1000;
+            else unmeasurable[key]=1;
+        }
     } END {
-        printf "%-18s %10s %10s %10s\n", "Workload", "Total", "Copying", "Other";
+        printf "%-18s %10s %10s %10s %12s\n", "Workload", "Total s", "Copying s", "Other s", "Copy MB/s";
         for (i=1; i<=count; i++) {
             key=order[i];
             if (unavailable[key]) {
-                printf "%-18s %10.3f %10s %10s\n", key, total[key]/n[key], "n/a", "n/a";
+                printf "%-18s %10.3f %10s %10s %12s\n", key, total[key]/n[key], "n/a", "n/a", "n/a";
                 print "Note (" key "): copying timing unavailable; update syq for a breakdown.";
                 continue;
             }
             other=total[key]-copying[key];
-            printf "%-18s %10.3f %10.3f %10.3f\n", key, total[key]/n[key], copying[key]/n[key], other/n[key];
-            if (total[key] > 0 && other >= total[key]*0.5)
+            printf "%-18s %10.3f %10.3f %10.3f %12s\n", key, total[key]/n[key], copying[key]/n[key], other/n[key], (unmeasurable[key] ? "n/a" : sprintf("%.3f", speed[key]/n[key]));
+            if (unmeasurable[key])
+                print "Note (" key "): copying speed unavailable; a copying interval was below timer resolution (0.001 s).";
+            if (total[key] > 0 && other >= total[key]*0.2)
                 printf "Note (%s): %.0f%% of syq total time was outside copying; setup/finish substantially affects this comparison.\n", key, other/total[key]*100;
             if (copying[key]/n[key] < 1)
                 print "Note (" key "): syq copying averaged under 1 second; this test is too short to assess sustained throughput.";
         }
     }' "$1"
     printf 'Other = total minus copying (setup/finish). Copying includes per-file work and waiting, and can overlap setup.\n'
+    printf 'Copy MB/s = copied bytes / copying seconds / 1,000,000, averaged across trials. Compare tools using total-time results above.\n'
     printf 'This is not pure network time or an exact setup measurement. Rsync/cp have total time only.\n'
     printf 'For sustained-throughput comparisons, try --workload large --size auto or a larger fixed --size.\n'
 }
@@ -605,12 +613,13 @@ main() {
                 if [[ $tool == syq ]]; then
                     copying_ms=$(copying_interval "$local_root/trial.json") || fail 'Cannot read syq trial timing.'
                     if [[ $copying_ms != n/a ]]; then
-                        awk -v ms="$copying_ms" -v seconds="$seconds" 'BEGIN {
+                        awk -v ms="$copying_ms" -v seconds="$seconds" -v bytes="$bytes" 'BEGIN {
                             if (ms / 1000 > seconds) exit 1;
                             printf "Syq copying interval: %.3f seconds; other time (setup/finish): %.3f seconds.\n", ms/1000, seconds-ms/1000;
+                            printf "Syq copying speed: %s MB/s (copying interval only).\n", (ms > 0 ? sprintf("%.3f", bytes/ms/1000) : "n/a");
                         }' || fail 'Syq copying interval exceeds total trial time.'
                     fi
-                    printf '%s %s %s\n' "$case_name" "$seconds" "$copying_ms" >> "$local_root/syq-timings"
+                    printf '%s %s %s %s\n' "$case_name" "$seconds" "$copying_ms" "$bytes" >> "$local_root/syq-timings"
                 fi
                 if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
                 else rm -rf -- "$destination"; fi
