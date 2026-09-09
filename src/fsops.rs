@@ -9870,6 +9870,154 @@ mod tests {
         assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
     }
 
+    fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
+        let observations = parallel_map(items, |&index| {
+            let thread = std::thread::current();
+            (
+                index,
+                thread.id(),
+                thread.name().map(str::to_owned),
+                rayon::current_num_threads(),
+            )
+        });
+        // Assert on the calling test thread so diagnostics reach this test's
+        // capture buffer, regardless of which test initialized the static pool.
+        assert_eq!(observations.len(), items.len());
+        // Catch accidentally selecting a single-thread or host-sized pool.
+        // Its size is static within the batch, so inspect it only once.
+        assert_eq!(
+            observations[0].3, PAR_THREADS,
+            "metadata pool must retain its configured parallelism"
+        );
+        observations
+            .into_iter()
+            .zip(items)
+            .map(|((index, thread, name, _), expected)| {
+                assert_eq!(index, *expected);
+                // Catch bypassing the dedicated metadata pool.
+                assert!(
+                    name.as_deref()
+                        .is_some_and(|name| name.starts_with("syq-metadata-")),
+                    "unexpected metadata thread name: {name:?}"
+                );
+                thread
+            })
+            .collect()
+    }
+
+    #[test]
+    fn small_metadata_batches_run_inline() {
+        let caller = std::thread::current().id();
+        assert_eq!(
+            parallel_map(&[(); PAR_MIN - 1], |_| std::thread::current().id()),
+            vec![caller; PAR_MIN - 1]
+        );
+    }
+
+    #[test]
+    fn parallel_metadata_batches_share_a_bounded_pool() {
+        let mut threads = std::collections::HashSet::new();
+        let items: Vec<_> = (0..PAR_MIN).collect();
+        // Rust ThreadIds are never reused, even after threads exit. Each nonempty
+        // call contributes at least one ID, so PAR_THREADS + 1 calls must exceed
+        // this bound with per-call pools. Passing proves reuse across calls
+        // without assumptions about scheduling or native thread-ID recycling.
+        for _ in 0..=PAR_THREADS {
+            threads.extend(checked_metadata_batch_threads(&items));
+        }
+        assert!(
+            threads.len() <= PAR_THREADS,
+            "metadata batches must reuse a bounded shared pool"
+        );
+    }
+
+    #[test]
+    fn parallel_metadata_batches_propagate_panics_and_remain_usable() {
+        let items: Vec<_> = (0..128).collect();
+        let panic = std::panic::catch_unwind(|| {
+            parallel_map(&items, |&index| {
+                if index == 64 {
+                    std::panic::panic_any("metadata test panic");
+                }
+                index
+            })
+        })
+        .expect_err("worker panics must reach the caller");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"metadata test panic"));
+        checked_metadata_batch_threads(&items);
+    }
+
+    #[test]
+    fn source_stat_batches_preserve_order_across_sizes() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[temporary.path()], false);
+        for idx in 0..129 {
+            fs::write(temporary.path().join(format!("f{idx}")), vec![0; idx]).unwrap();
+        }
+        for count in [31, 32, 65, 128, 7, 129] {
+            let sources: Vec<_> = (0..count)
+                .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
+                .collect();
+            let response = worker.handle(&Request::StatMany {
+                paths: vec![b"/display/path/is/not/authority".to_vec(); count],
+                sources: Some(sources),
+                follow: true,
+                guard: None,
+            });
+            let Response::Stats(entries) = response else {
+                panic!("unexpected response: {response:?}");
+            };
+            assert_eq!(entries.len(), count);
+            for (idx, entry) in entries.into_iter().enumerate() {
+                assert_eq!(entry.map(|e| e.size), Some(idx as u64));
+            }
+        }
+    }
+
+    #[test]
+    fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("selected");
+        fs::write(&path, b"original").unwrap();
+        let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
+        let request = Request::StatMany {
+            paths: vec![b"ignored".to_vec(); 64],
+            sources: Some(vec![selections[0].clone(); 64]),
+            follow: false,
+            guard: None,
+        };
+        let response = worker.handle(&request);
+        assert!(
+            matches!(&response, Response::Stats(entries) if entries.len() == 64),
+            "unexpected initial response: {response:?}"
+        );
+
+        fs::rename(&path, temporary.path().join("original")).unwrap();
+        let response = worker.handle(&request);
+        let Response::EndpointError(error) = response else {
+            panic!("expected missing-source error: {response:?}");
+        };
+        assert!(
+            error.message.contains("inspect registered source leaf"),
+            "{error:?}"
+        );
+        assert_eq!(error.io_kind, Some(WireIoKind::NotFound), "{error:?}");
+
+        fs::rename(temporary.path().join("original"), &path).unwrap();
+        let response = worker.handle(&request);
+        let Response::Stats(entries) = response else {
+            panic!("expected restored-file metadata: {response:?}");
+        };
+        assert_eq!(entries.len(), 64);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.as_ref().is_some_and(|e| e.size == 8)),
+            "{entries:?}"
+        );
+    }
+
     #[test]
     fn source_stat_does_not_follow_intermediate_symlinks() {
         let temporary = crate::test_support::tempdir().unwrap();
