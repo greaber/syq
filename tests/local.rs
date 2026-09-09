@@ -10301,7 +10301,37 @@ fn delete_preserves_recognized_partial_files() {
     write(&t.path("dst/.notes.syq-tmp.aaaaaaaaaaaaaaaa"), b"mine");
     write(&t.path("dst/.syq-tmp.notes"), b"odd name, not a sidecar");
     write(&t.path("dst/.gone.syq-tmp.aaaaaaaaaaaaaaaa"), b"leftover");
-    let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
+    for dry_run in [true, false] {
+        let out = syq(&[
+            if dry_run { "-anv" } else { "-av" },
+            "--delete",
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert_output_ok(&out);
+        let diagnostic = stderr_of(&out);
+        assert!(
+            diagnostic.contains("not deleting .gone.syq-tmp.aaaaaaaaaaaaaaaa:"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("name matches syq's partial-file format"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("syq clean-partials"), "{diagnostic}");
+        // A matching source payload is not an extra kept by the partial rule.
+        assert!(
+            !diagnostic.contains("not deleting .notes.syq-tmp."),
+            "{diagnostic}"
+        );
+        assert_eq!(t.path("dst/.syq-tmp.notes").exists(), dry_run);
+        if !dry_run {
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 deleted"),
+                "{out:?}"
+            );
+        }
+    }
     // Recognized partials stay; an unrecognized spelling is an ordinary extra.
     assert_eq!(
         listing(&t.path("dst")),
@@ -10311,7 +10341,6 @@ fn delete_preserves_recognized_partial_files() {
             "real"
         ]
     );
-    assert!(so.contains("1 deleted"), "{so}");
 }
 
 #[test]

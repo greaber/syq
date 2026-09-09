@@ -2494,7 +2494,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if debug() {
         crate::output::diagnostic!(
-            "syq: copy identity complete at {:.2}s",
+            "syq: source/destination ancestry checked at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -6928,6 +6928,11 @@ impl Planner<'_> {
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
                         if e.kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                            if self.opts.verbose > 0 {
+                                self.progress.eprintln(&format!(
+                                    "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"
+                                ));
+                            }
                             for (index, byte) in full.iter().enumerate() {
                                 if *byte == b'/' {
                                     partial_parents

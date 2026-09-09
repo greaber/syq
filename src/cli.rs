@@ -1214,16 +1214,21 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }
     validate_native_results_fd(parsed.results_output.results_fd)?;
-    let mut args = native_engine_defaults();
-    args.interface = Interface::NativeRm;
-    args.rm = true;
+    let confined = parsed.root.is_some();
+    let mut args = native_removal_args(
+        parsed.cwd,
+        parsed.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    );
     args.clean_partials = true;
     args.locations = parsed
         .trees
         .into_iter()
         .map(|tree| {
             let path = trim_native_trailing_slashes(tree.into_vec());
-            validate_native_source_selector(&path, parsed.root.is_some())?;
+            validate_native_source_selector(&path, confined)?;
             Ok(Location::native(
                 endpoint.clone(),
                 path,
@@ -1231,13 +1236,6 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
             ))
         })
         .collect::<Result<_>>()?;
-    args.native_rm_cwd = parsed.cwd.map(OsStringExt::into_vec);
-    args.native_rm_root = parsed.root.map(OsStringExt::into_vec);
-    args.native_results = parsed.results_output.results.map(OsStringExt::into_vec);
-    args.native_results_fd = parsed.results_output.results_fd;
-    args.syq_path = parsed.helper.syq_path;
-    args.no_bootstrap = parsed.helper.no_bootstrap;
-    apply_native_operational(&mut args, parsed.operational);
     Ok(args)
 }
 
@@ -1623,10 +1621,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let matches = crate::help::filesystem(NativeRmCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
-    let mut parsed = NativeRmCommand::from_arg_matches(&matches)?;
-    let results = parsed.results_output.results.take();
-    let results_fd = parsed.results_output.results_fd.take();
-    validate_native_results_fd(results_fd)?;
+    let parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         (
@@ -1690,21 +1686,40 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             Ok(Location::native(endpoint.clone(), path, selection))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut args = native_engine_defaults();
-    args.interface = Interface::NativeRm;
+    let mut args = native_removal_args(
+        parsed.selection.cwd,
+        parsed.selection.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    );
     args.locations = locations;
-    args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
-    args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
-    args.native_results = results.map(OsStringExt::into_vec);
-    args.native_results_fd = results_fd;
     args.pscope = parsed.pscope;
-    args.syq_path = parsed.helper.syq_path;
-    args.no_bootstrap = parsed.helper.no_bootstrap;
-    args.rm = true;
-    apply_native_operational(&mut args, parsed.operational);
     Ok(args)
+}
+
+// Keep common engine settings shared while each command retains its own
+// selection syntax and validation order.
+fn native_removal_args(
+    cwd: Option<OsString>,
+    root: Option<OsString>,
+    operational: NativeOperationalArgs,
+    helper: NativeRemoteHelperArgs,
+    results: NativeResultsArgs,
+) -> Args {
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeRm;
+    args.rm = true;
+    args.native_rm_cwd = cwd.map(OsStringExt::into_vec);
+    args.native_rm_root = root.map(OsStringExt::into_vec);
+    args.native_results = results.results.map(OsStringExt::into_vec);
+    args.native_results_fd = results.results_fd;
+    args.syq_path = helper.syq_path;
+    args.no_bootstrap = helper.no_bootstrap;
+    apply_native_operational(&mut args, operational);
+    args
 }
 
 fn validate_native_results_fd(results_fd: Option<i32>) -> Result<()> {
