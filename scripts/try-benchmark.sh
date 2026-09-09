@@ -39,11 +39,13 @@ Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
 The untimed setup copy and content checks still run. Source/destination,
 removal and output-file options are not accepted after --.
 
-Requires Bash, rsync, OpenSSL, and standard Unix utilities locally. Automatic
-sizing needs Perl with its core JSON::PP module; terminal runs also need Perl. Remote tests
+Requires Bash, rsync, OpenSSL, and standard Unix utilities locally. Syq timing
+uses Perl with its core JSON::PP module; terminal runs also need Perl. Remote tests
 also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
+Syq also reports its copying interval and other time (setup/finish). Short or
+setup-heavy trials get a note: total-time speeds may not show sustained throughput.
 The default push needs --host with --yes. Use a second machine, preferably
 on a fast link with some latency and reachable TCP data ports 47600-47699.
 Local results report seconds: filesystem clones do not measure byte throughput.
@@ -194,7 +196,7 @@ make_data() {
 }
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--preserve=permissions)
+    local command=() syq_options=(--preserve=permissions --results "$local_root/trial.json")
     # This repository-owned caller suppresses only the tiny copy's summary,
     # keeping bootstrap diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
@@ -262,18 +264,55 @@ next_amount() {
     }'
 }
 calibration_interval() {
+    copying_interval "$1" required
+}
+copying_interval() {
     perl -MJSON::PP -e '
+        my $required=shift @ARGV;
         my $result;
         while (<>) {
             my $record=decode_json($_);
             $result=$record if ($record->{type} // "") eq "result";
         }
-        die "Missing successful copying timing\n" unless
-            $result && $result->{status} eq "success" &&
-            defined($result->{copying_elapsed_ms}) &&
-            $result->{copying_elapsed_ms} =~ /^\d+$/;
+        die "Missing successful result\n" unless
+            $result && ($result->{status} // "") eq "success";
+        if (!defined($result->{copying_elapsed_ms}) && $required ne "required") {
+            print "n/a\n"; exit;
+        }
+        die "Missing or invalid copying timing\n" unless
+            defined($result->{copying_elapsed_ms}) && $result->{copying_elapsed_ms} =~ /^\d+$/;
         print $result->{copying_elapsed_ms}, "\n";
-    ' "$1"
+    ' "${2:-optional}" "$1"
+}
+
+summarize_syq_timings() {
+    [[ -s $1 ]] || return 0
+    printf '\nSyq timing breakdown (mean seconds per trial):\n'
+    awk '{
+        key=$1; if (!(key in n)) order[++count]=key;
+        n[key]++; total[key]+=$2;
+        if ($3 == "n/a") unavailable[key]=1;
+        else copying[key]+=$3 / 1000;
+    } END {
+        printf "%-18s %10s %10s %10s\n", "Workload", "Total", "Copying", "Other";
+        for (i=1; i<=count; i++) {
+            key=order[i];
+            if (unavailable[key]) {
+                printf "%-18s %10.3f %10s %10s\n", key, total[key]/n[key], "n/a", "n/a";
+                print "Note (" key "): copying timing unavailable; update syq for a breakdown.";
+                continue;
+            }
+            other=total[key]-copying[key];
+            printf "%-18s %10.3f %10.3f %10.3f\n", key, total[key]/n[key], copying[key]/n[key], other/n[key];
+            if (total[key] > 0 && other >= total[key]*0.5)
+                printf "Note (%s): %.0f%% of syq total time was outside copying; setup/finish substantially affects this comparison.\n", key, other/total[key]*100;
+            if (copying[key]/n[key] < 1)
+                print "Note (" key "): syq copying averaged under 1 second; this test is too short to assess sustained throughput.";
+        }
+    }' "$1"
+    printf 'Other = total minus copying (setup/finish). Copying includes per-file work and waiting, and can overlap setup.\n'
+    printf 'This is not pure network time or an exact setup measurement. Rsync/cp have total time only.\n'
+    printf 'For sustained-throughput comparisons, try --workload large --size auto or a larger fixed --size.\n'
 }
 
 summarize_results() {
@@ -375,9 +414,10 @@ main() {
     [[ $rounds =~ ^[1-9]$ ]] || fail 'Rounds must be between 1 and 9.'
     for tool in bash rsync openssl dd split cksum cmp awk mktemp mkdir rm cat ps sleep sed; do need "$tool"; done
     [[ $mode != local ]] || need cp
-    if [[ $size == auto ]]; then
-        need df; need perl
-        perl -MJSON::PP -e 1 || fail 'Automatic sizing needs Perl with JSON::PP.'
+    [[ $size != auto ]] || need df
+    if [[ $size == auto || $selected_tool == all || $selected_tool == syq ]]; then
+        need perl
+        perl -MJSON::PP -e 1 || fail 'Syq timing needs Perl with JSON::PP.'
     fi
     if [[ $mode != local ]]; then
         [[ -n $host ]] || fail 'Network benchmarks need an SSH host. Pass --host USER@HOST, or --mode local for a local comparison.'
@@ -448,6 +488,7 @@ main() {
     [[ $selected_tool == all ]] || tools=("$selected_tool")
     [[ $workload == both ]] || workloads=("$workload")
     : > "$local_root/results"
+    : > "$local_root/syq-timings"
     for case_name in "${workloads[@]}"; do
         if [[ $case_name == "${workloads[0]}" ]]; then
             # Do this once, not once per workload. Keep the measured copy's full
@@ -544,6 +585,7 @@ main() {
                 if [[ $mode == push ]]; then destination=$remote_root/trial; remote "mkdir $(quote "$destination")"
                 else mkdir "$destination"; fi
                 printf '\n%s: %s, trial %s/%s (%s bytes)\n' "$case_name" "$tool" "$round" "$rounds" "$bytes"
+                rm -f -- "$local_root/trial.json"
                 run timed_copy "$tool" "$source" "$destination" || fail "$tool failed; no successful result recorded for this trial."
                 seconds=$(cat "$local_root/time")
                 printf 'Checking copied data...\n'
@@ -559,6 +601,16 @@ main() {
                     printf 'Verified contents; elapsed %s seconds.\n' "$seconds"
                 else
                     printf 'Verified contents; speed %s MB/s; elapsed %s seconds.\n' "$speed" "$seconds"
+                fi
+                if [[ $tool == syq ]]; then
+                    copying_ms=$(copying_interval "$local_root/trial.json") || fail 'Cannot read syq trial timing.'
+                    if [[ $copying_ms != n/a ]]; then
+                        awk -v ms="$copying_ms" -v seconds="$seconds" 'BEGIN {
+                            if (ms / 1000 > seconds) exit 1;
+                            printf "Syq copying interval: %.3f seconds; other time (setup/finish): %.3f seconds.\n", ms/1000, seconds-ms/1000;
+                        }' || fail 'Syq copying interval exceeds total trial time.'
+                    fi
+                    printf '%s %s %s\n' "$case_name" "$seconds" "$copying_ms" >> "$local_root/syq-timings"
                 fi
                 if [[ $mode == push ]]; then remote "rm -rf $(quote "$destination")"
                 else rm -rf -- "$destination"; fi
@@ -577,6 +629,7 @@ main() {
     fi
     [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
     summarize_results "$local_root/results" "$metric"
+    summarize_syq_timings "$local_root/syq-timings"
     printf '\nCompare the trial range as well as the mean; small differences may be noise.\n'
     printf 'Results depend on your machines and workload.\n'
 }

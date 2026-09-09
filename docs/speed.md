@@ -64,8 +64,31 @@ in-place copying, and diagnostics; `--help` lists them. For example, append
 Path selection, removal and output-file options are excluded so all copies stay
 inside the disposable dataset. With `--tool all`, tuning applies only to syq.
 
+To test the amount of outstanding large-file work over SSH, keep the worker
+count and copy method fixed, then vary only the request window:
+
+```sh
+bash try-benchmark.sh --yes --mode pull --host j5 --workload large \
+  --tool syq --rounds 1 --size quick -- --no-tcp --connections 1 -v \
+  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
+```
+
+Repeat with `pipeline-depth=8` and `16`. With 1 MiB requests, these allow up to
+4, 8 and 16 MiB of outstanding range requests per endpoint per worker. They
+do not resize TCP or SSH flow-control windows. Compare separately with a run
+omitting `--tuning-options`: long remote ranges normally stream, and an explicit
+pipeline depth disables that behavior. The ordinary defaults already allow
+4 MiB × 4 requests; a larger application request window may not help.
+Use a larger fixed size if the timing notes show the test is too short.
+
+For the small-file workload, vary `batch-files` and `batch-bytes` instead,
+such as `--tuning-options batch-files=512,batch-bytes=4M`. Those are batch
+ceilings, and the scheduler may choose smaller batches. `pipeline-depth` does
+not multiply small-file batches. After testing these controls, vary
+`--connections` separately to assess parallelism and its startup cost.
+
 The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
-automatic sizing uses Perl with its core JSON::PP module. Terminal runs also
+syq timing uses Perl with its core JSON::PP module. Terminal runs also
 use Perl to keep SSH prompts interruptible. Remote tests
 need SSH access and rsync on the other machine. Syq prepares a helper matching
 your local build and shows installation progress when one is needed.
@@ -83,8 +106,8 @@ copying; reachable TCP data ports `47600–47699` allow the default encrypted
 TCP path. The script uses normal syq settings and fresh SSH connections for
 both tools. A faster result is not guaranteed. `--mode local` compares local
 copies, and `--workload large` or `--workload both` includes large files.
-Large files measure sustained throughput; small files also exercise per-file
-overhead, so the two workloads can have very different results.
+Sufficiently large tests help measure sustained throughput; small files also
+exercise per-file overhead, so the two workloads can have very different results.
 
 With `--size auto`, the script starts with 64 MiB for the large file and 1,024
 files of 8 KiB for the small-file workload. It makes verified, unscored syq copies
@@ -102,7 +125,8 @@ cp). Choosing both workloads doubles those counts. A faster cp result does not
 cause further growth.
 
 Automatic sizing requires syq to report `copying_elapsed_ms` in its automation
-results. Fixed sizes need no timing field: use `--size quick` (the default),
+results. With older syq versions, fixed sizes still report total times but show
+the copying breakdown as unavailable. Use `--size quick` (the default),
 `--size medium`, or `--size large`
 for fixed workloads: respectively 64 MiB / 1,024 files, 1 GiB / 4,096 files,
 and 8 GiB / 16,384 files. Small files remain 8 KiB each. These flags also let
@@ -132,6 +156,22 @@ optimizations.
 Generation, preparation, calibration, and POSIX `cksum` comparisons are
 outside the scored timers. Preparation shows helper installation messages without
 a throughput result. A failed command or content check stops the comparison.
+
+The main table always uses total command time, including connection startup.
+A separate syq table shows mean total time, its copying interval, and other time
+(total minus copying). Other time covers work outside that interval, such as
+setup and finishing. Copying spans the first file work through the last completed
+work: it includes waiting and per-file overhead, and can overlap planning and
+connection setup. It is neither pure network time nor an exact separation of
+setup from transfer. The script does not estimate this breakdown for rsync or cp.
+
+The script adds a note when at least half of syq's total time falls outside
+copying, or its mean copying interval is under one second. These are diagnostic
+thresholds, not guarantees that longer tests saturate the link. Short jobs still
+measure useful completion time; use `--workload large --size auto` or a larger
+fixed size to investigate sustained throughput. Compare both tools using their
+total times, rather than comparing syq's copying interval with rsync's total.
+
 Caches are not flushed, so this is a cache-friendly test rather than a cold
 disk benchmark. Times include process startup and buffered writes, without
 waiting for durable storage. Small tests can mostly measure startup costs;

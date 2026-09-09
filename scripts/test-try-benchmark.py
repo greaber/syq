@@ -50,11 +50,17 @@ if mode == 'hang':
     child=subprocess.Popen(['sleep','300'])
     pathlib.Path(os.environ['BENCH_TEST_PID']).write_text(str(child.pid))
     child.wait(); sys.exit(1)
+copy_start=time.monotonic()
 shutil.copytree(src,dst,dirs_exist_ok=True)
+copy_ms=int((time.monotonic()-copy_start)*1000)
 if '--results' in args:
     result={'type': 'result', 'status': 'success'}
     if not os.environ.get('BENCH_TEST_OLD'):
-        result['copying_elapsed_ms']=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
+        if dst.name == 'calibration':
+            copy_ms=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
+        result['copying_elapsed_ms']=copy_ms
+    if os.environ.get('BENCH_TEST_BAD_TIMING'):
+        result['copying_elapsed_ms']=999999999
     pathlib.Path(args[args.index('--results')+1]).write_text(json.dumps(result)+'\n')
 if '--quiet' not in args and src.name == 'probe':
     print('test double: preparing matching remote helper', flush=True)
@@ -200,6 +206,50 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(['large', 'cp', '0.003', '0.002', '0.004', '2'],
                       [line.split() for line in result.stdout.splitlines()])
+
+    def test_timing_breakdown_and_short_or_setup_heavy_notes(self):
+        records = self.root / 'timings'
+        records.write_text('large 10 8000\nlarge 14 10000\n'
+                           'small 10 3000\nshort 0.4 100\nzero 0.01 0\n'
+                           'old 5 n/a\nold 7 5000\n')
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        result = subprocess.run(['/bin/bash', '-c', definitions +
+                                 '\nsummarize_syq_timings "$1"', 'timing-test', str(records)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split() for line in result.stdout.splitlines()]
+        self.assertIn(['large', '12.000', '9.000', '3.000'], rows)
+        self.assertIn(['old', '6.000', 'n/a', 'n/a'], rows)
+        self.assertIn(['zero', '0.010', '0.000', '0.010'], rows)
+        self.assertIn('Note (small): 70%', result.stdout)
+        self.assertIn('Note (short): syq copying averaged under 1 second', result.stdout)
+        self.assertNotIn('Note (large)', result.stdout)
+        self.assertIn('not pure network time', result.stdout)
+
+    def test_fixed_size_with_old_syq_keeps_total_results(self):
+        result = self.invoke('--tool', 'syq', env=dict(self.env, BENCH_TEST_OLD='1'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Results (seconds', result.stdout)
+        self.assertIn('copying timing unavailable', result.stdout)
+        self.assert_clean()
+
+    def test_invalid_timing_is_rejected(self):
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        records = self.root / 'timings.json'
+        for record in ['{}', '{bad json',
+                       '{"type":"result","status":"failed","copying_elapsed_ms":1}',
+                       '{"type":"result","status":"success","copying_elapsed_ms":-1}']:
+            with self.subTest(record=record):
+                records.write_text(record + '\n')
+                result = subprocess.run(['/bin/bash', '-c', definitions +
+                                         '\ncopying_interval "$1"', 'timing-test', str(records)],
+                                        env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+        result = self.invoke('--tool', 'syq', env=dict(self.env, BENCH_TEST_BAD_TIMING='1'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('copying interval exceeds total trial time', result.stderr)
+        self.assertNotIn('Results (', result.stdout)
+        self.assert_clean()
 
     def test_auto_sizes_with_syq_for_each_direction(self):
         for mode in ['local', 'push', 'pull']:
