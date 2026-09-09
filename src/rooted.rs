@@ -1059,6 +1059,13 @@ impl Root {
         size: u64,
     ) -> Result<Option<File>> {
         let parent = self.resolve_parent(path)?;
+        // Reuse the held parent for the partial check and clone publication.
+        // RENAME_EXCL below also protects a partial created after this check.
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect clone partial"),
+        }
         let pair = (source.metadata()?.dev(), parent.directory.metadata()?.dev());
         // Process-local capability cache: file metadata and directory ACL failures
         // are not properties of a filesystem pair and must never enter it.
@@ -1095,15 +1102,7 @@ impl Root {
         }
         let temporary = match create_temporary(&parent, |fd, name| {
             #[cfg(debug_assertions)]
-            if let Ok(error) = std::env::var("SYQ_TEST_CLONE_MKDIR_ERROR") {
-                let code = match error.as_str() {
-                    "EACCES" => libc::EACCES,
-                    "EPERM" => libc::EPERM,
-                    "EMLINK" => libc::EMLINK,
-                    _ => libc::EIO,
-                };
-                return Err(io::Error::from_raw_os_error(code));
-            }
+            fail_clone_mkdir_for_test()?;
             retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
         }) {
             Ok(temporary) => temporary,
@@ -1123,10 +1122,11 @@ impl Root {
         let mut trusted_directory = None;
         let result = (|| -> Result<Option<File>> {
             #[cfg(debug_assertions)]
-            if std::env::var_os("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR").is_some() {
-                return Err(io::Error::from_raw_os_error(libc::EIO))
-                    .context("test clone directory failure");
-            }
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
+                libc::EIO,
+                "test clone directory failure",
+            )?;
             let directory = match open_directory_at(&parent.directory, temporary.as_bytes()) {
                 Ok(directory) => directory,
                 Err(error)
@@ -1140,9 +1140,7 @@ impl Root {
                 Err(error) => return Err(error).context("open private clone directory"),
             };
             #[cfg(debug_assertions)]
-            if std::env::var_os("SYQ_TEST_CLONE_PUBLIC_DIRECTORY").is_some() {
-                retry_zero(|| unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) })?;
-            }
+            make_clone_directory_public_for_test(&directory)?;
             let metadata = directory.metadata()?;
             if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o5777 != 0o700 {
                 // Some filesystems synthesize permissions. Fall back without
@@ -1158,15 +1156,7 @@ impl Root {
             // function but not this constant. Do not request source ACLs.
             const CLONE_NOOWNERCOPY: u32 = 0x0002;
             #[cfg(debug_assertions)]
-            if let Some(events) = std::env::var_os("SYQ_TEST_CLONE_ATTEMPTS") {
-                use std::io::Write;
-                writeln!(
-                    OpenOptions::new().create(true).append(true).open(events)?,
-                    "clone"
-                )?;
-            }
-            #[cfg(debug_assertions)]
-            if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
+            if record_clone_attempt_for_test()? {
                 pairs.lock().unwrap().insert(pair, false);
                 return Ok(None);
             }
@@ -1180,22 +1170,14 @@ impl Root {
             };
             if cloned != 0 {
                 let error = io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS | libc::EINVAL)
-                ) {
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS)
-                    ) {
+                match error.raw_os_error() {
+                    Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS) => {
                         pairs.lock().unwrap().insert(pair, false);
+                        return Ok(None);
                     }
-                    return Ok(None);
+                    Some(libc::EINVAL | libc::EACCES | libc::EPERM) => return Ok(None),
+                    _ => return Err(error).context("clone local file"),
                 }
-                if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
-                    return Ok(None);
-                }
-                return Err(error).context("clone local file");
             }
             // Normalize owner access before opening the caller-owned clone.
             // Immutable/append-only clones can refuse chmod; those retain
@@ -1246,10 +1228,11 @@ impl Root {
                 return Ok(None);
             }
             #[cfg(debug_assertions)]
-            if std::env::var_os("SYQ_TEST_FAIL_CLONE_AFTER_CREATE").is_some() {
-                return Err(io::Error::from_raw_os_error(libc::ENOSPC))
-                    .context("test clone failure");
-            }
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
+                libc::ENOSPC,
+                "test clone failure",
+            )?;
             retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
             // Do not replace an existing resumable partial, including one that
             // appeared after the caller checked. Both directory fds stay pinned.
@@ -1281,17 +1264,22 @@ impl Root {
             }
             // Also runs when opening or checking the new directory failed.
             // rmdir cannot traverse a replacement or delete its contents.
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_RMDIR",
+                libc::EACCES,
+                "test clone staging rmdir failure",
+            )?;
             unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
                 .context("remove private clone directory")
         })();
         #[cfg(debug_assertions)]
         let cleanup = cleanup.and_then(|()| {
-            if std::env::var_os("SYQ_TEST_FAIL_CLONE_CLEANUP").is_some() {
-                Err(io::Error::from_raw_os_error(libc::EACCES))
-                    .context("test clone cleanup failure")
-            } else {
-                Ok(())
-            }
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_CLEANUP",
+                libc::EACCES,
+                "test clone cleanup failure",
+            )
         });
         match (result, cleanup) {
             (Err(copy_error), Err(cleanup_error)) => {
@@ -1300,6 +1288,9 @@ impl Root {
                     "{original}; additionally, clone cleanup failed: {cleanup_error:#}"
                 )))
             }
+            // Publication here only names the resumable partial, not the final
+            // destination. Keep cleanup failure visible; rerunning verifies and
+            // finishes that partial through the ordinary resume path.
             (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
             (result, Ok(())) => result,
         }
@@ -1975,6 +1966,50 @@ struct ResolvedParent {
     leaf: CString,
 }
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn fail_clone_for_test(variable: &str, code: libc::c_int, context: &str) -> Result<()> {
+    if std::env::var_os(variable).is_some() {
+        return Err(io::Error::from_raw_os_error(code)).context(context.to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn fail_clone_mkdir_for_test() -> io::Result<()> {
+    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_MKDIR_ERROR") {
+        return Err(io::Error::from_raw_os_error(match error.as_str() {
+            "EACCES" => libc::EACCES,
+            "EPERM" => libc::EPERM,
+            "EMLINK" => libc::EMLINK,
+            _ => libc::EIO,
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn make_clone_directory_public_for_test(directory: &File) -> Result<()> {
+    if std::env::var_os("SYQ_TEST_CLONE_PUBLIC_DIRECTORY").is_some() {
+        retry_zero(|| unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) })?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn record_clone_attempt_for_test() -> Result<bool> {
+    if let Some(events) = std::env::var_os("SYQ_TEST_CLONE_ATTEMPTS") {
+        use std::io::Write;
+        writeln!(
+            OpenOptions::new().create(true).append(true).open(events)?,
+            "clone"
+        )?;
+    }
+    Ok(std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some())
+}
+
+// APFS eligibility uses device pairs, whereas Linux offload distinguishes
+// mounts and their NFS/synchronous traits. Keep this clone-specific cache here:
+// file metadata and ACL refusals must not disable other files on the volume.
 #[cfg(target_os = "macos")]
 fn clone_volume_pairs() -> &'static Mutex<HashMap<(u64, u64), bool>> {
     static PAIRS: OnceLock<Mutex<HashMap<(u64, u64), bool>>> = OnceLock::new();

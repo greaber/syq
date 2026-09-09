@@ -7,11 +7,17 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay.
 
-On macOS, eligible local files above the small-file limit (normally 4 MiB)
-use filesystem cloning when both paths are on the same APFS volume. The copy initially shares disk blocks
-with the source; later changes to either file are independent. Reported bytes
-count the file's size, so the displayed rate can exceed the disk's physical
-throughput. Other filesystems and cross-volume copies use normal copying.
+On macOS, eligible local files use filesystem cloning when both paths are on
+the same APFS volume. The copy initially shares disk blocks with the source;
+later changes to either file are independent. Reported bytes count the file's
+size, so the displayed rate can exceed the disk's physical throughput.
+Other filesystems and cross-volume copies use normal copying.
+
+Files at or below the batching threshold are sent together to reduce per-file
+overhead. Larger files can use cloning. This threshold is the smallest of the
+hash block size (`--block-size`, normally 4 MiB), `batch-bytes`, and the effective
+`request-size`; changing those settings changes which files can be cloned.
+See [batch sizes](tuning.md#batch-size-and-splitting) for tuning options.
 
 Cloning keeps the usual overwrite and metadata rules. Copies with a resumable
 partial, in-place writes, checksum comparison, a bandwidth limit, or
@@ -19,8 +25,6 @@ partial, in-place writes, checksum comparison, a bandwidth limit, or
 with inheritable access control entries, filesystem-compressed files, and files
 whose metadata cannot be safely removed also use normal copying. Cloned copies
 omit source extended attributes and file flags, just as normal copies do.
-Smaller files are sent together in batches to reduce per-file overhead; see
-[batch sizes](tuning.md#batch-size-and-splitting).
 
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.
@@ -253,6 +257,14 @@ Running the same copy twice at once can cause errors as the runs share temporary
 files. Wait for it to finish or stop it before restarting. To abandon a copy,
 stop all its runs before removing hidden files with `.syq-part.` in their names
 at the destination.
+
+An abruptly stopped macOS clone can also leave a hidden directory named
+`.syq-swap-<pid>-<counter>` beside the destination, possibly containing a `data`
+file. Syq does not resume or automatically remove these directories. After
+stopping all copies using that destination, you can remove those leftover
+directories and their contents. A staging-directory cleanup error leaves the
+final destination unchanged and may leave a complete `.syq-part.` file; rerun
+the copy to verify and finish it.
 
 ## Check file contents
 

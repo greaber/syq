@@ -65,6 +65,11 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
         run: cargo test --locked --all-targets --no-fail-fast
+      - name: Measure APFS cloning on manual runs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cargo build --release --locked --bin syq
+          python3 scripts/benchmark-macos-clone.py target/release/syq
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

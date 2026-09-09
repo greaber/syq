@@ -3269,9 +3269,9 @@ impl Endpoint {
                 // Every connection clone for this logical local endpoint uses
                 // the control connection's process-local session slot. Once
                 // the control registers roots, workers clone those retained
-                // descriptors in process instead of claiming SCM_RIGHTS from
-                // the broker after worker threads exist (unsupported on
-                // Darwin).
+                // destination descriptors in process. Same-host copy sources
+                // may additionally be claimed from the descriptor broker,
+                // including on Darwin after worker threads have started.
                 let mut conn = LocalConn::new(&role, descriptor_session.clone());
                 match role {
                     ConnectionRole::DestinationWorker {

@@ -122,9 +122,7 @@ enum FileSystemKey {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy {
     inplace: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allow_sequential_nfs_fallback: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     allow_sequential_local_fallback: bool,
 }
 
@@ -5534,16 +5532,14 @@ impl FsOps {
         }
         let (source, _, target) = self.prepare_local_copy(source, dst)?;
         let root = target.root.clone();
-        let (partial, label) = rooted_partial_target(&target, copy_id)?;
+        let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
-        if root.metadata_optional(&partial)?.is_some() {
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         let Some(file) = root.clone_file(&source, &partial, size)? else {
             return Ok(CopyLocalOutcome::Unsupported);
         };
-        require_safe_rooted_named_partial(&root, &partial, &label, &file)?;
+        // The clone is newly created and private. Finalize checks that its
+        // sidecar still names this singly-linked inode before publishing it.
         self.cache_file(
             FileLocation::Rooted {
                 root: root.identity(),

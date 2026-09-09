@@ -617,6 +617,50 @@ fn macos_clone_reports_copy_and_cleanup_errors() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
+fn macos_clone_rmdir_failure_keeps_complete_partial_for_resume() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    let data = prng(5 << 20, 1003);
+    write(&t.path("src"), &data);
+    write(&t.path("dst"), b"old destination");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_FAIL_CLONE_RMDIR", "1")
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("test clone staging rmdir failure"));
+    assert_eq!(read(&t.path("dst")), b"old destination");
+    let partials = partial_files(&t.0);
+    assert_eq!(partials.len(), 1);
+    assert_eq!(read(&partials[0]), data);
+    let staging: Vec<_> = fs::read_dir(&t.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".syq-swap-")
+        })
+        .collect();
+    assert_eq!(staging.len(), 1);
+    assert_eq!(fs::read_dir(&staging[0]).unwrap().count(), 0);
+    // The process has exited; remove only this test's empty staging directory.
+    fs::remove_dir(&staging[0]).unwrap();
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
 fn macos_clone_strips_quarantine_without_reading_ranges() {
     use std::os::fd::AsRawFd;
     if !macos_clone_support::available() {
