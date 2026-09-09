@@ -18990,6 +18990,102 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
 }
 
 #[test]
+fn forgetting_offline_owner_recreates_missing_lock() {
+    let t = Tmp::new();
+    write(&t.path(".syq-destinations-v3/laptop.owner"), b"{}");
+    fs::set_permissions(
+        t.path(".syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["persist", "destinations", "forget", "laptop"])
+        .env("HOME", t.path(""))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(!t.path(".syq-destinations-v3/laptop.owner").exists());
+    assert_eq!(
+        fs::metadata(t.path(".syq-destinations-v3/laptop.lock"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn offline_receiver_ownership_keeps_names_but_allows_remote_completion() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("home/.syq-destinations-v3/fake.owner"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let names = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "source",
+            "--to",
+            "@fake",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_output_ok(&names);
+    assert_eq!(names.stdout, b"@fake\0");
+    let ssh = fake_ssh(&t);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "9",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--src",
+            "source",
+            "--to",
+            "fake",
+            "--into",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .output()
+    .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![(
+            b'p',
+            t.path("remote-home/data/nested/")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        )]
+    );
+}
+
+#[test]
 fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() {
     let t = Tmp::new();
     fs::create_dir(t.path("downloads")).unwrap();

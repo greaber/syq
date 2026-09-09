@@ -158,10 +158,14 @@ pub(super) fn claim(directory: &Path, name: &str, key: &str) -> Result<()> {
         }
         return Ok(());
     }
+    // Comments are untrusted metadata, not identity. Keep records bounded by
+    // the Ed25519 key size even when the wire key carries a long comment.
+    let mut key = PublicKey::from_openssh(key)?;
+    key.set_comment("");
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(&serde_json::to_vec(&Owner {
         version: 1,
-        public_key: key.into(),
+        public_key: key.to_openssh()?,
     })?)?;
     temporary.as_file().sync_all()?;
     temporary.persist_noclobber(directory.join(format!("{name}.owner")))?;
@@ -323,6 +327,28 @@ mod tests {
     }
 
     #[test]
+    fn long_key_comment_does_not_poison_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_key().unwrap();
+        let challenge = random_token().unwrap();
+        let mut proof = prove(&key, "laptop", &challenge, "secret").unwrap();
+        proof.public_key.push_str(&"x".repeat(16_384));
+        let public = verify(proof, "laptop", &challenge, "secret", None).unwrap();
+        claim(dir.path(), "laptop", &public).unwrap();
+        let saved = owner(dir.path(), "laptop").unwrap().unwrap();
+        assert!(saved.len() < 128);
+        verify(
+            prove(&key, "laptop", &challenge, "secret").unwrap(),
+            "laptop",
+            &challenge,
+            "secret",
+            Some(&saved),
+        )
+        .unwrap();
+        claim(dir.path(), "laptop", &public).unwrap();
+    }
+
+    #[test]
     fn ownership_survives_disconnect_until_explicit_forget() {
         let dir = tempfile::tempdir().unwrap();
         let first = generate_key().unwrap().public_key().to_openssh().unwrap();
@@ -330,9 +356,19 @@ mod tests {
         claim(dir.path(), "laptop", &first).unwrap();
         claim(dir.path(), "laptop", &first).unwrap();
         assert!(claim(dir.path(), "laptop", &second).is_err());
-        assert_eq!(owner(dir.path(), "laptop").unwrap(), Some(first));
+        assert_eq!(
+            PublicKey::from_openssh(&owner(dir.path(), "laptop").unwrap().unwrap())
+                .unwrap()
+                .key_data(),
+            PublicKey::from_openssh(&first).unwrap().key_data()
+        );
         forget(dir.path(), "laptop").unwrap();
         claim(dir.path(), "laptop", &second).unwrap();
-        assert_eq!(owner(dir.path(), "laptop").unwrap(), Some(second));
+        assert_eq!(
+            PublicKey::from_openssh(&owner(dir.path(), "laptop").unwrap().unwrap())
+                .unwrap()
+                .key_data(),
+            PublicKey::from_openssh(&second).unwrap().key_data()
+        );
     }
 }

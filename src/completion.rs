@@ -1467,7 +1467,7 @@ fn complete_path_for(
     if find_option_value(args, b"--via").is_some()
         || (authorizer != Some("ssh")
             && (authorizer.is_some_and(|value| value != "auto")
-                || (command == "cp" && !crate::destination::registered_names().is_empty())))
+                || (command == "cp" && !crate::destination::connection_names().is_empty())))
     {
         // Completion must never request copy approval or inspect hostB through
         // an automatically selected authorizer. Explicit SSH keeps normal completion.
@@ -1475,7 +1475,7 @@ fn complete_path_for(
     }
     if endpoint.host.starts_with('@')
         || (authorizer != Some("ssh")
-            && crate::destination::registered_names().contains(&endpoint.host))
+            && crate::destination::connection_names().contains(&endpoint.host))
     {
         return Ok(Vec::new());
     }

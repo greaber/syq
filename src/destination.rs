@@ -267,6 +267,15 @@ fn private_directory(name: &str) -> Result<PathBuf> {
 /// Completion only lists local names; it never creates state or asks a laptop
 /// for file listings without a transfer approval.
 pub(crate) fn registered_names() -> Vec<String> {
+    local_names(true)
+}
+
+/// Connection records only, for completion routing without network probes.
+pub(crate) fn connection_names() -> Vec<String> {
+    local_names(false)
+}
+
+fn local_names(include_offline: bool) -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
@@ -289,7 +298,11 @@ pub(crate) fn registered_names() -> Vec<String> {
             let file = file.to_str()?;
             let name = file
                 .strip_suffix(".json")
-                .or_else(|| file.strip_suffix(".owner"))?
+                .or_else(|| {
+                    include_offline
+                        .then(|| file.strip_suffix(".owner"))
+                        .flatten()
+                })?
                 .to_owned();
             validate_name(&name).ok()?;
             Some(name)
@@ -1371,6 +1384,9 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(directory.join(format!("{name}.lock")))?;
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
