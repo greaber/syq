@@ -15,9 +15,10 @@ Other filesystems and cross-volume copies use normal copying.
 
 Files at or below the batching threshold are sent together to reduce per-file
 overhead. Larger files can use cloning. This threshold is the smallest of the
-hash block size (`--block-size`, normally 4 MiB), `batch-bytes`, and the effective
-`request-size`; changing those settings changes which files can be cloned.
-See [batch sizes](tuning.md#batch-size-and-splitting) for tuning options.
+hash block size (4 MiB for `syq cp`), `batch-bytes`, and the effective
+`request-size`; changing the tuning limits changes which files can be cloned.
+`syq rsync --block-size` can also change the hash block size. See
+[batch sizes](tuning.md#batch-size-and-splitting) for tuning options.
 
 Cloning keeps the usual overwrite and metadata rules. Copies with a resumable
 partial, in-place writes, checksum comparison, a bandwidth limit, or
