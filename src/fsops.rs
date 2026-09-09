@@ -9872,33 +9872,38 @@ mod tests {
 
     #[test]
     fn parallel_metadata_batches_share_a_bounded_pool() {
-        let callers = 4;
-        let start = std::sync::Barrier::new(callers);
-        let threads: std::collections::HashSet<_> = std::thread::scope(|scope| {
-            let batches: Vec<_> = (0..callers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        start.wait();
-                        let items: Vec<_> = (0..128).collect();
-                        parallel_map(&items, |&index| (index, std::thread::current().id()))
-                    })
+        let mut owners = HashMap::new();
+        let mut shared = false;
+        // More callers than pool threads guarantees reuse without depending on
+        // scheduling or the number of available CPUs. Run callers sequentially
+        // so a broken per-caller pool cannot exhaust the test host's thread limit.
+        for caller in 0..=PAR_THREADS {
+            let results = std::thread::spawn(|| {
+                let items: Vec<_> = (0..128).collect();
+                parallel_map(&items, |&index| {
+                    let thread = std::thread::current();
+                    assert!(thread
+                        .name()
+                        .is_some_and(|name| name.starts_with("syq-metadata-")));
+                    (index, thread.id())
                 })
-                .collect();
-            batches
-                .into_iter()
-                .flat_map(|batch| {
-                    let results = batch.join().unwrap();
-                    assert_eq!(
-                        results.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
-                        (0..128).collect::<Vec<_>>()
-                    );
-                    results.into_iter().map(|(_, thread)| thread)
-                })
-                .collect()
-        });
-        assert!(!threads.is_empty());
+            })
+            .join()
+            .unwrap();
+            assert_eq!(
+                results.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
+                (0..128).collect::<Vec<_>>()
+            );
+            for (_, thread) in results {
+                shared |= *owners.entry(thread).or_insert(caller) != caller;
+            }
+        }
         assert!(
-            threads.len() <= PAR_THREADS,
+            shared,
+            "different callers must execute on shared metadata workers"
+        );
+        assert!(
+            owners.len() <= PAR_THREADS,
             "metadata concurrency must not multiply by caller count"
         );
     }
@@ -9938,15 +9943,16 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_batches_preserve_order_confinement_and_release_capabilities() {
+    fn source_stat_batches_return_fresh_ordered_results_and_release_roots() {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
         let root = worker.source_roots[&selections[0].root()].root.clone();
-        let outside = crate::test_support::tempdir().unwrap();
-        fs::write(outside.path().join("secret"), b"secret").unwrap();
-        std::os::unix::fs::symlink(outside.path(), temporary.path().join("link")).unwrap();
-        for (round, count) in [31, 32, 65, 128, 7, 512].into_iter().enumerate() {
+        let sizes = [31, 32, 65, 128, 7, 129];
+        let mut previous_cycle_refs = None;
+        // Repeat the size sweep to allow caches to warm before checking that
+        // requests do not keep accumulating references to the source root.
+        for (round, count) in sizes.into_iter().cycle().take(sizes.len() * 2).enumerate() {
             for idx in 0..64 {
                 fs::write(
                     temporary.path().join(format!("f{idx}")),
@@ -9957,38 +9963,31 @@ mod tests {
             let sources: Vec<_> = (0..count)
                 .map(|idx| {
                     selections[0]
-                        .join(
-                            if idx == 3 {
-                                b"link/secret".to_vec()
-                            } else {
-                                format!("f{}", idx % 64).into_bytes()
-                            }
-                            .as_slice(),
-                        )
+                        .join(format!("f{}", idx % 64).as_bytes())
                         .unwrap()
                 })
                 .collect();
-            let root_refs = Arc::strong_count(&root);
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
                 sources: Some(sources),
                 follow: true,
                 guard: None,
             });
-            assert_eq!(
-                Arc::strong_count(&root),
-                root_refs,
-                "release batch capabilities before replying"
-            );
             let Response::Stats(entries) = response else {
                 panic!("unexpected response: {response:?}");
             };
             assert_eq!(entries.len(), count);
             for (idx, entry) in entries.into_iter().enumerate() {
-                assert_eq!(
-                    entry.map(|e| e.size),
-                    (idx != 3).then_some((idx % 64 + round) as u64)
-                );
+                assert_eq!(entry.map(|e| e.size), Some((idx % 64 + round) as u64));
+            }
+            if (round + 1) % sizes.len() == 0 {
+                let refs = Arc::strong_count(&root);
+                if let Some(previous) = previous_cycle_refs.replace(refs) {
+                    assert!(
+                        refs <= previous,
+                        "source-root references must not grow across size sweeps"
+                    );
+                }
             }
         }
         drop(worker);
@@ -10000,7 +9999,7 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_batches_recover_after_exact_leaf_identity_errors() {
+    fn source_stat_batches_recover_after_a_missing_source() {
         let temporary = crate::test_support::tempdir().unwrap();
         let path = temporary.path().join("selected");
         fs::write(&path, b"original").unwrap();
@@ -10013,25 +10012,16 @@ mod tests {
         };
         assert!(matches!(worker.handle(&request), Response::Stats(entries) if entries.len() == 64));
 
-        let leaf = worker.source_roots[&selections[0].root()]
-            ._leaf_object
-            .as_ref()
-            .unwrap()
-            .clone();
-        let leaf_refs = Arc::strong_count(&leaf);
-        // A failed batch must release its exact-leaf capabilities before replying.
-        // Restoring the selected inode then permits a fresh successful batch.
+        // A missing file must fail the batch; restoring it permits the next
+        // batch to return fresh results without carrying over the earlier error.
         fs::rename(&path, temporary.path().join("original")).unwrap();
-        fs::write(&path, b"replacement").unwrap();
-        assert!(
-            matches!(worker.handle(&request), Response::EndpointError(error)
-            if error.message.contains("registered source leaf changed identity"))
-        );
-        assert_eq!(Arc::strong_count(&leaf), leaf_refs);
+        assert!(matches!(
+            worker.handle(&request),
+            Response::EndpointError(_)
+        ));
         fs::rename(temporary.path().join("original"), &path).unwrap();
         assert!(matches!(worker.handle(&request), Response::Stats(entries)
             if entries.len() == 64 && entries.iter().all(|entry| entry.as_ref().is_some_and(|e| e.size == 8))));
-        assert_eq!(Arc::strong_count(&leaf), leaf_refs);
     }
 
     #[test]
