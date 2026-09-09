@@ -5165,7 +5165,7 @@ impl FsOps {
         &self,
         source: &RegisteredPath,
         dst: &[u8],
-    ) -> Result<(File, RootedTarget)> {
+    ) -> Result<(File, fs::Metadata, RootedTarget)> {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
@@ -5201,6 +5201,7 @@ impl FsOps {
         }
         Ok((
             s,
+            source_metadata,
             RootedTarget {
                 root: destination_root,
                 relative: destination_relative,
@@ -5230,9 +5231,8 @@ impl FsOps {
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
         } = policy;
-        let (s, target) = self.prepare_local_copy(source, dst)?;
+        let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
-        let source_metadata = s.metadata()?;
         // Advisory sequential readahead for the kernel copy on Linux.
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
@@ -5532,7 +5532,7 @@ impl FsOps {
         if policy.inplace || process_umask() & 0o700 != 0 {
             return Ok(CopyLocalOutcome::Unsupported);
         }
-        let (source, target) = self.prepare_local_copy(source, dst)?;
+        let (source, _, target) = self.prepare_local_copy(source, dst)?;
         let root = target.root.clone();
         let (partial, label) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);

@@ -39,7 +39,8 @@ to await replies at once. Both can increase memory use. Neither changes the
 hash blocks used for integrity checks and resume.
 
 `copy-path=ranges` disables small-file batches and whole-file shortcuts,
-including local kernel copying. Matching data can still be skipped or reused.
+including local kernel copying and APFS cloning. Matching data can still be
+skipped or reused.
 `auto` lets syq choose normally.
 
 ### Streaming and request windows
