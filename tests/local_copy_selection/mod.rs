@@ -194,7 +194,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(partial_files(&t.path("dst")), partials);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -261,8 +261,9 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
     write(&t.path("src/file"), &contents);
     let resumed = run().run().unwrap();
     assert_output_ok(&resumed);
+    assert_eq!(partial_files(&t.path("dst")), partials);
+    run_native_ok(&["clean-partials", &t.s("dst")]);
     assert_same_tree(&t.path("src"), &t.path("dst"));
-    assert!(partial_files(&t.path("dst")).is_empty());
     let observed = tuning_observed(&resumed);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);

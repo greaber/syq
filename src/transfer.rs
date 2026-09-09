@@ -154,7 +154,7 @@ pub struct Opts {
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
-    pub copy_id: std::sync::OnceLock<CopyId>,
+    pub copy_id: CopyId,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
     /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
@@ -171,8 +171,6 @@ pub struct Opts {
     pub preserve_existing_directory_metadata: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Record the local rsync operator-path opt-out in the resume identity.
-    pub insecure_links: bool,
     /// Symlink policy for the operator-selected destination path.
     pub operator_symlink_policy: OperatorSymlinkPolicy,
     /// --max-size / --min-size: regular files outside the range are not transferred.
@@ -657,25 +655,6 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
     output
 }
 
-/// The canonical form of a path (symlinks and `..` resolved the way the kernel
-/// does), normalized by the endpoint that holds it. Used for the copy identity —
-/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
-fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
-    if !remote {
-        return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
-    }
-    match ok(
-        ctl.call(Request::Canonicalize {
-            path: path.to_vec(),
-            guard: None,
-        })?,
-        "canonicalize",
-    )? {
-        Response::Path(p) => Ok(crate::fsops::resolve(&p)),
-        other => bail!("unexpected response {other:?}"),
-    }
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum DestinationIdentityPlan {
     /// The command-restricted enrollment already supplied the canonical
@@ -716,87 +695,6 @@ fn destination_identity_plan(
     } else {
         DestinationIdentityPlan::Canonicalize(destination_path.to_vec())
     }
-}
-
-/// Encode the content/metadata-affecting options into the copy identity.
-fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
-    let source_modes: Vec<&str> = srcs
-        .iter()
-        .map(|source| match source.selection {
-            crate::cli::SourceSelection::Rsync => "rsync",
-            crate::cli::SourceSelection::Named => "named-follow",
-            crate::cli::SourceSelection::Contents => "contents-follow",
-            crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
-            crate::cli::SourceSelection::File => "file",
-            crate::cli::SourceSelection::Directory => "directory",
-        })
-        .collect();
-    let mut flags = serde_json::json!({
-        "partial_format": 1,
-        "recursive": opts.recursive,
-        "links": opts.links,
-        "perms": opts.flags & flags::MODE != 0,
-        "times": opts.flags & flags::TIMES != 0,
-        "group": opts.flags & flags::GROUP != 0,
-        "owner": opts.flags & flags::OWNER != 0,
-        "devices": opts.devices,
-        "inplace": args.inplace,
-        "block_size": opts.block,
-        "ignore": opts.ignore,
-    });
-    // Keep the established compatibility identity byte-for-byte stable so an
-    // upgrade does not orphan resumable sidecars.
-    if srcs
-        .iter()
-        .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
-    {
-        flags["source_modes"] = serde_json::json!(source_modes);
-    }
-    if opts.insecure_links {
-        flags["insecure_links"] = serde_json::json!(true);
-    }
-    flags.to_string()
-}
-
-/// The endpoint half of a copy identity: `user@host[:port]` (the user and an
-/// explicit port matter — they may select different filesystems), or `local`.
-fn endpoint_identity(l: &Location) -> String {
-    match (&l.user, &l.host) {
-        (_, None) => "local".into(),
-        (user, Some(host)) => {
-            // Preserve the established portless identity byte-for-byte. A
-            // port-qualified native endpoint gets a distinct, unambiguous
-            // spelling; IPv6 needs brackets before the port separator.
-            let host = match l.port {
-                Some(port) if host.contains(':') => format!("[{host}]:{port}"),
-                Some(port) => format!("{host}:{port}"),
-                None => host.clone(),
-            };
-            match user {
-                Some(user) => format!("{user}@{host}"),
-                None => host,
-            }
-        }
-    }
-}
-
-/// Keep existing partial identities unchanged for UTF-8 paths, while giving
-/// native raw-byte paths a lossless and unambiguous spelling.
-pub(crate) fn path_identity(path: &std::path::Path) -> String {
-    if let Some(path) = path.to_str() {
-        return path.to_string();
-    }
-    use std::fmt::Write as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    let bytes = path.as_os_str().as_bytes();
-    let mut encoded = String::with_capacity(15 + bytes.len() * 2);
-    // NUL cannot occur in a Unix pathname, so no valid UTF-8 path can collide
-    // with this encoded namespace.
-    encoded.push_str("\0unix-path-hex:");
-    for byte in bytes {
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
 }
 
 struct DestinationRoot<'a> {
@@ -840,63 +738,6 @@ pub(crate) fn validate_native_source_type(
         | SourceSelection::Directory
         | SourceSelection::Contents => Ok(()),
     }
-}
-
-fn resolve_copy_identity(
-    args: &Args,
-    srcs: &[Location],
-    dst: &Location,
-    src_ctl: &mut dyn Conn,
-    dst_ctl: &mut dyn Conn,
-    dst_canonical: Option<std::path::PathBuf>,
-    opts: &Opts,
-) -> Result<String> {
-    // Relative native bases and selectors get their meaning from the source
-    // endpoint's process cwd. Identify that already-held cwd separately;
-    // never canonicalize the registered selection after it has been pinned.
-    let src_roots: Vec<(String, bool)> = if args.interface == Interface::NativeCp {
-        source_identity_parts(args, srcs, src_ctl)?
-    } else {
-        srcs.iter()
-            .map(|source| {
-                let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-                Ok((path_identity(&path), source.copies_contents()))
-            })
-            .collect::<Result<_>>()?
-    };
-    let dst_root = match dst_canonical {
-        Some(path) => path,
-        None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
-    };
-    let dst_root = path_identity(&dst_root);
-    Ok(crate::resume::copy_identity(
-        &endpoint_identity(&srcs[0]),
-        &src_roots,
-        &endpoint_identity(dst),
-        &dst_root,
-        &semantic_flags(opts, args, srcs),
-    ))
-}
-
-/// The job-identity inputs that do not depend on the destination endpoint:
-/// what a small push sends so the receiver can finish the identity with the
-/// canonical destination it resolves.
-fn source_identity_parts(
-    args: &Args,
-    srcs: &[Location],
-    src_ctl: &mut dyn Conn,
-) -> Result<Vec<(String, bool)>> {
-    let native_endpoint_cwd =
-        canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))?;
-    Ok(srcs
-        .iter()
-        .map(|source| {
-            (
-                native_source_identity(args, source, &native_endpoint_cwd),
-                source.copies_contents(),
-            )
-        })
-        .collect())
 }
 
 /// Mode a fresh destination file is created with: the source mode under -p,
@@ -1119,11 +960,8 @@ fn attempt_small_copy(
         symlink_policy: opts.operator_symlink_policy,
         request_prefix,
         identity: SmallCopyIdentity {
-            src_endpoint: endpoint_identity(&srcs[0]),
-            src_roots: source_identity_parts(args, srcs, src_ctl)?,
-            dst_endpoint: endpoint_identity(dst),
+            copy_id: opts.copy_id,
             dst_leaf,
-            semantic_flags: semantic_flags(opts, args, srcs),
         },
         flags,
         files,
@@ -1367,32 +1205,6 @@ fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64,
             String::new()
         }
     );
-}
-
-/// Native source authority is the pinned endpoint-side base plus the raw
-/// operator selector. Do not canonicalize the selector again after source
-/// registration: doing so could observe a different namespace identity from
-/// the descriptor-backed one the transfer actually uses.
-fn native_source_identity(args: &Args, source: &Location, endpoint_cwd: &str) -> String {
-    let (base_kind, base) = if let Some(path) = args.native_source_root.as_deref() {
-        ("root", Some(path))
-    } else if let Some(path) = args.native_source_cwd.as_deref() {
-        ("cwd", Some(path))
-    } else {
-        ("endpoint-cwd", None)
-    };
-    serde_json::json!({
-        "native_source_identity": 1,
-        "endpoint_cwd": endpoint_cwd,
-        "base_kind": base_kind,
-        "base": base.map(path_bytes_identity),
-        "selector": path_bytes_identity(&source.path),
-    })
-    .to_string()
-}
-
-fn path_bytes_identity(path: &[u8]) -> String {
-    path_identity(std::path::Path::new(OsStr::from_bytes(path)))
 }
 
 #[derive(Clone, Debug)]
@@ -1873,7 +1685,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
-        copy_id: std::sync::OnceLock::new(),
+        copy_id: crate::resume::fresh_copy_id()?,
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
         delete_excluded: args.delete_excluded,
@@ -1882,7 +1694,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         ignore_existing: args.ignore_existing,
         preserve_existing_directory_metadata: args.only_new_native_entries(),
         existing: args.existing,
-        insecure_links: rsync_insecure_links(&args, !src_ep.is_remote()),
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
         max_size,
         min_size,
@@ -2681,18 +2492,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    let identity = resolve_copy_identity(
-        &args,
-        srcs,
-        dst,
-        &mut *src_ctl,
-        &mut *dst_ctl,
-        Some(dst_canonical),
-        &opts,
-    )?;
-    opts.copy_id
-        .set(crate::resume::copy_id(&identity))
-        .expect("partial identity set once");
     if debug() {
         crate::output::diagnostic!(
             "syq: copy identity complete at {:.2}s",
@@ -2930,7 +2729,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dry_run_replaced_dirs: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
-        live_sidecars: Vec::new(),
         unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
@@ -4709,10 +4507,6 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
-    /// The keys of sidecar_paths, kept past finish_planning only for --delete
-    /// (sorted, binary-searched: one path per regular file is the dominant
-    /// resident cost of --delete on huge trees, so keep it lean).
-    live_sidecars: Vec<PathBytes>,
     /// Files whose destination cannot accommodate a safe sidecar name. They
     /// fail individually while the rest of the scan and transfer continue.
     unusable_files: std::collections::HashSet<PathBytes>,
@@ -5553,20 +5347,11 @@ impl Planner<'_> {
                 .into_iter()
                 .filter(|(path, ..)| self.implicit_dirs.contains(path)),
         );
-        // The preflight maps are dead now — except the sidecar set, which
-        // --delete needs (only its keys) to tell a live sidecar from an
-        // orphan. On multi-million-file trees these are the difference
-        // between transient and resident gigabytes.
         self.payload_paths = std::collections::HashMap::new();
-        let sidecars = std::mem::take(&mut self.sidecar_paths);
-        if self.opts.delete {
-            let mut keys: Vec<PathBytes> = sidecars.into_keys().collect();
-            keys.sort_unstable();
-            self.live_sidecars = keys;
-        }
+        self.sidecar_paths = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
-        // alone still needs the destination claims and live sidecar names.
+        // alone still needs the destination claims.
         self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
         self.mapping_explicit_parents = std::collections::HashSet::new();
@@ -5582,7 +5367,6 @@ impl Planner<'_> {
         }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
-            self.live_sidecars = Vec::new();
             self.delete_roots = Vec::new();
         }
     }
@@ -6764,11 +6548,7 @@ impl Planner<'_> {
         let (sidecars, dir_stats, other_stats) = if pre_stat {
             let response = self.dst.call(Request::PlanBatch {
                 partial_paths,
-                copy_id: *self
-                    .opts
-                    .copy_id
-                    .get()
-                    .expect("partial identity initialized before planning"),
+                copy_id: self.opts.copy_id,
                 directories: directories.clone(),
                 others: other_paths.clone(),
                 guard: self.container_guard.clone(),
@@ -7109,8 +6889,8 @@ impl Planner<'_> {
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
+            let mut partial_parents = std::collections::HashSet::new();
             let seen = &self.dst_seen;
-            let live_sidecars = &self.live_sidecars;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -7147,23 +6927,12 @@ impl Planner<'_> {
                         let dst_rel = join(&sub, &e.path);
                         let rel = display(&dst_rel);
                         let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
-                        // The only sidecar-patterned files that are not extras
-                        // are this job's live ones — exactly those the
-                        // namespace preflight listed. Membership is the whole
-                        // test: a path is only in that set if the receiver
-                        // generated it for this job, and the compact
-                        // (near-PATH_MAX) form doesn't even embed the copy ID,
-                        // so there is nothing valid to compare names against.
-                        // Anything else matching the pattern is an ordinary
-                        // extra: syq itself copies such names as payload now,
-                        // so a foreign-looking name proves nothing, and a
-                        // --delete run concurrent with another job would be
-                        // deleting that job's unclaimed payload anyway.
-                        if e.kind == Kind::File
-                            && crate::fsops::is_partial_name(OsStr::from_bytes(name))
-                            && live_sidecars.binary_search(&full).is_ok()
-                        {
-                            // Live resume state of this very command.
+                        if e.kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                            for (index, byte) in full.iter().enumerate() {
+                                if *byte == b'/' {
+                                    partial_parents.insert(full[..index].to_vec());
+                                }
+                            }
                         } else {
                             if e.kind == Kind::Dir {
                                 let depth = full.iter().filter(|&&c| c == b'/').count();
@@ -7203,6 +6972,7 @@ impl Planner<'_> {
                 },
             );
             res?;
+            protected.extend(partial_parents);
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
@@ -7463,11 +7233,7 @@ impl Planner<'_> {
         match ok(
             self.dst.call(Request::PartialPaths {
                 paths,
-                copy_id: *self
-                    .opts
-                    .copy_id
-                    .get()
-                    .expect("partial identity initialized before planning"),
+                copy_id: self.opts.copy_id,
                 guard: None,
             })?,
             "compute sidecar paths",
@@ -7547,6 +7313,7 @@ struct FastTiming {
 struct BlockDiff {
     ranges: Vec<(u64, u64)>,
     held_len: Option<u64>,
+    source_hashes: Vec<ContentDigest>,
 }
 
 impl Worker {
@@ -8135,8 +7902,8 @@ impl Worker {
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file {
-                let (ranges, basis_len) = self.diff_final_and_hold(&job)?;
-                if ranges.is_empty() && basis_len == size {
+                let diff = self.diff_final_and_hold(&job)?;
+                if diff.ranges.is_empty() && diff.held_len == Some(size) {
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
                     ok(
@@ -8152,17 +7919,7 @@ impl Worker {
                     )?;
                     return Ok((vec![], false));
                 }
-                ok(
-                    self.dst.call(Request::SeedBasis {
-                        path: job.dst.clone(),
-                        copy_id: self.copy_id(),
-                        len: size,
-                        attempt: job.attempt,
-                        guard: job.container_guard.clone(),
-                    })?,
-                    "seed partial from destination basis",
-                )?;
-                return Ok((ranges, true));
+                return Ok((self.reuse_blocks(&job, diff.source_hashes)?, true));
             }
             Ok((full(), true))
         })();
@@ -8291,11 +8048,7 @@ impl Worker {
     }
 
     fn copy_id(&self) -> CopyId {
-        *self
-            .opts
-            .copy_id
-            .get()
-            .expect("partial identity initialized before planning")
+        self.opts.copy_id
     }
 
     /// Metadata for the whole file just atomically published at the
@@ -8310,6 +8063,20 @@ impl Worker {
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
+        if which == Which::Partial {
+            let response = self.src.call(Request::HashBlocks {
+                path: job.src.clone(),
+                source: self.source_reference(job),
+                which: Which::Final,
+                copy_id: self.copy_id(),
+                block: self.opts.block,
+                len: job.entry.size,
+                attempt: job.attempt,
+                guard: None,
+            })?;
+            let hashes = Self::hashes(ok(response, "hash source")?)?;
+            return self.reuse_blocks(job, hashes);
+        }
         self.diff_with(
             job,
             Request::HashBlocks {
@@ -8327,9 +8094,32 @@ impl Worker {
         .map(|diff| diff.ranges)
     }
 
+    fn reuse_blocks(
+        &mut self,
+        job: &FileJob,
+        hashes: Vec<ContentDigest>,
+    ) -> Result<Vec<(u64, u64)>> {
+        let response = self.dst.call(Request::SeedBasis {
+            path: job.dst.clone(),
+            copy_id: self.copy_id(),
+            len: job.entry.size,
+            block: self.opts.block,
+            hashes: hashes.clone(),
+            attempt: job.attempt,
+            guard: job.container_guard.clone(),
+        })?;
+        let reused = Self::hashes(ok(response, "reuse destination blocks")?)?;
+        Ok(Self::different_ranges(
+            &hashes,
+            &reused,
+            self.opts.block,
+            job.entry.size,
+        ))
+    }
+
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
-    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<(Vec<(u64, u64)>, u64)> {
+    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<BlockDiff> {
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
@@ -8342,11 +8132,9 @@ impl Worker {
             },
             "hash and retain destination basis",
         )?;
-        Ok((
-            diff.ranges,
-            diff.held_len
-                .context("destination did not report its retained basis length")?,
-        ))
+        diff.held_len
+            .context("destination did not report its retained basis length")?;
+        Ok(diff)
     }
 
     fn diff_with(
@@ -8378,6 +8166,7 @@ impl Worker {
             Self::destination_hashes(ok(destination_response?, destination_label)?)?;
         Ok(BlockDiff {
             ranges: Self::different_ranges(&source, &destination, block, size),
+            source_hashes: source,
             held_len,
         })
     }
@@ -9120,7 +8909,7 @@ mod tests {
                         quiet: true,
                         verbose: 0,
                         umask: 0,
-                        copy_id: std::sync::OnceLock::from([0; 16]),
+                        copy_id: [0; 16],
                         ignore: Vec::new(),
                         delete: false,
                         delete_excluded: false,
@@ -9129,7 +8918,6 @@ mod tests {
                         ignore_existing: false,
                         preserve_existing_directory_metadata: false,
                         existing: false,
-                        insecure_links: false,
                         operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
                         max_size: None,
                         min_size: None,
@@ -9467,45 +9255,6 @@ mod tests {
         let error = mkdir_apply_result(vec![None, Some(error)]).unwrap_err();
         assert_eq!(os_kind_of(&error), Some("no_space"));
         assert_eq!(format!("{error:#}"), "mkdir: destination is full");
-    }
-
-    #[test]
-    fn raw_path_identity_is_lossless_without_changing_utf8_identity() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        assert_eq!(
-            path_identity(std::path::Path::new("/tmp/name")),
-            "/tmp/name"
-        );
-        let first = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xff"));
-        let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xfe"));
-        assert_ne!(path_identity(first), path_identity(second));
-        assert!(path_identity(first).starts_with('\0'));
-    }
-
-    #[test]
-    fn explicit_ssh_port_is_part_of_endpoint_identity() {
-        let location = |host: &str, port| Location {
-            user: Some("alice".into()),
-            host: Some(host.into()),
-            port,
-            path: b"/data".to_vec(),
-            selection: SourceSelection::Named,
-        };
-
-        assert_eq!(endpoint_identity(&location("backup", None)), "alice@backup");
-        assert_eq!(
-            endpoint_identity(&location("backup", Some(2200))),
-            "alice@backup:2200"
-        );
-        assert_eq!(
-            endpoint_identity(&location("backup", Some(2222))),
-            "alice@backup:2222"
-        );
-        assert_eq!(
-            endpoint_identity(&location("2001:db8::1", Some(2200))),
-            "alice@[2001:db8::1]:2200"
-        );
     }
 
     #[test]

@@ -249,6 +249,7 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
+        .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))

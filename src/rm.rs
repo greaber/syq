@@ -162,12 +162,18 @@ fn run_remove(
         .iter()
         .map(|location| NativeRemoveSelection {
             path: location.path.clone(),
-            kind: match location.selection {
-                SourceSelection::Contents => NativeRemoveKind::Contents,
-                SourceSelection::File => NativeRemoveKind::File,
-                SourceSelection::Directory => NativeRemoveKind::Directory,
-                SourceSelection::Named | SourceSelection::NamedNoFollow => NativeRemoveKind::Any,
-                SourceSelection::Rsync => unreachable!("native selector uses rsync semantics"),
+            kind: if args.clean_partials {
+                NativeRemoveKind::Partials
+            } else {
+                match location.selection {
+                    SourceSelection::Contents => NativeRemoveKind::Contents,
+                    SourceSelection::File => NativeRemoveKind::File,
+                    SourceSelection::Directory => NativeRemoveKind::Directory,
+                    SourceSelection::Named | SourceSelection::NamedNoFollow => {
+                        NativeRemoveKind::Any
+                    }
+                    SourceSelection::Rsync => unreachable!("native selector uses rsync semantics"),
+                }
             },
         })
         .collect::<Vec<_>>();

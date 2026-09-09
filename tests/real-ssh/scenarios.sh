@@ -328,9 +328,9 @@ return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
 while :; do
-    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)
+    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)
     if [ "$partial_count" -eq 1 ]; then
-        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*')
+        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*')
         partial_prefix=$(dd if="$partial" bs=1M count=4 status=none | sha256sum)
         if [ "$partial_prefix" = "$source_prefix" ]; then break; fi
     fi
@@ -361,7 +361,7 @@ test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
-test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
+test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
 printf 'return\n' | cmp - "$receive_root/after-reconnect"
 printf 'case: return heartbeat timeout reconnects without toggling persistence\n'
@@ -937,7 +937,7 @@ benchmark_pid=$!
 attempt=0
 copy_started=false
 while [ "$attempt" -lt 30 ]; do
-    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-part.*; do
+    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-tmp.*; do
         if [ -f "$file" ]; then exit 0; fi
     done; exit 1'; then
         copy_started=true

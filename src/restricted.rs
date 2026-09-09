@@ -2396,9 +2396,15 @@ impl RestrictedAuthority {
                 path,
                 copy_id,
                 len,
+                block,
+                hashes,
                 guard,
                 ..
             } => {
+                self.check_hash_request(*block, *len)?;
+                if hashes.len() as u64 != len.div_ceil(*block) {
+                    bail!("invalid block reuse hashes");
+                }
                 if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
                 }
@@ -6628,6 +6634,8 @@ esac
             path: path_bytes(&kept),
             copy_id: [1; 16],
             len: 3,
+            block: proto::MIN_HASH_BLOCK_BYTES,
+            hashes: vec![crate::fsops::content_digest(b"abc")],
             attempt: 0,
             guard: None,
         };
@@ -8613,6 +8621,8 @@ esac
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             copy_id: [1; 16],
             len: 3,
+            block: proto::MIN_HASH_BLOCK_BYTES,
+            hashes: vec![crate::fsops::content_digest(b"abc")],
             attempt: 0,
             guard: None,
         };

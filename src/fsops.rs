@@ -26,7 +26,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const PARTIAL_MARKER: &str = ".syq-part.";
+pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
 const SOURCE_FD_RESERVE: usize = 32;
 // A shared worker may fill its source file cache, retain five copies of its
@@ -40,7 +40,6 @@ const SOURCE_UNCACHED_FILE_FDS: usize = 1;
 const SOURCE_SHARED_WORKER_FD_RESERVE: usize =
     FD_CACHE_MAX + SOURCE_TCP_TRANSPORT_FDS + SOURCE_UNCACHED_FILE_FDS;
 const COMMON_NAME_MAX: usize = 255;
-const COMPACT_HASH_BYTES: usize = 10;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
@@ -939,10 +938,9 @@ fn path_component_budget(parent: &Path, component_limit: usize) -> usize {
     component_limit.min(path_budget)
 }
 
-/// Adjacent deterministic sidecar for this logical job. The common form keeps
-/// both the destination basename and copy ID visible. Long basenames are
-/// truncated and disambiguated; near PATH_MAX a compact combined digest keeps
-/// a little more of rsync's practical path reach.
+/// Private adjacent partial for this invocation and file. Keep a readable
+/// basename prefix where space allows; the suffix always identifies the file
+/// independently of prefix truncation.
 pub fn partial_path(final_: &Path, copy_id: &CopyId) -> Result<PathBuf> {
     let parent = final_.parent().unwrap_or_else(|| Path::new(""));
     partial_path_with_name_max(final_, copy_id, name_max(parent))
@@ -954,78 +952,46 @@ pub(crate) fn partial_path_with_name_max(
     component_limit: usize,
 ) -> Result<PathBuf> {
     let name = final_.file_name().map(OsStr::as_bytes).unwrap_or(b"root");
-    let job_id = base32(copy_id);
-    let mut normal = Vec::with_capacity(1 + name.len() + PARTIAL_MARKER.len() + job_id.len());
-    normal.push(b'.');
-    normal.extend_from_slice(name);
-    normal.extend_from_slice(PARTIAL_MARKER.as_bytes());
-    normal.extend_from_slice(job_id.as_bytes());
-
+    // A fresh invocation nonce makes this suffix unpredictable. Including the
+    // complete basename gives truncated names independent suffixes, while all
+    // workers can resolve the same file without a shared pathname registry.
+    let mut hash = Sha256::new();
+    hash.update(copy_id);
+    hash.update(name);
+    let suffix = base32(&hash.finalize()[..10]);
     let parent = final_.parent().unwrap_or_else(|| Path::new(""));
     let budget = path_component_budget(parent, component_limit);
-    let component = if normal.len() <= budget {
-        normal
-    } else {
-        let basename_hash = Sha256::digest(name);
-        let basename_hash = base32(&basename_hash[..12]);
-        let overhead = 1 + 1 + basename_hash.len() + PARTIAL_MARKER.len() + job_id.len();
-        if budget > overhead {
-            let keep = safe_prefix_len(name, budget - overhead);
-            let mut shortened = Vec::with_capacity(budget);
-            shortened.push(b'.');
-            shortened.extend_from_slice(&name[..keep]);
-            shortened.push(b'.');
-            shortened.extend_from_slice(basename_hash.as_bytes());
-            shortened.extend_from_slice(PARTIAL_MARKER.as_bytes());
-            shortened.extend_from_slice(job_id.as_bytes());
-            shortened
-        } else {
-            let mut hash = Sha256::new();
-            hash.update(copy_id);
-            hash.update([0]);
-            hash.update(name);
-            let digest = hash.finalize();
-            let compact = format!("{PARTIAL_MARKER}{}", base32(&digest[..COMPACT_HASH_BYTES]));
-            if compact.len() > budget {
-                bail!(
-                    "cannot create a safe partial name beside {}: path is too long",
-                    final_.display()
-                );
-            }
-            compact.into_bytes()
-        }
-    };
-    let component = OsString::from_vec(component);
-    Ok(if parent.as_os_str().is_empty() {
-        PathBuf::from(component)
-    } else {
-        parent.join(component)
-    })
+    let overhead = PARTIAL_MARKER.len() + suffix.len();
+    if budget < overhead {
+        bail!(
+            "cannot create a partial beside {}: path is too long",
+            final_.display()
+        );
+    }
+    let keep = safe_prefix_len(name, budget.saturating_sub(overhead + 1));
+    let mut component = Vec::with_capacity(budget.min(name.len() + overhead + 1));
+    if keep > 0 {
+        component.push(b'.');
+        component.extend_from_slice(&name[..keep]);
+    }
+    component.extend_from_slice(PARTIAL_MARKER.as_bytes());
+    component.extend_from_slice(suffix.as_bytes());
+    Ok(parent.join(OsString::from_vec(component)))
 }
 
 pub fn is_partial_name(name: &OsStr) -> bool {
-    let b = name.as_bytes();
-    let valid_id = |id: &[u8], len: usize| {
-        id.len() == len
-            && id
-                .iter()
-                .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
-    };
-    if !b.starts_with(b".") {
-        return false;
-    }
-    if let Some(pos) = b
-        .windows(PARTIAL_MARKER.len())
-        .rposition(|part| part == PARTIAL_MARKER.as_bytes())
-    {
-        let id = &b[pos + PARTIAL_MARKER.len()..];
-        return if pos == 0 {
-            valid_id(id, 16)
-        } else {
-            valid_id(id, 26)
-        };
-    }
-    false
+    let name = name.as_bytes();
+    name.starts_with(b".")
+        && name
+            .windows(PARTIAL_MARKER.len())
+            .rposition(|part| part == PARTIAL_MARKER.as_bytes())
+            .is_some_and(|at| {
+                let suffix = &name[at + PARTIAL_MARKER.len()..];
+                suffix.len() == 16
+                    && suffix
+                        .iter()
+                        .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+            })
 }
 
 /// Absolute, normalized form of a path, resolved the way the kernel resolves
@@ -1461,6 +1427,7 @@ pub struct FsOps {
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
+    partial_candidates: HashMap<FileLocation, Vec<PathBytes>>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -1614,6 +1581,7 @@ impl FsOps {
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
+            partial_candidates: HashMap::new(),
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
@@ -1749,21 +1717,7 @@ impl FsOps {
             }
             names.push(name);
         }
-        // The engine canonicalizes before it walks the directory; the job
-        // identity, and therefore every sidecar name, comes from that spelling.
-        let mut canonical = normalize(&resolve(&request.directory));
-        if let Some(leaf) = &request.identity.dst_leaf {
-            canonical.push(OsStr::from_bytes(leaf));
-        }
-        let identity = &request.identity;
-        let copy_identity = crate::resume::copy_identity(
-            &identity.src_endpoint,
-            &identity.src_roots,
-            &identity.dst_endpoint,
-            &crate::transfer::path_identity(&canonical),
-            &identity.semantic_flags,
-        );
-        let copy_id = crate::resume::copy_id(&copy_identity);
+        let copy_id = request.identity.copy_id;
 
         let (selection, anchor) =
             select_operator_directory(&request.directory, false, request.symlink_policy)?;
@@ -1919,6 +1873,13 @@ impl FsOps {
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_COPY_READY_FILE",
+            "SYQ_TEST_SMALL_COPY_CONTINUE_FILE",
+            "SYQ_TEST_HOLD_SMALL_COPY_MS",
+            "small copy staged",
+        )?;
         // Each publication/metadata repair has its own outcome. Unchanged
         // files keep their inode and reconcile only requested mode/ownership.
         let results = request
@@ -1942,7 +1903,7 @@ impl FsOps {
                             &item.partial,
                             &item.target,
                             &item.file,
-                            condition,
+                            TargetCondition::Any,
                         )
                         .err()
                         .map(|error| wire_error(&error)),
@@ -4834,6 +4795,72 @@ impl FsOps {
         )
     }
 
+    /// A directory is scanned once per worker. Candidates are only hints:
+    /// they may disappear or change, and their bytes are never trusted by name.
+    fn candidate_partials(
+        &mut self,
+        path: &[u8],
+        guard: Option<&ContainerGuard>,
+    ) -> Vec<PathBytes> {
+        let rooted = match self.rooted_destination_target(path, guard) {
+            Ok(rooted) => rooted,
+            Err(_) => return Vec::new(),
+        };
+        let label = rooted
+            .as_ref()
+            .map(|target| path_bytes(&target.relative.to_path_buf()))
+            .unwrap_or_else(|| path.to_vec());
+        let p = Path::new(OsStr::from_bytes(&label));
+        let parent = p.parent().unwrap_or_else(|| Path::new(""));
+        let basename = p.file_name().unwrap_or_default().as_bytes();
+        let key = if let Some(target) = &rooted {
+            let Ok(relative) = RelativePath::new(parent.as_os_str().as_bytes()) else {
+                return Vec::new();
+            };
+            FileLocation::Rooted {
+                root: target.root.identity(),
+                relative,
+            }
+        } else {
+            FileLocation::Path(parent.to_path_buf())
+        };
+        let candidates = self.partial_candidates.entry(key).or_insert_with(|| {
+            let names = if let Some(target) = &rooted {
+                RelativePath::new(parent.as_os_str().as_bytes())
+                    .ok()
+                    .and_then(|relative| target.root.read_directory(&relative).ok())
+                    .unwrap_or_default()
+            } else {
+                fs::read_dir(if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                })
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok().map(|entry| entry.file_name().into_vec()))
+                        .collect()
+                })
+                .unwrap_or_default()
+            };
+            names
+                .into_iter()
+                .filter(|name| is_partial_name(OsStr::from_bytes(name)))
+                .collect()
+        });
+        candidates
+            .iter()
+            .filter(|name| {
+                let at = name
+                    .windows(PARTIAL_MARKER.len())
+                    .rposition(|part| part == PARTIAL_MARKER.as_bytes())
+                    .unwrap();
+                at == 0 || basename.starts_with(&name[1..at])
+            })
+            .map(|name| path_bytes(&parent.join(OsStr::from_bytes(name))))
+            .collect()
+    }
+
     fn preallocate_new_partial(&mut self, file: &File, size: u64) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -4870,6 +4897,7 @@ impl FsOps {
             attempt,
             create_if_missing,
         } = options;
+        let has_candidates = !inplace && !self.candidate_partials(path, guard).is_empty();
         if let Some(target) = self.rooted_destination_target(path, guard)? {
             if inplace {
                 self.uncache_rooted(&target.root, &target.relative);
@@ -4929,7 +4957,7 @@ impl FsOps {
                 PRIVATE_PARTIAL_MODE,
             )?
             else {
-                return Ok(None);
+                return Ok(has_candidates.then_some(0));
             };
             if let Some(old_size) = basis_size {
                 if old_size > size {
@@ -4954,7 +4982,7 @@ impl FsOps {
                 true,
                 file,
             );
-            return Ok(basis_size);
+            return Ok(basis_size.or(has_candidates.then_some(0)));
         }
         let p = resolve(path);
         if inplace {
@@ -4974,7 +5002,7 @@ impl FsOps {
         let Some((f, basis_size)) =
             self.open_private_partial(&pp, create_if_missing, PRIVATE_PARTIAL_MODE)?
         else {
-            return Ok(None);
+            return Ok(has_candidates.then_some(0));
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
@@ -4991,7 +5019,7 @@ impl FsOps {
             "partial-ready",
         )?;
         self.cache_file(FileLocation::Path(pp), attempt, true, f);
-        Ok(basis_size)
+        Ok(basis_size.or(has_candidates.then_some(0)))
     }
 
     pub fn hash_and_hold(
@@ -5111,18 +5139,39 @@ impl FsOps {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_basis(
         &mut self,
         path: &[u8],
         copy_id: &CopyId,
         len: u64,
+        block: u64,
+        hashes: &[ContentDigest],
         attempt: u32,
         guard: Option<&ContainerGuard>,
-    ) -> Result<()> {
-        let (mut held, rooted) = self.take_held_basis(path, copy_id, guard)?;
-        let (dst, basis_size, location) = if let Some(target) = rooted {
-            let (relative, label) = rooted_partial_target(&target, copy_id)?;
-            let opened = self
+    ) -> Result<Vec<ContentDigest>> {
+        if !hash_response_fits(block, len) || hashes.len() as u64 != len.div_ceil(block) {
+            bail!("invalid block reuse request");
+        }
+        let candidates = self.candidate_partials(path, guard);
+        let rooted = self.rooted_destination_target(path, guard)?;
+        let mut inputs = Vec::new();
+        if self.held_basis.is_some() {
+            inputs.push(self.take_held_basis(path, copy_id, guard)?.0.file);
+        }
+        if inputs.is_empty() {
+            let final_file = if let Some(target) = &rooted {
+                target.root.open_regular_read(&target.relative)
+            } else {
+                open_existing_regular(&resolve(path), false)
+            };
+            if let Ok(file) = final_file {
+                inputs.push(file);
+            }
+        }
+        let (output, location) = if let Some(target) = &rooted {
+            let (relative, label) = rooted_partial_target(target, copy_id)?;
+            let (file, _) = self
                 .open_private_partial_rooted(
                     &target.root,
                     &relative,
@@ -5132,31 +5181,72 @@ impl FsOps {
                 )?
                 .context("sidecar creation was requested")?;
             (
-                opened.0,
-                opened.1,
+                file,
                 FileLocation::Rooted {
                     root: target.root.identity(),
                     relative,
                 },
             )
         } else {
-            let pp = self.partial_path(&held.label, copy_id)?;
-            let opened = self
-                .open_private_partial(&pp, true, PRIVATE_PARTIAL_MODE)?
+            let partial = self.partial_path(&resolve(path), copy_id)?;
+            let (file, _) = self
+                .open_private_partial(&partial, true, PRIVATE_PARTIAL_MODE)?
                 .context("sidecar creation was requested")?;
-            (opened.0, opened.1, FileLocation::Path(pp))
+            (file, FileLocation::Path(partial))
         };
-        if basis_size.is_some_and(|size| size > 0) {
-            dst.set_len(0)?;
+        // The private output may contain this invocation's own successful
+        // writes from a transport retry. It is never another run's output.
+        inputs.push(output.try_clone()?);
+        let mut reused = vec![[0; 32]; hashes.len()];
+        let mut buffer = vec![0; block as usize];
+        let mut reuse = |input: &File| -> Result<()> {
+            for (index, expected) in hashes.iter().enumerate() {
+                if reused[index] == *expected {
+                    continue;
+                }
+                let off = index as u64 * block;
+                let bytes = &mut buffer[..(len - off).min(block) as usize];
+                if input.read_exact_at(bytes, off).is_err() || content_digest(bytes) != *expected {
+                    continue;
+                }
+                #[cfg(debug_assertions)]
+                test_race_barrier(
+                    "SYQ_TEST_REUSE_READY_FILE",
+                    "SYQ_TEST_REUSE_CONTINUE_FILE",
+                    "SYQ_TEST_HOLD_REUSE_MS",
+                    "reuse verified bytes",
+                )?;
+                output
+                    .write_all_at(bytes, off)
+                    .context("write verified reused block")?;
+                reused[index] = *expected;
+            }
+            Ok(())
+        };
+        for input in inputs {
+            reuse(&input)?;
         }
-        self.preallocate_new_partial(&dst, len)?;
-        held.file.seek(SeekFrom::Start(0))?;
-        let mut writer = &dst;
-        writer.seek(SeekFrom::Start(0))?;
-        io::copy(&mut held.file.take(len), &mut writer)
-            .with_context(|| format!("seed partial from {}", held.label.display()))?;
-        self.cache_file(location, attempt, true, dst);
-        Ok(())
+        for candidate in candidates {
+            // Read-only, no-follow opens; vanished/unreadable/unsafe candidates
+            // are cache misses. Never chmod, truncate, rename or delete them.
+            let opened = if let Some(target) = &rooted {
+                RelativePath::new(&candidate)
+                    .and_then(|relative| target.root.open_regular_read(&relative))
+            } else {
+                open_existing_regular(&resolve(&candidate), false)
+            };
+            if let Ok(input) = opened {
+                if input
+                    .metadata()
+                    .is_ok_and(|metadata| is_owned_partial(&metadata))
+                {
+                    reuse(&input)?;
+                }
+            }
+        }
+        output.set_len(len)?;
+        self.cache_file(location, attempt, true, output);
+        Ok(reused)
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
@@ -5179,6 +5269,9 @@ impl FsOps {
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
         } = policy;
+        if !inplace && !self.candidate_partials(dst, None).is_empty() {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
@@ -5506,7 +5599,7 @@ impl FsOps {
         Ok(CopyLocalOutcome::Unsupported)
     }
 
-    /// Write a whole small file through its deterministic sidecar and atomically
+    /// Write a whole small file through its private partial and atomically
     /// rename it into place. Keeping this as one request preserves pipelining;
     /// unlike an in-place write, no partial final-named file is ever visible.
     fn put_small(&mut self, put: &SmallPut) -> Result<()> {
@@ -6266,11 +6359,21 @@ impl FsOps {
                 path,
                 copy_id,
                 len,
+                block,
+                hashes,
                 attempt,
                 guard,
             } => self
-                .seed_basis(path, copy_id, *len, *attempt, guard.as_ref())
-                .map(|_| Response::Ok),
+                .seed_basis(
+                    path,
+                    copy_id,
+                    *len,
+                    *block,
+                    hashes,
+                    *attempt,
+                    guard.as_ref(),
+                )
+                .map(Response::Hashes),
             Request::CopyLocal {
                 source,
                 dst,
@@ -7655,11 +7758,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_name_keeps_job_id_and_fits_name_max() {
+    fn partial_name_is_private_and_fits_name_max() {
         let id = [7u8; 16];
         let short = partial_path(Path::new("file"), &id).unwrap();
         let short_name = short.file_name().unwrap();
-        assert!(short_name.to_string_lossy().starts_with(".file.syq-part."));
+        assert!(short_name.to_string_lossy().starts_with(".file.syq-tmp."));
         assert!(is_partial_name(short_name));
 
         let long = PathBuf::from("n".repeat(240));
@@ -7667,7 +7770,32 @@ mod tests {
         let name = partial.file_name().unwrap();
         assert!(name.as_bytes().len() <= COMMON_NAME_MAX);
         assert!(is_partial_name(name));
-        assert!(name.to_string_lossy().ends_with(&base32(&id)));
+        assert_ne!(
+            partial,
+            partial_path_with_name_max(&long, &[9; 16], COMMON_NAME_MAX).unwrap()
+        );
+    }
+
+    #[test]
+    fn partial_names_disambiguate_truncated_basenames_and_reject_old_format() {
+        let first = PathBuf::from(format!("{}a", "n".repeat(240)));
+        let second = PathBuf::from(format!("{}b", "n".repeat(240)));
+        for limit in [25, 26, 80, 255] {
+            let a = partial_path_with_name_max(&first, &[1; 16], limit).unwrap();
+            let b = partial_path_with_name_max(&second, &[1; 16], limit).unwrap();
+            assert_ne!(a, b);
+            assert!(a.file_name().unwrap().as_bytes().len() <= limit);
+            assert!(is_partial_name(a.file_name().unwrap()));
+        }
+        assert!(!is_partial_name(OsStr::new(
+            ".file.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )));
+        assert!(!is_partial_name(OsStr::new(
+            ".file.syq-tmp.aaaaaaaaaaaaaaa"
+        )));
+        assert!(!is_partial_name(OsStr::new(
+            ".file.syq-tmp.aaaaaaaaaaaaaaa8"
+        )));
     }
 
     #[test]
@@ -7678,7 +7806,10 @@ mod tests {
         let name = partial.file_name().unwrap();
         assert!(name.as_bytes().len() <= 143);
         assert!(is_partial_name(name));
-        assert!(name.to_string_lossy().ends_with(&base32(&id)));
+        assert_ne!(
+            partial,
+            partial_path_with_name_max(&final_path, &[9; 16], 143).unwrap()
+        );
     }
 
     #[test]
@@ -7931,11 +8062,8 @@ mod tests {
             symlink_policy: OperatorSymlinkPolicy::Refuse,
             request_prefix: prefix.clone(),
             identity: SmallCopyIdentity {
-                src_endpoint: "local".into(),
-                src_roots: vec![("source".into(), false)],
-                dst_endpoint: "example".into(),
+                copy_id: [7; 16],
                 dst_leaf: None,
-                semantic_flags: "{}".into(),
             },
             flags: flags::TIMES,
             files: ["one", "two"]
@@ -8031,11 +8159,8 @@ mod tests {
                 symlink_policy: OperatorSymlinkPolicy::Refuse,
                 request_prefix: prefix.clone(),
                 identity: SmallCopyIdentity {
-                    src_endpoint: "local".into(),
-                    src_roots: vec![("source".into(), false)],
-                    dst_endpoint: "example".into(),
+                    copy_id: [7; 16],
                     dst_leaf: None,
-                    semantic_flags: "{}".into(),
                 },
                 flags: flags::MODE | flags::TIMES,
                 files,
@@ -8168,7 +8293,7 @@ mod tests {
         assert!(partial[0]
             .as_ref()
             .unwrap()
-            .starts_with(b"missing/deeper/.marker.syq-part."));
+            .starts_with(b"missing/deeper/.marker.syq-tmp."));
         assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16], None)[0].is_err());
         assert!(operations.file_hash(b"../outside", None, None).is_err());
         assert!(operations.stat_many(&[b"../outside".to_vec()], false, None)[0].is_none());
@@ -8210,7 +8335,15 @@ mod tests {
         assert_eq!(hashes, vec![content_digest(b"held")]);
         assert_eq!(held_len, 4);
         operations
-            .seed_basis(b"basis", &copy_id, 4, 0, None)
+            .seed_basis(
+                b"basis",
+                &copy_id,
+                4,
+                MIN_HASH_BLOCK_BYTES,
+                &[content_digest(b"held")],
+                0,
+                None,
+            )
             .unwrap();
         let basis_partial = partial_path(&moved.join("basis"), &copy_id).unwrap();
         assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
@@ -9090,7 +9223,7 @@ mod tests {
 
         symlink(&external, &partial).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
-        assert_eq!(observe(&mut operations), None);
+        assert_eq!(observe(&mut operations), Some(0));
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_symlink());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -9100,7 +9233,7 @@ mod tests {
         fs::hard_link(&external, &partial).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert_eq!(before.nlink(), 2);
-        assert_eq!(observe(&mut operations), None);
+        assert_eq!(observe(&mut operations), Some(0));
         let after = fs::symlink_metadata(&partial).unwrap();
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(after.nlink(), 2);
@@ -9110,7 +9243,7 @@ mod tests {
         create_node_any(&partial, MODE_FIFO | 0o600, 0).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert!(before.file_type().is_fifo());
-        assert_eq!(observe(&mut operations), None);
+        assert_eq!(observe(&mut operations), Some(0));
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_fifo());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -9154,7 +9287,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(observed, None);
+        assert_eq!(observed, Some(0));
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_symlink());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -9257,15 +9390,15 @@ mod tests {
 
     #[test]
     fn compact_partial_name_is_recognized() {
-        let name = OsStr::from_bytes(b".syq-part.aaaaaaaaaaaaaaaa");
+        let name = OsStr::from_bytes(b".syq-tmp.aaaaaaaaaaaaaaaa");
         assert!(is_partial_name(name));
-        assert!(!is_partial_name(OsStr::from_bytes(b".syq-part.notes")));
+        assert!(!is_partial_name(OsStr::from_bytes(b".syq-tmp.notes")));
 
         let id = [9u8; 16];
-        let parent_len = libc::PATH_MAX as usize - 28;
+        let parent_len = libc::PATH_MAX as usize - 27;
         let final_path = PathBuf::from("a".repeat(parent_len)).join("x");
         let partial = partial_path(&final_path, &id).unwrap();
-        assert_eq!(partial.file_name().unwrap().as_bytes().len(), 26);
+        assert_eq!(partial.file_name().unwrap().as_bytes().len(), 25);
         assert!(is_partial_name(partial.file_name().unwrap()));
 
         let too_deep = PathBuf::from("a".repeat(parent_len + 1)).join("x");

@@ -1502,8 +1502,7 @@ impl Root {
     /// Atomically publish a staged regular file with ordinary rename
     /// replacement semantics. Both parents are retained before the rename, so
     /// a concurrent ancestor replacement cannot redirect either side. A later
-    /// writer is never rolled back: post-rename validation can report a race,
-    /// but it must not mutate the target name again.
+    /// writer may replace this complete file immediately after publication.
     pub(crate) fn rename_regular_if_same(
         &self,
         source: &RelativePath,
@@ -1525,13 +1524,6 @@ impl Root {
         .with_context(|| format!("publish confined path {}", target.label()))?;
         #[cfg(test)]
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAnyRename);
-        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-        if !is_safe_staged_identity(published, staged_dev, staged_ino) {
-            bail!(
-                "confined staged path {} changed during publication",
-                source.label()
-            );
-        }
         Ok(())
     }
 
@@ -3437,11 +3429,8 @@ mod tests {
                 fs::write(&target_path, b"later").unwrap();
             },
         );
-        let error = root
-            .rename_regular_if_same(&staged, &target, (metadata.dev(), metadata.ino()))
-            .unwrap_err();
-
-        assert!(format!("{error:#}").contains("changed during publication"));
+        root.rename_regular_if_same(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap();
         assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
         assert!(!tree.path().join("staged").exists());
         assert_eq!(metadata.ino(), staged_file.metadata().unwrap().ino());
