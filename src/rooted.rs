@@ -1845,6 +1845,11 @@ fn clone_directory_has_no_acl(directory: &File) -> Result<bool> {
     let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
         let error = io::Error::last_os_error();
+        // acl_get_fd_np uses ENOENT when the held inode has no ACL property.
+        // This is distinct from an allocated ACL with zero entries below.
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(true);
+        }
         if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EACCES)) {
             return Ok(false);
         }
