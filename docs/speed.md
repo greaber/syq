@@ -179,8 +179,9 @@ allowing up to one worker per file within the selected connection count.
 Workers overlap reads and writes in bounded groups of whole files inside
 each batch. Tiny files share workers to avoid unnecessary connection setup.
 Idle workers can take groups whose reads have not started. After a source read
-stalls, the worker drains its read-ahead before claiming more groups. Hash
-comparison size does not determine new-file batching.
+stalls, the worker drains its read-ahead before claiming more groups. With
+request and batch limits held fixed, changing comparison size does not change
+new-file batching.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote

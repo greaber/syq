@@ -9243,6 +9243,7 @@ mod tests {
         steal_on_receive: Option<Arc<Sched>>,
         stolen_file: Option<usize>,
         receive_pause: Option<std::time::Duration>,
+        rtt_us: Option<u64>,
         dead: bool,
     }
 
@@ -9251,6 +9252,9 @@ mod tests {
     impl Conn for PipelineConn {
         fn supports_request_pipelining(&self) -> bool {
             !self.0.lock().unwrap().synchronous
+        }
+        fn tcp_rtt_us(&self) -> Option<u64> {
+            self.0.lock().unwrap().rtt_us
         }
         fn is_dead(&self) -> bool {
             self.0.lock().unwrap().dead
@@ -9897,45 +9901,52 @@ mod tests {
 
     #[test]
     fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
-        let jobs: Vec<_> = (0..8)
-            .map(|i| pipeline_job(format!("file{i}").as_bytes(), 512))
-            .collect();
-        let src = Arc::new(Mutex::new(PipelineState {
-            receive_pause: Some(std::time::Duration::from_millis(125)),
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        for _ in &jobs {
-            let data = vec![0; 512];
-            src.lock()
+        // The same wait is a source stall on a fast connection, but normal
+        // startup on a WAN or an SSH connection with a longer setup time.
+        for (rtt_us, setup_ms, expected) in [
+            (None, 0, [4, 4, 4, 4, 5, 6, 7, 8]),
+            (Some(10_000), 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+            (None, 200, [4, 5, 6, 7, 8, 8, 8, 8]),
+        ] {
+            let jobs: Vec<_> = (0..8)
+                .map(|i| pipeline_job(format!("file{i}").as_bytes(), 512))
+                .collect();
+            let src = Arc::new(Mutex::new(PipelineState {
+                receive_pause: Some(std::time::Duration::from_millis(125)),
+                rtt_us,
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState::default()));
+            for _ in &jobs {
+                let data = vec![0; 512];
+                src.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                        hash: content_digest(&data),
+                        data,
+                    })]));
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Applied(vec![None]));
+            }
+            let mut worker = pipeline_worker(
+                Arc::new(Sched::new(512, 8192)),
+                src.clone(),
+                dst,
+                512,
+                false,
+            );
+            worker.gate.set_active(2);
+            worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
+            assert!(worker
+                .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1))
                 .unwrap()
-                .replies
-                .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
-                    hash: content_digest(&data),
-                    data,
-                })]));
-            dst.lock()
-                .unwrap()
-                .replies
-                .push_back(Response::Applied(vec![None]));
+                .iter()
+                .all(Result::is_ok));
+            assert_eq!(src.lock().unwrap().sent_at_receive, expected);
         }
-        let mut worker = pipeline_worker(
-            Arc::new(Sched::new(512, 8192)),
-            src.clone(),
-            dst,
-            512,
-            false,
-        );
-        worker.gate.set_active(2);
-        assert!(worker
-            .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1))
-            .unwrap()
-            .iter()
-            .all(Result::is_ok));
-        assert_eq!(
-            src.lock().unwrap().sent_at_receive,
-            [4, 4, 4, 4, 5, 6, 7, 8]
-        );
     }
 
     #[test]
