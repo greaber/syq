@@ -38,7 +38,10 @@ fn configure_at(mut command: Command, path: &str) -> Command {
     }
     // Filesystem commands are classified below. On the management commands,
     // required operands stay visible and only everyday options enter short help.
-    if !matches!(path, "syq cp" | "syq rm" | "syq map" | "syq rsync") {
+    if !matches!(
+        path,
+        "syq cp" | "syq rm" | "syq clean-partials" | "syq map" | "syq rsync"
+    ) {
         command = command.mut_args(|arg| {
             let common = arg.is_positional()
                 || arg.is_required_set()
@@ -133,7 +136,8 @@ fn configure_at(mut command: Command, path: &str) -> Command {
 pub(crate) fn filesystem(command: Command) -> Command {
     let rsync = command.get_name() == "syq rsync";
     let map = command.get_name() == "syq map";
-    let rm = command.get_name() == "syq rm";
+    let clean = command.get_name() == "syq clean-partials";
+    let rm = command.get_name() == "syq rm" || clean;
     let command = command.mut_args(|arg| {
         if arg.is_hide_set() {
             return arg;
@@ -182,12 +186,13 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "help"
                     | "version"
             ) || (rm && id == "root")
+                || (clean && matches!(id, "trees" | "on"))
         };
         let heading =
             match id {
-                "sources" | "paths" | "src" | "srcs_in" | "src_non_dir" | "src_dir"
-                | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "follow"
-                | "follow_src" => "Sources and selection",
+                "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
+                | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
+                | "follow" | "follow_src" => "Sources and selection",
                 "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
                 | "follow_dst" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"

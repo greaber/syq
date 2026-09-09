@@ -20189,6 +20189,15 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
 
 #[test]
 fn clean_partials_selects_only_current_regular_files() {
+    let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["clean-partials", "--help"])
+        .run()
+        .unwrap();
+    assert_output_ok(&help);
+    let help = String::from_utf8_lossy(&help.stdout);
+    for option in ["--dry-run", "--on", "--root", "--cwd"] {
+        assert!(help.contains(option), "{help}");
+    }
     let t = Tmp::new();
     let current = ".file.syq-tmp.abcdefghijklmnop";
     let compact = ".syq-tmp.abcdefghijklmnop";
