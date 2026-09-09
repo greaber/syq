@@ -197,9 +197,9 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     assert!(partial_files(&t.path("dst")).is_empty());
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 #[test]
-fn platforms_without_direct_copy_keep_medium_batches() {
+fn platforms_without_medium_file_offload_keep_batches() {
     let t = Tmp::new();
     write(&t.path("src/file"), &prng(1 << 20, 82));
     let out = compat_command()
@@ -448,7 +448,7 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
     }
     let t = Tmp::new();
     for i in 0..4 {
-        write(&t.path(&format!("src/file{i}")), &prng(1 << 20, i));
+        write(&t.path(&format!("src/file{i}")), &prng(5 << 20, i));
     }
     let out = compat_command()
         .args([
@@ -505,4 +505,106 @@ fn macos_clone_source_growth_requeues_without_a_file_error() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), read(&t.path("src")));
     assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_medium_files_keep_batches_when_cloning_is_unavailable() {
+    // This test deliberately works on non-clone-capable TMPDIRs too.
+    let t = Tmp::new();
+    for (i, size) in [65537, 1 << 20, 4 << 20].into_iter().enumerate() {
+        write(&t.path(&format!("src/file{i}")), &prng(size, i as u64));
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--syq-connections=1",
+            "--block-size=4M",
+            "--tuning-options=request-size=4M",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+    assert!(observed["small_batches"].as_u64().unwrap() > 0);
+    assert!(!t.path("attempts").exists());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_mkdir_permission_and_link_limits_fall_back() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    for error in ["EACCES", "EPERM", "EMLINK"] {
+        let t = Tmp::new();
+        write(&t.path("src"), &prng(5 << 20, 998));
+        let out = compat_command()
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env("SYQ_TEST_CLONE_MKDIR_ERROR", error)
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+    }
+    // Real ACL case: adding files is allowed, adding subdirectories is denied.
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(5 << 20, 999));
+    fs::create_dir(t.path("dst")).unwrap();
+    assert!(Command::new("/bin/chmod")
+        .args(["+a", "everyone deny add_subdirectory"])
+        .arg(t.path("dst"))
+        .status()
+        .unwrap()
+        .success());
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 1);
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_reports_copy_and_cleanup_errors() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 1000));
+    write(&t.path("dst"), b"old destination");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "1")
+        .env("SYQ_TEST_FAIL_CLONE_CLEANUP", "1")
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    let error = stderr_of(&out);
+    assert!(error.contains("No space left on device"), "{error}");
+    assert!(
+        error.find("test clone failure").unwrap()
+            < error.find("test clone cleanup failure").unwrap(),
+        "{error}"
+    );
+    assert_eq!(read(&t.path("dst")), b"old destination");
+    assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
 }

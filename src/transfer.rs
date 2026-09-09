@@ -125,11 +125,9 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
             opts.tuning
                 .request_size(opts.block, bwlimit, opts.restricted_receiver),
         );
-    if cfg!(any(target_os = "linux", target_os = "macos"))
-        && opts.same_host
-        && !opts.checksum
-        && bwlimit.is_none()
-    {
+    // macOS retains its normal batching ceiling: clone refusal must not turn
+    // medium files into a per-file probe followed by range requests.
+    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
         limit

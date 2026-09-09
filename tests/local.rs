@@ -892,6 +892,10 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_uses_registered_source_after_path_replacement() {
+    #[cfg(target_os = "macos")]
+    if !macos_clone_support::available() {
+        return;
+    }
     for userspace in [false, true]
         .into_iter()
         .filter(|userspace| !userspace || cfg!(target_os = "linux"))
