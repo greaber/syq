@@ -247,6 +247,19 @@ report actual access or decision blockers instead of bypassing them.
   belong there. Keep only brief `current-plans/` notes needed to continue
   active work. State a limitation as a fact about today's behavior, not as
   an intention.
+- Match documentation detail to the page's job. Setup and task guides should
+  give a useful example, explain consequential choices, and link to reference
+  material. Reference pages hold option interactions and scripting contracts;
+  security pages explain trust boundaries. Algorithm mechanics and regression
+  histories usually belong in code, tests, or the PR description.
+- When adding behavior, revise the paragraph that owns it rather than appending
+  a new explanation everywhere it is mentioned. Read the surrounding section
+  as a new user: keep details that help them act or interpret a result. A fixed
+  bug does not automatically need a new paragraph. Avoid release-number history
+  and unmeasured tuning advice in guides; benchmark claims need linked evidence.
+- Use [the docs audit skill](.agents/skills/syq-docs-audit/SKILL.md) for requested
+  editorial audits and during release preparation. An audit can identify a
+  product question without changing runtime behavior to simplify its explanation.
 - Keep the selected data route fixed. TCP may fall back to SSH between the
   same endpoints, but failure must never silently relay file data through the
   invoking or authorizing machine. Relaying requires an explicit route choice.

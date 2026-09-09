@@ -23,6 +23,8 @@
 # Reference
 
 - [Remote copy details](remote-reference.md)
+- [Persistence details](persistence-reference.md)
+- [Tuning options](tuning.md)
 - [Automation results](automation.md)
 - [Rsync compatibility](rsync-compat.md)
 

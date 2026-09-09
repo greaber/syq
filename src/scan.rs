@@ -204,14 +204,19 @@ fn inspect_descriptor_children(
         return names.iter().map(inspect).collect();
     }
     let chunk = names.len().div_ceil(DESCRIPTOR_STAT_THREADS).max(1);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = names
-            .chunks(chunk)
-            .map(|names| scope.spawn(|| names.iter().map(inspect).collect::<Vec<_>>()))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("descriptor scan stat thread"))
+    use rayon::prelude::*;
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(DESCRIPTOR_STAT_THREADS)
+            .thread_name(|index| format!("syq-scan-stat-{index}"))
+            .build()
+            .expect("directory stat worker pool")
+    });
+    pool.install(|| {
+        names
+            .par_chunks(chunk)
+            .flat_map_iter(|names| names.iter().map(&inspect))
             .collect()
     })
 }

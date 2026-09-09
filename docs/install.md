@@ -26,40 +26,25 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-Choose a local or SSH copy and a workload. The script automatically sizes
-throwaway data with syq and cleans up afterward. No syq-bench install is needed;
-if syq is missing, it offers to install it.
+Choose an SSH copy to compare syq with rsync, or a local copy to include cp.
+The script creates test data, checks the copied contents, and cleans up afterward.
+If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
+to download the script and run it again.
 
 <figure class="benchmark-example">
-<div class="benchmark-example-grid">
-<section aria-label="Example benchmark choices">
-<div class="visual-step">1 <span>Choose your test</span></div>
-<dl class="benchmark-choices">
-<dt>Copy where?</dt><dd>local</dd>
-<dt>Workloads?</dt><dd>both</dd>
-<dt>Test size</dt><dd>automatic by default</dd>
-</dl>
-<p class="visual-note">Results pictured: fixed-size sample<br>64 MiB + 1,024 files of 8 KiB</p>
-</section>
-<section aria-label="Example benchmark results">
-<div class="visual-step">2 <span>Compare the results</span></div>
 <table>
-<caption>Mean MB/s · higher is faster · 3 trials</caption>
-<thead><tr><th scope="col">Tool</th><th scope="col">Large file</th><th scope="col">Small files</th></tr></thead>
+<caption>Published example: Germany → US East Coast</caption>
+<thead><tr><th scope="col">Tool</th><th scope="col">Average speed</th></tr></thead>
 <tbody>
-<tr><th scope="row">syq</th><td>710.0</td><td>50.1</td></tr>
-<tr><th scope="row">rsync</th><td>567.3</td><td>71.1</td></tr>
-<tr><th scope="row">cp</th><td>1379.1</td><td>160.4</td></tr>
+<tr><th scope="row">syq</th><td>159.1 MB/s</td></tr>
+<tr><th scope="row">syq over SSH</th><td>87.2 MB/s</td></tr>
+<tr><th scope="row">rsync</th><td>18.0 MB/s</td></tr>
 </tbody>
 </table>
-<p class="visual-note">✓ Copied contents checked</p>
-</section>
-</div>
-<figcaption>Speeds from a fixed-size local sample, not a speed promise. Your results will differ.</figcaption>
+<figcaption>One 1.07 GB file, held in memory at both ends; three runs per tool.
+From the separate <a href="https://greaber.github.io/syq-bench/all-results.html#public-wan-forward">syq-bench project</a>,
+which provides more extensive benchmarks. Your results will depend on your machines and connection.</figcaption>
 </figure>
-
-For requirements, options and how to read the results, see
-[the benchmark guide](speed.md#quick-comparison).
 
 ## Updates
 
@@ -84,90 +69,22 @@ source <(syq completion zsh)
 syq completion fish | source
 ```
 
-Path completion also shows file details. In Bash, press Tab again until the
-match list appears (or press Alt+? to list matches directly). Zsh shows one
-entry per line; fish shows details in its completion pager. Completing or
-selecting an entry still inserts only its path.
-
-The listing shows permissions, owner, group, human-readable file size, and
-modification time in UTC. Symlinks include their targets. A directory's size
-is shown as `—`: completion does not scan its contents or calculate tree totals.
-Owner and group names come from the machine holding the files, with numeric
-IDs when names are unavailable. Files that disappear or cannot be inspected
-are marked `[metadata unavailable]`. If fetching details takes more than two
-seconds after the names arrive, completion keeps the names and marks their
-metadata unavailable.
-
-Bash fetches metadata only when listing matches. Zsh and fish fetch it while
-preparing their menus. Remote completion uses the same SSH login as copying;
-connection persistence is optional. After upgrading, open a new shell or
-source the completion adapter again to use the new display.
+Completion suggests options, hosts, and paths, with file details beside path
+matches. In Bash, press Tab again to list matches. Remote paths use your usual
+SSH login. Open a new shell after adding the setup line or upgrading syq.
 
 ## Keep connections open
 
-Connect to a server without copying any files:
+Keep an SSH connection ready for repeated copies:
 
 ```sh
 syq persist connect server
-syq persist status
-syq persist off
 ```
 
-`connect` enables persistence, installs or reuses the matching remote helper,
-and waits until receiving is ready when it is enabled. Calling it again reuses
-a healthy connection, or restarts receiving if its service has stopped or failed.
-It does not cancel requests on a healthy connection. `--timeout 30` controls
-how long it waits for receiving after SSH and helper setup; it does not limit
-authentication or helper installation. When `connect` turns persistence on,
-it says so before connecting. A failed connection leaves the setting on; use
-`syq persist off` to disable it.
+This enables persistence and connects without copying files. It also lets you
+[send files back from the server](receive.md), with approval on your machine.
+Connections stay open until you close them with `syq persist off`.
+Use `syq persist status` to see them.
 
-You can also run `syq persist on` to enable persistence for later ordinary syq
-connections. No separate receiving startup command is needed. Receiving is on
-by default and [incoming copies and commands require local approval](receive.md).
-Use `syq persist receive off` to disable receiving, or
-`syq persist receive on --root DIRECTORY` to contain copies in an existing directory.
-
-Durable connections have no idle expiry. Keepalives detect network failures; receiving
-reconnects automatically after a dropped connection or laptop sleep. Ordinary
-copies reopen a broken SSH login when used again. Reconnection needs an available
-SSH key or agent; background receiving cannot ask for a password. After reboot,
-run `syq persist connect server` again. Syq does not install a login service.
-
-While an SSH login remains connected, other processes running as your local
-user can reuse it without another key touch or agent approval. Incoming requests
-still have their own approval checks. `persist off` closes both directions.
-Connections started by an older binary keep that binary's idle policy until
-closed and reopened; upgrading does not interrupt a working connection solely
-to change its timeout.
-
-`syq persist status --json` reports the persistence setting, scope, and one
-entry per endpoint. Each entry includes its state (`starting`, `connecting`,
-`ready`, `reconnecting`, `failed`, or `inactive`), whether ordinary SSH is connected,
-and receiving state and errors. With receiving enabled, `ready` means that the
-return connection is online; ordinary SSH can reconnect on its next use.
-Inspecting status does not start connections. A configuration failure is shown
-as `failed`; correct it and run `syq persist connect server` to retry. If receiving
-preferences cannot be read, status still lists SSH connections. JSON includes
-`receiving_error`, and each connection's `receiving_enabled` is `null` because
-the setting could not be determined.
-
-For an isolated script, `syq persist on --ephemeral` prints a scope path;
-pass it to `syq persist connect server --pscope PATH` and later copy commands.
-`syq persist off --pscope PATH` closes it without changing the user setting.
-Ephemeral scopes reuse forward SSH logins only: they do not enable return copies,
-forwarded authorization, or commands on your machine. SSH logins expire five
-minutes after their last session closes. An unused helper pool can hold a session
-for another five minutes, so an abandoned script leaves at most ten idle minutes
-of connection reuse. Closing the scope explicitly ends both immediately.
-
-Syq 0.4.1 also enabled receiving in ephemeral scopes. Replacing the executable
-does not replace background receivers that are already running, so those old
-receivers can keep working until stopped. Running an old executable can start
-them again. With the current executable, `syq persist receive on` stops existing
-receivers to apply the settings and restarts them only for durable persistence.
-
-To replace an old ephemeral scope, close it with
-`syq persist off --pscope PATH` and create a new one. If your script needs
-return copies or commands, use `syq persist connect server` without `--pscope`
-to establish a durable connection.
+See [background connections](receive.md#background-connections) for reconnecting,
+turning receiving off, and using persistence in scripts.

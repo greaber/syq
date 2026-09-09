@@ -23,16 +23,25 @@ SSH configuration, programs, or enrollment state. Manage that state with
 
 Repeating `enroll` updates the receiver to match your local build. A pending
 enrollment can be retried or revoked. Revoke and enroll again to rotate its
-receipt key. Revocation stops active receivers for that enrollment before
-removing its state; see [revocation and upgrades](remote-to-remote.md#first-copy-and-access-management)
-for interruption, retry, and older-receiver behavior.
+receipt key. Revocation stops active receivers before removing their state;
+see [access management](remote-to-remote.md#first-copy-and-access-management)
+for interruption and retry behavior.
 
-Enrollment detects the destination platform. When it matches your machine,
-setup uploads the running executable without a release download. For a different
-platform, official releases install the matching executable after verifying the
-signed release manifest and artifact. Source builds require matching platforms.
-Enrollment does not use `--syq-path`. See [Developing syq](development.md#direct-server-to-server-copies)
-for refreshing a receiver after rebuilding.
+Stop active copies before upgrading: replacing the executable does not update
+running receivers. Repeat `syq receiver enroll hostB:/destination` afterward
+to refresh the installed receiver. Compatible enrollment keys and replay records
+are preserved. Different client builds cannot share one installed receiver
+concurrently; each needs a matching receiver.
+
+An incompatible enrollment requires fresh setup, which needs ordinary SSH
+access. Eligible copies install it automatically, or you can use `enroll`.
+Incompatible old enrollments are not listed or removed by the new build;
+they require manual cleanup on both machines.
+
+Enrollment detects the destination platform and installs a matching executable.
+Source builds require compatible platforms; `--syq-path` does not select the
+restricted receiver. See [Developing syq](development.md#direct-server-to-server-copies)
+for testing source builds.
 
 ## Limits and unsupported options
 
@@ -61,17 +70,6 @@ workers from the source to the destination. Both transports share the same
 copy authorization, limits, revocation, and signed receipt. A failed direct
 connection never selects a relay through your machine; choose
 `--coordinate-at local` explicitly to send data through it.
-
-After upgrading syq, repeat `syq receiver enroll hostB:/destination` to refresh
-an older installed receiver before using the new build. Refresh preserves the
-enrollment keys and replay records. Older clients need a matching receiver
-build too; clients of different builds cannot share one installed receiver
-concurrently.
-
-TCP listeners must advertise a port in the requested range. An invalid port
-fails TCP setup before any address is probed. Special-file creation accepts
-only FIFO, socket, and device types; permission bits follow the grant's
-permission-preservation setting.
 
 ## Signed results
 
@@ -117,3 +115,45 @@ Save the reported remote log location. The log is not a signed receipt.
 If printing the location fails, the command reports an error but the job may
 still be running. The coordinating server needs `/bin/kill` and either
 `setsid` or `perl`.
+
+## Authorization selection
+
+For `syq cp` with local sources and an SSH destination, `--auth-from auto`
+tries live receiving machines in alphabetical order, allowing up to two seconds
+for each reply. Offline or unsupported connections are skipped. With none
+available, or with unsupported options, it uses the source machine's SSH access.
+Once approval is requested, refusal or failure ends the attempt.
+
+`--auth-from NAME` and `--auth-from @NAME` require that receiving machine.
+Names `ssh` and `auto` need the `@` prefix to distinguish them from the option
+values. `--via NAME` always means a receiving name. `--auth-from ssh` always
+treats `--to` as an SSH endpoint, even if it matches a receiving name.
+
+Authorization through a receiving machine does not support `--detach`, custom
+`--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
+or `--coordinate-at`, `--no-tcp`, or `--tcp-plain`. It requires direct encrypted
+TCP from source to destination. Destination completion does not request
+permission through a receiving machine; use `--auth-from ssh` for completion
+through the source's own SSH access.
+
+On this route, quoted `~` and `~/archive` select the destination account's home
+directory. Use `./~/archive` for a literal directory called `~`. Avoid
+`~//archive`: explicit receiving authorization keeps it under the home directory,
+but automatic selection uses ordinary SSH, where it resolves to `/archive`.
+
+## Verification
+
+For comparisons between two servers, `--coordinate-at local` uses ordinary
+SSH access from your machine to both endpoints. It needs no restricted receiver
+enrollment and supports `--verify-only --results FILE`. Files are hashed on
+the servers; your machine compares their hashes and receives listings and
+results, not the full file contents.
+
+Direct restricted verification requires an existing enrollment and cannot
+produce `--results`; a receiver receipt cannot attest to the source's comparison.
+Verification never installs an enrollment.
+
+`--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
+overwrite policies. Filters and size limits select the entries to compare;
+special files require `--preserve=specials`. Metadata is not compared, but device
+identity is. A requested results file and remote helper caches may still be written.
