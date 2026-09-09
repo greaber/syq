@@ -1216,8 +1216,10 @@ impl RestrictedAuthority {
                     // Settle only this request's provisional hold: concurrent
                     // preparations for the same partial retain their own
                     // capacity regardless of response ordering.
-                    let absent =
-                        skip_if_absent && matches!(response, proto::Response::PartialSize(None));
+                    let absent = matches!(response,
+                        proto::Response::Prepared(prepared)
+                            if prepared.has_candidates || (skip_if_absent && prepared.partial_size.is_none())
+                    );
                     if let Some(hold) = observation_hold {
                         let key = (path.clone(), copy_id);
                         Self::settle_observation_reservation(&mut state, &key, hold, !absent);
@@ -2397,14 +2399,10 @@ impl RestrictedAuthority {
                 copy_id,
                 len,
                 block,
-                hashes,
                 guard,
                 ..
             } => {
                 self.check_hash_request(*block, *len)?;
-                if hashes.len() as u64 != len.div_ceil(*block) {
-                    bail!("invalid block reuse hashes");
-                }
                 if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
                 }
@@ -2412,7 +2410,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, None, pending)?;
+                self.constrain_prepare(path)?;
                 self.reserve_bytes(path, *copy_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
@@ -6539,6 +6537,57 @@ esac
     }
 
     #[test]
+    fn signed_skip_allows_seeding_and_retrying_a_new_file() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let fresh = target.join("fresh");
+        let candidate = target.join(".fresh.syq-tmp.abcdefghijklmnop");
+        fs::write(&candidate, b"new").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        let mut prepare = prepare_request(&fresh);
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        let response = ops.handle(&prepare);
+        assert!(
+            matches!(&response, proto::Response::Prepared(prepared) if prepared.has_candidates)
+        );
+        authority.settle(settlement, &response);
+        assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+        for attempt in 0..2 {
+            let mut seed = Request::SeedBasis {
+                path: path_bytes(&fresh),
+                copy_id: [1; 16],
+                len: 3,
+                block: authority.copy.limits.hash_block_bytes,
+                attempt,
+                guard: None,
+            };
+            let settlement = authority.authorize(&mut seed, false).unwrap();
+            let response = ops.handle(&seed);
+            assert!(matches!(&response, proto::Response::Hashes(hashes)
+                if *hashes == vec![crate::fsops::content_digest(b"new")]));
+            authority.settle(settlement, &response);
+            assert!(!fresh.exists());
+        }
+        let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
+        let settlement = authority.authorize(&mut publish, false).unwrap();
+        assert_eq!(finalize_condition(&publish), proto::TargetCondition::Absent);
+        let response = ops.handle(&publish);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        authority.settle(settlement, &response);
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        assert_eq!(fs::read(&candidate).unwrap(), b"new");
+    }
+
+    #[test]
     fn signed_skip_policy_retains_preexisting_objects() {
         use proto::TargetCondition::{Absent, Any, Matches};
         let temporary = crate::test_support::tempdir().unwrap();
@@ -6635,7 +6684,6 @@ esac
             copy_id: [1; 16],
             len: 3,
             block: proto::MIN_HASH_BLOCK_BYTES,
-            hashes: vec![crate::fsops::content_digest(b"abc")],
             attempt: 0,
             guard: None,
         };
@@ -7273,9 +7321,15 @@ esac
         let first = authority.authorize(&mut absent, false).unwrap();
         let mut same_absent = prepare(&target.join("absent"));
         let second = authority.authorize(&mut same_absent, false).unwrap();
-        authority.settle(first, &proto::Response::PartialSize(None));
+        authority.settle(
+            first,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
         assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
-        authority.settle(second, &proto::Response::PartialSize(None));
+        authority.settle(
+            second,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
         {
             let state = authority.state.lock().unwrap();
             assert!(state.file_lifecycles.is_empty());
@@ -7286,7 +7340,13 @@ esac
         let present_path = target.join("present");
         let mut present = prepare(&present_path);
         let settlement = authority.authorize(&mut present, false).unwrap();
-        authority.settle(settlement, &proto::Response::PartialSize(Some(0)));
+        authority.settle(
+            settlement,
+            &proto::Response::Prepared(proto::Preparation {
+                partial_size: Some(0),
+                has_candidates: false,
+            }),
+        );
         let state = authority.state.lock().unwrap();
         assert!(state
             .file_lifecycles
@@ -7329,7 +7389,10 @@ esac
         let older = authority.authorize(&mut observation, false).unwrap();
         let mut real = prepare_request(&path);
         let newer = authority.authorize(&mut real, false).unwrap();
-        authority.settle(older, &proto::Response::PartialSize(None));
+        authority.settle(
+            older,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
 
         {
             let state = authority.state.lock().unwrap();
@@ -7343,7 +7406,10 @@ esac
         assert!(error
             .to_string()
             .contains("signed grant total-byte limit exceeded"));
-        authority.settle(newer, &proto::Response::PartialSize(None));
+        authority.settle(
+            newer,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
     }
 
     #[test]
@@ -8622,7 +8688,6 @@ esac
             copy_id: [1; 16],
             len: 3,
             block: proto::MIN_HASH_BLOCK_BYTES,
-            hashes: vec![crate::fsops::content_digest(b"abc")],
             attempt: 0,
             guard: None,
         };

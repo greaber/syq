@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
+const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;
+const PARTIAL_CANDIDATES_MAX: usize = 256;
 const SOURCE_FD_RESERVE: usize = 32;
 // A shared worker may fill its source file cache, retain five copies of its
 // transport socket in a TCP serving process, and open one uncached source file
@@ -1427,7 +1429,8 @@ pub struct FsOps {
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
     held_basis: Option<HeldBasis>,
-    partial_candidates: HashMap<FileLocation, Vec<PathBytes>>,
+    partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
+    partial_directory_order: VecDeque<FileLocation>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -1582,6 +1585,7 @@ impl FsOps {
             fd_order: Vec::new(),
             held_basis: None,
             partial_candidates: HashMap::new(),
+            partial_directory_order: VecDeque::new(),
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
@@ -4795,25 +4799,16 @@ impl FsOps {
         )
     }
 
-    /// A directory is scanned once per worker. Candidates are only hints:
-    /// they may disappear or change, and their bytes are never trusted by name.
-    fn candidate_partials(
-        &mut self,
-        path: &[u8],
-        guard: Option<&ContainerGuard>,
-    ) -> Vec<PathBytes> {
-        let rooted = match self.rooted_destination_target(path, guard) {
-            Ok(rooted) => rooted,
-            Err(_) => return Vec::new(),
-        };
+    /// Bounded, best-effort discovery. Only complete readable basenames are
+    /// matched: a shortened or omitted prefix must not redirect unrelated files.
+    fn candidate_partials(&mut self, path: &[u8], rooted: Option<&RootedTarget>) -> Vec<PathBytes> {
         let label = rooted
-            .as_ref()
             .map(|target| path_bytes(&target.relative.to_path_buf()))
             .unwrap_or_else(|| path.to_vec());
         let p = Path::new(OsStr::from_bytes(&label));
         let parent = p.parent().unwrap_or_else(|| Path::new(""));
         let basename = p.file_name().unwrap_or_default().as_bytes();
-        let key = if let Some(target) = &rooted {
+        let key = if let Some(target) = rooted {
             let Ok(relative) = RelativePath::new(parent.as_os_str().as_bytes()) else {
                 return Vec::new();
             };
@@ -4824,8 +4819,16 @@ impl FsOps {
         } else {
             FileLocation::Path(parent.to_path_buf())
         };
+        if !self.partial_candidates.contains_key(&key) {
+            if self.partial_candidates.len() >= PARTIAL_DIRECTORY_CACHE_MAX {
+                if let Some(oldest) = self.partial_directory_order.pop_front() {
+                    self.partial_candidates.remove(&oldest);
+                }
+            }
+            self.partial_directory_order.push_back(key.clone());
+        }
         let candidates = self.partial_candidates.entry(key).or_insert_with(|| {
-            let names = if let Some(target) = &rooted {
+            let names = if let Some(target) = rooted {
                 RelativePath::new(parent.as_os_str().as_bytes())
                     .ok()
                     .and_then(|relative| target.root.read_directory(&relative).ok())
@@ -4838,25 +4841,31 @@ impl FsOps {
                 })
                 .map(|entries| {
                     entries
-                        .filter_map(|entry| entry.ok().map(|entry| entry.file_name().into_vec()))
+                        .filter_map(|entry| entry.ok().map(|e| e.file_name().into_vec()))
                         .collect()
                 })
                 .unwrap_or_default()
             };
-            names
+            let mut by_basename: HashMap<PathBytes, Vec<PathBytes>> = HashMap::new();
+            for name in names
                 .into_iter()
                 .filter(|name| is_partial_name(OsStr::from_bytes(name)))
-                .collect()
+                .take(PARTIAL_CANDIDATES_MAX)
+            {
+                let at = name.len() - PARTIAL_MARKER.len() - 16;
+                if at > 1 {
+                    by_basename
+                        .entry(name[1..at].to_vec())
+                        .or_default()
+                        .push(name);
+                }
+            }
+            by_basename
         });
         candidates
-            .iter()
-            .filter(|name| {
-                let at = name
-                    .windows(PARTIAL_MARKER.len())
-                    .rposition(|part| part == PARTIAL_MARKER.as_bytes())
-                    .unwrap();
-                at == 0 || basename.starts_with(&name[1..at])
-            })
+            .get(basename)
+            .into_iter()
+            .flatten()
             .map(|name| path_bytes(&parent.join(OsStr::from_bytes(name))))
             .collect()
     }
@@ -4884,7 +4893,7 @@ impl FsOps {
         &mut self,
         target: PartialTarget<'_>,
         options: PrepareOptions,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Preparation> {
         let PartialTarget {
             path,
             id: copy_id,
@@ -4897,8 +4906,21 @@ impl FsOps {
             attempt,
             create_if_missing,
         } = options;
-        let has_candidates = !inplace && !self.candidate_partials(path, guard).is_empty();
-        if let Some(target) = self.rooted_destination_target(path, guard)? {
+        let rooted = self.rooted_destination_target(path, guard)?;
+        // Existing finals get their equality check first. For new files,
+        // defer allocation until seeding so a fresh preallocation cannot be
+        // mistaken for bytes already written by this invocation on a retry.
+        if !inplace
+            && create_if_missing
+            && size > 0
+            && !self.candidate_partials(path, rooted.as_ref()).is_empty()
+        {
+            return Ok(Preparation {
+                partial_size: None,
+                has_candidates: true,
+            });
+        }
+        if let Some(target) = rooted {
             if inplace {
                 self.uncache_rooted(&target.root, &target.relative);
                 // An interrupted non-inplace run must not strand this job's
@@ -4918,7 +4940,7 @@ impl FsOps {
                                 format!("resize confined file {}", target.label.display())
                             })?;
                             self.cache_file(target.location(), attempt, false, file);
-                            return Ok(None);
+                            return Ok(Preparation::default());
                         }
                         Some(metadata) if metadata.is_dir() => {
                             bail!("destination {} is a directory", target.label.display())
@@ -4930,7 +4952,7 @@ impl FsOps {
                                     format!("resize confined file {}", target.label.display())
                                 })?;
                                 self.cache_file(target.location(), attempt, false, file);
-                                return Ok(None);
+                                return Ok(Preparation::default());
                             }
                             Err(error)
                                 if error.downcast_ref::<io::Error>().is_some_and(|error| {
@@ -4957,7 +4979,7 @@ impl FsOps {
                 PRIVATE_PARTIAL_MODE,
             )?
             else {
-                return Ok(has_candidates.then_some(0));
+                return Ok(Preparation::default());
             };
             if let Some(old_size) = basis_size {
                 if old_size > size {
@@ -4982,7 +5004,10 @@ impl FsOps {
                 true,
                 file,
             );
-            return Ok(basis_size.or(has_candidates.then_some(0)));
+            return Ok(Preparation {
+                partial_size: basis_size,
+                has_candidates: false,
+            });
         }
         let p = resolve(path);
         if inplace {
@@ -4996,13 +5021,13 @@ impl FsOps {
             let f = open_regular_read_write(&p, mode, false)?;
             f.set_len(size)?;
             self.cache_file(FileLocation::Path(p.clone()), attempt, false, f);
-            return Ok(None);
+            return Ok(Preparation::default());
         }
         let pp = self.partial_path(&p, copy_id)?;
         let Some((f, basis_size)) =
             self.open_private_partial(&pp, create_if_missing, PRIVATE_PARTIAL_MODE)?
         else {
-            return Ok(has_candidates.then_some(0));
+            return Ok(Preparation::default());
         };
         if let Some(old_size) = basis_size {
             if old_size > size {
@@ -5019,7 +5044,10 @@ impl FsOps {
             "partial-ready",
         )?;
         self.cache_file(FileLocation::Path(pp), attempt, true, f);
-        Ok(basis_size.or(has_candidates.then_some(0)))
+        Ok(Preparation {
+            partial_size: basis_size,
+            has_candidates: false,
+        })
     }
 
     pub fn hash_and_hold(
@@ -5139,39 +5167,32 @@ impl FsOps {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn seed_basis(
         &mut self,
         path: &[u8],
         copy_id: &CopyId,
         len: u64,
         block: u64,
-        hashes: &[ContentDigest],
         attempt: u32,
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<ContentDigest>> {
-        if !hash_response_fits(block, len) || hashes.len() as u64 != len.div_ceil(block) {
+        if !hash_response_fits(block, len) {
             bail!("invalid block reuse request");
         }
-        let candidates = self.candidate_partials(path, guard);
         let rooted = self.rooted_destination_target(path, guard)?;
-        let mut inputs = Vec::new();
-        if self.held_basis.is_some() {
-            inputs.push(self.take_held_basis(path, copy_id, guard)?.0.file);
-        }
-        if inputs.is_empty() {
-            let final_file = if let Some(target) = &rooted {
-                target.root.open_regular_read(&target.relative)
-            } else {
-                open_existing_regular(&resolve(path), false)
-            };
-            if let Ok(file) = final_file {
-                inputs.push(file);
-            }
-        }
-        let (output, location) = if let Some(target) = &rooted {
+        let expected = rooted
+            .as_ref()
+            .map(RootedTarget::location)
+            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        // A previous failed job may have left a hold on this connection. It is
+        // only an optional donor here, unlike the explicit FinishBasis request.
+        let held = self
+            .held_basis
+            .take()
+            .filter(|held| held.location == expected && held.copy_id == *copy_id);
+        let (output, basis_size, location) = if let Some(target) = &rooted {
             let (relative, label) = rooted_partial_target(target, copy_id)?;
-            let (file, _) = self
+            let (file, basis_size) = self
                 .open_private_partial_rooted(
                     &target.root,
                     &relative,
@@ -5182,6 +5203,7 @@ impl FsOps {
                 .context("sidecar creation was requested")?;
             (
                 file,
+                basis_size,
                 FileLocation::Rooted {
                     root: target.root.identity(),
                     relative,
@@ -5189,64 +5211,94 @@ impl FsOps {
             )
         } else {
             let partial = self.partial_path(&resolve(path), copy_id)?;
-            let (file, _) = self
+            let (file, basis_size) = self
                 .open_private_partial(&partial, true, PRIVATE_PARTIAL_MODE)?
                 .context("sidecar creation was requested")?;
-            (file, FileLocation::Path(partial))
+            (file, basis_size, FileLocation::Path(partial))
         };
-        // The private output may contain this invocation's own successful
-        // writes from a transport retry. It is never another run's output.
-        inputs.push(output.try_clone()?);
-        let mut reused = vec![[0; 32]; hashes.len()];
+        // Retry bytes already belong to this invocation. Hash them in place;
+        // copying them onto themselves adds writes without improving safety.
+        let mut input = None;
+        if basis_size.unwrap_or(0) == 0 && len > 0 {
+            for candidate in self.candidate_partials(path, rooted.as_ref()) {
+                let candidate_location = if let Some(target) = &rooted {
+                    let Ok(relative) = RelativePath::new(&candidate) else {
+                        continue;
+                    };
+                    FileLocation::Rooted {
+                        root: target.root.identity(),
+                        relative,
+                    }
+                } else {
+                    FileLocation::Path(resolve(&candidate))
+                };
+                if candidate_location == location {
+                    continue;
+                }
+                // Donors are read-only hints. Missing or unsuitable files are
+                // cache misses; successful reads are hashed from the same buffer
+                // that is written, even if the donor changes or is unlinked.
+                let opened = if let Some(target) = &rooted {
+                    RelativePath::new(&candidate)
+                        .and_then(|relative| target.root.open_regular_read(&relative))
+                } else {
+                    open_existing_regular(&resolve(&candidate), false)
+                };
+                if let Ok(file) = opened {
+                    if file
+                        .metadata()
+                        .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                    {
+                        input = Some(file);
+                        break;
+                    }
+                }
+            }
+        }
+        // A previous transfer's partial is usually closer to the source than
+        // the old final. Use the final only when no readable candidate exists.
+        if basis_size.unwrap_or(0) == 0 && input.is_none() {
+            input = held.map(|held| held.file).or_else(|| {
+                if let Some(target) = &rooted {
+                    target.root.open_regular_read(&target.relative).ok()
+                } else {
+                    open_existing_regular(&resolve(path), false).ok()
+                }
+            });
+        }
+        if basis_size.unwrap_or(0) == 0 {
+            self.preallocate_new_partial(&output, len)?;
+        }
+        let mut hashes = Vec::with_capacity(len.div_ceil(block) as usize);
         let mut buffer = vec![0; block as usize];
-        let mut reuse = |input: &File| -> Result<()> {
-            for (index, expected) in hashes.iter().enumerate() {
-                if reused[index] == *expected {
-                    continue;
-                }
-                let off = index as u64 * block;
-                let bytes = &mut buffer[..(len - off).min(block) as usize];
-                if input.read_exact_at(bytes, off).is_err() || content_digest(bytes) != *expected {
-                    continue;
-                }
+        let reader = input.as_ref().unwrap_or(&output);
+        for index in 0..len.div_ceil(block) {
+            let off = index * block;
+            let bytes = &mut buffer[..(len - off).min(block) as usize];
+            if reader.read_exact_at(bytes, off).is_err() {
+                // The controller treats an absent hash as a block to transfer.
+                break;
+            }
+            let hash = content_digest(bytes);
+            if input.is_some() {
                 #[cfg(debug_assertions)]
                 test_race_barrier(
                     "SYQ_TEST_REUSE_READY_FILE",
                     "SYQ_TEST_REUSE_CONTINUE_FILE",
                     "SYQ_TEST_HOLD_REUSE_MS",
-                    "reuse verified bytes",
+                    "reuse buffered bytes",
                 )?;
                 output
                     .write_all_at(bytes, off)
-                    .context("write verified reused block")?;
-                reused[index] = *expected;
+                    .context("write reused block")?;
             }
-            Ok(())
-        };
-        for input in inputs {
-            reuse(&input)?;
+            hashes.push(hash);
         }
-        for candidate in candidates {
-            // Read-only, no-follow opens; vanished/unreadable/unsafe candidates
-            // are cache misses. Never chmod, truncate, rename or delete them.
-            let opened = if let Some(target) = &rooted {
-                RelativePath::new(&candidate)
-                    .and_then(|relative| target.root.open_regular_read(&relative))
-            } else {
-                open_existing_regular(&resolve(&candidate), false)
-            };
-            if let Ok(input) = opened {
-                if input
-                    .metadata()
-                    .is_ok_and(|metadata| is_owned_partial(&metadata))
-                {
-                    reuse(&input)?;
-                }
-            }
+        if output.metadata()?.len() != len {
+            output.set_len(len)?;
         }
-        output.set_len(len)?;
         self.cache_file(location, attempt, true, output);
-        Ok(reused)
+        Ok(hashes)
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
@@ -5269,9 +5321,6 @@ impl FsOps {
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
         } = policy;
-        if !inplace && !self.candidate_partials(dst, None).is_empty() {
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
@@ -6334,7 +6383,7 @@ impl FsOps {
                         create_if_missing: *create_if_missing,
                     },
                 )
-                .map(Response::PartialSize),
+                .map(Response::Prepared),
             Request::HashAndHold {
                 path,
                 copy_id,
@@ -6360,19 +6409,10 @@ impl FsOps {
                 copy_id,
                 len,
                 block,
-                hashes,
                 attempt,
                 guard,
             } => self
-                .seed_basis(
-                    path,
-                    copy_id,
-                    *len,
-                    *block,
-                    hashes,
-                    *attempt,
-                    guard.as_ref(),
-                )
+                .seed_basis(path, copy_id, *len, *block, *attempt, guard.as_ref())
                 .map(Response::Hashes),
             Request::CopyLocal {
                 source,
@@ -8335,15 +8375,7 @@ mod tests {
         assert_eq!(hashes, vec![content_digest(b"held")]);
         assert_eq!(held_len, 4);
         operations
-            .seed_basis(
-                b"basis",
-                &copy_id,
-                4,
-                MIN_HASH_BLOCK_BYTES,
-                &[content_digest(b"held")],
-                0,
-                None,
-            )
+            .seed_basis(b"basis", &copy_id, 4, MIN_HASH_BLOCK_BYTES, 0, None)
             .unwrap();
         let basis_partial = partial_path(&moved.join("basis"), &copy_id).unwrap();
         assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
@@ -9145,6 +9177,88 @@ mod tests {
     }
 
     #[test]
+    fn seed_basis_ignores_a_previous_jobs_hold() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let earlier = temporary.path().join("earlier");
+        let later = temporary.path().join("later");
+        fs::write(&earlier, b"earlier bytes").unwrap();
+        fs::write(
+            temporary.path().join(".later.syq-tmp.abcdefghijklmnop"),
+            b"later bytes",
+        )
+        .unwrap();
+        let mut ops = FsOps::new();
+        let id = [8; 16];
+        ops.hash_and_hold(
+            &path_bytes(&earlier),
+            &id,
+            MIN_HASH_BLOCK_BYTES,
+            13,
+            TargetCondition::Any,
+            None,
+        )
+        .unwrap();
+        // A source-side failure would leave this earlier hold unconsumed.
+        let hashes = ops
+            .seed_basis(&path_bytes(&later), &id, 11, MIN_HASH_BLOCK_BYTES, 0, None)
+            .unwrap();
+        assert_eq!(hashes, vec![content_digest(b"later bytes")]);
+        assert_eq!(
+            fs::read(partial_path(&later, &id).unwrap()).unwrap(),
+            b"later bytes"
+        );
+    }
+
+    #[test]
+    fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let target = temporary.path().join("file");
+        let id = [9; 16];
+        let partial = partial_path(&target, &id).unwrap();
+        fs::write(&partial, b"retry bytes").unwrap();
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        File::options()
+            .write(true)
+            .open(&partial)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let before = fs::metadata(&partial).unwrap();
+        let mut ops = FsOps::new();
+        let hashes = ops
+            .seed_basis(&path_bytes(&target), &id, 11, MIN_HASH_BLOCK_BYTES, 1, None)
+            .unwrap();
+        let after = fs::metadata(&partial).unwrap();
+        assert_eq!(hashes, vec![content_digest(b"retry bytes")]);
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(fs::read(partial).unwrap(), b"retry bytes");
+    }
+
+    #[test]
+    fn partial_discovery_is_exact_and_directory_cache_is_bounded() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = FsOps::new();
+        for index in 0..PARTIAL_DIRECTORY_CACHE_MAX + 2 {
+            let directory = temporary.path().join(index.to_string());
+            fs::create_dir(&directory).unwrap();
+            let candidate = directory.join(".file.syq-tmp.abcdefghijklmnop");
+            fs::write(&candidate, b"donor").unwrap();
+            fs::write(directory.join(".syq-tmp.abcdefghijklmnop"), b"ambiguous").unwrap();
+            assert_eq!(
+                ops.candidate_partials(&path_bytes(&directory.join("file")), None),
+                vec![path_bytes(&candidate)]
+            );
+            assert!(ops
+                .candidate_partials(&path_bytes(&directory.join("file-other")), None)
+                .is_empty());
+            assert!(ops.partial_candidates.len() <= PARTIAL_DIRECTORY_CACHE_MAX);
+            assert!(ops.partial_directory_order.len() <= PARTIAL_DIRECTORY_CACHE_MAX);
+        }
+    }
+
+    #[test]
     fn observation_only_prepare_does_not_create_a_sidecar() {
         let dir = test_dir();
         fs::create_dir(&dir).unwrap();
@@ -9169,7 +9283,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(observed, None);
+        assert_eq!(observed.partial_size, None);
         assert!(!partial.exists());
 
         operations
@@ -9223,7 +9337,7 @@ mod tests {
 
         symlink(&external, &partial).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
-        assert_eq!(observe(&mut operations), Some(0));
+        assert_eq!(observe(&mut operations).partial_size, None);
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_symlink());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -9233,7 +9347,7 @@ mod tests {
         fs::hard_link(&external, &partial).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert_eq!(before.nlink(), 2);
-        assert_eq!(observe(&mut operations), Some(0));
+        assert_eq!(observe(&mut operations).partial_size, None);
         let after = fs::symlink_metadata(&partial).unwrap();
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(after.nlink(), 2);
@@ -9243,7 +9357,7 @@ mod tests {
         create_node_any(&partial, MODE_FIFO | 0o600, 0).unwrap();
         let before = fs::symlink_metadata(&partial).unwrap();
         assert!(before.file_type().is_fifo());
-        assert_eq!(observe(&mut operations), Some(0));
+        assert_eq!(observe(&mut operations).partial_size, None);
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_fifo());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -9287,7 +9401,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(observed, Some(0));
+        assert_eq!(observed.partial_size, None);
         let after = fs::symlink_metadata(&partial).unwrap();
         assert!(after.file_type().is_symlink());
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));

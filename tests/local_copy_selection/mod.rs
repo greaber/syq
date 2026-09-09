@@ -262,8 +262,21 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
     let resumed = run().run().unwrap();
     assert_output_ok(&resumed);
     assert_eq!(partial_files(&t.path("dst")), partials);
+    // Cleanup changes the containing directory's mtime. Check copied directory
+    // metadata before cleanup, and compare each payload independently of donors.
+    let source_dir = fs::metadata(t.path("src")).unwrap();
+    let destination_dir = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(source_dir.mtime(), destination_dir.mtime());
+    assert_eq!(source_dir.mode() & 0o7777, destination_dir.mode() & 0o7777);
+    for name in ["file", "tiny"] {
+        assert_same_tree(
+            &t.path(&format!("src/{name}")),
+            &t.path(&format!("dst/{name}")),
+        );
+    }
     run_native_ok(&["clean-partials", &t.s("dst")]);
-    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 2);
     let observed = tuning_observed(&resumed);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);

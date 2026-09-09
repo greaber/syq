@@ -11815,7 +11815,7 @@ fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn long_basename_partial_is_truncated_and_resumed() {
+fn long_basename_partial_is_truncated_and_retry_copies_correctly() {
     let t = Tmp::new();
     let basename = "n".repeat(240);
     let contents = vec![b'z'; 5 * 1024 * 1024];
@@ -13077,6 +13077,10 @@ fn partial_candidates_protect_containing_directories() {
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert!(t.path(&foreign).exists());
     assert!(!t.path("dst/extra/gone").exists());
+    let diagnostic = stderr_of(&out);
+    assert!(diagnostic.contains(".f.syq-tmp."), "{diagnostic}");
+    assert!(diagnostic.contains("syq clean-partials"), "{diagnostic}");
+    assert!(!diagnostic.contains("ignored paths"), "{diagnostic}");
 }
 
 // ----------------------------------------------------------- review round 10
@@ -20511,4 +20515,118 @@ fn concurrent_default_tree_copies_keep_every_file_whole() {
             "mixed contents in {name}"
         );
     }
+}
+
+#[test]
+fn partial_candidates_do_not_break_empty_replacement_or_unchanged_files() {
+    for candidate in [".out.syq-tmp.abcdefghijklmnop", ".syq-tmp.abcdefghijklmnop"] {
+        for empty in [true, false] {
+            let t = Tmp::new();
+            let source = if empty { vec![] } else { vec![b'a'; 5 << 20] };
+            write(&t.path("src"), &source);
+            write(
+                &t.path("out"),
+                if empty { b"old contents" } else { &source },
+            );
+            write(&t.path(candidate), b"stale");
+            let before = fs::metadata(t.path("out")).unwrap().ino();
+            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("out")]);
+            assert_eq!(read(&t.path("out")), source);
+            if !empty {
+                assert_eq!(fs::metadata(t.path("out")).unwrap().ino(), before);
+            }
+            assert_eq!(read(&t.path(candidate)), b"stale");
+            assert_eq!(partial_files(&t.0).len(), 1);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn partial_candidates_do_not_disable_local_whole_file_copies() {
+    let t = Tmp::new();
+    for name in ["file", "file-other", "unrelated"] {
+        write(&t.path(&format!("src/{name}")), &vec![b'a'; 5 << 20]);
+    }
+    write(&t.path("dst/.file.syq-tmp.abcdefghijklmnop"), b"stale");
+    write(&t.path("dst/.syq-tmp.abcdefghijklmnop"), b"ambiguous");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 3);
+    assert_eq!(observed["range_requests"], 0);
+    for name in ["file", "file-other", "unrelated"] {
+        assert_eq!(
+            read(&t.path(&format!("src/{name}"))),
+            read(&t.path(&format!("dst/{name}")))
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn seeding_preallocates_before_copying_donor_bytes() {
+    for existing in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src"), &vec![b'a'; 5 << 20]);
+        if existing {
+            write(&t.path("out"), b"old contents");
+        }
+        write(&t.path(".out.syq-tmp.abcdefghijklmnop"), b"donor");
+        let out = compat_command()
+            .args([
+                "-ac",
+                "--bwlimit",
+                "1G",
+                "--no-progress",
+                &t.s("src"),
+                &t.s("out"),
+            ])
+            .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
+            .run()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            stderr_of(&out).contains("preallocate destination file"),
+            "{}",
+            stderr_of(&out)
+        );
+        if existing {
+            assert_eq!(read(&t.path("out")), b"old contents");
+        } else {
+            assert!(!t.path("out").exists());
+        }
+        assert_eq!(read(&t.path(".out.syq-tmp.abcdefghijklmnop")), b"donor");
+    }
+}
+
+#[test]
+fn resume_prefers_a_partial_to_the_old_destination_contents() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 5 << 20];
+    write(&t.path("src"), &contents);
+    write(&t.path("out"), &vec![b'b'; contents.len()]);
+    write(
+        &t.path(".out.syq-tmp.abcdefghijklmnop"),
+        &contents[..3 << 20],
+    );
+    let out = run_ok(&[
+        "-ac",
+        "--block-size=1M",
+        "--bwlimit=1G",
+        &t.s("src"),
+        &t.s("out"),
+    ]);
+    assert_eq!(read(&t.path("out")), contents);
+    assert!(
+        out.contains("1 files (2.00 MiB), 3.00 MiB unchanged"),
+        "{out}"
+    );
+    assert_eq!(partial_files(&t.0).len(), 1);
 }

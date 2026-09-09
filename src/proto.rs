@@ -559,6 +559,13 @@ pub enum ConnectionRole {
     },
 }
 
+/// An existing private output and an optional donor are separate states.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preparation {
+    pub partial_size: Option<u64>,
+    pub has_candidates: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     Hello {
@@ -702,7 +709,8 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
-    /// Returns PartialSize with the size observed before any adjustment. A
+    /// Returns Prepared with the private size observed before adjustment and
+    /// whether donor discovery deferred creation to SeedBasis. A
     /// false `create_if_missing` lets content-identical final files complete
     /// without ever allocating a sidecar.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -738,13 +746,14 @@ pub enum Request {
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
-    /// Copy verified candidate blocks into this invocation's private sidecar.
+    /// Copy one optional donor into the private sidecar and return hashes of
+    /// the exact buffers written. The controller must repair differing blocks
+    /// before publication. An existing private sidecar is hashed without copying.
     SeedBasis {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
         block: u64,
-        hashes: Vec<ContentDigest>,
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
@@ -1103,6 +1112,7 @@ pub enum Response {
     /// All data/error frames for the stopped source stream precede this marker.
     ReadStreamDone,
     WriteStreamDone,
+    Prepared(Preparation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -2078,6 +2088,19 @@ mod tests {
             let message = result.unwrap_err().to_string();
             assert!(message.contains("build identity mismatch"), "{message}");
             assert!(message.contains("remote v0.4.0"), "{message}");
+        }
+    }
+
+    #[test]
+    fn released_v052_preamble_rejects_new_transfer_messages_before_decoding() {
+        // Literal v0.5.2 preamble, independent of today's enum encodings.
+        const V052: &[u8] = b"SYQWIRE\0\0\x06v0.5.2";
+        if crate::identity::build() != "v0.5.2" {
+            let error = FrameReader::new(V052).read_msg::<Response>().unwrap_err();
+            assert!(
+                error.to_string().contains("build identity mismatch"),
+                "{error}"
+            );
         }
     }
 

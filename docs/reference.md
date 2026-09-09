@@ -234,8 +234,10 @@ Ignored paths are also protected from pruning.
 Rerun the command. Completed files are skipped; partially copied files can
 reuse matching blocks. Each run writes its own fresh partial beside the
 destination and replaces the final file only when complete. When resuming,
-syq reads candidates, checks each block against the source, and copies matching
-bytes into its own partial. Candidates are left unchanged for other copies.
+syq can copy bytes from a previous partial into its own output, hash the bytes
+it copied, and transfer blocks that differ from the source before publishing.
+The previous partial stays unchanged. Reuse is best effort; local direct copies
+can be faster than looking for reusable blocks and take priority.
 
 Concurrent copies use separate partials. With unchanged sources, each completed
 file comes from one copy; different copies may win for different files. This
@@ -245,7 +247,9 @@ updates, and pruning can delete another copy's completed files.
 Partials are named `.FILENAME.syq-tmp.RANDOM`, with 16 random characters at the
 end. The filename portion is shortened or omitted when space is tight. Syq
 removes its own partial when it publishes the completed file. Interrupted runs
-can leave partials behind, including after a later successful retry.
+can leave partials behind, including after a later successful retry. Automatic
+reuse looks for complete filename matches; partials with shortened or omitted
+filenames may not be reused.
 
 To remove leftover partials, stop copies writing into the tree, then preview
 and run:

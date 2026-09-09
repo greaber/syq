@@ -6889,7 +6889,7 @@ impl Planner<'_> {
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
-            let mut partial_parents = std::collections::HashSet::new();
+            let mut partial_parents = std::collections::HashMap::new();
             let seen = &self.dst_seen;
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
@@ -6930,7 +6930,9 @@ impl Planner<'_> {
                         if e.kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
                             for (index, byte) in full.iter().enumerate() {
                                 if *byte == b'/' {
-                                    partial_parents.insert(full[..index].to_vec());
+                                    partial_parents
+                                        .entry(full[..index].to_vec())
+                                        .or_insert_with(|| rel.clone());
                                 }
                             }
                         } else {
@@ -6972,11 +6974,14 @@ impl Planner<'_> {
                 },
             );
             res?;
-            protected.extend(partial_parents);
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
-                    if protected.contains(&path) {
+                    if let Some(partial) = partial_parents.get(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds partial {partial}; use syq clean-partials after copies stop"
+                        ));
+                    } else if protected.contains(&path) {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
@@ -7868,8 +7873,8 @@ impl Worker {
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
-            // absent until SeedBasis proves that bytes actually differ.
-            let partial_size = match ok(
+            // absent until the content comparison shows a difference.
+            let prepared = match ok(
                 self.dst.call(Request::Prepare {
                     path: job.dst.clone(),
                     size,
@@ -7882,11 +7887,11 @@ impl Worker {
                 })?,
                 "prepare",
             )? {
-                Response::PartialSize(size) => size,
+                Response::Prepared(prepared) => prepared,
                 other => bail!("unexpected response {other:?}"),
             };
 
-            if partial_size.is_some() || final_is_file {
+            if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
             }
             if inplace {
@@ -7895,7 +7900,9 @@ impl Worker {
                 }
                 return Ok((full(), true));
             }
-            if partial_size.is_some() {
+            // A retry's own output must be finished (and thus consumed), even
+            // if another copy has meanwhile published identical final bytes.
+            if prepared.partial_size.is_some() {
                 if size == 0 {
                     return Ok((vec![], true));
                 }
@@ -7920,6 +7927,9 @@ impl Worker {
                     return Ok((vec![], false));
                 }
                 return Ok((self.reuse_blocks(&job, diff.source_hashes)?, true));
+            }
+            if prepared.has_candidates {
+                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             Ok((full(), true))
         })();
@@ -8064,18 +8074,9 @@ impl Worker {
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
     fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
         if which == Which::Partial {
-            let response = self.src.call(Request::HashBlocks {
-                path: job.src.clone(),
-                source: self.source_reference(job),
-                which: Which::Final,
-                copy_id: self.copy_id(),
-                block: self.opts.block,
-                len: job.entry.size,
-                attempt: job.attempt,
-                guard: None,
-            })?;
-            let hashes = Self::hashes(ok(response, "hash source")?)?;
-            return self.reuse_blocks(job, hashes);
+            return self
+                .diff_with(job, self.seed_request(job), "seed and hash destination")
+                .map(|diff| diff.ranges);
         }
         self.diff_with(
             job,
@@ -8099,15 +8100,7 @@ impl Worker {
         job: &FileJob,
         hashes: Vec<ContentDigest>,
     ) -> Result<Vec<(u64, u64)>> {
-        let response = self.dst.call(Request::SeedBasis {
-            path: job.dst.clone(),
-            copy_id: self.copy_id(),
-            len: job.entry.size,
-            block: self.opts.block,
-            hashes: hashes.clone(),
-            attempt: job.attempt,
-            guard: job.container_guard.clone(),
-        })?;
+        let response = self.dst.call(self.seed_request(job))?;
         let reused = Self::hashes(ok(response, "reuse destination blocks")?)?;
         Ok(Self::different_ranges(
             &hashes,
@@ -8115,6 +8108,17 @@ impl Worker {
             self.opts.block,
             job.entry.size,
         ))
+    }
+
+    fn seed_request(&self, job: &FileJob) -> Request {
+        Request::SeedBasis {
+            path: job.dst.clone(),
+            copy_id: self.copy_id(),
+            len: job.entry.size,
+            block: self.opts.block,
+            attempt: job.attempt,
+            guard: job.container_guard.clone(),
+        }
     }
 
     /// Compare the source with one opened final-file inode retained by the
@@ -8881,7 +8885,7 @@ mod tests {
                         dst.lock()
                             .unwrap()
                             .replies
-                            .push_back(Response::PartialSize(None));
+                            .push_back(Response::Prepared(Preparation::default()));
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                     let opts = Arc::new(Opts {
