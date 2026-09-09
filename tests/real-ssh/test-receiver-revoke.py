@@ -78,7 +78,7 @@ def main():
 import json
 from pathlib import Path
 root = Path({root!r})
-print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in root.glob('.' + name + '.syq-part.*')) for name in ('one', 'two')]))
+print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in root.glob('.' + name + '.syq-tmp.*')) for name in ('one', 'two')]))
 """)
         def started():
             assert all(process.poll() is None for process in processes), "copy exited before revocation"

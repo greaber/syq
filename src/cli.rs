@@ -90,6 +90,8 @@ pub struct Args {
     /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
+    #[arg(skip)]
+    pub clean_partials: bool,
     /// Endpoint-side base for native copy source selectors. Unlike `--root`,
     /// this is not a containment boundary.
     #[arg(skip)]
@@ -442,6 +444,7 @@ impl Args {
             "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native(&argv[1..], Interface::NativeCp),
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
+            "clean-partials" => parse_clean_partials(&argv[1..]),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" | "--help-all" => {
                 print_root_help(command == "--help-all");
@@ -685,6 +688,7 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
+        "clean-partials" => Some(crate::help::filesystem(CleanPartialsCommand::command())),
         "map" => Some(crate::help::filesystem(NativeMapCommand::command())),
         _ => None,
     }
@@ -1168,6 +1172,73 @@ struct NativeRmCommand {
     pscope: Option<PathBuf>,
 }
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "syq clean-partials",
+    version,
+    about = "Delete syq partial files below the selected directories.",
+    long_about = "Delete new-format syq partial files recursively, leaving other files and directories intact. Stop copies writing into these trees first. Older partial formats are not selected. Symlinks are not followed.",
+    before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
+)]
+struct CleanPartialsCommand {
+    /// Directory trees to search
+    #[arg(value_name = "TREE", required = true)]
+    trees: Vec<OsString>,
+    /// Removal endpoint ([USER@]HOST[:PORT]); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    on: Option<String>,
+    /// Resolve relative trees from DIR at the removal endpoint
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
+    cwd: Option<OsString>,
+    /// Confine traversal beneath DIR
+    #[arg(long, value_name = "DIR")]
+    root: Option<OsString>,
+    #[command(flatten)]
+    operational: NativeOperationalArgs,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
+    #[command(flatten)]
+    results_output: NativeResultsArgs,
+}
+
+fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
+    reject_detached_dash_native_values(argv)?;
+    let mut full = vec![OsString::from("syq clean-partials")];
+    full.extend_from_slice(argv);
+    let matches = crate::help::filesystem(CleanPartialsCommand::command())
+        .try_get_matches_from(full)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = CleanPartialsCommand::from_arg_matches(&matches)?;
+    let endpoint = parse_native_endpoint(parsed.on.as_deref())?;
+    if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
+        bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
+    }
+    validate_native_results_fd(parsed.results_output.results_fd)?;
+    let confined = parsed.root.is_some();
+    let mut args = native_removal_args(
+        parsed.cwd,
+        parsed.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    );
+    args.clean_partials = true;
+    args.locations = parsed
+        .trees
+        .into_iter()
+        .map(|tree| {
+            let path = trim_native_trailing_slashes(tree.into_vec());
+            validate_native_source_selector(&path, confined)?;
+            Ok(Location::native(
+                endpoint.clone(),
+                path,
+                SourceSelection::Directory,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(args)
+}
+
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
     reject_detached_dash_native_values(argv)?;
     match interface {
@@ -1550,10 +1621,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let matches = crate::help::filesystem(NativeRmCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
-    let mut parsed = NativeRmCommand::from_arg_matches(&matches)?;
-    let results = parsed.results_output.results.take();
-    let results_fd = parsed.results_output.results_fd.take();
-    validate_native_results_fd(results_fd)?;
+    let parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         (
@@ -1617,21 +1686,40 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             Ok(Location::native(endpoint.clone(), path, selection))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut args = native_engine_defaults();
-    args.interface = Interface::NativeRm;
+    let mut args = native_removal_args(
+        parsed.selection.cwd,
+        parsed.selection.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    );
     args.locations = locations;
-    args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
-    args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
-    args.native_results = results.map(OsStringExt::into_vec);
-    args.native_results_fd = results_fd;
     args.pscope = parsed.pscope;
-    args.syq_path = parsed.helper.syq_path;
-    args.no_bootstrap = parsed.helper.no_bootstrap;
-    args.rm = true;
-    apply_native_operational(&mut args, parsed.operational);
     Ok(args)
+}
+
+// Keep common engine settings shared while each command retains its own
+// selection syntax and validation order.
+fn native_removal_args(
+    cwd: Option<OsString>,
+    root: Option<OsString>,
+    operational: NativeOperationalArgs,
+    helper: NativeRemoteHelperArgs,
+    results: NativeResultsArgs,
+) -> Args {
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeRm;
+    args.rm = true;
+    args.native_rm_cwd = cwd.map(OsStringExt::into_vec);
+    args.native_rm_root = root.map(OsStringExt::into_vec);
+    args.native_results = results.results.map(OsStringExt::into_vec);
+    args.native_results_fd = results.results_fd;
+    args.syq_path = helper.syq_path;
+    args.no_bootstrap = helper.no_bootstrap;
+    apply_native_operational(&mut args, operational);
+    args
 }
 
 fn validate_native_results_fd(results_fd: Option<i32>) -> Result<()> {
@@ -1748,6 +1836,7 @@ mod native_sdk_inventory_tests {
         let commands = [
             ("cp", NativeCopyCommand::command()),
             ("rm", NativeRmCommand::command()),
+            ("clean-partials", CleanPartialsCommand::command()),
             ("map", NativeMapCommand::command()),
         ];
         assert_eq!(

@@ -46,7 +46,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                 progress = time.monotonic() + 5
                 state = ""
                 while time.monotonic() < deadline:
-                    partials = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'").splitlines()
+                    partials = remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'").splitlines()
                     state = repr(partials)
                     if len(partials) == 1:
                         state = remote("dd if=" + shlex.quote(partials[0]) + " bs=1M count=4 status=none | sha256sum")
@@ -260,5 +260,8 @@ records = [json.loads(line) for line in run("ssh", "source", f"cat {results}").s
 assert records[-1]["type"] == "result", records
 assert records[-1]["bytes_unchanged"] >= 4 * 1024 * 1024, records[-1]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
-assert not remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-part.*'")
+assert len(remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'").splitlines()) == 1
+run("syq", "clean-partials", "--on", "destination", "/tmp/syq-real-ssh/forward")
+assert not remote("find /tmp/syq-real-ssh/forward -type f -name '.cancelled.syq-tmp.*'")
+assert remote("sha256sum /tmp/syq-real-ssh/forward/cancelled").split()[0] == expected
 print("source-shell remote copy checks passed", flush=True)

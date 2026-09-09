@@ -130,11 +130,11 @@ host resolution. A copy never switches routes after selecting its destination.
 
 ## Limits to keep in mind
 
-- **Privileged copies need trusted destination directories.** Resume uses
-  predictable partial-file names. Do not copy as root into a directory
-  writable by untrusted users. Syq only reuses partials owned by its effective
-  user; foreign-owned leftovers are replaced without changing their contents
-  or permissions. This does not make a shared writable directory trusted.
+- **Privileged copies need trusted destination directories.** Do not copy as root into a
+  directory writable by untrusted users. Syq writes private partial files.
+  When reusing bytes from another partial, it only reads regular files owned
+  by its effective user. It checks those bytes against source hashes and leaves
+  the other partial unchanged. This does not make a shared writable directory trusted.
 - **Hard links share contents and metadata.** In-place writes and metadata
   changes through a destination hard link affect every name for that file,
   including names outside the selected destination or a restricted grant's

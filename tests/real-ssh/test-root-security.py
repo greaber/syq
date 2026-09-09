@@ -62,7 +62,7 @@ def main():
             partials = []
             try:
                 while time.monotonic() < deadline:
-                    partials = list(root.glob(".*.syq-part.*"))
+                    partials = list(root.glob(".*.syq-tmp.*"))
                     if partials:
                         break
                     assert process.poll() is None, "copy exited before producing a partial"
@@ -85,7 +85,9 @@ def main():
                 assert held.read() == b"foreign inode must remain untouched"
                 after = os.fstat(held.fileno())
                 assert after.st_uid == 1000 and after.st_mode & 0o777 == 0o666
-                assert not partial.exists()
+                assert partial.exists()
+            run(["syq", "clean-partials", str(root)])
+            assert not partial.exists()
             print(f"Foreign-owned partial refused; requested ownership preserved: {interface}", flush=True)
 
         selected = root / "typed-link"

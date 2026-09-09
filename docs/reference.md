@@ -196,7 +196,9 @@ Ignored paths and files skipped by size limits are protected.
 
 Scan errors prevent deletion. An interruption after deletion starts can leave
 some extras removed. Do not prune while another copy is writing into the same
-tree: its files and partials can be treated as extras.
+tree: its completed files can be treated as extras. Recognized partial files
+and directories containing them are protected from pruning. With `-v`, syq
+lists each extra file it keeps because its name matches the partial-file format.
 
 ## Ignoring paths
 
@@ -230,14 +232,46 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerun the same command. Completed files are skipped; partially copied files
-reuse matching blocks. By default, syq writes a partial file beside the
-destination and replaces the final file only when complete.
+Rerun the command. Completed files are skipped; partially copied files can
+reuse matching blocks. Each run writes its own fresh partial beside the
+destination and replaces the final file only when complete. When resuming,
+syq can copy bytes from a previous partial into its own output, hash the bytes
+it copied, and transfer blocks that differ from the source before publishing.
+The previous partial stays unchanged. Reuse is best effort; local direct copies
+can be faster than looking for reusable blocks and take priority.
 
-Running the same copy twice at once can cause errors as the runs share temporary
-files. Wait for it to finish or stop it before restarting. To abandon a copy,
-stop all its runs before removing hidden files with `.syq-part.` in their names
-at the destination.
+Resuming requires space for the new output as well as the previous partial.
+This can require enough free space for another complete file, even when only
+a small amount remains to transfer.
+
+Concurrent copies use separate partials. With unchanged sources, each completed
+file comes from one copy; different copies may win for different files. This
+does not make a whole tree a snapshot. `--inplace` still exposes unfinished
+updates, and pruning can delete another copy's completed files.
+
+Partials are named `.FILENAME.syq-tmp.RANDOM`, with 16 random characters at the
+end. The filename portion is shortened or omitted when space is tight. Syq
+removes its own partial when it publishes the completed file. Interrupted runs
+can leave partials behind, including after a later successful retry. Partials
+with shortened or omitted filenames may not be reused.
+
+To remove leftover partials, stop copies writing into the tree, then preview
+and run:
+
+```sh
+syq clean-partials --dry-run -v backup
+syq clean-partials backup
+# Search several remote trees with the parallel removal workers.
+syq clean-partials --on server --cwd /data -j 8 backup archive
+```
+
+This command removes regular files with the current partial-name format. It
+keeps directories, other filenames, and symlinks, and does not follow symlinks.
+Use `--root DIR` to confine traversal and `--results FILE` for removal results.
+The results use the same `mode: "rm"` records as `syq rm`; they do not distinguish
+a partial sweep from other removal commands.
+A regular file deliberately named like a partial is also selected. Old partial
+formats are neither reused nor selected by this command; remove those manually.
 
 ## Check file contents
 

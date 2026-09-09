@@ -1207,7 +1207,7 @@ fn partial_files(dir: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".syq-part."))
+                .is_some_and(|name| name.to_string_lossy().contains(".syq-tmp."))
         })
         .collect()
 }
@@ -5004,7 +5004,7 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dest/file")), content);
-    assert!(!partial.exists());
+    assert!(partial.exists());
     let connected = fs::read_to_string(events)
         .unwrap()
         .lines()
@@ -5713,7 +5713,10 @@ fn resume_from_partial() {
     }
     let out = run_ok(&args);
     assert!(read(&t.path("dst/big.bin")) == data);
-    assert!(!partial.exists(), "partial should be gone after finalize");
+    assert!(
+        partial.exists(),
+        "the candidate remains available to other copies"
+    );
     assert_same_tree(&t.path("src/big.bin"), &t.path("dst/big.bin"));
     // Roughly half should have been reused.
     assert!(out.contains("unchanged"), "{out}");
@@ -5721,7 +5724,7 @@ fn resume_from_partial() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn checksum_toggle_reuses_the_same_partial() {
+fn checksum_toggle_accepts_prior_partial_candidates() {
     let t = Tmp::new();
     let data = prng(6 * 1024 * 1024, 43);
     write(&t.path("src"), &data);
@@ -5735,10 +5738,10 @@ fn checksum_toggle_reuses_the_same_partial() {
 
     assert_eq!(read(&t.path("dst")), data);
     assert!(
-        !partial.exists(),
-        "changing only -c must not strand the resumable partial"
+        partial.exists(),
+        "changing -c must leave another invocation's partial alone"
     );
-    assert!(partial_files(&t.0).is_empty());
+    assert_eq!(partial_files(&t.0), vec![partial]);
 }
 
 #[test]
@@ -6373,7 +6376,10 @@ fn streaming_and_default_copies_share_resume_partials() {
             &dst,
         ]);
         assert_eq!(read(&t.path("destination")), data);
-        assert!(!partial.exists(), "switching mode stranded a partial");
+        assert!(
+            partial.exists(),
+            "switching mode must not consume a candidate"
+        );
         assert!(
             out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
             "{out}"
@@ -6783,7 +6789,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
         &dst,
     ]);
     assert_eq!(read(&t.path("destination")), data);
-    assert!(!partial.exists(), "override stranded the existing partial");
+    assert!(partial.exists(), "overrides must not consume a candidate");
     assert!(
         out.contains("1 files (3.00 MiB), 3.00 MiB unchanged"),
         "{out}"
@@ -7992,7 +7998,7 @@ fn small_file_failure_never_publishes_partial_contents() {
 
     run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(read(&t.path("dst/f")), b"complete contents");
-    assert!(!partial.exists());
+    assert!(partial.exists());
 }
 
 // ---- Review round 4 (integrity) ----
@@ -8969,7 +8975,7 @@ fn small_push_refusals_and_failures_match_the_engine() {
     );
 
     // Retry without the staging fault: the fallback engine must complete
-    // the remaining file and consume its sidecar, preserving prior successes.
+    // the remaining file, preserving the candidate and prior successes.
     for dir in ["stage-fast", "stage-engine"] {
         let (retried, records) = push(
             &format!("{dir}-retry"),
@@ -8988,7 +8994,7 @@ fn small_push_refusals_and_failures_match_the_engine() {
         ] {
             assert_eq!(read(&t.path(dir).join(name)), data, "{dir}/{name}");
         }
-        assert!(partial_files(&t.path(dir)).is_empty(), "{dir}");
+        assert_eq!(partial_files(&t.path(dir)).len(), 1, "{dir}");
     }
 
     // -vv explains the helper and the route.
@@ -9791,9 +9797,7 @@ fn delete_removes_extras_and_protects_ignored() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn delete_removes_only_this_jobs_orphaned_sidecars() {
-    // Each scenario needs its own job (same source/destination/flags) so the
-    // interrupted run and the --delete run share a partial id.
+fn delete_preserves_partial_candidates() {
     // 1. The file is still in the source (here even up to date): the sidecar
     //    is resume state and stays.
     let t = Tmp::new();
@@ -9811,7 +9815,7 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     assert!(partial.exists(), "{so}");
     assert!(so.contains("0 deleted"), "{so}");
 
-    // 2. Orphan: the source file is gone, so its sidecar is an extra.
+    // 2. A missing source does not establish that its partial is abandoned.
     let t = Tmp::new();
     write(&t.path("src/gone"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
@@ -9821,8 +9825,8 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     );
     fs::remove_file(t.path("src/gone")).unwrap();
     let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(!partial.exists());
-    assert!(so.contains("1 deleted"), "{so}");
+    assert!(partial.exists());
+    assert!(so.contains("0 deleted"), "{so}");
 
     // 3. Failed this run: still in the source, kept.
     let t = Tmp::new();
@@ -9837,14 +9841,13 @@ fn delete_removes_only_this_jobs_orphaned_sidecars() {
     assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
     assert!(partial.exists());
 
-    // 4. Any other id is an ordinary extra (syq copies such names as
-    //    payload, so the name alone proves nothing).
+    // 4. Preserve other recognized partials too.
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
-    let other = format!("dst/.gone.syq-part.{}", "a".repeat(26));
+    let other = format!("dst/.gone.syq-tmp.{}", "a".repeat(16));
     write(&t.path(&other), b"unclaimed, whoever wrote it");
     run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(!t.path(&other).exists());
+    assert!(t.path(&other).exists());
 }
 
 #[test]
@@ -10291,31 +10294,53 @@ fn existing_leaves_a_file_where_a_source_directory_would_go() {
 }
 
 #[test]
-fn delete_treats_sidecar_patterned_files_as_ordinary_extras() {
+fn delete_preserves_recognized_partial_files() {
     let t = Tmp::new();
-    write(
-        &t.path("src/.notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        b"mine",
-    );
+    write(&t.path("src/.notes.syq-tmp.aaaaaaaaaaaaaaaa"), b"mine");
     write(&t.path("src/real"), b"r");
-    write(
-        &t.path("dst/.notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        b"mine",
-    );
-    write(&t.path("dst/.syq-part.notes"), b"odd name, not a sidecar");
-    write(
-        &t.path("dst/.gone.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        b"leftover",
-    );
-    let so = run_ok(&["-a", "--delete", &t.s("src/"), &t.s("dst")]);
-    // The source's sidecar-named file is ordinary payload (copied, and here
-    // already up to date), so the destination copy stays. Everything else
-    // matching the pattern is an ordinary extra, whatever id it carries.
+    write(&t.path("dst/.notes.syq-tmp.aaaaaaaaaaaaaaaa"), b"mine");
+    write(&t.path("dst/.syq-tmp.notes"), b"odd name, not a sidecar");
+    write(&t.path("dst/.gone.syq-tmp.aaaaaaaaaaaaaaaa"), b"leftover");
+    for dry_run in [true, false] {
+        let out = syq(&[
+            if dry_run { "-anv" } else { "-av" },
+            "--delete",
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert_output_ok(&out);
+        let diagnostic = stderr_of(&out);
+        assert!(
+            diagnostic.contains("not deleting .gone.syq-tmp.aaaaaaaaaaaaaaaa:"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("name matches syq's partial-file format"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("syq clean-partials"), "{diagnostic}");
+        // A matching source payload is not an extra kept by the partial rule.
+        assert!(
+            !diagnostic.contains("not deleting .notes.syq-tmp."),
+            "{diagnostic}"
+        );
+        assert_eq!(t.path("dst/.syq-tmp.notes").exists(), dry_run);
+        if !dry_run {
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 deleted"),
+                "{out:?}"
+            );
+        }
+    }
+    // Recognized partials stay; an unrecognized spelling is an ordinary extra.
     assert_eq!(
         listing(&t.path("dst")),
-        [".notes.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa", "real"]
+        [
+            ".gone.syq-tmp.aaaaaaaaaaaaaaaa",
+            ".notes.syq-tmp.aaaaaaaaaaaaaaaa",
+            "real"
+        ]
     );
-    assert!(so.contains("2 deleted"), "{so}");
 }
 
 #[test]
@@ -10437,14 +10462,8 @@ fn delete_nested_roots_keep_their_own_anchored_ignores() {
 fn delete_treats_partial_named_directory_as_ordinary_extra() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
-    write(
-        &t.path("dst/.d.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa/x"),
-        b"x",
-    );
-    write(
-        &t.path("dst/.d.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa/keep.log"),
-        b"k",
-    );
+    write(&t.path("dst/.d.syq-tmp.aaaaaaaaaaaaaaaa/x"), b"x");
+    write(&t.path("dst/.d.syq-tmp.aaaaaaaaaaaaaaaa/keep.log"), b"k");
     let so = run_ok(&[
         "-a",
         "-v",
@@ -10457,8 +10476,8 @@ fn delete_treats_partial_named_directory_as_ordinary_extra() {
     assert_eq!(
         listing(&t.path("dst")),
         [
-            ".d.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ".d.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa/keep.log",
+            ".d.syq-tmp.aaaaaaaaaaaaaaaa",
+            ".d.syq-tmp.aaaaaaaaaaaaaaaa/keep.log",
             "a"
         ]
     );
@@ -10730,9 +10749,9 @@ fn readonly_root_copies_and_reruns() {
 #[test]
 fn source_partials_are_copied_and_warned_about() {
     let t = Tmp::new();
-    let id = "a".repeat(26);
-    let file = format!(".payload.syq-part.{id}");
-    let dir = format!(".directory.syq-part.{id}");
+    let id = "a".repeat(16);
+    let file = format!(".payload.syq-tmp.{id}");
+    let dir = format!(".directory.syq-tmp.{id}");
     write(&t.path(&format!("src/{file}")), b"partial payload");
     write(&t.path(&format!("src/{dir}/child")), b"nested payload");
     write(&t.path("src/.ordinary.syq-partial"), b"ordinary payload");
@@ -10840,7 +10859,7 @@ fn quiet_suppresses_notices_but_not_errors() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn exact_payload_sidecar_collision_fails_before_publication() {
+fn previous_partial_name_can_be_copied_as_payload() {
     let t = Tmp::new();
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     let src = t.s("src/");
@@ -10856,16 +10875,17 @@ fn exact_payload_sidecar_collision_fails_before_publication() {
 
     let output = syq(&args);
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("reserved sidecar"), "{stderr}");
-    assert!(!t.path("dst/file").exists());
-    assert!(!t.path("dst").join(collision_name).exists());
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), read(&t.path("src/file")));
+    assert_eq!(
+        read(&t.path("dst").join(collision_name)),
+        b"deliberate collision"
+    );
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn exact_payload_sidecar_collision_with_dot_destination_fails_before_publication() {
+fn previous_partial_name_can_be_copied_with_dot_destination() {
     let t = Tmp::new();
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     fs::create_dir(t.path("dst")).unwrap();
@@ -10887,11 +10907,12 @@ fn exact_payload_sidecar_collision_with_dot_destination_fails_before_publication
         .run()
         .unwrap();
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("reserved sidecar"), "{stderr}");
-    assert!(!t.path("dst/file").exists());
-    assert!(!t.path("dst").join(collision_name).exists());
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), read(&t.path("src/file")));
+    assert_eq!(
+        read(&t.path("dst").join(collision_name)),
+        b"deliberate collision"
+    );
 }
 
 // Several content sources map onto the destination root; the last one's
@@ -11371,7 +11392,7 @@ fn checksum_identical_file_preserves_destination_inode() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn unreadable_interrupted_partials_are_reused() {
+fn unreadable_interrupted_partials_are_left_alone() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
@@ -11384,13 +11405,14 @@ fn unreadable_interrupted_partials_are_reused() {
 
         run_ok(&args);
         assert_eq!(read(&t.path(&format!("out-{i}"))), contents);
-        assert!(!partial.exists());
+        assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o777, mode);
+        fs::remove_file(partial).unwrap();
     }
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn unchmodable_interrupted_partial_is_replaced() {
+fn unchmodable_interrupted_partial_is_left_alone() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
@@ -11409,36 +11431,25 @@ fn unchmodable_interrupted_partial_is_replaced() {
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), contents);
-    assert!(!partial.exists());
+    assert!(partial.exists());
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn writable_interrupted_partial_is_made_private_before_reuse() {
+fn writable_interrupted_partial_is_left_unchanged() {
     let t = Tmp::new();
     let contents = vec![b'a'; 8 * 1024 * 1024];
     write(&t.path("src"), &contents);
     let src = t.s("src");
     let dst = t.s("dst");
-    let args = ["-a", "--bwlimit", "1M", &src, &dst];
+    let args = ["-a", "--bwlimit", "1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
+    write(&partial, &contents);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
-
-    let mut child = compat_command()
-        .args(args)
-        .arg("--no-progress")
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000")
-        .start()
-        .unwrap();
-    for _ in 0..300 {
-        if fs::metadata(&partial).unwrap().mode() & 0o7777 == 0o600 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o7777, 0o600);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    run_ok(&args);
+    assert_eq!(read(&t.path("dst")), contents);
+    assert_eq!(read(&partial), contents);
+    assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o7777, 0o644);
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -11739,7 +11750,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(partial_files(&t.path("dst")), partials);
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -11833,7 +11844,7 @@ fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn long_basename_partial_is_truncated_and_resumed() {
+fn long_basename_partial_is_truncated_and_retry_copies_correctly() {
     let t = Tmp::new();
     let basename = "n".repeat(240);
     let contents = vec![b'z'; 5 * 1024 * 1024];
@@ -11848,11 +11859,11 @@ fn long_basename_partial_is_truncated_and_resumed() {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .contains(".syq-part."));
+        .contains(".syq-tmp."));
 
     run_ok(&args);
     assert_eq!(read(&t.path(&format!("dst/{basename}"))), contents);
-    assert!(!partial.exists());
+    assert!(partial.exists());
 }
 
 #[test]
@@ -12574,23 +12585,19 @@ fn existing_opens_up_readonly_dirs_even_after_a_symlinked_dir() {
 fn partial_named_symlink_is_a_symlink_not_a_leftover() {
     let t = Tmp::new();
     write(&t.path("a/target"), b"t");
-    std::os::unix::fs::symlink("target", t.path("a/.x.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"))
-        .unwrap();
+    std::os::unix::fs::symlink("target", t.path("a/.x.syq-tmp.aaaaaaaaaaaaaaaa")).unwrap();
     write(&t.path("b/other"), b"o");
-    std::os::unix::fs::symlink("target", t.path("b/.x.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa"))
-        .unwrap();
+    std::os::unix::fs::symlink("target", t.path("b/.x.syq-tmp.aaaaaaaaaaaaaaaa")).unwrap();
     run_ok(&["-a", &t.s("a/"), &t.s("dst")]);
     assert!(t
-        .path("dst/.x.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .path("dst/.x.syq-tmp.aaaaaaaaaaaaaaaa")
         .symlink_metadata()
         .unwrap()
         .is_symlink());
     // Without -l the symlinks are skipped, and two sources skipping the same
     // path is not a collision.
     run_ok(&["-r", &t.s("a/"), &t.s("b/"), &t.s("dst2")]);
-    assert!(!t
-        .path("dst2/.x.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa")
-        .exists());
+    assert!(!t.path("dst2/.x.syq-tmp.aaaaaaaaaaaaaaaa").exists());
     assert!(t.path("dst2/target").is_file() && t.path("dst2/other").is_file());
 }
 
@@ -12934,7 +12941,7 @@ fn sidecar_named_source_directory_is_payload() {
     // warning); it uses another job's id, so it can't collide with this job's
     // own sidecar for `name`, and later updates of `name` still stage fine.
     let t = Tmp::new();
-    let sidecar_dir = format!("src/.name.syq-part.{}", "a".repeat(26));
+    let sidecar_dir = format!("src/.name.syq-tmp.{}", "a".repeat(16));
     write(&t.path(&format!("{sidecar_dir}/inside")), b"i");
     write(&t.path("src/name"), b"v1");
     let out = syq(&["-a", &t.s("src/"), &t.s("dst")]);
@@ -13025,9 +13032,7 @@ fn files_from_rejections_and_stdin() {
 #[cfg(debug_assertions)]
 #[test]
 fn truncated_sidecar_of_a_filtered_file_survives_delete() {
-    // A 240-character basename forces the truncated sidecar form, whose name
-    // cannot be read back to its target; liveness must come from the
-    // preflight's sidecar set, not from parsing.
+    // Truncated names are protected even when the full target name is unknown.
     let t = Tmp::new();
     let long = "n".repeat(240);
     write(&t.path(&format!("src/{long}")), &vec![7u8; 8 << 20]);
@@ -13048,7 +13053,7 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
     ]);
     assert!(partial.exists(), "{so}");
     assert!(so.contains("0 deleted"), "{so}");
-    // Once the file leaves the source, the same sidecar is an orphan.
+    // Removing the source does not authorize deleting another run's partial.
     fs::remove_file(t.path(&format!("src/{long}"))).unwrap();
     run_ok(&[
         "-a",
@@ -13058,12 +13063,12 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
         &t.s("src/"),
         &t.s("dst"),
     ]);
-    assert!(!partial.exists());
+    assert!(partial.exists());
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn sidecar_whose_target_became_a_directory_is_an_orphan() {
+fn partial_survives_when_target_becomes_a_directory() {
     let t = Tmp::new();
     write(&t.path("src/x"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
@@ -13081,22 +13086,30 @@ fn sidecar_whose_target_became_a_directory_is_an_orphan() {
         &t.s("src/"),
         &t.s("dst"),
     ]);
-    assert!(!partial.exists(), "no file transfer will ever consume it");
+    assert!(
+        partial.exists(),
+        "only explicit cleanup removes abandoned candidates"
+    );
     assert_eq!(read(&t.path("dst/x/inside")), b"now a directory");
 }
 
 #[test]
-fn sidecar_patterned_extras_do_not_block_directory_deletion() {
+fn partial_candidates_protect_containing_directories() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
-    let foreign = format!("dst/extra/deep/.f.syq-part.{}", "a".repeat(26));
+    let foreign = format!("dst/extra/deep/.f.syq-tmp.{}", "a".repeat(16));
     write(&t.path(&foreign), b"unclaimed");
     write(&t.path("dst/extra/gone"), b"an ordinary extra");
     let so = run_ok(&["-a", "-n", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
-    assert!(so.contains("delete extra/ (destination only)"), "{so}");
+    assert!(!so.contains("delete extra/ (destination only)"), "{so}");
     let out = syq(&["-a", "-v", "--delete", &t.s("src/"), &t.s("dst")]);
     assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(listing(&t.path("dst")), ["a"]);
+    assert!(t.path(&foreign).exists());
+    assert!(!t.path("dst/extra/gone").exists());
+    let diagnostic = stderr_of(&out);
+    assert!(diagnostic.contains(".f.syq-tmp."), "{diagnostic}");
+    assert!(diagnostic.contains("syq clean-partials"), "{diagnostic}");
+    assert!(!diagnostic.contains("ignored paths"), "{diagnostic}");
 }
 
 // ----------------------------------------------------------- review round 10
@@ -15714,6 +15727,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "rsync",
             "persist",
             "completion",
+            "clean-partials",
             "receiver",
             "--self-update",
         ],
@@ -20204,4 +20218,444 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
     let failed = run(&["persist", "receive", "status", "--json"]);
     assert!(!failed.status.success());
     assert!(stderr_of(&failed).contains("duplicate receiving profile"));
+}
+
+#[test]
+fn clean_partials_selects_only_current_regular_files() {
+    let help = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["clean-partials", "--help"])
+        .run()
+        .unwrap();
+    assert_output_ok(&help);
+    let help = String::from_utf8_lossy(&help.stdout);
+    for option in ["--dry-run", "--on", "--root", "--cwd"] {
+        assert!(help.contains(option), "{help}");
+    }
+    let t = Tmp::new();
+    let current = ".file.syq-tmp.abcdefghijklmnop";
+    let compact = ".syq-tmp.abcdefghijklmnop";
+    // Unchanged v0.5.2 spelling: the old format is deliberately unsupported.
+    let old = ".file.syq-part.aaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write(&t.path(&format!("tree/{current}")), b"unfinished");
+    write(&t.path(&format!("tree/nested/{compact}")), b"unfinished");
+    write(&t.path(&format!("tree/{old}")), b"old format");
+    write(&t.path("tree/ordinary"), b"keep");
+    write(&t.path("tree/.file.syq-tmp.notes"), b"keep");
+    fs::create_dir_all(t.path(&format!("tree/named/{current}"))).unwrap();
+    write(&t.path(&format!("outside/{current}")), b"keep");
+    std::os::unix::fs::symlink(t.path("outside"), t.path("tree/link")).unwrap();
+    std::os::unix::fs::symlink("ordinary", t.path(&format!("tree/nested/{current}"))).unwrap();
+    let before = listing(&t.path("tree"));
+    let preview = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "clean-partials",
+            "--dry-run",
+            "-v",
+            "--root",
+            &t.s(""),
+            "tree",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&preview);
+    let preview = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview.contains("would remove 2 entries"), "{preview}");
+    assert_eq!(listing(&t.path("tree")), before);
+    run_native_ok(&["clean-partials", "-j", "4", "--root", &t.s(""), "tree"]);
+    assert!(!t.path(&format!("tree/{current}")).exists());
+    assert!(!t.path(&format!("tree/nested/{compact}")).exists());
+    assert_eq!(read(&t.path(&format!("tree/{old}"))), b"old format");
+    assert_eq!(read(&t.path("tree/ordinary")), b"keep");
+    assert!(t.path(&format!("tree/named/{current}")).is_dir());
+    assert!(t.path(&format!("tree/nested/{current}")).is_symlink());
+    assert_eq!(read(&t.path(&format!("outside/{current}"))), b"keep");
+    run_native_ok(&["clean-partials", &t.s("tree")]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn concurrent_identical_and_different_copies_publish_complete_files() {
+    for identical in [true, false] {
+        for existing in [false, true] {
+            let t = Tmp::new();
+            let mut first_data = vec![b'a'; 8 << 20];
+            first_data[..4 << 20].fill(b'o');
+            let second_data = if identical {
+                first_data.clone()
+            } else {
+                vec![b'b'; 8 << 20]
+            };
+            write(&t.path("first"), &first_data);
+            write(&t.path("second"), &second_data);
+            if existing {
+                write(&t.path("out"), &vec![b'o'; 8 << 20]);
+            }
+            let ready = t.path("ready");
+            let continuation = t.path("continue");
+            let (ready_env, continue_env) = if existing {
+                ("SYQ_TEST_BASIS_READY_FILE", "SYQ_TEST_BASIS_CONTINUE_FILE")
+            } else {
+                (
+                    "SYQ_TEST_PARTIAL_READY_FILE",
+                    "SYQ_TEST_PARTIAL_CONTINUE_FILE",
+                )
+            };
+            let mut first = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    "--hash",
+                    "--bwlimit",
+                    "1G",
+                    "-j",
+                    "2",
+                    "--no-progress",
+                    &t.s("first"),
+                    "--as",
+                    &t.s("out"),
+                ])
+                .env(ready_env, &ready)
+                .env(continue_env, &continuation)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .start()
+                .unwrap();
+            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            let second = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    "--hash",
+                    "--bwlimit",
+                    "1G",
+                    "-j",
+                    "2",
+                    "--no-progress",
+                    &t.s("second"),
+                    "--as",
+                    &t.s("out"),
+                ])
+                .run()
+                .unwrap();
+            release_confinement_barrier(&continuation);
+            let first = first.wait_with_output().unwrap();
+            assert_output_ok(&second);
+            assert_output_ok(&first);
+            assert_eq!(
+                read(&t.path("out")),
+                first_data,
+                "identical={identical}, existing={existing}"
+            );
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
+    for remove in [false, true] {
+        let t = Tmp::new();
+        let data = vec![b'a'; 2 << 20];
+        write(&t.path("src"), &data);
+        let candidate = t.path(".out.syq-tmp.abcdefghijklmnop");
+        write(&candidate, &data);
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut child = compat_command()
+            .args([
+                "-ac",
+                "--block-size",
+                "1M",
+                "--bwlimit",
+                "1G",
+                "--no-progress",
+                &t.s("src"),
+                &t.s("out"),
+            ])
+            .env("SYQ_TEST_REUSE_READY_FILE", &ready)
+            .env("SYQ_TEST_REUSE_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "verified candidate buffer");
+        if remove {
+            fs::remove_file(&candidate).unwrap();
+        } else {
+            write(&candidate, &vec![b'b'; data.len()]);
+        }
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("out")), data);
+        if !remove {
+            assert_eq!(read(&candidate), vec![b'b'; data.len()]);
+        }
+        assert_eq!(partial_files(&t.0).len(), usize::from(!remove));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn concurrent_small_pushes_publish_independent_files() {
+    for existing in [false, true] {
+        let t = Tmp::new();
+        let ssh = fake_ssh(&t);
+        fs::create_dir_all(t.path("remote-home/dst")).unwrap();
+        write(&t.path("first"), b"first complete file");
+        write(&t.path("second"), b"second complete file");
+        set_mtime(&t.path("first"), 1_600_000_001);
+        set_mtime(&t.path("second"), 1_600_000_002);
+        if existing {
+            write(&t.path("remote-home/dst/file"), b"old");
+        }
+        let command = |source: &str| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-progress",
+                    &t.s(source),
+                    "--to",
+                    "fake.example",
+                    "--as",
+                    &t.s("remote-home/dst/file"),
+                ])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .env("SYQ_DEBUG", "1");
+            command
+        };
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut first = command("first")
+            .env("SYQ_TEST_SMALL_COPY_READY_FILE", &ready)
+            .env("SYQ_TEST_SMALL_COPY_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut first, &ready, "small push staging");
+        let second = command("second").run().unwrap();
+        release_confinement_barrier(&continuation);
+        let first = first.wait_with_output().unwrap();
+        assert_output_ok(&second);
+        assert_output_ok(&first);
+        assert!(stderr_of(&first).contains("small copy: published"));
+        assert!(stderr_of(&second).contains("small copy: published"));
+        assert_eq!(
+            read(&t.path("remote-home/dst/file")),
+            b"first complete file"
+        );
+        assert!(partial_files(&t.path("remote-home/dst")).is_empty());
+
+        write(
+            &t.path("remote-home/dst/.file.syq-tmp.abcdefghijklmnop"),
+            b"abandoned",
+        );
+        let cleanup = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "clean-partials",
+                "--on",
+                "fake.example",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--results",
+                &t.s("removed.ndjson"),
+                &t.s("remote-home/dst"),
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&cleanup);
+        assert!(partial_files(&t.path("remote-home/dst")).is_empty());
+        assert_eq!(
+            read(&t.path("remote-home/dst/file")),
+            b"first complete file"
+        );
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path("removed.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.last().unwrap()["status"], "success");
+        assert_eq!(records.last().unwrap()["entries_removed"], 1);
+    }
+}
+
+#[test]
+fn concurrent_default_tree_copies_keep_every_file_whole() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    for index in 0..12 {
+        let name = format!("nested/file-{index}");
+        write(
+            &t.path(&format!("first/{name}")),
+            &vec![index as u8; (2 << 20) + index],
+        );
+        write(
+            &t.path(&format!("second/{name}")),
+            &vec![index as u8 + 32; (3 << 20) + index],
+        );
+        if index % 2 == 0 {
+            write(&t.path(&format!("dst/{name}")), b"old destination");
+        }
+    }
+    let start = |source: &str| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--no-progress",
+                "--srcs-in",
+                &t.s(source),
+                "--into-existing",
+                &t.s("dst"),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap()
+    };
+    let first = start("first");
+    let second = start("second");
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_output_ok(&first);
+    assert_output_ok(&second);
+    assert_eq!(listing(&t.path("dst")), listing(&t.path("first")));
+    for index in 0..12 {
+        let name = format!("nested/file-{index}");
+        let result = read(&t.path(&format!("dst/{name}")));
+        assert!(
+            result == read(&t.path(&format!("first/{name}")))
+                || result == read(&t.path(&format!("second/{name}"))),
+            "mixed contents in {name}"
+        );
+    }
+}
+
+#[test]
+fn partial_candidates_do_not_break_empty_replacement_or_unchanged_files() {
+    for candidate in [".out.syq-tmp.abcdefghijklmnop", ".syq-tmp.abcdefghijklmnop"] {
+        for empty in [true, false] {
+            let t = Tmp::new();
+            let source = if empty { vec![] } else { vec![b'a'; 5 << 20] };
+            write(&t.path("src"), &source);
+            write(
+                &t.path("out"),
+                if empty { b"old contents" } else { &source },
+            );
+            write(&t.path(candidate), b"stale");
+            let before = fs::metadata(t.path("out")).unwrap().ino();
+            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("out")]);
+            assert_eq!(read(&t.path("out")), source);
+            if !empty {
+                assert_eq!(fs::metadata(t.path("out")).unwrap().ino(), before);
+            }
+            assert_eq!(read(&t.path(candidate)), b"stale");
+            assert_eq!(partial_files(&t.0).len(), 1);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn partial_candidates_do_not_disable_local_whole_file_copies() {
+    let t = Tmp::new();
+    for name in ["file", "file-other", "unrelated"] {
+        write(&t.path(&format!("src/{name}")), &vec![b'a'; 5 << 20]);
+    }
+    write(&t.path("dst/.file.syq-tmp.abcdefghijklmnop"), b"stale");
+    write(&t.path("dst/.syq-tmp.abcdefghijklmnop"), b"ambiguous");
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 3);
+    assert_eq!(observed["range_requests"], 0);
+    for name in ["file", "file-other", "unrelated"] {
+        assert_eq!(
+            read(&t.path(&format!("src/{name}"))),
+            read(&t.path(&format!("dst/{name}")))
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn seeding_preallocates_before_copying_donor_bytes() {
+    for existing in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src"), &vec![b'a'; 5 << 20]);
+        if existing {
+            write(&t.path("out"), b"old contents");
+        }
+        write(&t.path(".out.syq-tmp.abcdefghijklmnop"), b"donor");
+        let out = compat_command()
+            .args([
+                "-ac",
+                "--bwlimit",
+                "1G",
+                "--no-progress",
+                &t.s("src"),
+                &t.s("out"),
+            ])
+            .env("SYQ_TEST_FALLOCATE_ERRNO", "no_space")
+            .run()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            stderr_of(&out).contains("preallocate destination file"),
+            "{}",
+            stderr_of(&out)
+        );
+        if existing {
+            assert_eq!(read(&t.path("out")), b"old contents");
+        } else {
+            assert!(!t.path("out").exists());
+        }
+        assert_eq!(read(&t.path(".out.syq-tmp.abcdefghijklmnop")), b"donor");
+    }
+}
+
+#[test]
+fn resume_prefers_a_partial_to_the_old_destination_contents() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 5 << 20];
+    write(&t.path("src"), &contents);
+    write(&t.path("out"), &vec![b'b'; contents.len()]);
+    write(
+        &t.path(".out.syq-tmp.abcdefghijklmnop"),
+        &contents[..3 << 20],
+    );
+    let out = run_ok(&[
+        "-ac",
+        "--block-size=1M",
+        "--bwlimit=1G",
+        &t.s("src"),
+        &t.s("out"),
+    ]);
+    assert_eq!(read(&t.path("out")), contents);
+    assert!(
+        out.contains("1 files (2.00 MiB), 3.00 MiB unchanged"),
+        "{out}"
+    );
+    assert_eq!(partial_files(&t.0).len(), 1);
 }
