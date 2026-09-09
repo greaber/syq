@@ -16,7 +16,8 @@ throughput. Other filesystems and cross-volume copies use normal copying.
 Cloning keeps the usual overwrite and metadata rules. Copies with a resumable
 partial, in-place writes, checksum comparison, a bandwidth limit, or forced
 range transfer use the existing copy path. Files with macOS file flags or
-extended attributes also use normal copying. Small files remain batched.
+extended attributes, and destination directories with access control lists,
+also use normal copying. Small files remain batched.
 
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.

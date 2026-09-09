@@ -1058,15 +1058,23 @@ impl Root {
             return Ok(None);
         }
         let parent = self.resolve_parent(path)?;
+        // An extra staging directory must not change destination ACL inheritance.
+        if !clone_directory_has_no_acl(&parent.directory)? {
+            return Ok(None);
+        }
         let temporary = create_temporary(&parent, |fd, name| {
             retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
         })?;
         let directory = open_directory_at(&parent.directory, temporary.as_bytes())?;
+        let metadata = directory.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+            // Do not clean up an untrusted replacement directory.
+            bail!("private clone directory changed before opening");
+        }
         let leaf = &c"data".to_owned();
         let result = (|| -> Result<Option<File>> {
-            let metadata = directory.metadata()?;
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
-                bail!("private clone directory changed before opening");
+            if !clone_directory_has_no_acl(&directory)? {
+                return Ok(None);
             }
             // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
             // function but not this constant. Do not request source ACLs.
@@ -1817,6 +1825,45 @@ impl Root {
 struct ResolvedParent {
     directory: File,
     leaf: CString,
+}
+
+// Darwin's ACL functions and constants from <sys/acl.h> are not exposed by
+// libc. Keep the opaque allocation within this function and release it once.
+#[cfg(target_os = "macos")]
+fn clone_directory_has_no_acl(directory: &File) -> Result<bool> {
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EACCES)) {
+            return Ok(false);
+        }
+        return Err(error).context("inspect clone destination ACL");
+    }
+    let mut entry = std::ptr::null_mut();
+    let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let error = io::Error::last_os_error();
+    unsafe {
+        acl_free(acl);
+    }
+    // Darwin returns -1/EINVAL for an empty ACL, unlike Linux's iterator.
+    if found == 0 {
+        Ok(false)
+    } else if error.raw_os_error() == Some(libc::EINVAL) {
+        Ok(true)
+    } else {
+        Err(error).context("inspect clone destination ACL entry")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2717,6 +2764,35 @@ mod tests {
             .is_none());
         assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_falls_back_for_destination_acl_inheritance() {
+        let t = TestDir::new("clone-acl");
+        fs::write(t.path().join("source"), b"data").unwrap();
+        let source = File::open(t.path().join("source")).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow read,readattr,readextattr,readsecurity,file_inherit"
+            ])
+            .arg(t.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(root
+            .clone_file(&source, &relative(b"partial"), 4)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+        assert!(Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(t.path())
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[cfg(target_os = "linux")]
