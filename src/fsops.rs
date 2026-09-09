@@ -9870,46 +9870,50 @@ mod tests {
         assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
     }
 
+    fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
+        let observations = parallel_map(items, |&index| {
+            let thread = std::thread::current();
+            (
+                index,
+                thread.id(),
+                thread.name().map(str::to_owned),
+                rayon::current_num_threads(),
+            )
+        });
+        // Assert on the calling test thread so diagnostics reach this test's
+        // capture buffer, regardless of which test initialized the static pool.
+        assert_eq!(observations.len(), items.len());
+        observations
+            .into_iter()
+            .zip(items)
+            .map(|((index, thread, name, count), expected)| {
+                assert_eq!(index, *expected);
+                assert_eq!(
+                    count, PAR_THREADS,
+                    "metadata pool must retain its configured parallelism"
+                );
+                assert!(
+                    name.as_deref()
+                        .is_some_and(|name| name.starts_with("syq-metadata-")),
+                    "unexpected metadata thread name: {name:?}"
+                );
+                thread
+            })
+            .collect()
+    }
+
     #[test]
     fn parallel_metadata_batches_share_a_bounded_pool() {
-        let mut owners = HashMap::new();
-        let mut shared = false;
-        // More callers than pool threads guarantees reuse without depending on
-        // scheduling or the number of available CPUs. Run callers sequentially
-        // so a broken per-caller pool cannot exhaust the test host's thread limit.
-        for caller in 0..=PAR_THREADS {
-            let results = std::thread::spawn(|| {
-                let items: Vec<_> = (0..128).collect();
-                parallel_map(&items, |&index| {
-                    assert_eq!(
-                        rayon::current_num_threads(),
-                        PAR_THREADS,
-                        "metadata pool must retain its configured parallelism"
-                    );
-                    let thread = std::thread::current();
-                    assert!(thread
-                        .name()
-                        .is_some_and(|name| name.starts_with("syq-metadata-")));
-                    (index, thread.id())
-                })
-            })
-            .join()
-            .unwrap();
-            assert_eq!(
-                results.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
-                (0..128).collect::<Vec<_>>()
-            );
-            for (_, thread) in results {
-                shared |= *owners.entry(thread).or_insert(caller) != caller;
-            }
+        let mut threads = std::collections::HashSet::new();
+        let items: Vec<_> = (0..128).collect();
+        // More calls than pool threads guarantees reuse without depending on
+        // scheduling or CPU count: disjoint per-call pools exceed the bound.
+        for _ in 0..=PAR_THREADS {
+            threads.extend(checked_metadata_batch_threads(&items));
         }
         assert!(
-            shared,
-            "different callers must execute on shared metadata workers"
-        );
-        assert!(
-            owners.len() <= PAR_THREADS,
-            "metadata concurrency must not multiply by caller count"
+            threads.len() <= PAR_THREADS,
+            "metadata batches must reuse a bounded shared pool"
         );
     }
 
@@ -9926,7 +9930,7 @@ mod tests {
         })
         .expect_err("worker panics must reach the caller");
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"metadata test panic"));
-        assert_eq!(parallel_map(&items, |&index| index), items);
+        checked_metadata_batch_threads(&items);
     }
 
     #[test]
@@ -9970,7 +9974,7 @@ mod tests {
     }
 
     #[test]
-    fn source_stat_batches_recover_after_a_missing_source() {
+    fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
         let temporary = crate::test_support::tempdir().unwrap();
         let path = temporary.path().join("selected");
         fs::write(&path, b"original").unwrap();
@@ -9981,18 +9985,35 @@ mod tests {
             follow: false,
             guard: None,
         };
-        assert!(matches!(worker.handle(&request), Response::Stats(entries) if entries.len() == 64));
+        let response = worker.handle(&request);
+        assert!(
+            matches!(&response, Response::Stats(entries) if entries.len() == 64),
+            "unexpected initial response: {response:?}"
+        );
 
-        // A missing file must fail the batch; restoring it permits the next
-        // batch to return fresh results without carrying over the earlier error.
         fs::rename(&path, temporary.path().join("original")).unwrap();
-        assert!(matches!(
-            worker.handle(&request),
-            Response::EndpointError(_)
-        ));
+        let response = worker.handle(&request);
+        let Response::EndpointError(error) = response else {
+            panic!("expected missing-source error: {response:?}");
+        };
+        assert!(
+            error.message.contains("inspect registered source leaf"),
+            "{error:?}"
+        );
+        assert_eq!(error.io_kind, Some(WireIoKind::NotFound), "{error:?}");
+
         fs::rename(temporary.path().join("original"), &path).unwrap();
-        assert!(matches!(worker.handle(&request), Response::Stats(entries)
-            if entries.len() == 64 && entries.iter().all(|entry| entry.as_ref().is_some_and(|e| e.size == 8))));
+        let response = worker.handle(&request);
+        let Response::Stats(entries) = response else {
+            panic!("expected restored-file metadata: {response:?}");
+        };
+        assert_eq!(entries.len(), 64);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.as_ref().is_some_and(|e| e.size == 8)),
+            "{entries:?}"
+        );
     }
 
     #[test]
