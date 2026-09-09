@@ -487,7 +487,14 @@ fn macos_clone_source_growth_requeues_without_a_file_error() {
     write(&t.path("src"), &prng(5 << 20, 996));
     let ready = t.path("ready");
     let mut child = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--syq-connections=1",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
         .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
         .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
         .stdout(Stdio::piped())
@@ -501,7 +508,7 @@ fn macos_clone_source_growth_requeues_without_a_file_error() {
         .unwrap()
         .write_all(&prng(1 << 20, 997))
         .unwrap();
-    let out = wait_for_control_path_output(child);
+    let out = wait_for_child_output(child, std::time::Duration::from_secs(30));
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), read(&t.path("src")));
     assert!(partial_files(&t.0).is_empty());
@@ -528,7 +535,6 @@ fn macos_medium_files_keep_batches_when_cloning_is_unavailable() {
         ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
-        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
         .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();

@@ -1198,8 +1198,13 @@ fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path
 }
 
 #[cfg(debug_assertions)]
-fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+fn wait_for_control_path_output(child: std::process::Child) -> Output {
+    wait_for_child_output(child, std::time::Duration::from_secs(5))
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_child_output(mut child: std::process::Child, timeout: std::time::Duration) -> Output {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
@@ -1208,7 +1213,7 @@ fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
             child.kill().unwrap();
             let output = child.wait_with_output().unwrap();
             panic!(
-                "syq did not finish after the control-path race\nstdout:\n{}\nstderr:\n{}",
+                "syq did not finish before the test deadline\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
