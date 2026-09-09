@@ -238,7 +238,9 @@ destination and replaces the final file only when complete. When resuming,
 syq can copy bytes from a previous partial into its own output, hash the bytes
 it copied, and transfer blocks that differ from the source before publishing.
 The previous partial stays unchanged. Reuse is best effort; local direct copies
-can be faster than looking for reusable blocks and take priority.
+can be faster than looking for reusable blocks and take priority. If a previous
+partial is unavailable and there is no existing destination file, syq transfers
+the whole file.
 
 Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only

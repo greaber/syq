@@ -655,48 +655,6 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
     output
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum DestinationIdentityPlan {
-    /// The command-restricted enrollment already supplied the canonical
-    /// parent plus literal placement leaf. No receiver observation is needed.
-    Enrolled(std::path::PathBuf),
-    /// Canonicalize the complete destination spelling.
-    Canonicalize(PathBytes),
-    /// Canonicalize only the parent, then restore the literal placement leaf.
-    CanonicalizeParent {
-        parent: PathBytes,
-        exact_path: PathBytes,
-    },
-}
-
-fn destination_identity_plan(
-    exact_native_destination: bool,
-    restricted_receiver: bool,
-    operator_dst_root: &[u8],
-    destination_path: &[u8],
-) -> DestinationIdentityPlan {
-    if exact_native_destination && restricted_receiver {
-        // Direct setup replaces the public operand with the enrolled
-        // destination: a canonical parent plus its literal leaf. The signed
-        // grant binds these same absolute bytes. Asking the receiver to
-        // canonicalize the parent would both be unnecessary and exceed the
-        // exact destination's observation scope.
-        DestinationIdentityPlan::Enrolled(crate::fsops::resolve(destination_path))
-    } else if exact_native_destination && operator_dst_root == b"~" {
-        // Bare `~` names HOME rather than a literal leaf named `~`. Resolve the
-        // complete spelling so that expansion happens, while ordinary exact
-        // destinations continue to preserve their final symlink as a leaf.
-        DestinationIdentityPlan::Canonicalize(operator_dst_root.to_vec())
-    } else if exact_native_destination {
-        DestinationIdentityPlan::CanonicalizeParent {
-            parent: parent_path(operator_dst_root),
-            exact_path: operator_dst_root.to_vec(),
-        }
-    } else {
-        DestinationIdentityPlan::Canonicalize(destination_path.to_vec())
-    }
-}
-
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
@@ -2092,36 +2050,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let operator_dst_root = clean_root(&dst.path);
-    // Exact native placement names a directory entry, so its identity is the
-    // canonical parent plus the operator-supplied leaf. Ordinary endpoints
-    // compute that form here; restricted setup already supplied and signed
-    // it. Canonicalizing the whole path would dereference an existing leaf
-    // symlink and give the self-copy guard and resumable-copy identity the
-    // wrong destination.
+    // Only exact placement onto bare `~` needs the receiver's canonical
+    // spelling: it names HOME rather than a literal leaf. Other placements
+    // keep the operator's spelling; registration handles their path policy.
     let exact_native_destination =
         args.interface != Interface::Rsync && args.placement == Placement::As;
     let expand_exact_home =
         exact_native_destination && args.restricted_grant.is_none() && operator_dst_root == b"~";
-    let identity_plan = destination_identity_plan(
-        exact_native_destination,
-        args.restricted_grant.is_some(),
-        &operator_dst_root,
-        &dst.path,
-    );
-    let (dst_root_entry, dst_canonical) = match identity_plan {
-        DestinationIdentityPlan::Enrolled(canonical) => (
+    let (dst_root, dst_root_entry) = if expand_exact_home {
+        let (entry, canonical) = stat_and_canonicalize(
+            &mut *dst_ctl,
+            &operator_dst_root,
+            &operator_dst_root,
+            dst.is_remote(),
+        )?;
+        (canonical.as_os_str().as_bytes().to_vec(), entry)
+    } else {
+        (
+            operator_dst_root.clone(),
             stat_one(&mut *dst_ctl, &operator_dst_root, false)?,
-            canonical,
-        ),
-        DestinationIdentityPlan::Canonicalize(path) => {
-            stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &path, dst.is_remote())?
-        }
-        DestinationIdentityPlan::CanonicalizeParent { parent, exact_path } => {
-            let (entry, mut canonical) =
-                stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &parent, dst.is_remote())?;
-            append_final_component(&mut canonical, &exact_path);
-            (entry, canonical)
-        }
+        )
     };
     // Rsync retains its destination-directory compatibility rule. Native
     // container placement keeps the named symlink by default or resolves its
@@ -2129,11 +2077,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // placement always selects the final directory entry; destination
     // following applies only to its parent path.
     let (dst_root, mut dst_root_entry) = match args.interface {
-        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
-        _ if expand_exact_home => (
-            dst_canonical.as_os_str().as_bytes().to_vec(),
-            dst_root_entry,
-        ),
+        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &dst_root, dst_root_entry)?,
         _ if args.follows_native_destination_paths() && args.placement == Placement::Into => {
             follow_container_symlink(
                 &mut *dst_ctl,
@@ -2142,7 +2086,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 args.target_existence != Existence::Existing,
             )?
         }
-        _ => (operator_dst_root.clone(), dst_root_entry),
+        _ => (dst_root, dst_root_entry),
     };
     if debug() {
         crate::output::diagnostic!(
@@ -3903,22 +3847,9 @@ fn parent_path(path: &[u8]) -> PathBytes {
     }
 }
 
-/// Append the final raw component of `path` to an already-canonicalized
-/// parent. Native exact placement deliberately treats this component as a
-/// directory entry rather than resolving through it.
-fn append_final_component(parent: &mut std::path::PathBuf, path: &[u8]) {
-    let component = path
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .filter(|component| !component.is_empty());
-    if let Some(component) = component {
-        parent.push(OsStr::from_bytes(component));
-    }
-}
-
 /// Fetch the destination root's entry and canonical spelling in one network
 /// turn. They are independent read-only queries; sending both before waiting
-/// avoids an otherwise unnecessary RTT on every remote copy.
+/// avoids an extra RTT when expanding a remote bare-home destination.
 fn stat_and_canonicalize(
     conn: &mut dyn Conn,
     stat_path: &[u8],
@@ -9383,29 +9314,6 @@ mod tests {
                 "clean_root({given:?})"
             );
         }
-    }
-
-    #[test]
-    fn restricted_exact_identity_uses_the_enrolled_leaf_without_observing_its_parent() {
-        assert_eq!(
-            destination_identity_plan(true, true, b"/enrolled/root/link", b"/enrolled/root/link",),
-            DestinationIdentityPlan::Enrolled(std::path::PathBuf::from("/enrolled/root/link"))
-        );
-        assert_eq!(
-            destination_identity_plan(false, true, b"/enrolled/root", b"/enrolled/root"),
-            DestinationIdentityPlan::Canonicalize(b"/enrolled/root".to_vec())
-        );
-        assert_eq!(
-            destination_identity_plan(true, false, b"links/exact", b"links/exact"),
-            DestinationIdentityPlan::CanonicalizeParent {
-                parent: b"links".to_vec(),
-                exact_path: b"links/exact".to_vec(),
-            }
-        );
-        assert_eq!(
-            destination_identity_plan(true, false, b"~", b"~"),
-            DestinationIdentityPlan::Canonicalize(b"~".to_vec())
-        );
     }
 
     #[test]
