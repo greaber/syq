@@ -30,6 +30,9 @@ An untimed tiny copy still prepares the helper. Options after `--` apply to
 syq's setup, calibration and scored copies; path, removal and output-file
 options are excluded to keep copies inside the disposable dataset. Use
 `--tool rsync` for a separate rsync comparison, omitting syq options after `--`.
+Full commands and scratch paths appear only with `-v`, `-vv`, or `--verbose`
+after `--`. Syq's extra summary appears with those flags or `--stats`; the
+benchmark always reports verified trial results and failures.
 See [tuning options](tuning.md#streaming-and-request-windows) for request-window
 and small-file batch experiments, and `bash try-benchmark.sh --help` for all options.
 
@@ -48,7 +51,9 @@ Generation and checks keep the launch directory visible to tmux.
 Generation, helper preparation and content checks are untimed. Each scored
 copy uses an empty destination, with permissions and modification times
 preserved. Syq persistence is disabled in private settings and rsync uses fresh
-SSH connections, so the total timer includes connection startup. Caches are
+SSH connections, so the total timer includes connection startup. This leaves
+the normal [learned connection counts](tuning.md#remembered-connection-counts)
+active unless you override tuning; trials can reuse and update them. Caches are
 not flushed and copies do not wait for durable storage. Failed commands or
 content checks stop the comparison.
 

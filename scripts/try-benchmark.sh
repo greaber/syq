@@ -35,6 +35,7 @@ After --, tune syq with --connections/-j, --tuning-options, --bwlimit,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
 --tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
 These options also apply to syq setup/calibration; rsync and cp are unchanged.
+Add -v/-vv/--verbose after -- to show full commands and scratch paths.
 Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
 The untimed setup copy and content checks still run. Source/destination,
 removal and output-file options are not accepted after --.
@@ -44,6 +45,7 @@ uses Perl with its core JSON::PP module; terminal runs also need Perl. Remote te
 also need SSH locally and rsync plus standard utilities on the remote host.
 SSH tests disable syq persistence in private settings and prevent rsync from
 reusing SSH connections. Every timed trial includes connection startup.
+Auto-tuning and remembered counts stay active unless overridden by tuning options.
 Syq also reports copying time, copying MB/s, and other time (setup/finish).
 A note flags >=20% outside copying or copying under one second: total-time
 speeds may not show sustained throughput.
@@ -198,8 +200,9 @@ make_data() {
 copy_with() {
     local tool=$1 source=$2 destination=$3
     local command=() syq_options=(--preserve=permissions --results "$local_root/trial.json")
-    # This repository-owned caller suppresses only the tiny copy's summary,
-    # keeping bootstrap diagnostics and authentication prompts live. Supported
+    $show_syq_summary || syq_options+=(--suppress-summary)
+    # Always suppress the tiny setup copy's summary, keeping bootstrap
+    # diagnostics and authentication prompts live. Supported
     # by the released v0.3.2 CLI as well as current builds.
     [[ ${4:-} != setup ]] || syq_options=(--preserve=permissions --suppress-summary --no-progress)
     [[ ${4:-} != calibration ]] || syq_options=(--preserve=permissions --suppress-summary --results "$local_root/calibration.json")
@@ -229,7 +232,7 @@ copy_with() {
 }
 timed_copy() {
     # Separate Bash's timing output from the command's live stdout/stderr.
-    copy_with "$@" show
+    if $verbose; then copy_with "$@" show; fi
     TIMEFORMAT='%R'
     { time copy_with "$@" 1>&4 2>&5; } 2> "$local_root/time"
 }
@@ -311,16 +314,19 @@ summarize_syq_timings() {
             printf "%-18s %10.3f %10.3f %10.3f %12s\n", key, total[key]/n[key], copying[key]/n[key], other/n[key], (unmeasurable[key] ? "n/a" : sprintf("%.3f", speed[key]/n[key]));
             if (unmeasurable[key])
                 print "Note (" key "): copying speed unavailable; a copying interval was below timer resolution (0.001 s).";
-            if (total[key] > 0 && other >= total[key]*0.2)
+            if (total[key] > 0 && other >= total[key]*0.2) {
                 printf "Note (%s): %.0f%% of syq total time was outside copying; setup/finish substantially affects this comparison.\n", key, other/total[key]*100;
-            if (copying[key]/n[key] < 1)
+                short_test=1;
+            }
+            if (copying[key]/n[key] < 1) {
                 print "Note (" key "): syq copying averaged under 1 second; this test is too short to assess sustained throughput.";
+                short_test=1;
+            }
         }
+        if (short_test) print "For longer tests, use --workload large --size auto or a larger fixed --size.";
     }' "$1"
-    printf 'Other = total minus copying (setup/finish). Copying includes per-file work and waiting, and can overlap setup.\n'
-    printf 'Copy MB/s = copied bytes / copying seconds / 1,000,000, averaged across trials. Compare tools using total-time results above.\n'
-    printf 'This is not pure network time or an exact setup measurement. Rsync/cp have total time only.\n'
-    printf 'For sustained-throughput comparisons, try --workload large --size auto or a larger fixed --size.\n'
+    printf 'Other = time outside copying (setup/finish). Copying includes waiting and can overlap setup; it is not pure network time.\n'
+    printf 'Copy MB/s uses copying time; compare tools using total-time results above.\n'
 }
 
 summarize_results() {
@@ -347,7 +353,7 @@ summarize_results() {
 main() {
     local mode='' workload='' size='' source_dir='' dest_dir='' rounds=3 yes=false install=false
     local option tool round index offset source destination case_name bytes seconds speed local_parent remote_parent
-    local large_mib small_files syq_identity selected_tool=all has_syq_options=false
+    local large_mib small_files syq_identity selected_tool=all has_syq_options=false verbose=false show_syq_summary=false
     local syq_extra=()
     local key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
     local iv=000102030405060708090a0b0c0d0e0f
@@ -366,7 +372,11 @@ main() {
                             syq_extra+=("$1" "$2"); shift 2 ;;
                         --connections=?*|--tuning-options=?*|--bwlimit=?*|--tcp-ports=?*|--tcp-congestion=?*|-j[0-9]*)
                             syq_extra+=("$1"); shift ;;
-                        --no-tcp|--no-compress|--tcp-plain|--inplace|--stats|--no-progress|-v|-vv|--verbose)
+                        -v|-vv|--verbose)
+                            verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;
+                        --stats)
+                            show_syq_summary=true; syq_extra+=("$1"); shift ;;
+                        --no-tcp|--no-compress|--tcp-plain|--inplace|--no-progress)
                             syq_extra+=("$1"); shift ;;
                         *) fail "Unsupported syq benchmark option: $1 (see --help for tuning options)" ;;
                     esac
@@ -385,7 +395,6 @@ main() {
         esac
     done
     [[ -z $host || -n $mode ]] || mode=push
-    printf 'Compare copies on your machines — no speedup is guaranteed.\n'
     if { exec 3</dev/tty; } 2>/dev/null; then
         : # Also allow SSH credential prompts when --yes supplies benchmark choices.
     elif ! $yes; then
@@ -480,16 +489,11 @@ main() {
     fi
     printf '\nMode: %s; workloads: %s; size: %s; rounds: %s\n' "$mode" "$workload" "$size" "$rounds"
     [[ $mode == local ]] || printf 'SSH host: %s\n' "$host"
-    printf 'Local scratch: %s\n' "$local_root"
-    if [[ $mode == local ]]; then printf 'Destination scratch: %s\n' "$dest_root"
-    else printf 'Remote scratch: %s\n' "$remote_root"; fi
-    printf 'Each trial copies fresh test data and checks the result. Dataset preparation and checks are not timed.\n'
-    if [[ $mode == local ]]; then
-        printf 'Local copies may use filesystem cloning (copy-on-write). Times measure completed copies, not physical data throughput.\n'
-    else
-        printf 'Use a second machine; a fast link with some latency can expose the benefit of parallel copying. TCP data ports 47600-47699 must be reachable to test the default TCP path.\n'
+    if $verbose; then
+        printf 'Local scratch: %s\n' "$local_root"
+        if [[ $mode == local ]]; then printf 'Destination scratch: %s\n' "$dest_root"
+        else printf 'Remote scratch: %s\n' "$remote_root"; fi
     fi
-    [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
     exec 4>&1 5>&2
     local tools=(syq rsync) workloads=(large small)
     [[ $mode != local ]] || tools+=(cp)
@@ -503,7 +507,6 @@ main() {
             # transport path, but suppress meaningless throughput for the 14-byte probe.
             if [[ $mode != local ]]; then
                 printf 'Preparing syq %s on %s to match this machine (untimed)...\n' "$syq_identity" "$host"
-                printf 'A matching remote helper is reused, or installed if needed.\n'
             else
                 printf 'Preparing the benchmark (untimed)...\n'
             fi
@@ -596,7 +599,6 @@ main() {
                 rm -f -- "$local_root/trial.json"
                 run timed_copy "$tool" "$source" "$destination" || fail "$tool failed; no successful result recorded for this trial."
                 seconds=$(cat "$local_root/time")
-                printf 'Checking copied data...\n'
                 if [[ $mode == push ]]; then remote_manifest "$destination" > "$local_root/actual"
                 else manifest "$destination" > "$local_root/actual"; fi
                 cmp "$local_root/expected" "$local_root/actual" || fail "$tool destination content check failed."
@@ -615,8 +617,7 @@ main() {
                     if [[ $copying_ms != n/a ]]; then
                         awk -v ms="$copying_ms" -v seconds="$seconds" -v bytes="$bytes" 'BEGIN {
                             if (ms / 1000 > seconds) exit 1;
-                            printf "Syq copying interval: %.3f seconds; other time (setup/finish): %.3f seconds.\n", ms/1000, seconds-ms/1000;
-                            printf "Syq copying speed: %s MB/s (copying interval only).\n", (ms > 0 ? sprintf("%.3f", bytes/ms/1000) : "n/a");
+                            printf "Copying: %.3f s, %s MB/s; other: %.3f s.\n", ms/1000, (ms > 0 ? sprintf("%.3f", bytes/ms/1000) : "n/a"), seconds-ms/1000;
                         }' || fail 'Syq copying interval exceeds total trial time.'
                     fi
                     printf '%s %s %s %s\n' "$case_name" "$seconds" "$copying_ms" "$bytes" >> "$local_root/syq-timings"
@@ -639,8 +640,6 @@ main() {
     [[ $mode == local ]] || printf 'Connection profile: syq persistence OFF; rsync fresh SSH; connection startup is timed for every trial.\n'
     summarize_results "$local_root/results" "$metric"
     summarize_syq_timings "$local_root/syq-timings"
-    printf '\nCompare the trial range as well as the mean; small differences may be noise.\n'
-    printf 'Results depend on your machines and workload.\n'
 }
 # Keep execution last: a script downloaded through a pipe is parsed before prompts run.
 main "$@"

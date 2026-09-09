@@ -124,10 +124,12 @@ class BenchmarkTests(unittest.TestCase):
         log = self.root / 'args.jsonl'
         tuning = 'batch-files=256,batch-bytes=2M'
         result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
-                             '--', '--no-tcp', '--connections', '4', '--tuning-options', tuning,
+                             '--', '-vv', '--no-tcp', '--connections', '4', '--tuning-options', tuning,
                              env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count('Command:'), 1)
+        self.assertIn('Local scratch:', result.stdout)
+        self.assertEqual(result.stdout.count('test double: copy statistics'), 1)
         self.assertEqual(result.stdout.count(', trial 1/1'), 1)
         self.assertNotIn('large rsync', result.stdout)
         copies = [args for args in map(json.loads, log.read_text().splitlines()) if args[0] == 'cp']
@@ -143,10 +145,16 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(tool=tool):
                 result = self.invoke('--tool', tool)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stdout.count('Command:'), 1)
-                self.assertIn('Command: ' + tool, result.stdout)
+                self.assertNotIn('Command:', result.stdout)
                 self.assertNotIn('large syq', result.stdout)
                 self.assert_clean()
+
+    def test_explicit_stats_survive_concise_output(self):
+        result = self.invoke('--tool', 'syq', '--', '--stats')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('test double: copy statistics'), 1)
+        self.assertNotIn('Command:', result.stdout)
+        self.assert_clean()
 
     def test_tuning_cannot_redirect_copy_or_output(self):
         for args in [('--', '--as', str(self.scratch)), ('--', '--results', str(self.sentinel)),
@@ -333,8 +341,8 @@ class BenchmarkTests(unittest.TestCase):
                          ['syq', 'rsync', 'cp', 'rsync', 'cp', 'syq', 'cp', 'syq', 'rsync'])
         self.assertIn('small cp', result.stdout)
         self.assertIn('syq: syq test double', result.stdout)
-        self.assertEqual(result.stdout.count('Command:'), 18)
-        self.assertIn('Command: syq cp --preserve=permissions', result.stdout)
+        self.assertNotIn('Command:', result.stdout)
+        self.assertNotIn('Local scratch:', result.stdout)
         # Each reported mean must agree with the untimed per-trial records;
         # range columns show the variability hidden by a mean alone.
         import re
@@ -360,7 +368,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summaries, 6)
 
         self.assertEqual(result.stdout.count('Preparing the benchmark'), 1)
-        self.assertEqual(result.stdout.count('test double: copy statistics'), 6)
+        self.assertNotIn('test double: copy statistics', result.stdout)
         self.assertIn('Setup complete.', result.stdout)
         self.assertIn('test double: preparing matching remote helper', result.stdout)
         for detail in ['14-byte', 'tiny setup copy', 'Caches are NOT flushed', 'twice the selected', 'permissions preserved']:
@@ -376,6 +384,10 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn('Preparing syq syq test double on test-host', result.stdout)
                 self.assertIn('test double: preparing matching remote helper', result.stdout)
                 self.assertIn('Setup complete: syq syq test double is ready on test-host', result.stdout)
+                self.assertEqual(result.stdout.count('Connection profile:'), 1)
+                self.assertNotIn('Checking copied data...', result.stdout)
+                self.assertIn('Copying:', result.stdout)
+                self.assertIn('Copy MB/s', result.stdout)
                 self.assert_clean()
 
     def test_persistence_off_ignores_and_preserves_user_policy_and_runtime(self):

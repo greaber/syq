@@ -8,6 +8,27 @@ bounds may change between releases.
 adjustment. In `syq rsync`, use `--syq-connections N`. Use the same count when
 comparing other tuning settings. Leave it unset for everyday copies.
 
+## Remembered connection counts
+
+Remote copies start from the last learned count for the same host route,
+direction and transport, or from 8 workers over SSH and 16 over TCP. The cache
+normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
+parent). The quick benchmark uses this cache, even though it disables SSH
+connection persistence. Its temporary file paths do not change the cache key.
+
+Learning takes time: syq samples every 2.5 seconds and needs a warm-up interval
+plus two stable samples for one measurement. Saving a count requires a
+successful copy with at least two measured worker counts and an unchanged
+transport. Short copies may only use their starting count; the benchmark's
+five-second automatic sizing target does not ensure tuning has settled.
+
+`--connections N` disables automatic adjustment and cache use. Supplying
+`--tuning-options` bypasses reading and updating learned counts, but live
+auto-tuning continues unless you also fix `--connections`. Use `-vv` to see
+when syq starts from a remembered count.
+
+## Transfer controls
+
 `syq cp` and `syq rsync` accept `--tuning-options`. Supply
 comma-separated `KEY=VALUE` pairs:
 
