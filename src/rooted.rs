@@ -1203,11 +1203,15 @@ impl Root {
         let mut rules = filename_rules(&directory);
         let mut missing = false;
         let mut key = Vec::new();
-        for component in &path.components {
+        for (index, component) in path.components.iter().enumerate() {
             let name = filename_component_key(component, rules)?;
             key.extend_from_slice(&name);
             key.push(0); // Input path components cannot contain NUL.
-            if !missing {
+
+            // A name is compared by its parent directory. Opening the final
+            // component adds no naming information and can require search
+            // permission that the planner has not repaired yet.
+            if !missing && index + 1 < path.components.len() {
                 match open_directory_at(&directory, component) {
                     Ok(child) => {
                         directory = child;

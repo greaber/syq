@@ -17910,7 +17910,7 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
 #[test]
 fn native_cp_mapping_restores_only_reopened_implicit_parents() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for mode in [0o550, 0o750] {
+    for mode in [0o000, 0o600, 0o550, 0o750] {
         for preserve in [false, true] {
             let t = Tmp::new();
             write(&t.path("src/file"), b"same contents");

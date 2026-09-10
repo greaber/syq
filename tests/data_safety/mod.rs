@@ -178,3 +178,68 @@ fn prune_rechecks_names_after_destination_permissions_are_repaired() {
     assert_eq!(read(&t.path("dst/Report.txt")), b"keep these contents");
     assert!(!t.path("dst/extra").exists());
 }
+
+#[test]
+fn copy_repairs_destination_directories_without_search_permission() {
+    for directory in ["sub", "parent/sub"] {
+        for mode in [0o600, 0o000] {
+            for prune in [false, true] {
+                let t = Tmp::new();
+                let source = format!("src/{directory}/Report.txt");
+                let destination = format!("dst/{directory}");
+                write(&t.path(&source), b"copied contents");
+                write(&t.path(&format!("{destination}/extra")), b"extra contents");
+                fs::set_permissions(t.path(&destination), fs::Permissions::from_mode(mode))
+                    .unwrap();
+                let src = t.s("src");
+                let dst = t.s("dst");
+                let mut args = vec!["cp", "--srcs-in", &src, "--into", &dst];
+                if prune {
+                    args.push("--prune");
+                }
+                let out = native_syq(&args);
+                // The temporary repair must restore the existing mode when
+                // permissions are not being copied from the source.
+                let after = fs::metadata(t.path(&destination)).unwrap().mode() & 0o777;
+                fs::set_permissions(t.path(&destination), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                assert_output_ok(&out);
+                assert_eq!(after, mode);
+                assert_eq!(
+                    read(&t.path(&format!("{destination}/Report.txt"))),
+                    b"copied contents"
+                );
+                assert_eq!(t.path(&format!("{destination}/extra")).exists(), !prune);
+            }
+        }
+    }
+}
+
+#[test]
+fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
+    for mode in [0o600, 0o000] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/file"), b"new contents");
+        write(&t.path("dst/sub/file"), b"old contents");
+        fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(mode)).unwrap();
+        let before = fs::metadata(t.path("dst/sub")).unwrap();
+        let out = native_syq(&[
+            "cp",
+            "--dry-run",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        let after = fs::metadata(t.path("dst/sub")).unwrap();
+        fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_output_ok(&out);
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec()),
+            "dry-run filename inspection changed destination permissions"
+        );
+        assert_eq!(read(&t.path("dst/sub/file")), b"old contents");
+    }
+}
