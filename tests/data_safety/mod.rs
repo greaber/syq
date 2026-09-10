@@ -203,8 +203,22 @@ fn copy_repairs_destination_directories_without_search_permission() {
                 let after = fs::metadata(t.path(&destination)).unwrap().mode() & 0o777;
                 fs::set_permissions(t.path(&destination), fs::Permissions::from_mode(0o755))
                     .unwrap();
-                assert_output_ok(&out);
                 assert_eq!(after, mode);
+                if cfg!(target_os = "macos") && mode == 0 {
+                    // Darwin's O_EVTONLY metadata handles still need read
+                    // access. This is the pre-existing repair limitation;
+                    // failure must leave both existing and source data alone.
+                    assert!(!out.status.success(), "{out:?}");
+                    assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+                    assert!(!t.path(&format!("{destination}/Report.txt")).exists());
+                    assert_eq!(
+                        read(&t.path(&format!("{destination}/extra"))),
+                        b"extra contents"
+                    );
+                    assert_eq!(read(&t.path(&source)), b"copied contents");
+                    continue;
+                }
+                assert_output_ok(&out);
                 assert_eq!(
                     read(&t.path(&format!("{destination}/Report.txt"))),
                     b"copied contents"
@@ -233,7 +247,12 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
         ]);
         let after = fs::metadata(t.path("dst/sub")).unwrap();
         fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
-        assert_output_ok(&out);
+        if cfg!(target_os = "macos") && mode == 0 {
+            assert!(!out.status.success(), "{out:?}");
+            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+        } else {
+            assert_output_ok(&out);
+        }
         assert_eq!(after.mode(), before.mode());
         assert_eq!(
             (after.ctime(), after.ctime_nsec()),

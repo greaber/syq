@@ -17924,7 +17924,15 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
 #[test]
 fn native_cp_mapping_restores_only_reopened_implicit_parents() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for mode in [0o000, 0o600, 0o550, 0o750] {
+    // Darwin cannot open a mode-000 directory for descriptor-based repair;
+    // data_safety covers its failure without mutation. Mode 0600 exercises
+    // missing search permission on both platforms.
+    let modes: &[u32] = if cfg!(target_os = "macos") {
+        &[0o600, 0o550, 0o750]
+    } else {
+        &[0o000, 0o600, 0o550, 0o750]
+    };
+    for &mode in modes {
         for preserve in [false, true] {
             let t = Tmp::new();
             write(&t.path("src/file"), b"same contents");

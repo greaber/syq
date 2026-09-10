@@ -349,7 +349,9 @@ Copy keeps modification times and copies symlinks as symlinks. New files use
 the source read, write, and execute permissions limited by the destination
 umask; existing files keep their destination permissions. For example, a new
 script with mode `755` stays executable with umask `022`. Source setuid,
-setgid, and sticky bits are not copied by default.
+setgid, and sticky bits are not copied by default. On macOS, an existing
+destination directory must be readable before syq can temporarily repair
+missing write or search permission.
 
 To copy source permissions exactly, including onto existing files, or request
 ownership too:

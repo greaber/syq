@@ -2156,9 +2156,10 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
-/// Inspect a directory's naming rules without requiring access to its contents.
-/// macOS O_SEARCH checks the directory's search permission when opening it;
-/// O_EVTONLY supports metadata queries before the planner repairs that mode.
+/// Inspect a directory's naming rules before search permission is repaired.
+/// macOS O_SEARCH requires search permission on the directory being opened;
+/// O_EVTONLY permits these queries with read permission alone. It still needs
+/// read access, just like syq's existing macOS permission-repair handles.
 /// Descendant lookups still enforce search permission and never follow links.
 fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
     #[cfg(target_os = "macos")]
