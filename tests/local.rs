@@ -19383,7 +19383,13 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
     fs::remove_file(t.path("ssh-used")).unwrap();
     let explicit = run(&["cp", "source", "--to", "@laptop"]);
     assert!(!explicit.status.success());
-    assert!(stderr_of(&explicit).contains("offline"));
+    let error = stderr_of(&explicit);
+    assert!(
+        error.contains("could not connect to receiving machine"),
+        "{error}"
+    );
+    assert!(!error.contains("offline"), "{error}");
+    assert!(!error.contains("reconnect"), "{error}");
     assert!(!t.path("ssh-used").exists());
     // An older process can hand a selected bare receiver to this helper.
     // Reject that spelling rather than reinterpret its pinned destination as SSH.
