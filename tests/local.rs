@@ -13654,6 +13654,20 @@ fn native_endpoint_port_reaches_ssh() {
 }
 
 #[test]
+fn native_local_exact_bare_home_expands_before_identity_check() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("home")).unwrap();
+    write(&t.path("src/file"), b"home destination");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--src", &t.s("src"), "--as", "~", "-q"])
+        .env("HOME", t.path("home"))
+        .run()
+        .expect("copy to a local bare-home destination");
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("home/file")), b"home destination");
+}
+
+#[test]
 fn native_remote_exact_bare_home_expands_before_identity_check() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
