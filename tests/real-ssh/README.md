@@ -102,6 +102,13 @@ The experimental streaming path also runs over TCP and SSH, with push, pull,
 source/destination coordination and a local relay. Each streaming copy has a
 25-second deadline and is compared byte for byte, including a signed receiver.
 
+For receiver-state compatibility against an unchanged v0.5.2 binary, run
+`python3 tests/receiver_identity_compat.py target/debug/syq /path/to/v0.5.2/syq`
+from the repository root. It accepts the official release or a build of tag
+commit `fd2b17c642e6`, checks its version and build identity, and uses disposable
+local sockets and state. It also checks that reconnect probes send only Ping
+to the old connection and verify identity through the new one.
+
 This suite is intentionally outside `cargo test` and CI. Run it after changing
 SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
 topology behavior, and before cutting a release. For release preparation, use

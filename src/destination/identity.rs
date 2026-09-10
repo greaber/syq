@@ -301,6 +301,8 @@ mod tests {
     #[test]
     fn released_v052_advertisement_and_ping_still_decode() {
         // Unchanged v0.5.2 wire shapes: ownership is a separate record.
+        // tests/receiver_identity_compat.py also checks actual released binaries,
+        // including probes sent to a dying connection during reconnect retries.
         let registration: Registration = serde_json::from_str(r#"{"version":3,"identity":"old-build","socket":"/tmp/receiver.sock","secret":"old-secret","program":[47,115,121,113]}"#).unwrap();
         assert_eq!(registration.version, REGISTRATION_VERSION);
         let ping: Envelope = serde_json::from_str(

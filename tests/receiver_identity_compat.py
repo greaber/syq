@@ -26,6 +26,12 @@ def run(*args, env=None, success=True, input=None):
     return result
 
 
+old_version = run(previous, "--version").stdout.decode().strip()
+assert old_version == "syq 0.5.2", f"expected v0.5.2 baseline, got {old_version!r}"
+old_identity = run(previous, "--build-identity").stdout.decode().strip()
+assert old_identity in ("v0.5.2", "v0.5.2+dev.fd2b17c642e6"), old_identity
+
+
 def read_frame(stream):
     deadline = time.monotonic() + 10
 
@@ -151,6 +157,7 @@ with tempfile.TemporaryDirectory(prefix="syq-id-compat-") as directory:
                               error=b"already connected"):
                 assert owner.read_bytes() == owned_bytes
         paused.set()
+        before_retry = len(messages)
         for secret in ("test-connection-secret", "restarted-service"):
             with registration(candidate, home, key_one, retry=True, secret=secret):
                 assert owner.read_bytes() == owned_bytes
@@ -159,7 +166,13 @@ with tempfile.TemporaryDirectory(prefix="syq-id-compat-") as directory:
         paused.clear()
         print("PASS: responsive duplicates fail; unresponsive same-identity reconnects wait without displacing the lock", flush=True)
         run(previous, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
+        # The successful old-client Ping also drains earlier queued probes.
+        retry_messages = messages[before_retry:]
+        assert retry_messages and all(message == "Ping" for message in retry_messages), retry_messages
+        before_ready = len(messages)
         run(candidate, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
+        ready_messages = messages[before_ready:]
+        assert len(ready_messages) == 1 and "Identify" in ready_messages[0], ready_messages
     assert owner.read_bytes() == owned_bytes and not advertisement.exists()
     print("PASS: v0.5.2 discovers new advertisements; disconnect preserves ownership", flush=True)
 

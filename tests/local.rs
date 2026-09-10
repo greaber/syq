@@ -18989,6 +18989,81 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
     assert_eq!(completion.stdout, b"@laptop\0");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn receiver_wait_and_list_do_not_block_on_a_full_listen_queue() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::time::{Duration, Instant};
+    let t = Tmp::new();
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("receiver.sock");
+    let address = SockAddr::unix(&socket_path).unwrap();
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&address).unwrap();
+    listener.listen(0).unwrap();
+    let mut queued = Vec::new();
+    let mut full = false;
+    for _ in 0..16 {
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        client.set_nonblocking(true).unwrap();
+        match client.connect(&address) {
+            Ok(()) => queued.push(client),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                full = true;
+                break;
+            }
+            Err(error) => panic!("fill listen queue: {error}"),
+        }
+    }
+    assert!(full, "test did not fill the listen queue");
+    let path = registry.join("stuck.json");
+    write(
+        &path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version":3,"identity":"test-build","socket":socket_path,
+            "secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes(),
+        }))
+        .unwrap(),
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    // A hard watchdog unblocks even the old blocking implementation, so a
+    // regression fails the latency assertion instead of hanging the test suite.
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        let _ = stopped.recv_timeout(Duration::from_secs(4));
+        drop(listener);
+        drop(queued);
+    });
+    let start = Instant::now();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap()
+    };
+    let wait = run(&["persist", "destinations", "wait", "stuck", "--timeout", "1"]);
+    let list = run(&["persist", "destinations", "list"]);
+    let elapsed = start.elapsed();
+    let _ = stop.send(());
+    watchdog.join().unwrap();
+    assert!(!wait.status.success());
+    assert!(
+        stderr_of(&wait).contains("timed out waiting"),
+        "{}",
+        stderr_of(&wait)
+    );
+    assert_output_ok(&list);
+    assert_eq!(list.stdout, b"@stuck\toffline\n");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "wait/list took {elapsed:?}"
+    );
+}
+
 #[test]
 fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
     use std::os::unix::net::UnixListener;

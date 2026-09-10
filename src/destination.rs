@@ -185,39 +185,131 @@ pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Resul
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn deadline_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|time| !time.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "return channel exchange timed out",
+            )
+        })
+}
+
+fn wait_socket(socket: &impl AsRawFd, events: i16, deadline: Instant) -> std::io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    loop {
+        let milliseconds = deadline_remaining(deadline)?
+            .as_millis()
+            .clamp(1, i32::MAX as u128) as i32;
+        // The borrowed socket remains alive and descriptor is writable during
+        // poll. Signals and spurious wakeups never renew the deadline.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready > 0 {
+            return Ok(());
+        }
+    }
+}
+
+struct DeadlineSocket<'a> {
+    socket: &'a mut UnixStream,
+    deadline: Instant,
+}
+impl Read for DeadlineSocket<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            deadline_remaining(self.deadline)?;
+            // recv writes at most bytes.len() bytes into this live mutable
+            // slice. Per-call nonblocking mode does not affect socket clones.
+            let count = unsafe {
+                libc::recv(
+                    self.socket.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count >= 0 {
+                return Ok(count as usize);
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {
+                    wait_socket(self.socket, libc::POLLIN, self.deadline)?
+                }
+                _ => return Err(error),
+            }
+        }
+    }
+}
+impl Write for DeadlineSocket<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            deadline_remaining(self.deadline)?;
+            match socket2::SockRef::from(&*self.socket)
+                .send_with_flags(bytes, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_socket(self.socket, libc::POLLOUT, self.deadline)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        deadline_remaining(self.deadline)?;
+        Ok(())
+    }
+}
+
 /// A complete incoming envelope has an absolute deadline, including clients
 /// trickling bytes. Timeout budgets cannot be renewed by partial progress.
 pub(crate) fn read_socket_message<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
 ) -> Result<T> {
-    struct DeadlineReader<'a> {
-        socket: &'a mut UnixStream,
-        deadline: Instant,
-    }
-    impl Read for DeadlineReader<'_> {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|time| !time.is_zero())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "return channel handshake timed out",
-                    )
-                })?;
-            self.socket.set_read_timeout(Some(remaining))?;
-            self.socket.read(bytes)
-        }
-    }
-    let previous = socket.read_timeout()?;
-    let result = read_message(&mut DeadlineReader {
+    read_message(&mut DeadlineSocket {
         socket,
         deadline: Instant::now() + timeout,
-    });
-    socket.set_read_timeout(previous)?;
-    result
+    })
+}
+
+fn connect_socket(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    deadline_remaining(deadline)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&SockAddr::unix(path)?) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
+            wait_socket(&socket, libc::POLLOUT, deadline)?;
+            if let Some(error) = socket.take_error()? {
+                return Err(error);
+            }
+            socket.peer_addr()?;
+        }
+        // In particular, Linux reports EAGAIN for a full Unix listen queue:
+        // no connection is pending. Return it without a blocking connect retry.
+        Err(error) => return Err(error),
+    }
+    socket.set_nonblocking(false)?;
+    let descriptor: std::os::fd::OwnedFd = socket.into();
+    Ok(descriptor.into())
 }
 
 fn random_token() -> Result<String> {
@@ -367,13 +459,15 @@ fn exchange(
         );
     }
     let deadline = Instant::now() + timeout;
-    let mut stream = UnixStream::connect(&registration.socket).context(
+    let mut stream = connect_socket(&registration.socket, deadline).context(
         "receiving machine is offline; run `syq persist connect SERVER` on that machine to reconnect to this server account",
     )?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let mut io = DeadlineSocket {
+        socket: &mut stream,
+        deadline,
+    };
     write_message(
-        &mut stream,
+        &mut io,
         &Envelope {
             version: if matches!(message, Message::Ping | Message::Identify { .. }) {
                 DISCOVERY_VERSION
@@ -387,11 +481,11 @@ fn exchange(
             message,
         },
     )?;
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .context("return channel exchange timed out")?;
-    let reply = read_socket_message(&mut stream, remaining)?;
+    let reply = read_message(&mut io)?;
+    // Callers that retain the stream keep the existing per-operation budget
+    // for the next protocol phase, rather than the spent handshake budget.
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     if let Reply::Error(error) = &reply {
         bail!("receiving machine: {error}");
     }
@@ -1480,6 +1574,56 @@ mod tests {
             }
             assert!(!path.exists(), "failed registration must remove its socket");
         }
+    }
+
+    #[test]
+    fn partial_writes_do_not_renew_the_exchange_deadline() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        socket2::SockRef::from(&writer)
+            .set_send_buffer_size(1024)
+            .unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut received = 0;
+            let mut bytes = [0; 1024];
+            while Instant::now() < end {
+                match reader.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => received += count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("{error}"),
+                }
+                if stopped.recv_timeout(Duration::from_millis(30)).is_ok() {
+                    break;
+                }
+            }
+            received
+        });
+        let start = Instant::now();
+        let result = write_message(
+            &mut DeadlineSocket {
+                socket: &mut writer,
+                deadline: start + Duration::from_millis(150),
+            },
+            &"x".repeat(MAX_MESSAGE / 2),
+        );
+        let elapsed = start.elapsed();
+        let _ = stop.send(());
+        let received = peer.join().unwrap();
+        assert!(result.is_err());
+        assert!(received > 4, "peer made no payload progress");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write took {elapsed:?}"
+        );
     }
 
     pub(super) fn args(source: &Path, destination: &str) -> Args {
