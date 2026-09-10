@@ -564,7 +564,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
-        "cp" | "rm" | "map" | "rsync" => {
+        "cp" | "rm" | "clean-partials" | "map" | "rsync" => {
             filesystem_command_candidates(command, args_before, current)
         }
         _ => Ok(Vec::new()),
@@ -708,6 +708,7 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "cp",
         "exec",
         "rm",
+        "clean-partials",
         "map",
         "rsync",
         "persist",
@@ -1148,7 +1149,7 @@ fn filesystem_command_candidates(
         }
     }
     match command {
-        "cp" | "rm" | "map" if context.sources_allowed(command) => {
+        "cp" | "rm" | "clean-partials" | "map" if context.sources_allowed(command) => {
             complete_path_for(command, &context.options, current, true)
         }
         "rsync" => complete_rsync_operand(&context.options, current),
@@ -1251,7 +1252,7 @@ fn value_completion(
             }),
             _ => None,
         },
-        "rm" => match option {
+        "rm" | "clean-partials" => match option {
             b"--results" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1497,14 +1498,24 @@ fn complete_source_path(
 ) -> Result<Vec<Candidate>> {
     // Removal follows parent paths when requested, but selects the final link
     // itself. --cwd and --root still resolve their complete directory paths.
-    let policy = path_policy(command, args, true, command != "rm" || !apply_base);
+    let policy = path_policy(
+        command,
+        args,
+        true,
+        !matches!(command, "rm" | "clean-partials") || !apply_base,
+    );
     let base = if apply_base { source_base(args) } else { None };
     if command == "map" {
         return Ok(local_path_candidates_at(current, false, base, policy));
     }
-    let Some(endpoint_text) =
-        find_option_value(args, if command == "rm" { b"--on" } else { b"--from" })
-    else {
+    let Some(endpoint_text) = find_option_value(
+        args,
+        if matches!(command, "rm" | "clean-partials") {
+            b"--on"
+        } else {
+            b"--from"
+        },
+    ) else {
         return Ok(local_path_candidates_at(current, false, base, policy));
     };
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {

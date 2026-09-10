@@ -328,9 +328,9 @@ return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
 while :; do
-    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)
+    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)
     if [ "$partial_count" -eq 1 ]; then
-        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*')
+        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*')
         partial_prefix=$(dd if="$partial" bs=1M count=4 status=none | sha256sum)
         if [ "$partial_prefix" = "$source_prefix" ]; then break; fi
     fi
@@ -361,7 +361,7 @@ test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
-test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
+test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
 printf 'return\n' | cmp - "$receive_root/after-reconnect"
 printf 'case: return heartbeat timeout reconnects without toggling persistence\n'
@@ -910,14 +910,40 @@ mkdir "$benchmark_parent"
 ssh destination "mkdir -p \"/tmp/benchmark scratch's\""
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload both --size quick \
+        --mode "$benchmark_mode" --host destination --workload both --size quick --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 # Automatic sizing uses the real terminal timing from each remote direction.
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload small \
+        --mode "$benchmark_mode" --host destination --workload small --size auto --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
+done
+# One scored syq copy with transport and batch overrides in each direction.
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --connections 2 --tuning-options batch-files=256,batch-bytes=2M
+done
+# A new route can learn during warm-up before the first scored copy. Speed up
+# only the debug tuner's sample clock and cap traffic to keep this lab bounded.
+# These are correctness checks, not performance measurements.
+for benchmark_mode in push pull; do
+    benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
+    SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \
+        bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --bwlimit 2M
+    python3 - "$benchmark_cache" "$benchmark_mode" <<'PY'
+import json, pathlib, sys
+cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
+key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
+assert 1 <= cache['paths'][key] <= 64, cache
+print('Verified a learned starting count for', key)
+PY
+    rm -f "$benchmark_cache" "$benchmark_cache.lock"
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
@@ -931,13 +957,13 @@ cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
-    --workload large --size quick --rounds 1 --source-dir "$cancel_parent" \
+    --workload large --size quick --warmup off --rounds 1 --source-dir "$cancel_parent" \
     --dest-dir /tmp/benchmark-cancel &
 benchmark_pid=$!
 attempt=0
 copy_started=false
 while [ "$attempt" -lt 30 ]; do
-    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-part.*; do
+    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-tmp.*; do
         if [ -f "$file" ]; then exit 0; fi
     done; exit 1'; then
         copy_started=true

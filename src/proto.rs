@@ -116,8 +116,7 @@ fn validate_relative_path(path: &[u8]) -> Result<()> {
 /// Full BLAKE3 digest used whenever content equality affects copy behavior.
 pub type ContentDigest = [u8; 32];
 
-/// Stable identifier for one logical copy command. Destination partial names
-/// include this value so unrelated commands never write the same staged inode.
+/// Fresh nonce for one invocation. Workers derive private per-file names from it.
 pub type CopyId = [u8; 16];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -182,6 +181,7 @@ pub enum NativeRemoveKind {
     Contents,
     File,
     Directory,
+    Partials,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -559,6 +559,13 @@ pub enum ConnectionRole {
     },
 }
 
+/// An existing private output and an optional donor are separate states.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preparation {
+    pub partial_size: Option<u64>,
+    pub has_candidates: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Request {
     Hello {
@@ -694,7 +701,7 @@ pub enum Request {
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
     },
-    /// Return the size of the deterministic sidecar, if it is a regular file.
+    /// Return the size of this invocation's partial, if it is a regular file.
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
@@ -702,7 +709,8 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
-    /// Returns PartialSize with the size observed before any adjustment. A
+    /// Returns Prepared with the private size observed before adjustment and
+    /// whether donor discovery deferred creation to SeedBasis. A
     /// false `create_if_missing` lets content-identical final files complete
     /// without ever allocating a sidecar.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -738,11 +746,14 @@ pub enum Request {
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
-    /// Seed this job's sidecar from the retained basis descriptor.
+    /// Copy one optional donor into the private sidecar and return hashes of
+    /// the exact buffers written. The controller must repair differing blocks
+    /// before publication. An existing private sidecar is hashed without copying.
     SeedBasis {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
+        block: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
@@ -815,7 +826,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
-    /// existing prefix resolved), for a stable copy identity.
+    /// existing prefix resolved).
     Canonicalize {
         path: PathBytes,
         guard: Option<ContainerGuard>,
@@ -916,18 +927,11 @@ pub const SMALL_COPY_MAX_FILES: usize = 64;
 pub const SMALL_COPY_MAX_FILE_BYTES: u64 = 1 << 20;
 pub const SMALL_COPY_MAX_TOTAL_BYTES: u64 = 4 << 20;
 
-/// The parts of a job identity only the coordinator knows. The receiver adds
-/// the canonical destination it resolves, so the sidecar names it stages
-/// through are the ones the ordinary engine would use for the same copy.
+/// Fresh invocation identity and optional exact destination leaf for a small push.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyIdentity {
-    pub src_endpoint: String,
-    pub src_roots: Vec<(String, bool)>,
-    pub dst_endpoint: String,
-    /// Exact placement names a directory entry beneath the selected
-    /// directory; its identity is the canonical parent plus this leaf.
+    pub copy_id: CopyId,
     pub dst_leaf: Option<PathBytes>,
-    pub semantic_flags: String,
 }
 
 /// One file of a small push. `path` is spelled as the ordinary engine would
@@ -1108,6 +1112,7 @@ pub enum Response {
     /// All data/error frames for the stopped source stream precede this marker.
     ReadStreamDone,
     WriteStreamDone,
+    Prepared(Preparation),
     /// The source volume cannot clone into this destination directory. Only
     /// same-executable local macOS receivers emit this hint; existing response
     /// discriminants and remote helper exchanges stay unchanged.
@@ -2089,6 +2094,19 @@ mod tests {
             let message = result.unwrap_err().to_string();
             assert!(message.contains("build identity mismatch"), "{message}");
             assert!(message.contains("remote v0.4.0"), "{message}");
+        }
+    }
+
+    #[test]
+    fn released_v052_preamble_rejects_new_transfer_messages_before_decoding() {
+        // Literal v0.5.2 preamble, independent of today's enum encodings.
+        const V052: &[u8] = b"SYQWIRE\0\0\x06v0.5.2";
+        if crate::identity::build() != "v0.5.2" {
+            let error = FrameReader::new(V052).read_msg::<Response>().unwrap_err();
+            assert!(
+                error.to_string().contains("build identity mismatch"),
+                "{error}"
+            );
         }
     }
 

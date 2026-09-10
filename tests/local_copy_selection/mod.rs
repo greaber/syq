@@ -182,8 +182,20 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let mut changed = original;
     changed[..1 << 20].fill(b'c');
     write(&t.path("src/file"), &changed);
+    // ENOSPC can stop the companion before it completes. Reproduce that state
+    // deterministically and select ranges so the retry exercises partial reuse
+    // instead of the direct-copy fast path for multiple pending files.
+    if t.path("dst/small").exists() {
+        fs::remove_file(t.path("dst/small")).unwrap();
+    }
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .args([
+            "-a",
+            "--tuning-options=copy-path=ranges",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
@@ -194,7 +206,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(partial_files(&t.path("dst")), partials);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -259,10 +271,32 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
 
     contents[..1 << 20].fill(b'x');
     write(&t.path("src/file"), &contents);
-    let resumed = run().run().unwrap();
+    // Keep the companion pending as it may be after ENOSPC, and explicitly
+    // select ranges to test reuse rather than the multi-file direct-copy path.
+    if t.path("dst/tiny").exists() {
+        fs::remove_file(t.path("dst/tiny")).unwrap();
+    }
+    let resumed = run()
+        .arg("--tuning-options=copy-path=ranges")
+        .run()
+        .unwrap();
     assert_output_ok(&resumed);
-    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert_eq!(partial_files(&t.path("dst")), partials);
+    // Cleanup changes the containing directory's mtime. Check copied directory
+    // metadata before cleanup, and compare each payload independently of donors.
+    let source_dir = fs::metadata(t.path("src")).unwrap();
+    let destination_dir = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(source_dir.mtime(), destination_dir.mtime());
+    assert_eq!(source_dir.mode() & 0o7777, destination_dir.mode() & 0o7777);
+    for name in ["file", "tiny"] {
+        assert_same_tree(
+            &t.path(&format!("src/{name}")),
+            &t.path(&format!("dst/{name}")),
+        );
+    }
+    run_native_ok(&["clean-partials", &t.s("dst")]);
     assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 2);
     let observed = tuning_observed(&resumed);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
@@ -463,7 +497,7 @@ fn macos_immutable_clone_open_failure_cleans_up_and_streams() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
-fn macos_clone_leaves_existing_partial_for_verified_resume() {
+fn macos_clone_preserves_previous_run_partial() {
     if !macos_clone_support::available() {
         return;
     }
@@ -479,8 +513,11 @@ fn macos_clone_leaves_existing_partial_for_verified_resume() {
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), data);
-    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
-    assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
+    assert_eq!(tuning_observed(&out)["range_requests"], 0);
+    assert_eq!(read(&partial), data[..4 << 20]);
+    assert_eq!(partial_files(&t.0), vec![partial]);
+    run_native_ok(&["clean-partials", &t.s("")]);
     assert!(partial_files(&t.0).is_empty());
 }
 
@@ -733,11 +770,21 @@ fn macos_clone_rmdir_failure_keeps_complete_partial_for_resume() {
     // The process has exited; remove only this test's empty staging directory.
     fs::remove_dir(&staging[0]).unwrap();
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .args([
+            "-a",
+            "--no-progress",
+            "--tuning-options=copy-path=ranges",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(partial_files(&t.0), partials);
+    assert_eq!(read(&partials[0]), data);
+    run_native_ok(&["clean-partials", &t.s("")]);
     assert!(partial_files(&t.0).is_empty());
 }
 

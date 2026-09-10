@@ -26,8 +26,10 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-Choose an SSH copy to compare syq with rsync, or a local copy to include cp.
-The script creates test data, checks the copied contents, and cleans up afterward.
+The default sends 1,024 small throwaway files to an SSH host you choose and
+compares syq with rsync over three rounds, following an untimed tuning warm-up
+(`--warmup off` skips it). Local copies, large files, and
+automatic sizing are optional. The script checks the copied contents and cleans up afterward.
 If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
 to download the script and run it again.
 

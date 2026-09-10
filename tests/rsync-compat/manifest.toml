@@ -263,7 +263,7 @@ baseline = "pass"
 platforms = ["linux", "macos"]
 tags = ["local", "resume", "partial-files"]
 requirements = ["signals", "bandwidth limiting"]
-note = "An interrupted transfer leaves SYQ's job-scoped deterministic sidecar and a rerun completes it."
+note = "An interrupted transfer leaves SYQ's private partial; a rerun completes a fresh file using checked candidate bytes."
 
 [[tests]]
 name = "protected-regular"

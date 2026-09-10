@@ -15,8 +15,8 @@ index 1c8e953..d0c937c 100644
 -basename. All of this is parent- and cross-directory path resolution -- what
 -the resolver restructure rewrites -- so exercise it on a file several levels
 -deep, with the absolute partial-dir kept OUTSIDE the destination tree.
-+SYQ keeps an interrupted transfer in a deterministic
-+`.name.syq-part.<job-id>` sidecar, then consumes it on a later run. The
++SYQ keeps an interrupted transfer in a private
++`.name.syq-tmp.<random>` sidecar, reused read-only on later runs. The
 +upstream rsync test's unsupported relative and absolute --partial-dir cases
 +are outside this adapted oracle.
  """
@@ -58,7 +58,7 @@ index 1c8e953..d0c937c 100644
              break                       # exited before we caught it
          if tdir.is_dir():
 -            temps = [p for p in tdir.glob('.f3.*')
-+            temps = [p for p in tdir.glob('.f3.syq-part.*')
++            temps = [p for p in tdir.glob('.f3.syq-tmp.*')
                       if p.is_file() and p.stat().st_size > 0]
              if temps:
 -                caught = True
@@ -82,7 +82,7 @@ index 1c8e953..d0c937c 100644
 
 
 -# --- 1. --partial (no dir): partial kept in the dest file itself, at depth --
-+# --- --partial: interrupted data is kept in SYQ's deterministic sidecar -----
++# --- --partial: interrupted data is kept in SYQ's private sidecar -----
  seed_big()
 -interrupt_transfer(['--partial'], TODIR / deep)
 -if not (TODIR / deep).is_file() or not is_prefix(TODIR / deep):
@@ -93,8 +93,8 @@ index 1c8e953..d0c937c 100644
 +    test_fail("--partial did not leave an incomplete SYQ sidecar")
 +run_rsync('-a', '--partial', f'{src}/', f'{TODIR}/')
  assert_same(TODIR / deep, src / deep, label='--partial resume')
-+if sidecar.exists():
-+    test_fail("SYQ partial sidecar remained after a successful resume")
++if not sidecar.exists():
++    test_fail("SYQ consumed another invocation's partial during resume")
 
 -# --- 2. relative --partial-dir at depth: deterministic clean pre-seed -------
 -rmtree(src)

@@ -28,7 +28,7 @@ for its named behavior, not a score for compatibility as a whole.
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
 | `-B` and `--block-size` select syq's transfer/hash block size | by construction | `checksum_repairs_silent_corruption` |
 | A remote source and remote destination are refused before connecting, as by rsync | by construction | `rsync_rejects_remote_to_remote` |
-| Source entries whose names look like syq's partial files (`.name.syq-part.<id>`) are copied as data like any other file (with one warning); only the exact case where a source path equals the partial file this copy would use for another file is refused, before anything is written | by construction | `sidecar_named_source_directory_is_payload`, `delete_treats_sidecar_patterned_files_as_ordinary_extras`, `partial_named_symlink_is_a_symlink_not_a_leftover` |
+| Source entries whose names look like syq's partial files (`.name.syq-tmp.<random>`) are copied as data like any other file (with one warning); only the exact case where a source path equals the partial file this copy would use for another file is refused, before anything is written | by construction | `sidecar_named_source_directory_is_payload`, `delete_preserves_recognized_partial_files`, `partial_named_symlink_is_a_symlink_not_a_leftover` |
 
 ## Focused regression tests
 

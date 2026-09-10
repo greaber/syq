@@ -14,9 +14,87 @@ curl --proto '=https' --tlsv1.2 -fLsS -o try-benchmark.sh \
 bash try-benchmark.sh
 ```
 
-Choose an SSH copy to compare syq with rsync, or a local copy to include cp.
-The script creates test data, checks the copied contents, and cleans up afterward.
-Use `bash try-benchmark.sh --help` for options.
+The default pushes 1,024 files of 8 KiB to an SSH host you choose, comparing syq
+with rsync over three rounds. Use `--mode pull` for downloads or `--mode local`
+to include cp. `--workload large` selects one 64 MiB file; `--workload both`
+runs both workloads. The script checks every copy and cleans up afterward.
+
+Before scoring each network workload, an untimed syq warm-up gives automatic
+tuning time to refine the remembered connection count. It uses the same
+direction, transport options and file type as the scored copies. It starts
+with 64 MiB or 1,024 small files and grows toward 60 seconds of copying,
+stopping after at most four copies or at 1 GiB per dataset, subject to free
+space. A slow copy can take longer than 60 seconds; preparation and checks
+also add time. The script reports the measured duration and warns if it hits
+a limit before the target. Reaching the target does not prove tuning settled.
+
+Use `--warmup off` for a short comparison using the existing cached or default
+count. A cached count alone does not currently skip the warm-up automatically.
+Warm-up is skipped for local copies, comparisons without scored syq
+trials, and manual `--connections` or `--tuning-options` overrides. The scored
+dataset size stays the same. For pull warm-ups, identical data is generated
+locally and remotely and checked, avoiding a large preliminary upload; the
+remote host needs Bash, OpenSSL, dd and split for that step.
+
+For one scored syq copy with your own options:
+
+```sh
+bash try-benchmark.sh --yes --mode pull --host j5 --tool syq --rounds 1 \
+  -- --no-tcp --connections 1 -v
+```
+
+An untimed tiny copy still prepares the helper. Options after `--` apply to
+syq's setup, warm-up, calibration and scored copies; path, removal and output-file
+options are excluded to keep copies inside the disposable dataset. Use
+`--tool rsync` for a separate rsync comparison, omitting syq options after `--`.
+Full commands and scratch paths appear only with `-v`, `-vv`, or `--verbose`
+after `--`. Syq's extra summary appears with those flags or `--stats`; the
+benchmark always reports verified trial results and failures.
+See [tuning options](tuning.md#streaming-and-request-windows) for request-window
+and small-file batch experiments, and `bash try-benchmark.sh --help` for all options.
+
+`--size quick` is the fixed-size default. For longer tests, `--size medium`
+uses 1 GiB or 4,096 small files; `--size large` uses 8 GiB or 16,384 files.
+`--size auto` makes verified, unscored syq copies and grows the dataset until
+copying takes about five seconds or scratch space limits growth. There is no
+fixed total-data or runtime limit. All scored tools use the same dataset.
+
+The script needs Bash, rsync, OpenSSL and standard Unix utilities locally;
+syq timing uses Perl's core JSON::PP module. Remote tests need SSH access and
+rsync on the other machine. Scratch parents must exist: `--source-dir` is
+always local and `--dest-dir` is the remote scratch parent for push and pull.
+Generation and checks keep the launch directory visible to tmux.
+
+Generation, helper preparation, warm-up and content checks are untimed. Each scored
+copy uses an empty destination, with permissions and modification times
+preserved. Syq persistence is disabled in private settings and rsync uses fresh
+SSH connections, so the total timer includes connection startup. This leaves
+the normal [learned connection counts](tuning.md#remembered-connection-counts)
+active unless you override tuning; trials can reuse and update them. Caches are
+not flushed and copies do not wait for durable storage. Failed commands or
+content checks stop the comparison.
+
+Network results use decimal MB/s, averaging trial speeds. Local comparisons
+use seconds: filesystem cloning can avoid moving bytes, so fast copy times
+are not disk bandwidth measurements. Each tool may use its normal optimizations.
+
+The main table always uses total command time, including connection startup.
+A separate syq table shows mean total time, its copying interval, other time
+(total minus copying), and copying speed in decimal MB/s. Copying speed is
+copied bytes divided by copying seconds and 1,000,000, averaged across trial
+speeds. It also appears after each syq trial. A copying interval below timer
+resolution makes copying speed unavailable. Other time covers work outside that interval, such as
+setup and finishing. Copying spans the first file work through the last completed
+work: it includes waiting and per-file overhead, and can overlap planning and
+connection setup. It is neither pure network time nor an exact separation of
+setup from transfer. The script does not estimate this breakdown for rsync or cp.
+
+The script adds a note when at least 20% of syq's total time falls outside
+copying, or its mean copying interval is under one second. These are diagnostic
+thresholds, not guarantees that longer tests saturate the link. Short jobs still
+measure useful completion time; use `--workload large --size auto` or a larger
+fixed size to investigate sustained throughput. Compare both tools using their
+total times, rather than comparing syq's copying interval with rsync's total.
 
 ## Benchmarks
 

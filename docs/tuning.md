@@ -8,6 +8,30 @@ bounds may change between releases.
 adjustment. In `syq rsync`, use `--syq-connections N`. Use the same count when
 comparing other tuning settings. Leave it unset for everyday copies.
 
+## Remembered connection counts
+
+Remote copies start from the last learned count for the same host route,
+direction and transport, or from 8 workers over SSH and 16 over TCP. The cache
+normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
+parent). The quick benchmark uses this cache, even though it disables SSH
+connection persistence. Its temporary file paths do not change the cache key.
+
+Learning takes time: syq samples every 2.5 seconds and needs a warm-up interval
+plus two stable samples for one measurement. Saving a count requires a
+successful copy with at least two measured worker counts and an unchanged
+transport. Failed or aborted copies leave the previous cached count intact.
+If a copy finishes during another probe, syq saves the last accepted count. Short copies may only use their starting count. The benchmark's
+[untimed warm-up](speed.md#quick-comparison) allows more time before scoring;
+neither its 60-second target nor the separate five-second automatic sizing
+target guarantees tuning has settled.
+
+`--connections N` disables automatic adjustment and cache use. Supplying
+`--tuning-options` bypasses reading and updating learned counts, but live
+auto-tuning continues unless you also fix `--connections`. Use `-vv` to see
+when syq starts from a remembered count.
+
+## Transfer controls
+
 `syq cp` and `syq rsync` accept `--tuning-options`. Supply
 comma-separated `KEY=VALUE` pairs:
 
@@ -57,7 +81,31 @@ An explicit `request-size` also sets the streaming block size; bandwidth and
 receiver limits may reduce it. An explicit `pipeline-depth` disables automatic
 streaming. Neither forced streaming mode accepts `pipeline-depth`.
 
-For a controlled comparison, use fresh scratch destinations:
+To test the amount of outstanding large-file work over SSH, keep the worker
+count and copy method fixed, then vary only the request window:
+
+```sh
+bash try-benchmark.sh --yes --mode pull --host j5 --workload large \
+  --tool syq --rounds 1 --size quick -- --no-tcp --connections 1 -v \
+  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
+```
+
+Repeat with `pipeline-depth=8` and `16`. With 1 MiB requests, these allow up to
+4, 8 and 16 MiB of outstanding range requests per endpoint per worker. They
+do not resize TCP or SSH flow-control windows. Compare separately with a run
+omitting `--tuning-options`: long remote ranges normally stream, and an explicit
+pipeline depth disables that behavior. The ordinary defaults already allow
+4 MiB × 4 requests; a larger application request window may not help.
+Use a larger fixed size if the timing notes show the test is too short.
+
+For the small-file workload, vary `batch-files` and `batch-bytes` instead,
+such as `--tuning-options batch-files=512,batch-bytes=4M`. Those are batch
+ceilings, and the scheduler may choose smaller batches. `pipeline-depth` does
+not multiply small-file batches. After testing these controls, vary
+`--connections` separately to assess parallelism and its startup cost.
+
+
+For a direct comparison without the benchmark script, use fresh scratch destinations:
 
 ```sh
 syq cp data.bin --to host --as /scratch/pipeline.bin --connections 1 -v \
@@ -136,4 +184,3 @@ change what you measure. Use explicit defaults for the baseline, such as
 Record the source data, transport, connections, settings, elapsed time, CPU use,
 and peak memory. Check exit status and copied contents. Leave `--bwlimit` unset
 when measuring unrestricted throughput.
-
