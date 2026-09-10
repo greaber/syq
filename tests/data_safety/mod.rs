@@ -461,3 +461,31 @@ fn prune_preserves_replacement_recovery_entries_and_their_contents() {
     assert!(!t.path("dst/extra").exists());
     assert!(!t.path("dst/.syq-swap-not-a-recovery").exists());
 }
+
+#[test]
+fn resume_accepts_pre_path_hash_partial_filename() {
+    let t = Tmp::new();
+    let data = prng(4 * 1024 * 1024, 327);
+    write(&t.path("src/file"), &data);
+    // Unchanged master 8618cf3 filename for basename "file" and copy ID [7; 16].
+    // Kept literal so this test never regenerates the old writer's format.
+    let partial = t.path("dst/.file.syq-tmp.hduynbiimayar6tk");
+    write(&partial, &data);
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
+    run_native_ok(&[
+        "cp",
+        "--results",
+        &t.s("results"),
+        "--tuning-options=copy-path=ranges",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/file")), data);
+    assert_eq!(read(&partial), data);
+    let records = fs::read_to_string(t.path("results")).unwrap();
+    let result: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(result["bytes_transferred"], 0);
+    assert_eq!(result["bytes_unchanged"], data.len() as u64);
+}

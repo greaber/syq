@@ -982,12 +982,13 @@ pub(crate) fn partial_path_with_name_max(
     component_limit: usize,
 ) -> Result<PathBuf> {
     let name = final_.file_name().map(OsStr::as_bytes).unwrap_or(b"root");
-    // A fresh invocation nonce makes this suffix unpredictable. Including the
-    // complete basename gives truncated names independent suffixes, while all
-    // workers can resolve the same file without a shared pathname registry.
+    // A fresh invocation nonce makes this suffix unpredictable. Hash the full
+    // logical destination spelling so different names (including aliased
+    // parent directories) have independent staging files. The readable prefix
+    // and opaque suffix format stay compatible with older resume candidates.
     let mut hash = Sha256::new();
     hash.update(copy_id);
-    hash.update(name);
+    hash.update(final_.as_os_str().as_bytes());
     let suffix = base32(&hash.finalize()[..10]);
     let parent = final_.parent().unwrap_or_else(|| Path::new(""));
     let budget = path_component_budget(parent, component_limit);
@@ -8006,6 +8007,21 @@ mod tests {
     }
 
     #[test]
+    fn partial_names_distinguish_aliased_parent_spellings() {
+        for (left, right) in [("sub/file", "SUB/file"), ("é/file", "e\u{301}/file")] {
+            for limit in [25, 80, 255] {
+                let a = partial_path_with_name_max(Path::new(left), &[7; 16], limit).unwrap();
+                let b = partial_path_with_name_max(Path::new(right), &[7; 16], limit).unwrap();
+                assert_ne!(
+                    a.file_name(),
+                    b.file_name(),
+                    "same leaf in aliased parents must have distinct staging names"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn partial_name_honors_filesystems_with_smaller_name_max() {
         let id = [8u8; 16];
         let final_path = PathBuf::from("dir").join("n".repeat(120));
@@ -8544,7 +8560,8 @@ mod tests {
         operations
             .seed_basis(b"basis", &copy_id, 4, MIN_HASH_BLOCK_BYTES, 0, None)
             .unwrap();
-        let basis_partial = partial_path(&moved.join("basis"), &copy_id).unwrap();
+        let basis_name = partial_path(&selected.join("basis"), &copy_id).unwrap();
+        let basis_partial = moved.join(basis_name.file_name().unwrap());
         assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
         let Response::PartialSize(partial_size) =
             operations.probe_partial(b"basis", &copy_id, None).unwrap()
@@ -8607,7 +8624,8 @@ mod tests {
             0o600
         );
 
-        let stale = partial_path(&moved.join("inplace"), &copy_id).unwrap();
+        let stale_name = partial_path(&selected.join("inplace"), &copy_id).unwrap();
+        let stale = moved.join(stale_name.file_name().unwrap());
         fs::write(&stale, b"stale").unwrap();
         operations
             .prepare(
@@ -8941,7 +8959,10 @@ mod tests {
                 },
             )
             .is_err());
-        let parked_partial = partial_path(&root_path.join("parked/file"), &copy_id).unwrap();
+        let original_partial = partial_path(&root_path.join("parent/file"), &copy_id).unwrap();
+        let parked_partial = root_path
+            .join("parked")
+            .join(original_partial.file_name().unwrap());
         assert_eq!(fs::read(parked_partial).unwrap(), b"held");
         assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside");
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
