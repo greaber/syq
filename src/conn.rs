@@ -3266,12 +3266,17 @@ impl Endpoint {
     ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
-                // Every connection clone for this logical local endpoint uses
-                // the control connection's process-local session slot. Once
-                // the control registers roots, workers clone those retained
-                // destination descriptors in process. Same-host copy sources
-                // may additionally be claimed from the descriptor broker,
-                // including on Darwin after worker threads have started.
+                // Coordinator workers use their process-local session. Actual
+                // local destinations run in an isolated receiver process, whose
+                // spawn path serializes Darwin SCM_RIGHTS claims with exec.
+                #[cfg(target_os = "macos")]
+                if matches!(&role, ConnectionRole::DestinationWorker { copy_sources, .. } if !copy_sources.is_empty())
+                {
+                    return Err(WorkerInitializationError(
+                        "macOS copy-source claims require an isolated receiver process".into(),
+                    )
+                    .into());
+                }
                 let mut conn = LocalConn::new(&role, descriptor_session.clone());
                 match role {
                     ConnectionRole::DestinationWorker {
@@ -3573,6 +3578,37 @@ mod tests {
     struct ExitObserved<R> {
         inner: R,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coordinator_rejects_darwin_copy_source_claims() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let endpoint = Endpoint::local();
+        let mut control = endpoint.connect_control(false).unwrap();
+        let response = control
+            .call(Request::RegisterSourceRoots {
+                base: SourceRootBase::default(),
+                selections: vec![SourceRootSelection {
+                    path: temporary.path().as_os_str().as_bytes().to_vec(),
+                    follow_root: false,
+                }],
+                symlink_policy: OperatorSymlinkPolicy::Refuse,
+                allow_unconfined_paths: false,
+                shared_workers: 1,
+                independent_handoff_workers: 0,
+            })
+            .unwrap();
+        let Response::SourceRootsRegistered(roots) = response else {
+            panic!("{response:?}")
+        };
+        // Removing the broker proves rejection occurs before any foreign claim.
+        std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
+        let error = Endpoint::local()
+            .connect_with_copy_capabilities(false, None, roots, false)
+            .err()
+            .expect("in-process Darwin copy sources must be rejected");
+        assert!(format!("{error:#}").contains("isolated receiver process"));
     }
 
     #[test]

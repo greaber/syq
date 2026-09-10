@@ -318,6 +318,41 @@ fn macos_clone_copies_without_reading_ranges_and_preserves_metadata() {
     }
 }
 
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn ineligible_local_copies_do_not_claim_source_capabilities() {
+    let mut options = vec![
+        "--checksum",
+        "--bwlimit=1G",
+        "--tuning-options=copy-path=ranges",
+    ];
+    if cfg!(target_os = "macos") {
+        options.push("--inplace");
+    }
+    for option in options {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 1234);
+        write(&t.path("src"), &data);
+        let out = compat_command()
+            .args(["-a", "--no-progress", option, &t.s("src"), &t.s("dst")])
+            .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), data);
+    }
+    // Positive control: an eligible copy really reaches the guarded initializer.
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 1235));
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("test rejected unnecessary copy-source capabilities"));
+}
+
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
 fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {

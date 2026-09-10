@@ -1066,6 +1066,9 @@ impl Root {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect clone partial"),
         }
+        // A descendant mount can differ from the root device. Resolve and
+        // inspect the actual parent even for cached unsupported pairs; a root
+        // device shortcut would incorrectly reject eligible mounted volumes.
         let pair = (source.metadata()?.dev(), parent.directory.metadata()?.dev());
         // Process-local capability cache: file metadata and directory ACL failures
         // are not properties of a filesystem pair and must never enter it.

@@ -752,7 +752,34 @@ pub(crate) fn receive_message(
     Ok((payload, descriptors))
 }
 
+// Darwin cannot receive SCM_RIGHTS with close-on-exec set atomically. The
+// isolated receiver's child-process launch must share this lock with claims.
+// Hold it only through spawn, never while waiting for the child to finish.
+#[cfg(target_os = "macos")]
+static DESCRIPTOR_INHERITANCE: Mutex<()> = Mutex::new(());
+
+pub(crate) fn spawn_without_received_descriptors(
+    command: &mut std::process::Command,
+) -> io::Result<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    let _inheritance = DESCRIPTOR_INHERITANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    command.spawn()
+}
+
 fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
+    receive_descriptor_before_cloexec(socket, |_| {})
+}
+
+fn receive_descriptor_before_cloexec(
+    socket: RawFd,
+    before_cloexec: impl FnOnce(&File),
+) -> io::Result<(u8, Option<File>)> {
+    #[cfg(target_os = "macos")]
+    let _inheritance = DESCRIPTOR_INHERITANCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut status = [0u8];
     let mut iovec = libc::iovec {
         iov_base: status.as_mut_ptr().cast(),
@@ -768,9 +795,9 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     message.msg_controllen = FD_CONTROL_LEN as _;
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
-    // Darwin does not expose an atomic close-on-exec receive flag. Root and
-    // same-host source claims apply FD_CLOEXEC below, after recvmsg; unlike
-    // Linux, that leaves a window if another thread concurrently spawns a child.
+    // Darwin applies FD_CLOEXEC below while holding DESCRIPTOR_INHERITANCE.
+    // The isolated receiver's spawn path takes the same lock. Coordinator
+    // endpoints do not accept same-host copy-source claims on Darwin.
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
     loop {
@@ -834,6 +861,7 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     }
     let descriptor = descriptors.pop();
     if let Some(file) = &descriptor {
+        before_cloexec(file);
         set_close_on_exec(file)?;
     }
     Ok((status[0], descriptor))
@@ -889,6 +917,84 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         bytes
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_spawn_waits_for_received_descriptor_cloexec() {
+        const CHILD: &str = "SYQ_TEST_DARWIN_RECEIVED_FD";
+        if let Ok(fd) = std::env::var(CHILD) {
+            let fd: RawFd = fd.parse().unwrap();
+            let mut stat = unsafe { zeroed::<libc::stat>() };
+            let found = unsafe { libc::fstat(fd, &mut stat) } == 0;
+            if found {
+                // The test harness may reuse a closed descriptor number.
+                let expected_dev: u64 = std::env::var("SYQ_TEST_DARWIN_FD_DEV")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let expected_ino: u64 = std::env::var("SYQ_TEST_DARWIN_FD_INO")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_ne!(
+                    (stat.st_dev as u64, stat.st_ino),
+                    (expected_dev, expected_ino)
+                );
+            }
+            return;
+        }
+        let temp = crate::test_support::tempdir().unwrap();
+        let directory = File::open(temp.path()).unwrap();
+        let identity = directory.metadata().unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        send_descriptor(sender.as_raw_fd(), directory.as_raw_fd()).unwrap();
+        let mut worker = None;
+        let (status, received) = receive_descriptor_before_cloexec(receiver.as_raw_fd(), |file| {
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "descriptor_broker::tests::darwin_spawn_waits_for_received_descriptor_cloexec",
+                    "--nocapture",
+                ])
+                .env(CHILD, file.as_raw_fd().to_string())
+                .env("SYQ_TEST_DARWIN_FD_DEV", identity.dev().to_string())
+                .env("SYQ_TEST_DARWIN_FD_INO", identity.ino().to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let child = spawn_without_received_descriptors(&mut command).unwrap();
+                done_tx.send(()).ok();
+                child.wait_with_output().unwrap()
+            }));
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Receive deliberately pauses with an inheritable root fd. Spawn
+            // must not finish until this callback returns and CLOEXEC is set.
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+        })
+        .unwrap();
+        assert_eq!(status, RESPONSE_OK);
+        let received = received.unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let output = worker.unwrap().join().unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     fn ticket_from_environment() -> DescriptorTicket {

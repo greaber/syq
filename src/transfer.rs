@@ -182,6 +182,18 @@ pub struct Opts {
     pub min_size: Option<u64>,
 }
 
+fn local_copy_enabled(opts: &Opts, bandwidth_limited: bool) -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+        && opts.same_host
+        && !opts.tuning.force_ranges()
+        && !opts.checksum
+        && !opts.verify_only
+        && !opts.dry_run
+        && !opts.restricted_receiver
+        && !bandwidth_limited
+        && !(cfg!(target_os = "macos") && opts.inplace)
+}
+
 fn print_benchmark_observations(opts: &Opts) {
     if let Some(benchmark) = &opts.benchmark {
         crate::output::diagnostic!(
@@ -2008,14 +2020,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
-                            let copy_sources =
-                                if cfg!(any(target_os = "linux", target_os = "macos"))
-                                    && opts.same_host
-                                {
-                                    initial_sources.clone()
-                                } else {
-                                    Vec::new()
-                                };
+                            let copy_sources = if local_copy_enabled(&opts, bwlimit.is_some()) {
+                                initial_sources.clone()
+                            } else {
+                                Vec::new()
+                            };
                             Ok((
                                 src,
                                 dst_ep.connect_with_copy_capabilities(
@@ -2202,16 +2211,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Local { .. } => 0,
         Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
-    // On Linux, each same-machine destination worker also claims the exact
-    // source capabilities from the source endpoint's broker before reporting
-    // ready. These are foreign-session claims even when both logical endpoints
-    // are local to the coordinator process.
-    let copy_local_claim_workers =
-        if cfg!(any(target_os = "linux", target_os = "macos")) && opts.same_host {
-            maximum_workers
-        } else {
-            0
-        };
+    // Only workers that can attempt local offload need foreign source claims.
+    // Actual local destinations live in a separate receiver process.
+    let copy_local_claim_workers = if local_copy_enabled(&opts, bwlimit.is_some()) {
+        maximum_workers
+    } else {
+        0
+    };
     let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
         .context("source worker count overflow")?;
@@ -8057,10 +8063,7 @@ impl Worker {
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self.opts.same_host
-            && !self.opts.tuning.force_ranges()
-            && !self.opts.checksum
-            && self.bwlimit.is_none()
+        if local_copy_enabled(&self.opts, self.bwlimit.is_some())
             && job.entry.size > 0
             && job.container_guard.is_none()
         {

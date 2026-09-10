@@ -899,9 +899,16 @@ fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
             .nth(2)
             .and_then(|ip| ip.parse::<IpAddr>().ok())
     });
-    let out = std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output();
+    // This is the isolated receiver's only child-process launch. On Darwin,
+    // serialize spawn with SCM_RIGHTS receipt until FD_CLOEXEC has been set.
+    let child = crate::descriptor_broker::spawn_without_received_descriptors(
+        std::process::Command::new("ip")
+            .args(["-o", "addr", "show"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    );
+    let out = child.and_then(std::process::Child::wait_with_output);
     let text = out
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();

@@ -173,6 +173,14 @@ fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+fn reject_copy_source_claim_for_test() -> Result<()> {
+    if std::env::var_os("SYQ_TEST_REJECT_COPY_SOURCES").is_some() {
+        bail!("test rejected unnecessary copy-source capabilities");
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -2267,6 +2275,8 @@ impl FsOps {
         &mut self,
         sources: &[RegisteredSourceRoot],
     ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        reject_copy_source_claim_for_test()?;
         if self.destination_root.is_none() {
             bail!("local copy sources require a registered destination root");
         }
@@ -5535,20 +5545,11 @@ impl FsOps {
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
-        let Some(file) = root.clone_file(&source, &partial, size)? else {
+        let Some(_file) = root.clone_file(&source, &partial, size)? else {
             return Ok(CopyLocalOutcome::Unsupported);
         };
-        // The clone is newly created and private. Finalize checks that its
-        // sidecar still names this singly-linked inode before publishing it.
-        self.cache_file(
-            FileLocation::Rooted {
-                root: root.identity(),
-                relative: partial,
-            },
-            0,
-            true,
-            file,
-        );
+        // Like Linux offload, leave no writer-cache entry. CopyLocal has no
+        // attempt field; finalize opens and checks the named partial normally.
         Ok(CopyLocalOutcome::Copied)
     }
 
