@@ -525,9 +525,9 @@ pub struct DirectoryAncestryCheck {
     /// False for an exact file or symlink: the ticket then names its parent.
     pub source_is_directory: bool,
     pub suffixes: Vec<PathBytes>,
-    /// Different endpoint spellings may still name this machine. A missing
-    /// broker is expected only when the coordinator has not identified them
-    /// as the same endpoint; a present broker must authenticate normally.
+    /// Different endpoint spellings may still name this machine. Connection
+    /// failure is tolerated only when the coordinator has not identified them
+    /// as the same endpoint; a connected broker must authenticate normally.
     pub allow_missing_source_broker: bool,
 }
 

@@ -2,8 +2,8 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId,
-    DEFAULT_MAX_ROOTS,
+    acquire_descriptor, acquire_descriptor_if_reachable, DescriptorSessionSlot, DescriptorTicket,
+    RegisteredRootId, DEFAULT_MAX_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -1679,21 +1679,17 @@ impl FsOps {
                 if !check.source_root.is_directory() {
                     bail!("destination ancestry requires a source directory ticket");
                 }
-                let source = match acquire_descriptor(&check.source_root) {
-                    Ok(source) => source,
-                    Err(error)
-                        if check.allow_missing_source_broker
-                            && error_is_kind(&error, io::ErrorKind::NotFound) =>
-                    {
-                        return Ok(vec![
-                            DirectoryRelation::SourceUnavailable;
-                            check.suffixes.len()
-                        ]);
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .context("claim exact source directory for destination ancestry")
-                    }
+                let source = if check.allow_missing_source_broker {
+                    acquire_descriptor_if_reachable(&check.source_root)
+                } else {
+                    acquire_descriptor(&check.source_root).map(Some)
+                }
+                .context("claim exact source directory for destination ancestry")?;
+                let Some(source) = source else {
+                    return Ok(vec![
+                        DirectoryRelation::SourceUnavailable;
+                        check.suffixes.len()
+                    ]);
                 };
                 check
                     .suffixes
@@ -7666,6 +7662,63 @@ mod tests {
         .unwrap();
         assert!(anchor.is_some());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ancestry_allows_an_unreachable_broker_only_for_unknown_endpoints() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let session = DescriptorSessionSlot::default();
+        let ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut ops = FsOps::new();
+        ops.check_operator_directory(
+            temp.path().as_os_str().as_bytes(),
+            false,
+            OperatorSymlinkPolicy::Refuse,
+        )
+        .unwrap();
+        let check = |allow_missing_source_broker| {
+            ops.check_operator_directory_ancestry(&[DirectoryAncestryCheck {
+                source_root: ticket.clone(),
+                source_is_directory: true,
+                suffixes: vec![Vec::new()],
+                allow_missing_source_broker,
+            }])
+        };
+        for optional in [false, true] {
+            assert_eq!(
+                check(optional).unwrap(),
+                vec![vec![DirectoryRelation::Same]]
+            );
+        }
+
+        if unsafe { libc::geteuid() } != 0 {
+            let socket = ticket.broker_path();
+            let parent = socket.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+            let strict = check(false);
+            let optional = check(true);
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(error_is_kind(
+                &strict.unwrap_err(),
+                io::ErrorKind::PermissionDenied
+            ));
+            assert_eq!(
+                optional.unwrap(),
+                vec![vec![DirectoryRelation::SourceUnavailable]]
+            );
+        } else {
+            eprintln!("skipping permission denial: running as root");
+        }
+
+        session.close();
+        assert!(error_is_kind(
+            &check(false).unwrap_err(),
+            io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            check(true).unwrap(),
+            vec![vec![DirectoryRelation::SourceUnavailable]]
+        );
     }
 
     #[test]
