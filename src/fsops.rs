@@ -131,6 +131,19 @@ struct CopyLocalPolicy {
 enum CopyLocalOutcome {
     Copied,
     Unsupported,
+    #[cfg(target_os = "macos")]
+    UnsupportedVolume(u64),
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn record_copy_local_request_for_test() -> Result<()> {
+    if let Some(path) = std::env::var_os("SYQ_TEST_COPY_LOCAL_REQUESTS") {
+        writeln!(
+            OpenOptions::new().create(true).append(true).open(path)?,
+            "copy-local"
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -5535,6 +5548,8 @@ impl FsOps {
         size: u64,
         _mode: u32,
     ) -> Result<CopyLocalOutcome> {
+        #[cfg(debug_assertions)]
+        record_copy_local_request_for_test()?;
         // A mask that removes owner access would make the private clone
         // directory unusable. Keep the normal file-copy semantics for it.
         if policy.inplace || process_umask() & 0o700 != 0 {
@@ -5545,9 +5560,13 @@ impl FsOps {
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
-        let Some(_file) = root.clone_file(&source, &source_metadata, &partial, size)? else {
-            return Ok(CopyLocalOutcome::Unsupported);
-        };
+        match root.clone_file(&source, &source_metadata, &partial, size)? {
+            crate::rooted::CloneOutcome::Copied(_file) => {}
+            crate::rooted::CloneOutcome::Unsupported => return Ok(CopyLocalOutcome::Unsupported),
+            crate::rooted::CloneOutcome::UnsupportedVolume(dev) => {
+                return Ok(CopyLocalOutcome::UnsupportedVolume(dev));
+            }
+        }
         // Like Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
         Ok(CopyLocalOutcome::Copied)
@@ -6356,6 +6375,10 @@ impl FsOps {
                 .map(|outcome| match outcome {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
+                    #[cfg(target_os = "macos")]
+                    CopyLocalOutcome::UnsupportedVolume(source_dev) => {
+                        Response::CopyLocalUnsupportedVolume { source_dev }
+                    }
                 }),
             Request::PutSmallBatch(puts) => Ok(Response::Applied(
                 puts.iter()

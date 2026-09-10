@@ -73,6 +73,11 @@ limit is an average copy rate, not a strict cap on incoming bursts.
 
 ### Batch size and splitting
 
+For macOS local copies, files above the batching limit can use APFS cloning.
+The limit is the smallest of the hash block size (normally 4 MiB for `syq cp`),
+`batch-bytes`, and the effective `request-size`. Changing these limits changes
+which files can be cloned; `syq rsync --block-size` changes the hash block size.
+
 For example, compare small-file batches with:
 
 ```sh

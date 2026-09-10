@@ -3266,48 +3266,15 @@ impl Endpoint {
     ) -> Result<Box<dyn Conn>> {
         match self {
             Endpoint::Local { descriptor_session } => {
-                // Coordinator workers use their process-local session. Actual
-                // local destinations run in an isolated receiver process,
-                // which never spawns children on Darwin.
-                #[cfg(target_os = "macos")]
-                if matches!(&role, ConnectionRole::DestinationWorker { copy_sources, .. } if !copy_sources.is_empty())
-                {
-                    return Err(WorkerInitializationError(
-                        "macOS copy-source claims require an isolated receiver process".into(),
-                    )
-                    .into());
-                }
+                // run_transfer substitutes an isolated receiver for every
+                // destination before opening workers, on every platform.
+                assert!(
+                    !matches!(role, ConnectionRole::DestinationWorker { .. }),
+                    "destination workers require an isolated receiver"
+                );
                 let mut conn = LocalConn::new(&role, descriptor_session.clone());
                 match role {
-                    ConnectionRole::DestinationWorker {
-                        destination: Some(destination),
-                        copy_sources,
-                    } => {
-                        conn.ops
-                            .initialize_destination(&destination)
-                            .map_err(|error| {
-                                WorkerInitializationError(format!(
-                                    "initialize local destination worker: {error:#}"
-                                ))
-                            })?;
-                        if !copy_sources.is_empty() {
-                            conn.ops
-                                .initialize_copy_sources(&copy_sources)
-                                .map_err(|error| {
-                                    WorkerInitializationError(format!(
-                                        "initialize local copy sources: {error:#}"
-                                    ))
-                                })?;
-                        }
-                    }
-                    ConnectionRole::DestinationWorker {
-                        destination: None, ..
-                    } => {
-                        return Err(WorkerInitializationError(
-                            "local destination worker requires a registered root".into(),
-                        )
-                        .into())
-                    }
+                    ConnectionRole::DestinationWorker { .. } => unreachable!(),
                     ConnectionRole::SourceWorker { roots } => {
                         conn.ops.initialize_sources(&roots).map_err(|error| {
                             WorkerInitializationError(format!(
@@ -3578,37 +3545,6 @@ mod tests {
     struct ExitObserved<R> {
         inner: R,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn coordinator_rejects_darwin_copy_source_claims() {
-        let temporary = crate::test_support::tempdir().unwrap();
-        let endpoint = Endpoint::local();
-        let mut control = endpoint.connect_control(false).unwrap();
-        let response = control
-            .call(Request::RegisterSourceRoots {
-                base: SourceRootBase::default(),
-                selections: vec![SourceRootSelection {
-                    path: temporary.path().as_os_str().as_bytes().to_vec(),
-                    follow_root: false,
-                }],
-                symlink_policy: OperatorSymlinkPolicy::Refuse,
-                allow_unconfined_paths: false,
-                shared_workers: 1,
-                independent_handoff_workers: 0,
-            })
-            .unwrap();
-        let Response::SourceRootsRegistered(roots) = response else {
-            panic!("{response:?}")
-        };
-        // Removing the broker proves rejection occurs before any foreign claim.
-        std::fs::remove_file(roots[0].ticket.broker_path()).unwrap();
-        let error = Endpoint::local()
-            .connect_with_copy_capabilities(false, None, roots, false)
-            .err()
-            .expect("in-process Darwin copy sources must be rejected");
-        assert!(format!("{error:#}").contains("isolated receiver process"));
     }
 
     #[test]

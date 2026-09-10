@@ -138,6 +138,9 @@ pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
+    /// Negative volume hints are scoped to an exact destination parent, not
+    /// its subtree: a child directory may be a different mounted volume.
+    local_copy_unavailable: Mutex<std::collections::HashSet<(u64, PathBytes)>>,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -191,7 +194,7 @@ fn local_copy_enabled(opts: &Opts, bandwidth_limited: bool) -> bool {
         && !opts.dry_run
         && !opts.restricted_receiver
         && !bandwidth_limited
-        && !(cfg!(target_os = "macos") && opts.inplace)
+        && !(cfg!(target_os = "macos") && (opts.inplace || opts.umask & 0o700 != 0))
 }
 
 fn print_benchmark_observations(opts: &Opts) {
@@ -1834,6 +1837,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
+    // Every destination worker runs in a receiver process. On Darwin this
+    // also keeps foreign descriptor claims out of the spawning coordinator;
+    // the receiver itself has no child-process launch paths on that platform.
     if matches!(dst_ep, Endpoint::Local { .. }) {
         let mut receiver = RemoteSpec::local_receiver(args.quiet);
         receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
@@ -1865,6 +1871,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let opts = Arc::new(Opts {
+        local_copy_unavailable: Mutex::new(Default::default()),
         block,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
@@ -3249,13 +3256,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
-                    let single_direct_candidate = autotune
-                        && !opts.tuning.force_ranges()
-                        && opts.same_host
-                        && !opts.checksum
-                        && !opts.verify_only
-                        && bwlimit.is_none()
-                        && {
+                    let single_direct_candidate =
+                        autotune && local_copy_enabled(&opts, bwlimit.is_some()) && {
                             let jobs = sched.jobs.lock().unwrap();
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
@@ -8246,6 +8248,21 @@ impl Worker {
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
+        let directory = job
+            .dst
+            .rsplitn(2, |byte| *byte == b'/')
+            .nth(1)
+            .unwrap_or(&[]);
+        let key = (job.entry.dev, directory.to_vec());
+        if self
+            .opts
+            .local_copy_unavailable
+            .lock()
+            .unwrap()
+            .contains(&key)
+        {
+            return Ok(false);
+        }
         // Write to a partial and let finish_file rename it, so an interrupted
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
@@ -8282,6 +8299,16 @@ impl Worker {
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
+            Response::CopyLocalUnsupportedVolume { source_dev } => {
+                // Use the receiver's actual source device if planning raced a
+                // source replacement. No lock spans a receiver operation.
+                self.opts
+                    .local_copy_unavailable
+                    .lock()
+                    .unwrap()
+                    .insert((source_dev, key.1));
+                Ok(false)
+            }
             Response::EndpointError(error) => Err(endpoint_error(error)),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
@@ -9105,6 +9132,7 @@ mod tests {
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                     let opts = Arc::new(Opts {
+                        local_copy_unavailable: Mutex::new(Default::default()),
                         block: 512,
                         tuning: crate::transfer_tuning::TransferTuning {
                             copy_path: (!streaming)

@@ -770,7 +770,8 @@ fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
     let flags = libc::MSG_CMSG_CLOEXEC;
     // Darwin applies FD_CLOEXEC below. Its isolated receiver never spawns
     // children (the server's network-probe command is Linux-only), and
-    // coordinator endpoints reject same-host copy-source claims on Darwin.
+    // run_transfer replaces every local destination with that isolated receiver
+    // before workers can claim copy-source descriptors.
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
     loop {

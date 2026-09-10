@@ -399,22 +399,30 @@ fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
-fn macos_clone_failure_keeps_destination_and_cleans_temporary_files() {
+fn macos_clone_prepublication_failures_clean_up_and_fall_back() {
     if !macos_clone_support::available() {
         return;
     }
-    let t = Tmp::new();
-    write(&t.path("src"), &prng(5 << 20, 993));
-    write(&t.path("dst"), b"old destination");
-    let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-        .env("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "1")
-        .run()
-        .unwrap();
-    assert!(!out.status.success(), "{out:?}");
-    assert!(stderr_of(&out).contains("test clone failure"), "{out:?}");
-    assert_eq!(read(&t.path("dst")), b"old destination");
-    assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+    for hook in [
+        "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
+        "SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS",
+    ] {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 993);
+        write(&t.path("src"), &data);
+        write(&t.path("dst"), b"old destination");
+        let out = compat_command()
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env(hook, "1")
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), data);
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+        assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -482,9 +490,9 @@ fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
     if !macos_clone_support::available() {
         return;
     }
-    for (hook, success) in [
-        ("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR", false),
-        ("SYQ_TEST_CLONE_PUBLIC_DIRECTORY", true),
+    for hook in [
+        "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
+        "SYQ_TEST_CLONE_PUBLIC_DIRECTORY",
     ] {
         let t = Tmp::new();
         let data = prng(5 << 20, 995);
@@ -496,17 +504,9 @@ fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
             .env("SYQ_DEBUG", "1")
             .run()
             .unwrap();
-        assert_eq!(out.status.success(), success, "{out:?}");
-        if success {
-            assert_eq!(read(&t.path("dst")), data);
-            assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
-        } else {
-            assert!(
-                stderr_of(&out).contains("test clone directory failure"),
-                "{out:?}"
-            );
-            assert_eq!(read(&t.path("dst")), b"old destination");
-        }
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), data);
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
         assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
     }
 }
@@ -521,6 +521,8 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
     for i in 0..4 {
         write(&t.path(&format!("src/file{i}")), &prng(5 << 20, i));
     }
+    // A separate parent must get its own request: it could be a mountpoint.
+    write(&t.path("src/subdir/child"), &prng(5 << 20, 5));
     let out = compat_command()
         .args([
             "-a",
@@ -532,6 +534,7 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
         ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
+        .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"))
         .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();
@@ -544,6 +547,14 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
             .lines()
             .count(),
         1
+    );
+    assert_eq!(
+        fs::read_to_string(t.path("requests"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "after one volume refusal, later files in that exact directory skip CopyLocal entirely"
     );
     assert!(partial_files(&t.path("dst")).is_empty());
 }
@@ -624,7 +635,7 @@ fn macos_clone_mkdir_permission_and_link_limits_fall_back() {
     if !macos_clone_support::available() {
         return;
     }
-    for error in ["EACCES", "EPERM", "EMLINK"] {
+    for error in ["EACCES", "EPERM", "EMLINK", "EIO"] {
         let t = Tmp::new();
         write(&t.path("src"), &prng(5 << 20, 998));
         let out = compat_command()
@@ -804,4 +815,88 @@ fn macos_compressed_source_keeps_logical_bytes_through_fallback() {
     assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
     assert_eq!(read(&t.path("dst")), data);
     assert_eq!(read(&t.path("compressed")), data);
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_disabled_cloning_starts_full_workers_without_claims_or_requests() {
+    for inplace in [true, false] {
+        let t = Tmp::new();
+        let data = prng(8 << 20, 1100);
+        write(&t.path("src"), &data);
+        let mut command = compat_command();
+        command
+            .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
+            .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"));
+        if inplace {
+            command.arg("--inplace");
+        } else {
+            // Change only the child's umask, never the parallel test process.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o400);
+                    Ok(())
+                });
+            }
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), data);
+        assert!(!t.path("requests").exists());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "connections: auto: settled at {0} (path {0}, peak {0})",
+                expected_local_start()
+            )),
+            "{stdout}"
+        );
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_unremovable_clone_is_a_visible_cleanup_failure() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    use std::os::fd::AsRawFd;
+    let t = Tmp::new();
+    write(&t.path("src"), &prng(5 << 20, 1101));
+    write(&t.path("dst"), b"old destination");
+    let source = File::open(t.path("src")).unwrap();
+    assert_eq!(
+        unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_IMMUTABLE) },
+        0
+    );
+    // Model an unprivileged receiver being unable to clear a raced system flag.
+    let result = compat_command()
+        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS", "1")
+        .run();
+    assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+    let swaps: Vec<_> = fs::read_dir(&t.0)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".syq-swap-")
+        })
+        .collect();
+    // Restore mutability of our user-flag fixture even if assertions fail.
+    for swap in &swaps {
+        let clone = File::open(swap.join("data")).unwrap();
+        assert_eq!(unsafe { libc::fchflags(clone.as_raw_fd(), 0) }, 0);
+        fs::remove_dir_all(swap).unwrap();
+    }
+    let out = result.unwrap();
+    assert!(!out.status.success());
+    assert_eq!(swaps.len(), 1);
+    let error = stderr_of(&out);
+    assert!(error.contains("test clear clone flags failure"), "{error}");
+    assert!(error.contains("remove unpublished clone"), "{error}");
+    assert_eq!(read(&t.path("dst")), b"old destination");
 }

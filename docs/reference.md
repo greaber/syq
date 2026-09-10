@@ -13,17 +13,15 @@ later changes to either file are independent. Reported bytes count the file's
 size, so the displayed rate can exceed the disk's physical throughput.
 Other filesystems and cross-volume copies use normal copying.
 
-Files at or below the batching threshold are sent together to reduce per-file
-overhead. Larger files can use cloning. This threshold is the smallest of the
-hash block size (4 MiB for `syq cp`), `batch-bytes`, and the effective
-`request-size`; changing the tuning limits changes which files can be cloned.
-`syq rsync --block-size` can also change the hash block size. See
-[batch sizes](tuning.md#batch-size-and-splitting) for tuning options.
+Syq groups small files into requests to reduce per-file overhead; larger files
+can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
+tuning affects this choice.
 
-Cloning keeps the usual overwrite and metadata rules. Copies with a resumable
-partial, in-place writes, checksum comparison, a bandwidth limit, or
-`--tuning-options=copy-path=ranges` use normal copying. Destination directories
-with inheritable access control entries, filesystem-compressed files, and files
+Cloning keeps the usual overwrite and metadata rules. Resuming an
+[interrupted copy](#resume-an-interrupted-copy), writing in place, comparing
+checksums, or setting a bandwidth limit uses normal copying. So does explicitly
+selecting [range transfers](tuning.md). Destination directories with
+inheritable access control entries, filesystem-compressed files, and files
 whose metadata cannot be safely removed also use normal copying. Cloned copies
 omit source extended attributes and file flags, just as normal copies do.
 

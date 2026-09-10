@@ -1108,6 +1108,12 @@ pub enum Response {
     /// All data/error frames for the stopped source stream precede this marker.
     ReadStreamDone,
     WriteStreamDone,
+    /// The source volume cannot clone into this destination directory. Only
+    /// same-executable local macOS receivers emit this hint; existing response
+    /// discriminants and remote helper exchanges stay unchanged.
+    CopyLocalUnsupportedVolume {
+        source_dev: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -2168,6 +2174,22 @@ mod tests {
 
     #[test]
     fn copy_local_fallback_has_a_structured_wire_response() {
+        // Released v0.5.2's postcard encoding: response discriminant 32,
+        // no payload. Keep this fixed fixture independent of today's encoder.
+        const V052_UNSUPPORTED: &[u8] = &[32];
+        assert!(matches!(
+            postcard::from_bytes::<Response>(V052_UNSUPPORTED).unwrap(),
+            Response::CopyLocalUnsupported
+        ));
+        assert_eq!(
+            postcard::to_stdvec(&Response::CopyLocalUnsupported).unwrap(),
+            V052_UNSUPPORTED
+        );
+        let hint = Response::CopyLocalUnsupportedVolume { source_dev: 123 };
+        assert!(matches!(
+            postcard::from_bytes::<Response>(&postcard::to_stdvec(&hint).unwrap()).unwrap(),
+            Response::CopyLocalUnsupportedVolume { source_dev: 123 }
+        ));
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, false)
             .write_msg(&Response::CopyLocalUnsupported)
