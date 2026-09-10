@@ -102,9 +102,9 @@ def direct():
         ssh("destination", f"from pathlib import Path; p=Path({blocked!r}); assert (p/'blocked-file').read_bytes()==b'keep file'; assert (p/'blocked-link').is_symlink(); assert list((p/'protected').iterdir())==[p/'protected'/'sentinel']; assert (p/'protected'/'sentinel').read_bytes()==b'keep target'; assert (p/'good'/'item').read_bytes()==b'mapped contents'")
         # Exceeds both the old grant scope count and one mapping protocol chunk.
         ssh("source", f"from pathlib import Path; import os; p=Path({source!r})/'directory'; p.chmod(0o750); os.utime(p,(1500000000,1500000000))")
-        # The later explicit group entry permits replacing its old file, while
-        # blocked descendants in different scan batches fail independently.
-        ssh("destination", f"from pathlib import Path; p=Path({root + '/large'!r}); p.mkdir(); (p/'group').write_bytes(b'replace explicit parent'); (p/'blocked').write_bytes(b'keep implicit parent')")
+        # Even a later explicit directory entry cannot replace an old file.
+        # Unrelated implicit-parent conflicts span different scan batches.
+        ssh("destination", f"from pathlib import Path; p=Path({root + '/large'!r}); p.mkdir(); (p/'group').write_bytes(b'keep explicit parent'); (p/'blocked').write_bytes(b'keep implicit parent')")
         large = manifest([("file", "blocked/first", "file")] + [("file", f"group/file-{i}", "file") for i in range(10_000)] + [("directory", "group", "dir"), ("file", "blocked/last", "file")])
         assert len(large) > 1024 * 1024
         print("mapping route: large SSH manifest", flush=True)
@@ -114,6 +114,15 @@ def direct():
         records = [json.loads(line) for line in results_path.read_text().splitlines()]
         assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; assert Path({root + '/large/blocked'!r}).read_bytes()==b'keep implicit parent'")
+        assert b"cannot replace non-directory" in result.stderr, result.stderr
+        ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); assert p.read_bytes()==b'keep explicit parent'; p.unlink()")
+        # Once the fixture obstruction is removed, the late explicit entry
+        # supplies directory metadata after all 10,000 mapped files are copied.
+        result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
+        assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
+        assert b"cannot replace non-directory" not in result.stderr, result.stderr
+        records = [json.loads(line) for line in results_path.read_text().splitlines()]
+        assert records[-1]["status"] == "partial", records[-1]
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); files=list(p.iterdir()); assert len(files)==10000; assert all(f.read_bytes()==b'mapped contents' for f in files); assert p.stat().st_mode & 0o777 == 0o750; assert p.stat().st_mtime_ns == 1500000000000000000")
     print("Restricted mapping and timestamp selection passed", flush=True)
 
