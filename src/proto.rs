@@ -891,11 +891,10 @@ pub enum Request {
         data: Vec<u8>,
         finish: bool,
     },
-    /// Read-only receiver filename identities, for collision and prune checks.
-    DestinationNameKeys {
+    /// Destination lookup for pruning. Unlike planning stats, errors other
+    /// than a missing path fail the request rather than looking absent.
+    PruneLookup {
         paths: Vec<PathBytes>,
-        /// Derive sidecars from these authorized final paths when present.
-        partial_copy_id: Option<CopyId>,
         guard: Option<ContainerGuard>,
     },
 }
@@ -1130,7 +1129,6 @@ pub enum Response {
     ReadStreamDone,
     WriteStreamDone,
     Prepared(Preparation),
-    DestinationNameKeys(Vec<PathBytes>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1248,7 +1246,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {

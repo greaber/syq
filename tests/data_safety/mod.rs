@@ -73,17 +73,49 @@ fn prune_is_suppressed_after_an_ordinary_file_read_failure() {
     assert_eq!(read(&t.path("dst/extra")), b"keep after failure");
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn prune_preserves_equivalent_existing_filename_spelling() {
-    let t = Tmp::new();
-    write(&t.path("src/report.txt"), b"contents");
-    write(&t.path("dst/REPORT.TXT"), b"contents");
-    if !t.path("dst/report.txt").exists() {
-        return;
+    for dry_run in [true, false] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/report.txt"), b"contents");
+        write(&t.path("dst/SUB/REPORT.TXT"), b"contents");
+        if !t.path("dst/sub/report.txt").exists() {
+            eprintln!("skipping: test filesystem distinguishes case");
+            return;
+        }
+        timestamp(&t.path("src/sub/report.txt"), 1_700_000_000, 0);
+        timestamp(&t.path("dst/SUB/REPORT.TXT"), 1_700_000_000, 0);
+        std::os::unix::fs::symlink("missing-target", t.path("src/sub/link")).unwrap();
+        std::os::unix::fs::symlink("missing-target", t.path("dst/SUB/LINK")).unwrap();
+        fs::hard_link(t.path("dst/SUB/REPORT.TXT"), t.path("dst/SUB/other-link")).unwrap();
+        write(&t.path("dst/SUB/extra"), b"extra");
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec!["cp", "--prune", "--srcs-in", &src, "--into", &dst];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        run_native_ok(&args);
+        assert_eq!(read(&t.path("dst/sub/report.txt")), b"contents");
+        assert_eq!(
+            fs::read_link(t.path("dst/sub/link")).unwrap(),
+            Path::new("missing-target")
+        );
+        // An alternate spelling cannot distinguish this extra hard link by
+        // inode. Keep both possible matches, rather than risk deleting one.
+        assert_eq!(read(&t.path("dst/SUB/other-link")), b"contents");
+        assert_eq!(t.path("dst/SUB/extra").exists(), dry_run);
     }
-    timestamp(&t.path("src/report.txt"), 1_700_000_000, 0);
-    timestamp(&t.path("dst/REPORT.TXT"), 1_700_000_000, 0);
+}
+
+#[test]
+fn prune_removes_extra_hardlinks_when_selected_spelling_matches() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"contents");
+    write(&t.path("dst/file"), b"contents");
+    timestamp(&t.path("src/file"), 1_700_000_000, 0);
+    timestamp(&t.path("dst/file"), 1_700_000_000, 0);
+    fs::hard_link(t.path("dst/file"), t.path("dst/extra-link")).unwrap();
     run_native_ok(&[
         "cp",
         "--prune",
@@ -92,33 +124,49 @@ fn prune_preserves_equivalent_existing_filename_spelling() {
         "--into",
         &t.s("dst"),
     ]);
-    assert_eq!(read(&t.path("dst/report.txt")), b"contents");
+    assert_eq!(read(&t.path("dst/file")), b"contents");
+    assert!(!t.path("dst/extra-link").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
 #[test]
-fn copy_refuses_sources_that_collapse_to_one_destination_name() {
-    let t = Tmp::new();
-    write(&t.path("dst/probe"), b"");
-    if !t.path("dst/PROBE").exists() {
-        return;
+fn copy_and_prune_preserve_distinct_unix_filename_bytes() {
+    let names = [
+        b"Makefile".as_slice(),
+        b"makefile",
+        "é".as_bytes(),
+        "e\u{301}".as_bytes(),
+        "fullwidth-Ａ".as_bytes(),
+        b"fullwidth-A",
+        b"trailing",
+        b"trailing.",
+        b"trailing ",
+        b"raw-\xff",
+    ];
+    for mode in ["auto", "ranges"] {
+        let t = Tmp::new();
+        let names: Vec<_> = names
+            .iter()
+            .map(|name| std::ffi::OsString::from_vec(name.to_vec()))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            write(&t.path("src").join(name), &[i as u8]);
+        }
+        // Includes the fused small-file path and the general planner, then
+        // pruning on an existing tree. Run on the caller's test filesystem.
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let tuning = format!("--tuning-options=copy-path={mode}");
+        let mut args = vec!["cp", &tuning, "--srcs-in", &src, "--into", &dst];
+        run_native_ok(&args);
+        write(&t.path("dst/extra"), b"extra");
+        args.push("--prune");
+        run_native_ok(&args);
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(read(&t.path("dst").join(name)), [i as u8]);
+        }
+        assert!(!t.path("dst/extra").exists());
     }
-    fs::remove_file(t.path("dst/probe")).unwrap();
-    write(&t.path("one/report.txt"), b"first source");
-    write(&t.path("two/REPORT.TXT"), b"second source");
-    let output = native_syq(&[
-        "cp",
-        &t.s("one/report.txt"),
-        &t.s("two/REPORT.TXT"),
-        "--into",
-        &t.s("dst"),
-    ]);
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("cannot safely be distinguished"),
-        "{output:?}"
-    );
-    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
 }
 
 #[test]

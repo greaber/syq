@@ -2324,8 +2324,7 @@ impl RestrictedAuthority {
             Request::DestinationFilesystemInfo { .. } => {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
-            Request::PartialPaths { paths, guard, .. }
-            | Request::DestinationNameKeys { paths, guard, .. } => {
+            Request::PartialPaths { paths, guard, .. } | Request::PruneLookup { paths, guard } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
@@ -5537,29 +5536,33 @@ esac
     }
 
     #[test]
-    fn exact_file_grants_can_inspect_their_derived_partial_names() {
+    fn prune_lookup_is_confined_to_authorized_observation_paths() {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         fs::create_dir(&root).unwrap();
-        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 4);
-        authority.copy.mutation_scopes[0].descendants = false;
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
         let target = root.join("target");
-        let copy_id = [7; 16];
-        let mut request = Request::DestinationNameKeys {
+        fs::write(&target, b"data").unwrap();
+        let mut request = Request::PruneLookup {
             paths: vec![target.as_os_str().as_bytes().to_vec()],
-            partial_copy_id: Some(copy_id),
             guard: None,
         };
         authority.authorize(&mut request, false).unwrap();
         let response = crate::fsops::FsOps::new().handle(&request);
-        let proto::Response::DestinationNameKeys(keys) = response else {
-            panic!("partial name inspection failed: {response:?}")
+        let proto::Response::Stats(stats) = response else {
+            panic!("prune lookup failed: {response:?}")
         };
-        let partial = crate::fsops::partial_path(&target, &copy_id).unwrap();
-        let mut expected = partial.file_name().unwrap().as_bytes().to_vec();
-        expected.push(0);
-        assert_eq!(keys, vec![expected]);
-        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+        assert_eq!(stats[0].as_ref().unwrap().size, 4);
+        let mut outside = Request::PruneLookup {
+            paths: vec![temporary
+                .path()
+                .join("outside")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut outside, false).is_err());
     }
 
     #[test]

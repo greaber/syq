@@ -1828,21 +1828,6 @@ impl FsOps {
                 }
             }
         }
-        let naming_root = Root::from_directory(selection.directory.try_clone()?)?;
-        let mut missing_prefix = Vec::new();
-        for component in &selection.missing {
-            missing_prefix = join(&missing_prefix, component);
-        }
-        let mut filename_keys = std::collections::HashSet::new();
-        for name in &names {
-            let key =
-                naming_root.filename_key(&RelativePath::new(&join(&missing_prefix, name))?)?;
-            if !filename_keys.insert(key) {
-                bail!(
-                    "source filenames cannot safely be distinguished on the destination filesystem"
-                );
-            }
-        }
         // This fused path serves native copies: use all available timestamp
         // precision, matching the native planner's quick check.
         let mut unchanged: Vec<bool> = request
@@ -2494,7 +2479,7 @@ impl FsOps {
             Request::Scan { guard, .. }
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
-            | Request::DestinationNameKeys { guard, .. }
+            | Request::PruneLookup { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -2788,7 +2773,7 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::DestinationNameKeys { paths, guard, .. } => {
+            | Request::PruneLookup { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -3173,6 +3158,46 @@ impl FsOps {
         })
     }
 
+    fn prune_lookup(
+        &self,
+        paths: &[PathBytes],
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Vec<Option<Entry>>> {
+        parallel_map(paths, |path| {
+            // Resolve authority before classifying missing paths. An invalid
+            // root/guard must never be mistaken for a missing child.
+            let target = self.rooted_destination_target(path, guard)?;
+            let result: Result<Entry> = (|| {
+                if let Some(target) = target {
+                    let metadata = target.root.metadata(&target.relative)?;
+                    rooted_entry(&target.root, &target.relative, Vec::new(), metadata)
+                } else {
+                    let path = resolve(path);
+                    let metadata = fs::symlink_metadata(&path)?;
+                    Ok(entry_from_meta(Vec::new(), &path, &metadata))
+                }
+            })();
+            match result {
+                Ok(entry) => Ok(Some(entry)),
+                Err(error)
+                    if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+                    }) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "inspect destination for pruning: {}",
+                        resolve(path).display()
+                    )
+                }),
+            }
+        })
+        .into_iter()
+        .collect()
+    }
+
     fn stat_many_request(
         &mut self,
         paths: &[PathBytes],
@@ -3235,59 +3260,6 @@ impl FsOps {
             bail!("source stat omitted its registered source references");
         }
         Ok(self.stat_many(paths, follow, guard))
-    }
-
-    fn destination_name_keys(
-        &mut self,
-        paths: &[PathBytes],
-        partial_copy_id: Option<&CopyId>,
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Vec<PathBytes>> {
-        // The request names final paths so exact-file grants can authorize it.
-        // Resolve sidecars here without widening the receiver's observations.
-        let partials;
-        let paths = if let Some(copy_id) = partial_copy_id {
-            partials = self
-                .partial_paths(paths, copy_id, guard)
-                .into_iter()
-                .map(|result| result.map_err(anyhow::Error::msg))
-                .collect::<Result<Vec<_>>>()?;
-            &partials
-        } else {
-            paths
-        };
-        paths
-            .iter()
-            .map(|path| {
-                if let Some(target) = self.rooted_destination_target(path, guard)? {
-                    return target.root.filename_key(&target.relative);
-                }
-                let selection = self
-                    .operator_selection
-                    .as_ref()
-                    .context("destination directory has not been selected")?;
-                let requested = resolve(path);
-                let requested = if requested.is_absolute() {
-                    requested
-                } else {
-                    std::env::current_dir()?.join(requested)
-                };
-                let suffix = requested
-                    .strip_prefix(Path::new(OsStr::from_bytes(&selection.path)))
-                    .context("filename inspection is outside the selected destination")?;
-                let root = Root::from_directory(selection.directory.try_clone()?)?;
-                let mut virtual_path = Vec::new();
-                for component in &selection.missing {
-                    virtual_path = join(&virtual_path, component);
-                }
-                let virtual_prefix = root.filename_key(&RelativePath::new(&virtual_path)?)?;
-                let key = root.filename_key(&RelativePath::new(&join(
-                    &virtual_path,
-                    suffix.as_os_str().as_bytes(),
-                ))?)?;
-                Ok(key[virtual_prefix.len()..].to_vec())
-            })
-            .collect()
     }
 
     pub fn partial_paths(
@@ -6460,13 +6432,9 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
-            Request::DestinationNameKeys {
-                paths,
-                partial_copy_id,
-                guard,
-            } => self
-                .destination_name_keys(paths, partial_copy_id.as_ref(), guard.as_ref())
-                .map(Response::DestinationNameKeys),
+            Request::PruneLookup { paths, guard } => self
+                .prune_lookup(paths, guard.as_ref())
+                .map(Response::Stats),
             Request::PartialPaths {
                 paths,
                 copy_id,
@@ -7286,6 +7254,34 @@ fn apply_owner_if_changed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/file"), b"contents").unwrap();
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        let stats = ops
+            .prune_lookup(&[b"missing/child".to_vec(), b"sub/file".to_vec()], None)
+            .unwrap();
+        assert!(stats[0].is_none());
+        assert_eq!(stats[1].as_ref().unwrap().size, 8);
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission denial: running as root");
+            return;
+        }
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = ops.prune_lookup(&[b"sub/file".to_vec()], None);
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        let error = denied.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::fs::{symlink, FileTypeExt};

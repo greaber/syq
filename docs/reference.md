@@ -203,6 +203,9 @@ the same tree: its completed files can be treated as extras. Recognized partial 
 and replacement recovery entries (`.syq-swap-<pid>-<number>`) are protected
 from pruning, along with their contents and parent directories. With `-v`, syq
 lists each extra file it keeps because its name matches the partial-file format.
+When a copied path resolves to a different filename spelling at the destination,
+pruning protects that entry. If hard links make the match ambiguous, it can keep
+additional links to the same file.
 
 ## Ignoring paths
 
@@ -249,12 +252,11 @@ Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
 a small amount remains to transfer.
 
-Syq checks destination filename equivalence before copying each batch. It
-refuses source names that could address the same destination entry, including
-case or Unicode spelling differences. On filesystems whose exact naming rules
-are unavailable, the checks are conservative: an ambiguous copy can be refused,
-and pruning can keep a possible source counterpart. These checks do not rename
-source files or change their spelling.
+Syq preserves filename bytes and reports names the destination cannot create as
+copy errors. It checks exact destination and partial-file name conflicts, but
+does not preflight case or Unicode equivalence. Source names that the destination
+considers equivalent can overwrite one another; rename them before copying when
+you need to preserve both files.
 
 A directory cannot replace a file or symlink, and a file, symlink or special
 file cannot replace a directory, even an empty one. Syq reports an error and
@@ -302,6 +304,8 @@ Syq normally skips files whose size and modification time match, including
 fractional seconds. It preserves the source timestamp at the destination, so
 the machines' clocks do not need to agree. A changed timestamp triggers checking
 even when it is older than the destination's, unless you request `--skip-newer`.
+A destination that rounds timestamps to coarser precision can cause unchanged
+files to be checked or copied again on later runs.
 
 Matching metadata is a shortcut, not proof that contents match. An edit can
 preserve both size and timestamp, and some filesystems record timestamps with

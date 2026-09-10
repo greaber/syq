@@ -1193,45 +1193,6 @@ impl Root {
         Ok(names)
     }
 
-    /// Conservative filename identity for planning and pruning. Byte-sensitive
-    /// filesystems retain byte identity; Unicode filesystems use a deliberately
-    /// broader equivalence so an uncertain spelling can only refuse a copy or
-    /// protect an extra, never silently overwrite or delete a source claim.
-    /// This is read-only, including for missing destination directories.
-    pub(crate) fn filename_key(&self, path: &RelativePath) -> Result<Vec<u8>> {
-        let mut directory = self.directory.try_clone()?;
-        let mut rules = filename_rules(&directory);
-        let mut missing = false;
-        let mut key = Vec::new();
-        for (index, component) in path.components.iter().enumerate() {
-            let name = filename_component_key(component, rules)?;
-            key.extend_from_slice(&name);
-            key.push(0); // Input path components cannot contain NUL.
-
-            // A name is compared by its parent directory. Opening the final
-            // component adds no naming information and can require search
-            // permission that the planner has not repaired yet.
-            if !missing && index + 1 < path.components.len() {
-                match open_directory_metadata_at(&directory, component) {
-                    Ok(child) => {
-                        directory = child;
-                        rules = filename_rules(&directory);
-                    }
-                    Err(error)
-                        if matches!(
-                            error.raw_os_error(),
-                            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
-                        ) =>
-                    {
-                        missing = true
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        Ok(key)
-    }
-
     /// Component limit for a sidecar beside `path`. Missing or non-directory
     /// suffixes are walked back to the nearest existing real directory, never
     /// through a symlink.
@@ -2397,107 +2358,6 @@ fn stat_rdev(stat: &libc::stat) -> u64 {
     stat.st_rdev as u64
 }
 
-#[derive(Clone, Copy)]
-enum FilenameRules {
-    // Only Linux currently provides a proven byte-comparison branch here.
-    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-    Bytes,
-    Unicode {
-        fold: bool,
-        trim: bool,
-    },
-}
-
-fn filename_component_key(name: &[u8], rules: FilenameRules) -> Result<Vec<u8>> {
-    let FilenameRules::Unicode { fold, trim } = rules else {
-        return Ok(name.to_vec());
-    };
-    let name = std::str::from_utf8(name)
-        .context("cannot safely compare a non-UTF-8 filename on this destination filesystem")?;
-    let normalize = icu_normalizer::DecomposingNormalizer::new_nfkd();
-    let ignored =
-        icu_properties::CodePointSetData::new::<icu_properties::props::DefaultIgnorableCodePoint>();
-    let decomposed = normalize.normalize(name);
-    // Full Unicode folding handles expansions (including capital sharp S).
-    // Uppercase first also covers the simple uppercase tables used by FAT.
-    // Compatibility decomposition and ignored format controls deliberately
-    // err toward collisions across older filesystem Unicode tables.
-    let folded: String = if fold {
-        let uppercase: String = decomposed.chars().flat_map(char::to_uppercase).collect();
-        icu_casemap::CaseMapper::new()
-            .fold_string(&uppercase)
-            .into_owned()
-    } else {
-        decomposed.into_owned()
-    };
-    let normalized: String = normalize
-        .normalize(&folded)
-        .chars()
-        .filter(|c| !ignored.contains(*c))
-        .collect();
-    let normalized = if trim {
-        normalized.trim_end_matches(['.', ' '])
-    } else {
-        &normalized
-    };
-    Ok(normalized.as_bytes().to_vec())
-}
-
-#[cfg(target_os = "linux")]
-fn filename_rules(directory: &File) -> FilenameRules {
-    let conservative = FilenameRules::Unicode {
-        fold: true,
-        trim: true,
-    };
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-        return conservative;
-    }
-    let kind = unsafe { stats.assume_init() }.f_type as u32;
-    if kind == libc::EXT4_SUPER_MAGIC as u32
-        || kind == libc::F2FS_SUPER_MAGIC as u32
-        || kind == libc::BTRFS_SUPER_MAGIC as u32
-        || kind == libc::TMPFS_MAGIC as u32
-    {
-        let Ok(readable) = open_readable_directory_at(directory, b".") else {
-            return conservative;
-        };
-        let mut flags: libc::c_int = 0;
-        if unsafe { libc::ioctl(readable.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
-            return conservative;
-        }
-        return if flags & 0x4000_0000 != 0 {
-            FilenameRules::Unicode {
-                fold: true,
-                trim: false,
-            }
-        } else {
-            FilenameRules::Bytes
-        };
-    }
-    // XFS also has an optional legacy case-insensitive format. Network and
-    // other filesystems can implement server- or mount-specific
-    // name equivalence. Never assume byte sensitivity from the client OS.
-    conservative
-}
-
-#[cfg(target_os = "macos")]
-fn filename_rules(directory: &File) -> FilenameRules {
-    let sensitive = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
-    FilenameRules::Unicode {
-        fold: sensitive != 1,
-        trim: false,
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn filename_rules(_directory: &File) -> FilenameRules {
-    FilenameRules::Unicode {
-        fold: true,
-        trim: true,
-    }
-}
-
 fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {
     retry_zero(|| unsafe { libc::unlinkat(parent, name.as_ptr(), flags) })
 }
@@ -2753,40 +2613,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn filename_safety_keys_preserve_byte_names_and_cover_unicode_aliases() {
-        let folded = FilenameRules::Unicode {
-            fold: true,
-            trim: false,
-        };
-        for (a, b) in [
-            ("Report", "report"),
-            ("é", "e\u{301}"),
-            ("Straße", "STRASSE"),
-            ("ẞ", "ss"),
-            ("Σ", "ς"),
-            ("K", "k"),
-            ("a\u{200b}", "a"),
-        ] {
-            assert_eq!(
-                filename_component_key(a.as_bytes(), folded).unwrap(),
-                filename_component_key(b.as_bytes(), folded).unwrap()
-            );
-        }
-        assert_ne!(
-            filename_component_key(b"A", FilenameRules::Bytes).unwrap(),
-            filename_component_key(b"a", FilenameRules::Bytes).unwrap()
-        );
-        assert_eq!(
-            filename_component_key(&[0xff], FilenameRules::Bytes).unwrap(),
-            [0xff]
-        );
-        assert!(filename_component_key(&[0xff], folded).is_err());
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
-    fn naming_queries_traverse_search_only_directories_without_chmod() {
+    fn name_limit_queries_traverse_search_only_directories_without_chmod() {
         let tree = TestDir::new("search-only-naming");
         let parent = tree.path().join("parent");
         fs::create_dir_all(parent.join("child")).unwrap();
@@ -2795,11 +2624,9 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o111)).unwrap();
         let before = fs::metadata(&parent).unwrap();
         let path = relative(b"parent/child/file");
-        let key = root.filename_key(&path);
         let limit = root.name_max_for_parent(&path);
         let after = fs::metadata(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(key.is_ok(), "{key:?}");
         assert!(limit.unwrap() >= 4);
         assert_eq!(after.mode(), before.mode());
         assert_eq!(
