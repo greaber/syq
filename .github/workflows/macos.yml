@@ -7,6 +7,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Also run the independent APFS timing benchmark
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.run_id }}
@@ -65,11 +70,6 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
         run: cargo test --locked --all-targets --no-fail-fast
-      - name: Measure APFS cloning on manual runs
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          cargo build --release --locked --bin syq
-          python3 scripts/benchmark-macos-clone.py target/release/syq
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -148,6 +148,32 @@ jobs:
             fi
           done
           exit "$status"
+
+  clone-benchmark:
+    if: github.event_name == 'workflow_dispatch' && inputs.benchmark
+    runs-on: macos-26
+    timeout-minutes: 30
+    # Timing/resource failures must not invalidate release evidence. This job's
+    # step result still records failure for anyone requesting benchmark results.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-macos-clone-benchmark-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Measure APFS cloning
+        run: |
+          cargo build --release --locked --bin syq
+          python3 scripts/benchmark-macos-clone.py target/release/syq
 
   release-certification:
     needs: [scope, suite]

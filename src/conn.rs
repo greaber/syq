@@ -3267,8 +3267,8 @@ impl Endpoint {
         match self {
             Endpoint::Local { descriptor_session } => {
                 // Coordinator workers use their process-local session. Actual
-                // local destinations run in an isolated receiver process, whose
-                // spawn path serializes Darwin SCM_RIGHTS claims with exec.
+                // local destinations run in an isolated receiver process,
+                // which never spawns children on Darwin.
                 #[cfg(target_os = "macos")]
                 if matches!(&role, ConnectionRole::DestinationWorker { copy_sources, .. } if !copy_sources.is_empty())
                 {

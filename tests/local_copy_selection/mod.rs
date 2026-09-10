@@ -419,6 +419,42 @@ fn macos_clone_failure_keeps_destination_and_cleans_temporary_files() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
+fn macos_immutable_clone_open_failure_cleans_up_and_streams() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    use std::os::fd::AsRawFd;
+    use std::os::macos::fs::MetadataExt;
+    for flags in [libc::UF_IMMUTABLE, libc::UF_APPEND] {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 999);
+        write(&t.path("src"), &data);
+        write(&t.path("dst"), b"old destination");
+        let source = fs::File::open(t.path("src")).unwrap();
+        assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), flags) }, 0);
+        let result = compat_command()
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env("SYQ_TEST_CLONE_OPEN_EMFILE", "1")
+            .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
+            .env("SYQ_DEBUG", "1")
+            .run();
+        let source_flags = source.metadata().unwrap().st_flags();
+        // Always unlock the source fixture before checking the child result.
+        assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+        let out = result.unwrap();
+        assert_output_ok(&out);
+        assert_eq!(source_flags, flags);
+        assert_eq!(read(&t.path("src")), data);
+        assert_eq!(read(&t.path("dst")), data);
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+        assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+        assert_eq!(read(&t.path("attempts")), b"clone\n");
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 3);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
 fn macos_clone_leaves_existing_partial_for_verified_resume() {
     if !macos_clone_support::available() {
         return;

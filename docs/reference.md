@@ -263,9 +263,9 @@ An abruptly stopped macOS clone can also leave a hidden directory named
 `.syq-swap-<pid>-<counter>` beside the destination, possibly containing a `data`
 file. Syq does not resume or automatically remove these directories. After
 stopping all copies using that destination, you can remove those leftover
-directories and their contents. A staging-directory cleanup error leaves the
-final destination unchanged and may leave a complete `.syq-part.` file; rerun
-the copy to verify and finish it.
+directories and their contents. An error removing a `.syq-swap-` directory leaves
+the final destination unchanged and may leave a complete `.syq-part.` file;
+rerun the copy to verify and finish it.
 
 ## Check file contents
 

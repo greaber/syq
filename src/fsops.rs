@@ -5540,12 +5540,12 @@ impl FsOps {
         if policy.inplace || process_umask() & 0o700 != 0 {
             return Ok(CopyLocalOutcome::Unsupported);
         }
-        let (source, _, target) = self.prepare_local_copy(source, dst)?;
+        let (source, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let root = target.root.clone();
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
-        let Some(_file) = root.clone_file(&source, &partial, size)? else {
+        let Some(_file) = root.clone_file(&source, &source_metadata, &partial, size)? else {
             return Ok(CopyLocalOutcome::Unsupported);
         };
         // Like Linux offload, leave no writer-cache entry. CopyLocal has no

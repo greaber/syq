@@ -1055,6 +1055,7 @@ impl Root {
     pub(crate) fn clone_file(
         &self,
         source: &File,
+        source_metadata: &std::fs::Metadata,
         path: &RelativePath,
         size: u64,
     ) -> Result<Option<File>> {
@@ -1069,7 +1070,7 @@ impl Root {
         // A descendant mount can differ from the root device. Resolve and
         // inspect the actual parent even for cached unsupported pairs; a root
         // device shortcut would incorrectly reject eligible mounted volumes.
-        let pair = (source.metadata()?.dev(), parent.directory.metadata()?.dev());
+        let pair = (source_metadata.dev(), parent.directory.metadata()?.dev());
         // Process-local capability cache: file metadata and directory ACL failures
         // are not properties of a filesystem pair and must never enter it.
         let pairs = clone_volume_pairs();
@@ -1096,7 +1097,7 @@ impl Root {
         if !supported {
             return Ok(None);
         }
-        if !clone_flags_can_be_removed(source)? {
+        if !clone_flags_can_be_removed(source_metadata) {
             return Ok(None);
         }
         // An extra staging directory must not change destination ACL inheritance.
@@ -1182,42 +1183,27 @@ impl Root {
                     _ => return Err(error).context("clone local file"),
                 }
             }
-            // Normalize owner access before opening the caller-owned clone.
-            // Immutable/append-only clones can refuse chmod; those retain
-            // owner-read access (checked before cloning), so open them to clear
-            // the flags first. O_EVTONLY still requires access on Darwin.
-            if let Err(error) = retry_zero(|| unsafe {
+            // Clear inherited flags before chmod or opening another descriptor:
+            // descriptor pressure must not leave an immutable, undeletable clone.
+            // The private directory and fixed leaf keep this operation confined.
+            clear_clone_flags_at(directory, leaf)?;
+            retry_zero(|| unsafe {
                 libc::fchmodat(
                     directory.as_raw_fd(),
                     leaf.as_ptr(),
                     0o600,
                     libc::AT_SYMLINK_NOFOLLOW,
                 )
-            }) {
-                if error.raw_os_error() != Some(libc::EPERM) {
-                    return Err(error).context("set private clone permissions");
-                }
-            }
-            let metadata_file = open_at(
-                directory.as_raw_fd(),
-                leaf,
-                libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )
-            .context("open clone metadata handle")?;
-            if !clone_flags_can_be_removed(&metadata_file)? {
-                return Ok(None);
-            }
-            retry_zero(|| unsafe { libc::fchflags(metadata_file.as_raw_fd(), 0) })?;
-            retry_zero(|| unsafe { libc::fchmod(metadata_file.as_raw_fd(), 0o600) })?;
-            let file = match open_at(
-                directory.as_raw_fd(),
-                leaf,
-                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            ) {
+            })
+            .context("set private clone permissions")?;
+            let file = match open_clone_for_copy(directory, leaf) {
                 Ok(file) => file,
-                Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EACCES | libc::EPERM | libc::EMFILE | libc::ENFILE)
+                    ) =>
+                {
                     return Ok(None)
                 }
                 Err(error) => return Err(error).context("open normalized clone"),
@@ -1258,7 +1244,7 @@ impl Root {
             Ok(Some(file))
         })();
         let cleanup = (|| -> Result<()> {
-            if let Some(directory) = trusted_directory {
+            if let Some(directory) = trusted_directory.filter(|_| !matches!(result, Ok(Some(_)))) {
                 match unlink_at(directory.as_raw_fd(), leaf, 0) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -2088,16 +2074,52 @@ fn clone_directory_has_no_inheritable_acl(directory: &File) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn clone_flags_can_be_removed(file: &File) -> Result<bool> {
+fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_FLAGS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut flags = 0u32;
+    retry_zero(|| unsafe {
+        libc::setattrlistat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            (&mut flags as *mut u32).cast(),
+            std::mem::size_of_val(&flags),
+            libc::FSOPT_NOFOLLOW,
+        )
+    })
+    .context("clear private clone flags")
+}
+
+#[cfg(target_os = "macos")]
+fn open_clone_for_copy(directory: &File, leaf: &CString) -> io::Result<File> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_CLONE_OPEN_EMFILE").is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    open_at(
+        directory.as_raw_fd(),
+        leaf,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clone_flags_can_be_removed(metadata: &std::fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     // Compressed-file xattrs can hold the actual data, so stripping them is
     // not equivalent to copying logical bytes. System flags may require root
     // to clear, including flags that prevent deleting an unpublished clone.
-    let metadata = file.metadata()?;
     let flags = metadata.st_flags();
-    let cannot_open_to_unlock =
-        metadata.mode() & 0o400 == 0 && flags & (libc::UF_IMMUTABLE | libc::UF_APPEND) != 0;
-    Ok(flags & (!libc::UF_SETTABLE | libc::UF_COMPRESSED) == 0 && !cannot_open_to_unlock)
+    flags & (!libc::UF_SETTABLE | libc::UF_COMPRESSED) == 0
 }
 
 #[cfg(target_os = "macos")]
@@ -2121,6 +2143,15 @@ fn strip_clone_xattrs(file: &File) -> Result<bool> {
         unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0) };
     if count < 0 {
         return Err(io::Error::last_os_error()).context("read cloned extended attributes");
+    }
+    // The source can acquire filesystem compression after its initial stat.
+    // Its cloned compression payload must never be stripped and published as
+    // ordinary bytes, even though the private clone's flags are already clear.
+    if names[..count as usize]
+        .split(|&byte| byte == 0)
+        .any(|name| name == b"com.apple.decmpfs")
+    {
+        return Ok(false);
     }
     for name in names[..count as usize]
         .split(|&byte| byte == 0)
@@ -2967,7 +2998,12 @@ mod tests {
         let source = File::open(&source_path).unwrap();
         let root = Root::open(t.path()).unwrap();
         let clone = root
-            .clone_file(&source, &relative(b"partial"), 13)
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                13,
+            )
             .unwrap()
             .expect("macOS clone tests require a clone-capable filesystem (APFS)");
         assert_eq!(clone.metadata().unwrap().mode() & 0o7777, 0o600);
@@ -2976,7 +3012,12 @@ mod tests {
             clone.metadata().unwrap().ino()
         );
         assert!(root
-            .clone_file(&source, &relative(b"partial"), 13)
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                13
+            )
             .unwrap()
             .is_none());
         (&clone).write_all(b"changed clone").unwrap();
@@ -2984,7 +3025,12 @@ mod tests {
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
         for planned_size in [12, 14] {
             assert!(root
-                .clone_file(&source, &relative(b"wrong-size"), planned_size)
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"wrong-size"),
+                    planned_size
+                )
                 .unwrap()
                 .is_none());
         }
@@ -3027,7 +3073,12 @@ mod tests {
         }
         for flags in [libc::UF_NODUMP, libc::UF_IMMUTABLE, libc::UF_APPEND] {
             assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), flags) }, 0);
-            let result = root.clone_file(&source, &relative(b"partial"), 4);
+            let result = root.clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                4,
+            );
             let source_flags = source.metadata().unwrap().st_flags();
             // Restore fixture mutability even if cloning failed.
             assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
@@ -3052,6 +3103,41 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn apfs_clone_refuses_compression_added_after_source_snapshot() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        use std::os::macos::fs::MetadataExt;
+        let t = TestDir::new("clone-raced-compression");
+        let original = t.path().join("original");
+        let compressed = t.path().join("compressed");
+        let data = b"compressible test data\n".repeat(250_000);
+        fs::write(&original, &data).unwrap();
+        let snapshot = fs::metadata(&original).unwrap();
+        assert!(Command::new("/usr/bin/ditto")
+            .arg("--hfsCompression")
+            .arg(&original)
+            .arg(&compressed)
+            .status()
+            .unwrap()
+            .success());
+        let source = File::open(&compressed).unwrap();
+        assert_ne!(
+            source.metadata().unwrap().st_flags() & libc::UF_COMPRESSED,
+            0
+        );
+        // Model a source compressed between the prelude stat and cloning.
+        let root = Root::open(t.path()).unwrap();
+        assert!(root
+            .clone_file(&source, &snapshot, &relative(b"partial"), data.len() as u64)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(&compressed).unwrap(), data);
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn apfs_clone_falls_back_for_destination_acl_inheritance() {
         if !macos_clone_support::available() {
             return;
@@ -3071,7 +3157,12 @@ mod tests {
                 .unwrap()
                 .success());
             assert!(root
-                .clone_file(&source, &relative(b"noninherited"), 4)
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"noninherited"),
+                    4
+                )
                 .unwrap()
                 .is_some());
             fs::remove_file(t.path().join("noninherited")).unwrap();
@@ -3082,7 +3173,12 @@ mod tests {
                 .unwrap()
                 .success());
             assert!(root
-                .clone_file(&source, &relative(b"partial"), 4)
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"partial"),
+                    4
+                )
                 .unwrap()
                 .is_none());
             assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
@@ -3094,7 +3190,12 @@ mod tests {
                 .success());
             // Ineligibility is per-directory, never cached for the volume.
             assert!(root
-                .clone_file(&source, &relative(b"after-acl"), 4)
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"after-acl"),
+                    4
+                )
                 .unwrap()
                 .is_some());
             fs::remove_file(t.path().join("after-acl")).unwrap();
@@ -3140,12 +3241,25 @@ mod tests {
             unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_IMMUTABLE) },
             0
         );
-        let locked = root.clone_file(&source, &relative(b"locked"), 4);
+        let locked = root.clone_file(
+            &source,
+            &source.metadata().unwrap(),
+            &relative(b"locked"),
+            4,
+        );
         assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
-        assert!(locked.unwrap().is_none());
-        assert!(!t.path().join("locked").exists());
+        let locked = locked
+            .unwrap()
+            .expect("flags are cleared before owner access");
+        assert_eq!(locked.metadata().unwrap().mode() & 0o777, 0o600);
+        fs::remove_file(t.path().join("locked")).unwrap();
         let clone = root
-            .clone_file(&source, &relative(b"partial"), 4)
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                4,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(clone.metadata().unwrap().mode() & 0o777, 0o600);
@@ -3212,7 +3326,12 @@ mod tests {
             .unwrap();
         let root = Root::open(t.path()).unwrap();
         let clone = root
-            .clone_file(&source, &relative(b"normalized"), 4)
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"normalized"),
+                4,
+            )
             .unwrap()
             .unwrap();
         (&clone).write_all(b"copy").unwrap();
