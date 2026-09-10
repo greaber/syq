@@ -6895,6 +6895,7 @@ impl Planner<'_> {
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
             let mut recovery_parents = std::collections::HashSet::new();
+            let mut alias_parents = std::collections::HashSet::new();
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -7002,11 +7003,21 @@ impl Planner<'_> {
                 {
                     continue;
                 }
-                let claimed = self.dst_seen.get(&full).or_else(|| {
+                let exact = self.dst_seen.get(&full);
+                let claimed = exact.or_else(|| {
                     aliases
                         .get(&(entry.dev, entry.ino))
                         .and_then(|spelling| self.dst_seen.get(spelling))
                 });
+                if exact.is_none() && claimed.is_some() {
+                    // An ambiguous hard link may live in an otherwise extra
+                    // directory. Keep its ancestors as well as the link.
+                    for (index, byte) in full.iter().enumerate() {
+                        if *byte == b'/' {
+                            alias_parents.insert(full[..index].to_vec());
+                        }
+                    }
+                }
                 match claimed {
                     Some(Claim::Dir) => continue,
                     Some(_) => {
@@ -7065,6 +7076,10 @@ impl Planner<'_> {
                     } else if recovery_parents.contains(&path) {
                         self.progress.eprintln(&format!(
                             "syq: not deleting {rel}: it holds replacement recovery data"
+                        ));
+                    } else if alias_parents.contains(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds a possible filename alias"
                         ));
                     } else if protected.contains(&path) {
                         self.progress

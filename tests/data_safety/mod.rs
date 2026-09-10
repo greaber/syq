@@ -87,7 +87,13 @@ fn prune_preserves_equivalent_existing_filename_spelling() {
         timestamp(&t.path("dst/SUB/REPORT.TXT"), 1_700_000_000, 0);
         std::os::unix::fs::symlink("missing-target", t.path("src/sub/link")).unwrap();
         std::os::unix::fs::symlink("missing-target", t.path("dst/SUB/LINK")).unwrap();
-        fs::hard_link(t.path("dst/SUB/REPORT.TXT"), t.path("dst/SUB/other-link")).unwrap();
+        fs::create_dir_all(t.path("dst/EXTRA/nested")).unwrap();
+        fs::hard_link(
+            t.path("dst/SUB/REPORT.TXT"),
+            t.path("dst/EXTRA/nested/other-link"),
+        )
+        .unwrap();
+        write(&t.path("dst/EXTRA/extra"), b"extra");
         write(&t.path("dst/SUB/extra"), b"extra");
         let src = t.s("src");
         let dst = t.s("dst");
@@ -103,8 +109,9 @@ fn prune_preserves_equivalent_existing_filename_spelling() {
         );
         // An alternate spelling cannot distinguish this extra hard link by
         // inode. Keep both possible matches, rather than risk deleting one.
-        assert_eq!(read(&t.path("dst/SUB/other-link")), b"contents");
+        assert_eq!(read(&t.path("dst/EXTRA/nested/other-link")), b"contents");
         assert_eq!(t.path("dst/SUB/extra").exists(), dry_run);
+        assert_eq!(t.path("dst/EXTRA/extra").exists(), dry_run);
     }
 }
 
