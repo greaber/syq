@@ -168,8 +168,8 @@ preferences; use the newer binary to manage receiving.
 
 Connections created before persistent receiver identities remain discoverable.
 Their names become assigned when an updated receiving machine reconnects.
-Updated commands verify assigned names even when an older helper advertises
-them; a receiver without a matching identity is rejected. Older binaries do
+Updated commands verify assigned names even when their connection uses an older
+helper; a receiver without a matching identity is rejected. Older binaries do
 not enforce these assignments, so use updated syq commands on the server and
 stop older receiving services before switching versions. The receiver key and
 assignments are independent of the helper build and survive later upgrades.

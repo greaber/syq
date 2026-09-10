@@ -197,17 +197,26 @@ fn deadline_remaining(deadline: Instant) -> std::io::Result<Duration> {
         })
 }
 
-fn wait_socket(socket: &impl AsRawFd, events: i16, deadline: Instant) -> std::io::Result<()> {
+fn wait_fd(
+    fd: std::os::fd::RawFd,
+    events: i16,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> std::io::Result<()> {
     let mut descriptor = libc::pollfd {
-        fd: socket.as_raw_fd(),
+        fd,
         events,
         revents: 0,
     };
     loop {
-        let milliseconds = deadline_remaining(deadline)?
-            .as_millis()
-            .clamp(1, i32::MAX as u128) as i32;
-        // The borrowed socket remains alive and descriptor is writable during
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "return request cancelled",
+            ));
+        }
+        let milliseconds = deadline_remaining(deadline)?.as_millis().clamp(1, 100) as i32;
+        // The caller keeps the descriptor alive and descriptor is writable during
         // poll. Signals and spurious wakeups never renew the deadline.
         let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
         if ready < 0 {
@@ -247,9 +256,12 @@ impl Read for DeadlineSocket<'_> {
             let error = std::io::Error::last_os_error();
             match error.kind() {
                 std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => {
-                    wait_socket(self.socket, libc::POLLIN, self.deadline)?
-                }
+                std::io::ErrorKind::WouldBlock => wait_fd(
+                    self.socket.as_raw_fd(),
+                    libc::POLLIN,
+                    self.deadline,
+                    &|| false,
+                )?,
                 _ => return Err(error),
             }
         }
@@ -264,9 +276,12 @@ impl Write for DeadlineSocket<'_> {
             {
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    wait_socket(self.socket, libc::POLLOUT, self.deadline)?
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => wait_fd(
+                    self.socket.as_raw_fd(),
+                    libc::POLLOUT,
+                    self.deadline,
+                    &|| false,
+                )?,
                 Err(error) => return Err(error),
             }
         }
@@ -294,19 +309,9 @@ fn connect_socket(path: &Path, deadline: Instant) -> std::io::Result<UnixStream>
     deadline_remaining(deadline)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     socket.set_nonblocking(true)?;
-    match socket.connect(&SockAddr::unix(path)?) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
-            wait_socket(&socket, libc::POLLOUT, deadline)?;
-            if let Some(error) = socket.take_error()? {
-                return Err(error);
-            }
-            socket.peer_addr()?;
-        }
-        // In particular, Linux reports EAGAIN for a full Unix listen queue:
-        // no connection is pending. Return it without a blocking connect retry.
-        Err(error) => return Err(error),
-    }
+    // Unix stream connect completes immediately or fails. In particular,
+    // Linux reports EAGAIN for a full listen queue, with no connection pending.
+    socket.connect(&SockAddr::unix(path)?)?;
     socket.set_nonblocking(false)?;
     let descriptor: std::os::fd::OwnedFd = socket.into();
     Ok(descriptor.into())
@@ -459,9 +464,14 @@ fn exchange(
         );
     }
     let deadline = Instant::now() + timeout;
-    let mut stream = connect_socket(&registration.socket, deadline).context(
-        "receiving machine is offline; run `syq persist connect SERVER` on that machine to reconnect to this server account",
-    )?;
+    let mut stream = connect_socket(&registration.socket, deadline).map_err(|error| {
+        let message = if error.kind() == std::io::ErrorKind::WouldBlock {
+            "receiving machine is busy; try again shortly"
+        } else {
+            "could not connect to receiving machine; if it is offline, run `syq persist connect SERVER` on that machine to reconnect to this server account"
+        };
+        anyhow::Error::new(error).context(message)
+    })?;
     let mut io = DeadlineSocket {
         socket: &mut stream,
         deadline,
@@ -1534,6 +1544,34 @@ mod tests {
     use crate::cli::{Args, Interface, Location, Placement};
     use crate::conn::Conn;
     use crate::proto::{Request, Response};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_listen_queue_reports_busy_without_reconnect_advice() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(0).unwrap();
+        let _queued = connect_socket(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let registration = Registration {
+            version: REGISTRATION_VERSION,
+            identity: crate::identity::build().into(),
+            socket: path,
+            secret: "test".into(),
+            program: b"/test/syq".to_vec(),
+        };
+        let error = exchange(&registration, Message::Ping, Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("busy"), "{error:#}");
+        assert!(!error.to_string().contains("reconnect"), "{error:#}");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn registration_retries_socket_timeout_but_not_peer_rejection() {

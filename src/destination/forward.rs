@@ -490,43 +490,6 @@ fn relay(
     result
 }
 
-fn wait_fd(
-    fd: std::os::fd::RawFd,
-    events: i16,
-    deadline: Instant,
-    cancelled: &impl Fn() -> bool,
-) -> std::io::Result<()> {
-    loop {
-        if cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "return request cancelled",
-            ));
-        }
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "return helper deadline expired",
-                )
-            })?;
-        let mut descriptor = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        let result =
-            unsafe { libc::poll(&mut descriptor, 1, left.as_millis().clamp(1, 100) as i32) };
-        if result > 0 {
-            return Ok(());
-        }
-        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-}
 struct DeadlineIo<'a, T, F> {
     inner: &'a mut T,
     deadline: Instant,
