@@ -236,10 +236,11 @@ Ignored paths are also protected from pruning.
 Rerun the command. Completed files are skipped; partially copied files can
 reuse matching blocks. Each run writes its own fresh partial beside the
 destination and replaces the final file only when complete. When resuming,
-syq can copy bytes from a previous partial into its own output, hash the bytes
-it copied, and transfer blocks that differ from the source before publishing.
-The previous partial stays unchanged. Reuse is best effort; local direct copies
-can be faster than looking for reusable blocks and take priority.
+syq can copy bytes from a previous partial or the existing destination into its
+own output, hash the bytes it copied, and transfer blocks that differ from the
+source before publishing. The previous partial stays unchanged. Reuse is best
+effort; local direct copies can be faster than looking for reusable blocks and
+take priority.
 
 Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only

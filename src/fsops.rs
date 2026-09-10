@@ -61,17 +61,11 @@ pub(crate) fn test_race_barrier(
             .with_context(|| format!("write {label} signal {}", Path::new(&ready).display()))?;
     }
     if let Some(continuation) = continuation {
-        let timeout_ms = std::env::var("SYQ_TEST_BARRIER_TIMEOUT_MS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .context("parse test barrier timeout")?
-            .unwrap_or(10_000);
-        if !(1..=60_000).contains(&timeout_ms) {
-            bail!("test barrier timeout must be between 1 and 60000 milliseconds");
-        }
+        // Some race tests finish a competing copy before releasing this worker.
+        // Leave room for that work under suite load, especially on macOS. This
+        // is a deadlock safety bound, not an assertion about transfer speed.
         let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_millis(timeout_ms);
+        let deadline = started + std::time::Duration::from_secs(60);
         let mut next_progress = started + std::time::Duration::from_secs(5);
         loop {
             match File::open(&continuation) {
@@ -5395,30 +5389,37 @@ impl FsOps {
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
         }
-        let mut hashes = Vec::with_capacity(len.div_ceil(block) as usize);
-        let mut buffer = vec![0; block as usize];
-        let reader = input.as_ref().unwrap_or(&output);
-        for index in 0..len.div_ceil(block) {
-            let off = index * block;
-            let bytes = &mut buffer[..(len - off).min(block) as usize];
-            if reader.read_exact_at(bytes, off).is_err() {
-                // The controller treats an absent hash as a block to transfer.
-                break;
+        // A cached donor can disappear or become unsuitable before opening.
+        // Freshly allocated zeros are not old copy data worth scanning.
+        let reader = input
+            .as_ref()
+            .or_else(|| (basis_size.unwrap_or(0) > 0).then_some(&output));
+        let mut hashes = Vec::new();
+        if let Some(reader) = reader {
+            hashes.reserve(len.div_ceil(block) as usize);
+            let mut buffer = vec![0; block.min(len) as usize];
+            for index in 0..len.div_ceil(block) {
+                let off = index * block;
+                let bytes = &mut buffer[..(len - off).min(block) as usize];
+                if reader.read_exact_at(bytes, off).is_err() {
+                    // The controller treats an absent hash as a block to transfer.
+                    break;
+                }
+                let hash = content_digest(bytes);
+                if input.is_some() {
+                    #[cfg(debug_assertions)]
+                    test_race_barrier(
+                        "SYQ_TEST_REUSE_READY_FILE",
+                        "SYQ_TEST_REUSE_CONTINUE_FILE",
+                        "SYQ_TEST_HOLD_REUSE_MS",
+                        "reuse buffered bytes",
+                    )?;
+                    output
+                        .write_all_at(bytes, off)
+                        .context("write reused block")?;
+                }
+                hashes.push(hash);
             }
-            let hash = content_digest(bytes);
-            if input.is_some() {
-                #[cfg(debug_assertions)]
-                test_race_barrier(
-                    "SYQ_TEST_REUSE_READY_FILE",
-                    "SYQ_TEST_REUSE_CONTINUE_FILE",
-                    "SYQ_TEST_HOLD_REUSE_MS",
-                    "reuse buffered bytes",
-                )?;
-                output
-                    .write_all_at(bytes, off)
-                    .context("write reused block")?;
-            }
-            hashes.push(hash);
         }
         if output.metadata()?.len() != len {
             output.set_len(len)?;
@@ -9377,6 +9378,69 @@ mod tests {
             fs::read(partial_path(&later, &id).unwrap()).unwrap(),
             b"later bytes"
         );
+    }
+
+    #[test]
+    fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
+        for rooted in [false, true] {
+            for unsuitable in [false, true] {
+                let temporary = crate::test_support::tempdir().unwrap();
+                let target = temporary.path().join("file");
+                let donor = temporary.path().join(".file.syq-tmp.abcdefghijklmnop");
+                fs::write(&donor, b"old bytes").unwrap();
+                let mut ops = FsOps::new();
+                if rooted {
+                    ops.destination_root = Some(Arc::new(
+                        Root::from_directory(File::open(temporary.path()).unwrap()).unwrap(),
+                    ));
+                    ops.destination_prefix = Some(path_bytes(temporary.path()));
+                }
+                let path = if rooted {
+                    b"file".to_vec()
+                } else {
+                    path_bytes(&target)
+                };
+                let id = [10; 16];
+                let len = 2 * MIN_HASH_BLOCK_BYTES;
+                let preparation = ops
+                    .prepare(
+                        PartialTarget {
+                            path: &path,
+                            id: &id,
+                            guard: None,
+                        },
+                        PrepareOptions {
+                            size: len,
+                            inplace: false,
+                            mode: 0o600,
+                            attempt: 0,
+                            create_if_missing: true,
+                        },
+                    )
+                    .unwrap();
+                assert!(preparation.has_candidates);
+                fs::remove_file(&donor).unwrap();
+                if unsuitable {
+                    fs::create_dir(&donor).unwrap();
+                }
+                let hashes = ops
+                    .seed_basis(&path, &id, len, MIN_HASH_BLOCK_BYTES, 0, None)
+                    .unwrap();
+                assert!(hashes.is_empty(), "fresh zero-filled output is not a donor");
+                let partial = partial_path(&target, &id).unwrap();
+                assert_eq!(fs::metadata(&partial).unwrap().len(), len);
+                assert!(!target.exists());
+                // On a retry the existing private output is a real basis,
+                // including blocks whose contents happen to be all zeros.
+                let hashes = ops
+                    .seed_basis(&path, &id, len, MIN_HASH_BLOCK_BYTES, 1, None)
+                    .unwrap();
+                assert_eq!(
+                    hashes,
+                    vec![content_digest(&vec![0; MIN_HASH_BLOCK_BYTES as usize]); 2]
+                );
+            }
+        }
     }
 
     #[test]
