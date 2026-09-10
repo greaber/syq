@@ -273,9 +273,15 @@ impl Write for DeadlineSocket<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         loop {
             deadline_remaining(self.deadline)?;
-            match socket2::SockRef::from(&*self.socket)
-                .send_with_flags(bytes, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
-            {
+            // Darwin's Unix-stream send path checks the kernel-private
+            // MSG_NBIO flag, not MSG_DONTWAIT, while waiting for buffer space.
+            // This per-call flag avoids toggling O_NONBLOCK on a descriptor
+            // shared with socket clones. MSG_NBIO has been 0x20000 in XNU.
+            #[cfg(target_vendor = "apple")]
+            let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | 0x20000;
+            #[cfg(not(target_vendor = "apple"))]
+            let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+            match socket2::SockRef::from(&*self.socket).send_with_flags(bytes, flags) {
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -471,6 +477,10 @@ fn exchange(
         };
         anyhow::Error::new(error).context(message)
     })?;
+    // Configure the next protocol phase before the peer can close after its
+    // reply. macOS may reject socket timeout changes after peer shutdown.
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let mut io = DeadlineSocket {
         socket: &mut stream,
         deadline,
@@ -491,10 +501,6 @@ fn exchange(
         },
     )?;
     let reply = read_message(&mut io)?;
-    // Callers that retain the stream keep the existing per-operation budget
-    // for the next protocol phase, rather than the spent handshake budget.
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     if let Reply::Error(error) = &reply {
         bail!("receiving machine: {error}");
     }
