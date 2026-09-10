@@ -137,6 +137,7 @@ enum CopyLocalOutcome {
 
 #[cfg(all(target_os = "macos", debug_assertions))]
 fn record_copy_local_request_for_test() -> Result<()> {
+    use std::io::Write;
     if let Some(path) = std::env::var_os("SYQ_TEST_COPY_LOCAL_REQUESTS") {
         writeln!(
             OpenOptions::new().create(true).append(true).open(path)?,
