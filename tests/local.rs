@@ -19389,7 +19389,7 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         "{error}"
     );
     assert!(!error.contains("offline"), "{error}");
-    assert!(!error.contains("reconnect"), "{error}");
+    assert!(error.contains("syq persist connect SERVER"), "{error}");
     assert!(!t.path("ssh-used").exists());
     // An older process can hand a selected bare receiver to this helper.
     // Reject that spelling rather than reinterpret its pinned destination as SSH.

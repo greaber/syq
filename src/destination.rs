@@ -467,7 +467,7 @@ fn exchange(
         let message = if error.kind() == std::io::ErrorKind::WouldBlock {
             "receiving machine is busy; try again shortly"
         } else {
-            "could not connect to receiving machine; try again or check its connection to this server"
+            "could not connect to receiving machine; it may be busy or its connection may have ended; try again, or run `syq persist connect SERVER` on the receiving machine to connect to this server account"
         };
         anyhow::Error::new(error).context(message)
     })?;
