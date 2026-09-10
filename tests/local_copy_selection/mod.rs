@@ -182,8 +182,20 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let mut changed = original;
     changed[..1 << 20].fill(b'c');
     write(&t.path("src/file"), &changed);
+    // ENOSPC can stop the companion before it completes. Reproduce that state
+    // deterministically and select ranges so the retry exercises partial reuse
+    // instead of the direct-copy fast path for multiple pending files.
+    if t.path("dst/small").exists() {
+        fs::remove_file(t.path("dst/small")).unwrap();
+    }
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .args([
+            "-a",
+            "--tuning-options=copy-path=ranges",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
@@ -259,7 +271,15 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
 
     contents[..1 << 20].fill(b'x');
     write(&t.path("src/file"), &contents);
-    let resumed = run().run().unwrap();
+    // Keep the companion pending as it may be after ENOSPC, and explicitly
+    // select ranges to test reuse rather than the multi-file direct-copy path.
+    if t.path("dst/tiny").exists() {
+        fs::remove_file(t.path("dst/tiny")).unwrap();
+    }
+    let resumed = run()
+        .arg("--tuning-options=copy-path=ranges")
+        .run()
+        .unwrap();
     assert_output_ok(&resumed);
     assert_eq!(partial_files(&t.path("dst")), partials);
     // Cleanup changes the containing directory's mtime. Check copied directory
