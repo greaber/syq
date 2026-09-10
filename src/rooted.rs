@@ -2158,18 +2158,21 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 
 /// Inspect a directory's naming rules before search permission is repaired.
 /// macOS O_SEARCH requires search permission on the directory being opened;
-/// O_EVTONLY permits these queries with read permission alone. It still needs
-/// read access, just like syq's existing macOS permission-repair handles.
+/// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
+/// permission is available. Neither changes permissions during inspection.
 /// Descendant lookups still enforce search permission and never follow links.
 fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
     #[cfg(target_os = "macos")]
     {
-        open_at(
-            parent.as_raw_fd(),
-            &component_cstring(component),
-            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
+        match open_directory_at(parent, component) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
+                parent.as_raw_fd(),
+                &component_cstring(component),
+                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            ),
+            result => result,
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2830,6 +2833,30 @@ mod tests {
             [0xff]
         );
         assert!(filename_component_key(&[0xff], folded).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn naming_queries_traverse_search_only_directories_without_chmod() {
+        let tree = TestDir::new("search-only-naming");
+        let parent = tree.path().join("parent");
+        fs::create_dir_all(parent.join("child")).unwrap();
+        fs::write(parent.join("child/file"), b"contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o111)).unwrap();
+        let before = fs::metadata(&parent).unwrap();
+        let path = relative(b"parent/child/file");
+        let key = root.filename_key(&path);
+        let limit = root.name_max_for_parent(&path);
+        let after = fs::metadata(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(key.is_ok(), "{key:?}");
+        assert!(limit.unwrap() >= 4);
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
     }
 
     #[test]

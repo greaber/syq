@@ -9,7 +9,7 @@ use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
-use crate::fsops::{content_digest, is_partial_name, join};
+use crate::fsops::{content_digest, is_partial_name, is_recovery_name, join};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
@@ -2378,14 +2378,42 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .unwrap_or_default()
                     .to_vec()
             };
-            let mut suffixes = vec![primary_suffix];
+            let mut suffixes = vec![primary_suffix.clone()];
             if dst_is_dir && !source.copies_contents() && args.files_from.is_none() {
                 let basename = source.basename();
                 if !basename.is_empty() {
                     suffixes.push(basename);
                 }
             }
-            source_checks.push((source_index, suffixes.len()));
+            // Recursion checks include the destination container, but prune
+            // overlap checks apply only to copied directory roots. Compare
+            // every selected source with every such root: one source's prune
+            // must not remove another selected source.
+            let mut prune_suffixes = Vec::new();
+            if may_prune {
+                for (candidate, candidate_root) in srcs.iter().zip(roots) {
+                    if !candidate_root.selection.relative.is_empty() {
+                        continue;
+                    }
+                    let suffix = if candidate.copies_contents()
+                        || args.files_from.is_some()
+                        || args.placement == Placement::As
+                    {
+                        primary_suffix.clone()
+                    } else {
+                        join(&primary_suffix, &candidate.basename())
+                    };
+                    if !suffixes.contains(&suffix) {
+                        suffixes.push(suffix.clone());
+                    }
+                    prune_suffixes.push(suffix);
+                }
+            }
+            let checked_for_prune = suffixes
+                .iter()
+                .map(|suffix| prune_suffixes.contains(suffix))
+                .collect::<Vec<_>>();
+            source_checks.push((source_index, checked_for_prune));
             ancestry_checks.push(DirectoryAncestryCheck {
                 source_root: root.ticket.clone(),
                 source_is_directory,
@@ -2406,28 +2434,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source_checks.len()
             );
         }
-        for ((source_index, expected_relations), relations) in
+        for ((source_index, checked_for_prune), relations) in
             source_checks.into_iter().zip(relations)
         {
-            if relations.len() != expected_relations {
+            if relations.len() != checked_for_prune.len() {
                 bail!(
                     "destination returned {} ancestry results for {} effective paths",
                     relations.len(),
-                    expected_relations
+                    checked_for_prune.len()
                 );
             }
             let source = &srcs[source_index];
-            for relation in relations {
+            for (relation, checks_prune) in relations.into_iter().zip(checked_for_prune) {
                 match relation {
                     DirectoryRelation::Separate => {}
                     DirectoryRelation::SourceUnsearchable => {
-                        if opts.delete {
+                        if checks_prune {
                             progress.error("syq: source directory cannot be searched to check pruning overlap");
                         }
                     }
                     DirectoryRelation::SourceUnavailable if !same_machine => {}
                     DirectoryRelation::SourceUnavailable => bail!("source directory capability became unavailable during overlap checking"),
-                    DirectoryRelation::Ancestor if !opts.delete => {}
+                    DirectoryRelation::Ancestor if !checks_prune => {}
                     DirectoryRelation::Ancestor => bail!(
                         "cannot prune destination {:?}: it contains source {:?}",
                         display(&dst.path), display(&source.path)
@@ -6950,6 +6978,7 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
+            let mut recovery_parents = std::collections::HashSet::new();
             // Destination directories whose path the source claims as a
             // non-directory (a file we chose not to send, a symlink skipped
             // without -l, ...). The source has that path, so syq doesn't touch
@@ -6964,12 +6993,28 @@ impl Planner<'_> {
                 &ignore,
                 true,
                 &mut |batch: Vec<Entry>| {
-                    entries.extend(
-                        batch
-                            .into_iter()
-                            .filter(|e| !e.path.is_empty())
-                            .map(|e| (e.path, e.kind)),
-                    );
+                    for entry in batch {
+                        if entry.path.is_empty() {
+                            continue;
+                        }
+                        if entry
+                            .path
+                            .split(|byte| *byte == b'/')
+                            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
+                        {
+                            // A recovery entry can be a directory with old
+                            // contents. Protect the entire subtree and every
+                            // ancestor, independently of scan ordering.
+                            let full = join(&root, &entry.path);
+                            for (index, byte) in full.iter().enumerate() {
+                                if *byte == b'/' {
+                                    recovery_parents.insert(full[..index].to_vec());
+                                }
+                            }
+                            continue;
+                        }
+                        entries.push((entry.path, entry.kind));
+                    }
                     Ok(())
                 },
                 &mut |paths: Vec<PathBytes>| {
@@ -7072,6 +7117,10 @@ impl Planner<'_> {
                     if let Some(partial) = partial_parents.get(&path) {
                         self.progress.eprintln(&format!(
                             "syq: not deleting {rel}: it holds partial {partial}; use syq clean-partials after copies stop"
+                        ));
+                    } else if recovery_parents.contains(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds replacement recovery data"
                         ));
                     } else if protected.contains(&path) {
                         self.progress
@@ -8345,9 +8394,10 @@ impl Worker {
         let result = (|| -> Result<()> {
             loop {
                 if self.sched.is_failed(idx) || self.sched.is_aborted() {
-                    // Issued reads have advanced pos but may not have been
-                    // written. Draining them is cancellation, not completion.
-                    bail!("copy cancelled before this range completed");
+                    // Drain issued I/O without inventing an error for a file
+                    // cancelled by another worker. range_done and finish_file
+                    // both prevent publication after failure or global abort.
+                    break;
                 }
                 if !self.gate.allowed(self.id) {
                     // Being parked: give the rest of this range back so an active
@@ -8873,6 +8923,7 @@ mod tests {
         requests: Vec<Request>,
         replies: std::collections::VecDeque<Response>,
         received: usize,
+        abort_on_receive: Option<Arc<Sched>>,
     }
 
     struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -8891,6 +8942,9 @@ mod tests {
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
             state.received += 1;
+            if let Some(sched) = state.abort_on_receive.take() {
+                sched.abort();
+            }
             Ok(state.replies.pop_front().expect("unexpected receive"))
         }
         fn scan(
@@ -8919,6 +8973,123 @@ mod tests {
         ) -> Result<()> {
             unreachable!()
         }
+    }
+
+    fn pipeline_worker(
+        sched: &Arc<Sched>,
+        src: &Arc<Mutex<PipelineState>>,
+        dst: &Arc<Mutex<PipelineState>>,
+        streaming: bool,
+    ) -> Worker {
+        let opts = Arc::new(Opts {
+            block: 512,
+            tuning: crate::transfer_tuning::TransferTuning {
+                copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
+                pipeline_depth: (!streaming).then_some(4),
+                ..Default::default()
+            },
+            benchmark: None,
+            flags: 0,
+            recursive: true,
+            links: false,
+            perms: false,
+            devices: false,
+            checksum: false,
+            precise_mtime: true,
+            verify_only: false,
+            inplace: false,
+            same_host: false,
+            allow_sequential_nfs_fallback: false,
+            dst_remote: true,
+            restricted_receiver: false,
+            dry_run: false,
+            quiet: true,
+            verbose: 0,
+            umask: 0,
+            copy_id: [0; 16],
+            ignore: Vec::new(),
+            delete: false,
+            delete_excluded: false,
+            max_delete: None,
+            update: false,
+            ignore_existing: false,
+            preserve_existing_directory_metadata: false,
+            existing: false,
+            operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+            max_size: None,
+            min_size: None,
+        });
+        Worker {
+            id: 0,
+            src: Box::new(PipelineConn(src.clone())),
+            dst: Box::new(PipelineConn(dst.clone())),
+            sched: sched.clone(),
+            progress: Progress::new(false, false, None, false),
+            opts,
+            bwlimit: None,
+            gate: Gate::new(1),
+            t: [0.0; 4],
+            fast: FastTiming::default(),
+            benchmark: Default::default(),
+            fast_batch_files: 1,
+        }
+    }
+
+    #[test]
+    fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(FileJob {
+            src: b"source".to_vec(),
+            source: RegisteredPath {
+                root: serde_json::from_str("0").unwrap(),
+                relative: b"source".to_vec(),
+            },
+            dst: b"destination".to_vec(),
+            rel: "innocent-file".into(),
+            entry,
+            dst_entry: None,
+            target_condition: TargetCondition::Any,
+            container_guard: None,
+            attempt: 0,
+            done: Arc::new(AtomicU64::new(0)),
+            inplace: false,
+            rel_bytes: b"innocent-file".to_vec(),
+            src_rel: None,
+        });
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+        let src = Arc::new(Mutex::new(PipelineState {
+            abort_on_receive: Some(sched.clone()),
+            ..Default::default()
+        }));
+        for i in 0..4 {
+            let data = vec![0; 512];
+            src.lock().unwrap().replies.push_back(Response::Block {
+                off: i * 512,
+                hash: content_digest(&data),
+                data,
+            });
+        }
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        dst.lock().unwrap().replies.push_back(Response::Ok);
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.transfer_range(&range, &mut 0).unwrap();
+        assert!(!sched.range_done(&range));
+        worker.finish_file(0).unwrap();
+        assert!(!sched.is_failed(0));
+        assert!(src.lock().unwrap().replies.is_empty());
+        let destination = dst.lock().unwrap();
+        assert!(destination.replies.is_empty());
+        assert!(destination
+            .requests
+            .iter()
+            .all(|r| matches!(r, Request::WriteRange { .. })));
+        assert_eq!(worker.progress.errors.load(Relaxed), 0);
     }
 
     #[test]
@@ -8986,59 +9157,7 @@ mod tests {
                             .push_back(Response::Prepared(Preparation::default()));
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
-                    let opts = Arc::new(Opts {
-                        block: 512,
-                        tuning: crate::transfer_tuning::TransferTuning {
-                            copy_path: (!streaming)
-                                .then_some(crate::transfer_tuning::CopyPath::Ranges),
-                            pipeline_depth: (!streaming).then_some(4),
-                            ..Default::default()
-                        },
-                        benchmark: None,
-                        flags: 0,
-                        recursive: true,
-                        links: false,
-                        perms: false,
-                        devices: false,
-                        checksum: false,
-                        precise_mtime: true,
-                        verify_only: false,
-                        inplace: false,
-                        same_host: false,
-                        allow_sequential_nfs_fallback: false,
-                        dst_remote: true,
-                        restricted_receiver: false,
-                        dry_run: false,
-                        quiet: true,
-                        verbose: 0,
-                        umask: 0,
-                        copy_id: [0; 16],
-                        ignore: Vec::new(),
-                        delete: false,
-                        delete_excluded: false,
-                        max_delete: None,
-                        update: false,
-                        ignore_existing: false,
-                        preserve_existing_directory_metadata: false,
-                        existing: false,
-                        operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
-                        max_size: None,
-                        min_size: None,
-                    });
-                    let mut worker = Worker {
-                        id: 0,
-                        src: Box::new(PipelineConn(src.clone())),
-                        dst: Box::new(PipelineConn(dst.clone())),
-                        sched: sched.clone(),
-                        progress: Progress::new(false, false, None, false),
-                        opts,
-                        bwlimit: None,
-                        gate: Gate::new(1),
-                        t: [0.0; 4],
-                        fast: FastTiming::default(),
-                        benchmark: Default::default(),
-                        fast_batch_files: 1,
-                    };
+                    let mut worker = pipeline_worker(&sched, &src, &dst, streaming);
                     let error = worker.run().unwrap_err();
                     assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
                     assert!(sched.is_aborted());

@@ -1010,6 +1010,19 @@ pub(crate) fn partial_path_with_name_max(
     Ok(parent.join(OsString::from_vec(component)))
 }
 
+/// Names used for displaced entries during interrupted replacement. Keep
+/// this separate from resumable partials: clean-partials must not remove them.
+pub fn is_recovery_name(name: &OsStr) -> bool {
+    let Some(suffix) = name.as_bytes().strip_prefix(b".syq-swap-") else {
+        return false;
+    };
+    let mut fields = suffix.split(|byte| *byte == b'-');
+    let decimal = |field: Option<&[u8]>| {
+        field.is_some_and(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+    };
+    decimal(fields.next()) && decimal(fields.next()) && fields.next().is_none()
+}
+
 pub fn is_partial_name(name: &OsStr) -> bool {
     let name = name.as_bytes();
     name.starts_with(b".")
@@ -3801,7 +3814,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     "destination {} cannot change type under a matched condition",
                     target.label.display()
                 ),
-                Some(_) => root.replace_directory(path, *mode),
+                Some(_) => root.replace_directory(path, (*mode & 0o7777) | 0o700),
                 None => create_rooted_directory_or_existing(target, *mode),
             }
         }
@@ -7040,23 +7053,12 @@ fn mkdir_with_parent_fallback(p: &Path, mode: u32) -> Result<()> {
     }
 }
 
-fn replacement_parent(path: &Path) -> Result<(Root, RelativePath)> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let leaf = path
-        .file_name()
-        .context("replacement requires a named entry")?;
-    Ok((Root::open(parent)?, RelativePath::new(leaf.as_bytes())?))
-}
-
 fn create_symlink_any(path: &Path, target: &[u8]) -> Result<()> {
     let target = OsStr::from_bytes(target);
     match std::os::unix::fs::symlink(target, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let (root, relative) = replacement_parent(path)?;
+            let (root, relative) = exact_parent(path)?;
             root.replace_symlink(&relative, target.as_bytes())
         }
         Err(error) => Err(error).with_context(|| format!("symlink {}", path.display())),
@@ -7081,7 +7083,7 @@ fn create_node_any(path: &Path, mode: u32, rdev: u64) -> Result<()> {
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
         {
-            let (root, relative) = replacement_parent(path)?;
+            let (root, relative) = exact_parent(path)?;
             root.replace_node(&relative, mode, rdev)
         }
         Err(error) => Err(error).with_context(|| format!("mknod {}", path.display())),
@@ -7106,8 +7108,8 @@ fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
             match fs::symlink_metadata(p) {
                 Ok(md) if md.is_dir() => make_dir_writable(p, &md),
                 Ok(_) => {
-                    let (root, relative) = replacement_parent(p)?;
-                    root.replace_directory(&relative, mode)
+                    let (root, relative) = exact_parent(p)?;
+                    root.replace_directory(&relative, (mode & 0o7777) | 0o700)
                 }
                 Err(_) => Err(err),
             }

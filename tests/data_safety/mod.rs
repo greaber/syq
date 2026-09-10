@@ -262,3 +262,98 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
         assert_eq!(read(&t.path("dst/sub/file")), b"old contents");
     }
 }
+
+#[test]
+fn replacement_directory_is_writable_until_children_finish() {
+    for native in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/file"), b"copied contents");
+        write(&t.path("dst/sub"), b"previous destination");
+        fs::set_permissions(t.path("src/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        if native {
+            run_native_ok(&[
+                "cp",
+                "--preserve=permissions",
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ]);
+        } else {
+            run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+        }
+        assert_eq!(read(&t.path("dst/sub/file")), b"copied contents");
+        assert_eq!(
+            fs::metadata(t.path("dst/sub")).unwrap().mode() & 0o777,
+            0o555
+        );
+    }
+}
+
+#[test]
+fn prune_named_directory_inside_source_ancestor_is_safe() {
+    let t = Tmp::new();
+    write(&t.path("b/2024/photos/file"), b"source contents");
+    write(&t.path("b/photos/extra"), b"remove this extra");
+    write(&t.path("b/unrelated"), b"keep sibling");
+    run_native_ok(&["cp", "--prune", &t.s("b/2024/photos"), "--into", &t.s("b")]);
+    assert_eq!(read(&t.path("b/photos/file")), b"source contents");
+    assert_eq!(read(&t.path("b/2024/photos/file")), b"source contents");
+    assert_eq!(read(&t.path("b/unrelated")), b"keep sibling");
+    assert!(!t.path("b/photos/extra").exists());
+}
+
+#[test]
+fn prune_named_directory_cannot_remove_another_selected_source() {
+    let t = Tmp::new();
+    write(&t.path("external/photos/file"), b"external source");
+    write(&t.path("b/photos/import/selected"), b"selected source");
+    let out = native_syq(&[
+        "cp",
+        "--prune",
+        &t.s("external/photos"),
+        &t.s("b/photos/import"),
+        "--into",
+        &t.s("b"),
+    ]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stderr_of(&out).contains("contains source"), "{out:?}");
+    assert_eq!(
+        read(&t.path("b/photos/import/selected")),
+        b"selected source"
+    );
+    assert!(!t.path("b/photos/file").exists());
+}
+
+#[test]
+fn prune_preserves_replacement_recovery_entries_and_their_contents() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"current contents");
+    write(&t.path("dst/nested/.syq-swap-123-1"), b"old file");
+    write(
+        &t.path("dst/nested/.syq-swap-123-2/child/file"),
+        b"old directory contents",
+    );
+    std::os::unix::fs::symlink("old-target", t.path("dst/.syq-swap-123-3")).unwrap();
+    write(&t.path("dst/extra"), b"remove extra");
+    write(&t.path("dst/.syq-swap-not-a-recovery"), b"ordinary extra");
+    run_native_ok(&[
+        "cp",
+        "--prune",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/nested/.syq-swap-123-1")), b"old file");
+    assert_eq!(
+        read(&t.path("dst/nested/.syq-swap-123-2/child/file")),
+        b"old directory contents"
+    );
+    assert_eq!(
+        fs::read_link(t.path("dst/.syq-swap-123-3")).unwrap(),
+        Path::new("old-target")
+    );
+    assert!(!t.path("dst/extra").exists());
+    assert!(!t.path("dst/.syq-swap-not-a-recovery").exists());
+}

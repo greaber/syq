@@ -195,10 +195,13 @@ and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone
 Ignored paths and files skipped by size limits are protected.
 
 Scan or copy errors prevent deletion. Syq refuses to prune a destination
-that contains its source on the same host. An interruption after deletion starts
+that contains its source when both paths are local or use ordinary SSH on the
+same host. This check cannot identify shared storage across different hosts
+or restricted-receiver aliases. An interruption after deletion starts
 can leave some extras removed. Do not prune while another copy is writing into
 the same tree: its completed files can be treated as extras. Recognized partial files
-and directories containing them are protected from pruning. With `-v`, syq
+and replacement recovery entries (`.syq-swap-<pid>-<number>`) are protected
+from pruning, along with their contents and parent directories. With `-v`, syq
 lists each extra file it keeps because its name matches the partial-file format.
 
 ## Ignoring paths
