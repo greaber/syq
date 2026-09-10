@@ -1320,7 +1320,7 @@ fn option_takes_value(command: &clap::Command, option: &[u8]) -> bool {
 fn return_name_candidates(current: &[u8]) -> impl Iterator<Item = Candidate> + '_ {
     crate::destination::registered_names()
         .into_iter()
-        .flat_map(|name| [name.as_bytes().to_vec(), format!("@{name}").into_bytes()])
+        .map(|name| format!("@{name}").into_bytes())
         .filter(move |name| name.starts_with(current))
         .map(Candidate::text)
 }
@@ -1467,16 +1467,13 @@ fn complete_path_for(
     if find_option_value(args, b"--via").is_some()
         || (authorizer != Some("ssh")
             && (authorizer.is_some_and(|value| value != "auto")
-                || (command == "cp" && !crate::destination::registered_names().is_empty())))
+                || (command == "cp" && !crate::destination::connection_names().is_empty())))
     {
         // Completion must never request copy approval or inspect hostB through
         // an automatically selected authorizer. Explicit SSH keeps normal completion.
         return Ok(Vec::new());
     }
-    if endpoint.host.starts_with('@')
-        || (authorizer != Some("ssh")
-            && crate::destination::registered_names().contains(&endpoint.host))
-    {
+    if endpoint.host.starts_with('@') {
         return Ok(Vec::new());
     }
     remote_path_candidates(

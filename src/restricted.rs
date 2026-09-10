@@ -4457,6 +4457,7 @@ pub(crate) fn named_authority(
         });
     }
     for path in [
+        crate::destination::receiver_identity_directory()?,
         crate::receive_service::config_path()?
             .parent()
             .unwrap()

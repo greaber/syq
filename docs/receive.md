@@ -27,8 +27,8 @@ On the server, use the name from any shell, including an existing tmux session:
 
 ```sh
 ls -lh results
-syq cp results --to laptop
-syq cp report.pdf --to laptop --as reports/latest.pdf
+syq cp results --to @laptop
+syq cp report.pdf --to @laptop --as reports/latest.pdf
 ```
 
 Each incoming copy waits for approval **on your laptop** before it can inspect
@@ -51,7 +51,9 @@ syq persist connect server
 
 Then run `syq cp results --to @project` on the server. The directory must already
 exist. Each name has its own settings and approval policy, so you can keep a
-project separate from your general `laptop` destination.
+project separate from your general `laptop` destination. Names stay assigned to
+their receiving machine while it is offline; see [replacing a receiver](persistence-reference.md#names-and-profiles)
+when moving a name to another laptop.
 
 Use `syq persist receive status` to list profiles and
 `syq persist receive off --name project` to stop one. See
@@ -87,9 +89,9 @@ for the trust boundary.
 
 ## Names and paths
 
-When you use `--to laptop`, syq looks for a connected receiving machine with
-that name. If it is offline, syq tries an SSH host called `laptop` instead.
-Use `--to @laptop` when you want the command to fail if your laptop is offline.
+Use `--to @laptop` to select a receiving machine. The command fails if that
+receiver is offline or fails its identity check. Without `@`, `--to laptop`
+always names an SSH destination, resolved through SSH configuration or DNS.
 Once a copy starts, it keeps the same destination even if the connection fails.
 
 The directory you set with `--cwd` is where incoming copies start. You can

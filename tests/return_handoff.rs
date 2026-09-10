@@ -98,7 +98,7 @@ fn replaced_helper_fails_the_build_guard_instead_of_reexecuting_forever() {
         serde_json::from_str(results.lines().last().unwrap()).unwrap();
     assert_eq!(terminal["status"], "failed");
     assert_failure(
-        &fixture.run(&["exec", "--on", "laptop", "--", "true"]),
+        &fixture.run(&["exec", "--on", "@laptop", "--", "true"]),
         "registered return helper has a different build",
     );
 }

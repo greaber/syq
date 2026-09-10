@@ -201,7 +201,7 @@ syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
 printf 'case: return copies await local approval and denial leaves no destination\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as denied' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as denied' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; r=json.load(open("/tmp/syq-pending.json")); assert len(r)==1 and "source" in r[0]["from"] and "denied" in r[0]["destination"],r; print(r[0]["id"])')
@@ -225,7 +225,7 @@ test ! -e "$receive_root/denied"
 if syq persist receive approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
 
 printf 'case: approval allows only the pending copy once\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as approved' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -237,7 +237,7 @@ printf 'return\n' | cmp - "$receive_root/approved"
 if syq persist receive approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
 
 printf 'case: disconnected requests cannot be approved later\n'
-ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as disconnected' &
+ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as disconnected' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -256,7 +256,7 @@ if syq persist receive approve "$request_id"; then echo 'disconnected request wa
 test ! -e "$receive_root/disconnected"
 
 printf 'case: changing policy cancels a pending request\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as cancelled-policy' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as cancelled-policy' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -277,7 +277,7 @@ python3 /usr/local/libexec/syq-test-return-exec.py
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --approve always
 syq persist receive wait source --timeout 30
-ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to laptop --into first'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
     cd "$receive_root/first"
@@ -304,10 +304,12 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
     exit 1
 fi
 
-printf 'case: duplicate named return cannot displace the existing laptop\n'
+printf 'case: a copied receiver identity cannot displace a responsive laptop\n'
 (
-    export XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
-    mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    original_receiver_identity=$HOME/.syq-receiver-identity
+    export HOME=/tmp/syq-duplicate-home XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
+    mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    cp -a "$original_receiver_identity" "$HOME/"
     trap 'syq persist off' EXIT
     syq persist on
     syq persist receive on --name laptop --root /tmp/syq-real-ssh-receive-other
@@ -316,7 +318,7 @@ printf 'case: duplicate named return cannot displace the existing laptop\n'
         echo 'duplicate named destination unexpectedly succeeded' >&2
         exit 1
     fi
-    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
+    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already connected" in s["connection"]["error"] for s in states), states'
 )
 ssh source 'syq persist destinations wait laptop --timeout 5'
 
@@ -403,9 +405,9 @@ printf 'return\n' | cmp - "$receive_root/after-heartbeat-timeout"
 printf 'case: cwd permits destinations outside its starting directory\n'
 syq persist receive on --cwd "$receive_root"
 syq persist receive wait source --timeout 30
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as ../syq-return-outside'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as ../syq-return-outside'
 printf 'return\n' | cmp - /tmp/syq-return-outside
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as /tmp/syq-return-absolute'
 printf 'return\n' | cmp - /tmp/syq-return-absolute
 python3 /usr/local/libexec/syq-test-receive-profiles.py
 printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
@@ -418,7 +420,7 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 syq persist receive on
 syq persist receive wait source --timeout 30
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as reenabled'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as reenabled'
 printf 'return\n' | cmp - "$receive_root/reenabled"
 printf 'case: persistence off stops background receiving\n'
 syq persist off
@@ -428,6 +430,8 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 test ! -e "$receive_root/after-stop"
 ssh source 'test ! -e ~/.syq-destinations-v3/laptop.json'
+printf 'case: offline names require the original receiver identity or explicit replacement\n'
+python3 /usr/local/libexec/syq-test-receiver-identity.py
 # Unrelated pooling scenarios count SSH commands; explicitly disable receiving.
 syq persist receive off
 syq completion cache clear >/dev/null
