@@ -4380,8 +4380,6 @@ fn require_named_target_identity_known(
 /// file contents. O_NONBLOCK prevents a concurrent FIFO/device replacement
 /// from hanging before fstat can reject it.
 fn open_metadata_handle(path: &Path) -> Result<File> {
-    #[cfg(target_os = "macos")]
-    crate::rooted::prepare_metadata_opens();
     let path = cstr(path)?;
     #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;

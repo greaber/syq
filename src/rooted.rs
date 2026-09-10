@@ -972,8 +972,6 @@ impl Root {
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
-        #[cfg(target_os = "macos")]
-        prepare_metadata_opens();
         let (parent, leaf) = if path.is_empty() {
             (
                 self.directory.try_clone().context("duplicate root fd")?,
@@ -1907,8 +1905,6 @@ fn open_operator_directory_fd(parent: RawFd, component: &CString) -> Result<File
 }
 
 fn open_operator_metadata_at(parent: RawFd, name: &CString) -> io::Result<File> {
-    #[cfg(target_os = "macos")]
-    prepare_metadata_opens();
     #[cfg(target_os = "linux")]
     let flags =
         libc::O_PATH | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
@@ -2160,40 +2156,6 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
-/// All syq O_EVTONLY handles are for metadata. Darwin otherwise gives these
-/// handles legacy read access, which prevents opening mode-000 objects. This
-/// documented policy removes data access from future O_EVTONLY opens in this
-/// process and its children; it changes no file permissions or persistent state.
-#[cfg(target_os = "macos")]
-pub(crate) fn prepare_metadata_opens() {
-    static CONFIGURE: std::sync::Once = std::sync::Once::new();
-    CONFIGURE.call_once(|| {
-        // Public Darwin sys/resource.h constants, absent from the libc crate.
-        // The policy is present in macOS 13's xnu-8792.41.9 headers. Earlier
-        // kernels reject it; retaining their old open behavior keeps readable
-        // metadata operations working without raising the minimum OS version.
-        const IOPOL_TYPE_VFS_DISALLOW_RW_FOR_O_EVTONLY: libc::c_int = 10;
-        const IOPOL_SCOPE_PROCESS: libc::c_int = 0;
-        const IOPOL_VFS_DISALLOW_RW_FOR_O_EVTONLY_ON: libc::c_int = 1;
-        unsafe extern "C" {
-            fn setiopolicy_np(
-                iotype: libc::c_int,
-                scope: libc::c_int,
-                policy: libc::c_int,
-            ) -> libc::c_int;
-        }
-        // Best effort on older kernels. If unsupported, the metadata open
-        // itself still enforces permissions and reports any access failure.
-        let _ = unsafe {
-            setiopolicy_np(
-                IOPOL_TYPE_VFS_DISALLOW_RW_FOR_O_EVTONLY,
-                IOPOL_SCOPE_PROCESS,
-                IOPOL_VFS_DISALLOW_RW_FOR_O_EVTONLY_ON,
-            )
-        };
-    });
-}
-
 /// Inspect a directory's naming rules without requiring access to its contents.
 /// macOS O_SEARCH checks the directory's search permission when opening it;
 /// O_EVTONLY supports metadata queries before the planner repairs that mode.
@@ -2201,7 +2163,6 @@ pub(crate) fn prepare_metadata_opens() {
 fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
     #[cfg(target_os = "macos")]
     {
-        prepare_metadata_opens();
         open_at(
             parent.as_raw_fd(),
             &component_cstring(component),
@@ -2868,40 +2829,6 @@ mod tests {
             [0xff]
         );
         assert!(filename_component_key(&[0xff], folded).is_err());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn metadata_only_handles_inspect_and_repair_mode_zero_directories() {
-        let tree = TestDir::new("metadata-only-directory");
-        let child = tree.path().join("child");
-        fs::create_dir(&child).unwrap();
-        fs::write(child.join("file"), b"contents").unwrap();
-        let root = Root::open(tree.path()).unwrap();
-        fs::set_permissions(&child, fs::Permissions::from_mode(0o000)).unwrap();
-        let before = fs::metadata(&child).unwrap();
-
-        let key = root.filename_key(&relative(b"child/file"));
-        let limit = root.name_max_for_parent(&relative(b"child/file"));
-        let handle = root.open_metadata(&relative(b"child"));
-        let after = fs::metadata(&child).unwrap();
-        let repair = handle.and_then(|handle| {
-            handle
-                .set_permissions(fs::Permissions::from_mode(0o750))
-                .context("repair mode through metadata handle")
-        });
-        let repaired_mode = fs::metadata(&child).unwrap().mode() & 0o777;
-        // Restore access even if a query failed so the fixture can be removed.
-        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(key.is_ok(), "{key:?}");
-        assert!(limit.unwrap() >= b"file".len());
-        assert_eq!(after.mode(), before.mode());
-        assert_eq!(
-            (after.ctime(), after.ctime_nsec()),
-            (before.ctime(), before.ctime_nsec())
-        );
-        repair.unwrap();
-        assert_eq!(repaired_mode, 0o750);
     }
 
     #[test]
