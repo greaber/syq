@@ -44,7 +44,7 @@ def read_frame(stream):
 
 @contextlib.contextmanager
 def registration(binary, home, key, *, success=True, legacy=False, retry=False, messages=None,
-                 secret="test-connection-secret"):
+                 secret="test-connection-secret", paused=None, error=b"different receiver"):
     """A local test peer exercises the binary's actual registration entry point."""
     env = dict(os.environ, HOME=str(home), SYQ_NO_UPDATE_CHECK="1")
     path = home / ("return-" + uuid.uuid4().hex + ".sock")
@@ -70,6 +70,11 @@ def registration(binary, home, key, *, success=True, legacy=False, retry=False, 
                     message = envelope["message"]
                     if messages is not None:
                         messages.append(message)
+                    if paused is not None and paused.is_set():
+                        for _ in range(200):
+                            if not paused.is_set() or stopped.wait(.01):
+                                break
+                        continue
                     if message == "Ping":
                         reply = "Ready"
                     elif legacy:
@@ -86,7 +91,10 @@ def registration(binary, home, key, *, success=True, legacy=False, retry=False, 
                         reply = {"Identity": {"public_key": key.with_suffix(".pub").read_text().strip(),
                                               "signature": signature}}
                     data = json.dumps(reply).encode()
-                    stream.sendall(struct.pack("!I", len(data)) + data)
+                    try:
+                        stream.sendall(struct.pack("!I", len(data)) + data)
+                    except BrokenPipeError:
+                        pass  # A timed-out liveness probe already closed its end.
         except Exception as error:
             errors.append(error)
 
@@ -103,7 +111,7 @@ def registration(binary, home, key, *, success=True, legacy=False, retry=False, 
             assert read_frame(process.stdout) == "Ready"
         else:
             _, stderr = process.communicate(timeout=15)
-            assert process.returncode != 0 and b"different receiver" in stderr, stderr
+            assert process.returncode != 0 and error in stderr, stderr
         yield env
     finally:
         if process.poll() is None:
@@ -134,18 +142,22 @@ with tempfile.TemporaryDirectory(prefix="syq-id-compat-") as directory:
     print("PASS: new binary reads unchanged v0.5.2 advertisement and discovery", flush=True)
 
     messages = []
-    with registration(candidate, home, key_one, messages=messages) as env:
+    paused = threading.Event()
+    with registration(candidate, home, key_one, messages=messages, paused=paused) as env:
         owned_bytes = owner.read_bytes()
-        before_retry = list(messages)
-        with registration(candidate, home, key_one, retry=True):
-            assert messages == before_retry, messages
-            assert owner.read_bytes() == owned_bytes
-        with registration(candidate, home, key_one, retry=True, secret="restarted-service"):
-            assert messages == before_retry, messages
-            assert owner.read_bytes() == owned_bytes
+        for key, secret in [(key_one, "test-connection-secret"),
+                            (key_one, "restarted-service"), (key_two, "other-receiver")]:
+            with registration(candidate, home, key, success=False, secret=secret,
+                              error=b"already connected"):
+                assert owner.read_bytes() == owned_bytes
+        paused.set()
+        for secret in ("test-connection-secret", "restarted-service"):
+            with registration(candidate, home, key_one, retry=True, secret=secret):
+                assert owner.read_bytes() == owned_bytes
         with registration(candidate, home, key_two, success=False, secret="other-receiver"):
             assert owner.read_bytes() == owned_bytes
-        print("PASS: reconnects and service restarts wait without contacting or displacing the old transport", flush=True)
+        paused.clear()
+        print("PASS: responsive duplicates fail; unresponsive same-identity reconnects wait without displacing the lock", flush=True)
         run(previous, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
         run(candidate, "persist", "destinations", "wait", "laptop", "--timeout", "1", env=env)
     assert owner.read_bytes() == owned_bytes and not advertisement.exists()

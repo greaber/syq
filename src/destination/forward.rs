@@ -98,9 +98,8 @@ pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selectio
         (name, registration)
     } else {
         let Some(found) = registered_names().into_iter().find_map(|name| {
-            let registration = load_registration(&name).ok()?;
-            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(2)).ok()?;
-            matches!(reply, Reply::Ready).then_some((name, registration))
+            let registration = available(&name, Duration::from_secs(2)).ok()?;
+            Some((name, registration))
         }) else {
             return Ok(None);
         };

@@ -37,7 +37,7 @@ it uses hostA's SSH access. A copy addressed to a live receiving name goes to
 that machine itself.
 
 Use `--auth-from @laptop` to choose your laptop explicitly, or `--auth-from ssh`
-to use hostA's SSH access. The default is `--auth-from auto`. `--via NAME` is
+to use hostA's SSH access. The default is `--auth-from auto`. `--via @NAME` is
 an alias for choosing a receiving machine. See
 [authorization selection](remote-reference.md#authorization-selection) for
 name rules and route restrictions.

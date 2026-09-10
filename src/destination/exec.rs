@@ -67,7 +67,10 @@ enum Event {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let matches = command_for_help().try_get_matches_from(argv)?;
     let command = ExecCommand::from_arg_matches(&matches)?;
-    let name = command.on.strip_prefix('@').unwrap_or(&command.on);
+    let name = command
+        .on
+        .strip_prefix('@')
+        .context("receiver references require @NAME")?;
     validate_name(name)?;
     let request = ExecRequest {
         argv: command.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),

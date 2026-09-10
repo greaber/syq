@@ -98,6 +98,15 @@ pub(super) fn verify_receiver(
     registration: &Registration,
     owner: Option<&str>,
 ) -> Result<String> {
+    verify_receiver_with_timeout(name, registration, owner, Duration::from_secs(10))
+}
+
+pub(super) fn verify_receiver_with_timeout(
+    name: &str,
+    registration: &Registration,
+    owner: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
     let challenge = random_token()?;
     let (_, reply) = exchange(
         registration,
@@ -105,7 +114,7 @@ pub(super) fn verify_receiver(
             name: name.into(),
             challenge: challenge.clone(),
         },
-        Duration::from_secs(10),
+        timeout,
     )
     .context(
         "cannot verify receiver identity; reconnect with an updated syq on the receiving machine",

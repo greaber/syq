@@ -366,6 +366,7 @@ fn exchange(
             "named destination requires its matching helper; reconnect from the receiving machine"
         );
     }
+    let deadline = Instant::now() + timeout;
     let mut stream = UnixStream::connect(&registration.socket).context(
         "receiving machine is offline; run `syq persist connect SERVER` on that machine to reconnect to this server account",
     )?;
@@ -386,7 +387,11 @@ fn exchange(
             message,
         },
     )?;
-    let reply = read_message(&mut stream)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("return channel exchange timed out")?;
+    let reply = read_socket_message(&mut stream, remaining)?;
     if let Reply::Error(error) = &reply {
         bail!("receiving machine: {error}");
     }
@@ -556,8 +561,6 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
                     "--auth-from ssh requires local sources and an ordinary SSH --to destination"
                 );
             }
-            // This explicit choice also disambiguates an SSH host whose name
-            // happens to match a receiving machine's advertisement.
             return Ok(None);
         }
         crate::cli::AuthFrom::Auto => {}
@@ -568,36 +571,14 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     let Some(host) = destination.host.as_deref() else {
         return Ok(None);
     };
-    let explicit = host.starts_with('@');
-    let name = host.strip_prefix('@').unwrap_or(host).to_owned();
-    // A normal SSH endpoint with a user/port remains explicit SSH. Bare names
-    // opt into lookup only when this process can actually send a return copy.
-    let registration = if explicit {
-        load_registration(&name)?
-    } else {
-        if destination.user.is_some()
-            || destination.port.is_some()
-            || args.interface != crate::cli::Interface::NativeCp
-            || args.locations[..args.locations.len() - 1]
-                .iter()
-                .any(|l| l.is_remote())
-            || !registered_names().contains(&name)
-        {
-            return forward::select(args);
+    let Some(name) = host.strip_prefix('@') else {
+        if handoff::selected_name(handoff::Kind::Copy).is_some() {
+            bail!("receiver destinations require @NAME; retry the command with --to @NAME");
         }
-        if !registry()?.join(format!("{name}.json")).try_exists()?
-            && handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
-        {
-            return forward::select(args);
-        }
-        let registration = load_registration(&name)?;
-        if handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
-            && exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err()
-        {
-            return forward::select(args);
-        }
-        registration
+        return forward::select(args);
     };
+    let name = name.to_owned();
+    let registration = load_registration(&name)?;
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]
             .iter()
@@ -1283,17 +1264,23 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join(format!("{name}.lock")))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        // A laptop may reconnect before the server has noticed the old TCP
-        // session died. A retry still cannot displace an active registration
-        // or obtain its lock.
-        // Read only the saved credential: the old transport may be unresponsive.
+        // A responsive holder is a duplicate, even when a copied home directory
+        // gives both machines the same identity. Never replace a held lock.
+        if read_registration(name).is_ok_and(|previous| {
+            exchange(&previous, Message::Ping, Duration::from_secs(1))
+                .is_ok_and(|(_, reply)| matches!(reply, Reply::Ready))
+        }) {
+            bail!("destination @{name} is already connected; choose another receiver name to use both connections at the same time");
+        }
+        // The old transport may be dying. Its heartbeat releases the lock;
+        // only the same connection or verified owner may wait to reconnect.
         if read_registration(name).is_ok_and(|previous| previous.secret == secret) {
             crate::output::diagnostic!("syq: previous return connection is still closing");
             return Ok(RECONNECT_PENDING);
         }
         if let Some(owner) = identity::owner(&directory, name)? {
             // A restarted service has a new connection credential but keeps
-            // its receiver key. Verify the new connection, never the dying one.
+            // its receiver key. Verify it before allowing reconnect retries.
             identity::verify_receiver(name, &registration, Some(&owner))?;
             crate::output::diagnostic!("syq: previous return connection is still closing");
             return Ok(RECONNECT_PENDING);
@@ -1340,13 +1327,17 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     }
     Ok(0)
 }
-fn available(name: &str) -> Result<()> {
-    let registration = load_registration(name)?;
-    let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(1))?;
-    if !matches!(reply, Reply::Ready) {
-        bail!("destination not ready");
+fn available(name: &str, timeout: Duration) -> Result<Registration> {
+    let registration = read_registration(name)?;
+    if let Some(owner) = identity::owner(&registry()?, name)? {
+        identity::verify_receiver_with_timeout(name, &registration, Some(&owner), timeout)?;
+    } else {
+        let (_, reply) = exchange(&registration, Message::Ping, timeout)?;
+        if !matches!(reply, Reply::Ready) {
+            bail!("destination not ready");
+        }
     }
-    Ok(())
+    Ok(registration)
 }
 fn destinations(action: DestinationAction) -> Result<i32> {
     match action {
@@ -1369,7 +1360,7 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             for name in names {
                 println!(
                     "@{name}\t{}",
-                    if available(&name).is_ok() {
+                    if available(&name, Duration::from_secs(1)).is_ok() {
                         "online"
                     } else {
                         "offline"
@@ -1404,18 +1395,25 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             let deadline = Instant::now() + Duration::from_secs(timeout);
             let mut last_progress = Instant::now();
             loop {
-                match available(&name) {
-                    Ok(()) => return Ok(0),
-                    Err(error) if Instant::now() >= deadline => {
-                        return Err(error).context("timed out waiting for named destination")
-                    }
-                    Err(error) if last_progress.elapsed() >= Duration::from_secs(5) => {
-                        crate::output::diagnostic!("syq: waiting for @{name}: {error:#}");
-                        last_progress = Instant::now();
-                    }
-                    Err(_) => {}
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("timed out waiting for named destination");
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                let error = match available(&name, remaining.min(Duration::from_secs(1))) {
+                    Ok(_) => return Ok(0),
+                    Err(error) => error,
+                };
+                if last_progress.elapsed() >= Duration::from_secs(5) {
+                    crate::output::diagnostic!("syq: waiting for @{name}: {error:#}");
+                    last_progress = Instant::now();
+                }
+                std::thread::sleep(
+                    Duration::from_millis(200)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    return Err(error).context("timed out waiting for named destination");
+                }
             }
         }
     }

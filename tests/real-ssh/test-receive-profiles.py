@@ -121,7 +121,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
         receive("on", "--name", "laptop", "--root", str(other_root), "--notify", "off", env=other_env)
         receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--approve", "always", env=other_env)
         conflict = run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env, ok=False)
-        assert conflict.returncode != 0 and "different receiver" in conflict.stderr, conflict
+        assert conflict.returncode != 0 and "already connected" in conflict.stderr, conflict
         receive("wait", "source", "--name", "other-client", "--timeout", "30", env=other_env)
         assert profile("laptop", other_env)["connection"]["phase"] == "failed"
         assert profile("laptop")["connection"]["ssh_pid"] == original
