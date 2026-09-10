@@ -118,6 +118,7 @@ def direct():
         ssh("destination", f"from pathlib import Path; p=Path({root + '/large/group'!r}); assert p.read_bytes()==b'keep explicit parent'; p.unlink()")
         # Once the fixture obstruction is removed, the late explicit entry
         # supplies directory metadata after all 10,000 mapped files are copied.
+        results_path = Path(temporary) / "results-large-unblocked.ndjson"
         result = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/large", "--no-tcp", "--preserve=permissions", "--results", str(results_path)], data=large, expected=23)
         assert result.stderr.count(b"blocks an implicit mapping parent") == 2, result.stderr
         assert b"cannot replace non-directory" not in result.stderr, result.stderr
