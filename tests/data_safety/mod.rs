@@ -264,29 +264,85 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
 }
 
 #[test]
-fn replacement_directory_is_writable_until_children_finish() {
+fn directory_type_conflicts_preserve_destination_and_prevent_prune() {
     for native in [false, true] {
-        let t = Tmp::new();
-        write(&t.path("src/sub/file"), b"copied contents");
-        write(&t.path("dst/sub"), b"previous destination");
-        fs::set_permissions(t.path("src/sub"), fs::Permissions::from_mode(0o555)).unwrap();
-        if native {
-            run_native_ok(&[
-                "cp",
-                "--preserve=permissions",
-                "--srcs-in",
-                &t.s("src"),
-                "--into",
-                &t.s("dst"),
-            ]);
-        } else {
-            run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+        for dry_run in [false, true] {
+            for (source_dir, destination_kind) in [
+                (true, "file"),
+                (true, "symlink"),
+                (false, "empty_directory"),
+                (false, "unreadable_directory"),
+                (false, "nonempty_directory"),
+            ] {
+                for source_link in [false, true] {
+                    if source_dir && source_link {
+                        continue;
+                    }
+                    let t = Tmp::new();
+                    fs::create_dir(t.path("src")).unwrap();
+                    if source_dir {
+                        write(&t.path("src/item/sub/file"), b"source contents");
+                        fs::set_permissions(t.path("src/item"), fs::Permissions::from_mode(0o555))
+                            .unwrap();
+                    } else if source_link {
+                        std::os::unix::fs::symlink("source-target", t.path("src/item")).unwrap();
+                    } else {
+                        write(&t.path("src/item"), b"source contents");
+                    }
+                    write(&t.path("dst/extra"), b"keep after failure");
+                    write(&t.path("outside/sub/file"), b"outside contents");
+                    match destination_kind {
+                        "file" => write(&t.path("dst/item"), b"old contents"),
+                        "symlink" => {
+                            std::os::unix::fs::symlink(t.path("outside"), t.path("dst/item"))
+                                .unwrap()
+                        }
+                        _ => fs::create_dir(t.path("dst/item")).unwrap(),
+                    }
+                    if destination_kind == "unreadable_directory" {
+                        fs::set_permissions(t.path("dst/item"), fs::Permissions::from_mode(0o0))
+                            .unwrap();
+                    } else if destination_kind == "nonempty_directory" {
+                        write(&t.path("dst/item/child"), b"keep child");
+                    }
+                    let before = fs::symlink_metadata(t.path("dst/item")).unwrap();
+                    let out = if native {
+                        let mut args = vec!["cp", "--prune", "--preserve=permissions", "--srcs-in"];
+                        let src = t.s("src");
+                        let dst = t.s("dst");
+                        args.extend([&src, "--into", &dst]);
+                        if dry_run {
+                            args.push("--dry-run");
+                        }
+                        native_syq(&args)
+                    } else {
+                        syq(&[
+                            if dry_run { "-an" } else { "-a" },
+                            "--delete",
+                            &t.s("src/"),
+                            &t.s("dst/"),
+                        ])
+                    };
+                    let after = fs::symlink_metadata(t.path("dst/item")).unwrap();
+                    if destination_kind == "unreadable_directory" {
+                        fs::set_permissions(t.path("dst/item"), fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                    }
+                    assert_eq!(out.status.code(), Some(23), "native={native}, dry={dry_run}, source_link={source_link}, dst={destination_kind}: {out:?}");
+                    let stderr = stderr_of(&out);
+                    assert!(stderr.contains("cannot replace"), "{stderr}");
+                    assert!(!stderr.contains("Permission denied"), "{stderr}");
+                    assert_eq!((before.ino(), before.mode()), (after.ino(), after.mode()));
+                    assert_eq!(read(&t.path("dst/extra")), b"keep after failure");
+                    assert_eq!(read(&t.path("outside/sub/file")), b"outside contents");
+                    if destination_kind == "file" {
+                        assert_eq!(read(&t.path("dst/item")), b"old contents");
+                    } else if destination_kind == "nonempty_directory" {
+                        assert_eq!(read(&t.path("dst/item/child")), b"keep child");
+                    }
+                }
+            }
         }
-        assert_eq!(read(&t.path("dst/sub/file")), b"copied contents");
-        assert_eq!(
-            fs::metadata(t.path("dst/sub")).unwrap().mode() & 0o777,
-            0o555
-        );
     }
 }
 

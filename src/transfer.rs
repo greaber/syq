@@ -2709,7 +2709,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         filename_claims: std::collections::HashMap::new(),
         partial_claims: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
-        dry_run_replaced_dirs: std::collections::HashSet::new(),
+        blocked_directory_paths: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
         unusable_files: std::collections::HashSet::new(),
@@ -4485,10 +4485,9 @@ struct Planner<'a> {
     /// (or aren't directories); --ignore-existing: an existing non-directory
     /// sits at their path. Nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
-    /// Directories that a dry run would create over destination leaves. Until
-    /// that virtual replacement exists, lstat would follow an old in-tree
-    /// symlink in an intermediate component and inspect the wrong subtree.
-    dry_run_replaced_dirs: std::collections::HashSet<PathBytes>,
+    /// Directory copies blocked by a destination file or symlink. The conflict
+    /// is reported at the parent; its descendants must not be copied.
+    blocked_directory_paths: std::collections::HashSet<PathBytes>,
     /// Once syq has observed a missing remote destination root, every mapped
     /// path is missing too. Avoid WAN round trips for impossible descendants;
     /// local stats stay cheap and warm filesystem metadata for the writers.
@@ -5395,7 +5394,7 @@ impl Planner<'_> {
         self.missing_dirs = std::collections::HashSet::new();
         self.mapping_explicit_parents = std::collections::HashSet::new();
         self.blocked_mapping_parents = std::collections::HashSet::new();
-        self.dry_run_replaced_dirs = std::collections::HashSet::new();
+        self.blocked_directory_paths = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
         // Dry-run directory traces are intentionally deferred until after
         // planning, when a later explicit directory can have upgraded an
@@ -5660,15 +5659,9 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
-            for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
+            for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
                 if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
                     continue;
-                }
-                // Keep the parent-first overlay invariant explicit here too:
-                // a directory below a replacement is missing in the virtual
-                // destination tree.
-                if opts.dry_run && Self::under_any(&self.dry_run_replaced_dirs, &p, dst_root) {
-                    st = None;
                 }
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
@@ -5683,7 +5676,7 @@ impl Planner<'_> {
                 }
                 // --existing creates nothing. A non-directory at the path (a
                 // file, a symlink even to a directory — in-tree symlinks are
-                // replaced, never traversed) counts as missing: we won't
+                // never traversed) counts as missing: we won't
                 // replace it and won't write through it, and since entries
                 // come parent-first, everything below is skipped too.
                 // --ignore-existing never touches what exists either: an
@@ -5717,8 +5710,10 @@ impl Planner<'_> {
                     self.blocked_mapping_parents.insert(p);
                     continue;
                 }
-                if opts.dry_run && st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
-                    self.dry_run_replaced_dirs.insert(p.clone());
+                if st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
+                    self.fail_directory_type_change(&p, &dst_rel, Kind::Dir);
+                    self.blocked_directory_paths.insert(p);
+                    continue;
                 }
                 planned.push((p, dst_rel, e, st));
             }
@@ -5745,21 +5740,6 @@ impl Planner<'_> {
                                     self.progress.println(&format!(
                                         "create directory {} (destination missing)",
                                         display_directory(p)
-                                    ));
-                                }
-                            }
-                        }
-                        Some(d) if d.kind != Kind::Dir => {
-                            if self.dry_run_changes.directories.insert(p.clone()) {
-                                self.dry_run_changes.type_replacements += 1;
-                                self.dry_run_changes
-                                    .directory_creates
-                                    .push((p.clone(), "type_differs"));
-                                if opts.verbose > 0 {
-                                    self.progress.println(&format!(
-                                        "replace with directory {} (destination is {})",
-                                        display_directory(p),
-                                        kind_label(d.kind)
                                     ));
                                 }
                             }
@@ -6010,7 +5990,7 @@ impl Planner<'_> {
             }
         }
 
-        if !self.blocked_mapping_parents.is_empty() {
+        if !self.blocked_mapping_parents.is_empty() || !self.blocked_directory_paths.is_empty() {
             others.retain(|p| !self.fail_blocked_mapping_entry(&p.dst, &p.dst_rel, p.e.kind));
         }
         if others.is_empty() {
@@ -6128,6 +6108,11 @@ impl Planner<'_> {
                         || self.skip_existing(&dst_entry)
                     {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    {
+                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -6272,6 +6257,11 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
+                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    {
+                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
+                        continue;
+                    }
                     let target = e.link.clone().unwrap_or_default();
                     let same = dst_entry.as_ref().is_some_and(|d| {
                         d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..])
@@ -6346,6 +6336,11 @@ impl Planner<'_> {
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
                     if self.skip_existing(&dst_entry) {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    {
+                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
                         continue;
                     }
                     let same = dst_entry
@@ -6708,9 +6703,54 @@ impl Planner<'_> {
         )
     }
 
+    fn fail_directory_type_change(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) {
+        let message = if kind == Kind::Dir {
+            format!(
+                "syq: cannot replace non-directory {} with a directory",
+                display(dst)
+            )
+        } else {
+            format!(
+                "syq: cannot replace directory {} with a non-directory",
+                display(dst)
+            )
+        };
+        self.progress
+            .error_classified(&message, Some("conflict"), None);
+        if self.opts.dry_run {
+            return;
+        }
+        if let Some(results) = self.progress.results_writer() {
+            let (action, kind) = match kind {
+                Kind::Dir => ("create_directory", "dir"),
+                Kind::File => ("transfer_file", "file"),
+                Kind::Symlink => ("create_symlink", "symlink"),
+                _ => ("create_special", "special"),
+            };
+            results.emit_operation(&crate::results::OperationRecord {
+                action,
+                dst: dst_rel,
+                src: self.mapping_source_rel(dst_rel).as_deref(),
+                kind,
+                disposition: "failed",
+                bytes: None,
+                attempts: None,
+                retryable: Some("no"),
+                class: Some("conflict"),
+                os_kind: None,
+                message: Some(&message),
+            });
+        }
+    }
+
     /// Report only real manifest entries beneath a protected obstruction;
     /// synthesized directories have no source object or retry record.
     fn fail_blocked_mapping_entry(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) -> bool {
+        // The parent conflict has already been reported. Do not schedule its
+        // descendants or report them as separate failed copies.
+        if Self::under_any(&self.blocked_directory_paths, dst, &self.dst_root) {
+            return true;
+        }
         if !Self::under_any(&self.blocked_mapping_parents, dst, &self.dst_root) {
             return false;
         }
@@ -7283,23 +7323,21 @@ impl Planner<'_> {
         stat_many(self.dst, paths, false)
     }
 
-    /// lstat paths that remain reachable after the directory replacements a
-    /// dry run has already planned. Descendants of those replacements are
-    /// virtually missing; querying them would follow the old intermediate
-    /// leaf that the real run removes first.
+    /// Avoid querying descendants of a directory conflict. The planner skips
+    /// these entries; inspecting them could traverse an obstructing symlink.
     fn stat_many_with_dry_run_overlay(
         &mut self,
         paths: Vec<PathBytes>,
         dst_root: &[u8],
     ) -> Result<Vec<Option<Entry>>> {
-        if !self.opts.dry_run || self.dry_run_replaced_dirs.is_empty() {
+        if !self.opts.dry_run || self.blocked_directory_paths.is_empty() {
             return self.stat_many(paths);
         }
         let mut visible = Vec::new();
         let mut indexes = Vec::new();
         let mut results = vec![None; paths.len()];
         for (index, path) in paths.into_iter().enumerate() {
-            if !Self::under_any(&self.dry_run_replaced_dirs, &path, dst_root) {
+            if !Self::under_any(&self.blocked_directory_paths, &path, dst_root) {
                 indexes.push(index);
                 visible.push(path);
             }
@@ -7310,10 +7348,9 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    /// Stat dry-run directories parent-depth first. Discovering a destination
-    /// leaf at one depth makes its whole source-directory subtree virtually
-    /// missing at deeper levels, so no request traverses the leaf that the
-    /// real run would already have replaced.
+    /// Stat dry-run directories parent-depth first, hiding descendants of
+    /// obstructing leaves. The planner reports the parent conflict and skips
+    /// its subtree without following an intermediate symlink.
     fn stat_directories_with_dry_run_overlay(
         &mut self,
         dirs: &[(PathBytes, PathBytes, Entry)],
@@ -7324,7 +7361,7 @@ impl Planner<'_> {
         }
         let existing = self.opts.existing;
         let ignore_existing = self.opts.ignore_existing;
-        let mut replaced = self.dry_run_replaced_dirs.clone();
+        let mut blocked = self.blocked_directory_paths.clone();
         let mut missing = self.missing_dirs.clone();
         let mut by_depth: std::collections::BTreeMap<usize, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -7343,10 +7380,10 @@ impl Planner<'_> {
             let mut visible_indexes = Vec::new();
             for &index in &indexes {
                 let path = &dirs[index].0;
-                let hidden_by_replacement = Self::under_any(&replaced, path, dst_root);
+                let hidden_by_conflict = Self::under_any(&blocked, path, dst_root);
                 let hidden_by_option =
                     (existing || ignore_existing) && Self::under_any(&missing, path, dst_root);
-                if !hidden_by_replacement && !hidden_by_option {
+                if !hidden_by_conflict && !hidden_by_option {
                     visible_indexes.push(index);
                     visible.push(path.clone());
                 }
@@ -7365,7 +7402,7 @@ impl Planner<'_> {
                 {
                     missing.insert(path.clone());
                 } else if entry.as_ref().is_some_and(|item| item.kind != Kind::Dir) {
-                    replaced.insert(path.clone());
+                    blocked.insert(path.clone());
                 }
             }
         }

@@ -17,7 +17,8 @@ syq rsync -av project/ server:backup/project/
 | Positive `--max-delete N` | Deletes nothing if the plan exceeds N; rsync deletes up to N |
 | Destination collisions | Distinct sources claiming the same destination fail before copying |
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
-| `--update` | Checks mtimes only for regular files; type replacements still occur |
+| Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
+| `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
 | Resume | Always keeps syq partial files; cannot reuse rsync partials |
 | Delta transfer | Reuses matching blocks at the same offsets; does not find shifted blocks |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |

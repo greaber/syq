@@ -1407,15 +1407,6 @@ impl Root {
         .with_context(|| format!("set times on confined path {}", path.label()))
     }
 
-    /// Stage replacements before touching the old entry. Cross-type directory
-    /// changes need an atomic exchange; the displaced object remains recoverable
-    /// until cleanup succeeds. Never fall back to unlink-before-create.
-    pub(crate) fn replace_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
-        self.replace_entry(path, |fd, name| {
-            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), mode as libc::mode_t) })
-        })
-    }
-
     pub(crate) fn replace_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
         let target = CString::new(target).context("symlink target contains NUL")?;
         self.replace_entry(path, |fd, name| {
@@ -1438,69 +1429,27 @@ impl Root {
     ) -> Result<()> {
         let parent = self.resolve_parent(path)?;
         let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
-        if before.is_dir() && !self.read_directory(path)?.is_empty() {
-            bail!("refusing to replace nonempty directory {}", path.label());
+        if before.is_dir() {
+            bail!(
+                "cannot replace directory {} with a non-directory",
+                path.label()
+            );
         }
+        // Stage the new leaf before touching the old one. renameat also refuses
+        // a directory that appears at the destination after the check above.
         let temporary = create_temporary(&parent, create)?;
-        let replacement = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
-        let cleanup_new = || {
-            unlink_at(
+        let result = retry_zero(|| unsafe {
+            libc::renameat(
                 parent.directory.as_raw_fd(),
-                &temporary,
-                if replacement.is_dir() {
-                    libc::AT_REMOVEDIR
-                } else {
-                    0
-                },
+                temporary.as_ptr(),
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
             )
-        };
-        if before.is_dir() == replacement.is_dir() {
-            let result = retry_zero(|| unsafe {
-                libc::renameat(
-                    parent.directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    parent.directory.as_raw_fd(),
-                    parent.leaf.as_ptr(),
-                )
-            });
-            if result.is_err() {
-                let _ = cleanup_new();
-            }
-            return result.with_context(|| format!("publish replacement for {}", path.label()));
+        });
+        if result.is_err() {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
         }
-        if let Err(error) = rename_exchange(
-            parent.directory.as_raw_fd(),
-            &temporary,
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
-        ) {
-            let _ = cleanup_new();
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot atomically change the type of {}; original entry was preserved",
-                    path.label()
-                )
-            });
-        }
-        // The old entry now has the temporary name. Nonrecursive cleanup can
-        // never discard a directory that acquired children during publication.
-        let displaced = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
-        unlink_at(
-            parent.directory.as_raw_fd(),
-            &temporary,
-            if displaced.is_dir() {
-                libc::AT_REMOVEDIR
-            } else {
-                0
-            },
-        )
-        .with_context(|| {
-            format!(
-                "replacement published for {}; previous entry remains beside it as {:?}",
-                path.label(),
-                temporary
-            )
-        })
+        result.with_context(|| format!("publish replacement for {}", path.label()))
     }
 
     pub(crate) fn replace_symlink_if_same(
@@ -2878,11 +2827,32 @@ mod tests {
             fs::read_link(tree.path().join("item")).unwrap(),
             Path::new("target")
         );
-        root.replace_directory(&path, 0o700).unwrap();
-        assert!(tree.path().join("item").is_dir());
-        fs::write(tree.path().join("item/child"), b"keep").unwrap();
-        assert!(root.replace_symlink(&path, b"other").is_err());
-        assert_eq!(fs::read(tree.path().join("item/child")).unwrap(), b"keep");
+        fs::create_dir(tree.path().join("directory")).unwrap();
+        let directory = relative(b"directory");
+        fs::set_permissions(
+            tree.path().join("directory"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let before = fs::metadata(tree.path().join("directory")).unwrap();
+        let error = root.replace_symlink(&directory, b"other").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot replace directory"),
+            "{error:#}"
+        );
+        let after = fs::metadata(tree.path().join("directory")).unwrap();
+        assert_eq!((before.ino(), before.mode()), (after.ino(), after.mode()));
+        fs::set_permissions(
+            tree.path().join("directory"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(tree.path().join("directory/child"), b"keep").unwrap();
+        assert!(root.replace_symlink(&directory, b"other").is_err());
+        assert_eq!(
+            fs::read(tree.path().join("directory/child")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]

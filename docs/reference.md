@@ -256,11 +256,16 @@ are unavailable, the checks are conservative: an ambiguous copy can be refused,
 and pruning can keep a possible source counterpart. These checks do not rename
 source files or change their spelling.
 
-Replacing an entry with a directory, symlink or special file stages the new
-entry before publication. If the filesystem cannot perform an atomic type
-change, the operation fails with the old entry preserved. An interrupted type
-change can leave the previous entry beside its replacement under a
-`.syq-swap-...` name; inspect it before removing it.
+A directory cannot replace a file or symlink, and a file, symlink or special
+file cannot replace a directory, even an empty one. Syq reports an error and
+skips the conflicting directory's subtree. This follows cp's conservative
+behavior and applies to both `syq cp` and `syq rsync`.
+
+Replacements between non-directory entries stage the new entry before
+publication. Some guarded replacements require an atomic exchange; if the
+filesystem does not support it, the old entry is preserved and the operation
+fails. An interrupted exchange can leave the previous entry beside its
+replacement under a `.syq-swap-...` name; inspect it before removing it.
 
 Concurrent copies use separate partials. With unchanged sources, each completed
 file comes from one copy; different copies may win for different files. This

@@ -465,9 +465,8 @@ impl OperatorDirectorySelection {
             match open_operator_directory_at(&directory, &component) {
                 Ok(child) => directory = child,
                 Err(error) if absent_or_nondirectory(&error) => {
-                    // A missing entry, regular file, or symlink will either be
-                    // replaced as a directory beneath this parent or make the
-                    // copy fail. It must never be followed for this decision.
+                    // A missing entry can become a directory; an existing leaf
+                    // makes the copy fail. Neither is followed for this decision.
                     virtual_components.push(component);
                 }
                 Err(error) => {
@@ -883,8 +882,8 @@ fn name_max_cached(
 
     // Resolve from a retained root one component at a time. A pathname lstat
     // would still follow symlinks in intermediate components when a descendant
-    // exists. Planning replaces such a symlink instead, so descendants inherit
-    // the containing real directory's filesystem limit.
+    // exists. Planning refuses directory copies onto such a symlink; use the
+    // containing real directory's limit until that conflict is reported.
     let Ok(root) = Root::open(Path::new("/")) else {
         return COMMON_NAME_MAX;
     };
@@ -3810,11 +3809,10 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(_) if *condition != TargetCondition::Any => bail!(
-                    "destination {} cannot change type under a matched condition",
+                Some(_) => bail!(
+                    "cannot replace non-directory {} with a directory",
                     target.label.display()
                 ),
-                Some(_) => root.replace_directory(path, (*mode & 0o7777) | 0o700),
                 None => create_rooted_directory_or_existing(target, *mode),
             }
         }
@@ -7107,10 +7105,10 @@ fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
         {
             match fs::symlink_metadata(p) {
                 Ok(md) if md.is_dir() => make_dir_writable(p, &md),
-                Ok(_) => {
-                    let (root, relative) = exact_parent(p)?;
-                    root.replace_directory(&relative, (mode & 0o7777) | 0o700)
-                }
+                Ok(_) => bail!(
+                    "cannot replace non-directory {} with a directory",
+                    p.display()
+                ),
                 Err(_) => Err(err),
             }
         }
