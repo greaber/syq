@@ -4687,7 +4687,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     let rsh = fake_rsh(&t);
     executable(
         &t.path("remote-bin/ip"),
-        b"#!/bin/sh\nprintf '2: eth9 inet 192.0.2.1/24 scope global eth9\\n'\n",
+        b"#!/bin/sh\nprintf invoked > \"$FAKE_IP_LOG\"\nprintf '2: eth9 inet 192.0.2.1/24 scope global eth9\\n'\n",
     );
     write(&t.path("src"), b"fallback");
     let remote = format!("diagnostic.invalid:{}", t.s("dst"));
@@ -4705,12 +4705,19 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_IP_LOG", t.path("ip.log"))
+        .env("FAKE_SSH_CONNECTION", "192.0.2.2 40000 192.0.2.1 22")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .run()
         .expect("run double-verbose dry-run with TCP fallback");
 
     assert_output_ok(&out);
     assert!(!t.path("dst").exists());
+    assert_eq!(
+        t.path("ip.log").exists(),
+        cfg!(target_os = "linux"),
+        "only Linux receivers may spawn the iproute2 probe"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("TCP 192.0.2.1:") && stderr.contains("not reachable"),
