@@ -1212,7 +1212,7 @@ impl Root {
             // component adds no naming information and can require search
             // permission that the planner has not repaired yet.
             if !missing && index + 1 < path.components.len() {
-                match open_directory_at(&directory, component) {
+                match open_directory_metadata_at(&directory, component) {
                     Ok(child) => {
                         directory = child;
                         rules = filename_rules(&directory);
@@ -1265,7 +1265,18 @@ impl Root {
             let candidate = RelativePath {
                 components: components.clone(),
             };
-            match self.open_directory(&candidate) {
+            #[cfg(not(target_os = "macos"))]
+            let directory = self.open_directory(&candidate);
+            #[cfg(target_os = "macos")]
+            let directory = if candidate.is_empty() {
+                self.directory.try_clone().map_err(anyhow::Error::from)
+            } else {
+                self.resolve_parent(&candidate).and_then(|parent| {
+                    open_directory_metadata_at(&parent.directory, parent.leaf.as_bytes())
+                        .map_err(anyhow::Error::from)
+                })
+            };
+            match directory {
                 Ok(directory) => {
                     let device = directory.metadata()?.dev();
                     // Serialize the first query too: PartialPaths resolves a
@@ -2143,6 +2154,26 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
         access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC,
         0,
     )
+}
+
+/// Inspect a directory's naming rules without requiring access to its contents.
+/// macOS O_SEARCH checks the directory's search permission when opening it;
+/// O_EVTONLY supports metadata queries before the planner repairs that mode.
+/// Descendant lookups still enforce search permission and never follow links.
+fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    #[cfg(target_os = "macos")]
+    {
+        open_at(
+            parent.as_raw_fd(),
+            &component_cstring(component),
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        open_directory_at(parent, component)
+    }
 }
 
 fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
