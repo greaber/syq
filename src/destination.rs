@@ -201,7 +201,7 @@ fn wait_fd(
     fd: std::os::fd::RawFd,
     events: i16,
     deadline: Instant,
-    cancelled: &impl Fn() -> bool,
+    cancelled: Option<&dyn Fn() -> bool>,
 ) -> std::io::Result<()> {
     let mut descriptor = libc::pollfd {
         fd,
@@ -209,13 +209,18 @@ fn wait_fd(
         revents: 0,
     };
     loop {
-        if cancelled() {
+        if cancelled.is_some_and(|check| check()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "return request cancelled",
             ));
         }
-        let milliseconds = deadline_remaining(deadline)?.as_millis().clamp(1, 100) as i32;
+        // Only cancellation needs periodic wakeups. Socket and handshake waits
+        // can sleep until readiness or their deadline, including human approval.
+        let cap = if cancelled.is_some() { 100 } else { i32::MAX };
+        let milliseconds = deadline_remaining(deadline)?
+            .as_millis()
+            .clamp(1, cap as u128) as i32;
         // The caller keeps the descriptor alive and descriptor is writable during
         // poll. Signals and spurious wakeups never renew the deadline.
         let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
@@ -256,12 +261,9 @@ impl Read for DeadlineSocket<'_> {
             let error = std::io::Error::last_os_error();
             match error.kind() {
                 std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => wait_fd(
-                    self.socket.as_raw_fd(),
-                    libc::POLLIN,
-                    self.deadline,
-                    &|| false,
-                )?,
+                std::io::ErrorKind::WouldBlock => {
+                    wait_fd(self.socket.as_raw_fd(), libc::POLLIN, self.deadline, None)?
+                }
                 _ => return Err(error),
             }
         }
@@ -276,12 +278,9 @@ impl Write for DeadlineSocket<'_> {
             {
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => wait_fd(
-                    self.socket.as_raw_fd(),
-                    libc::POLLOUT,
-                    self.deadline,
-                    &|| false,
-                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_fd(self.socket.as_raw_fd(), libc::POLLOUT, self.deadline, None)?
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -468,7 +467,7 @@ fn exchange(
         let message = if error.kind() == std::io::ErrorKind::WouldBlock {
             "receiving machine is busy; try again shortly"
         } else {
-            "could not connect to receiving machine; if it is offline, run `syq persist connect SERVER` on that machine to reconnect to this server account"
+            "could not connect to receiving machine; try again or check its connection to this server"
         };
         anyhow::Error::new(error).context(message)
     })?;
@@ -1554,7 +1553,19 @@ mod tests {
         let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
         listener.listen(0).unwrap();
-        let _queued = connect_socket(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..16 {
+            match connect_socket(&path, Instant::now() + Duration::from_secs(1)) {
+                Ok(socket) => queued.push(socket),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("fill listen queue: {error}"),
+            }
+        }
+        assert!(full, "test did not fill the listen queue");
         let registration = Registration {
             version: REGISTRATION_VERSION,
             identity: crate::identity::build().into(),

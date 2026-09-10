@@ -291,14 +291,14 @@ impl ForwardChild {
                     &mut DeadlineIo {
                         inner: child.child.stdin.as_mut().unwrap(),
                         deadline,
-                        cancelled,
+                        cancelled: Some(cancelled),
                     },
                     request,
                 )?;
                 read_message::<Reply>(&mut DeadlineIo {
                     inner: child.child.stdout.as_mut().unwrap(),
                     deadline,
-                    cancelled,
+                    cancelled: Some(cancelled),
                 })
             })();
             match reply {
@@ -490,12 +490,12 @@ fn relay(
     result
 }
 
-struct DeadlineIo<'a, T, F> {
+struct DeadlineIo<'a, T> {
     inner: &'a mut T,
     deadline: Instant,
-    cancelled: &'a F,
+    cancelled: Option<&'a dyn Fn() -> bool>,
 }
-impl<T: Read + AsRawFd, F: Fn() -> bool> Read for DeadlineIo<'_, T, F> {
+impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         wait_fd(
             self.inner.as_raw_fd(),
@@ -506,7 +506,7 @@ impl<T: Read + AsRawFd, F: Fn() -> bool> Read for DeadlineIo<'_, T, F> {
         self.inner.read(bytes)
     }
 }
-impl<T: Write + AsRawFd, F: Fn() -> bool> Write for DeadlineIo<'_, T, F> {
+impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         wait_fd(
             self.inner.as_raw_fd(),
@@ -550,9 +550,7 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
             return Ok(0);
         }
         if self.pending.load(Ordering::Acquire) {
-            wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, &|| {
-                false
-            })?;
+            wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, None)?;
         }
         let count = self.inner.read(bytes)?;
         if count > 0 && !self.started {
@@ -591,7 +589,7 @@ fn receive() -> Result<i32> {
         let request: HelperRequest = read_message(&mut DeadlineIo {
             inner: &mut input,
             deadline: Instant::now() + Duration::from_secs(10),
-            cancelled: &|| false,
+            cancelled: None,
         })?;
         if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
             bail!("return helper build mismatch");
@@ -926,7 +924,7 @@ mod tests {
         let error = read_message::<Reply>(&mut DeadlineIo {
             inner: &mut reader,
             deadline: Instant::now() + Duration::from_millis(20),
-            cancelled: &|| false,
+            cancelled: None,
         })
         .err()
         .unwrap();
@@ -937,7 +935,7 @@ mod tests {
         let error = read_message::<Reply>(&mut DeadlineIo {
             inner: &mut reader,
             deadline: Instant::now() + Duration::from_secs(60),
-            cancelled: &|| true,
+            cancelled: Some(&|| true),
         })
         .err()
         .unwrap();
