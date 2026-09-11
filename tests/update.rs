@@ -323,3 +323,80 @@ fn source_install_cannot_create_or_use_a_standalone_receipt_implicitly() {
     assert!(!fixture.config.join("syq/install.json").exists());
     assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
 }
+
+#[test]
+fn remote_command_registration_enables_signed_update_without_changing_helper() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    let home = fixture.temp.path("remote-home");
+    let installed = home.join(".local/bin/syq");
+    let install = Command::new(&fixture.installed)
+        .arg("--install-remote-command")
+        .env("HOME", &home)
+        .env("PATH", fixture.temp.path("no-tools"))
+        .env("XDG_CONFIG_HOME", &fixture.config)
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
+        .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
+        .output()
+        .unwrap();
+    assert_success(&install);
+    assert_eq!(fixture.receipt()["binary"], installed.to_str().unwrap());
+    assert_eq!(fixture.receipt()["provider"], "standalone");
+    let update = fixture.command_at(&installed, "--self-update");
+    assert_success(&update);
+    assert_eq!(fixture.receipt()["version"], release_version);
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+}
+
+#[test]
+fn remote_install_preserves_standalone_receipt_outside_ssh_path() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    let receipt = fs::read(fixture.config.join("syq/install.json")).unwrap();
+    let home = fixture.temp.path("remote-home");
+    let install = Command::new(&fixture.installed)
+        .arg("--install-remote-command")
+        .env("HOME", &home)
+        .env("PATH", fixture.temp.path("no-tools"))
+        .env("XDG_CONFIG_HOME", &fixture.config)
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
+        .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
+        .output()
+        .unwrap();
+    assert_success(&install);
+    assert!(!home.join(".local/bin/syq").exists());
+    assert_eq!(
+        fs::read(fixture.config.join("syq/install.json")).unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn remote_install_reports_receipt_failure_without_removing_the_command() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    let home = fixture.temp.path("remote-home");
+    let blocked_config = fixture.temp.path("not-a-directory");
+    fs::write(&blocked_config, b"preserve").unwrap();
+    let install = Command::new(&fixture.installed)
+        .arg("--install-remote-command")
+        .env("HOME", &home)
+        .env("PATH", fixture.temp.path("no-tools"))
+        .env("XDG_CONFIG_HOME", &blocked_config)
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
+        .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
+        .output()
+        .unwrap();
+    assert_success(&install);
+    assert_eq!(
+        fs::read(home.join(".local/bin/syq")).unwrap(),
+        fixture.original
+    );
+    assert_eq!(fs::read(&blocked_config).unwrap(), b"preserve");
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(stderr.contains("could not enable self-update"));
+    assert!(stderr
+        .lines()
+        .all(|line| line.starts_with("syq-remote-install-notice:")));
+}

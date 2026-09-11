@@ -2889,8 +2889,8 @@ impl RemoteSpec {
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
-            if authorized && !self.quiet && !detail.is_empty() {
-                crate::output::diagnostic!("syq: {}: {detail}", self.label());
+            if authorized {
+                self.relay_install_notices(&stderr);
             }
             return if authorized {
                 Ok(RemoteDownloadOutcome::Installed)
@@ -2930,6 +2930,14 @@ impl RemoteSpec {
         }
     }
 
+    fn relay_install_notices(&self, stderr: &[u8]) {
+        if !self.quiet {
+            for notice in install_notices(stderr) {
+                crate::output::diagnostic!("syq: {}: {notice}", self.label());
+            }
+        }
+    }
+
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
         let script = remote_helper::upload_script(target);
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
@@ -2946,10 +2954,7 @@ impl RemoteSpec {
                 output_suffix(&out.stderr.bytes)
             );
         }
-        let detail = output_message(&out.stderr.bytes);
-        if !self.quiet && !detail.is_empty() {
-            crate::output::diagnostic!("syq: {}: {detail}", self.label());
-        }
+        self.relay_install_notices(&out.stderr.bytes);
         match out.input_error {
             Some(error) => Err(error).with_context(|| format!("upload helper to {}", self.label())),
             None => Ok(()),
@@ -3164,6 +3169,14 @@ fn protocol_line(mut line: &[u8]) -> &[u8] {
         line = value;
     }
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn install_notices(stderr: &[u8]) -> impl Iterator<Item = &str> {
+    stderr.split(|byte| *byte == b'\n').filter_map(|line| {
+        std::str::from_utf8(protocol_line(line))
+            .ok()?
+            .strip_prefix(crate::remote_user_install::NOTICE_PREFIX)
+    })
 }
 
 fn output_suffix(stderr: &[u8]) -> String {
@@ -3382,6 +3395,16 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_notices_exclude_ssh_noise_and_preserve_individual_lines() {
+        let stderr = b"Warning: new host key\nsshd banner\nsyq-remote-install-notice:installed syq\nrc noise\nsyq-remote-install-notice:check SSH PATH\r\n";
+        assert_eq!(
+            super::install_notices(stderr).collect::<Vec<_>>(),
+            ["installed syq", "check SSH PATH"]
+        );
+        assert!(super::output_suffix(stderr).contains("sshd banner"));
+    }
+
     #[test]
     fn advertised_tcp_port_must_match_requested_range() {
         for port in [47_600, 47_650, 47_699] {

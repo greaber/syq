@@ -7,25 +7,45 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
+pub const NOTICE_PREFIX: &str = "syq-remote-install-notice:";
+
+fn notice(message: impl std::fmt::Display) {
+    for line in message.to_string().lines() {
+        crate::output::diagnostic!("{NOTICE_PREFIX}{line}");
+    }
+}
+
 pub fn install() {
     if !crate::identity::is_release_build() {
         return;
     }
-    let result = (|| {
+    let result: Result<Option<bool>> = (|| {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
         let path = std::env::var_os("PATH").unwrap_or_default();
         let source = std::env::current_exe().context("locate the installed helper")?;
-        install_from(&source, Path::new(&home), &path)
+        // The standalone receipt can describe an installation outside SSH's PATH.
+        // Leave that installation and its update authority alone too.
+        if crate::update::standalone_receipt_exists()? {
+            return Ok(None);
+        }
+        let installed = install_from(&source, Path::new(&home), &path)?;
+        if installed.is_some() {
+            let binary = Path::new(&home).join(".local/bin/syq").canonicalize()?;
+            if let Err(error) = crate::update::register_standalone_install_at(binary) {
+                notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates"));
+            }
+        }
+        Ok(installed)
     })();
     match result {
         Ok(Some(on_path)) => {
-            crate::output::diagnostic!("installed syq {} at ~/.local/bin/syq for use on this server", env!("CARGO_PKG_VERSION"));
+            notice(format!("installed syq {} at ~/.local/bin/syq for use on this server", env!("CARGO_PKG_VERSION")));
             if !on_path {
-                crate::output::diagnostic!("add ~/.local/bin to PATH to run it as syq; shell configuration was not changed");
+                notice("~/.local/bin is absent from the non-interactive SSH PATH; if syq is unavailable after login, add it to your shell PATH");
             }
         }
         Ok(None) => {}
-        Err(error) => crate::output::diagnostic!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its cached helper"),
+        Err(error) => notice(format!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its cached helper")),
     }
 }
 
@@ -38,21 +58,23 @@ fn exists(path: &Path) -> bool {
 fn install_from(source: &Path, home: &Path, path: &std::ffi::OsStr) -> Result<Option<bool>> {
     let bin = home.join(".local/bin");
     let destination = bin.join("syq");
-    if exists(&destination) || std::env::split_paths(path).any(|dir| exists(&dir.join("syq"))) {
+    if exists(&destination)
+        || std::env::split_paths(path).any(|dir| fs::metadata(dir.join("syq")).is_ok())
+    {
         return Ok(None);
     }
     fs::create_dir_all(&bin).context("create the user binary directory")?;
     let temporary = tempfile::Builder::new()
         .prefix(".syq-install-")
         .tempfile_in(&bin)?;
-    // cp exposes filesystem cloning on both supported platforms. A failed clone
-    // is harmless: the ordinary copy truncates the private temporary file.
+    // cp prefers cloning on both supported platforms. If the tool is missing
+    // or fails, the ordinary copy truncates the private temporary file.
     let clone_flag = if cfg!(target_os = "macos") {
         "-c"
     } else {
-        "--reflink=always"
+        "--reflink=auto"
     };
-    let cloned = Command::new("cp")
+    let copied = Command::new("cp")
         .arg(clone_flag)
         .arg(source)
         .arg(temporary.path())
@@ -61,10 +83,11 @@ fn install_from(source: &Path, home: &Path, path: &std::ffi::OsStr) -> Result<Op
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    if !cloned {
+    if !copied {
         fs::copy(source, temporary.path()).context("copy the helper for interactive use")?;
     }
     fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755))?;
+    // macOS cp -c may replace the temporary inode; sync the file being published.
     fs::File::open(temporary.path())?.sync_all()?;
     // Atomic no-clobber publication protects installations created concurrently.
     // This never links the interactive command to the cached helper inode.
@@ -129,6 +152,34 @@ mod tests {
             fs::read_link(bin.join("syq")).unwrap(),
             Path::new("missing")
         );
+    }
+
+    #[test]
+    fn inaccessible_path_directory_does_not_block_install_but_destination_does() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root bypasses the directory search permissions under test.
+        }
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("module-bin");
+        let source = root.path().join("helper");
+        let home = root.path().join("home");
+        fs::write(&source, b"release").unwrap();
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            fs::metadata(blocked.join("syq")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let result = install_from(&source, &home, blocked.as_os_str());
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap(), Some(false));
+        assert_eq!(fs::read(home.join(".local/bin/syq")).unwrap(), b"release");
+
+        let bin = home.join(".local/bin");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = install_from(&source, &home, "".as_ref());
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]

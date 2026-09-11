@@ -113,6 +113,14 @@ exec "$program" "$@""#,
     )
 }
 
+fn install_command() -> &'static str {
+    if crate::identity::is_release_build() {
+        "\"$program\" --install-remote-command </dev/null || :"
+    } else {
+        ""
+    }
+}
+
 pub fn download_script(target: Target) -> String {
     let release = cache_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -258,11 +266,7 @@ trap - EXIT HUP INT TERM
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = if crate::identity::is_release_build() {
-            "\"$program\" --install-remote-command </dev/null || :"
-        } else {
-            ""
-        },
+        install_command = install_command(),
     )
 }
 
@@ -319,11 +323,7 @@ trap - EXIT HUP INT TERM
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = if crate::identity::is_release_build() {
-            "\"$program\" --install-remote-command </dev/null || :"
-        } else {
-            ""
-        },
+        install_command = install_command(),
     )
 }
 

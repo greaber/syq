@@ -207,7 +207,7 @@ pub struct Args {
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
     /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// leave source and destination data unchanged (remote setup may install syq)
+    /// leave source and destination data unchanged (remote setup may still cache the helper or install syq)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)

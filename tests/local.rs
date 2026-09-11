@@ -4041,6 +4041,16 @@ fn add_remote_tool(t: &Tmp, name: &str) {
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap();
+    executable(
+        &rsh,
+        script
+            .replace(
+                "#!/bin/sh\n",
+                "#!/bin/sh\necho 'unrelated SSH banner' >&2\n",
+            )
+            .as_bytes(),
+    );
     setup_release_bootstrap(&t);
 
     write(&t.path("src"), b"first");
@@ -4049,10 +4059,22 @@ fn managed_remote_helper_install_is_cached() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("syq: fake: unrelated SSH banner"));
+    for line in stderr
+        .lines()
+        .filter(|line| line.contains("installed syq") || line.contains("non-interactive SSH PATH"))
+    {
+        assert!(
+            line.starts_with("syq: fake: "),
+            "missing host label: {line}"
+        );
+    }
     let installed = t.path("remote-home/.local/bin/syq");
     assert_eq!(read(&installed), read(&cached_remote_helper(&t)));
     assert!(String::from_utf8_lossy(&out.stderr).contains("installed syq"));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("add ~/.local/bin to PATH"));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("~/.local/bin is absent from the non-interactive SSH PATH"));
     // Updating the interactive command must leave the helper usable.
     write(&installed, b"user-managed replacement");
 
@@ -4099,6 +4121,11 @@ fn remote_helper_command_install_falls_back_without_cp_and_preserves_existing_co
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("--install-remote-command")
             .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env(
+                "SYQ_TEST_RELEASE_PUBLIC_KEY",
+                base64::engine::general_purpose::STANDARD.encode([19; 32]),
+            )
             .env("PATH", t.path("no-tools"))
             .env("SYQ_TEST_RELEASE_BUILD", "1")
             .output()

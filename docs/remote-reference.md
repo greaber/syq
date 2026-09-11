@@ -158,4 +158,4 @@ Verification never installs an enrollment.
 overwrite policies. Filters and size limits select the entries to compare;
 special files require `--preserve=specials`. Metadata is not compared, but device
 identity is. A requested results file may still be written, and remote setup may
-[install syq](install.md#automatic-installation-on-ssh-servers).
+still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).

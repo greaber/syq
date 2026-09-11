@@ -127,6 +127,14 @@ pub fn self_update() -> Result<()> {
 /// Called by the generated installer after the verified binary has reached its
 /// final path. Keeping receipt creation inside syq avoids shell JSON escaping.
 pub fn register_standalone_install() -> Result<()> {
+    register_standalone_install_at(canonical_current_exe()?)
+}
+
+pub(crate) fn standalone_receipt_exists() -> Result<bool> {
+    Ok(fs::symlink_metadata(receipt_path()?).is_ok())
+}
+
+pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
     embedded_public_key()?;
     let target = Target::local().ok_or_else(|| {
         anyhow!(
@@ -135,7 +143,6 @@ pub fn register_standalone_install() -> Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let binary = canonical_current_exe()?;
     let path = receipt_path()?;
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA,
