@@ -145,6 +145,11 @@ copying every byte. You can also copy to or from a mounted NFS directory using
 its local path. See [storage placement](server-tuning.md#check-local-storage-placement)
 for how the source and destination filesystems affect performance.
 
+On macOS, APFS cloning within one volume can avoid copying file contents.
+Smaller files still travel together in batches. See [batch size and splitting](tuning.md#batch-size-and-splitting)
+for the cloning threshold and how tuning changes it, and [copy files](reference.md#copy-files)
+for the cases that use normal copying.
+
 ## Limit bandwidth
 
 Use `--bwlimit` to leave bandwidth for other work:

@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[path = "support/macos_clone.rs"]
+mod macos_clone_support;
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Successful host-native TCP tests must not share the product's fixed default
@@ -320,8 +324,12 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
     // Conservatively budget every selector as parent + exact object for the
     // registry, control, and all 64 shared workers, plus worker/cache reserve.
     // Same-machine destination workers claim exact source capabilities only
-    // on Linux, where the descriptor-copy fast path exists.
-    let copy_local_claims = if cfg!(target_os = "linux") { 64 * 3 } else { 0 };
+    // on Linux and macOS, where the descriptor-copy fast paths exist.
+    let copy_local_claims = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        64 * 3
+    } else {
+        0
+    };
     assert_eq!(
         required,
         current_open + 1572 + copy_local_claims,
@@ -850,6 +858,8 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             // Keep the test on the ranged transport path instead of the excluded
             // same-machine CopyLocal optimization.
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
+            .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
             .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
@@ -876,15 +886,24 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
 
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
+        assert_eq!(tuning_observed(&output)["local_whole_files"], 0);
+        assert!(tuning_observed(&output)["range_requests"].as_u64().unwrap() > 0);
         assert_eq!(read(&t.path("dst/small")), b"original");
         assert_eq!(read(&t.path("dst/large")), original_large);
     }
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_uses_registered_source_after_path_replacement() {
-    for userspace in [false, true] {
+    #[cfg(target_os = "macos")]
+    if !macos_clone_support::available() {
+        return;
+    }
+    for userspace in [false, true]
+        .into_iter()
+        .filter(|userspace| !userspace || cfg!(target_os = "linux"))
+    {
         let t = Tmp::new();
         let original = vec![b'o'; 8 << 20];
         write(&t.path("src/file"), &original);
@@ -936,10 +955,13 @@ fn copy_local_uses_registered_source_after_path_replacement() {
     }
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_refuses_a_replaced_destination_parent() {
-    for userspace in [false, true] {
+    for userspace in [false, true]
+        .into_iter()
+        .filter(|userspace| !userspace || cfg!(target_os = "linux"))
+    {
         let t = Tmp::new();
         write(&t.path("src/tree/file"), &vec![b's'; 8 << 20]);
         write(&t.path("src/tree/other"), &vec![b'o'; 5 << 20]);
@@ -1180,8 +1202,13 @@ fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path
 }
 
 #[cfg(debug_assertions)]
-fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+fn wait_for_control_path_output(child: std::process::Child) -> Output {
+    wait_for_child_output(child, std::time::Duration::from_secs(5))
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_child_output(mut child: std::process::Child, timeout: std::time::Duration) -> Output {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
@@ -1190,7 +1217,7 @@ fn wait_for_control_path_output(mut child: std::process::Child) -> Output {
             child.kill().unwrap();
             let output = child.wait_with_output().unwrap();
             panic!(
-                "syq did not finish after the control-path race\nstdout:\n{}\nstderr:\n{}",
+                "syq did not finish before the test deadline\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -4666,7 +4693,7 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
     let rsh = fake_rsh(&t);
     executable(
         &t.path("remote-bin/ip"),
-        b"#!/bin/sh\nprintf '2: eth9 inet 192.0.2.1/24 scope global eth9\\n'\n",
+        b"#!/bin/sh\nprintf invoked > \"$FAKE_IP_LOG\"\nprintf '2: eth9 inet 192.0.2.1/24 scope global eth9\\n'\n",
     );
     write(&t.path("src"), b"fallback");
     let remote = format!("diagnostic.invalid:{}", t.s("dst"));
@@ -4684,12 +4711,19 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_IP_LOG", t.path("ip.log"))
+        .env("FAKE_SSH_CONNECTION", "192.0.2.2 40000 192.0.2.1 22")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .run()
         .expect("run double-verbose dry-run with TCP fallback");
 
     assert_output_ok(&out);
     assert!(!t.path("dst").exists());
+    assert_eq!(
+        t.path("ip.log").exists(),
+        cfg!(target_os = "linux"),
+        "only Linux receivers may spawn the iproute2 probe"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("TCP 192.0.2.1:") && stderr.contains("not reachable"),
@@ -8270,6 +8304,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
             .args(sources)
             .args(["--to", "fake.example"])
             .args(placement)
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
@@ -8629,6 +8664,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
             .arg(t.path("source"))
             .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
             .args(["--results", &t.s("results.ndjson")])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -8710,6 +8746,7 @@ fn small_push_preserves_results_with_closed_human_streams() {
             .arg(t.path("source"))
             .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
             .args(["--results", &t.s("results.ndjson")])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -8786,6 +8823,7 @@ fn small_push_refusals_and_failures_match_the_engine() {
             .args(sources)
             .args(["--to", "fake.example"])
             .args(placement)
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
@@ -9143,6 +9181,7 @@ fn native_remote_copy_omitted_placement_uses_destination_base() {
                     "-q",
                 ])
                 .args(args)
+                .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -11420,7 +11459,7 @@ fn writable_interrupted_partial_is_left_unchanged() {
     assert_eq!(fs::metadata(&partial).unwrap().mode() & 0o7777, 0o644);
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_local_exdev_fallback_leaves_no_partial() {
     let t = Tmp::new();
@@ -11440,9 +11479,12 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
             &t.s("dst"),
         ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
+        .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
     assert_eq!(read(&t.path("dst")), contents);
     assert!(partial_files(&t.0).is_empty());
 }
@@ -13620,6 +13662,7 @@ fn native_endpoint_port_reaches_ssh() {
             &t.s("dst"),
             "-q",
         ])
+        .env("XDG_CONFIG_HOME", t.path("config"))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -20742,6 +20785,7 @@ fn concurrent_small_pushes_publish_independent_files() {
                     "--as",
                     &t.s("remote-home/dst/file"),
                 ])
+                .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -20790,6 +20834,7 @@ fn concurrent_small_pushes_publish_independent_files() {
                 &t.s("removed.ndjson"),
                 &t.s("remote-home/dst"),
             ])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))

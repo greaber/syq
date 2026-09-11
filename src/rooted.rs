@@ -39,6 +39,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/macos_clone.rs"]
+mod macos_clone_support;
+
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
@@ -1044,6 +1048,245 @@ impl Root {
         Ok(file)
     }
 
+    /// Clone data into a new private sidecar, removing copied xattrs and user
+    /// flags to match byte-copy metadata behavior.
+    /// The private directory hides the source mode until it has been normalized.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clone_file(
+        &self,
+        source: &File,
+        source_metadata: &std::fs::Metadata,
+        path: &RelativePath,
+        size: u64,
+    ) -> Result<CloneOutcome> {
+        let fallback = |error: anyhow::Error| {
+            if crate::transfer::debug() {
+                crate::output::diagnostic!(
+                    "syq: clone {} unavailable; using byte copying: {error:#}",
+                    path.label()
+                );
+            }
+            Ok(CloneOutcome::Unsupported)
+        };
+        let parent = match self.resolve_parent(path) {
+            Ok(parent) => parent,
+            Err(error) => return fallback(error),
+        };
+        // Reuse the held parent for the partial check and clone publication.
+        // RENAME_EXCL below also protects a partial created after this check.
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return fallback(error.into()),
+        }
+        // A descendant mount can differ from the root device. Resolve and
+        // inspect the actual parent even for cached unsupported pairs; a root
+        // device shortcut would incorrectly reject eligible mounted volumes.
+        let parent_metadata = match parent.directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return fallback(error.into()),
+        };
+        let pair = (source_metadata.dev(), parent_metadata.dev());
+        // Process-local capability cache: file metadata and directory ACL failures
+        // are not properties of a filesystem pair and must never enter it.
+        let pairs = clone_volume_pairs();
+        let cached = pairs.lock().unwrap().get(&pair).copied();
+        let supported = if let Some(supported) = cached {
+            supported
+        } else {
+            // This optimization targets APFS. Reject exFAT/SMB and other
+            // destinations before probing ACLs or creating staging directories.
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            let supported = if pair.0 != pair.1 {
+                false
+            } else {
+                if let Err(error) = retry_zero(|| unsafe {
+                    libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
+                }) {
+                    return fallback(anyhow::Error::new(error).context("inspect clone filesystem"));
+                }
+                let stats = unsafe { stats.assume_init() };
+                unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
+                    == b"apfs"
+            };
+            #[cfg(debug_assertions)]
+            let supported =
+                supported && std::env::var_os("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME").is_none();
+            pairs.lock().unwrap().insert(pair, supported);
+            supported
+        };
+        if !supported {
+            return Ok(CloneOutcome::UnsupportedVolume {
+                source_dev: pair.0,
+                destination_dev: pair.1,
+            });
+        }
+        if !clone_flags_can_be_removed(source_metadata) {
+            return Ok(CloneOutcome::Unsupported);
+        }
+        // An extra staging directory must not change destination ACL inheritance.
+        match clone_directory_has_no_inheritable_acl(&parent.directory) {
+            Ok(true) => {}
+            Ok(false) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error),
+        }
+        let temporary = match create_temporary(&parent, |fd, name| {
+            #[cfg(debug_assertions)]
+            fail_clone_mkdir_for_test()?;
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
+        }) {
+            Ok(temporary) => temporary,
+            Err(error) => return fallback(error.context("create private clone directory")),
+        };
+        let leaf = &c"data".to_owned();
+        let mut trusted_directory = None;
+        let result = (|| -> Result<CloneOutcome> {
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
+                libc::EIO,
+                "test clone directory failure",
+            )?;
+            // Open with search access, then restore owner permissions on the
+            // empty directory. If umask also removed search access, opening can
+            // fail; cleanup below still removes it before byte copying begins.
+            let directory = open_directory_at(&parent.directory, temporary.as_bytes())
+                .context("open private clone directory")?;
+            let metadata = directory.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            // Preserve inherited setgid while restoring owner access.
+            let private_mode = 0o700 | (metadata.mode() as libc::mode_t & 0o2000);
+            retry_zero(|| unsafe { libc::fchmod(directory.as_raw_fd(), private_mode) })
+                .context("set private clone directory permissions")?;
+            #[cfg(debug_assertions)]
+            make_clone_directory_public_for_test(&directory)?;
+            if directory.metadata()?.mode() & 0o7777 != u32::from(private_mode) {
+                // Some filesystems synthesize permissions. Fall back without
+                // putting source data into a directory we cannot keep private.
+                return Ok(CloneOutcome::Unsupported);
+            }
+            if !clone_directory_has_no_inheritable_acl(&directory)? {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            trusted_directory = Some(directory);
+            let directory = trusted_directory.as_ref().unwrap();
+            // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
+            // function but not this constant. Do not request source ACLs.
+            const CLONE_NOOWNERCOPY: u32 = 0x0002;
+            #[cfg(debug_assertions)]
+            record_clone_attempt_for_test().context("clone local file")?;
+            let cloned = unsafe {
+                libc::fclonefileat(
+                    source.as_raw_fd(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    CLONE_NOOWNERCOPY,
+                )
+            };
+            if cloned != 0 {
+                // The device/filesystem probe established volume eligibility.
+                // Even an unsupported errno here may describe just this inode;
+                // it must not disable cloning for other files on the volume.
+                return Err(io::Error::last_os_error()).context("clone local file");
+            }
+            // Clear inherited flags before chmod or opening another descriptor:
+            // descriptor pressure must not leave an immutable, undeletable clone.
+            // The private directory and fixed leaf keep this operation confined.
+            clear_clone_flags_at(directory, leaf)?;
+            retry_zero(|| unsafe {
+                libc::fchmodat(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0o600,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+            .context("set private clone permissions")?;
+            let file = open_clone_for_copy(directory, leaf).context("open normalized clone")?;
+            if !strip_clone_xattrs(&file)? {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            if file.metadata()?.len() != size {
+                // Streaming and the final source re-stat handle concurrent
+                // growth/shrinkage using the same retry policy as other copies.
+                return Ok(CloneOutcome::Unsupported);
+            }
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
+                libc::ENOSPC,
+                "test clone failure",
+            )?;
+            retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
+            // Do not replace an existing resumable partial, including one that
+            // appeared after the caller checked. Both directory fds stay pinned.
+            let published = unsafe {
+                libc::renameatx_np(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if published != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(CloneOutcome::Unsupported);
+                }
+                return Err(error).context("stage cloned local file");
+            }
+            Ok(CloneOutcome::Copied(file))
+        })();
+        let cleanup = (|| -> Result<()> {
+            if let Some(directory) =
+                trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied(_))))
+            {
+                match unlink_at(directory.as_raw_fd(), leaf, 0) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("remove unpublished clone"),
+                }
+            }
+            // Also runs when opening or checking the new directory failed.
+            // rmdir cannot traverse a replacement or delete its contents.
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_RMDIR",
+                libc::EACCES,
+                "test clone staging rmdir failure",
+            )?;
+            unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
+                .context("remove private clone directory")
+        })();
+        #[cfg(debug_assertions)]
+        let cleanup = cleanup.and_then(|()| {
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_CLEANUP",
+                libc::EACCES,
+                "test clone cleanup failure",
+            )
+        });
+        match (result, cleanup) {
+            (Err(copy_error), Err(cleanup_error)) => {
+                let original = format!("{copy_error:#}");
+                Err(copy_error.context(format!(
+                    "{original}; additionally, clone cleanup failed: {cleanup_error:#}"
+                )))
+            }
+            // Publication here only names the resumable partial, not the final
+            // destination. Keep cleanup failure visible; rerunning verifies and
+            // finishes that partial through the ordinary resume path.
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            // Cloning is optional, but falling back is safe only once its
+            // unpublished data and private directory have been removed.
+            (Err(copy_error), Ok(())) => fallback(copy_error),
+            (Ok(outcome), Ok(())) => Ok(outcome),
+        }
+    }
+
     /// Create exactly one directory. Parents must already exist and be real
     /// directories beneath this root.
     pub(crate) fn create_directory(&self, path: &RelativePath, mode: u32) -> Result<()> {
@@ -1757,9 +2000,258 @@ impl Root {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) enum CloneOutcome {
+    // Keep the normalized inode open through staging cleanup. Tests also use
+    // this handle to inspect metadata and write without reopening the path.
+    Copied(File),
+    Unsupported,
+    UnsupportedVolume {
+        source_dev: u64,
+        destination_dev: u64,
+    },
+}
+
+#[cfg(all(target_os = "macos", test))]
+impl CloneOutcome {
+    fn copied(self) -> Option<File> {
+        match self {
+            Self::Copied(file) => Some(file),
+            Self::Unsupported | Self::UnsupportedVolume { .. } => None,
+        }
+    }
+}
+
 struct ResolvedParent {
     directory: File,
     leaf: CString,
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn fail_clone_for_test(variable: &str, code: libc::c_int, context: &str) -> Result<()> {
+    if std::env::var_os(variable).is_some() {
+        return Err(io::Error::from_raw_os_error(code)).context(context.to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn fail_clone_mkdir_for_test() -> io::Result<()> {
+    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_MKDIR_ERROR") {
+        return Err(io::Error::from_raw_os_error(match error.as_str() {
+            "EACCES" => libc::EACCES,
+            "EPERM" => libc::EPERM,
+            "EMLINK" => libc::EMLINK,
+            _ => libc::EIO,
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn make_clone_directory_public_for_test(directory: &File) -> Result<()> {
+    if std::env::var_os("SYQ_TEST_CLONE_PUBLIC_DIRECTORY").is_some() {
+        retry_zero(|| unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) })?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn record_clone_attempt_for_test() -> io::Result<()> {
+    if let Some(events) = std::env::var_os("SYQ_TEST_CLONE_ATTEMPTS") {
+        use std::io::Write;
+        writeln!(
+            OpenOptions::new().create(true).append(true).open(events)?,
+            "clone"
+        )?;
+    }
+    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_ERROR") {
+        if let Some(once) = std::env::var_os("SYQ_TEST_CLONE_ERROR_ONCE") {
+            match OpenOptions::new().write(true).create_new(true).open(once) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        return Err(io::Error::from_raw_os_error(match error.as_str() {
+            "EPERM" => libc::EPERM,
+            "EXDEV" => libc::EXDEV,
+            "ENOTSUP" => libc::ENOTSUP,
+            "ENOSYS" => libc::ENOSYS,
+            _ => libc::EIO,
+        }));
+    }
+    Ok(())
+}
+
+// APFS eligibility uses device pairs, whereas Linux offload distinguishes
+// mounts and their NFS/synchronous traits. Keep this clone-specific cache here:
+// file metadata and ACL refusals must not disable other files on the volume.
+#[cfg(target_os = "macos")]
+fn clone_volume_pairs() -> &'static Mutex<HashMap<(u64, u64), bool>> {
+    static PAIRS: OnceLock<Mutex<HashMap<(u64, u64), bool>>> = OnceLock::new();
+    PAIRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Darwin's ACL functions and constants from <sys/acl.h> are not exposed by
+// libc. Keep the opaque allocation within this function and release it once.
+#[cfg(target_os = "macos")]
+fn clone_directory_has_no_inheritable_acl(directory: &File) -> Result<bool> {
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_get_flagset_np(
+            entry: *mut libc::c_void,
+            flags: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_get_flag_np(flags: *mut libc::c_void, flag: libc::c_int) -> libc::c_int;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        // acl_get_fd_np uses ENOENT when the held inode has no ACL property.
+        // This is distinct from an allocated ACL with zero entries below.
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(true);
+        }
+        if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EACCES)) {
+            return Ok(false);
+        }
+        return Err(error).context("inspect clone destination ACL");
+    }
+    let result = (|| -> Result<bool> {
+        let mut entry = std::ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        loop {
+            if unsafe { acl_get_entry(acl, entry_id, &mut entry) } != 0 {
+                let error = io::Error::last_os_error();
+                // Darwin ends iteration with -1/EINVAL, including empty ACLs.
+                return if error.raw_os_error() == Some(libc::EINVAL) {
+                    Ok(true)
+                } else {
+                    Err(error).context("inspect clone destination ACL entry")
+                };
+            }
+            const ACL_NEXT_ENTRY: libc::c_int = -1;
+            entry_id = ACL_NEXT_ENTRY;
+            let mut flags = std::ptr::null_mut();
+            retry_zero(|| unsafe { acl_get_flagset_np(entry, &mut flags) })?;
+            // Non-inheritable entries (such as Downloads' deny-delete ACL)
+            // cannot change the ACL of either the staging directory or clone.
+            for flag in [1 << 5, 1 << 6] {
+                // FILE_INHERIT, DIRECTORY_INHERIT
+                match unsafe { acl_get_flag_np(flags, flag) } {
+                    0 => {}
+                    1 => return Ok(false),
+                    _ => return Err(io::Error::last_os_error()).context("inspect ACL inheritance"),
+                }
+            }
+        }
+    })();
+    unsafe {
+        acl_free(acl);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
+    #[cfg(debug_assertions)]
+    fail_clone_for_test(
+        "SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS",
+        libc::EPERM,
+        "test clear clone flags failure",
+    )?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_FLAGS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut flags = 0u32;
+    retry_zero(|| unsafe {
+        libc::setattrlistat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            (&mut flags as *mut u32).cast(),
+            std::mem::size_of_val(&flags),
+            libc::FSOPT_NOFOLLOW,
+        )
+    })
+    .context("clear private clone flags")
+}
+
+#[cfg(target_os = "macos")]
+fn open_clone_for_copy(directory: &File, leaf: &CString) -> io::Result<File> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_CLONE_OPEN_EMFILE").is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    open_at(
+        directory.as_raw_fd(),
+        leaf,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clone_flags_can_be_removed(metadata: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    // Compressed-file xattrs can hold the actual data, so stripping them is
+    // not equivalent to copying logical bytes. System flags may require root
+    // to clear, including flags that prevent deleting an unpublished clone.
+    let flags = metadata.st_flags();
+    flags & (!libc::UF_SETTABLE | libc::UF_COMPRESSED) == 0
+}
+
+#[cfg(target_os = "macos")]
+fn strip_clone_xattrs(file: &File) -> Result<bool> {
+    let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return Err(error).context("list cloned extended attributes");
+    }
+    if count == 0 {
+        return Ok(true);
+    }
+    let mut names = vec![0u8; count as usize];
+    let count =
+        unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0) };
+    if count < 0 {
+        return Err(io::Error::last_os_error()).context("read cloned extended attributes");
+    }
+    // The source can acquire filesystem compression after its initial stat.
+    // Its cloned compression payload must never be stripped and published as
+    // ordinary bytes, even though the private clone's flags are already clear.
+    if names[..count as usize]
+        .split(|&byte| byte == 0)
+        .any(|name| name == b"com.apple.decmpfs")
+    {
+        return Ok(false);
+    }
+    for name in names[..count as usize]
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = component_cstring(name);
+        if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            return Err(error).context("remove cloned extended attribute");
+        }
+    }
+    Ok(true)
 }
 
 fn component_cstring(component: &[u8]) -> CString {
@@ -2593,6 +3085,379 @@ mod tests {
 
     fn relative(path: &[u8]) -> RelativePath {
         RelativePath::new(path).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_is_private_independent_and_never_replaces_a_partial() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let t = TestDir::new("clone");
+        // A setgid destination may pass its group and setgid bit to the
+        // private directory; that does not make the directory public.
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o2700)).unwrap();
+        let source_path = t.path().join("source");
+        fs::write(&source_path, b"original data").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        let clone = root
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                13,
+            )
+            .unwrap()
+            .copied()
+            .expect("macOS clone tests require a clone-capable filesystem (APFS)");
+        assert_eq!(clone.metadata().unwrap().mode() & 0o7777, 0o600);
+        assert_ne!(
+            source.metadata().unwrap().ino(),
+            clone.metadata().unwrap().ino()
+        );
+        assert!(root
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                13
+            )
+            .unwrap()
+            .copied()
+            .is_none());
+        (&clone).write_all(b"changed clone").unwrap();
+        assert_eq!(fs::read(&source_path).unwrap(), b"original data");
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+        for planned_size in [12, 14] {
+            assert!(root
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"wrong-size"),
+                    planned_size
+                )
+                .unwrap()
+                .copied()
+                .is_none());
+        }
+        assert!(!t.path().join("wrong-size").exists());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_strips_xattrs_and_user_flags_without_changing_source() {
+        use std::os::macos::fs::MetadataExt;
+        if !macos_clone_support::available() {
+            return;
+        }
+        let t = TestDir::new("clone-metadata");
+        let source_path = t.path().join("source");
+        fs::write(&source_path, b"data").unwrap();
+        let source = File::open(&source_path).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        for (name, value) in [
+            (c"com.apple.quarantine", b"0081;66000000;syq;".as_slice()),
+            (
+                c"com.apple.FinderInfo",
+                b"TEXTttxt000000000000000000000000".as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                unsafe {
+                    libc::fsetxattr(
+                        source.as_raw_fd(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                        0,
+                    )
+                },
+                0
+            );
+        }
+        for flags in [libc::UF_NODUMP, libc::UF_IMMUTABLE, libc::UF_APPEND] {
+            assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), flags) }, 0);
+            let result = root.clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                4,
+            );
+            let source_flags = source.metadata().unwrap().st_flags();
+            // Restore fixture mutability even if cloning failed.
+            assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+            let clone = result
+                .unwrap()
+                .copied()
+                .expect("ordinary xattrs and user flags must allow cloning");
+            assert_eq!(source_flags, flags);
+            assert_eq!(clone.metadata().unwrap().st_flags(), 0);
+            // macOS can add its own provenance attribute after publication,
+            // including on byte copies. Check the source attributes by name.
+            for (name, value) in [
+                (c"com.apple.quarantine", b"0081;66000000;syq;".as_slice()),
+                (
+                    c"com.apple.FinderInfo",
+                    b"TEXTttxt000000000000000000000000".as_slice(),
+                ),
+            ] {
+                macos_clone_support::assert_xattr(&clone, name, None);
+                macos_clone_support::assert_xattr(&source, name, Some(value));
+            }
+            (&clone).write_all(b"copy").unwrap();
+            assert_eq!(fs::read(&source_path).unwrap(), b"data");
+            fs::remove_file(t.path().join("partial")).unwrap();
+        }
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_refuses_compression_added_after_source_snapshot() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        use std::os::macos::fs::MetadataExt;
+        let t = TestDir::new("clone-raced-compression");
+        let original = t.path().join("original");
+        let compressed = t.path().join("compressed");
+        let data = b"compressible test data\n".repeat(250_000);
+        fs::write(&original, &data).unwrap();
+        let snapshot = fs::metadata(&original).unwrap();
+        assert!(Command::new("/usr/bin/ditto")
+            .arg("--hfsCompression")
+            .arg(&original)
+            .arg(&compressed)
+            .status()
+            .unwrap()
+            .success());
+        let source = File::open(&compressed).unwrap();
+        assert_ne!(
+            source.metadata().unwrap().st_flags() & libc::UF_COMPRESSED,
+            0
+        );
+        // Model a source compressed between the prelude stat and cloning.
+        let root = Root::open(t.path()).unwrap();
+        assert!(root
+            .clone_file(&source, &snapshot, &relative(b"partial"), data.len() as u64)
+            .unwrap()
+            .copied()
+            .is_none());
+        assert_eq!(fs::read(&compressed).unwrap(), data);
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_falls_back_for_destination_acl_inheritance() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        let t = TestDir::new("clone-acl");
+        fs::write(t.path().join("source"), b"data").unwrap();
+        let source = File::open(t.path().join("source")).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        for rule in [
+            "everyone allow read,readattr,readextattr,readsecurity,file_inherit",
+            "everyone allow read,readattr,readextattr,readsecurity,directory_inherit",
+        ] {
+            assert!(Command::new("/bin/chmod")
+                .args(["+a", "everyone deny delete"])
+                .arg(t.path())
+                .status()
+                .unwrap()
+                .success());
+            assert!(root
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"noninherited"),
+                    4
+                )
+                .unwrap()
+                .copied()
+                .is_some());
+            fs::remove_file(t.path().join("noninherited")).unwrap();
+            assert!(Command::new("/bin/chmod")
+                .args(["+a", rule])
+                .arg(t.path())
+                .status()
+                .unwrap()
+                .success());
+            assert!(root
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"partial"),
+                    4
+                )
+                .unwrap()
+                .copied()
+                .is_none());
+            assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+            assert!(Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(t.path())
+                .status()
+                .unwrap()
+                .success());
+            // Ineligibility is per-directory, never cached for the volume.
+            assert!(root
+                .clone_file(
+                    &source,
+                    &source.metadata().unwrap(),
+                    &relative(b"after-acl"),
+                    4
+                )
+                .unwrap()
+                .copied()
+                .is_some());
+            fs::remove_file(t.path().join("after-acl")).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_normalizes_mode_before_opening() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        let t = TestDir::new("clone-owner-mode");
+        let path = t.path().join("source");
+        fs::write(&path, b"data").unwrap();
+        // ACL read access lets us reproduce a caller-readable source whose
+        // owner bits forbid reading, without requiring a second OS account.
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o044)).unwrap();
+        let source = File::open(&path).unwrap();
+        let root = Root::open(t.path()).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow read,readattr,readextattr,readsecurity"
+            ])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            unsafe { libc::fchflags(source.as_raw_fd(), libc::UF_IMMUTABLE) },
+            0
+        );
+        let locked = root.clone_file(
+            &source,
+            &source.metadata().unwrap(),
+            &relative(b"locked"),
+            4,
+        );
+        assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
+        let locked = locked
+            .unwrap()
+            .copied()
+            .expect("flags are cleared before owner access");
+        assert_eq!(locked.metadata().unwrap().mode() & 0o777, 0o600);
+        fs::remove_file(t.path().join("locked")).unwrap();
+        let clone = root
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"partial"),
+                4,
+            )
+            .unwrap()
+            .copied()
+            .unwrap();
+        assert_eq!(clone.metadata().unwrap().mode() & 0o777, 0o600);
+        (&clone).write_all(b"copy").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"data");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_clone_noownercopy_does_not_copy_source_acl() {
+        if !macos_clone_support::available() {
+            return;
+        }
+        let t = TestDir::new("clone-source-acl");
+        let path = t.path().join("source");
+        fs::write(&path, b"data").unwrap();
+        for rule in [
+            "everyone deny write,append",
+            "everyone allow read,readattr,readextattr,readsecurity",
+        ] {
+            assert!(Command::new("/bin/chmod")
+                .args(["+a", rule])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let source = File::open(&path).unwrap();
+        let parent = File::open(t.path()).unwrap();
+        // Independent API check, before syq performs any normalization.
+        assert_eq!(
+            unsafe {
+                libc::fclonefileat(
+                    source.as_raw_fd(),
+                    parent.as_raw_fd(),
+                    c"raw-clone".as_ptr(),
+                    2,
+                )
+            },
+            0
+        );
+        let source_acl = Command::new("/bin/ls")
+            .arg("-le")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let clone_acl = Command::new("/bin/ls")
+            .arg("-le")
+            .arg(t.path().join("raw-clone"))
+            .output()
+            .unwrap();
+        assert!(source_acl.status.success() && clone_acl.status.success());
+        let source_acl = String::from_utf8(source_acl.stdout).unwrap();
+        let clone_acl = String::from_utf8(clone_acl.stdout).unwrap();
+        eprintln!("source ACL:\n{source_acl}raw CLONE_NOOWNERCOPY clone:\n{clone_acl}");
+        assert!(source_acl.contains("deny") && source_acl.contains("allow"));
+        assert!(
+            !clone_acl.contains("deny") && !clone_acl.contains("allow"),
+            "{clone_acl}"
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(t.path().join("raw-clone"))
+            .unwrap();
+        let root = Root::open(t.path()).unwrap();
+        let clone = root
+            .clone_file(
+                &source,
+                &source.metadata().unwrap(),
+                &relative(b"normalized"),
+                4,
+            )
+            .unwrap()
+            .copied()
+            .unwrap();
+        (&clone).write_all(b"copy").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"data");
     }
 
     #[cfg(target_os = "linux")]

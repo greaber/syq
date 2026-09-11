@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -125,6 +125,8 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
             opts.tuning
                 .request_size(opts.block, bwlimit, opts.restricted_receiver),
         );
+    // macOS retains its normal batching ceiling: clone refusal must not turn
+    // medium files into a per-file probe followed by range requests.
     if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
@@ -136,6 +138,9 @@ pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
+    /// Process-local negative hints keyed by source and destination devices.
+    /// A current local parent stat keeps descendant mounts independent.
+    local_copy_unavailable: Mutex<std::collections::HashSet<(u64, u64)>>,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -177,6 +182,18 @@ pub struct Opts {
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+}
+
+fn local_copy_enabled(opts: &Opts, bandwidth_limited: bool) -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+        && opts.same_host
+        && !opts.tuning.force_ranges()
+        && !opts.checksum
+        && !opts.verify_only
+        && !opts.dry_run
+        && !opts.restricted_receiver
+        && !bandwidth_limited
+        && !(cfg!(target_os = "macos") && opts.inplace)
 }
 
 fn print_benchmark_observations(opts: &Opts) {
@@ -1591,6 +1608,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             interface_option(&args, "--tcp-congestion", "--syq-tcp-congestion")
         );
     }
+    // Every destination worker runs in a receiver process. On Darwin this
+    // also keeps foreign descriptor claims out of the spawning coordinator;
+    // the receiver itself has no child-process launch paths on that platform.
     if matches!(dst_ep, Endpoint::Local { .. }) {
         let mut receiver = RemoteSpec::local_receiver(args.quiet);
         receiver.read_ahead = args.tuning_options.unwrap_or_default().pipeline_depth();
@@ -1622,6 +1642,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let opts = Arc::new(Opts {
+        local_copy_unavailable: Mutex::new(Default::default()),
         block,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
@@ -1777,7 +1798,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
+                            let copy_sources = if local_copy_enabled(&opts, bwlimit.is_some()) {
                                 initial_sources.clone()
                             } else {
                                 Vec::new()
@@ -1968,11 +1989,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Local { .. } => 0,
         Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
-    // On Linux, each same-machine destination worker also claims the exact
-    // source capabilities from the source endpoint's broker before reporting
-    // ready. These are foreign-session claims even when both logical endpoints
-    // are local to the coordinator process.
-    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
+    // Only workers that can attempt local offload need foreign source claims.
+    // Actual local destinations live in a separate receiver process.
+    let copy_local_claim_workers = if local_copy_enabled(&opts, bwlimit.is_some()) {
         maximum_workers
     } else {
         0
@@ -3014,13 +3033,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // instead discovers a partial or an unsupported offload,
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
-                    let single_direct_candidate = autotune
-                        && !opts.tuning.force_ranges()
-                        && opts.same_host
-                        && !opts.checksum
-                        && !opts.verify_only
-                        && bwlimit.is_none()
-                        && {
+                    let single_direct_candidate =
+                        autotune && local_copy_enabled(&opts, bwlimit.is_some()) && {
                             let jobs = sched.jobs.lock().unwrap();
                             matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
                         };
@@ -7919,10 +7933,7 @@ impl Worker {
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self.opts.same_host
-            && !self.opts.tuning.force_ranges()
-            && !self.opts.checksum
-            && self.bwlimit.is_none()
+        if local_copy_enabled(&self.opts, self.bwlimit.is_some())
             && job.entry.size > 0
             && job.container_guard.is_none()
         {
@@ -8101,6 +8112,24 @@ impl Worker {
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
+        // Only same-host macOS receivers emit these hints. After a refusal,
+        // stat the local parent instead of paying another receiver RPC for
+        // each directory. Never infer a descendant's device from an ancestor:
+        // it may be a mountpoint. A failed stat leaves the receiver in charge.
+        let has_volume_refusal = !self.opts.local_copy_unavailable.lock().unwrap().is_empty();
+        if has_volume_refusal {
+            if let Ok(parent) = std::fs::metadata(OsStr::from_bytes(&parent_path(&job.dst))) {
+                if self
+                    .opts
+                    .local_copy_unavailable
+                    .lock()
+                    .unwrap()
+                    .contains(&(job.entry.dev, parent.dev()))
+                {
+                    return Ok(false);
+                }
+            }
+        }
         // Write to a partial and let finish_file rename it, so an interrupted
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
@@ -8137,6 +8166,17 @@ impl Worker {
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
+            Response::CopyLocalUnsupportedVolume {
+                source_dev,
+                destination_dev,
+            } => {
+                // Queued siblings still use the planning-time source device,
+                // even if the receiver opened a replacement on another volume.
+                let mut unavailable = self.opts.local_copy_unavailable.lock().unwrap();
+                unavailable.insert((source_dev, destination_dev));
+                unavailable.insert((job.entry.dev, destination_dev));
+                Ok(false)
+            }
             Response::EndpointError(error) => Err(endpoint_error(error)),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
@@ -8936,6 +8976,7 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
+            local_copy_unavailable: Mutex::new(Default::default()),
             block: 512,
             tuning: crate::transfer_tuning::TransferTuning {
                 copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -9044,6 +9085,82 @@ mod tests {
             .iter()
             .all(|r| matches!(r, Request::WriteRange { .. })));
         assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn local_copy_volume_refusal_covers_both_source_devices_across_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, b"data").unwrap();
+        let mut entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+        entry.dev = 11;
+        let destination_dev = directory.path().metadata().unwrap().dev();
+        let destination = |name: &str| directory.path().join(name).as_os_str().as_bytes().to_vec();
+        std::fs::create_dir(directory.path().join("subdir")).unwrap();
+        let sched = Arc::new(Sched::new(512, 8192));
+        let mut job = FileJob {
+            src: b"source".to_vec(),
+            source: RegisteredPath {
+                root: serde_json::from_str("0").unwrap(),
+                relative: b"source".to_vec(),
+            },
+            dst: destination("first"),
+            rel: "first".into(),
+            entry,
+            dst_entry: None,
+            target_condition: TargetCondition::Any,
+            container_guard: None,
+            attempt: 0,
+            done: Arc::new(AtomicU64::new(0)),
+            inplace: false,
+            rel_bytes: b"first".to_vec(),
+            src_rel: None,
+        };
+        sched.push_file(job.clone());
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        dst.lock().unwrap().replies.extend([
+            Response::CopyLocalUnsupportedVolume {
+                source_dev: 22,
+                destination_dev,
+            },
+            // A refusal on a different destination device must not affect this
+            // directory, even with the same source device and pathname.
+            Response::CopyLocalUnsupportedVolume {
+                source_dev: 33,
+                destination_dev: destination_dev + 1,
+            },
+            Response::CopyLocalUnsupported,
+            Response::CopyLocalUnsupported,
+            Response::CopyLocalUnsupported,
+        ]);
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        // Both queued and newly scanned siblings skip the RPC, across parents.
+        for device in [11, 22] {
+            for name in ["sibling", "subdir/child"] {
+                job.dst = destination(name);
+                job.entry.dev = device;
+                assert!(!worker.try_copy_local(0, &job).unwrap());
+            }
+        }
+        assert_eq!(dst.lock().unwrap().requests.len(), 1);
+        job.entry.dev = 33;
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        // A file-specific refusal must not suppress the next attempt either.
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        assert_eq!(dst.lock().unwrap().requests.len(), 4);
+        // Unknown parent devices cannot match a negative volume hint.
+        job.entry.dev = 11;
+        job.dst = destination("missing/child");
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        assert_eq!(dst.lock().unwrap().requests.len(), 5);
+        let unavailable = worker.opts.local_copy_unavailable.lock().unwrap();
+        assert_eq!(unavailable.len(), 3);
+        assert!(unavailable.contains(&(11, destination_dev)));
+        assert!(unavailable.contains(&(22, destination_dev)));
+        assert!(unavailable.contains(&(33, destination_dev + 1)));
     }
 
     #[test]

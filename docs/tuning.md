@@ -63,7 +63,8 @@ to await replies at once. Both can increase memory use. Neither changes the
 hash blocks used for integrity checks and resume.
 
 `copy-path=ranges` disables small-file batches and whole-file shortcuts,
-including local kernel copying. Matching data can still be skipped or reused.
+including local kernel copying and APFS cloning. Matching data can still be
+skipped or reused.
 `auto` lets syq choose normally.
 
 ### Streaming and request windows
@@ -119,6 +120,11 @@ request size, worker count, compression, and transport buffering. With
 limit is an average copy rate, not a strict cap on incoming bursts.
 
 ### Batch size and splitting
+
+For macOS local copies, files above the batching limit can use APFS cloning.
+The limit is the smallest of the hash block size (normally 4 MiB for `syq cp`),
+`batch-bytes`, and the effective `request-size`. Changing these limits changes
+which files can be cloned; `syq rsync --block-size` changes the hash block size.
 
 For example, compare small-file batches with:
 

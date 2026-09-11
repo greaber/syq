@@ -69,3 +69,7 @@ strip = "symbols"
 libc = "0.2"
 serde_json = "1"
 jsonschema = { version = "0.33", default-features = false }
+
+[lints.clippy]
+# Receiver modules opt into the subprocess restrictions in clippy.toml.
+disallowed_methods = "allow"

@@ -762,8 +762,8 @@ pub enum Request {
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
-    /// Receiver-side copy of a same-machine file (copy_file_range when
-    /// possible, otherwise an eligible sequential userspace fallback).
+    /// Receiver-side copy of a same-machine file (Linux copy_file_range,
+    /// macOS cloning, or an eligible sequential userspace fallback).
     /// Local and NFS fallback policies are independent. `CopyLocalUnsupported`
     /// tells the caller to use the normal streaming path.
     CopyLocal {
@@ -1124,6 +1124,13 @@ pub enum Response {
     ReadStreamDone,
     WriteStreamDone,
     Prepared(Preparation),
+    /// This source/destination device pair cannot clone files. Only
+    /// same-executable local macOS receivers emit this hint; existing response
+    /// discriminants and remote helper exchanges stay unchanged.
+    CopyLocalUnsupportedVolume {
+        source_dev: u64,
+        destination_dev: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -2197,6 +2204,28 @@ mod tests {
 
     #[test]
     fn copy_local_fallback_has_a_structured_wire_response() {
+        // Released v0.5.2's postcard encoding: response discriminant 32,
+        // no payload. Keep this fixed fixture independent of today's encoder.
+        const V052_UNSUPPORTED: &[u8] = &[32];
+        assert!(matches!(
+            postcard::from_bytes::<Response>(V052_UNSUPPORTED).unwrap(),
+            Response::CopyLocalUnsupported
+        ));
+        assert_eq!(
+            postcard::to_stdvec(&Response::CopyLocalUnsupported).unwrap(),
+            V052_UNSUPPORTED
+        );
+        let hint = Response::CopyLocalUnsupportedVolume {
+            source_dev: 123,
+            destination_dev: 456,
+        };
+        assert!(matches!(
+            postcard::from_bytes::<Response>(&postcard::to_stdvec(&hint).unwrap()).unwrap(),
+            Response::CopyLocalUnsupportedVolume {
+                source_dev: 123,
+                destination_dev: 456
+            }
+        ));
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, false)
             .write_msg(&Response::CopyLocalUnsupported)

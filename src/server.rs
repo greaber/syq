@@ -437,6 +437,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             destination: None, ..
         } => {}
     }
+    // All foreign descriptor claims and their close-on-exec setup are complete
+    // before readiness is acknowledged or this connection starts its reader.
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
@@ -854,15 +856,26 @@ fn serve<R: Read + Send + 'static, W: Write>(
 }
 
 fn is_virtual_iface(name: &str) -> bool {
-    name == "lo"
+    if name == "lo"
         || [
             "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
         ]
         .iter()
         .any(|p| name.starts_with(p))
-        || std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn iface_speed(name: &str) -> u32 {
     std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
         .ok()
@@ -900,13 +913,21 @@ fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
             .nth(2)
             .and_then(|ip| ip.parse::<IpAddr>().ok())
     });
-    let out = std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output();
-    let text = out
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    advertised_addrs(&text, ssh_ip, families, iface_speed)
+    // Only Linux has this iproute2/sysfs probe. The Darwin receiver must not
+    // spawn children: its workers receive SCM_RIGHTS before setting CLOEXEC.
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::process::Command::new("ip")
+            .args(["-o", "addr", "show"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        advertised_addrs(&text, ssh_ip, families, iface_speed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        advertised_addrs("", ssh_ip, families, |_| 0)
+    }
 }
 
 /// Priority bucket for an advertised address: lower sorts first. The address

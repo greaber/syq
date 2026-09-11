@@ -7,6 +7,23 @@ syq cp project --into backup
 This copies `project` to `backup/project`. Existing files are updated when
 needed; unrelated files stay.
 
+On macOS, eligible local files use filesystem cloning when both paths are on
+the same APFS volume. The copy initially shares disk blocks with the source;
+later changes to either file are independent. Reported bytes count the file's
+size, so the displayed rate can exceed the disk's physical throughput.
+Other filesystems and cross-volume copies use normal copying.
+
+Syq groups small files into requests to reduce per-file overhead; larger files
+can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
+tuning affects this choice.
+
+Cloning keeps the usual overwrite and metadata rules. Writing in place,
+comparing checksums, or setting a bandwidth limit uses normal copying. So does explicitly
+selecting [range transfers](tuning.md). Destination directories with
+inheritable access control entries, filesystem-compressed files, and files
+whose metadata cannot be safely removed also use normal copying. Cloned copies
+omit source extended attributes and file flags, just as normal copies do.
+
 The default final summary reports transferred files and bytes, unchanged
 files and bytes, directories created, elapsed time, rate, and any errors.
 
@@ -302,6 +319,15 @@ The results use the same `mode: "rm"` records as `syq rm`; they do not distingui
 a partial sweep from other removal commands.
 A regular file deliberately named like a partial is also selected. Old partial
 formats are neither reused nor selected by this command; remove those manually.
+
+An abruptly stopped macOS clone can also leave a hidden directory named
+`.syq-swap-<pid>-<counter>` beside the destination, possibly containing a `data`
+file. Syq does not resume or automatically remove these directories. After
+stopping all copies using that destination, you can remove those leftover
+directories and their contents. An error removing a `.syq-swap-` directory leaves
+the final destination unchanged and may leave a complete partial. Rerun the
+copy to finish; use `syq clean-partials` as described above to remove leftover
+partials after all copies have stopped.
 
 ## Check file contents
 
