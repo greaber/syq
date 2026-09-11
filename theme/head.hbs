@@ -1,0 +1,10 @@
+{{!-- Social card metadata. og:image is intentionally absent: the repository
+      carries no stable social image, and mdBook's generated favicon is
+      content-hashed, so its filename changes between builds.
+      og:url is absent too: the page path is only available here as a `.md`
+      source path, and a URL that redirects is worse than none. --}}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ book_title }}">
+<meta property="og:title" content="{{ title }}">
+<meta property="og:description" content="{{ description }}">
+<meta name="twitter:card" content="summary">
