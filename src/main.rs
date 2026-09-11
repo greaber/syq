@@ -27,6 +27,7 @@ mod receive_approval;
 mod receive_service;
 mod remote_helper;
 mod remote_to_remote;
+mod remote_user_install;
 mod restricted;
 mod results;
 mod resume;
@@ -139,6 +140,10 @@ fn main() {
             crate::output::diagnostic!("syq: {error:#}");
             std::process::exit(2);
         }
+        return;
+    }
+    if argv.len() == 2 && argv[1] == "--install-remote-command" {
+        remote_user_install::install();
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {

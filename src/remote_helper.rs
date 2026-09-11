@@ -248,7 +248,8 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+{install_command}"#,
         target_key = target.key,
         archive_url = shell_words::quote(&archive_url),
         manifest_url = shell_words::quote(&manifest_url),
@@ -257,6 +258,11 @@ trap - EXIT HUP INT TERM"#,
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = if crate::identity::is_release_build() {
+            "\"$program\" --install-remote-command </dev/null || :"
+        } else {
+            ""
+        },
     )
 }
 
@@ -307,11 +313,17 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+{install_command}"#,
         target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = if crate::identity::is_release_build() {
+            "\"$program\" --install-remote-command </dev/null || :"
+        } else {
+            ""
+        },
     )
 }
 

@@ -2889,6 +2889,9 @@ impl RemoteSpec {
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
+            if authorized && !detail.is_empty() {
+                crate::output::diagnostic!("syq: {}: {detail}", self.label());
+            }
             return if authorized {
                 Ok(RemoteDownloadOutcome::Installed)
             } else {
@@ -2942,6 +2945,10 @@ impl RemoteSpec {
                 out.status,
                 output_suffix(&out.stderr.bytes)
             );
+        }
+        let detail = output_message(&out.stderr.bytes);
+        if !detail.is_empty() {
+            crate::output::diagnostic!("syq: {}: {detail}", self.label());
         }
         match out.input_error {
             Some(error) => Err(error).with_context(|| format!("upload helper to {}", self.label())),

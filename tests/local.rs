@@ -4049,6 +4049,13 @@ fn managed_remote_helper_install_is_cached() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
+    let installed = t.path("remote-home/.local/bin/syq");
+    assert_eq!(read(&installed), read(&cached_remote_helper(&t)));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("installed syq"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("add ~/.local/bin to PATH"));
+    // Updating the interactive command must leave the helper usable.
+    write(&installed, b"user-managed replacement");
+
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -4082,6 +4089,20 @@ fn managed_remote_helper_install_is_cached() {
         .matches("syq-helper-target:")
         .count();
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
+}
+
+#[test]
+fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    write(&t.path("remote-home/.local"), b"not a directory");
+    write(&t.path("src"), b"copy succeeds");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"copy succeeds");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not install ~/.local/bin/syq"));
 }
 
 #[test]
@@ -4438,6 +4459,7 @@ fn development_build_uploads_itself_and_reuses_cached_helper() {
         read(&cached_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
+    assert!(!t.path("remote-home/.local/bin/syq").exists());
     assert!(!t.path("curl.log").exists());
     assert!(!cached_local_helper(&t).exists());
 

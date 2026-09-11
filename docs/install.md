@@ -12,6 +12,21 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 `PATH`. To choose another directory, download the script and run
 `sh install.sh --bin-dir DIR`.
 
+## Automatic installation on SSH servers
+
+When an official syq release sets up its matching helper on an SSH server, it
+also installs that same version at `~/.local/bin/syq` for use on the server. It
+leaves existing installations alone: both an existing entry at that location
+and a `syq` found on the remote `PATH` prevent installation. It does not fetch
+the latest release or update an existing command.
+
+Syq reports the installation and whether `~/.local/bin` is on the remote
+`PATH`; it never edits shell startup files. The command is an independent copy
+of the helper, using a reflink when supported. You can update it with
+`syq --self-update` without changing the version-specific helper cache. Failure
+to install this command does not fail the transfer. Development builds and
+connections using `--syq-path` or `--no-bootstrap` do not install it.
+
 ## Homebrew
 
 ```sh
