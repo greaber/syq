@@ -489,3 +489,51 @@ fn resume_accepts_pre_path_hash_partial_filename() {
     assert_eq!(result["bytes_transferred"], 0);
     assert_eq!(result["bytes_unchanged"], data.len() as u64);
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn prune_ancestry_permission_error_names_source_and_explains_skipping() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping permission denial: running as root");
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("ancestor/src/file"), b"source contents");
+    write(&t.path("dst/extra"), b"keep");
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--prune",
+            "--srcs-in",
+            &t.s("ancestor/src"),
+            "--into",
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for(
+        "source registration",
+        std::time::Duration::from_secs(10),
+        || ready.exists(),
+    );
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(&continuation, b"continue").unwrap();
+    let out = child.wait_with_output().unwrap();
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains(&t.s("ancestor/src")), "{stderr}");
+    assert!(
+        stderr.contains("source ancestry could not be checked; skipping deletions"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("copy reported errors"), "{stderr}");
+    assert_eq!(read(&t.path("dst/file")), b"source contents");
+    assert_eq!(read(&t.path("dst/extra")), b"keep");
+}

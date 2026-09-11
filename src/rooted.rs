@@ -2071,22 +2071,16 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 /// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
 /// permission is available. Neither changes permissions during inspection.
 /// Descendant lookups still enforce search permission and never follow links.
+#[cfg(target_os = "macos")]
 fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
-    #[cfg(target_os = "macos")]
-    {
-        match open_directory_at(parent, component) {
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
-                parent.as_raw_fd(),
-                &component_cstring(component),
-                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            ),
-            result => result,
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        open_directory_at(parent, component)
+    match open_directory_at(parent, component) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
+            parent.as_raw_fd(),
+            &component_cstring(component),
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ),
+        result => result,
     }
 }
 
@@ -2368,7 +2362,7 @@ fn create_temporary(
 ) -> Result<CString> {
     for _ in 0..32 {
         let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(".syq-swap-{}-{counter}", std::process::id()))
+        let name = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
             .expect("generated swap name contains no NUL");
         match create(parent.directory.as_raw_fd(), &name) {
             Ok(()) => return Ok(name),

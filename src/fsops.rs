@@ -1010,10 +1010,16 @@ pub(crate) fn partial_path_with_name_max(
     Ok(parent.join(OsString::from_vec(component)))
 }
 
+const RECOVERY_PREFIX: &str = ".syq-swap-";
+
+pub(crate) fn recovery_name(process: u32, counter: u64) -> String {
+    format!("{RECOVERY_PREFIX}{process}-{counter}")
+}
+
 /// Names used for displaced entries during interrupted replacement. Keep
 /// this separate from resumable partials: clean-partials must not remove them.
 pub fn is_recovery_name(name: &OsStr) -> bool {
-    let Some(suffix) = name.as_bytes().strip_prefix(b".syq-swap-") else {
+    let Some(suffix) = name.as_bytes().strip_prefix(RECOVERY_PREFIX.as_bytes()) else {
         return false;
     };
     let mut fields = suffix.split(|byte| *byte == b'-');
@@ -7241,6 +7247,28 @@ fn apply_owner_if_changed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacement_names_preserve_existing_recovery_format() {
+        assert_eq!(recovery_name(123, 456), ".syq-swap-123-456");
+        // Literal old names stay protected; never regenerate this inventory.
+        for name in [
+            ".syq-swap-123-456",
+            ".syq-swap-0-0",
+            ".syq-swap-4294967295-18446744073709551615",
+        ] {
+            assert!(is_recovery_name(OsStr::new(name)));
+        }
+        for name in [
+            ".syq-swap-",
+            ".syq-swap-123-",
+            ".syq-swap--456",
+            ".syq-swap-123-456-extra",
+            ".syq-swap-123-x",
+        ] {
+            assert!(!is_recovery_name(OsStr::new(name)));
+        }
+    }
+
     #[test]
     fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         use std::os::unix::fs::PermissionsExt;

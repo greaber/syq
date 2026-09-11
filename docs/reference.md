@@ -159,8 +159,9 @@ The placement options `--into-existing` and `--as-existing` check only the
 placement path, rather than every copied entry.
 
 `--skip-newer` compares timestamps, not the age of the contents. It affects only
-regular-file pairs; replacing a different entry type still occurs. Combine it
-with `--only-existing` to avoid creating missing entries too.
+regular-file pairs; replacements between non-directory entry types still
+occur, but replacing a directory with a non-directory or the reverse is
+refused. Combine it with `--only-existing` to avoid creating missing entries too.
 
 `--only-new` cannot combine with either policy. Neither `--only-new` nor
 `--skip-newer` can combine with `--inplace`: an interrupted write could leave
@@ -269,7 +270,7 @@ skips the conflicting directory's subtree. This follows cp's conservative
 behavior and applies to both `syq cp` and `syq rsync`.
 
 Replacements between non-directory entries stage the new entry before
-publication. Some guarded replacements require an atomic exchange; if the
+publication. Some replacements require an atomic exchange; if the
 filesystem does not support it, the old entry is preserved and the operation
 fails. An interrupted exchange can leave the previous entry beside its
 replacement under a `.syq-swap-...` name; inspect it before removing it.
