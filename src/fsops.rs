@@ -2546,6 +2546,19 @@ impl FsOps {
         let files_available = statvfs_counter(stats.f_favail);
         let available_bytes = blocks_available.saturating_mul(fragment_size);
         let available_inodes = (files != 0 && files_available <= files).then_some(files_available);
+        #[cfg(target_os = "macos")]
+        let available_inodes = available_inodes.and_then(|available| {
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let filesystem = unsafe { filesystem.assume_init() };
+            let name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
+            // macOS exFAT reports f_files=1 and f_favail=0 even while new
+            // files can be created. That is unavailable inode accounting,
+            // not exhaustion. Keep zero authoritative on other filesystems.
+            (name.to_bytes() != b"exfat").then_some(available)
+        });
         #[cfg(debug_assertions)]
         let available_bytes = match std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
             Some(value) => value
