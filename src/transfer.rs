@@ -4073,6 +4073,22 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
     kind != Kind::Socket || destination_supports_sockets
 }
 
+/// Compare at the decimal precision suggested by the destination timestamp.
+/// Trailing zeros may reflect either filesystem truncation or a round timestamp;
+/// this is the size/mtime shortcut, not a content verification.
+fn destination_fraction_matches(source: u32, destination: u32) -> bool {
+    if destination == 0 {
+        return true;
+    }
+    let mut precision = 1;
+    let mut fraction = destination;
+    while fraction.is_multiple_of(10) {
+        precision *= 10;
+        fraction /= 10;
+    }
+    source / precision == destination / precision
+}
+
 fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
     (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
@@ -6040,7 +6056,8 @@ impl Planner<'_> {
                         d.kind == Kind::File
                             && d.size == e.size
                             && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
-                            && (!opts.precise_mtime || d.mtime_nsec == e.mtime_nsec)
+                            && (!opts.precise_mtime
+                                || destination_fraction_matches(e.mtime_nsec, d.mtime_nsec))
                     });
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {

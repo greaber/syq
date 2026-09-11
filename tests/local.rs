@@ -20979,3 +20979,51 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
     );
     assert_eq!(partial_files(&t.0).len(), 1);
 }
+
+#[test]
+fn native_mtime_uses_destination_decimal_precision() {
+    // Different same-size bytes make an accidental copy/skip observable. Set
+    // exact timestamps to emulate destination truncation without mounting a FS.
+    for (source_nsec, destination_nsec, source_seconds, same_size, skipped) in [
+        (123_456_789, 123_456_789, 10, true, true),
+        (123_456_789, 123_456_788, 10, true, false),
+        (123_456_789, 123_456_700, 10, true, true),
+        (123_456_789, 123_456_800, 10, true, false),
+        (123_456_789, 120_000_000, 10, true, true),
+        (129_999_999, 120_000_000, 10, true, true),
+        (130_000_000, 120_000_000, 10, true, false),
+        (120_000_000, 123_456_789, 10, true, false),
+        (999_999_999, 0, 10, true, true),
+        (0, 0, 10, true, true),
+        (123_456_789, 0, 11, true, false),
+        (123_456_789, 0, 9, true, false),
+        (123_456_789, 120_000_000, 10, false, false),
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"new");
+        write(&t.path("dst"), if same_size { b"old" } else { b"older" });
+        for (name, seconds, nanos) in [
+            ("src", source_seconds, source_nsec),
+            ("dst", 10, destination_nsec),
+        ] {
+            let time = std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos);
+            File::options()
+                .write(true)
+                .open(t.path(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        run_native_ok(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+        assert_eq!(
+            read(&t.path("dst")),
+            if skipped { b"old" } else { b"new" },
+            "source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}"
+        );
+        if skipped {
+            // Content verification must bypass the inferred-precision shortcut.
+            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("dst")]);
+            assert_eq!(read(&t.path("dst")), b"new");
+        }
+    }
+}
