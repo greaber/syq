@@ -4560,6 +4560,123 @@ enum Claim {
     Weak,
 }
 
+/// Keep destination-only candidates, borrowing source claim paths instead of
+/// copying every destination spelling. Exact matches are discarded as scanned.
+struct PruneWalk<'a> {
+    seen: &'a std::collections::HashMap<PathBytes, Claim>,
+    unmatched: std::collections::HashSet<&'a PathBytes>,
+    entries: Vec<Entry>,
+    shielded: std::collections::HashSet<PathBytes>,
+    recovery_parents: std::collections::HashSet<PathBytes>,
+}
+
+impl<'a> PruneWalk<'a> {
+    fn new(seen: &'a std::collections::HashMap<PathBytes, Claim>, root: &[u8]) -> Self {
+        Self {
+            seen,
+            unmatched: seen
+                .keys()
+                .filter(|path| path_is_inside(path, root))
+                .collect(),
+            entries: Vec::new(),
+            shielded: Default::default(),
+            recovery_parents: Default::default(),
+        }
+    }
+
+    fn push(&mut self, entry: Entry, root: &[u8], nested: &[PathBytes]) {
+        if entry.path.is_empty() {
+            return;
+        }
+        let full = join(root, &entry.path);
+        if entry
+            .path
+            .split(|byte| *byte == b'/')
+            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
+        {
+            for (index, byte) in full.iter().enumerate() {
+                if *byte == b'/' {
+                    self.recovery_parents.insert(full[..index].to_vec());
+                }
+            }
+            return;
+        }
+        self.unmatched.remove(&full);
+        if nested
+            .iter()
+            .any(|n| *n == full || path_is_inside(&full, n))
+        {
+            return;
+        }
+        if let Some(claim) = self.seen.get(&full) {
+            if *claim != Claim::Dir && entry.kind == Kind::Dir {
+                self.shielded.insert(full);
+            }
+            return;
+        }
+        self.entries.push(entry);
+    }
+
+    fn finish_scan(&mut self, root: &[u8]) {
+        // Apply exact directory shields after all batches, independently of
+        // scan order. Alias directory shields are applied after lookup.
+        self.entries
+            .retain(|entry| !Planner::under_any(&self.shielded, &join(root, &entry.path), root));
+    }
+}
+
+fn lookup_prune_aliases(
+    conn: &mut dyn Conn,
+    walk: &PruneWalk<'_>,
+    guard: Option<&ContainerGuard>,
+) -> Result<std::collections::HashMap<(u64, u64), Claim>> {
+    let mut aliases = std::collections::HashMap::new();
+    if walk.entries.is_empty() {
+        return Ok(aliases);
+    }
+    let candidates: std::collections::HashSet<_> = walk
+        .entries
+        .iter()
+        .map(|entry| (entry.dev, entry.ino))
+        .collect();
+    let mut unmatched = walk.unmatched.iter();
+    loop {
+        let paths: Vec<_> = unmatched
+            .by_ref()
+            .take(512)
+            .map(|path| (**path).clone())
+            .collect();
+        if paths.is_empty() {
+            break;
+        }
+        let stats = match ok(
+            conn.call(Request::PruneLookup {
+                paths: paths.clone(),
+                guard: guard.cloned(),
+            })?,
+            "inspect prune aliases",
+        )? {
+            Response::Stats(stats) => stats,
+            other => bail!("unexpected prune lookup response {other:?}"),
+        };
+        for (path, entry) in paths.iter().zip(stats) {
+            if let Some(entry) = entry {
+                let identity = (entry.dev, entry.ino);
+                // Retain all ambiguous hard links, but do not accumulate
+                // identities that cannot protect any deletion candidate.
+                if candidates.contains(&identity) {
+                    aliases.insert(identity, walk.seen[path]);
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+fn path_is_inside(path: &[u8], root: &[u8]) -> bool {
+    path.starts_with(root) && (root.ends_with(b"/") || path.get(root.len()) == Some(&b'/'))
+}
+
 /// Everything the planner decided about one source entry, made once in the
 /// mapping loop so the directory pass and the per-kind arms can't disagree.
 struct Planned {
@@ -6892,15 +7009,8 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
-            let mut recovery_parents = std::collections::HashSet::new();
             let mut alias_parents = std::collections::HashSet::new();
-            // Destination directories whose path the source claims as a
-            // non-directory (a file we chose not to send, a symlink skipped
-            // without -l, ...). The source has that path, so syq doesn't touch
-            // it — and gutting the directory underneath would be touching it.
-            let mut shielded: std::collections::HashSet<PathBytes> =
-                std::collections::HashSet::new();
-            let mut entries = Vec::new();
+            let mut walk = PruneWalk::new(&self.dst_seen, &root);
             let res = self.dst.scan(
                 &root,
                 None,
@@ -6909,26 +7019,7 @@ impl Planner<'_> {
                 true,
                 &mut |batch: Vec<Entry>| {
                     for entry in batch {
-                        if entry.path.is_empty() {
-                            continue;
-                        }
-                        if entry
-                            .path
-                            .split(|byte| *byte == b'/')
-                            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
-                        {
-                            // A recovery entry can be a directory with old
-                            // contents. Protect the entire subtree and every
-                            // ancestor, independently of scan ordering.
-                            let full = join(&root, &entry.path);
-                            for (index, byte) in full.iter().enumerate() {
-                                if *byte == b'/' {
-                                    recovery_parents.insert(full[..index].to_vec());
-                                }
-                            }
-                            continue;
-                        }
-                        entries.push(entry);
+                        walk.push(entry, &root, &nested);
                     }
                     Ok(())
                 },
@@ -6952,43 +7043,16 @@ impl Planner<'_> {
             if self.delete_walk_failed {
                 return Ok(());
             }
-            // Prefer exact directory-entry spellings. Only claims absent from
-            // the walk need an actual receiver lookup: case/normalization
-            // aliases can resolve to an entry whose stored spelling differs.
-            // Do this after permission repair, without guessing filesystem
-            // naming rules or adding writes to dry runs.
-            let spellings: std::collections::HashSet<_> = entries
-                .iter()
-                .map(|entry| join(&root, &entry.path))
-                .collect();
-            let unmatched: Vec<_> = self
-                .dst_seen
-                .keys()
-                .filter(|path| inside(path, &root) && !spellings.contains(*path))
-                .cloned()
-                .collect();
-            let mut aliases = std::collections::HashMap::new();
-            for paths in unmatched.chunks(512) {
-                let stats = match ok(
-                    self.dst.call(Request::PruneLookup {
-                        paths: paths.to_vec(),
-                        guard: self.container_guard.clone(),
-                    })?,
-                    "inspect prune aliases",
-                )? {
-                    Response::Stats(stats) => stats,
-                    other => bail!("unexpected prune lookup response {other:?}"),
-                };
-                for (path, entry) in paths.iter().zip(stats) {
-                    if let Some(entry) = entry {
-                        // When several hard links could be the alias, retain
-                        // all of them. Exact-spelling claims above do not
-                        // protect unrelated hard links from pruning.
-                        aliases.insert((entry.dev, entry.ino), path.clone());
-                    }
-                }
+            walk.finish_scan(&root);
+            // There is nothing for an alias to protect when no candidates
+            // remain, including dry runs whose claimed files do not exist yet.
+            if walk.entries.is_empty() {
+                continue;
             }
-            for entry in &entries {
+            let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
+            let mut shielded = walk.shielded;
+            let recovery_parents = walk.recovery_parents;
+            for entry in &walk.entries {
                 let entry_path = &entry.path;
                 let entry_kind = entry.kind;
 
@@ -7001,13 +7065,8 @@ impl Planner<'_> {
                 {
                     continue;
                 }
-                let exact = self.dst_seen.get(&full);
-                let claimed = exact.or_else(|| {
-                    aliases
-                        .get(&(entry.dev, entry.ino))
-                        .and_then(|spelling| self.dst_seen.get(spelling))
-                });
-                if exact.is_none() && claimed.is_some() {
+                let claimed = aliases.get(&(entry.dev, entry.ino));
+                if claimed.is_some() {
                     // An ambiguous hard link may live in an otherwise extra
                     // directory. Keep its ancestors as well as the link.
                     for (index, byte) in full.iter().enumerate() {
@@ -8987,6 +9046,91 @@ mod tests {
             benchmark: Default::default(),
             fast_batch_files: 1,
         }
+    }
+
+    #[test]
+    fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let template = crate::fsops::lstat_entry(Vec::new(), &file).unwrap();
+        let seen: std::collections::HashMap<_, _> = (0..10_000)
+            .map(|index| (format!("dst/file-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst");
+        for index in 0..9_000 {
+            let mut entry = template.clone();
+            entry.path = format!("file-{index}").into_bytes();
+            walk.push(entry, b"dst", &[]);
+            assert!(walk.entries.is_empty(), "exact matches must not accumulate");
+        }
+        walk.finish_scan(b"dst");
+        assert_eq!(walk.unmatched.len(), 1_000);
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert!(aliases.is_empty());
+        assert!(state.lock().unwrap().requests.is_empty());
+    }
+
+    #[test]
+    fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
+        let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
+            .into_iter()
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst");
+        // The child deliberately arrives before its claimed directory.
+        for path in [
+            "blocked/child",
+            "blocked",
+            "nested/extra",
+            "old/.syq-swap-123-4/data",
+            "extra",
+        ] {
+            entry.path = path.as_bytes().to_vec();
+            walk.push(entry.clone(), b"dst", &[b"dst/nested".to_vec()]);
+        }
+        walk.finish_scan(b"dst");
+        assert!(walk.unmatched.is_empty());
+        assert_eq!(walk.entries.len(), 1);
+        assert_eq!(walk.entries[0].path, b"extra");
+        assert!(walk.recovery_parents.contains(b"dst/old".as_slice()));
+    }
+
+    #[test]
+    fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
+        candidate.ino = 42;
+        let seen: std::collections::HashMap<_, _> = (0..1_025)
+            .map(|index| (format!("dst/claim-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst");
+        walk.push(candidate.clone(), b"dst", &[]);
+        let mut unrelated = candidate.clone();
+        unrelated.ino = 43;
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        state.lock().unwrap().replies.extend([
+            Response::Stats(vec![Some(unrelated); 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![Some(candidate.clone())]),
+        ]);
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[&(candidate.dev, candidate.ino)], Claim::Leaf);
+        assert_eq!(state.lock().unwrap().requests.len(), 3);
+        assert!(state.lock().unwrap().replies.is_empty());
+
+        let malformed = Arc::new(Mutex::new(PipelineState::default()));
+        malformed
+            .lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(vec![]));
+        assert!(lookup_prune_aliases(&mut PipelineConn(malformed), &walk, None).is_err());
     }
 
     #[test]
