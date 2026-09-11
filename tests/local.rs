@@ -858,6 +858,8 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             // Keep the test on the ranged transport path instead of the excluded
             // same-machine CopyLocal optimization.
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
+            .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
             .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
@@ -884,6 +886,8 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
 
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
+        assert_eq!(tuning_observed(&output)["local_whole_files"], 0);
+        assert!(tuning_observed(&output)["range_requests"].as_u64().unwrap() > 0);
         assert_eq!(read(&t.path("dst/small")), b"original");
         assert_eq!(read(&t.path("dst/large")), original_large);
     }
@@ -11507,9 +11511,12 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
             &t.s("dst"),
         ])
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
+        .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
     assert_eq!(read(&t.path("dst")), contents);
     assert!(partial_files(&t.0).is_empty());
 }
