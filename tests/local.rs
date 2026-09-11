@@ -11768,8 +11768,20 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     let mut changed = original;
     changed[..1 << 20].fill(b'c');
     write(&t.path("src/file"), &changed);
+    // ENOSPC can stop the companion before it completes. Reproduce that state
+    // deterministically and select ranges so the retry exercises partial reuse
+    // instead of the direct-copy fast path for multiple pending files.
+    if t.path("dst/small").exists() {
+        fs::remove_file(t.path("dst/small")).unwrap();
+    }
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .args([
+            "-a",
+            "--tuning-options=copy-path=ranges",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
@@ -19033,6 +19045,258 @@ fn named_destination_offline_failure_settles_results_and_completes_names_locally
     assert_eq!(completion.stdout, b"@laptop\0");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn receiver_wait_and_list_do_not_block_on_a_full_listen_queue() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::time::{Duration, Instant};
+    let t = Tmp::new();
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("receiver.sock");
+    let address = SockAddr::unix(&socket_path).unwrap();
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&address).unwrap();
+    listener.listen(0).unwrap();
+    let mut queued = Vec::new();
+    let mut full = false;
+    for _ in 0..16 {
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        client.set_nonblocking(true).unwrap();
+        match client.connect(&address) {
+            Ok(()) => queued.push(client),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                full = true;
+                break;
+            }
+            Err(error) => panic!("fill listen queue: {error}"),
+        }
+    }
+    assert!(full, "test did not fill the listen queue");
+    let path = registry.join("stuck.json");
+    write(
+        &path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version":3,"identity":"test-build","socket":socket_path,
+            "secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes(),
+        }))
+        .unwrap(),
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    // A hard watchdog unblocks even the old blocking implementation, so a
+    // regression fails the latency assertion instead of hanging the test suite.
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        let _ = stopped.recv_timeout(Duration::from_secs(4));
+        drop(listener);
+        drop(queued);
+    });
+    let start = Instant::now();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap()
+    };
+    let wait = run(&["persist", "destinations", "wait", "stuck", "--timeout", "1"]);
+    let list = run(&["persist", "destinations", "list"]);
+    let elapsed = start.elapsed();
+    let _ = stop.send(());
+    watchdog.join().unwrap();
+    assert!(!wait.status.success());
+    assert!(
+        stderr_of(&wait).contains("timed out waiting"),
+        "{}",
+        stderr_of(&wait)
+    );
+    assert_output_ok(&list);
+    assert_eq!(list.stdout, b"@stuck\toffline\n");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "wait/list took {elapsed:?}"
+    );
+}
+
+#[test]
+fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("receiver.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[1; 32]).into(),
+        "test",
+    )
+    .unwrap();
+    for (extension, value) in [
+        (
+            "json",
+            serde_json::json!({"version":3,"identity":"test-build",
+            "socket":socket_path,"secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes()}),
+        ),
+        (
+            "owner",
+            serde_json::json!({"version":1,"public_key":key.public_key().to_openssh().unwrap()}),
+        ),
+    ] {
+        let path = registry.join(format!("laptop.{extension}"));
+        write(&path, &serde_json::to_vec(&value).unwrap());
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let responder = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("receiver accept: {e}"),
+            }
+        };
+        // Keep making partial framing progress beyond the one-second deadline.
+        for byte in 100u32.to_be_bytes() {
+            if socket.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    });
+    let start = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "persist",
+            "destinations",
+            "wait",
+            "laptop",
+            "--timeout",
+            "1",
+        ])
+        .env("HOME", t.path(""))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    responder.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("timed out waiting"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "wait took {elapsed:?}"
+    );
+}
+
+#[test]
+fn forgetting_offline_owner_recreates_missing_lock() {
+    let t = Tmp::new();
+    write(&t.path(".syq-destinations-v3/laptop.owner"), b"{}");
+    fs::set_permissions(
+        t.path(".syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["persist", "destinations", "forget", "laptop"])
+        .env("HOME", t.path(""))
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(!t.path(".syq-destinations-v3/laptop.owner").exists());
+    assert_eq!(
+        fs::metadata(t.path(".syq-destinations-v3/laptop.lock"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn offline_receiver_ownership_keeps_names_but_allows_remote_completion() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    write(&t.path("home/.syq-destinations-v3/fake.owner"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let names = completion_command(
+        &t,
+        &[
+            "__complete",
+            "fish",
+            "4",
+            "--",
+            "syq",
+            "cp",
+            "source",
+            "--to",
+            "@fake",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_output_ok(&names);
+    assert_eq!(names.stdout, b"@fake\0");
+    let ssh = fake_ssh(&t);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let output = completion_command(
+        &t,
+        &[
+            "__complete",
+            "bash",
+            "9",
+            "--",
+            "syq",
+            "cp",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--src",
+            "source",
+            "--to",
+            "fake",
+            "--into",
+            &path,
+        ],
+    )
+    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+    .env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+    )
+    .output()
+    .unwrap();
+    assert_output_ok(&output);
+    assert_eq!(
+        completion_values(&output.stdout),
+        vec![(
+            b'p',
+            t.path("remote-home/data/nested/")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        )]
+    );
+}
+
 #[test]
 fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() {
     let t = Tmp::new();
@@ -19119,7 +19383,7 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
 }
 
 #[test]
-fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
+fn receiver_destinations_require_sigil_and_never_fall_back() {
     use std::os::unix::net::UnixListener;
     let t = Tmp::new();
     write(&t.path("source"), b"source");
@@ -19175,16 +19439,49 @@ fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
     fs::remove_file(t.path("ssh-used")).unwrap();
     let explicit = run(&["cp", "source", "--to", "@laptop"]);
     assert!(!explicit.status.success());
-    assert!(stderr_of(&explicit).contains("offline"));
+    let error = stderr_of(&explicit);
+    assert!(
+        error.contains("could not connect to receiving machine"),
+        "{error}"
+    );
+    assert!(!error.contains("offline"), "{error}");
+    assert!(error.contains("syq persist connect SERVER"), "{error}");
+    assert!(!t.path("ssh-used").exists());
+    // An older process can hand a selected bare receiver to this helper.
+    // Reject that spelling rather than reinterpret its pinned destination as SSH.
+    let guard_registration = format!(
+        r#"{{"version":3,"identity":{},"socket":{},"secret":"test","program":{}}}"#,
+        serde_json::to_string(identity.trim()).unwrap(),
+        serde_json::to_string(&socket_path).unwrap(),
+        serde_json::to_string(env!("CARGO_BIN_EXE_syq").as_bytes()).unwrap(),
+    );
+    let guard = serde_json::json!({"name":"laptop","identity":identity.trim(),
+        "kind":"Copy","registration":blake3::hash(guard_registration.as_bytes()).to_hex().to_string()})
+    .to_string();
+    let handed_off = run(&[
+        "--return-handoff-v1",
+        &guard,
+        "cp",
+        "source",
+        "--to",
+        "laptop",
+    ]);
+    assert!(!handed_off.status.success());
+    assert!(
+        stderr_of(&handed_off).contains("receiver destinations require @NAME"),
+        "{}",
+        stderr_of(&handed_off)
+    );
     assert!(!t.path("ssh-used").exists());
     let listener = UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
+    let bare = run(&["cp", "source", "--to", "laptop", "--no-tcp"]);
+    assert!(!bare.status.success());
+    assert!(t.path("ssh-used").exists());
+    fs::remove_file(t.path("ssh-used")).unwrap();
     let responder = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for response in [
-            serde_json::json!("Ready"),
-            serde_json::json!({"Error":"copy denied by test policy"}),
-        ] {
+        for response in [serde_json::json!({"Error":"copy denied by test policy"})] {
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
@@ -19213,7 +19510,7 @@ fn receiving_names_fall_back_only_before_a_live_route_is_selected() {
             socket.write_all(&response).unwrap();
         }
     });
-    let denied = run(&["cp", "source", "--to", "laptop"]);
+    let denied = run(&["cp", "source", "--to", "@laptop"]);
     responder.join().unwrap();
     assert!(!denied.status.success());
     assert!(
@@ -19333,7 +19630,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
 }
 
 #[test]
-fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
+fn return_via_completes_only_explicit_names_without_contacting_hosts() {
     let t = Tmp::new();
     write(&t.path(".syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(
@@ -19348,7 +19645,7 @@ fn return_via_completes_bare_and_explicit_names_without_contacting_hosts() {
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     for option in ["--via", "--auth-from"] {
         for (prefix, expected) in [
-            ("lap", b"laptop\0".as_slice()),
+            ("lap", b"".as_slice()),
             ("@lap", b"@laptop\0"),
             ("absent", b""),
         ] {
@@ -19595,11 +19892,17 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         .collect();
     let legacy = run(&argv);
     assert!(
-        stderr_of(&legacy).contains("copy denied by fixture"),
+        stderr_of(&legacy).contains("receiver references require @NAME"),
         "{}",
         stderr_of(&legacy)
     );
     assert!(!t.path("ssh-used").exists());
+    // The released fixture stays unchanged: its bare receiver reference is
+    // explicitly rejected, and adding @ is the recovery path.
+    let explicit = run(&[
+        "cp", "source", "--to", "backup", "--via", "@ssh", "--into", "out",
+    ]);
+    assert!(stderr_of(&explicit).contains("copy denied by fixture"));
     let messages = responder.join().unwrap();
     assert_eq!(messages[0]["secret"], "laptop");
     assert_eq!(messages[0]["message"], "Ping");
@@ -19654,7 +19957,7 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         vec![],
         vec!["--auth-from", "@laptop"],
         vec!["--auth-from", "auto"],
-        vec!["--via", "laptop"],
+        vec!["--via", "@laptop"],
     ] {
         let mut words = vec!["syq", "cp", "source", "--to", "backup"];
         words.extend(selector);
@@ -19683,7 +19986,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
     )
     .unwrap();
     assert_completion_candidates(&t, &["syq", "ex"], &["exec"]);
-    assert_completion_candidates(&t, &["syq", "exec", "--on", "lap"], &["laptop"]);
+    assert_completion_candidates(&t, &["syq", "exec", "--on", "lap"], &[]);
     assert_completion_candidates(&t, &["syq", "exec", "--on", "@lap"], &["@laptop"]);
     assert_completion_candidates(&t, &["syq", "exec", "--cw"], &["--cwd"]);
     assert_completion_candidates(&t, &["syq", "exec", "--on", "laptop", "--", "--he"], &[]);
@@ -19701,7 +20004,7 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        if matches!(name, "absent" | "@absent") {
+        if name == "@absent" {
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(
                 error.contains("no receiving machine named @absent is registered"),

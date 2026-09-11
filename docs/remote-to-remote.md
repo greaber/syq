@@ -33,11 +33,11 @@ syq cp results --to hostB --into /archive
 
 Syq uses the first available receiving machine in alphabetical name order.
 If none is available, or the requested options are unsupported on this route,
-it uses hostA's SSH access. A copy addressed to a live receiving name goes to
-that machine itself.
+it uses hostA's SSH access. `--to @laptop` instead sends the files to the
+receiving machine itself.
 
 Use `--auth-from @laptop` to choose your laptop explicitly, or `--auth-from ssh`
-to use hostA's SSH access. The default is `--auth-from auto`. `--via NAME` is
+to use hostA's SSH access. The default is `--auth-from auto`. `--via @NAME` is
 an alias for choosing a receiving machine. See
 [authorization selection](remote-reference.md#authorization-selection) for
 name rules and route restrictions.
@@ -47,8 +47,8 @@ prompt or `syq persist receive pending` and `syq persist receive approve REQUEST
 These requests require a decision even when `persist receive on --approve always` permits
 automatic copies onto the laptop itself. Once an approval request is sent,
 a refusal, interrupted connection, setup failure, or copy failure ends that
-attempt; syq does not try another authorizer or SSH. Explicit receiving names
-require a live return connection and never fall back to DNS lookup.
+attempt; syq does not try another authorizer or SSH. `--auth-from @NAME` and
+`--via @NAME` fail if that receiving machine is unavailable.
 
 The laptop uses its own SSH configuration, credentials, and trusted host keys
 to connect to hostB and install the matching syq helper. Connect to hostB with

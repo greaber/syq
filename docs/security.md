@@ -109,6 +109,14 @@ are validated before prompting; the restricted filesystem executor checks
 every operation after approval. The server receives no SSH agent.
 [Commands](exec.md) need separate approval.
 
+Receiving names stay assigned to a persistent receiver public key. Reconnecting
+requires proof of the corresponding private key; knowing the public key does
+not let another receiver claim the name. This prevents accidental reassignment
+and impersonation through registration, but the server account controls the
+assignment files and can replace them. It is not a security boundary against
+someone who controls that account. The receiver private key stays on the
+receiving machine and does not grant SSH login access.
+
 Approval permits that pending copy's destination, overwrite policy, and limits.
 It does not authenticate what you typed on a remote server or attest to source
 contents. The receiving user and desktop session remain trusted. Request IDs
@@ -124,9 +132,9 @@ request more copies and invent their content. Once approved, it can inspect
 destination entries during copy planning and consume disk space within the
 approved limits. The laptop's receiving account is trusted.
 
-Bare destination names fall back to ordinary SSH while the laptop is offline.
-Use `@name` when you require a return connection and want failure instead of
-host resolution. A copy never switches routes after selecting its destination.
+Receiver destinations require `@name` and fail if that receiver is offline.
+Bare names always identify SSH destinations, resolved through SSH configuration
+or DNS. A copy never switches routes after selecting its destination.
 
 ## Limits to keep in mind
 

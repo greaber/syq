@@ -44,11 +44,27 @@ removed. `pending`, `approve`, and `deny` work across all profiles; prompts name
 the receiving profile. Without `--name`, `receive wait` waits for every enabled
 profile on that server.
 
-Names belong to a server account. Different laptops can receive through the same
-account under different names. If a name already has a live connection, another
-client's attempt is rejected without disturbing the existing connection. Other
-profiles remain usable. Choose a different name, or stop the original connection
-and run `syq persist connect server` on the waiting client to retry.
+Names belong to a server account and stay assigned to their original receiving
+machine when it disconnects. Another laptop cannot claim the same name, even
+while the original is offline. Stopping receiving or removing a local profile
+does not release its server-side name. Other profiles remain usable.
+
+To replace a laptop, stop its receiving connection, then run
+`syq persist destinations forget laptop` on the server. Run
+`syq persist connect server` on the replacement laptop to claim the released
+name. A rejected connection needs this explicit retry. Forgetting a live
+connection is refused.
+
+Syq generates one receiver key per local account, shared by receiving profiles
+and syq versions. It lives in `~/.syq-receiver-identity/identity_ed25519` and is
+independent of your SSH login keys and profile settings. Keep that directory
+across upgrades; include it in private backups if you want to restore the same
+identity. Losing it requires releasing the old names on each server. Copying it
+to another machine gives that machine the same receiver identity. If the old
+connection is still responsive, the replacement is rejected; use different
+profile names to receive on both machines at once. If the old connection is
+unresponsive, reconnecting waits for its heartbeat cleanup to release the name
+lock. It does not displace the existing connection.
 
 ## Directories
 
@@ -100,7 +116,7 @@ syq persist destinations wait laptop --timeout 30
 syq persist destinations forget laptop
 ```
 
-`forget` removes a stale entry while its connection is stopped. For structured
+`forget` releases the name assignment while its connection is stopped. For structured
 status and approval requests, see [connection status](automation.md#connection-status).
 
 ## Isolated script scopes
@@ -149,3 +165,11 @@ After upgrading both machines, run `syq persist connect server` for each server.
 Saved names, directories, and limits carry over. Settings predating approval
 prompts require approval after upgrading. Older binaries may not read updated
 preferences; use the newer binary to manage receiving.
+
+Connections created before persistent receiver identities remain discoverable.
+Their names become assigned when an updated receiving machine reconnects.
+Updated commands verify assigned names even when their connection uses an older
+helper; a receiver without a matching identity is rejected. Older binaries do
+not enforce these assignments, so use updated syq commands on the server and
+stop older receiving services before switching versions. The receiver key and
+assignments are independent of the helper build and survive later upgrades.

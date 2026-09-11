@@ -924,7 +924,9 @@ pub(crate) enum AuthFrom {
 
 impl AuthFrom {
     fn receiving(value: &str) -> Result<Self> {
-        let name = value.strip_prefix('@').unwrap_or(value);
+        let name = value
+            .strip_prefix('@')
+            .ok_or_else(|| anyhow::anyhow!("receiver references require @NAME"))?;
         crate::destination::validate_name(name)?;
         Ok(Self::Return(name.to_owned()))
     }
@@ -943,7 +945,7 @@ struct NativeRemoteArgs {
     /// Authorize with a live receiving machine, or use SSH from this machine (default: auto)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, conflicts_with = "via")]
     auth_from: Option<AuthFrom>,
-    /// Alias for --auth-from @NAME; every bare value remains a receiving name
+    /// Alias for --auth-from @NAME
     #[arg(long, value_name = "@NAME")]
     via: Option<String>,
     /// Choose the endpoint that runs the coordinator
@@ -1008,7 +1010,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination SSH endpoint or live receiving name; @NAME requires a return connection; placement defaults to --into .
+    /// Destination SSH endpoint or @NAME for a receiving machine; placement defaults to --into .
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths

@@ -1,8 +1,8 @@
 //! Named, permission-checked return channels over laptop-initiated SSH.
 //!
-//! This protocol uses transient advertisements maintained by persistence,
-//! independent of durable receiver enrollments. The remote account is the requester identity: shells
-//! and jobs under that account intentionally share access to its registrations.
+//! Persistence maintains transient advertisements and durable name ownership,
+//! independent of restricted receiver enrollments. The remote account is the
+//! requester identity: shells and jobs under it share access to registrations.
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -30,9 +30,10 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
+mod identity;
 
 // Discovery is independent of the build-pinned request protocol. Keep the
-// Ping/Ready JSON envelope and this version stable across helper wire changes.
+// Ping/Ready and Identify/Identity JSON envelopes stable across helper wire changes.
 const DISCOVERY_VERSION: u16 = 2;
 const VERSION: u16 = 2;
 const REGISTRATION_VERSION: u16 = 3;
@@ -125,6 +126,10 @@ struct Envelope {
 #[derive(Serialize, Deserialize)]
 enum Message {
     Ping,
+    Identify {
+        name: String,
+        challenge: String,
+    },
     Exec(exec::ExecRequest),
     Request(Box<CopyRequest>),
     Forward {
@@ -139,6 +144,7 @@ enum Message {
 #[derive(Serialize, Deserialize)]
 enum Reply {
     Ready,
+    Identity(identity::Proof),
     Approved(Approved),
     Error(String),
 }
@@ -179,39 +185,141 @@ pub(crate) fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Resul
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn deadline_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|time| !time.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "return channel exchange timed out",
+            )
+        })
+}
+
+fn wait_fd(
+    fd: std::os::fd::RawFd,
+    events: i16,
+    deadline: Instant,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> std::io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        if cancelled.is_some_and(|check| check()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "return request cancelled",
+            ));
+        }
+        // Only cancellation needs periodic wakeups. Socket and handshake waits
+        // can sleep until readiness or their deadline, including human approval.
+        let cap = if cancelled.is_some() { 100 } else { i32::MAX };
+        let milliseconds = deadline_remaining(deadline)?
+            .as_millis()
+            .clamp(1, cap as u128) as i32;
+        // The caller keeps the descriptor alive and descriptor is writable during
+        // poll. Signals and spurious wakeups never renew the deadline.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready > 0 {
+            return Ok(());
+        }
+    }
+}
+
+struct DeadlineSocket<'a> {
+    socket: &'a mut UnixStream,
+    deadline: Instant,
+}
+impl Read for DeadlineSocket<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            deadline_remaining(self.deadline)?;
+            // recv writes at most bytes.len() bytes into this live mutable
+            // slice. Per-call nonblocking mode does not affect socket clones.
+            let count = unsafe {
+                libc::recv(
+                    self.socket.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count >= 0 {
+                return Ok(count as usize);
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {
+                    wait_fd(self.socket.as_raw_fd(), libc::POLLIN, self.deadline, None)?
+                }
+                _ => return Err(error),
+            }
+        }
+    }
+}
+impl Write for DeadlineSocket<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            deadline_remaining(self.deadline)?;
+            // Darwin's Unix-stream send path checks the kernel-private
+            // MSG_NBIO flag, not MSG_DONTWAIT, while waiting for buffer space.
+            // This per-call flag avoids toggling O_NONBLOCK on a descriptor
+            // shared with socket clones. MSG_NBIO has been 0x20000 in XNU.
+            #[cfg(target_vendor = "apple")]
+            let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | 0x20000;
+            #[cfg(not(target_vendor = "apple"))]
+            let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+            match socket2::SockRef::from(&*self.socket).send_with_flags(bytes, flags) {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_fd(self.socket.as_raw_fd(), libc::POLLOUT, self.deadline, None)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        deadline_remaining(self.deadline)?;
+        Ok(())
+    }
+}
+
 /// A complete incoming envelope has an absolute deadline, including clients
 /// trickling bytes. Timeout budgets cannot be renewed by partial progress.
 pub(crate) fn read_socket_message<T: DeserializeOwned>(
     socket: &mut UnixStream,
     timeout: Duration,
 ) -> Result<T> {
-    struct DeadlineReader<'a> {
-        socket: &'a mut UnixStream,
-        deadline: Instant,
-    }
-    impl Read for DeadlineReader<'_> {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|time| !time.is_zero())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "return channel handshake timed out",
-                    )
-                })?;
-            self.socket.set_read_timeout(Some(remaining))?;
-            self.socket.read(bytes)
-        }
-    }
-    let previous = socket.read_timeout()?;
-    let result = read_message(&mut DeadlineReader {
+    read_message(&mut DeadlineSocket {
         socket,
         deadline: Instant::now() + timeout,
-    });
-    socket.set_read_timeout(previous)?;
-    result
+    })
+}
+
+fn connect_socket(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    deadline_remaining(deadline)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    // Unix stream connect completes immediately or fails. In particular,
+    // Linux reports EAGAIN for a full listen queue, with no connection pending.
+    socket.connect(&SockAddr::unix(path)?)?;
+    socket.set_nonblocking(false)?;
+    let descriptor: std::os::fd::OwnedFd = socket.into();
+    Ok(descriptor.into())
 }
 
 fn random_token() -> Result<String> {
@@ -229,6 +337,13 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
         bail!("destination name must contain 1–64 letters, digits, hyphens, or underscores");
     }
     Ok(())
+}
+
+/// Protect the actual identity location, including an explicitly supplied HOME.
+/// Merely computing the path must not create receiver state.
+pub(crate) fn receiver_identity_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is unset")?;
+    Ok(fs::canonicalize(home)?.join(".syq-receiver-identity"))
 }
 
 fn registry() -> Result<PathBuf> {
@@ -254,6 +369,15 @@ fn private_directory(name: &str) -> Result<PathBuf> {
 /// Completion only lists local names; it never creates state or asks a laptop
 /// for file listings without a transfer approval.
 pub(crate) fn registered_names() -> Vec<String> {
+    local_names(true)
+}
+
+/// Connection records only, for completion routing without network probes.
+pub(crate) fn connection_names() -> Vec<String> {
+    local_names(false)
+}
+
+fn local_names(include_offline: bool) -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
@@ -272,27 +396,35 @@ pub(crate) fn registered_names() -> Vec<String> {
     };
     let mut names: Vec<_> = entries
         .filter_map(|entry| {
-            let name = entry
-                .ok()?
-                .file_name()
-                .to_str()?
-                .strip_suffix(".json")?
+            let file = entry.ok()?.file_name();
+            let file = file.to_str()?;
+            let name = file
+                .strip_suffix(".json")
+                .or_else(|| {
+                    include_offline
+                        .then(|| file.strip_suffix(".owner"))
+                        .flatten()
+                })?
                 .to_owned();
             validate_name(&name).ok()?;
             Some(name)
         })
         .collect();
     names.sort();
+    names.dedup();
     names
 }
 
-fn load_registration(name: &str) -> Result<Registration> {
+fn read_registration(name: &str) -> Result<Registration> {
     validate_name(name)?;
     let path = registry()?.join(format!("{name}.json"));
     let encoded = match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
         Ok(encoded) => encoded,
         Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => {
+            if identity::owner(&registry()?, name)?.is_some() {
+                bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
+            }
             let names = registered_names();
             let advice = if names.is_empty() {
                 "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
@@ -316,37 +448,59 @@ fn load_registration(name: &str) -> Result<Registration> {
     }
     Ok(registration)
 }
+
+fn load_registration(name: &str) -> Result<Registration> {
+    let registration = read_registration(name)?;
+    if let Some(owner) = identity::owner(&registry()?, name)? {
+        identity::verify_receiver(name, &registration, Some(&owner))?;
+    }
+    Ok(registration)
+}
 fn exchange(
     registration: &Registration,
     message: Message,
     timeout: Duration,
 ) -> Result<(UnixStream, Reply)> {
-    if !matches!(message, Message::Ping) && registration.identity != crate::identity::build() {
+    if !matches!(message, Message::Ping | Message::Identify { .. })
+        && registration.identity != crate::identity::build()
+    {
         bail!(
             "named destination requires its matching helper; reconnect from the receiving machine"
         );
     }
-    let mut stream = UnixStream::connect(&registration.socket).context(
-        "receiving machine is offline; run `syq persist connect SERVER` on that machine to reconnect to this server account",
-    )?;
+    let deadline = Instant::now() + timeout;
+    let mut stream = connect_socket(&registration.socket, deadline).map_err(|error| {
+        let message = if error.kind() == std::io::ErrorKind::WouldBlock {
+            "receiving machine is busy; try again shortly"
+        } else {
+            "could not connect to receiving machine; it may be busy or its connection may have ended; try again, or run `syq persist connect SERVER` on the receiving machine to connect to this server account"
+        };
+        anyhow::Error::new(error).context(message)
+    })?;
+    // Configure the next protocol phase before the peer can close after its
+    // reply. macOS may reject socket timeout changes after peer shutdown.
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    let mut io = DeadlineSocket {
+        socket: &mut stream,
+        deadline,
+    };
     write_message(
-        &mut stream,
+        &mut io,
         &Envelope {
-            version: if matches!(message, Message::Ping) {
+            version: if matches!(message, Message::Ping | Message::Identify { .. }) {
                 DISCOVERY_VERSION
             } else {
                 VERSION
             },
-            // Ping is the fixed discovery contract. All authoritative requests
-            // above still require this executable to match the receiving build.
+            // Discovery and identity proofs are stable across builds. Copy,
+            // command, and forwarding requests still require a matching helper.
             identity: registration.identity.clone(),
             secret: registration.secret.clone(),
             message,
         },
     )?;
-    let reply = read_message(&mut stream)?;
+    let reply = read_message(&mut io)?;
     if let Reply::Error(error) = &reply {
         bail!("receiving machine: {error}");
     }
@@ -516,8 +670,6 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
                     "--auth-from ssh requires local sources and an ordinary SSH --to destination"
                 );
             }
-            // This explicit choice also disambiguates an SSH host whose name
-            // happens to match a receiving machine's advertisement.
             return Ok(None);
         }
         crate::cli::AuthFrom::Auto => {}
@@ -528,31 +680,14 @@ fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     let Some(host) = destination.host.as_deref() else {
         return Ok(None);
     };
-    let explicit = host.starts_with('@');
-    let name = host.strip_prefix('@').unwrap_or(host).to_owned();
-    // A normal SSH endpoint with a user/port remains explicit SSH. Bare names
-    // opt into lookup only when this process can actually send a return copy.
-    let registration = if explicit {
-        load_registration(&name)?
-    } else {
-        if destination.user.is_some()
-            || destination.port.is_some()
-            || args.interface != crate::cli::Interface::NativeCp
-            || args.locations[..args.locations.len() - 1]
-                .iter()
-                .any(|l| l.is_remote())
-            || !registered_names().contains(&name)
-        {
-            return forward::select(args);
+    let Some(name) = host.strip_prefix('@') else {
+        if handoff::selected_name(handoff::Kind::Copy).is_some() {
+            bail!("receiver destinations require @NAME; retry the command with --to @NAME");
         }
-        let registration = load_registration(&name)?;
-        if handoff::selected_name(handoff::Kind::Copy).is_none_or(|selected| selected != name)
-            && exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err()
-        {
-            return forward::select(args);
-        }
-        registration
+        return forward::select(args);
     };
+    let name = name.to_owned();
+    let registration = load_registration(&name)?;
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]
             .iter()
@@ -718,6 +853,8 @@ struct Prompt {
     decision: mpsc::SyncSender<bool>,
 }
 struct Receiver {
+    name: String,
+    identity_key: ssh_key::PrivateKey,
     requester: String,
     approval_mode: crate::receive_approval::Mode,
     notifications: crate::receive_approval::Notifications,
@@ -787,12 +924,15 @@ impl Receiver {
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let envelope: Envelope =
             read_socket_message(&mut stream.try_clone()?, Duration::from_secs(10))?;
-        let version = if matches!(envelope.message, Message::Ping) {
+        let version = if matches!(envelope.message, Message::Ping | Message::Identify { .. }) {
             DISCOVERY_VERSION
         } else {
             VERSION
         };
-        if envelope.version != version || envelope.identity != crate::identity::build() {
+        if envelope.version != version
+            || (!matches!(envelope.message, Message::Identify { .. })
+                && envelope.identity != crate::identity::build())
+        {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
         if envelope.secret != self.secret {
@@ -801,6 +941,13 @@ impl Receiver {
         match envelope.message {
             Message::Exec(request) => self.execute(request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
+            Message::Identify { name, challenge } => {
+                if name != self.name {
+                    bail!("receiver identity requested for a different profile");
+                }
+                let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
+                write_message(&mut stream, &Reply::Identity(proof))
+            }
             Message::Forward { target, request } => self.forward(target, *request, stream),
             Message::Request(request) => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
@@ -988,6 +1135,8 @@ pub(crate) fn serve_background(
     #[cfg(test)]
     let (prompts, _requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
+        name: config.name.clone(),
+        identity_key: identity::load_key()?,
         requester: format!(
             "{} (receiving profile @{})",
             spec.endpoint.label(),
@@ -1224,15 +1373,32 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join(format!("{name}.lock")))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        // A laptop may reconnect before the server has noticed the old TCP
-        // session died. Only the same ephemeral credential gets a retry; it
-        // still cannot displace an active registration or obtain its lock.
-        if load_registration(name).is_ok_and(|previous| previous.secret == secret) {
+        // A responsive holder is a duplicate, even when a copied home directory
+        // gives both machines the same identity. Never replace a held lock.
+        if read_registration(name).is_ok_and(|previous| {
+            exchange(&previous, Message::Ping, Duration::from_secs(1))
+                .is_ok_and(|(_, reply)| matches!(reply, Reply::Ready))
+        }) {
+            bail!("destination @{name} is already connected; choose another receiver name to use both connections at the same time");
+        }
+        // The old transport may be dying. Its heartbeat releases the lock;
+        // only the same connection or verified owner may wait to reconnect.
+        if read_registration(name).is_ok_and(|previous| previous.secret == secret) {
+            crate::output::diagnostic!("syq: previous return connection is still closing");
+            return Ok(RECONNECT_PENDING);
+        }
+        if let Some(owner) = identity::owner(&directory, name)? {
+            // A restarted service has a new connection credential but keeps
+            // its receiver key. Verify it before allowing reconnect retries.
+            identity::verify_receiver(name, &registration, Some(&owner))?;
             crate::output::diagnostic!("syq: previous return connection is still closing");
             return Ok(RECONNECT_PENDING);
         }
         bail!("destination @{name} is already registered by another connection");
     }
+    let owner = identity::owner(&directory, name)?;
+    let public_key = identity::verify_receiver(name, &registration, owner.as_deref())?;
+    identity::claim(&directory, name, &public_key)?;
     let path = directory.join(format!("{name}.json"));
     let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
     temporary.write_all(&serde_json::to_vec(&registration)?)?;
@@ -1240,7 +1406,7 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     let meta = fs::symlink_metadata(&path)?;
     guard.record = Some((path, (meta.dev(), meta.ino())));
     // Drop the advertisement before releasing its name lock, including on a
-    // normal disconnect. A crash can leave a stale record, never a reservation.
+    // normal disconnect. Ownership survives; a crash cannot keep the live lock.
     let _guard = guard;
     write_message(&mut std::io::stdout(), &Reply::Ready)?;
     let mut input = std::io::stdin();
@@ -1250,7 +1416,7 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
             events: libc::POLLIN,
             revents: 0,
         };
-        // A quiet, half-open SSH transport must not reserve a name forever.
+        // A quiet, half-open SSH transport must not block reconnection forever.
         let ready = unsafe { libc::poll(&mut descriptor, 1, 15_000) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
@@ -1270,31 +1436,40 @@ fn register_inner(name: &str, socket: &Path, secret: &str) -> Result<i32> {
     }
     Ok(0)
 }
-fn available(name: &str) -> Result<()> {
-    let registration = load_registration(name)?;
-    let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(1))?;
-    if !matches!(reply, Reply::Ready) {
-        bail!("destination not ready");
+fn available(name: &str, timeout: Duration) -> Result<Registration> {
+    let registration = read_registration(name)?;
+    if let Some(owner) = identity::owner(&registry()?, name)? {
+        identity::verify_receiver_with_timeout(name, &registration, Some(&owner), timeout)?;
+    } else {
+        let (_, reply) = exchange(&registration, Message::Ping, timeout)?;
+        if !matches!(reply, Reply::Ready) {
+            bail!("destination not ready");
+        }
     }
-    Ok(())
+    Ok(registration)
 }
 fn destinations(action: DestinationAction) -> Result<i32> {
     match action {
         DestinationAction::List => {
             let mut names = Vec::new();
             for entry in fs::read_dir(registry()?)? {
-                let name = entry?.file_name().to_string_lossy().into_owned();
-                if let Some(name) = name.strip_suffix(".json") {
+                let file = entry?.file_name();
+                let file = file.to_string_lossy();
+                if let Some(name) = file
+                    .strip_suffix(".json")
+                    .or_else(|| file.strip_suffix(".owner"))
+                {
                     if validate_name(name).is_ok() {
                         names.push(name.to_owned());
                     }
                 }
             }
             names.sort();
+            names.dedup();
             for name in names {
                 println!(
                     "@{name}\t{}",
-                    if available(&name).is_ok() {
+                    if available(&name, Duration::from_secs(1)).is_ok() {
                         "online"
                     } else {
                         "offline"
@@ -1309,12 +1484,15 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(directory.join(format!("{name}.lock")))?;
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
-            fs::remove_file(directory.join(format!("{name}.json")))?;
+            identity::forget(&directory, &name)?;
             println!("syq: forgot offline destination @{name}");
             Ok(0)
         }
@@ -1326,18 +1504,25 @@ fn destinations(action: DestinationAction) -> Result<i32> {
             let deadline = Instant::now() + Duration::from_secs(timeout);
             let mut last_progress = Instant::now();
             loop {
-                match available(&name) {
-                    Ok(()) => return Ok(0),
-                    Err(error) if Instant::now() >= deadline => {
-                        return Err(error).context("timed out waiting for named destination")
-                    }
-                    Err(error) if last_progress.elapsed() >= Duration::from_secs(5) => {
-                        crate::output::diagnostic!("syq: waiting for @{name}: {error:#}");
-                        last_progress = Instant::now();
-                    }
-                    Err(_) => {}
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("timed out waiting for named destination");
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                let error = match available(&name, remaining.min(Duration::from_secs(1))) {
+                    Ok(_) => return Ok(0),
+                    Err(error) => error,
+                };
+                if last_progress.elapsed() >= Duration::from_secs(5) {
+                    crate::output::diagnostic!("syq: waiting for @{name}: {error:#}");
+                    last_progress = Instant::now();
+                }
+                std::thread::sleep(
+                    Duration::from_millis(200)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    return Err(error).context("timed out waiting for named destination");
+                }
             }
         }
     }
@@ -1364,6 +1549,46 @@ mod tests {
     use crate::cli::{Args, Interface, Location, Placement};
     use crate::conn::Conn;
     use crate::proto::{Request, Response};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_listen_queue_reports_busy_without_reconnect_advice() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(0).unwrap();
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..16 {
+            match connect_socket(&path, Instant::now() + Duration::from_secs(1)) {
+                Ok(socket) => queued.push(socket),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("fill listen queue: {error}"),
+            }
+        }
+        assert!(full, "test did not fill the listen queue");
+        let registration = Registration {
+            version: REGISTRATION_VERSION,
+            identity: crate::identity::build().into(),
+            socket: path,
+            secret: "test".into(),
+            program: b"/test/syq".to_vec(),
+        };
+        let error = exchange(&registration, Message::Ping, Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("busy"), "{error:#}");
+        assert!(!error.to_string().contains("reconnect"), "{error:#}");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn registration_retries_socket_timeout_but_not_peer_rejection() {
@@ -1404,6 +1629,56 @@ mod tests {
             }
             assert!(!path.exists(), "failed registration must remove its socket");
         }
+    }
+
+    #[test]
+    fn partial_writes_do_not_renew_the_exchange_deadline() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        socket2::SockRef::from(&writer)
+            .set_send_buffer_size(1024)
+            .unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut received = 0;
+            let mut bytes = [0; 1024];
+            while Instant::now() < end {
+                match reader.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => received += count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("{error}"),
+                }
+                if stopped.recv_timeout(Duration::from_millis(30)).is_ok() {
+                    break;
+                }
+            }
+            received
+        });
+        let start = Instant::now();
+        let result = write_message(
+            &mut DeadlineSocket {
+                socket: &mut writer,
+                deadline: start + Duration::from_millis(150),
+            },
+            &"x".repeat(MAX_MESSAGE / 2),
+        );
+        let elapsed = start.elapsed();
+        let _ = stop.send(());
+        let received = peer.join().unwrap();
+        assert!(result.is_err());
+        assert!(received > 4, "peer made no payload progress");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write took {elapsed:?}"
+        );
     }
 
     pub(super) fn args(source: &Path, destination: &str) -> Args {
@@ -1448,6 +1723,8 @@ mod tests {
     ) {
         let (prompts, requests) = mpsc::sync_channel(1);
         let receiver = Arc::new(Receiver {
+            name: "laptop".into(),
+            identity_key: identity::generate_key().unwrap(),
             requester: "test-server".into(),
             approval_mode: crate::receive_approval::Mode::Always,
             notifications: crate::receive_approval::Notifications::Off,

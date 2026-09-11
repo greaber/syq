@@ -19,8 +19,7 @@ existing tmux session.
 
 Replace `@laptop` with your desktop's receiving name. You can find it by running
 `syq persist destinations list` on the server or `syq persist receive status`
-on your desktop. The desktop must be connected: both `--on laptop` and
-`--on @laptop` fail while it is offline.
+on your desktop. Use `--on @laptop`; the desktop must be connected.
 
 ## Approve each command locally
 

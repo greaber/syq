@@ -100,14 +100,18 @@ syq cp project --to server       # put project in your home directory on server
 syq cp --from server project     # fetch project into your current directory
 ```
 
-Endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
+SSH endpoints use `[USER@]HOST[:PORT]`, for example `alice@server:2222`.
 Host names cannot start with a dash, including when using an `--rsh` wrapper.
 Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
+Use `--to @NAME` to send local source files to a registered receiving machine.
+The `@` is required: `--to laptop` always selects an SSH destination, while
+`--to @laptop` selects the receiver and fails if it is offline or its identity
+check fails. Receiver destinations do not switch to SSH when unavailable. See [Send files home from a server](receive.md)
+for setup and receiver-side path settings.
+
 For two remote endpoints, see [Copy between servers](remote-to-remote.md).
-To send files to your laptop from a server shell, see
-[Send files home from a server](receive.md).
 
 ## Progress
 

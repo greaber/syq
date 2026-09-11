@@ -60,7 +60,7 @@ The source sshd permits remote Unix socket forwarding for named return transfers
 keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
 copies from independent source shells without a forwarded agent, destination
 background startup through persistence, `--root` traversal refusal, unconfined
-`--cwd` paths, conflicting names, reconnection after killing the owned SSH
+`--cwd` paths, conflicting names, offline ownership and explicit receiver replacement, reconnection after killing the owned SSH
 transport, recovery after a server heartbeat times out while the client is
 paused, and stopping receiving with persistence. Approval cases cover local
 allow/deny, one-use IDs, disconnect and settings cancellation, and explicit
@@ -187,3 +187,12 @@ expiry cases verify automatic recovery and successful subsequent copies.
 The suite also revokes an enrollment while two restricted copies are writing,
 checks that both fail without publishing their files, and verifies that a fresh
 enrollment can resume their partials.
+
+For receiver-state compatibility against an unchanged v0.5.2 binary, run
+`python3 tests/receiver_identity_compat.py target/debug/syq /path/to/v0.5.2/syq`
+from the repository root. It accepts the official release or a clean build of tag
+commit `fd2b17c642e6`, checks its version and build identity, and uses disposable
+local sockets and state. It also checks that reconnect probes send only Ping
+to an unresponsive old connection without displacing it, and that readiness
+checks verify the identity of the registered receiver. Dirty baseline builds
+are rejected.
