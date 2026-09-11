@@ -64,7 +64,9 @@ pub(crate) fn test_race_barrier(
         // Some race tests finish a competing copy before releasing this worker.
         // Leave room for that work under suite load, especially on macOS. This
         // is a deadlock safety bound, not an assertion about transfer speed.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(60);
+        let mut next_progress = started + std::time::Duration::from_secs(5);
         loop {
             match File::open(&continuation) {
                 Ok(_) => return Ok(()),
@@ -83,6 +85,13 @@ pub(crate) fn test_race_barrier(
                     "timed out waiting for {label} continuation {}",
                     Path::new(&continuation).display()
                 );
+            }
+            if std::time::Instant::now() >= next_progress {
+                eprintln!(
+                    "syq: waiting for {label} continuation {}",
+                    Path::new(&continuation).display()
+                );
+                next_progress += std::time::Duration::from_secs(5);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -456,9 +465,8 @@ impl OperatorDirectorySelection {
             match open_operator_directory_at(&directory, &component) {
                 Ok(child) => directory = child,
                 Err(error) if absent_or_nondirectory(&error) => {
-                    // A missing entry, regular file, or symlink will either be
-                    // replaced as a directory beneath this parent or make the
-                    // copy fail. It must never be followed for this decision.
+                    // A missing entry can become a directory; an existing leaf
+                    // makes the copy fail. Neither is followed for this decision.
                     virtual_components.push(component);
                 }
                 Err(error) => {
@@ -472,12 +480,29 @@ impl OperatorDirectorySelection {
             }
         }
 
-        opened_directory_relation(
+        let destination_metadata = directory.metadata()?;
+        let relation = opened_directory_relation(
             directory,
             source_metadata.dev(),
             source_metadata.ino(),
             !virtual_components.is_empty(),
-        )
+        )?;
+        if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
+            match opened_directory_relation(
+                source.try_clone()?,
+                destination_metadata.dev(),
+                destination_metadata.ino(),
+                false,
+            ) {
+                Ok(DirectoryRelation::Descendant) => return Ok(DirectoryRelation::Ancestor),
+                Ok(_) => {}
+                Err(error) if error_is_kind(&error, io::ErrorKind::PermissionDenied) => {
+                    return Ok(DirectoryRelation::SourceUnsearchable);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(relation)
     }
 }
 
@@ -857,8 +882,8 @@ fn name_max_cached(
 
     // Resolve from a retained root one component at a time. A pathname lstat
     // would still follow symlinks in intermediate components when a descendant
-    // exists. Planning replaces such a symlink instead, so descendants inherit
-    // the containing real directory's filesystem limit.
+    // exists. Planning refuses directory copies onto such a symlink; use the
+    // containing real directory's limit until that conflict is reported.
     let Ok(root) = Root::open(Path::new("/")) else {
         return COMMON_NAME_MAX;
     };
@@ -957,12 +982,13 @@ pub(crate) fn partial_path_with_name_max(
     component_limit: usize,
 ) -> Result<PathBuf> {
     let name = final_.file_name().map(OsStr::as_bytes).unwrap_or(b"root");
-    // A fresh invocation nonce makes this suffix unpredictable. Including the
-    // complete basename gives truncated names independent suffixes, while all
-    // workers can resolve the same file without a shared pathname registry.
+    // A fresh invocation nonce makes this suffix unpredictable. Hash the full
+    // logical destination spelling so different names (including aliased
+    // parent directories) have independent staging files. The readable prefix
+    // and opaque suffix format stay compatible with older resume candidates.
     let mut hash = Sha256::new();
     hash.update(copy_id);
-    hash.update(name);
+    hash.update(final_.as_os_str().as_bytes());
     let suffix = base32(&hash.finalize()[..10]);
     let parent = final_.parent().unwrap_or_else(|| Path::new(""));
     let budget = path_component_budget(parent, component_limit);
@@ -982,6 +1008,19 @@ pub(crate) fn partial_path_with_name_max(
     component.extend_from_slice(PARTIAL_MARKER.as_bytes());
     component.extend_from_slice(suffix.as_bytes());
     Ok(parent.join(OsString::from_vec(component)))
+}
+
+/// Names used for displaced entries during interrupted replacement. Keep
+/// this separate from resumable partials: clean-partials must not remove them.
+pub fn is_recovery_name(name: &OsStr) -> bool {
+    let Some(suffix) = name.as_bytes().strip_prefix(b".syq-swap-") else {
+        return false;
+    };
+    let mut fields = suffix.split(|byte| *byte == b'-');
+    let decimal = |field: Option<&[u8]>| {
+        field.is_some_and(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+    };
+    decimal(fields.next()) && decimal(fields.next()) && fields.next().is_none()
 }
 
 pub fn is_partial_name(name: &OsStr) -> bool {
@@ -1619,10 +1658,21 @@ impl FsOps {
                 checks.len()
             );
         }
-        let selection = self
-            .operator_selection
-            .as_ref()
-            .context("destination directory was not checked on this connection")?;
+        let registered_selection;
+        let selection = if let Some(selection) = &self.operator_selection {
+            selection
+        } else {
+            let root = self
+                .destination_root
+                .as_ref()
+                .context("destination directory was not checked on this connection")?;
+            registered_selection = OperatorDirectorySelection {
+                path: Vec::new(),
+                directory: root.open_directory(&RelativePath::new(b"")?)?,
+                missing: VecDeque::new(),
+            };
+            &registered_selection
+        };
         checks
             .iter()
             .map(|check| {
@@ -1634,7 +1684,18 @@ impl FsOps {
                 check
                     .suffixes
                     .iter()
-                    .map(|suffix| selection.relation_to_source(&source, suffix))
+                    .map(|suffix| {
+                        let relation = selection.relation_to_source(&source, suffix)?;
+                        Ok(if check.source_is_directory {
+                            relation
+                        } else {
+                            match relation {
+                                DirectoryRelation::Same => DirectoryRelation::Ancestor,
+                                DirectoryRelation::Descendant => DirectoryRelation::Separate,
+                                other => other,
+                            }
+                        })
+                    })
                     .collect()
             })
             .collect()
@@ -1754,8 +1815,8 @@ impl FsOps {
                 }
             }
         }
-        // Match the engine's size + whole-second mtime quick check. A
-        // nanosecond difference alone does not cause a content transfer.
+        // This fused path serves native copies: use all available timestamp
+        // precision, matching the native planner's quick check.
         let mut unchanged: Vec<bool> = request
             .files
             .iter()
@@ -1765,6 +1826,7 @@ impl FsOps {
                     request.flags & flags::TIMES != 0
                         && stat.st_size as u64 == file.data.len() as u64
                         && stat.st_mtime == file.meta.mtime
+                        && stat.st_mtime_nsec as u32 == file.meta.mtime_nsec
                 })
             })
             .collect();
@@ -2404,6 +2466,7 @@ impl FsOps {
             Request::Scan { guard, .. }
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
+            | Request::PruneLookup { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -2695,7 +2758,9 @@ impl FsOps {
                     map(root)?;
                 }
             }
-            Request::StatMany { paths, guard, .. } | Request::PartialPaths { paths, guard, .. } => {
+            Request::StatMany { paths, guard, .. }
+            | Request::PartialPaths { paths, guard, .. }
+            | Request::PruneLookup { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -3078,6 +3143,46 @@ impl FsOps {
             };
             md.ok().map(|md| entry_from_meta(Vec::new(), &full, &md))
         })
+    }
+
+    fn prune_lookup(
+        &self,
+        paths: &[PathBytes],
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Vec<Option<Entry>>> {
+        parallel_map(paths, |path| {
+            // Resolve authority before classifying missing paths. An invalid
+            // root/guard must never be mistaken for a missing child.
+            let target = self.rooted_destination_target(path, guard)?;
+            let result: Result<Entry> = (|| {
+                if let Some(target) = target {
+                    let metadata = target.root.metadata(&target.relative)?;
+                    rooted_entry(&target.root, &target.relative, Vec::new(), metadata)
+                } else {
+                    let path = resolve(path);
+                    let metadata = fs::symlink_metadata(&path)?;
+                    Ok(entry_from_meta(Vec::new(), &path, &metadata))
+                }
+            })();
+            match result {
+                Ok(entry) => Ok(Some(entry)),
+                Err(error)
+                    if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+                    }) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "inspect destination for pruning: {}",
+                        resolve(path).display()
+                    )
+                }),
+            }
+        })
+        .into_iter()
+        .collect()
     }
 
     fn stat_many_request(
@@ -3663,14 +3768,10 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(_) if *condition != TargetCondition::Any => bail!(
-                    "destination {} cannot change type under a matched condition",
+                Some(_) => bail!(
+                    "cannot replace non-directory {} with a directory",
                     target.label.display()
                 ),
-                Some(_) => {
-                    root.unlink(path)?;
-                    create_rooted_directory_or_existing(target, *mode)
-                }
                 None => create_rooted_directory_or_existing(target, *mode),
             }
         }
@@ -3706,14 +3807,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     root.replace_symlink_if_same(path, link, metadata.dev, metadata.ino)
                 }
-                Some(metadata) => {
-                    if metadata.is_dir() {
-                        root.remove_directory(path)?;
-                    } else {
-                        root.unlink(path)?;
-                    }
-                    root.create_symlink(path, link)
-                }
+                Some(_) => root.replace_symlink(path, link),
                 None => root.create_symlink(path, link),
             }
         }
@@ -3747,14 +3841,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     }
                     root.replace_node_if_same(path, *mode, *rdev, metadata.dev, metadata.ino)
                 }
-                Some(metadata) => {
-                    if metadata.is_dir() {
-                        root.remove_directory(path)?;
-                    } else {
-                        root.unlink(path)?;
-                    }
-                    root.create_node(path, *mode, *rdev)
-                }
+                Some(_) => root.replace_node(path, *mode, *rdev),
                 None => root.create_node(path, *mode, *rdev),
             }
         }
@@ -5603,7 +5690,7 @@ impl FsOps {
                 });
             }
             if n == 0 {
-                break; // source shorter than expected; finalize what we have
+                bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
         }
@@ -6332,6 +6419,9 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
+            Request::PruneLookup { paths, guard } => self
+                .prune_lookup(paths, guard.as_ref())
+                .map(Response::Stats),
             Request::PartialPaths {
                 paths,
                 copy_id,
@@ -6916,24 +7006,13 @@ fn mkdir_with_parent_fallback(p: &Path, mode: u32) -> Result<()> {
     }
 }
 
-fn remove_non_directory_or_empty_directory(p: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(p)?;
-    if metadata.is_dir() {
-        fs::remove_dir(p)?;
-    } else {
-        fs::remove_file(p)?;
-    }
-    Ok(())
-}
-
 fn create_symlink_any(path: &Path, target: &[u8]) -> Result<()> {
     let target = OsStr::from_bytes(target);
     match std::os::unix::fs::symlink(target, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            remove_non_directory_or_empty_directory(path)?;
-            std::os::unix::fs::symlink(target, path)
-                .with_context(|| format!("symlink {}", path.display()))
+            let (root, relative) = exact_parent(path)?;
+            root.replace_symlink(&relative, target.as_bytes())
         }
         Err(error) => Err(error).with_context(|| format!("symlink {}", path.display())),
     }
@@ -6957,8 +7036,8 @@ fn create_node_any(path: &Path, mode: u32, rdev: u64) -> Result<()> {
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
         {
-            remove_non_directory_or_empty_directory(path)?;
-            create().with_context(|| format!("mknod {}", path.display()))
+            let (root, relative) = exact_parent(path)?;
+            root.replace_node(&relative, mode, rdev)
         }
         Err(error) => Err(error).with_context(|| format!("mknod {}", path.display())),
     }
@@ -6981,10 +7060,10 @@ fn mkdir_or_existing_dir(p: &Path, mode: u32) -> Result<()> {
         {
             match fs::symlink_metadata(p) {
                 Ok(md) if md.is_dir() => make_dir_writable(p, &md),
-                Ok(_) => {
-                    fs::remove_file(p)?;
-                    mkdir_with_parent_fallback(p, mode)
-                }
+                Ok(_) => bail!(
+                    "cannot replace non-directory {} with a directory",
+                    p.display()
+                ),
                 Err(_) => Err(err),
             }
         }
@@ -7162,6 +7241,34 @@ fn apply_owner_if_changed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/file"), b"contents").unwrap();
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        let stats = ops
+            .prune_lookup(&[b"missing/child".to_vec(), b"sub/file".to_vec()], None)
+            .unwrap();
+        assert!(stats[0].is_none());
+        assert_eq!(stats[1].as_ref().unwrap().size, 8);
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission denial: running as root");
+            return;
+        }
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = ops.prune_lookup(&[b"sub/file".to_vec()], None);
+        fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        let error = denied.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::fs::{symlink, FileTypeExt};
@@ -7205,6 +7312,36 @@ mod tests {
         // Return the control endpoint so tests retain the complete session
         // lifecycle in addition to each worker's own root and leaf clones.
         (worker, selections, control)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_copy_rejects_eof_before_the_planned_size() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"short").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("file"), b"old complete file").unwrap();
+        let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+        worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+        let result = worker.copy_local(
+            &sources[0],
+            b"file",
+            CopyLocalPolicy {
+                inplace: false,
+                allow_sequential_nfs_fallback: false,
+                allow_sequential_local_fallback: true,
+            },
+            &[37; 16],
+            100,
+            0o600,
+        );
+        assert!(result.is_err(), "a short copy cannot be finalized");
+        assert_eq!(
+            fs::read(destination.join("file")).unwrap(),
+            b"old complete file"
+        );
     }
 
     #[test]
@@ -7518,6 +7655,48 @@ mod tests {
     }
 
     #[test]
+    fn ancestry_requires_an_available_source_directory() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let session = DescriptorSessionSlot::default();
+        let ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut ops = FsOps::new();
+        ops.check_operator_directory(
+            temp.path().as_os_str().as_bytes(),
+            false,
+            OperatorSymlinkPolicy::Refuse,
+        )
+        .unwrap();
+        let check = || {
+            ops.check_operator_directory_ancestry(&[DirectoryAncestryCheck {
+                source_root: ticket.clone(),
+                source_is_directory: true,
+                suffixes: vec![Vec::new()],
+            }])
+        };
+        assert_eq!(check().unwrap(), vec![vec![DirectoryRelation::Same]]);
+
+        if unsafe { libc::geteuid() } != 0 {
+            let socket = ticket.broker_path();
+            let parent = socket.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+            let result = check();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(error_is_kind(
+                &result.unwrap_err(),
+                io::ErrorKind::PermissionDenied
+            ));
+        } else {
+            eprintln!("skipping permission denial: running as root");
+        }
+
+        session.close();
+        assert!(error_is_kind(
+            &check().unwrap_err(),
+            io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
     fn retained_operator_directory_reports_source_ancestry_without_following_suffix_links() {
         let dir = test_dir();
         let source = dir.join("source");
@@ -7567,6 +7746,13 @@ mod tests {
                 .relation_to_source(&source, b"..")
                 .unwrap(),
             DirectoryRelation::Same
+        );
+
+        assert_eq!(
+            select(&dir, false)
+                .relation_to_source(&source, b"")
+                .unwrap(),
+            DirectoryRelation::Ancestor
         );
 
         fs::remove_dir_all(&dir).unwrap();
@@ -7846,6 +8032,21 @@ mod tests {
         assert!(!is_partial_name(OsStr::new(
             ".file.syq-tmp.aaaaaaaaaaaaaaa8"
         )));
+    }
+
+    #[test]
+    fn partial_names_distinguish_aliased_parent_spellings() {
+        for (left, right) in [("sub/file", "SUB/file"), ("é/file", "e\u{301}/file")] {
+            for limit in [25, 80, 255] {
+                let a = partial_path_with_name_max(Path::new(left), &[7; 16], limit).unwrap();
+                let b = partial_path_with_name_max(Path::new(right), &[7; 16], limit).unwrap();
+                assert_ne!(
+                    a.file_name(),
+                    b.file_name(),
+                    "same leaf in aliased parents must have distinct staging names"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8387,7 +8588,8 @@ mod tests {
         operations
             .seed_basis(b"basis", &copy_id, 4, MIN_HASH_BLOCK_BYTES, 0, None)
             .unwrap();
-        let basis_partial = partial_path(&moved.join("basis"), &copy_id).unwrap();
+        let basis_name = partial_path(&selected.join("basis"), &copy_id).unwrap();
+        let basis_partial = moved.join(basis_name.file_name().unwrap());
         assert_eq!(fs::read(&basis_partial).unwrap(), b"held");
         let Response::PartialSize(partial_size) =
             operations.probe_partial(b"basis", &copy_id, None).unwrap()
@@ -8450,7 +8652,8 @@ mod tests {
             0o600
         );
 
-        let stale = partial_path(&moved.join("inplace"), &copy_id).unwrap();
+        let stale_name = partial_path(&selected.join("inplace"), &copy_id).unwrap();
+        let stale = moved.join(stale_name.file_name().unwrap());
         fs::write(&stale, b"stale").unwrap();
         operations
             .prepare(
@@ -8784,7 +8987,10 @@ mod tests {
                 },
             )
             .is_err());
-        let parked_partial = partial_path(&root_path.join("parked/file"), &copy_id).unwrap();
+        let original_partial = partial_path(&root_path.join("parent/file"), &copy_id).unwrap();
+        let parked_partial = root_path
+            .join("parked")
+            .join(original_partial.file_name().unwrap());
         assert_eq!(fs::read(parked_partial).unwrap(), b"held");
         assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside");
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);

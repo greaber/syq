@@ -39,7 +39,9 @@ pub trait Conn: Send {
     }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = match &req {
-            Request::StatMany { paths, .. } => Some(("stat", paths.len())),
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
+                Some(("stat", paths.len()))
+            }
             Request::Apply { ops, .. } => Some(("apply", ops.len())),
             Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
             _ => None,
@@ -562,6 +564,7 @@ impl Conn for LocalConn {
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
                     | Request::CopySmallFiles(_)
+                    | Request::PruneLookup { .. }
                     | Request::Receipt
             )
         {
