@@ -8332,6 +8332,7 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
             .args(sources)
             .args(["--to", "fake.example"])
             .args(placement)
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
@@ -8691,6 +8692,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
             .arg(t.path("source"))
             .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
             .args(["--results", &t.s("results.ndjson")])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -8772,6 +8774,7 @@ fn small_push_preserves_results_with_closed_human_streams() {
             .arg(t.path("source"))
             .args(["--to", "fake.example", "--into", &t.s("remote-home/dest")])
             .args(["--results", &t.s("results.ndjson")])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -8848,6 +8851,7 @@ fn small_push_refusals_and_failures_match_the_engine() {
             .args(sources)
             .args(["--to", "fake.example"])
             .args(placement)
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path(&format!("{label}.rsh.log")))
@@ -9205,6 +9209,7 @@ fn native_remote_copy_omitted_placement_uses_destination_base() {
                     "-q",
                 ])
                 .args(args)
+                .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -13679,6 +13684,7 @@ fn native_endpoint_port_reaches_ssh() {
             &t.s("dst"),
             "-q",
         ])
+        .env("XDG_CONFIG_HOME", t.path("config"))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -20786,6 +20792,7 @@ fn concurrent_small_pushes_publish_independent_files() {
                     "--as",
                     &t.s("remote-home/dst/file"),
                 ])
+                .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -20834,6 +20841,7 @@ fn concurrent_small_pushes_publish_independent_files() {
                 &t.s("removed.ndjson"),
                 &t.s("remote-home/dst"),
             ])
+            .env("XDG_CONFIG_HOME", t.path("config"))
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))

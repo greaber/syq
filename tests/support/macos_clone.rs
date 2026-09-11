@@ -32,3 +32,29 @@ pub fn available() -> bool {
         false
     })
 }
+
+/// Check source metadata independently of attributes macOS creates itself.
+pub fn assert_xattr(file: &std::fs::File, name: &std::ffi::CStr, expected: Option<&[u8]>) {
+    let mut buffer = vec![0; expected.map_or(0, <[u8]>::len)];
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+            0,
+        )
+    };
+    if let Some(expected) = expected {
+        assert_eq!(size, expected.len() as isize, "{name:?}");
+        assert_eq!(buffer, expected, "{name:?}");
+    } else {
+        assert_eq!(size, -1, "unexpected attribute {name:?}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOATTR),
+            "{name:?}"
+        );
+    }
+}

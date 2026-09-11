@@ -3091,13 +3091,18 @@ mod tests {
                 .expect("ordinary xattrs and user flags must allow cloning");
             assert_eq!(source_flags, flags);
             assert_eq!(clone.metadata().unwrap().st_flags(), 0);
-            assert_eq!(
-                unsafe { libc::flistxattr(clone.as_raw_fd(), std::ptr::null_mut(), 0, 0) },
-                0
-            );
-            assert!(
-                unsafe { libc::flistxattr(source.as_raw_fd(), std::ptr::null_mut(), 0, 0) } > 0
-            );
+            // macOS can add its own provenance attribute after publication,
+            // including on byte copies. Check the source attributes by name.
+            for (name, value) in [
+                (c"com.apple.quarantine", b"0081;66000000;syq;".as_slice()),
+                (
+                    c"com.apple.FinderInfo",
+                    b"TEXTttxt000000000000000000000000".as_slice(),
+                ),
+            ] {
+                macos_clone_support::assert_xattr(&clone, name, None);
+                macos_clone_support::assert_xattr(&source, name, Some(value));
+            }
             (&clone).write_all(b"copy").unwrap();
             assert_eq!(fs::read(&source_path).unwrap(), b"data");
             fs::remove_file(t.path().join("partial")).unwrap();

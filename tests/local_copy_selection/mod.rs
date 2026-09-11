@@ -824,11 +824,8 @@ fn macos_clone_strips_quarantine_without_reading_ranges() {
     assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
     assert_eq!(tuning_observed(&out)["range_requests"], 0);
     let destination = File::open(t.path("dst")).unwrap();
-    assert_eq!(
-        unsafe { libc::flistxattr(destination.as_raw_fd(), std::ptr::null_mut(), 0, 0) },
-        0
-    );
-    assert!(unsafe { libc::flistxattr(source.as_raw_fd(), std::ptr::null_mut(), 0, 0) } > 0);
+    macos_clone_support::assert_xattr(&destination, c"com.apple.quarantine", None);
+    macos_clone_support::assert_xattr(&source, c"com.apple.quarantine", Some(value));
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
