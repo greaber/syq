@@ -2506,7 +2506,7 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
 
     write(&t.path("source-tree/file"), b"tree");
     symlink("source-tree", t.path("source-tree-link")).unwrap();
-    run_native_ok(&[
+    let refused = native_syq(&[
         "cp",
         "--follow",
         "--src-dir",
@@ -2514,7 +2514,9 @@ fn native_copy_placement_links_follow_containers_but_not_exact_names() {
         "--as-existing",
         &t.s("source-tree-link"),
     ]);
-    assert!(!t.path("source-tree-link").is_symlink());
+    assert_eq!(refused.status.code(), Some(23), "{refused:?}");
+    assert!(stderr_of(&refused).contains("cannot replace non-directory"));
+    assert!(t.path("source-tree-link").is_symlink());
     assert_eq!(read(&t.path("source-tree-link/file")), b"tree");
     assert_eq!(read(&t.path("source-tree/file")), b"tree");
 
@@ -7479,55 +7481,25 @@ fn dry_run_accounts_for_changed_symlinks_and_type_replacements() {
 }
 
 #[test]
-fn dry_run_directory_replacement_makes_descendants_virtually_missing() {
+fn dry_run_directory_conflict_does_not_inspect_symlink_descendants() {
     let t = Tmp::new();
-    write(&t.path("src/d/f"), b"same");
-    write(&t.path("outside/f"), b"same");
+    write(&t.path("src/d/sub/f"), b"source");
+    write(&t.path("outside/sub/f"), b"keep");
     fs::create_dir_all(t.path("dst")).unwrap();
     std::os::unix::fs::symlink(t.path("outside"), t.path("dst/d")).unwrap();
-    set_mtime(&t.path("src/d/f"), 1_600_000_000);
-    set_mtime(&t.path("outside/f"), 1_600_000_000);
-    set_mtime(&t.path("src"), 1_600_000_100);
-    set_mtime(&t.path("dst"), 1_600_000_100);
 
-    let out = run_ok(&["-anv", &t.s("src/"), &t.s("dst")]);
-    let changes = out
-        .lines()
-        .find(|line| line.starts_with("  changes:"))
-        .unwrap_or_else(|| panic!("missing changes line in {out}"));
-    assert!(changes.contains("1 regular file"), "{out}");
-    assert!(changes.contains("1 directory"), "{out}");
-    assert!(changes.contains("1 type replacement among them"), "{out}");
-    assert!(
-        out.contains("4 B in 1 file needing content work (upper bound)"),
-        "{out}"
-    );
-    assert!(
-        out.contains("0 B in 0 files with unchanged content"),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "replace with directory {}/ (destination is symlink)",
-            t.s("dst/d")
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "create file {} (destination missing)",
-            t.s("dst/d/f")
-        )),
-        "{out}"
-    );
-    assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
-    assert_eq!(read(&t.path("outside/f")), b"same");
-
-    let actual = run_ok(&["-a", &t.s("src/"), &t.s("dst")]);
-    assert_eq!(transferred(&actual), 1, "{actual}");
-    assert!(t.path("dst/d").is_dir());
-    assert_eq!(read(&t.path("dst/d/f")), b"same");
-    assert_eq!(read(&t.path("outside/f")), b"same");
+    for flags in ["-anv", "-av"] {
+        let out = syq(&[flags, &t.s("src/"), &t.s("dst")]);
+        assert_eq!(out.status.code(), Some(23), "{out:?}");
+        assert!(
+            stderr_of(&out).contains("cannot replace non-directory"),
+            "{out:?}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("create file"), "{stdout}");
+        assert!(t.path("dst/d").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(read(&t.path("outside/sub/f")), b"keep");
+    }
 }
 
 #[test]
@@ -7843,11 +7815,7 @@ fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
 
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
-    let err_lower = err.to_ascii_lowercase();
-    assert!(
-        err_lower.contains("destination") && err_lower.contains("is a directory"),
-        "{err}"
-    );
+    assert!(err.contains("cannot replace directory"), "{err}");
     assert!(!err.contains("panicked"), "{err}");
     assert_eq!(read(&t.path("dest/foo/keep")), b"keep");
 }
@@ -12417,17 +12385,20 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
 }
 
 #[test]
-fn in_tree_destination_symlink_is_replaced_not_followed() {
+fn in_tree_destination_symlink_blocks_directory_copy() {
     let t = Tmp::new();
     write(&t.path("src/sub/f"), b"payload");
     fs::create_dir_all(t.path("dst")).unwrap();
     fs::create_dir_all(t.path("elsewhere")).unwrap();
     std::os::unix::fs::symlink("../elsewhere", t.path("dst/sub")).unwrap();
 
-    run_ok(&["-a", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&["-a", &t.s("src/"), &t.s("dst/")]);
 
-    assert!(fs::symlink_metadata(t.path("dst/sub")).unwrap().is_dir());
-    assert_eq!(read(&t.path("dst/sub/f")), b"payload");
+    assert_eq!(out.status.code(), Some(23), "{out:?}");
+    assert!(stderr_of(&out).contains("cannot replace non-directory"));
+    assert!(fs::symlink_metadata(t.path("dst/sub"))
+        .unwrap()
+        .is_symlink());
     assert!(!t.path("elsewhere/f").exists());
 }
 
@@ -17979,7 +17950,15 @@ fn explicit_pscope_is_refused_for_remote_coordinators() {
 #[test]
 fn native_cp_mapping_restores_only_reopened_implicit_parents() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for mode in [0o550, 0o750] {
+    // Darwin cannot open a mode-000 directory for descriptor-based repair;
+    // data_safety covers its failure without mutation. Mode 0600 exercises
+    // missing search permission on both platforms.
+    let modes: &[u32] = if cfg!(target_os = "macos") {
+        &[0o600, 0o550, 0o750]
+    } else {
+        &[0o000, 0o600, 0o550, 0o750]
+    };
+    for &mode in modes {
         for preserve in [false, true] {
             let t = Tmp::new();
             write(&t.path("src/file"), b"same contents");
@@ -18832,7 +18811,7 @@ fn native_overwrite_policies_apply_per_entry() {
         fs::create_dir_all(t.path("dst/nested")).unwrap();
         set_mtime(&t.path("src/present"), 1_600_000_000);
         set_mtime(&t.path("dst/present"), 1_700_000_000);
-        run_native_ok(&[
+        let out = native_syq(&[
             "cp",
             policy,
             "--srcs-in",
@@ -18840,6 +18819,14 @@ fn native_overwrite_policies_apply_per_entry() {
             "--into",
             &t.s("dst"),
         ]);
+        assert_eq!(
+            out.status.code(),
+            Some(if policy == "--skip-newer" { 23 } else { 0 }),
+            "{out:?}"
+        );
+        if policy == "--skip-newer" {
+            assert!(stderr_of(&out).contains("cannot replace non-directory"));
+        }
         let updates = policy == "--only-existing";
         assert_eq!(
             read(&t.path("dst/present")),
@@ -18854,11 +18841,7 @@ fn native_overwrite_policies_apply_per_entry() {
             t.path("dst/nested/new").exists(),
             policy != "--only-existing"
         );
-        if policy == "--skip-newer" {
-            assert_eq!(read(&t.path("dst/dir/child")), b"child");
-        } else {
-            assert_eq!(read(&t.path("dst/dir")), b"keep non-directory");
-        }
+        assert_eq!(read(&t.path("dst/dir")), b"keep non-directory");
     }
     let t = Tmp::new();
     write(&t.path("source"), b"source");
@@ -20428,6 +20411,7 @@ fn native_only_new_later_sources_stamp_directories_created_by_this_copy() {
     }
 }
 
+mod data_safety;
 mod local_copy_selection;
 
 #[test]
@@ -20679,6 +20663,8 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 ])
                 .env(ready_env, &ready)
                 .env(continue_env, &continuation)
+                // This barrier covers the second complete copy, including
+                // hashing and publication on a loaded macOS CI runner.
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .start()

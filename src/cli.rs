@@ -839,7 +839,7 @@ struct NativeCopyOperationalArgs {
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
     existing: bool,
-    /// Skip regular files newer at the destination; type replacements still occur
+    /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
     /// Disable transport compression
@@ -2287,7 +2287,7 @@ const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq exten
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";
-const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq replaces destination symlink conflicts instead.";
+const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq refuses to copy a directory onto an in-tree symlink.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {

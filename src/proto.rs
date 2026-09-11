@@ -522,6 +522,8 @@ impl SourceRootBase {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DirectoryAncestryCheck {
     pub source_root: DescriptorTicket,
+    /// False for an exact file or symlink: the ticket then names its parent.
+    pub source_is_directory: bool,
     pub suffixes: Vec<PathBytes>,
 }
 
@@ -531,6 +533,9 @@ pub enum DirectoryRelation {
     Separate,
     Same,
     Descendant,
+    /// The source lies beneath the effective destination directory.
+    Ancestor,
+    SourceUnsearchable,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -880,6 +885,12 @@ pub enum Request {
         offset: u64,
         data: Vec<u8>,
         finish: bool,
+    },
+    /// Destination lookup for pruning. Unlike planning stats, errors other
+    /// than a missing path fail the request rather than looking absent.
+    PruneLookup {
+        paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
     },
 }
 
@@ -1237,7 +1248,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {

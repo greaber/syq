@@ -14,7 +14,7 @@ for its named behavior, not a score for compatibility as a whole.
 | `--delete` scope: only inside the directories being synced; a single-file source deletes nothing | measured | `delete_only_inside_directories_the_sources_map_onto`, `delete_with_nested_roots_deletes_once` |
 | Ignored/excluded paths are protected from deletion by default; `--delete-excluded` lifts that | measured | `delete_removes_extras_and_protects_ignored`, `delete_nested_roots_keep_their_own_anchored_ignores`, `delete_excluded_removes_ignored_destination_paths` |
 | A directory that can't be emptied because of protected content is reported and left (rsync: `cannot delete non-empty directory`; syq: `not deleting keep/: it holds ignored paths`) | measured | `delete_removes_extras_and_protects_ignored` |
-| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; see "Compatible subsets or approximations" 1 for the transfer-time case | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
+| Deletion is skipped when listing the source hit errors (rsync: `IO error encountered -- skipping file deletion`) | measured; copy errors also suppress deletion | `delete_is_skipped_when_the_source_scan_has_errors`, `unreadable_source_root_disables_delete` |
 | Files the source has but a rule skips (`-u`, `--existing`, `--ignore-existing`, `--max-size`/`--min-size`, symlinks without `-l`, specials without `-D`) are not deleted, even when the destination entry is a non-empty directory | measured on 3.2.7 and 3.5.0 | `delete_never_removes_paths_the_source_has_but_skips`, `delete_leaves_directory_contents_under_a_skipped_source_path`, `size_limits_filter_files_and_protect_them_from_delete`, `delete_keeps_partials_of_filtered_files` |
 | `-u`/`--update`: a destination regular file with a newer mtime is left alone | measured for regular files; see "Compatible subsets or approximations" for symlinks/devices | `update_skips_files_newer_on_the_destination` |
 | `--existing` / `--ignore-existing`, including `--existing` covering directories | measured | `ignore_existing_and_existing`, `existing_never_creates_the_destination_root`, `existing_leaves_a_file_where_a_source_directory_would_go`, `existing_dry_run_reports_no_missing_directory_changes`, `existing_opens_up_readonly_dirs_even_after_a_symlinked_dir` |
@@ -24,7 +24,7 @@ for its named behavior, not a score for compatibility as a whole.
 | `--max-delete N` exists and exits 25 when it trips | believed (exit code matches rsync); see "Intentional divergences" for positive-limit semantics | `max_delete_refuses_everything_past_the_limit` |
 | `--max-delete=0` reports destination-only entries without deleting them; `--max-delete=-1` is accepted as the historical synonym; without `--delete` the option has no effect | measured for syq; rsync behavior documented upstream | `max_delete_refuses_everything_past_the_limit` |
 | A destination symlink named on the command line is followed when owned by root or by the receiving process's effective uid; a component owned by anyone else is refused | measured, including absolute and relative root/cross-uid cases | `symlink_destination_is_followed`, `destination_root_symlink_preserves_target_metadata_for_both_spellings`, `existing_updates_through_a_destination_root_symlink_to_a_dir`, `foreign_owned_destination_root_symlink_is_refused` |
-| A symlink to a directory found *inside* the destination tree is replaced with a real directory; only the argument itself is followed (rsync without `-K`) | measured | `in_tree_destination_symlink_is_replaced_not_followed`, `existing_does_not_write_through_a_destination_symlink_dir` |
+| A symlink found *inside* the destination tree blocks a directory copy; only the destination argument itself is followed | intentional difference | `in_tree_destination_symlink_blocks_directory_copy`, `directory_type_conflicts_preserve_destination_and_prevent_prune`, `existing_does_not_write_through_a_destination_symlink_dir` |
 | `-P`, `-h`, `--partial`, `--numeric-ids`, `-V` accepted as no-ops/aliases; common unsupported flags are rejected with an explanation | by construction | `rsync_compat_noops_are_accepted`, `unsupported_rsync_flags_explain_themselves` |
 | `-B` and `--block-size` select syq's transfer/hash block size | by construction | `checksum_repairs_silent_corruption` |
 | A remote source and remote destination are refused before connecting, as by rsync | by construction | `rsync_rejects_remote_to_remote` |
@@ -70,7 +70,8 @@ for its named behavior, not a score for compatibility as a whole.
 
 *Tests:
    `unreadable_source_root_disables_delete`,
-   `delete_is_skipped_when_the_source_scan_has_errors`.*
+   `delete_is_skipped_when_the_source_scan_has_errors`,
+   `data_safety::prune_is_suppressed_after_an_ordinary_file_read_failure`.*
 
 ### File-list option restrictions
 

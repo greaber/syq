@@ -215,11 +215,19 @@ Pruning stays inside the copied directories. Copying named directories `a`
 and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone.
 Ignored paths and files skipped by size limits are protected.
 
-Scan errors prevent deletion. An interruption after deletion starts can leave
-some extras removed. Do not prune while another copy is writing into the same
-tree: its completed files can be treated as extras. Recognized partial files
-and directories containing them are protected from pruning. With `-v`, syq
+Scan or copy errors prevent deletion. Syq refuses to prune a destination
+that it can identify as containing its source. Checks cover local copies and
+copies between remote paths with the same host name, user, and port. They do not
+detect overlap through different SSH aliases, local-to-SSH connections, or shared
+storage across different hosts. An interruption after deletion starts can leave
+some extras removed. Do not prune
+while another copy is writing into the same tree: its completed files can be treated as extras. Recognized partial files
+and replacement recovery entries (`.syq-swap-<pid>-<number>`) are protected
+from pruning, along with their contents and parent directories. With `-v`, syq
 lists each extra file it keeps because its name matches the partial-file format.
+When a copied path resolves to a different filename spelling at the destination,
+pruning protects that entry. If hard links make the match ambiguous, it can keep
+additional links to the same file.
 
 ## Ignoring paths
 
@@ -266,6 +274,23 @@ Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
 a small amount remains to transfer.
 
+Syq preserves filename bytes and reports names the destination cannot create as
+copy errors. It checks exact destination and partial-file name conflicts, but
+does not preflight case or Unicode equivalence. Source names that the destination
+considers equivalent can overwrite one another; rename them before copying when
+you need to preserve both files.
+
+A directory cannot replace a file or symlink, and a file, symlink or special
+file cannot replace a directory, even an empty one. Syq reports an error and
+skips the conflicting directory's subtree. This follows cp's conservative
+behavior and applies to both `syq cp` and `syq rsync`.
+
+Replacements between non-directory entries stage the new entry before
+publication. Some guarded replacements require an atomic exchange; if the
+filesystem does not support it, the old entry is preserved and the operation
+fails. An interrupted exchange can leave the previous entry beside its
+replacement under a `.syq-swap-...` name; inspect it before removing it.
+
 Concurrent copies use separate partials. With unchanged sources, each completed
 file comes from one copy; different copies may win for different files. This
 does not make a whole tree a snapshot. `--inplace` still exposes unfinished
@@ -306,8 +331,16 @@ partials after all copies have stopped.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match.
-`--hash` checks contents even when those two attributes match:
+Syq normally skips files whose size and modification time match, including
+fractional seconds. It preserves the source timestamp at the destination, so
+the machines' clocks do not need to agree. A changed timestamp triggers checking
+even when it is older than the destination's, unless you request `--skip-newer`.
+A destination that rounds timestamps to coarser precision can cause unchanged
+files to be checked or copied again on later runs.
+
+Matching metadata is a shortcut, not proof that contents match. An edit can
+preserve both size and timestamp, and some filesystems record timestamps with
+less precision. `--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
@@ -359,7 +392,9 @@ Copy keeps modification times and copies symlinks as symlinks. New files use
 the source read, write, and execute permissions limited by the destination
 umask; existing files keep their destination permissions. For example, a new
 script with mode `755` stays executable with umask `022`. Source setuid,
-setgid, and sticky bits are not copied by default.
+setgid, and sticky bits are not copied by default. On macOS, an existing
+destination directory must be readable before syq can temporarily repair
+missing write or search permission.
 
 To copy source permissions exactly, including onto existing files, or request
 ownership too:

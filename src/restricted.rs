@@ -2324,7 +2324,7 @@ impl RestrictedAuthority {
             Request::DestinationFilesystemInfo { .. } => {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
-            Request::PartialPaths { paths, guard, .. } => {
+            Request::PartialPaths { paths, guard, .. } | Request::PruneLookup { paths, guard } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
@@ -5534,6 +5534,36 @@ esac
         assert!(!directory.join("pending.json").exists());
         assert!(directory.join("metadata.json").is_file());
         assert!(directory.join("enrollment-key").is_file());
+    }
+
+    #[test]
+    fn prune_lookup_is_confined_to_authorized_observation_paths() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
+        let target = root.join("target");
+        fs::write(&target, b"data").unwrap();
+        let mut request = Request::PruneLookup {
+            paths: vec![target.as_os_str().as_bytes().to_vec()],
+            guard: None,
+        };
+        authority.authorize(&mut request, false).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&request);
+        let proto::Response::Stats(stats) = response else {
+            panic!("prune lookup failed: {response:?}")
+        };
+        assert_eq!(stats[0].as_ref().unwrap().size, 4);
+        let mut outside = Request::PruneLookup {
+            paths: vec![temporary
+                .path()
+                .join("outside")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut outside, false).is_err());
     }
 
     #[test]

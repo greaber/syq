@@ -114,8 +114,8 @@ the receiver’s umask. Existing implicit parents keep their permissions, includ
 restoration if copying temporarily requires write access. A listed directory
 still selects only that directory, not its unlisted children. If a file or symlink
 blocks an implicit parent, the affected entries fail and unrelated mappings
-continue. Replacing that obstruction requires a directory entry for the parent
-in the manifest.
+continue. Move or remove the obstruction before retrying, even when the manifest
+explicitly lists the parent directory.
 Restricted receivers count mapped destinations and their parent directories
 against the copy’s entry limit. Each manifest line can be up to 1 MiB, and each
 destination path up to 4096 bytes. There is no separate limit on the total

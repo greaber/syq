@@ -1469,7 +1469,18 @@ impl Root {
             let candidate = RelativePath {
                 components: components.clone(),
             };
-            match self.open_directory(&candidate) {
+            #[cfg(not(target_os = "macos"))]
+            let directory = self.open_directory(&candidate);
+            #[cfg(target_os = "macos")]
+            let directory = if candidate.is_empty() {
+                self.directory.try_clone().map_err(anyhow::Error::from)
+            } else {
+                self.resolve_parent(&candidate).and_then(|parent| {
+                    open_directory_metadata_at(&parent.directory, parent.leaf.as_bytes())
+                        .map_err(anyhow::Error::from)
+                })
+            };
+            match directory {
                 Ok(directory) => {
                     let device = directory.metadata()?.dev();
                     // Serialize the first query too: PartialPaths resolves a
@@ -1598,6 +1609,51 @@ impl Root {
             )
         })
         .with_context(|| format!("set times on confined path {}", path.label()))
+    }
+
+    pub(crate) fn replace_symlink(&self, path: &RelativePath, target: &[u8]) -> Result<()> {
+        let target = CString::new(target).context("symlink target contains NUL")?;
+        self.replace_entry(path, |fd, name| {
+            retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+        })
+    }
+
+    pub(crate) fn replace_node(&self, path: &RelativePath, mode: u32, rdev: u64) -> Result<()> {
+        self.replace_entry(path, |fd, name| {
+            retry_zero(|| unsafe {
+                libc::mknodat(fd, name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t)
+            })
+        })
+    }
+
+    fn replace_entry(
+        &self,
+        path: &RelativePath,
+        create: impl Fn(RawFd, &CString) -> io::Result<()>,
+    ) -> Result<()> {
+        let parent = self.resolve_parent(path)?;
+        let before = metadata_at(parent.directory.as_raw_fd(), &parent.leaf)?;
+        if before.is_dir() {
+            bail!(
+                "cannot replace directory {} with a non-directory",
+                path.label()
+            );
+        }
+        // Stage the new leaf before touching the old one. renameat also refuses
+        // a directory that appears at the destination after the check above.
+        let temporary = create_temporary(&parent, create)?;
+        let result = retry_zero(|| unsafe {
+            libc::renameat(
+                parent.directory.as_raw_fd(),
+                temporary.as_ptr(),
+                parent.directory.as_raw_fd(),
+                parent.leaf.as_ptr(),
+            )
+        });
+        if result.is_err() {
+            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+        }
+        result.with_context(|| format!("publish replacement for {}", path.label()))
     }
 
     pub(crate) fn replace_symlink_if_same(
@@ -2502,6 +2558,30 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
+/// Inspect a directory's naming rules before search permission is repaired.
+/// macOS O_SEARCH requires search permission on the directory being opened;
+/// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
+/// permission is available. Neither changes permissions during inspection.
+/// Descendant lookups still enforce search permission and never follow links.
+fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    #[cfg(target_os = "macos")]
+    {
+        match open_directory_at(parent, component) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
+                parent.as_raw_fd(),
+                &component_cstring(component),
+                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            ),
+            result => result,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        open_directory_at(parent, component)
+    }
+}
+
 fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
     #[cfg(target_os = "linux")]
     {
@@ -3396,6 +3476,75 @@ mod tests {
             }
             Err(error) => panic!("openat2 fast path failed unexpectedly: {error}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn name_limit_queries_traverse_search_only_directories_without_chmod() {
+        let tree = TestDir::new("search-only-naming");
+        let parent = tree.path().join("parent");
+        fs::create_dir_all(parent.join("child")).unwrap();
+        fs::write(parent.join("child/file"), b"contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o111)).unwrap();
+        let before = fs::metadata(&parent).unwrap();
+        let path = relative(b"parent/child/file");
+        let limit = root.name_max_for_parent(&path);
+        let after = fs::metadata(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(limit.unwrap() >= 4);
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+
+    #[test]
+    fn staged_type_replacements_preserve_old_entries_on_failure() {
+        let tree = TestDir::new("staged-types");
+        fs::write(tree.path().join("item"), b"previous contents").unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        let path = relative(b"item");
+        let error = root.replace_entry(&path, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            fs::read(tree.path().join("item")).unwrap(),
+            b"previous contents"
+        );
+        root.replace_symlink(&path, b"target").unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("item")).unwrap(),
+            Path::new("target")
+        );
+        fs::create_dir(tree.path().join("directory")).unwrap();
+        let directory = relative(b"directory");
+        fs::set_permissions(
+            tree.path().join("directory"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let before = fs::metadata(tree.path().join("directory")).unwrap();
+        let error = root.replace_symlink(&directory, b"other").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot replace directory"),
+            "{error:#}"
+        );
+        let after = fs::metadata(tree.path().join("directory")).unwrap();
+        assert_eq!((before.ino(), before.mode()), (after.ino(), after.mode()));
+        fs::set_permissions(
+            tree.path().join("directory"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(tree.path().join("directory/child"), b"keep").unwrap();
+        assert!(root.replace_symlink(&directory, b"other").is_err());
+        assert_eq!(
+            fs::read(tree.path().join("directory/child")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]

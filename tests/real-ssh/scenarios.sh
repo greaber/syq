@@ -123,6 +123,17 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: ordinary SSH directory push and pull across separate hosts\n'
+mkdir -p /tmp/syq-ordinary-source/sub
+printf 'ordinary cross-host directory copy\n' > /tmp/syq-ordinary-source/sub/file
+syq rsync -a --no-progress --syq-no-tcp /tmp/syq-ordinary-source/ \
+    destination:/tmp/syq-real-ssh/ordinary-push/
+ssh destination 'cat /tmp/syq-real-ssh/ordinary-push/sub/file' | \
+    cmp /tmp/syq-ordinary-source/sub/file -
+syq rsync -a --no-progress --syq-no-tcp \
+    destination:/tmp/syq-real-ssh/ordinary-push/ /tmp/syq-ordinary-pull/
+cmp /tmp/syq-ordinary-source/sub/file /tmp/syq-ordinary-pull/sub/file
+
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 

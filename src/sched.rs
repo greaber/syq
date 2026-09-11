@@ -236,8 +236,10 @@ impl Sched {
         self.inner.lock().unwrap().abort
     }
 
-    pub fn fail_file(&self, idx: usize) {
-        self.inner.lock().unwrap().failed.insert(idx);
+    /// Record failure before retiring work or reporting it. The return value
+    /// elects one caller to report the error when several workers fail together.
+    pub fn fail_file(&self, idx: usize) -> bool {
+        self.inner.lock().unwrap().failed.insert(idx)
     }
 
     pub fn is_failed(&self, idx: usize) -> bool {
@@ -486,7 +488,7 @@ impl Sched {
             g.outstanding.remove(&idx);
         }
         self.cv.notify_all();
-        done
+        done && !g.abort && !g.failed.contains(&idx)
     }
 
     /// A connection died with this range's acknowledgements uncertain. Put
@@ -521,6 +523,27 @@ impl Sched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_or_aborted_ranges_never_elect_a_publisher() {
+        for abort in [false, true] {
+            let sched = Sched::new(4, 8);
+            sched.inner.lock().unwrap().probing = 1;
+            let first = sched.ranges_ready(0, vec![(0, 4), (4, 8)]).unwrap();
+            sched.scan_done();
+            let Item::Range(last) = sched.next() else {
+                panic!("missing range")
+            };
+            if abort {
+                sched.abort();
+            } else {
+                assert!(sched.fail_file(0));
+                assert!(!sched.fail_file(0), "report each failed file once");
+            }
+            assert!(!sched.range_done(&first));
+            assert!(!sched.range_done(&last));
+        }
+    }
 
     #[test]
     fn initial_ranges_preserve_coverage_alignment_and_split_floor() {
