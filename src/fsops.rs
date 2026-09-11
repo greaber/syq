@@ -2,8 +2,8 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, acquire_descriptor_if_reachable, DescriptorSessionSlot, DescriptorTicket,
-    RegisteredRootId, DEFAULT_MAX_ROOTS,
+    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId,
+    DEFAULT_MAX_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -1679,18 +1679,8 @@ impl FsOps {
                 if !check.source_root.is_directory() {
                     bail!("destination ancestry requires a source directory ticket");
                 }
-                let source = if check.allow_missing_source_broker {
-                    acquire_descriptor_if_reachable(&check.source_root)
-                } else {
-                    acquire_descriptor(&check.source_root).map(Some)
-                }
-                .context("claim exact source directory for destination ancestry")?;
-                let Some(source) = source else {
-                    return Ok(vec![
-                        DirectoryRelation::SourceUnavailable;
-                        check.suffixes.len()
-                    ]);
-                };
+                let source = acquire_descriptor(&check.source_root)
+                    .context("claim exact source directory for destination ancestry")?;
                 check
                     .suffixes
                     .iter()
@@ -7665,7 +7655,7 @@ mod tests {
     }
 
     #[test]
-    fn ancestry_allows_an_unreachable_broker_only_for_unknown_endpoints() {
+    fn ancestry_requires_an_available_source_directory() {
         let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSessionSlot::default();
         let ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
@@ -7676,49 +7666,34 @@ mod tests {
             OperatorSymlinkPolicy::Refuse,
         )
         .unwrap();
-        let check = |allow_missing_source_broker| {
+        let check = || {
             ops.check_operator_directory_ancestry(&[DirectoryAncestryCheck {
                 source_root: ticket.clone(),
                 source_is_directory: true,
                 suffixes: vec![Vec::new()],
-                allow_missing_source_broker,
             }])
         };
-        for optional in [false, true] {
-            assert_eq!(
-                check(optional).unwrap(),
-                vec![vec![DirectoryRelation::Same]]
-            );
-        }
+        assert_eq!(check().unwrap(), vec![vec![DirectoryRelation::Same]]);
 
         if unsafe { libc::geteuid() } != 0 {
             let socket = ticket.broker_path();
             let parent = socket.parent().unwrap();
             fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
-            let strict = check(false);
-            let optional = check(true);
+            let result = check();
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
             assert!(error_is_kind(
-                &strict.unwrap_err(),
+                &result.unwrap_err(),
                 io::ErrorKind::PermissionDenied
             ));
-            assert_eq!(
-                optional.unwrap(),
-                vec![vec![DirectoryRelation::SourceUnavailable]]
-            );
         } else {
             eprintln!("skipping permission denial: running as root");
         }
 
         session.close();
         assert!(error_is_kind(
-            &check(false).unwrap_err(),
+            &check().unwrap_err(),
             io::ErrorKind::NotFound
         ));
-        assert_eq!(
-            check(true).unwrap(),
-            vec![vec![DirectoryRelation::SourceUnavailable]]
-        );
     }
 
     #[test]

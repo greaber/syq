@@ -177,19 +177,12 @@ fn copy_and_prune_preserve_distinct_unix_filename_bytes() {
 }
 
 #[test]
-fn prune_checks_source_overlap_across_endpoint_spellings() {
+fn prune_refuses_destination_containing_source() {
     let t = Tmp::new();
     write(&t.path("backup/import/file"), b"source contents");
-    let shell = fake_rsh(&t);
     let out = compat_command()
-        .args(["-a", "--delete", "-e"])
-        .arg(shell)
-        .args([
-            "--syq-no-bootstrap",
-            "--rsync-path",
-            env!("CARGO_BIN_EXE_syq"),
-        ])
-        .arg(format!("fake:{}", t.s("backup/import/")))
+        .args(["-a", "--delete"])
+        .arg(t.path("backup/import/"))
         .arg(t.path("backup/"))
         .run()
         .unwrap();

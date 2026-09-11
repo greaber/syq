@@ -2352,10 +2352,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // (or is beneath) a source directory, the scanner would discover the
     // freshly-created destination and recurse. Compare the exact source and
     // retained destination descriptors; never re-resolve either operator
-    // pathname for this decision.
+    // pathname for this decision. The descriptor handoff requires one kernel,
+    // so attempt it only for local paths or matching SSH endpoints.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
-    if same_machine || !opts.restricted_receiver {
+    if same_machine {
         let roots = source_roots.get().expect("source roots registered");
         let mut source_checks = Vec::new();
         let mut ancestry_checks = Vec::new();
@@ -2418,7 +2419,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source_root: root.ticket.clone(),
                 source_is_directory,
                 suffixes,
-                allow_missing_source_broker: !same_machine,
             });
         }
 
@@ -2453,8 +2453,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             progress.error("syq: source directory cannot be searched to check pruning overlap");
                         }
                     }
-                    DirectoryRelation::SourceUnavailable if !same_machine => {}
-                    DirectoryRelation::SourceUnavailable => bail!("source directory capability became unavailable during overlap checking"),
                     DirectoryRelation::Ancestor if !checks_prune => {}
                     DirectoryRelation::Ancestor => bail!(
                         "cannot prune destination {:?}: it contains source {:?}",

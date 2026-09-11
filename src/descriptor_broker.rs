@@ -503,23 +503,8 @@ impl DescriptorSessionSlot {
 /// pathname has been renamed or replaced.
 pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     let socket_path = ticket.socket_path();
-    let stream = UnixStream::connect(&socket_path)
+    let mut stream = UnixStream::connect(&socket_path)
         .with_context(|| format!("connect to descriptor broker {}", socket_path.display()))?;
-    acquire_from_stream(ticket, stream)
-}
-
-/// Try a handoff when endpoint spellings do not establish whether they share
-/// a kernel. Shared storage can expose an unreachable socket or an inaccessible
-/// broker directory. Only connection failure means unavailable; once connected,
-/// authentication and descriptor handoff errors must still be reported.
-pub(crate) fn acquire_descriptor_if_reachable(ticket: &DescriptorTicket) -> Result<Option<File>> {
-    match UnixStream::connect(ticket.socket_path()) {
-        Ok(stream) => acquire_from_stream(ticket, stream).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-fn acquire_from_stream(ticket: &DescriptorTicket, mut stream: UnixStream) -> Result<File> {
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
     let mut request = [0u8; HANDOFF_REQUEST_LEN];
@@ -1069,36 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_acquisition_tolerates_only_connection_failures() {
-        use std::os::unix::net::UnixListener;
-
-        let temp = crate::test_support::tempdir().unwrap();
-        let session = DescriptorSessionSlot::default();
-        let mut ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
-        let directory = acquire_descriptor_if_reachable(&ticket).unwrap().unwrap();
-        assert_eq!(
-            directory.metadata().unwrap().ino(),
-            std::fs::metadata(temp.path()).unwrap().ino()
-        );
-
-        for (name, kind) in [
-            ("missing.sock", io::ErrorKind::NotFound),
-            ("closed.sock", io::ErrorKind::ConnectionRefused),
-        ] {
-            let socket = temp.path().join(name);
-            if kind == io::ErrorKind::ConnectionRefused {
-                // An existing socket with no local listener, as another host
-                // can observe on shared temporary storage.
-                drop(UnixListener::bind(&socket).unwrap());
-            }
-            ticket.socket_path = socket.as_os_str().as_bytes().to_vec();
-            let error = acquire_descriptor(&ticket).unwrap_err();
-            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
-            assert!(acquire_descriptor_if_reachable(&ticket).unwrap().is_none());
-        }
-    }
-
-    #[test]
     fn broker_rejects_bad_secrets_and_unknown_roots() {
         let temp = crate::test_support::tempdir().unwrap();
         let session = DescriptorSession::start(2, 2).unwrap();
@@ -1110,18 +1065,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rejected"));
-        assert!(acquire_descriptor_if_reachable(&bad_secret)
-            .unwrap_err()
-            .to_string()
-            .contains("rejected"));
 
         let mut unknown = session.ticket(root).unwrap();
         unknown.root_id = RegisteredRootId(root.0 + 1);
         assert!(acquire_descriptor(&unknown)
-            .unwrap_err()
-            .to_string()
-            .contains("rejected"));
-        assert!(acquire_descriptor_if_reachable(&unknown)
             .unwrap_err()
             .to_string()
             .contains("rejected"));
