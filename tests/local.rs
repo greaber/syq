@@ -4162,6 +4162,10 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
+        !stderr.contains("installed syq"),
+        "quiet hides optional installation notices"
+    );
+    assert!(
         stderr.contains("remote helper download failed integrity verification"),
         "{stderr}"
     );

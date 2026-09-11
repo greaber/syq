@@ -21,7 +21,7 @@ and a `syq` found on the remote `PATH` prevent installation. It does not fetch
 the latest release or update an existing command.
 
 Syq reports the installation and whether `~/.local/bin` is on the remote
-`PATH`; it never edits shell startup files. The command is an independent copy
+`PATH` unless `--quiet` is set; it never edits shell startup files. The command is an independent copy
 of the helper, using a reflink when supported. You can update it with
 `syq --self-update` without changing the version-specific helper cache. Failure
 to install this command does not fail the transfer. Development builds and

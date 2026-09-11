@@ -2889,7 +2889,7 @@ impl RemoteSpec {
         let detail = output_message(&stderr);
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
-            if authorized && !detail.is_empty() {
+            if authorized && !self.quiet && !detail.is_empty() {
                 crate::output::diagnostic!("syq: {}: {detail}", self.label());
             }
             return if authorized {
@@ -2947,7 +2947,7 @@ impl RemoteSpec {
             );
         }
         let detail = output_message(&out.stderr.bytes);
-        if !detail.is_empty() {
+        if !self.quiet && !detail.is_empty() {
             crate::output::diagnostic!("syq: {}: {detail}", self.label());
         }
         match out.input_error {
