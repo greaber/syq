@@ -4092,6 +4092,28 @@ fn managed_remote_helper_install_is_cached() {
 }
 
 #[test]
+fn remote_helper_command_install_falls_back_without_cp_and_preserves_existing_command() {
+    let t = Tmp::new();
+    let installed = t.path("home/.local/bin/syq");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("--install-remote-command")
+            .env("HOME", t.path("home"))
+            .env("PATH", t.path("no-tools"))
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
+            .output()
+            .unwrap()
+    };
+    assert_output_ok(&run());
+    assert_eq!(read(&installed), read(Path::new(env!("CARGO_BIN_EXE_syq"))));
+    write(&installed, b"existing release");
+    let out = run();
+    assert_output_ok(&out);
+    assert!(out.stderr.is_empty());
+    assert_eq!(read(&installed), b"existing release");
+}
+
+#[test]
 fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -4126,6 +4148,10 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"integrity fallback");
+    assert_eq!(
+        read(&t.path("remote-home/.local/bin/syq")),
+        read(&cached_remote_helper(&t))
+    );
     assert_eq!(
         read(&cached_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
