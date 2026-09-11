@@ -1,3 +1,6 @@
+// The receiver modules below forbid subprocess launches on macOS: SCM_RIGHTS
+// has no atomic close-on-exec receive there. Other executable roles can spawn.
+
 mod agent_broker;
 mod bwlimit;
 mod cli;
@@ -6,9 +9,11 @@ mod completion_details;
 mod conn;
 mod delegation;
 #[allow(dead_code)]
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod descriptor_broker;
 mod destination;
 pub mod enrollment;
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod fsops;
 mod help;
 mod identity;
@@ -18,6 +23,7 @@ mod native_map;
 mod native_rm;
 mod output;
 mod persistence;
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod private_broker;
 mod process_group;
 mod progress;
@@ -32,9 +38,11 @@ mod results;
 mod resume;
 mod rm;
 #[allow(dead_code)]
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod rooted;
 mod scan;
 mod sched;
+#[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod server;
 mod session_pool;
 mod streaming;

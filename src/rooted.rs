@@ -1059,215 +1059,224 @@ impl Root {
         path: &RelativePath,
         size: u64,
     ) -> Result<CloneOutcome> {
-        let mut cleanup_failed = false;
-        let attempt = (|| -> Result<CloneOutcome> {
-            let parent = self.resolve_parent(path)?;
-            // Reuse the held parent for the partial check and clone publication.
-            // RENAME_EXCL below also protects a partial created after this check.
-            match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
-                Ok(_) => return Ok(CloneOutcome::Unsupported),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("inspect clone partial"),
-            }
-            // A descendant mount can differ from the root device. Resolve and
-            // inspect the actual parent even for cached unsupported pairs; a root
-            // device shortcut would incorrectly reject eligible mounted volumes.
-            let pair = (source_metadata.dev(), parent.directory.metadata()?.dev());
-            // Process-local capability cache: file metadata and directory ACL failures
-            // are not properties of a filesystem pair and must never enter it.
-            let pairs = clone_volume_pairs();
-            let cached = pairs.lock().unwrap().get(&pair).copied();
-            let supported = if let Some(supported) = cached {
-                supported
+        let parent = match self.resolve_parent(path) {
+            Ok(parent) => parent,
+            Err(_) => return Ok(CloneOutcome::Unsupported),
+        };
+        // Reuse the held parent for the partial check and clone publication.
+        // RENAME_EXCL below also protects a partial created after this check.
+        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Ok(CloneOutcome::Unsupported),
+        }
+        // A descendant mount can differ from the root device. Resolve and
+        // inspect the actual parent even for cached unsupported pairs; a root
+        // device shortcut would incorrectly reject eligible mounted volumes.
+        let parent_metadata = match parent.directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(CloneOutcome::Unsupported),
+        };
+        let pair = (source_metadata.dev(), parent_metadata.dev());
+        // Process-local capability cache: file metadata and directory ACL failures
+        // are not properties of a filesystem pair and must never enter it.
+        let pairs = clone_volume_pairs();
+        let cached = pairs.lock().unwrap().get(&pair).copied();
+        let supported = if let Some(supported) = cached {
+            supported
+        } else {
+            // This optimization targets APFS. Reject exFAT/SMB and other
+            // destinations before probing ACLs or creating staging directories.
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            let supported = if pair.0 != pair.1 {
+                false
             } else {
-                // This optimization targets APFS. Reject exFAT/SMB and other
-                // destinations before probing ACLs or creating staging directories.
-                let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-                let supported = if pair.0 != pair.1 {
-                    false
-                } else {
-                    retry_zero(|| unsafe {
-                        libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
-                    })?;
-                    let stats = unsafe { stats.assume_init() };
-                    unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
-                        == b"apfs"
-                };
-                pairs.lock().unwrap().insert(pair, supported);
-                supported
+                if retry_zero(|| unsafe {
+                    libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
+                })
+                .is_err()
+                {
+                    return Ok(CloneOutcome::Unsupported);
+                }
+                let stats = unsafe { stats.assume_init() };
+                unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
+                    == b"apfs"
             };
-            if !supported {
+            pairs.lock().unwrap().insert(pair, supported);
+            supported
+        };
+        if !supported {
+            return Ok(CloneOutcome::UnsupportedVolume(pair.0));
+        }
+        if !clone_flags_can_be_removed(source_metadata) {
+            return Ok(CloneOutcome::Unsupported);
+        }
+        // An extra staging directory must not change destination ACL inheritance.
+        if !clone_directory_has_no_inheritable_acl(&parent.directory).unwrap_or(false) {
+            return Ok(CloneOutcome::Unsupported);
+        }
+        let temporary = match create_temporary(&parent, |fd, name| {
+            #[cfg(debug_assertions)]
+            fail_clone_mkdir_for_test()?;
+            retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
+        }) {
+            Ok(temporary) => temporary,
+            Err(_) => return Ok(CloneOutcome::Unsupported),
+        };
+        let leaf = &c"data".to_owned();
+        let mut trusted_directory = None;
+        let result = (|| -> Result<CloneOutcome> {
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
+                libc::EIO,
+                "test clone directory failure",
+            )?;
+            // Open with search access, then restore owner permissions on the
+            // empty directory. If umask also removed search access, opening can
+            // fail; cleanup below still removes it before byte copying begins.
+            let directory = open_directory_at(&parent.directory, temporary.as_bytes())
+                .context("open private clone directory")?;
+            let metadata = directory.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            // Preserve inherited setgid while restoring owner access.
+            let private_mode = 0o700 | (metadata.mode() as libc::mode_t & 0o2000);
+            retry_zero(|| unsafe { libc::fchmod(directory.as_raw_fd(), private_mode) })
+                .context("set private clone directory permissions")?;
+            #[cfg(debug_assertions)]
+            make_clone_directory_public_for_test(&directory)?;
+            if directory.metadata()?.mode() & 0o7777 != u32::from(private_mode) {
+                // Some filesystems synthesize permissions. Fall back without
+                // putting source data into a directory we cannot keep private.
+                return Ok(CloneOutcome::Unsupported);
+            }
+            if !clone_directory_has_no_inheritable_acl(&directory)? {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            trusted_directory = Some(directory);
+            let directory = trusted_directory.as_ref().unwrap();
+            // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
+            // function but not this constant. Do not request source ACLs.
+            const CLONE_NOOWNERCOPY: u32 = 0x0002;
+            #[cfg(debug_assertions)]
+            if record_clone_attempt_for_test()? {
                 return Ok(CloneOutcome::UnsupportedVolume(pair.0));
             }
-            if !clone_flags_can_be_removed(source_metadata) {
-                return Ok(CloneOutcome::Unsupported);
-            }
-            // An extra staging directory must not change destination ACL inheritance.
-            if !clone_directory_has_no_inheritable_acl(&parent.directory)? {
-                return Ok(CloneOutcome::Unsupported);
-            }
-            let temporary = create_temporary(&parent, |fd, name| {
-                #[cfg(debug_assertions)]
-                fail_clone_mkdir_for_test()?;
-                retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
-            })?;
-            let leaf = &c"data".to_owned();
-            let mut trusted_directory = None;
-            let mut unsupported_volume = false;
-            let result = (|| -> Result<Option<File>> {
-                #[cfg(debug_assertions)]
-                fail_clone_for_test(
-                    "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
-                    libc::EIO,
-                    "test clone directory failure",
-                )?;
-                let directory = open_directory_at(&parent.directory, temporary.as_bytes())
-                    .context("open private clone directory")?;
-                #[cfg(debug_assertions)]
-                make_clone_directory_public_for_test(&directory)?;
-                let metadata = directory.metadata()?;
-                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o5777 != 0o700
-                {
-                    // Some filesystems synthesize permissions. Fall back without
-                    // putting source data into a directory we cannot keep private.
-                    return Ok(None);
-                }
-                if !clone_directory_has_no_inheritable_acl(&directory)? {
-                    return Ok(None);
-                }
-                trusted_directory = Some(directory);
-                let directory = trusted_directory.as_ref().unwrap();
-                // CLONE_NOOWNERCOPY from <sys/clonefile.h>; libc exposes the
-                // function but not this constant. Do not request source ACLs.
-                const CLONE_NOOWNERCOPY: u32 = 0x0002;
-                #[cfg(debug_assertions)]
-                if record_clone_attempt_for_test()? {
-                    pairs.lock().unwrap().insert(pair, false);
-                    unsupported_volume = true;
-                    return Ok(None);
-                }
-                let cloned = unsafe {
-                    libc::fclonefileat(
-                        source.as_raw_fd(),
-                        directory.as_raw_fd(),
-                        leaf.as_ptr(),
-                        CLONE_NOOWNERCOPY,
-                    )
-                };
-                if cloned != 0 {
-                    let error = io::Error::last_os_error();
-                    match error.raw_os_error() {
-                        Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS) => {
-                            pairs.lock().unwrap().insert(pair, false);
-                            unsupported_volume = true;
-                            return Ok(None);
-                        }
-                        _ => return Err(error).context("clone local file"),
-                    }
-                }
-                // Clear inherited flags before chmod or opening another descriptor:
-                // descriptor pressure must not leave an immutable, undeletable clone.
-                // The private directory and fixed leaf keep this operation confined.
-                clear_clone_flags_at(directory, leaf)?;
-                retry_zero(|| unsafe {
-                    libc::fchmodat(
-                        directory.as_raw_fd(),
-                        leaf.as_ptr(),
-                        0o600,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                })
-                .context("set private clone permissions")?;
-                let file = open_clone_for_copy(directory, leaf).context("open normalized clone")?;
-                if !strip_clone_xattrs(&file)? {
-                    return Ok(None);
-                }
-                if file.metadata()?.len() != size {
-                    // Streaming and the final source re-stat handle concurrent
-                    // growth/shrinkage using the same retry policy as other copies.
-                    return Ok(None);
-                }
-                #[cfg(debug_assertions)]
-                fail_clone_for_test(
-                    "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
-                    libc::ENOSPC,
-                    "test clone failure",
-                )?;
-                retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
-                // Do not replace an existing resumable partial, including one that
-                // appeared after the caller checked. Both directory fds stay pinned.
-                let published = unsafe {
-                    libc::renameatx_np(
-                        directory.as_raw_fd(),
-                        leaf.as_ptr(),
-                        parent.directory.as_raw_fd(),
-                        parent.leaf.as_ptr(),
-                        libc::RENAME_EXCL,
-                    )
-                };
-                if published != 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::AlreadyExists {
-                        return Ok(None);
-                    }
-                    return Err(error).context("stage cloned local file");
-                }
-                Ok(Some(file))
-            })();
-            let cleanup = (|| -> Result<()> {
-                if let Some(directory) =
-                    trusted_directory.filter(|_| !matches!(result, Ok(Some(_))))
-                {
-                    match unlink_at(directory.as_raw_fd(), leaf, 0) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error).context("remove unpublished clone"),
-                    }
-                }
-                // Also runs when opening or checking the new directory failed.
-                // rmdir cannot traverse a replacement or delete its contents.
-                #[cfg(debug_assertions)]
-                fail_clone_for_test(
-                    "SYQ_TEST_FAIL_CLONE_RMDIR",
-                    libc::EACCES,
-                    "test clone staging rmdir failure",
-                )?;
-                unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
-                    .context("remove private clone directory")
-            })();
-            #[cfg(debug_assertions)]
-            let cleanup = cleanup.and_then(|()| {
-                fail_clone_for_test(
-                    "SYQ_TEST_FAIL_CLONE_CLEANUP",
-                    libc::EACCES,
-                    "test clone cleanup failure",
+            let cloned = unsafe {
+                libc::fclonefileat(
+                    source.as_raw_fd(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    CLONE_NOOWNERCOPY,
                 )
-            });
-            cleanup_failed = cleanup.is_err();
-            match (result, cleanup) {
-                (Err(copy_error), Err(cleanup_error)) => {
-                    let original = format!("{copy_error:#}");
-                    Err(copy_error.context(format!(
-                        "{original}; additionally, clone cleanup failed: {cleanup_error:#}"
-                    )))
+            };
+            if cloned != 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS) => {
+                        return Ok(CloneOutcome::UnsupportedVolume(pair.0));
+                    }
+                    _ => return Err(error).context("clone local file"),
                 }
-                // Publication here only names the resumable partial, not the final
-                // destination. Keep cleanup failure visible; rerunning verifies and
-                // finishes that partial through the ordinary resume path.
-                (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-                (result, Ok(())) => result.map(|file| match file {
-                    Some(file) => CloneOutcome::Copied(file),
-                    None if unsupported_volume => CloneOutcome::UnsupportedVolume(pair.0),
-                    None => CloneOutcome::Unsupported,
-                }),
             }
+            // Clear inherited flags before chmod or opening another descriptor:
+            // descriptor pressure must not leave an immutable, undeletable clone.
+            // The private directory and fixed leaf keep this operation confined.
+            clear_clone_flags_at(directory, leaf)?;
+            retry_zero(|| unsafe {
+                libc::fchmodat(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0o600,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+            .context("set private clone permissions")?;
+            let file = open_clone_for_copy(directory, leaf).context("open normalized clone")?;
+            if !strip_clone_xattrs(&file)? {
+                return Ok(CloneOutcome::Unsupported);
+            }
+            if file.metadata()?.len() != size {
+                // Streaming and the final source re-stat handle concurrent
+                // growth/shrinkage using the same retry policy as other copies.
+                return Ok(CloneOutcome::Unsupported);
+            }
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
+                libc::ENOSPC,
+                "test clone failure",
+            )?;
+            retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
+            // Do not replace an existing resumable partial, including one that
+            // appeared after the caller checked. Both directory fds stay pinned.
+            let published = unsafe {
+                libc::renameatx_np(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if published != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(CloneOutcome::Unsupported);
+                }
+                return Err(error).context("stage cloned local file");
+            }
+            Ok(CloneOutcome::Copied(file))
         })();
-        // Cloning is optional. Only fall back after cleanup succeeded; a
-        // system-immutable clone that we cannot remove must remain a visible
-        // failure rather than silently leaving an undeletable copy behind.
-        match attempt {
-            Err(_) if !cleanup_failed => Ok(CloneOutcome::Unsupported),
-            result => result,
+        if matches!(result, Ok(CloneOutcome::UnsupportedVolume(_))) {
+            pairs.lock().unwrap().insert(pair, false);
+        }
+        let cleanup = (|| -> Result<()> {
+            if let Some(directory) =
+                trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied(_))))
+            {
+                match unlink_at(directory.as_raw_fd(), leaf, 0) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("remove unpublished clone"),
+                }
+            }
+            // Also runs when opening or checking the new directory failed.
+            // rmdir cannot traverse a replacement or delete its contents.
+            #[cfg(debug_assertions)]
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_RMDIR",
+                libc::EACCES,
+                "test clone staging rmdir failure",
+            )?;
+            unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
+                .context("remove private clone directory")
+        })();
+        #[cfg(debug_assertions)]
+        let cleanup = cleanup.and_then(|()| {
+            fail_clone_for_test(
+                "SYQ_TEST_FAIL_CLONE_CLEANUP",
+                libc::EACCES,
+                "test clone cleanup failure",
+            )
+        });
+        match (result, cleanup) {
+            (Err(copy_error), Err(cleanup_error)) => {
+                let original = format!("{copy_error:#}");
+                Err(copy_error.context(format!(
+                    "{original}; additionally, clone cleanup failed: {cleanup_error:#}"
+                )))
+            }
+            // Publication here only names the resumable partial, not the final
+            // destination. Keep cleanup failure visible; rerunning verifies and
+            // finishes that partial through the ordinary resume path.
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            // Cloning is optional, but falling back is safe only once its
+            // unpublished data and private directory have been removed.
+            (Err(_), Ok(())) => Ok(CloneOutcome::Unsupported),
+            (Ok(outcome), Ok(())) => Ok(outcome),
         }
     }
 
@@ -1930,6 +1939,8 @@ impl Root {
 
 #[cfg(target_os = "macos")]
 pub(crate) enum CloneOutcome {
+    // Keep the normalized inode open through staging cleanup. Tests also use
+    // this handle to inspect metadata and write without reopening the path.
     Copied(File),
     Unsupported,
     UnsupportedVolume(u64),

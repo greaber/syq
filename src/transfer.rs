@@ -192,7 +192,7 @@ fn local_copy_enabled(opts: &Opts, bandwidth_limited: bool) -> bool {
         && !opts.dry_run
         && !opts.restricted_receiver
         && !bandwidth_limited
-        && !(cfg!(target_os = "macos") && (opts.inplace || opts.umask & 0o700 != 0))
+        && !(cfg!(target_os = "macos") && opts.inplace)
 }
 
 fn print_benchmark_observations(opts: &Opts) {
@@ -7933,12 +7933,7 @@ impl Worker {
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
-        let directory = job
-            .dst
-            .rsplitn(2, |byte| *byte == b'/')
-            .nth(1)
-            .unwrap_or(&[]);
-        let key = (job.entry.dev, directory.to_vec());
+        let key = (job.entry.dev, parent_path(&job.dst));
         if self
             .opts
             .local_copy_unavailable
@@ -7985,13 +7980,12 @@ impl Worker {
             }
             Response::CopyLocalUnsupported => Ok(false),
             Response::CopyLocalUnsupportedVolume { source_dev } => {
-                // Use the receiver's actual source device if planning raced a
-                // source replacement. No lock spans a receiver operation.
-                self.opts
-                    .local_copy_unavailable
-                    .lock()
-                    .unwrap()
-                    .insert((source_dev, key.1));
+                // Siblings already queued by the planner still use its device
+                // even if the receiver opened a replacement on another volume.
+                // Remember both observations; each exact parent probes separately.
+                let mut unavailable = self.opts.local_copy_unavailable.lock().unwrap();
+                unavailable.insert((source_dev, key.1.clone()));
+                unavailable.insert(key);
                 Ok(false)
             }
             Response::EndpointError(error) => Err(endpoint_error(error)),
@@ -8777,6 +8771,118 @@ mod tests {
         }
     }
 
+    fn pipeline_worker(
+        sched: Arc<Sched>,
+        src: Arc<Mutex<PipelineState>>,
+        dst: Arc<Mutex<PipelineState>>,
+    ) -> Worker {
+        let opts = Arc::new(Opts {
+            local_copy_unavailable: Mutex::new(Default::default()),
+            block: 512,
+            tuning: Default::default(),
+            benchmark: None,
+            flags: 0,
+            recursive: true,
+            links: false,
+            perms: false,
+            devices: false,
+            checksum: false,
+            verify_only: false,
+            inplace: false,
+            same_host: false,
+            allow_sequential_nfs_fallback: false,
+            dst_remote: true,
+            restricted_receiver: false,
+            dry_run: false,
+            quiet: true,
+            verbose: 0,
+            umask: 0,
+            copy_id: [0; 16],
+            ignore: Vec::new(),
+            delete: false,
+            delete_excluded: false,
+            max_delete: None,
+            update: false,
+            ignore_existing: false,
+            preserve_existing_directory_metadata: false,
+            existing: false,
+            operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
+            max_size: None,
+            min_size: None,
+        });
+        Worker {
+            id: 0,
+            src: Box::new(PipelineConn(src)),
+            dst: Box::new(PipelineConn(dst)),
+            sched,
+            progress: Progress::new(false, false, None, false),
+            opts,
+            bwlimit: None,
+            gate: Gate::new(1),
+            t: [0.0; 4],
+            fast: FastTiming::default(),
+            benchmark: Default::default(),
+            fast_batch_files: 1,
+        }
+    }
+
+    #[test]
+    fn local_copy_volume_refusal_covers_planned_and_opened_devices_per_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, b"data").unwrap();
+        let mut entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+        entry.dev = 11;
+        let sched = Arc::new(Sched::new(512, 8192));
+        let mut job = FileJob {
+            src: b"source".to_vec(),
+            source: RegisteredPath {
+                root: serde_json::from_str("0").unwrap(),
+                relative: b"source".to_vec(),
+            },
+            dst: b"/first".to_vec(),
+            rel: "first".into(),
+            entry,
+            dst_entry: None,
+            target_condition: TargetCondition::Any,
+            container_guard: None,
+            attempt: 0,
+            done: Arc::new(AtomicU64::new(0)),
+            inplace: false,
+            rel_bytes: b"first".to_vec(),
+            src_rel: None,
+        };
+        sched.push_file(job.clone());
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(sched, src, dst.clone());
+        dst.lock().unwrap().replies.extend([
+            Response::CopyLocalUnsupportedVolume { source_dev: 22 },
+            Response::CopyLocalUnsupported,
+            Response::CopyLocalUnsupportedVolume { source_dev: 22 },
+        ]);
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        // A queued sibling uses the planning-time device, a newly scanned one
+        // uses the receiver's device. Neither should issue another RPC.
+        for device in [11, 22] {
+            job.dst = b"/sibling".to_vec();
+            job.entry.dev = device;
+            assert!(!worker.try_copy_local(0, &job).unwrap());
+        }
+        assert_eq!(dst.lock().unwrap().requests.len(), 1);
+        // Bare names use '.', separate from '/'. File-specific refusal there
+        // must not prevent the next file from probing the same parent.
+        job.dst = b"bare".to_vec();
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        job.dst = b"another".to_vec();
+        assert!(!worker.try_copy_local(0, &job).unwrap());
+        assert_eq!(dst.lock().unwrap().requests.len(), 3);
+        let unavailable = worker.opts.local_copy_unavailable.lock().unwrap();
+        assert!(unavailable.contains(&(11, b"/".to_vec())));
+        assert!(unavailable.contains(&(22, b"/".to_vec())));
+        assert!(unavailable.contains(&(22, b".".to_vec())));
+    }
+
     #[test]
     fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
         // Exercise both callers of transfer_range: initial file work and a
@@ -8842,59 +8948,14 @@ mod tests {
                             .push_back(Response::Prepared(Preparation::default()));
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
-                    let opts = Arc::new(Opts {
-                        local_copy_unavailable: Mutex::new(Default::default()),
-                        block: 512,
-                        tuning: crate::transfer_tuning::TransferTuning {
+                    let mut worker = pipeline_worker(sched.clone(), src.clone(), dst.clone());
+                    Arc::get_mut(&mut worker.opts).unwrap().tuning =
+                        crate::transfer_tuning::TransferTuning {
                             copy_path: (!streaming)
                                 .then_some(crate::transfer_tuning::CopyPath::Ranges),
                             pipeline_depth: (!streaming).then_some(4),
                             ..Default::default()
-                        },
-                        benchmark: None,
-                        flags: 0,
-                        recursive: true,
-                        links: false,
-                        perms: false,
-                        devices: false,
-                        checksum: false,
-                        verify_only: false,
-                        inplace: false,
-                        same_host: false,
-                        allow_sequential_nfs_fallback: false,
-                        dst_remote: true,
-                        restricted_receiver: false,
-                        dry_run: false,
-                        quiet: true,
-                        verbose: 0,
-                        umask: 0,
-                        copy_id: [0; 16],
-                        ignore: Vec::new(),
-                        delete: false,
-                        delete_excluded: false,
-                        max_delete: None,
-                        update: false,
-                        ignore_existing: false,
-                        preserve_existing_directory_metadata: false,
-                        existing: false,
-                        operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
-                        max_size: None,
-                        min_size: None,
-                    });
-                    let mut worker = Worker {
-                        id: 0,
-                        src: Box::new(PipelineConn(src.clone())),
-                        dst: Box::new(PipelineConn(dst.clone())),
-                        sched: sched.clone(),
-                        progress: Progress::new(false, false, None, false),
-                        opts,
-                        bwlimit: None,
-                        gate: Gate::new(1),
-                        t: [0.0; 4],
-                        fast: FastTiming::default(),
-                        benchmark: Default::default(),
-                        fast_batch_files: 1,
-                    };
+                        };
                     let error = worker.run().unwrap_err();
                     assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
                     assert!(sched.is_aborted());

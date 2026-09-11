@@ -437,6 +437,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             destination: None, ..
         } => {}
     }
+    // All foreign descriptor claims and their close-on-exec setup are complete
+    // before readiness is acknowledged or this connection starts its reader.
     w.write_msg(&Response::HelloOk {
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),

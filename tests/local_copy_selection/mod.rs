@@ -866,40 +866,28 @@ fn macos_compressed_source_keeps_logical_bytes_through_fallback() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
-fn macos_disabled_cloning_starts_full_workers_without_claims_or_requests() {
-    for inplace in [true, false] {
-        let t = Tmp::new();
-        let data = prng(8 << 20, 1100);
-        write(&t.path("src"), &data);
-        let mut command = compat_command();
-        command
-            .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
-            .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
-            .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"));
-        if inplace {
-            command.arg("--inplace");
-        } else {
-            // Change only the child's umask, never the parallel test process.
-            unsafe {
-                command.pre_exec(|| {
-                    libc::umask(0o400);
-                    Ok(())
-                });
-            }
-        }
-        let out = command.run().unwrap();
-        assert_output_ok(&out);
-        assert_eq!(read(&t.path("dst")), data);
-        assert!(!t.path("requests").exists());
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains(&format!(
-                "connections: auto: settled at {0} (path {0}, peak {0})",
-                expected_local_start()
-            )),
-            "{stdout}"
-        );
-    }
+fn macos_inplace_starts_full_workers_without_claims_or_requests() {
+    let t = Tmp::new();
+    let data = prng(8 << 20, 1100);
+    write(&t.path("src"), &data);
+    let mut command = compat_command();
+    command
+        .args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")])
+        .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
+        .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"));
+    command.arg("--inplace");
+    let out = command.run().unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert!(!t.path("requests").exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "connections: auto: settled at {0} (path {0}, peak {0})",
+            expected_local_start()
+        )),
+        "{stdout}"
+    );
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -946,4 +934,43 @@ fn macos_unremovable_clone_is_a_visible_cleanup_failure() {
     assert!(error.contains("test clear clone flags failure"), "{error}");
     assert!(error.contains("remove unpublished clone"), "{error}");
     assert_eq!(read(&t.path("dst")), b"old destination");
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_normalizes_staging_permissions_under_restrictive_umasks() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    for mask in [0o022, 0o077, 0o400, 0o200, 0o100, 0o777] {
+        let can_open_staging = mask & 0o100 == 0 || unsafe { libc::geteuid() } == 0;
+        let t = Tmp::new();
+        let data = prng(5 << 20, 1200);
+        write(&t.path("src"), &data);
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o640)).unwrap();
+        let mut command = compat_command();
+        command
+            .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
+            .env("SYQ_DEBUG", "1");
+        if can_open_staging {
+            command.env("SYQ_TEST_FAIL_READ_RANGE", "1");
+        }
+        // Keep the test harness and its other threads' file creation unchanged.
+        unsafe {
+            command.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(
+            tuning_observed(&out)["local_whole_files"],
+            u64::from(can_open_staging),
+            "umask {mask:o}: {out:?}"
+        );
+        assert_eq!(read(&t.path("dst")), data);
+        assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2, "umask {mask:o}");
+    }
 }
