@@ -558,8 +558,12 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
     for i in 0..4 {
         write(&t.path(&format!("src/file{i}")), &prng(5 << 20, i));
     }
-    // A separate parent must get its own request: it could be a mountpoint.
-    write(&t.path("src/subdir/child"), &prng(5 << 20, 5));
+    for i in 0..8 {
+        write(
+            &t.path(&format!("src/subdir{i}/nested/child")),
+            &prng(5 << 20, i + 4),
+        );
+    }
     let out = compat_command()
         .args([
             "-a",
@@ -569,7 +573,7 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME", "1")
         .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
         .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"))
         .env("SYQ_DEBUG", "1")
@@ -578,22 +582,109 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
     assert_output_ok(&out);
     assert_same_tree(&t.path("src"), &t.path("dst"));
     assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
-    assert_eq!(
-        fs::read_to_string(t.path("attempts"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert!(!t.path("attempts").exists());
     assert_eq!(
         fs::read_to_string(t.path("requests"))
             .unwrap()
             .lines()
             .count(),
-        2,
-        "after one volume refusal, later files in that exact directory skip CopyLocal entirely"
+        1,
+        "one volume refusal suppresses CopyLocal in every directory on that device"
     );
     assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_syscall_errors_are_diagnosable_and_do_not_disable_siblings() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    for (error, code) in [
+        ("EIO", libc::EIO),
+        ("EPERM", libc::EPERM),
+        ("EXDEV", libc::EXDEV),
+        ("ENOTSUP", libc::ENOTSUP),
+        ("ENOSYS", libc::ENOSYS),
+    ] {
+        for debug in [false, true] {
+            for once in [false, true] {
+                let t = Tmp::new();
+                for i in 0..3 {
+                    write(&t.path(&format!("src/file{i}")), &prng(5 << 20, i));
+                }
+                let mut command = compat_command();
+                command
+                    .args([
+                        "-a",
+                        "--syq-no-tcp",
+                        "--syq-connections=1",
+                        "--no-progress",
+                        "--stats",
+                        "--tuning-options=request-size=4M",
+                        &t.s("src/"),
+                        &t.s("dst/"),
+                    ])
+                    .env("SYQ_TEST_CLONE_ERROR", error)
+                    .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
+                    .env_remove("SYQ_DEBUG");
+                if once {
+                    command.env("SYQ_TEST_CLONE_ERROR_ONCE", t.path("failed-once"));
+                }
+                if debug {
+                    command.env("SYQ_DEBUG", "1");
+                }
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::umask(0o022);
+                        Ok(())
+                    });
+                }
+                let out = command.run().unwrap();
+                assert_output_ok(&out);
+                assert_same_tree(&t.path("src"), &t.path("dst"));
+                assert_eq!(
+                    fs::read_to_string(t.path("attempts"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    3
+                );
+                assert_eq!(
+                    tuning_observed(&out)["local_whole_files"],
+                    if once { 2 } else { 0 }
+                );
+                let diagnostic = stderr_of(&out);
+                let fallbacks: Vec<_> = diagnostic
+                    .lines()
+                    .filter(|line| line.contains("unavailable; using byte copying"))
+                    .collect();
+                assert_eq!(
+                    fallbacks.len(),
+                    if debug {
+                        if once {
+                            1
+                        } else {
+                            3
+                        }
+                    } else {
+                        0
+                    },
+                    "{diagnostic}"
+                );
+                for line in fallbacks {
+                    assert!(line.contains("clone local file"), "{line}");
+                    assert!(
+                        line.contains(&std::io::Error::from_raw_os_error(code).to_string()),
+                        "{line}"
+                    );
+                    assert!(line.contains("file"), "{line}");
+                }
+                assert!(partial_files(&t.path("dst")).is_empty());
+                assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 3);
+            }
+        }
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -652,7 +743,7 @@ fn macos_medium_files_keep_batches_when_cloning_is_unavailable() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_CLONE_ERROR", "EXDEV")
         .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
         .env("SYQ_DEBUG", "1")
         .run()

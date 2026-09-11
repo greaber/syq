@@ -136,7 +136,10 @@ enum CopyLocalOutcome {
     Copied,
     Unsupported,
     #[cfg(target_os = "macos")]
-    UnsupportedVolume(u64),
+    UnsupportedVolume {
+        source_dev: u64,
+        destination_dev: u64,
+    },
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -5714,8 +5717,14 @@ impl FsOps {
         match root.clone_file(&source, &source_metadata, &partial, size)? {
             crate::rooted::CloneOutcome::Copied(_file) => {}
             crate::rooted::CloneOutcome::Unsupported => return Ok(CopyLocalOutcome::Unsupported),
-            crate::rooted::CloneOutcome::UnsupportedVolume(dev) => {
-                return Ok(CopyLocalOutcome::UnsupportedVolume(dev));
+            crate::rooted::CloneOutcome::UnsupportedVolume {
+                source_dev,
+                destination_dev,
+            } => {
+                return Ok(CopyLocalOutcome::UnsupportedVolume {
+                    source_dev,
+                    destination_dev,
+                });
             }
         }
         // Like Linux offload, leave no writer-cache entry. CopyLocal has no
@@ -6528,9 +6537,13 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                     #[cfg(target_os = "macos")]
-                    CopyLocalOutcome::UnsupportedVolume(source_dev) => {
-                        Response::CopyLocalUnsupportedVolume { source_dev }
-                    }
+                    CopyLocalOutcome::UnsupportedVolume {
+                        source_dev,
+                        destination_dev,
+                    } => Response::CopyLocalUnsupportedVolume {
+                        source_dev,
+                        destination_dev,
+                    },
                 }),
             Request::PutSmallBatch(puts) => Ok(Response::Applied(
                 puts.iter()

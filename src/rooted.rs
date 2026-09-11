@@ -1059,23 +1059,32 @@ impl Root {
         path: &RelativePath,
         size: u64,
     ) -> Result<CloneOutcome> {
+        let fallback = |error: anyhow::Error| {
+            if crate::transfer::debug() {
+                crate::output::diagnostic!(
+                    "syq: clone {} unavailable; using byte copying: {error:#}",
+                    path.label()
+                );
+            }
+            Ok(CloneOutcome::Unsupported)
+        };
         let parent = match self.resolve_parent(path) {
             Ok(parent) => parent,
-            Err(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error),
         };
         // Reuse the held parent for the partial check and clone publication.
         // RENAME_EXCL below also protects a partial created after this check.
         match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(_) => return Ok(CloneOutcome::Unsupported),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error.into()),
         }
         // A descendant mount can differ from the root device. Resolve and
         // inspect the actual parent even for cached unsupported pairs; a root
         // device shortcut would incorrectly reject eligible mounted volumes.
         let parent_metadata = match parent.directory.metadata() {
             Ok(metadata) => metadata,
-            Err(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error.into()),
         };
         let pair = (source_metadata.dev(), parent_metadata.dev());
         // Process-local capability cache: file metadata and directory ACL failures
@@ -1091,29 +1100,35 @@ impl Root {
             let supported = if pair.0 != pair.1 {
                 false
             } else {
-                if retry_zero(|| unsafe {
+                if let Err(error) = retry_zero(|| unsafe {
                     libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
-                })
-                .is_err()
-                {
-                    return Ok(CloneOutcome::Unsupported);
+                }) {
+                    return fallback(anyhow::Error::new(error).context("inspect clone filesystem"));
                 }
                 let stats = unsafe { stats.assume_init() };
                 unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
                     == b"apfs"
             };
+            #[cfg(debug_assertions)]
+            let supported =
+                supported && std::env::var_os("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME").is_none();
             pairs.lock().unwrap().insert(pair, supported);
             supported
         };
         if !supported {
-            return Ok(CloneOutcome::UnsupportedVolume(pair.0));
+            return Ok(CloneOutcome::UnsupportedVolume {
+                source_dev: pair.0,
+                destination_dev: pair.1,
+            });
         }
         if !clone_flags_can_be_removed(source_metadata) {
             return Ok(CloneOutcome::Unsupported);
         }
         // An extra staging directory must not change destination ACL inheritance.
-        if !clone_directory_has_no_inheritable_acl(&parent.directory).unwrap_or(false) {
-            return Ok(CloneOutcome::Unsupported);
+        match clone_directory_has_no_inheritable_acl(&parent.directory) {
+            Ok(true) => {}
+            Ok(false) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error),
         }
         let temporary = match create_temporary(&parent, |fd, name| {
             #[cfg(debug_assertions)]
@@ -1121,7 +1136,7 @@ impl Root {
             retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
         }) {
             Ok(temporary) => temporary,
-            Err(_) => return Ok(CloneOutcome::Unsupported),
+            Err(error) => return fallback(error.context("create private clone directory")),
         };
         let leaf = &c"data".to_owned();
         let mut trusted_directory = None;
@@ -1161,9 +1176,7 @@ impl Root {
             // function but not this constant. Do not request source ACLs.
             const CLONE_NOOWNERCOPY: u32 = 0x0002;
             #[cfg(debug_assertions)]
-            if record_clone_attempt_for_test()? {
-                return Ok(CloneOutcome::UnsupportedVolume(pair.0));
-            }
+            record_clone_attempt_for_test().context("clone local file")?;
             let cloned = unsafe {
                 libc::fclonefileat(
                     source.as_raw_fd(),
@@ -1173,13 +1186,10 @@ impl Root {
                 )
             };
             if cloned != 0 {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS) => {
-                        return Ok(CloneOutcome::UnsupportedVolume(pair.0));
-                    }
-                    _ => return Err(error).context("clone local file"),
-                }
+                // The device/filesystem probe established volume eligibility.
+                // Even an unsupported errno here may describe just this inode;
+                // it must not disable cloning for other files on the volume.
+                return Err(io::Error::last_os_error()).context("clone local file");
             }
             // Clear inherited flags before chmod or opening another descriptor:
             // descriptor pressure must not leave an immutable, undeletable clone.
@@ -1230,9 +1240,6 @@ impl Root {
             }
             Ok(CloneOutcome::Copied(file))
         })();
-        if matches!(result, Ok(CloneOutcome::UnsupportedVolume(_))) {
-            pairs.lock().unwrap().insert(pair, false);
-        }
         let cleanup = (|| -> Result<()> {
             if let Some(directory) =
                 trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied(_))))
@@ -1275,7 +1282,7 @@ impl Root {
             (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
             // Cloning is optional, but falling back is safe only once its
             // unpublished data and private directory have been removed.
-            (Err(_), Ok(())) => Ok(CloneOutcome::Unsupported),
+            (Err(copy_error), Ok(())) => fallback(copy_error),
             (Ok(outcome), Ok(())) => Ok(outcome),
         }
     }
@@ -1943,7 +1950,10 @@ pub(crate) enum CloneOutcome {
     // this handle to inspect metadata and write without reopening the path.
     Copied(File),
     Unsupported,
-    UnsupportedVolume(u64),
+    UnsupportedVolume {
+        source_dev: u64,
+        destination_dev: u64,
+    },
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1951,7 +1961,7 @@ impl CloneOutcome {
     fn copied(self) -> Option<File> {
         match self {
             Self::Copied(file) => Some(file),
-            Self::Unsupported | Self::UnsupportedVolume(_) => None,
+            Self::Unsupported | Self::UnsupportedVolume { .. } => None,
         }
     }
 }
@@ -1991,7 +2001,7 @@ fn make_clone_directory_public_for_test(directory: &File) -> Result<()> {
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
-fn record_clone_attempt_for_test() -> Result<bool> {
+fn record_clone_attempt_for_test() -> io::Result<()> {
     if let Some(events) = std::env::var_os("SYQ_TEST_CLONE_ATTEMPTS") {
         use std::io::Write;
         writeln!(
@@ -1999,7 +2009,23 @@ fn record_clone_attempt_for_test() -> Result<bool> {
             "clone"
         )?;
     }
-    Ok(std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some())
+    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_ERROR") {
+        if let Some(once) = std::env::var_os("SYQ_TEST_CLONE_ERROR_ONCE") {
+            match OpenOptions::new().write(true).create_new(true).open(once) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        return Err(io::Error::from_raw_os_error(match error.as_str() {
+            "EPERM" => libc::EPERM,
+            "EXDEV" => libc::EXDEV,
+            "ENOTSUP" => libc::ENOTSUP,
+            "ENOSYS" => libc::ENOSYS,
+            _ => libc::EIO,
+        }));
+    }
+    Ok(())
 }
 
 // APFS eligibility uses device pairs, whereas Linux offload distinguishes
