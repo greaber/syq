@@ -17,9 +17,13 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 When an official syq release installs its matching helper in an SSH server's
 cache, it also tries to install that version at `~/.local/bin/syq` for use on
 the server. Reusing a cached helper does not run this installation step.
+Shell completion and the return-connection service only install the cached
+helper; they do not install the command.
 
-Any existing entry at `~/.local/bin/syq`, including a symlink, is left alone.
-If you delete the command but leave its adjacent update receipt, later helper
+Syq records the command's installation in an update receipt, a small file named
+`.syq-install.json` beside the executable. Any existing entry at
+`~/.local/bin/syq`, including a symlink, is left alone.
+If you delete the command but leave its receipt, later helper
 installations leave it absent. Removing both allows automatic installation
 again. A missing cached helper is recreated when needed, regardless of the
 command or its receipt. Syq does not fetch a newer command or check for copies
@@ -32,8 +36,8 @@ group-write permissions are accepted; directory permissions are not changed.
 
 Syq reports installing this command, or failing to do so, unless `--quiet` is
 set. Failure to install this command does not fail the transfer. Syq never
-edits shell startup files. Ensure
-`~/.local/bin` is on your shell's `PATH` to use the command. The command is an
+edits shell startup files. Ensure `~/.local/bin` is on your shell's `PATH` to
+use the command. The command is an
 independent copy of the helper, with filesystem cloning used when available.
 It is registered for `syq --self-update`, which leaves the version-specific
 helper cache unchanged. If registration fails, the notice explains how to
@@ -81,10 +85,12 @@ which provides more extensive benchmarks. Your results will depend on your machi
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
-New standalone installations keep their update receipt beside the executable
-(`.syq-install.json` for `syq`). Existing receipts under the configured syq
-configuration directory remain supported. Preferences still respect
-`XDG_CONFIG_HOME`; changing it does not affect receipts beside executables.
+The update receipt lives beside the executable (`.syq-install.json` for `syq`).
+Older installations may keep it in the syq configuration directory. Syq reads
+the adjacent receipt first and checks the configuration directory if it is
+absent. `XDG_CONFIG_HOME` selects the configuration directory for preferences,
+older receipts, and the update-check timestamp; it does not change the location
+of receipts beside executables.
 
 Standalone installs check for updates at most once a day after a successful
 command when stderr is a terminal and `--quiet` is not set. They print a

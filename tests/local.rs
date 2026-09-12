@@ -4040,6 +4040,148 @@ fn add_remote_tool(t: &Tmp, name: &str) {
 }
 
 #[test]
+fn background_bootstrap_only_installs_the_cached_helper() {
+    use base64::Engine;
+
+    for completion in [true, false] {
+        for upload in [false, true] {
+            let t = Tmp::new();
+            fs::create_dir(t.runtime()).unwrap();
+            write(&t.path("remote-home/data/name"), b"remote");
+            setup_release_bootstrap(&t);
+            if upload {
+                executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+            }
+            let ssh = fake_ssh(&t);
+            // Stop after bootstrap for the return service: its receiver protocol
+            // is unrelated to whether setup publishes an interactive command.
+            let script = fs::read_to_string(&ssh).unwrap().replace(
+                "exec /bin/sh -c",
+                "case \"$1\" in *--return-receiver*) exit 0 ;; esac\nexec /bin/sh -c",
+            );
+            executable(&ssh, script.as_bytes());
+            let path = t.s("remote-home/data/n");
+            let mut command = if completion {
+                completion_command(
+                    &t,
+                    &[
+                        "__complete",
+                        "bash",
+                        "4",
+                        "--",
+                        "syq",
+                        "cp",
+                        "--from",
+                        "fake.example",
+                        &path,
+                    ],
+                )
+            } else {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command
+                    .arg("--return-connect-install")
+                    .arg(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake.example"));
+                command
+            };
+            let output = command
+                .env("HOME", t.path("home"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .env("XDG_RUNTIME_DIR", t.runtime())
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
+                .env(
+                    "FAKE_REMOTE_RELEASE_MANIFEST",
+                    t.path("release-manifest.json"),
+                )
+                .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_TEST_RELEASE_BUILD", "1")
+                .env(
+                    "SYQ_TEST_RELEASE_PUBLIC_KEY",
+                    fs::read_to_string(t.path("release-public-key"))
+                        .unwrap()
+                        .trim(),
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_DOWNLOADS",
+                    "https://release.invalid/download",
+                )
+                .env("SYQ_TEST_FIXTURES", &t.0)
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            if completion {
+                assert_eq!(
+                    completion_values(&output.stdout),
+                    vec![(
+                        b'f',
+                        t.path("remote-home/data/name")
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec()
+                    )]
+                );
+            }
+            assert!(
+                cached_remote_helper(&t).is_file(),
+                "completion={completion}, upload={upload}: {output:?}"
+            );
+            assert!(!t.path("remote-home/.local/bin/syq").exists());
+            assert!(!t.path("remote-home/.local/bin/.syq-install.json").exists());
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            assert!(!log.contains("--install-remote-command"), "{log}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("syq-remote-install-notice:"));
+        }
+    }
+}
+
+#[test]
+fn bootstrap_disconnect_errors_exclude_install_notice_tags() {
+    for upload in [false, true] {
+        let t = Tmp::new();
+        setup_release_bootstrap(&t);
+        if upload {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        let rsh = fake_rsh(&t);
+        let script = fs::read_to_string(&rsh).unwrap().replace(
+            "exec /bin/sh -c \"$1\"",
+            r#"case "$1" in
+    *--install-remote-command*)
+        /bin/sh -c "$1"
+        status=$?
+        [ "$status" -eq 0 ] || exit "$status"
+        echo 'SSH connection closed after bootstrap' >&2
+        exit 255
+        ;;
+esac
+exec /bin/sh -c "$1""#,
+        );
+        executable(&rsh, script.as_bytes());
+        write(&t.path("src"), b"payload");
+        let remote = format!("fake:{}", t.s("dst"));
+        let output = remote_syq(&t, &rsh, &[&t.s("src"), &remote]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(cached_remote_helper(&t).is_file(), "{output:?}");
+        assert!(t.path("remote-home/.local/bin/syq").is_file(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("SSH connection closed after bootstrap"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("255"), "{stderr}");
+        assert!(!stderr.contains("syq-remote-install-notice:"), "{stderr}");
+        assert!(!stderr.contains("installed syq"), "{stderr}");
+    }
+}
+
+#[test]
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);

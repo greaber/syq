@@ -64,14 +64,9 @@ pub fn install() {
             .filter(|value| !value.is_empty())
             .context("HOME is not set")?;
         let source = std::env::current_exe().context("locate the installed helper")?;
-        let destination = Path::new(&home).join(".local/bin/syq");
-        if exists(&destination)? || crate::update::was_standalone_install(&destination)? {
-            return Ok(false);
-        }
         let installed = install_from(&source, Path::new(&home), &cancellation)?;
-        if installed {
-            let registration = Path::new(&home)
-                .join(".local/bin/syq")
+        if let Some(destination) = &installed {
+            let registration = destination
                 .canonicalize()
                 .context("locate the installed command for self-update")
                 .and_then(crate::update::register_standalone_install_at);
@@ -79,7 +74,7 @@ pub fn install() {
                 notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates"));
             }
         }
-        Ok(installed)
+        Ok(installed.is_some())
     })();
     match result {
         Ok(true) => {
@@ -133,14 +128,18 @@ fn prepare_bin(home: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn install_from(source: &Path, home: &Path, cancellation: &Cancellation) -> Result<bool> {
+fn install_from(
+    source: &Path,
+    home: &Path,
+    cancellation: &Cancellation,
+) -> Result<Option<PathBuf>> {
     let destination = home.join(".local/bin/syq");
-    if exists(&destination)? {
-        return Ok(false);
+    if exists(&destination)? || crate::update::was_standalone_install(&destination)? {
+        return Ok(None);
     }
     cancellation.check()?;
     let bin = prepare_bin(home)?;
-    copy_and_publish(source, &bin, &destination, cancellation)
+    Ok(copy_and_publish(source, &bin, &destination, cancellation)?.then_some(destination))
 }
 
 fn copy_and_publish(
@@ -182,7 +181,9 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
         let cancellation = Cancellation::default();
         fs::write(&source, b"first release").unwrap();
-        assert!(install_from(&source, &home, &cancellation).unwrap());
+        assert!(install_from(&source, &home, &cancellation)
+            .unwrap()
+            .is_some());
         let destination = home.join(".local/bin/syq");
         assert_ne!(
             fs::metadata(&source).unwrap().ino(),
@@ -194,11 +195,15 @@ mod tests {
         );
         fs::write(&source, b"second release").unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"first release");
-        assert!(!install_from(&source, &home, &cancellation).unwrap());
+        assert!(install_from(&source, &home, &cancellation)
+            .unwrap()
+            .is_none());
         fs::write(&destination, b"self updated").unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"second release");
         fs::remove_file(&destination).unwrap();
-        assert!(install_from(&source, &home, &cancellation).unwrap());
+        assert!(install_from(&source, &home, &cancellation)
+            .unwrap()
+            .is_some());
         assert_eq!(fs::read(&destination).unwrap(), b"second release");
     }
 
@@ -208,12 +213,13 @@ mod tests {
         let bin = root.path().join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         symlink("missing", bin.join("syq")).unwrap();
-        assert!(!install_from(
+        assert!(install_from(
             &root.path().join("missing helper"),
             root.path(),
             &Cancellation::default()
         )
-        .unwrap());
+        .unwrap()
+        .is_none());
         assert_eq!(
             fs::read_link(bin.join("syq")).unwrap(),
             Path::new("missing")
@@ -245,7 +251,9 @@ mod tests {
             }
             let source = root.path().join("helper");
             fs::write(&source, b"release").unwrap();
-            assert!(install_from(&source, &home, &Cancellation::default()).unwrap());
+            assert!(install_from(&source, &home, &Cancellation::default())
+                .unwrap()
+                .is_some());
             for directory in [&home, &local, &bin] {
                 assert_eq!(fs::metadata(directory).unwrap().mode() & 0o7777, mode);
             }

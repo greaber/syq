@@ -1139,6 +1139,7 @@ mod tests {
             rsh: vec!["ssh".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,

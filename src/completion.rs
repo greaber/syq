@@ -1719,6 +1719,7 @@ fn connect_completion_endpoint(
         ],
         syq_path: syq_path.clone(),
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
+        install_user_command: false,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer),

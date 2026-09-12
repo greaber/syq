@@ -1513,6 +1513,8 @@ pub struct RemoteSpec {
     pub syq_path: Option<String>,
     /// Install and use the versioned helper rather than resolving `syq` on PATH.
     pub bootstrap_helper: bool,
+    /// Also install the user command during bootstrap. Background callers opt out.
+    pub install_user_command: bool,
     /// One-time signed authorization for a command-restricted receiver. It is
     /// sent only on the SSH control connection; TCP and SSH workers join
     /// that already-authorized receiver without redeeming the grant again.
@@ -1557,6 +1559,7 @@ impl RemoteSpec {
             rsh: vec!["local".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -2806,7 +2809,7 @@ impl RemoteSpec {
     }
 
     fn try_remote_download(&self, target: Target) -> Result<RemoteDownloadOutcome> {
-        let script = remote_helper::download_script(target);
+        let script = remote_helper::download_script(target, self.install_user_command);
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
@@ -2939,7 +2942,7 @@ impl RemoteSpec {
     }
 
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
-        let script = remote_helper::upload_script(target);
+        let script = remote_helper::upload_script(target, self.install_user_command);
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
@@ -3189,7 +3192,11 @@ fn output_suffix(stderr: &[u8]) -> String {
 }
 
 fn output_message(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr);
+    let message = String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.starts_with(crate::remote_user_install::NOTICE_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n");
     message
         .trim()
         .strip_prefix("syq: ")
@@ -3402,7 +3409,18 @@ mod tests {
             super::install_notices(stderr).collect::<Vec<_>>(),
             ["installed syq", "check SSH PATH"]
         );
-        assert!(super::output_suffix(stderr).contains("sshd banner"));
+        assert_eq!(
+            super::output_suffix(stderr),
+            ": Warning: new host key\nsshd banner\nrc noise"
+        );
+        assert_eq!(
+            super::output_suffix(b"syq-remote-install-notice:installed syq\r\n"),
+            ""
+        );
+        assert_eq!(
+            super::output_message(b"syq: error mentions syq-remote-install-notice: tag\n"),
+            "error mentions syq-remote-install-notice: tag"
+        );
     }
 
     #[test]
@@ -4017,6 +4035,7 @@ mod tests {
             rsh: vec!["ssh".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4620,6 +4639,7 @@ mod tests {
             rsh: vec!["ssh".to_string()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4673,6 +4693,7 @@ mod tests {
             ],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4716,6 +4737,7 @@ mod tests {
             rsh: vec!["ssh".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(multiplexer),
@@ -4863,6 +4885,7 @@ mod tests {
             rsh: vec!["ssh".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
@@ -4948,6 +4971,7 @@ mod tests {
             rsh: vec!["ssh".into()],
             syq_path: None,
             bootstrap_helper: false,
+            install_user_command: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),

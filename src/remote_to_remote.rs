@@ -879,6 +879,7 @@ fn run_remote(
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
         bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
+        install_user_command: true,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: None,

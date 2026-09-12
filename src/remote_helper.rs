@@ -113,15 +113,15 @@ exec "$program" "$@""#,
     )
 }
 
-fn install_command() -> &'static str {
-    if crate::identity::is_release_build() {
+fn install_command(install_user_command: bool) -> &'static str {
+    if install_user_command && crate::identity::is_release_build() {
         "\"$program\" --install-remote-command </dev/null || :"
     } else {
         ""
     }
 }
 
-pub fn download_script(target: Target) -> String {
+pub fn download_script(target: Target, install_user_command: bool) -> String {
     let release = cache_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
@@ -266,13 +266,13 @@ trap - EXIT HUP INT TERM
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = install_command(),
+        install_command = install_command(install_user_command),
     )
 }
 
 /// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
-pub fn upload_script(target: Target) -> String {
+pub fn upload_script(target: Target, install_user_command: bool) -> String {
     let release = cache_key();
     let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_identity = helper_identity();
@@ -325,7 +325,7 @@ umask "$install_umask"
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = install_command(),
+        install_command = install_command(install_user_command),
     )
 }
 
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn release_download_is_pinned_and_verified() {
         let target = Target::from_uname("Linux", "x86_64").unwrap();
-        let script = download_script(target);
+        let script = download_script(target, true);
         assert!(script.contains(&format!(
             "/v{}/syq-linux-x86_64.gz",
             env!("CARGO_PKG_VERSION")
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn upload_needs_no_download_verification_or_decompression_tools() {
         let target = Target::from_uname("Linux", "x86_64").unwrap();
-        let script = upload_script(target);
+        let script = upload_script(target, true);
         assert!(script.contains("cat > \"$tmp\""));
         assert!(script.contains("--build-identity"));
         assert!(!script.contains("curl"));

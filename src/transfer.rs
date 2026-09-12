@@ -223,6 +223,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 bootstrap_helper: args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
+                install_user_command: true,
                 restricted_grant: args.restricted_grant.clone(),
                 helper_install: Default::default(),
                 ssh_multiplexer,
