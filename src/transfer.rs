@@ -2358,11 +2358,39 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // so attempt it only for local paths or matching SSH endpoints.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
+    let mut prune_overlap_unsearchable = false;
     if same_machine {
         let roots = source_roots.get().expect("source roots registered");
         let mut source_checks = Vec::new();
         let mut ancestry_checks = Vec::new();
         let may_prune = opts.delete && roots.iter().any(|root| root.selection.relative.is_empty());
+        let primary_suffix = if expand_exact_home || dst_is_dir {
+            Vec::new()
+        } else {
+            operator_dst_root
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default()
+                .to_vec()
+        };
+        let prune_suffixes: Vec<_> = if may_prune {
+            srcs.iter()
+                .zip(roots)
+                .filter(|(_, root)| root.selection.relative.is_empty())
+                .map(|(candidate, _)| {
+                    if candidate.copies_contents()
+                        || args.files_from.is_some()
+                        || args.placement == Placement::As
+                    {
+                        primary_suffix.clone()
+                    } else {
+                        join(&primary_suffix, &candidate.basename())
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
             // Registration represents every selected directory as an empty
             // path beneath that directory descriptor. Exact files and
@@ -2372,15 +2400,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if !source_is_directory && !may_prune {
                 continue;
             }
-            let primary_suffix = if expand_exact_home || dst_is_dir {
-                Vec::new()
-            } else {
-                operator_dst_root
-                    .rsplit(|byte| *byte == b'/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_vec()
-            };
             let mut suffixes = vec![primary_suffix.clone()];
             if dst_is_dir && !source.copies_contents() && args.files_from.is_none() {
                 let basename = source.basename();
@@ -2392,24 +2411,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // overlap checks apply only to copied directory roots. Compare
             // every selected source with every such root: one source's prune
             // must not remove another selected source.
-            let mut prune_suffixes = Vec::new();
-            if may_prune {
-                for (candidate, candidate_root) in srcs.iter().zip(roots) {
-                    if !candidate_root.selection.relative.is_empty() {
-                        continue;
-                    }
-                    let suffix = if candidate.copies_contents()
-                        || args.files_from.is_some()
-                        || args.placement == Placement::As
-                    {
-                        primary_suffix.clone()
-                    } else {
-                        join(&primary_suffix, &candidate.basename())
-                    };
-                    if !suffixes.contains(&suffix) {
-                        suffixes.push(suffix.clone());
-                    }
-                    prune_suffixes.push(suffix);
+            for suffix in &prune_suffixes {
+                if !suffixes.contains(suffix) {
+                    suffixes.push(suffix.clone());
                 }
             }
             let checked_for_prune = suffixes
@@ -2452,7 +2456,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     DirectoryRelation::Separate => {}
                     DirectoryRelation::SourceUnsearchable => {
                         if checks_prune {
-                            progress.error("syq: source directory cannot be searched to check pruning overlap");
+                            prune_overlap_unsearchable = true;
+                            progress.error(&format!(
+                                "syq: cannot check pruning overlap for source {}: a source ancestor cannot be searched",
+                                display(&source.path)
+                            ));
                         }
                     }
                     DirectoryRelation::Ancestor if !checks_prune => {}
@@ -3141,6 +3149,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if st.scan_warned {
             delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
+        } else if prune_overlap_unsearchable {
+            delete_plan = DeletePlan::Skipped("source ancestry could not be checked");
+            progress.eprintln("syq: source ancestry could not be checked; skipping deletions");
         } else if progress.errors.load(Relaxed) != 0 {
             delete_plan = DeletePlan::Skipped("copy errors");
             progress.eprintln("syq: copy reported errors; skipping deletions");
@@ -3879,6 +3890,12 @@ fn prepare_existing_destination(
     Ok((selection, filesystem, anchor))
 }
 
+fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'/').then_some(&path[..index]))
+}
+
 fn parent_path(path: &[u8]) -> PathBytes {
     match path.iter().rposition(|byte| *byte == b'/') {
         Some(0) => b"/".to_vec(),
@@ -4563,6 +4580,13 @@ enum Claim {
     Weak,
 }
 
+/// A failed entry's result identity, with a source path only in mapping mode.
+struct FailedEntry<'a> {
+    dst: &'a [u8],
+    src: Option<&'a [u8]>,
+    kind: Option<DeclaredKind>,
+}
+
 /// Keep destination-only candidates, borrowing source claim paths instead of
 /// copying every destination spelling. Exact matches are discarded as scanned.
 struct PruneWalk<'a> {
@@ -4615,11 +4639,8 @@ impl<'a> PruneWalk<'a> {
             .split(|byte| *byte == b'/')
             .any(|name| is_recovery_name(OsStr::from_bytes(name)))
         {
-            for (index, byte) in full.iter().enumerate() {
-                if *byte == b'/' {
-                    self.recovery_parents.insert(full[..index].to_vec());
-                }
-            }
+            self.recovery_parents
+                .extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
             return;
         }
         self.unmatched.remove(&full);
@@ -6203,9 +6224,8 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
                     {
-                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
                         continue;
                     }
                     let same = dst_entry.as_ref().is_some_and(|d| {
@@ -6351,9 +6371,8 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
                     {
-                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
                         continue;
                     }
                     let target = e.link.clone().unwrap_or_default();
@@ -6432,9 +6451,8 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    if !opts.verify_only && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::Dir)
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
                     {
-                        self.fail_directory_type_change(&dst_path, &dst_rel, e.kind);
                         continue;
                     }
                     let same = dst_entry
@@ -6766,6 +6784,20 @@ impl Planner<'_> {
         )
     }
 
+    fn refuse_directory_target(
+        &self,
+        dst: &[u8],
+        dst_rel: &[u8],
+        kind: Kind,
+        entry: Option<&Entry>,
+    ) -> bool {
+        if self.opts.verify_only || !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
+            return false;
+        }
+        self.fail_directory_type_change(dst, dst_rel, kind);
+        true
+    }
+
     fn fail_directory_type_change(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) {
         let message = if kind == Kind::Dir {
             format!(
@@ -6780,30 +6812,22 @@ impl Planner<'_> {
         };
         self.progress
             .error_classified(&message, Some("conflict"), None);
-        if self.opts.dry_run {
-            return;
-        }
-        if let Some(results) = self.progress.results_writer() {
-            let (action, kind) = match kind {
-                Kind::Dir => ("create_directory", "dir"),
-                Kind::File => ("transfer_file", "file"),
-                Kind::Symlink => ("create_symlink", "symlink"),
-                _ => ("create_special", "special"),
-            };
-            results.emit_operation(&crate::results::OperationRecord {
-                action,
+        self.emit_entry_failed(
+            FailedEntry {
                 dst: dst_rel,
                 src: self.mapping_source_rel(dst_rel).as_deref(),
-                kind,
-                disposition: "failed",
-                bytes: None,
-                attempts: None,
-                retryable: Some("no"),
-                class: Some("conflict"),
-                os_kind: None,
-                message: Some(&message),
-            });
-        }
+                kind: Some(match kind {
+                    Kind::Dir => DeclaredKind::Dir,
+                    Kind::File => DeclaredKind::File,
+                    Kind::Symlink => DeclaredKind::Symlink,
+                    _ => DeclaredKind::Special,
+                }),
+            },
+            "no",
+            "conflict",
+            None,
+            &message,
+        );
     }
 
     /// Report only real manifest entries beneath a protected obstruction;
@@ -6857,6 +6881,27 @@ impl Planner<'_> {
         os_kind: Option<&'static str>,
         message: &str,
     ) {
+        self.emit_entry_failed(
+            FailedEntry {
+                dst: &entry.dst,
+                src: Some(&entry.src),
+                kind: entry.kind,
+            },
+            retryable,
+            class,
+            os_kind,
+            message,
+        );
+    }
+
+    fn emit_entry_failed(
+        &self,
+        entry: FailedEntry<'_>,
+        retryable: &'static str,
+        class: &'static str,
+        os_kind: Option<&'static str>,
+        message: &str,
+    ) {
         // Dry runs are trace-only: the error record and terminal accounting
         // still reflect the failure.
         if self.opts.dry_run {
@@ -6871,8 +6916,8 @@ impl Planner<'_> {
             };
             results.emit_operation(&crate::results::OperationRecord {
                 action,
-                dst: &entry.dst,
-                src: Some(&entry.src),
+                dst: entry.dst,
+                src: entry.src,
                 kind,
                 disposition: "failed",
                 bytes: None,
@@ -7086,11 +7131,7 @@ impl Planner<'_> {
                 &mut |paths: Vec<PathBytes>| {
                     for p in paths {
                         // Every ancestor of an ignored path is protected.
-                        for (i, &c) in p.iter().enumerate() {
-                            if c == b'/' {
-                                protected.insert(join(&root, &p[..i]));
-                            }
-                        }
+                        protected.extend(ancestor_prefixes(&p).map(|prefix| join(&root, prefix)));
                     }
                     Ok(())
                 },
@@ -7124,11 +7165,7 @@ impl Planner<'_> {
                 if claimed.is_some() {
                     // An ambiguous hard link may live in an otherwise extra
                     // directory. Keep its ancestors as well as the link.
-                    for (index, byte) in full.iter().enumerate() {
-                        if *byte == b'/' {
-                            alias_parents.insert(full[..index].to_vec());
-                        }
-                    }
+                    alias_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
                 }
                 match claimed {
                     Some(Claim::Dir) => continue,
@@ -7152,12 +7189,10 @@ impl Planner<'_> {
                                     "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"
                                 ));
                     }
-                    for (index, byte) in full.iter().enumerate() {
-                        if *byte == b'/' {
-                            partial_parents
-                                .entry(full[..index].to_vec())
-                                .or_insert_with(|| rel.clone());
-                        }
+                    for prefix in ancestor_prefixes(&full) {
+                        partial_parents
+                            .entry(prefix.to_vec())
+                            .or_insert_with(|| rel.clone());
                     }
                 } else {
                     if entry_kind == Kind::Dir {
