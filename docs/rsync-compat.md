@@ -29,9 +29,11 @@ on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
 see [deletion rules](reference.md#mirror-a-directory).
 
 The compatibility command uses rsync's default size-and-whole-second timestamp
-quick check. Native `syq cp` also compares fractional seconds. Use `-c` to compare
-contents when size and timestamp match; source timestamps are preserved, so
-ordinary clock skew does not require the source timestamp to be newer.
+quick check. Native `syq cp` also compares fractional seconds at the precision
+suggested by the destination timestamp; see [timestamp matching](reference.md#check-file-contents).
+Use `-c` to compare contents when size and timestamp match; source timestamps
+are preserved, so ordinary clock skew does not require the source timestamp
+to be newer.
 
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by

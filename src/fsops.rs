@@ -26,6 +26,22 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Compare at the decimal precision suggested by the destination timestamp.
+/// Trailing zeros may reflect either filesystem truncation or a round timestamp;
+/// this is the size/mtime shortcut, not a content verification.
+pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> bool {
+    if destination == 0 {
+        return true;
+    }
+    let mut precision = 1;
+    let mut fraction = destination;
+    while fraction.is_multiple_of(10) {
+        precision *= 10;
+        fraction /= 10;
+    }
+    source / precision == destination / precision
+}
+
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
 const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;
@@ -1815,8 +1831,8 @@ impl FsOps {
                 }
             }
         }
-        // This fused path serves native copies: use all available timestamp
-        // precision, matching the native planner's quick check.
+        // This fused path serves native copies: share the planner's inferred
+        // destination precision so dispatch does not change the skip decision.
         let mut unchanged: Vec<bool> = request
             .files
             .iter()
@@ -1826,7 +1842,10 @@ impl FsOps {
                     request.flags & flags::TIMES != 0
                         && stat.st_size as u64 == file.data.len() as u64
                         && stat.st_mtime == file.meta.mtime
-                        && stat.st_mtime_nsec as u32 == file.meta.mtime_nsec
+                        && destination_fraction_matches(
+                            file.meta.mtime_nsec,
+                            stat.st_mtime_nsec as u32,
+                        )
                 })
             })
             .collect();

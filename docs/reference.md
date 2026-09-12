@@ -305,16 +305,21 @@ formats are neither reused nor selected by this command; remove those manually.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match, including
-fractional seconds. It preserves the source timestamp at the destination, so
-the machines' clocks do not need to agree. A changed timestamp triggers checking
-even when it is older than the destination's, unless you request `--skip-newer`.
-A destination that rounds timestamps to coarser precision can cause unchanged
-files to be checked or copied again on later runs.
+Syq normally skips files whose size and modification time match. `syq cp`
+compares whole seconds exactly and ignores as many trailing fractional digits
+as are zero in the destination timestamp. For example, destination `.120000000`
+seconds matches source `.123456789`; a whole-second destination timestamp
+ignores the source fraction entirely. This accommodates destinations that
+truncate fractional seconds. Directory metadata previews use the same fractional
+precision rule. `syq rsync` compares whole seconds only when checking file contents.
+
+Syq preserves the source timestamp at the destination, so the machines' clocks
+do not need to agree. A timestamp difference outside that precision triggers
+checking even when the source is older, unless you request `--skip-newer`.
 
 Matching metadata is a shortcut, not proof that contents match. An edit can
-preserve both size and timestamp, and some filesystems record timestamps with
-less precision. `--hash` checks contents even when those two attributes match:
+preserve both size and timestamp, and changes within the ignored fraction can
+be missed. `--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup

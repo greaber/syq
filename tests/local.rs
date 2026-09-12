@@ -8243,6 +8243,95 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
 /// results records must match the ordinary engine's for the same copy, and
 /// anything the one-turn path declines must reach the engine unchanged.
 #[test]
+fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
+    for (source_seconds, source_nsec, destination_nsec, same_size, matches) in [
+        (10, 123_456_789, 120_000_000, true, true),
+        (10, 123_456_789, 123_456_700, true, true),
+        (10, 123_456_789, 0, true, true),
+        (10, 130_000_000, 120_000_000, true, false),
+        (10, 120_000_000, 123_456_789, true, false),
+        (11, 123_456_789, 120_000_000, true, false),
+        (10, 123_456_789, 120_000_000, false, false),
+    ] {
+        for option in [None, Some("--stats"), Some("--dry-run"), Some("--hash")] {
+            let t = Tmp::new();
+            let ssh = fake_ssh(&t);
+            write(&t.path("source"), b"new");
+            let old: &[u8] = if same_size { b"old" } else { b"older" };
+            write(&t.path("remote-home/dest/source"), old);
+            for (path, seconds, nanos) in [
+                ("source", source_seconds, source_nsec),
+                ("remote-home/dest/source", 10, destination_nsec),
+            ] {
+                File::open(t.path(path))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos),
+                    ))
+                    .unwrap();
+            }
+            let before = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-progress",
+                    "--results",
+                    &t.s("results.ndjson"),
+                    &t.s("source"),
+                    "--to",
+                    "fake.example",
+                    "--into",
+                    &t.s("remote-home/dest"),
+                ])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .env("SYQ_DEBUG", "1");
+            if let Some(option) = option {
+                command.arg(option);
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            assert_eq!(
+                stderr_of(&output).contains("small copy: published"),
+                option.is_none(),
+                "wrong dispatch for {option:?}: {}",
+                stderr_of(&output)
+            );
+            let skipped = matches && option != Some("--hash");
+            let unchanged = skipped || option == Some("--dry-run");
+            assert_eq!(read(&t.path("remote-home/dest/source")), if unchanged { old } else { b"new" },
+                "option={option:?}, source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}");
+            if unchanged {
+                let after = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+                assert_eq!(after.ino(), before.ino());
+                assert_eq!(
+                    (after.mtime(), after.mtime_nsec()),
+                    (before.mtime(), before.mtime_nsec())
+                );
+            }
+            let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(result["status"], "success");
+            assert_eq!(result["files_unchanged"], u64::from(skipped), "{records}");
+            assert_eq!(
+                result["bytes_transferred"],
+                if skipped { 0 } else { 3 },
+                "{records}"
+            );
+        }
+    }
+}
+
+#[test]
 fn small_pushes_take_one_turn_and_match_the_engine() {
     let t = Tmp::new();
     let ssh = fake_ssh(&t);
@@ -20978,6 +21067,87 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
         "{out}"
     );
     assert_eq!(partial_files(&t.0).len(), 1);
+}
+
+#[test]
+fn native_mtime_uses_destination_decimal_precision() {
+    // Different same-size bytes make an accidental copy/skip observable. Set
+    // exact timestamps to emulate destination truncation without mounting a FS.
+    for (source_nsec, destination_nsec, source_seconds, same_size, skipped) in [
+        (123_456_789, 123_456_789, 10, true, true),
+        (123_456_789, 123_456_788, 10, true, false),
+        (123_456_789, 123_456_700, 10, true, true),
+        (123_456_789, 123_456_800, 10, true, false),
+        (123_456_789, 120_000_000, 10, true, true),
+        (129_999_999, 120_000_000, 10, true, true),
+        (130_000_000, 120_000_000, 10, true, false),
+        (120_000_000, 123_456_789, 10, true, false),
+        (999_999_999, 0, 10, true, true),
+        (0, 0, 10, true, true),
+        (123_456_789, 0, 11, true, false),
+        (123_456_789, 0, 9, true, false),
+        (123_456_789, 120_000_000, 10, false, false),
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"new");
+        write(&t.path("dst"), if same_size { b"old" } else { b"older" });
+        for (name, seconds, nanos) in [
+            ("src", source_seconds, source_nsec),
+            ("dst", 10, destination_nsec),
+        ] {
+            let time = std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos);
+            File::options()
+                .write(true)
+                .open(t.path(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        run_native_ok(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+        assert_eq!(
+            read(&t.path("dst")),
+            if skipped { b"old" } else { b"new" },
+            "source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}"
+        );
+        if skipped {
+            // Content verification must bypass the inferred-precision shortcut.
+            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("dst")]);
+            assert_eq!(read(&t.path("dst")), b"new");
+        }
+    }
+}
+
+#[test]
+fn directory_dry_run_uses_destination_timestamp_precision() {
+    for (source_ns, destination_ns, differs) in [
+        (123_456_789, 120_000_000, false),
+        (123_456_789, 0, false),
+        (123_456_789, 130_000_000, true),
+        (120_000_000, 123_456_789, true),
+    ] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/sub")).unwrap();
+        fs::create_dir_all(t.path("dst/sub")).unwrap();
+        set_mtime(&t.path("src"), 10);
+        set_mtime(&t.path("dst"), 10);
+        for (name, nanos) in [("src/sub", source_ns), ("dst/sub", destination_ns)] {
+            File::open(t.path(name))
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(10, nanos)),
+                )
+                .unwrap();
+        }
+        let out = syq_cp_in(
+            &t.path(""),
+            &["src", "--as", "dst", "--dry-run", "-v"],
+            None,
+        );
+        assert_output_ok(&out);
+        let stderr = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stderr.contains("metadata"), differs, "{stderr}");
+    }
 }
 
 #[test]

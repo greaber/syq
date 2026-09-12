@@ -9,7 +9,9 @@ use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
-use crate::fsops::{content_digest, is_partial_name, is_recovery_name, join};
+use crate::fsops::{
+    content_digest, destination_fraction_matches, is_partial_name, is_recovery_name, join,
+};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
@@ -4078,7 +4080,8 @@ fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
-            && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
+            && (source.mtime != destination.mtime
+                || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
 }
 
 fn publication_metadata_flags(requested: u8) -> u8 {
@@ -6209,7 +6212,8 @@ impl Planner<'_> {
                         d.kind == Kind::File
                             && d.size == e.size
                             && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
-                            && (!opts.precise_mtime || d.mtime_nsec == e.mtime_nsec)
+                            && (!opts.precise_mtime
+                                || destination_fraction_matches(e.mtime_nsec, d.mtime_nsec))
                     });
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {
