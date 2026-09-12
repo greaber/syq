@@ -128,6 +128,11 @@ syq cp report.txt --as-new reports/final.txt
 `--into` uses or creates a directory. `--as` can rename a directory too.
 Sources that would collide at one destination are refused before copying.
 
+For a missing or empty destination, syq checks available space before copying
+and refuses a clear shortage. It also checks free inodes when the filesystem
+reports a meaningful count; exFAT on macOS does not. These checks are estimates:
+allocation failures during the copy still cause an error.
+
 ## Choose which existing files to update
 
 By default, selected destination entries are updated when needed.
