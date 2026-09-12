@@ -468,7 +468,7 @@ fn registration_needs_no_config_and_does_not_change_bin_permissions() {
 }
 
 #[test]
-fn remote_install_replaces_stale_receipt_after_binary_removal_and_ignores_path() {
+fn remote_install_preserves_deleted_command_until_its_receipt_is_removed() {
     let version = next_release_version();
     let fixture = UpdateFixture::new(&version, &format!("v{version}"));
     let home = fixture.temp.path("remote-home");
@@ -490,7 +490,13 @@ fn remote_install_replaces_stale_receipt_after_binary_removal_and_ignores_path()
     let binary = home.join(".local/bin/syq");
     fs::remove_file(&binary).unwrap();
     let receipt = binary.with_file_name(".syq-install.json");
-    fs::write(&receipt, b"stale receipt").unwrap();
+    let saved_receipt = fs::read(&receipt).unwrap();
+    let skipped = install();
+    assert_success(&skipped);
+    assert!(skipped.stderr.is_empty());
+    assert!(!binary.exists());
+    assert_eq!(fs::read(&receipt).unwrap(), saved_receipt);
+    fs::remove_file(&receipt).unwrap();
     assert_success(&install());
     assert_eq!(fs::read(binary).unwrap(), fixture.original);
     let registered: serde_json::Value =

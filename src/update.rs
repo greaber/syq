@@ -150,6 +150,37 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
     write_receipt(&path, &receipt)
 }
 
+/// An adjacent receipt records that this command was already installed. If its
+/// executable was removed, remote bootstrap preserves that choice. A receipt
+/// for a different executable (or malformed metadata) is not such a record.
+pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
+    let path = receipt_path_for(binary)?;
+    match fs::metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspect previous standalone install receipt"),
+    }
+    let bytes = fs::read(&path).context("read previous standalone install receipt")?;
+    let Ok(receipt) = serde_json::from_slice::<InstallReceipt>(&bytes) else {
+        return Ok(false);
+    };
+    // Resolve the parent separately: the executable itself may have been deleted.
+    let expected = canonical_or_original(
+        binary
+            .parent()
+            .context("installed executable has no parent")?,
+    )
+    .join(
+        binary
+            .file_name()
+            .context("installed executable has no filename")?,
+    );
+    Ok(receipt.schema == RECEIPT_SCHEMA
+        && receipt.provider == "standalone"
+        && canonical_or_original(&receipt.binary) == expected)
+}
+
 /// Check at most once per day after a successful interactive command and print
 /// an update notice when needed. Errors never change the command's exit status.
 pub fn after_success(quiet: bool) {
@@ -160,13 +191,13 @@ pub fn after_success(quiet: bool) {
     ) {
         return;
     }
-    if managed_receipt().is_err() {
-        return;
-    }
     let Ok(stamp) = check_stamp_path() else {
         return;
     };
     if !check_is_due(&stamp) {
+        return;
+    }
+    if managed_receipt().is_err() {
         return;
     }
     // Mark before networking so an outage does not delay every invocation.
@@ -1054,6 +1085,31 @@ mod tests {
         let mut value = manifest();
         value.installer.size = MAX_SAFE_JSON_INTEGER + 1;
         assert!(validate_manifest(&value).is_err());
+    }
+
+    #[test]
+    fn deleted_command_requires_a_matching_standalone_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("syq");
+        let path = receipt_path_for(&binary).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        let mut receipt = InstallReceipt {
+            schema: RECEIPT_SCHEMA,
+            provider: "standalone".into(),
+            version: "0.5.2".into(),
+            target: "linux-x86_64".into(),
+            binary: root.path().join("other-syq"),
+        };
+        write_receipt(&path, &receipt).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        receipt.binary = canonical_or_original(root.path()).join("syq");
+        write_receipt(&path, &receipt).unwrap();
+        assert!(was_standalone_install(&binary).unwrap());
+        receipt.provider = "other".into();
+        write_receipt(&path, &receipt).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        fs::write(&path, b"malformed receipt").unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
     }
 
     #[test]

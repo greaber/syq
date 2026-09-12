@@ -4114,76 +4114,25 @@ fn managed_remote_helper_install_is_cached() {
         .matches("syq-helper-target:")
         .count();
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
-}
 
-#[test]
-fn remote_helper_command_install_falls_back_without_cp_and_preserves_existing_command() {
-    let t = Tmp::new();
-    let installed = t.path("home/.local/bin/syq");
-    fs::create_dir(t.path("home")).unwrap();
-    fs::set_permissions(t.path("home"), fs::Permissions::from_mode(0o700)).unwrap();
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
-            .arg("--install-remote-command")
-            .env("HOME", t.path("home"))
-            .env("XDG_CONFIG_HOME", t.path("config"))
-            .env(
-                "SYQ_TEST_RELEASE_PUBLIC_KEY",
-                base64::engine::general_purpose::STANDARD.encode([19; 32]),
-            )
-            .env("PATH", t.path("no-tools"))
-            .env("SYQ_TEST_RELEASE_BUILD", "1")
-            .output()
-            .unwrap()
-    };
-    assert_output_ok(&run());
-    assert_eq!(read(&installed), read(Path::new(env!("CARGO_BIN_EXE_syq"))));
-    write(&installed, b"existing release");
-    let out = run();
+    // The command's receipt does not suppress recovery of a missing helper.
+    let receipt = installed.with_file_name(".syq-install.json");
+    let saved_receipt = read(&receipt);
+    fs::remove_file(&installed).unwrap();
+    fs::remove_file(cached_remote_helper(&t)).unwrap();
+    write(&t.path("src"), b"third");
+    let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
-    assert!(out.stderr.is_empty());
-    assert_eq!(read(&installed), b"existing release");
-}
-
-#[test]
-fn remote_helper_interrupted_command_install_cleans_up_partial_copy() {
-    let t = Tmp::new();
-    fs::create_dir(t.path("home")).unwrap();
-    fs::set_permissions(t.path("home"), fs::Permissions::from_mode(0o700)).unwrap();
-    executable(
-        &t.path("tools/cp"),
-        br#"#!/bin/sh
-printf ready > "$INSTALL_READY"
-/bin/sleep 1
-/bin/cp "$2" "$3"
-"#,
+    assert_eq!(read(&t.path("dst")), b"third");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
-    for signal in [libc::SIGHUP, libc::SIGTERM] {
-        let marker = t.path("ready");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .arg("--install-remote-command")
-            .env("HOME", t.path("home"))
-            .env("PATH", t.path("tools"))
-            .env("INSTALL_READY", &marker)
-            .env("SYQ_TEST_RELEASE_BUILD", "1")
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        wait_for(
-            "remote install copy to start",
-            std::time::Duration::from_secs(5),
-            || marker.exists(),
-        );
-        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
-        wait_for(
-            "interrupted installer to exit",
-            std::time::Duration::from_secs(5),
-            || child.try_wait().unwrap().is_some(),
-        );
-        assert!(child.wait().unwrap().success());
-        assert_eq!(fs::read_dir(t.path("home/.local/bin")).unwrap().count(), 0);
-        fs::remove_file(marker).unwrap();
-    }
+    assert!(
+        !installed.exists(),
+        "preserve a deliberately removed command"
+    );
+    assert_eq!(read(&receipt), saved_receipt);
 }
 
 #[test]
