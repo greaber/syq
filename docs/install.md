@@ -16,33 +16,25 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 
 When an official syq release installs its matching helper in an SSH server's
 cache, it also tries to install that version at `~/.local/bin/syq` for use on
-the server. Reusing a cached helper does not run this installation step.
-Shell completion and the return-connection service only install the cached
-helper; they do not install the command.
+the server. Existing files and symlinks there are never overwritten, and shell
+startup files are never edited.
 
-Syq records the command's installation in an update receipt, a small file named
-`.syq-install.json` beside the executable. Any existing entry at
-`~/.local/bin/syq`, including a symlink, is left alone.
-If you delete the command but leave its receipt, later helper
-installations leave it absent. Removing both allows automatic installation
-again. A missing cached helper is recreated when needed, regardless of the
-command or its receipt. Syq does not fetch a newer command or check for copies
-elsewhere on your `PATH`.
+The installation receipt, `~/.local/bin/.syq-install.json`, lets
+`syq --self-update` find and update this command independently of the cached
+helper. If you delete the command but leave its receipt, syq leaves it absent.
+Remove both files to allow installation again the next time a helper is
+installed. Missing cached helpers are recreated regardless of these files.
 
-New `.local` and `.local/bin` directories allow only their owner to write,
-and respect stricter permissions from your umask. Existing directories must
-be owned by your account or root and must not be world-writable. Existing
-group-write permissions are accepted; directory permissions are not changed.
+Success and failure are reported as notices unless `--quiet` is set. Failure
+to install the command does not fail the transfer. If update registration
+fails, the notice explains how to enable updates. Existing install directories
+must be owned by your account or root and must not be world-writable;
+their permissions are left unchanged.
 
-Syq reports installing this command, or failing to do so, unless `--quiet` is
-set. Failure to install this command does not fail the transfer. Syq never
-edits shell startup files. Ensure `~/.local/bin` is on your shell's `PATH` to
-use the command. The command is an
-independent copy of the helper, with filesystem cloning used when available.
-It is registered for `syq --self-update`, which leaves the version-specific
-helper cache unchanged. If registration fails, the notice explains how to
-enable updates. Development builds and connections using `--syq-path` or
-`--no-bootstrap` do not install the command.
+Reusing a cached helper does not install the command. Neither do development
+builds or connections using `--syq-path` or `--no-bootstrap`. Shell completion
+and connections opened on your behalf by a [receiving machine](receive.md)
+only set up the helper cache.
 
 ## Homebrew
 
@@ -85,12 +77,9 @@ which provides more extensive benchmarks. Your results will depend on your machi
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
-The update receipt lives beside the executable (`.syq-install.json` for `syq`).
-Older installations may keep it in the syq configuration directory. Syq reads
-the adjacent receipt first and checks the configuration directory if it is
-absent. `XDG_CONFIG_HOME` selects the configuration directory for preferences,
-older receipts, and the update-check timestamp; it does not change the location
-of receipts beside executables.
+Standalone installations use a small receipt file beside the executable
+(`.syq-install.json` for `syq`). Older installations may keep their receipt
+in the syq configuration directory; self-update supports both locations.
 
 Standalone installs check for updates at most once a day after a successful
 command when stderr is a terminal and `--quiet` is not set. They print a

@@ -3,8 +3,6 @@
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 
@@ -16,55 +14,16 @@ fn notice(message: impl std::fmt::Display) {
     }
 }
 
-// This runs only in the short-lived installer process. Let an interrupted copy
-// return, then unwind normally so its private temporary directory is removed.
-// SIGKILL and crashes can still leave a temporary file behind.
-#[derive(Default)]
-struct Cancellation {
-    cancelled: Arc<AtomicBool>,
-    handlers: Vec<signal_hook::SigId>,
-}
-
-impl Cancellation {
-    fn register() -> Result<Self> {
-        let mut cancellation = Self::default();
-        for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
-            cancellation.handlers.push(signal_hook::flag::register(
-                signal,
-                cancellation.cancelled.clone(),
-            )?);
-        }
-        Ok(cancellation)
-    }
-
-    fn check(&self) -> Result<()> {
-        ensure!(
-            !self.cancelled.load(Ordering::Relaxed),
-            "remote command installation interrupted"
-        );
-        Ok(())
-    }
-}
-
-impl Drop for Cancellation {
-    fn drop(&mut self) {
-        for handler in &self.handlers {
-            signal_hook::low_level::unregister(*handler);
-        }
-    }
-}
-
 pub fn install() {
     if !crate::identity::is_release_build() {
         return;
     }
     let result: Result<bool> = (|| {
-        let cancellation = Cancellation::register()?;
         let home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .context("HOME is not set")?;
         let source = std::env::current_exe().context("locate the installed helper")?;
-        let installed = install_from(&source, Path::new(&home), &cancellation)?;
+        let installed = install_from(&source, Path::new(&home))?;
         if let Some(destination) = &installed {
             let registration = destination
                 .canonicalize()
@@ -128,26 +87,18 @@ fn prepare_bin(home: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn install_from(
-    source: &Path,
-    home: &Path,
-    cancellation: &Cancellation,
-) -> Result<Option<PathBuf>> {
+fn install_from(source: &Path, home: &Path) -> Result<Option<PathBuf>> {
     let destination = home.join(".local/bin/syq");
     if exists(&destination)? || crate::update::was_standalone_install(&destination)? {
         return Ok(None);
     }
-    cancellation.check()?;
     let bin = prepare_bin(home)?;
-    Ok(copy_and_publish(source, &bin, &destination, cancellation)?.then_some(destination))
+    Ok(copy_and_publish(source, &bin, &destination)?.then_some(destination))
 }
 
-fn copy_and_publish(
-    source: &Path,
-    bin: &Path,
-    destination: &Path,
-    cancellation: &Cancellation,
-) -> Result<bool> {
+fn copy_and_publish(source: &Path, bin: &Path, destination: &Path) -> Result<bool> {
+    // Use default signal handling. Termination may leave this private staging
+    // directory behind; normal returns and errors remove it.
     let staging = tempfile::Builder::new()
         .prefix(".syq-install-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -158,7 +109,6 @@ fn copy_and_publish(
     fs::copy(source, &temporary).context("copy the helper for interactive use")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
     fs::File::open(&temporary)?.sync_all()?;
-    cancellation.check()?;
     // Atomic no-clobber publication never links to the cached helper inode.
     match temporary.persist_noclobber(destination) {
         Ok(_) => {}
@@ -179,11 +129,8 @@ mod tests {
         let source = root.path().join("helper");
         let home = root.path().join("home with spaces");
         fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
-        let cancellation = Cancellation::default();
         fs::write(&source, b"first release").unwrap();
-        assert!(install_from(&source, &home, &cancellation)
-            .unwrap()
-            .is_some());
+        assert!(install_from(&source, &home).unwrap().is_some());
         let destination = home.join(".local/bin/syq");
         assert_ne!(
             fs::metadata(&source).unwrap().ino(),
@@ -195,15 +142,11 @@ mod tests {
         );
         fs::write(&source, b"second release").unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"first release");
-        assert!(install_from(&source, &home, &cancellation)
-            .unwrap()
-            .is_none());
+        assert!(install_from(&source, &home).unwrap().is_none());
         fs::write(&destination, b"self updated").unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"second release");
         fs::remove_file(&destination).unwrap();
-        assert!(install_from(&source, &home, &cancellation)
-            .unwrap()
-            .is_some());
+        assert!(install_from(&source, &home).unwrap().is_some());
         assert_eq!(fs::read(&destination).unwrap(), b"second release");
     }
 
@@ -213,13 +156,11 @@ mod tests {
         let bin = root.path().join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         symlink("missing", bin.join("syq")).unwrap();
-        assert!(install_from(
-            &root.path().join("missing helper"),
-            root.path(),
-            &Cancellation::default()
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            install_from(&root.path().join("missing helper"), root.path())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             fs::read_link(bin.join("syq")).unwrap(),
             Path::new("missing")
@@ -251,9 +192,7 @@ mod tests {
             }
             let source = root.path().join("helper");
             fs::write(&source, b"release").unwrap();
-            assert!(install_from(&source, &home, &Cancellation::default())
-                .unwrap()
-                .is_some());
+            assert!(install_from(&source, &home).unwrap().is_some());
             for directory in [&home, &local, &bin] {
                 assert_eq!(fs::metadata(directory).unwrap().mode() & 0o7777, mode);
             }
@@ -265,26 +204,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local = root.path().join(".local");
         symlink(".local", &local).unwrap();
-        let error = install_from(
-            &root.path().join("helper"),
-            root.path(),
-            &Cancellation::default(),
-        )
-        .unwrap_err();
+        let error = install_from(&root.path().join("helper"), root.path()).unwrap_err();
         assert!(format!("{error:#}").contains("inspect"));
         assert_eq!(fs::read_link(local).unwrap(), Path::new(".local"));
     }
 
     #[test]
-    fn cancellation_before_publication_cleans_up_the_completed_copy() {
+    fn copy_failure_cleans_up_staging() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("helper");
-        fs::write(&source, b"release").unwrap();
         let bin = prepare_bin(root.path()).unwrap();
-        let cancellation = Cancellation::default();
-        cancellation.cancelled.store(true, Ordering::Relaxed);
-        let error = copy_and_publish(&source, &bin, &bin.join("syq"), &cancellation).unwrap_err();
-        assert!(error.to_string().contains("interrupted"));
+        let error =
+            copy_and_publish(&root.path().join("missing"), &bin, &bin.join("syq")).unwrap_err();
+        assert!(error.to_string().contains("copy the helper"));
         assert_eq!(fs::read_dir(bin).unwrap().count(), 0);
     }
 }

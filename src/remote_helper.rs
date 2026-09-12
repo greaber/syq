@@ -115,7 +115,7 @@ exec "$program" "$@""#,
 
 fn install_command(install_user_command: bool) -> &'static str {
     if install_user_command && crate::identity::is_release_build() {
-        "\"$program\" --install-remote-command </dev/null || :"
+        "\"$program\" --install-remote-command </dev/null >/dev/null || :"
     } else {
         ""
     }

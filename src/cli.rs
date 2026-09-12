@@ -788,7 +788,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Preview without changing copy/removal data; requested results files are still written
+    /// Preview without changing copy/removal data; remote setup may still cache the helper or install syq; requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity

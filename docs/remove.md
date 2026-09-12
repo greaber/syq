@@ -23,7 +23,9 @@ syq rm --on server /scratch/old-output
 ```
 
 This removes `/scratch/old-output` on `server`. Remote removal runs while your
-connection stays open; there is no detached mode.
+connection stays open; there is no detached mode. With `--dry-run`, nothing is
+removed, but remote setup may still cache the helper or
+[install syq](install.md#automatic-installation-on-ssh-servers).
 
 ## Limit the selection
 
