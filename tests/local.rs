@@ -3836,6 +3836,8 @@ exec /bin/sh -c "$1"
 }
 
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    fs::set_permissions(t.path("remote-home"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut cmd = compat_command();
     cmd.args([
         "-e",
@@ -4063,7 +4065,7 @@ fn managed_remote_helper_install_is_cached() {
     assert!(!stderr.contains("syq: fake: unrelated SSH banner"));
     for line in stderr
         .lines()
-        .filter(|line| line.contains("installed syq") || line.contains("non-interactive SSH PATH"))
+        .filter(|line| line.contains("installed syq") || line.contains("on your shell PATH"))
     {
         assert!(
             line.starts_with("syq: fake: "),
@@ -4073,8 +4075,9 @@ fn managed_remote_helper_install_is_cached() {
     let installed = t.path("remote-home/.local/bin/syq");
     assert_eq!(read(&installed), read(&cached_remote_helper(&t)));
     assert!(String::from_utf8_lossy(&out.stderr).contains("installed syq"));
-    assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("~/.local/bin is absent from the non-interactive SSH PATH"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ensure ~/.local/bin is on your shell PATH")
+    );
     // Updating the interactive command must leave the helper usable.
     write(&installed, b"user-managed replacement");
 
@@ -4117,6 +4120,8 @@ fn managed_remote_helper_install_is_cached() {
 fn remote_helper_command_install_falls_back_without_cp_and_preserves_existing_command() {
     let t = Tmp::new();
     let installed = t.path("home/.local/bin/syq");
+    fs::create_dir(t.path("home")).unwrap();
+    fs::set_permissions(t.path("home"), fs::Permissions::from_mode(0o700)).unwrap();
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .arg("--install-remote-command")
@@ -4138,6 +4143,47 @@ fn remote_helper_command_install_falls_back_without_cp_and_preserves_existing_co
     assert_output_ok(&out);
     assert!(out.stderr.is_empty());
     assert_eq!(read(&installed), b"existing release");
+}
+
+#[test]
+fn remote_helper_interrupted_command_install_cleans_up_partial_copy() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("home")).unwrap();
+    fs::set_permissions(t.path("home"), fs::Permissions::from_mode(0o700)).unwrap();
+    executable(
+        &t.path("tools/cp"),
+        br#"#!/bin/sh
+printf ready > "$INSTALL_READY"
+/bin/sleep 1
+/bin/cp "$2" "$3"
+"#,
+    );
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        let marker = t.path("ready");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("--install-remote-command")
+            .env("HOME", t.path("home"))
+            .env("PATH", t.path("tools"))
+            .env("INSTALL_READY", &marker)
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for(
+            "remote install copy to start",
+            std::time::Duration::from_secs(5),
+            || marker.exists(),
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        wait_for(
+            "interrupted installer to exit",
+            std::time::Duration::from_secs(5),
+            || child.try_wait().unwrap().is_some(),
+        );
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::read_dir(t.path("home/.local/bin")).unwrap().count(), 0);
+        fs::remove_file(marker).unwrap();
+    }
 }
 
 #[test]

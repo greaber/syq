@@ -103,7 +103,7 @@ enum FetchMode {
 /// Install the latest release when this executable came from the standalone
 /// installer. A package-manager binary cannot accidentally overwrite itself.
 pub fn self_update() -> Result<()> {
-    let (_, mut receipt) = managed_receipt().context(
+    let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
     let release = fetch_latest(FetchMode::Interactive)?;
@@ -119,7 +119,7 @@ pub fn self_update() -> Result<()> {
         }
         std::cmp::Ordering::Greater => {}
     }
-    install_release(&release, &mut receipt)?;
+    install_release(&release, &receipt_path, &mut receipt)?;
     println!("updated syq to {}", release.version);
     Ok(())
 }
@@ -128,10 +128,6 @@ pub fn self_update() -> Result<()> {
 /// final path. Keeping receipt creation inside syq avoids shell JSON escaping.
 pub fn register_standalone_install() -> Result<()> {
     register_standalone_install_at(canonical_current_exe()?)
-}
-
-pub(crate) fn standalone_receipt_exists() -> Result<bool> {
-    Ok(fs::symlink_metadata(receipt_path()?).is_ok())
 }
 
 pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
@@ -143,7 +139,7 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let path = receipt_path()?;
+    let path = receipt_path_for(&binary)?;
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA,
         provider: "standalone".into(),
@@ -440,7 +436,11 @@ fn validate_release_file(target: &str, file: &ReleaseFile) -> Result<()> {
     Ok(())
 }
 
-fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> Result<()> {
+fn install_release(
+    release: &VerifiedRelease,
+    receipt_path: &Path,
+    receipt: &mut InstallReceipt,
+) -> Result<()> {
     let target = Target::local().ok_or_else(|| {
         anyhow!(
             "standalone releases do not support {} {}",
@@ -480,7 +480,7 @@ fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> R
     })?;
     sync_parent(parent)?;
     receipt.version = release.version.to_string();
-    write_receipt(&receipt_path()?, receipt)?;
+    write_receipt(receipt_path, receipt)?;
     Ok(())
 }
 
@@ -721,12 +721,19 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
-    let path = receipt_path()?;
+    let current = canonical_current_exe()?;
+    let adjacent = receipt_path_for(&current)?;
+    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
+    // when no adjacent receipt exists, keeping malformed new state visible.
+    let path = match fs::symlink_metadata(&adjacent) {
+        Ok(_) => adjacent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path()?,
+        Err(error) => return Err(error).context("inspect standalone install receipt"),
+    };
     let receipt = read_receipt(&path)?;
     if receipt.schema != RECEIPT_SCHEMA || receipt.provider != "standalone" {
         bail!("unrecognized standalone install receipt");
     }
-    let current = canonical_current_exe()?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -746,7 +753,7 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("install receipt has no parent directory"))?;
-    create_private_dir(parent)?;
+    // This directory also contains the executable; never chmod it as config.
     let temporary = TempFile::new(parent, ".receipt")?;
     let file = temporary.writer()?;
     let mut file = BufWriter::new(file);
@@ -759,7 +766,21 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     sync_parent(parent)
 }
 
-fn receipt_path() -> Result<PathBuf> {
+fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
+    let parent = binary
+        .parent()
+        .ok_or_else(|| anyhow!("installed executable has no parent"))?;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(
+        binary
+            .file_name()
+            .ok_or_else(|| anyhow!("installed executable has no filename"))?,
+    );
+    name.push("-install.json");
+    Ok(parent.join(name))
+}
+
+fn legacy_receipt_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("install.json"))
 }
 

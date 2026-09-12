@@ -42,7 +42,7 @@ def smoke(dist):
                 actual = subprocess.check_output([binary, option], env=environment, text=True, timeout=10).strip()
                 if actual != expected:
                     raise ValueError(f"installed {option}: {actual!r}, expected {expected!r}")
-            receipt = json.loads((work / "config" / "syq" / "install.json").read_text())
+            receipt = json.loads((Path(binary).resolve().with_name(".syq-install.json")).read_text())
             if (receipt.get("provider") != "standalone" or receipt.get("version") != manifest["version"]
                     or receipt.get("binary") != str(Path(binary).resolve())):
                 raise ValueError("installer did not register the expected standalone receipt")

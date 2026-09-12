@@ -16,19 +16,18 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 
 When an official syq release sets up its matching helper on an SSH server, it
 also installs that same version at `~/.local/bin/syq` for use on the server. It
-leaves existing installations alone: both an existing entry at that location
-and a `syq` found on the non-interactive SSH `PATH` prevent installation.
-An already registered standalone installation also prevents installation. Syq
-does not fetch the latest release or update an existing command.
+leaves any existing entry at that location alone. If the command has been removed,
+syq installs it again the next time it sets up a helper. It does not fetch the
+latest release or update an existing command.
 
-SSH can have a different `PATH` from your login shell, so installations visible
-only after login (for example, Homebrew or Cargo) may not be detected. Syq
-reports the installation and whether `~/.local/bin` is on the SSH `PATH` unless
-`--quiet` is set; it never edits shell startup files. The command is an
-independent copy of the helper, using a reflink when supported. You can update
-it with `syq --self-update` without changing the version-specific helper cache. Failure
-to install this command does not fail the transfer. Development builds and
-connections using `--syq-path` or `--no-bootstrap` do not install it.
+Syq installs at this fixed location even if another copy is available elsewhere
+on your `PATH`. It reports the installation unless `--quiet` is set; it never
+edits shell startup files. Ensure `~/.local/bin` is on your shell's `PATH` to use
+the command. The command is an independent copy of the helper, using a reflink
+when supported. You can update it with `syq --self-update` without changing the
+version-specific helper cache. Failure to install this command does not fail the
+transfer. Development builds and connections using `--syq-path` or
+`--no-bootstrap` do not install it.
 
 ## Homebrew
 
@@ -70,6 +69,11 @@ which provides more extensive benchmarks. Your results will depend on your machi
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
+
+New standalone installations keep their update receipt beside the executable
+(`.syq-install.json` for `syq`). Existing receipts under the configured syq
+configuration directory remain supported. Preferences still respect
+`XDG_CONFIG_HOME`; changing it does not affect receipts beside executables.
 
 Standalone installs print an update reminder; nothing updates automatically.
 Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
