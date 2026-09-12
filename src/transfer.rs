@@ -4080,7 +4080,8 @@ fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
-            && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
+            && (source.mtime != destination.mtime
+                || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
 }
 
 fn publication_metadata_flags(requested: u8) -> u8 {

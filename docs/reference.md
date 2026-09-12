@@ -310,7 +310,8 @@ compares whole seconds exactly and ignores as many trailing fractional digits
 as are zero in the destination timestamp. For example, destination `.120000000`
 seconds matches source `.123456789`; a whole-second destination timestamp
 ignores the source fraction entirely. This accommodates destinations that
-truncate fractional seconds. `syq rsync` compares whole seconds only.
+truncate fractional seconds. Directory metadata previews use the same fractional
+precision rule. `syq rsync` compares whole seconds only when checking file contents.
 
 Syq preserves the source timestamp at the destination, so the machines' clocks
 do not need to agree. A timestamp difference outside that precision triggers

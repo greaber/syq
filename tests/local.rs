@@ -21116,3 +21116,36 @@ fn native_mtime_uses_destination_decimal_precision() {
         }
     }
 }
+
+#[test]
+fn directory_dry_run_uses_destination_timestamp_precision() {
+    for (source_ns, destination_ns, differs) in [
+        (123_456_789, 120_000_000, false),
+        (123_456_789, 0, false),
+        (123_456_789, 130_000_000, true),
+        (120_000_000, 123_456_789, true),
+    ] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/sub")).unwrap();
+        fs::create_dir_all(t.path("dst/sub")).unwrap();
+        set_mtime(&t.path("src"), 10);
+        set_mtime(&t.path("dst"), 10);
+        for (name, nanos) in [("src/sub", source_ns), ("dst/sub", destination_ns)] {
+            File::open(t.path(name))
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(10, nanos)),
+                )
+                .unwrap();
+        }
+        let out = syq_cp_in(
+            &t.path(""),
+            &["src", "--as", "dst", "--dry-run", "-v"],
+            None,
+        );
+        assert_output_ok(&out);
+        let stderr = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stderr.contains("metadata"), differs, "{stderr}");
+    }
+}
