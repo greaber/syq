@@ -218,7 +218,17 @@ report actual access or decision blockers instead of bypassing them.
 - A matching branch name is not proof that a local ref belongs to the PR, especially for fork PRs. Treat a local ref as PR code only when its worktree ownership is explicit and its repository identity and ancestry relative to `headRefOid` have been verified.
 - If the local ref is missing, behind the GitHub head, divergent from it, or cannot be tied unambiguously to the PR's head repository, review the GitHub `headRefOid`. Fetch that exact head into a dedicated review ref or worktree when necessary, without overwriting an unrelated local branch, and report the discrepancy.
 - If local and GitHub refs match, review that SHA. If the local ref is ahead, use it only when the worktree belongs to the task and the GitHub `headRefOid` is its ancestor; tell the user that GitHub is stale and either review the unpushed local tip explicitly or wait for it to be pushed.
-- If the chosen review target SHA matches the last SHA already reviewed, stop immediately and report that the PR is unchanged instead of producing another review.
+- Skip a repeated review only when the chosen target SHA matches the last SHA
+  that this same agent reviewed for this PR in its own conversation history
+  (including preserved context when resuming that conversation). Report that
+  the PR is unchanged since this agent's review and name the SHA. An explicit
+  user request to review it again overrides this shortcut.
+- Use only that agent's own conversation history to establish its previous
+  review. Do not use GitHub reviews, comments, review decisions, shared review
+  notes, or another agent's review history to decide to skip. Agents may share
+  a GitHub account, and multiple agents must be able to review the same commit
+  independently. If this agent has no record of its own prior review, proceed
+  with the review.
 - Always state the exact reviewed SHA and whether it came from the local branch tip or the GitHub PR head.
 
 ## Working on syq
