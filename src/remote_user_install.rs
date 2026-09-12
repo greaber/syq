@@ -30,8 +30,12 @@ pub fn install() {
         }
         let installed = install_from(&source, Path::new(&home), &path)?;
         if installed.is_some() {
-            let binary = Path::new(&home).join(".local/bin/syq").canonicalize()?;
-            if let Err(error) = crate::update::register_standalone_install_at(binary) {
+            let registration = Path::new(&home)
+                .join(".local/bin/syq")
+                .canonicalize()
+                .context("locate the installed command for self-update")
+                .and_then(crate::update::register_standalone_install_at);
+            if let Err(error) = registration {
                 notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates"));
             }
         }
@@ -59,7 +63,11 @@ fn install_from(source: &Path, home: &Path, path: &std::ffi::OsStr) -> Result<Op
     let bin = home.join(".local/bin");
     let destination = bin.join("syq");
     if exists(&destination)
-        || std::env::split_paths(path).any(|dir| fs::metadata(dir.join("syq")).is_ok())
+        || std::env::split_paths(path).any(|dir| {
+            fs::metadata(dir.join("syq")).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
     {
         return Ok(None);
     }
@@ -138,6 +146,7 @@ mod tests {
         let other = root.path().join("other-bin");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("syq"), b"existing install").unwrap();
+        fs::set_permissions(other.join("syq"), fs::Permissions::from_mode(0o755)).unwrap();
         let source = root.path().join("missing helper");
         assert_eq!(
             install_from(&source, &home, other.as_os_str()).unwrap(),
@@ -180,6 +189,28 @@ mod tests {
         let result = install_from(&source, &home, "".as_ref());
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn non_commands_on_path_do_not_suppress_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("helper");
+        fs::write(&source, b"release").unwrap();
+        for directory in [false, true] {
+            let bin = root.path().join(format!("path-{directory}"));
+            fs::create_dir(&bin).unwrap();
+            if directory {
+                fs::create_dir(bin.join("syq")).unwrap();
+            } else {
+                fs::write(bin.join("syq"), b"not executable").unwrap();
+            }
+            let home = root.path().join(format!("home-{directory}"));
+            assert_eq!(
+                install_from(&source, &home, bin.as_os_str()).unwrap(),
+                Some(false)
+            );
+            assert_eq!(fs::read(home.join(".local/bin/syq")).unwrap(), b"release");
+        }
     }
 
     #[test]

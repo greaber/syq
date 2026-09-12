@@ -4314,6 +4314,13 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
 fn failed_remote_download_falls_back_to_verified_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap();
+    executable(
+        &rsh,
+        script
+            .replace("#!/bin/sh\n", "#!/bin/sh\numask 027\n")
+            .as_bytes(),
+    );
     setup_release_bootstrap(&t);
     executable(
         &t.path("remote-bin/curl"),
@@ -4329,6 +4336,17 @@ exit 22
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"download fallback");
+    for directory in ["remote-home/.local", "remote-home/.local/bin"] {
+        assert_eq!(
+            fs::metadata(t.path(directory)).unwrap().mode() & 0o777,
+            0o750
+        );
+    }
+    assert_eq!(
+        fs::metadata(cached_remote_helper(&t)).unwrap().mode() & 0o777,
+        0o700
+    );
+
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("remote download unavailable"), "{stderr}");
     assert!(

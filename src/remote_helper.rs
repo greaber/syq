@@ -278,6 +278,7 @@ pub fn upload_script(target: Target) -> String {
     let expected_identity = helper_identity();
     format!(
         r#"set -u
+install_umask=$(umask)
 umask 077
 dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
 program="$dir/syq"
@@ -318,6 +319,7 @@ if ! mv "$tmp" "$program"; then
 fi
 cleanup
 trap - EXIT HUP INT TERM
+umask "$install_umask"
 {install_command}"#,
         target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
