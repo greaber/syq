@@ -4571,20 +4571,38 @@ struct PruneWalk<'a> {
 }
 
 impl<'a> PruneWalk<'a> {
-    fn new(seen: &'a std::collections::HashMap<PathBytes, Claim>, root: &[u8]) -> Self {
+    fn new(
+        seen: &'a std::collections::HashMap<PathBytes, Claim>,
+        root: &[u8],
+        sorted: Option<&[&'a PathBytes]>,
+    ) -> Self {
         Self {
             seen,
-            unmatched: seen
-                .keys()
-                .filter(|path| path_is_inside(path, root))
-                .collect(),
+            unmatched: match sorted {
+                Some(paths) => {
+                    let mut prefix = root.to_vec();
+                    if !prefix.ends_with(b"/") {
+                        prefix.push(b'/');
+                    }
+                    let start = paths.partition_point(|path| path.as_slice() < prefix.as_slice());
+                    paths[start..]
+                        .iter()
+                        .copied()
+                        .take_while(|path| path.starts_with(&prefix))
+                        .collect()
+                }
+                None => seen
+                    .keys()
+                    .filter(|path| path_is_inside(path, root))
+                    .collect(),
+            },
             entries: Vec::new(),
             shielded: Default::default(),
             recovery_parents: Default::default(),
         }
     }
 
-    fn push(&mut self, entry: Entry, root: &[u8], nested: &[PathBytes]) {
+    fn push(&mut self, mut entry: Entry, root: &[u8], nested: &[PathBytes]) {
         if entry.path.is_empty() {
             return;
         }
@@ -4614,6 +4632,7 @@ impl<'a> PruneWalk<'a> {
             }
             return;
         }
+        entry.path = full;
         self.entries.push(entry);
     }
 
@@ -4621,7 +4640,7 @@ impl<'a> PruneWalk<'a> {
         // Apply exact directory shields after all batches, independently of
         // scan order. Alias directory shields are applied after lookup.
         self.entries
-            .retain(|entry| !Planner::under_any(&self.shielded, &join(root, &entry.path), root));
+            .retain(|entry| !Planner::under_any(&self.shielded, &entry.path, root));
     }
 }
 
@@ -4640,30 +4659,63 @@ fn lookup_prune_aliases(
         .map(|entry| (entry.dev, entry.ino))
         .collect();
     let mut unmatched = walk.unmatched.iter();
+    // Remote response queues hold at least this many replies, even when the
+    // file-data pipeline is configured smaller. Local calls execute in send.
+    let depth = if conn.supports_request_pipelining() {
+        crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH
+    } else {
+        1
+    };
+    let mut pending = std::collections::VecDeque::new();
+    let mut exhausted = false;
     loop {
-        let paths: Vec<_> = unmatched
-            .by_ref()
-            .take(512)
-            .map(|path| (**path).clone())
-            .collect();
-        if paths.is_empty() {
-            break;
-        }
-        let stats = match ok(
-            conn.call(Request::PruneLookup {
+        while !exhausted && pending.len() < depth {
+            let paths: Vec<_> = unmatched
+                .by_ref()
+                .take(512)
+                .map(|path| (**path).clone())
+                .collect();
+            if paths.is_empty() {
+                exhausted = true;
+                break;
+            }
+            if let Err(error) = conn.send(Request::PruneLookup {
                 paths: paths.clone(),
                 guard: guard.cloned(),
-            })?,
-            "inspect prune aliases",
-        )? {
-            Response::Stats(stats) => stats,
-            other => bail!("unexpected prune lookup response {other:?}"),
+            }) {
+                if !conn.is_dead() {
+                    crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                }
+                return Err(error);
+            }
+            pending.push_back(paths);
+        }
+        let Some(paths) = pending.pop_front() else {
+            break;
+        };
+        let response = conn.recv()?;
+        let stats = (|| -> Result<_> {
+            match ok(response, "inspect prune aliases")? {
+                Response::Stats(stats) if stats.len() == paths.len() => Ok(stats),
+                Response::Stats(stats) => bail!(
+                    "stat reply count {} does not match request count {}",
+                    stats.len(),
+                    paths.len()
+                ),
+                other => bail!("unexpected prune lookup response {other:?}"),
+            }
+        })();
+        let stats = match stats {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Keep the shared control connection at a request boundary.
+                crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                return Err(error);
+            }
         };
         for (path, entry) in paths.iter().zip(stats) {
             if let Some(entry) = entry {
                 let identity = (entry.dev, entry.ino);
-                // Retain all ambiguous hard links, but do not accumulate
-                // identities that cannot protect any deletion candidate.
                 if candidates.contains(&identity) {
                     aliases.insert(identity, walk.seen[path]);
                 }
@@ -6981,16 +7033,20 @@ impl Planner<'_> {
         let mut roots = std::mem::take(&mut self.delete_roots);
         roots.sort();
         roots.dedup();
-        let inside = |p: &[u8], r: &[u8]| {
-            p.starts_with(r) && (r.ends_with(b"/") || p.get(r.len()) == Some(&b'/'))
-        };
+        // Sorting costs more than a few linear scans. Larger root sets share
+        // one index; focused timings cover this crossover.
+        let sorted_claims = (roots.len() >= 32).then(|| {
+            let mut paths: Vec<_> = self.dst_seen.keys().collect();
+            paths.sort_unstable();
+            paths
+        });
         for (root, sub) in roots.clone() {
             // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
-                .filter(|(r, _)| *r != root && inside(r, &root))
+                .filter(|(r, _)| *r != root && path_is_inside(r, &root))
                 .map(|(r, _)| r.clone())
                 .collect();
             // Not there yet (a dry run into a new destination): nothing to delete.
@@ -7010,7 +7066,7 @@ impl Planner<'_> {
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
             let mut alias_parents = std::collections::HashSet::new();
-            let mut walk = PruneWalk::new(&self.dst_seen, &root);
+            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
             let res = self.dst.scan(
                 &root,
                 None,
@@ -7052,17 +7108,12 @@ impl Planner<'_> {
             let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
             let mut shielded = walk.shielded;
             let recovery_parents = walk.recovery_parents;
-            for entry in &walk.entries {
-                let entry_path = &entry.path;
+            for entry in walk.entries {
+                let full = entry.path;
+                let entry_path =
+                    &full[root.len() + usize::from(!root.is_empty() && !root.ends_with(b"/"))..];
                 let entry_kind = entry.kind;
-
-                if entry_path.is_empty() {
-                    continue;
-                }
-                let full = join(&root, entry_path);
-                if nested.iter().any(|n| *n == full || inside(&full, n))
-                    || Planner::under_any(&shielded, &full, &root)
-                {
+                if Planner::under_any(&shielded, &full, &root) {
                     continue;
                 }
                 let claimed = aliases.get(&(entry.dev, entry.ino));
@@ -8936,12 +8987,19 @@ mod tests {
         requests: Vec<Request>,
         replies: std::collections::VecDeque<Response>,
         received: usize,
+        max_pending: usize,
+        local: bool,
+        latency: Option<std::time::Duration>,
+        ready: std::collections::VecDeque<std::time::Instant>,
         abort_on_receive: Option<Arc<Sched>>,
     }
 
     struct PipelineConn(Arc<Mutex<PipelineState>>);
 
     impl Conn for PipelineConn {
+        fn supports_request_pipelining(&self) -> bool {
+            !self.0.lock().unwrap().local
+        }
         fn begin_streaming_writes(&mut self) -> Result<()> {
             Ok(())
         }
@@ -8949,12 +9007,20 @@ mod tests {
             Ok(())
         }
         fn send(&mut self, request: Request) -> Result<()> {
-            self.0.lock().unwrap().requests.push(request);
+            let mut state = self.0.lock().unwrap();
+            state.requests.push(request);
+            if let Some(latency) = state.latency {
+                state.ready.push_back(std::time::Instant::now() + latency);
+            }
+            state.max_pending = state.max_pending.max(state.requests.len() - state.received);
             Ok(())
         }
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
             state.received += 1;
+            if let Some(ready) = state.ready.pop_front() {
+                std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
+            }
             if let Some(sched) = state.abort_on_receive.take() {
                 sched.abort();
             }
@@ -9049,6 +9115,103 @@ mod tests {
     }
 
     #[test]
+    fn prune_index_preserves_root_boundaries() {
+        let seen: std::collections::HashMap<_, _> = [
+            "dst",
+            "dst/file",
+            "dst/sub",
+            "dst/sub/file",
+            "dst/submarine/file",
+            "dst2/file",
+            "/file",
+        ]
+        .into_iter()
+        .map(|p| (p.as_bytes().to_vec(), Claim::Leaf))
+        .collect();
+        let mut sorted: Vec<_> = seen.keys().collect();
+        sorted.sort_unstable();
+        for root in [
+            b"dst".as_slice(),
+            b"dst/",
+            b"dst/sub",
+            b"dst/sub/",
+            b"missing",
+            b"/",
+            b"",
+        ] {
+            assert_eq!(
+                PruneWalk::new(&seen, root, None).unmatched,
+                PruneWalk::new(&seen, root, Some(&sorted)).unmatched
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual planner timing; run with --release --ignored --nocapture"]
+    fn prune_index_timing() {
+        use std::time::Instant;
+        let count = 200_000;
+        for roots in [1, 2, 10, 16, 32, 100] {
+            let seen: std::collections::HashMap<_, _> = (0..count)
+                .map(|i| {
+                    (
+                        format!("destination/root-{:03}/directory/file-{i:08}", i % roots)
+                            .into_bytes(),
+                        Claim::Leaf,
+                    )
+                })
+                .collect();
+            let root_paths: Vec<_> = (0..roots)
+                .map(|i| format!("destination/root-{i:03}").into_bytes())
+                .collect();
+            let start = Instant::now();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, None));
+            }
+            let original = start.elapsed();
+            let start = Instant::now();
+            let mut sorted: Vec<_> = seen.keys().collect();
+            sorted.sort_unstable();
+            let sorting = start.elapsed();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, Some(&sorted)));
+            }
+            eprintln!("claims={count} roots={roots} scan={original:?} index_total={:?} sorting={sorting:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual simulated-latency timing; run with --ignored --nocapture"]
+    fn prune_pipeline_timing() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = crate::fsops::lstat_entry(b"extra".to_vec(), directory.path()).unwrap();
+        let seen = (0..4096)
+            .map(|i| (format!("dst/file-{i}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        walk.push(candidate, b"dst", &[]);
+        for local in [true, false] {
+            let state = Arc::new(Mutex::new(PipelineState {
+                local,
+                latency: Some(std::time::Duration::from_millis(20)),
+                ..Default::default()
+            }));
+            state
+                .lock()
+                .unwrap()
+                .replies
+                .extend((0..8).map(|_| Response::Stats(vec![None; 512])));
+            let start = std::time::Instant::now();
+            lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+            eprintln!(
+                "simulated RTT=20ms paths=4096 sequential={local} elapsed={:?}",
+                start.elapsed()
+            );
+            assert_eq!(state.lock().unwrap().max_pending, if local { 1 } else { 4 });
+        }
+    }
+
+    #[test]
     fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("file");
@@ -9057,7 +9220,7 @@ mod tests {
         let seen: std::collections::HashMap<_, _> = (0..10_000)
             .map(|index| (format!("dst/file-{index}").into_bytes(), Claim::Leaf))
             .collect();
-        let mut walk = PruneWalk::new(&seen, b"dst");
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
         for index in 0..9_000 {
             let mut entry = template.clone();
             entry.path = format!("file-{index}").into_bytes();
@@ -9079,7 +9242,7 @@ mod tests {
         let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
             .into_iter()
             .collect();
-        let mut walk = PruneWalk::new(&seen, b"dst");
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
         // The child deliberately arrives before its claimed directory.
         for path in [
             "blocked/child",
@@ -9094,7 +9257,7 @@ mod tests {
         walk.finish_scan(b"dst");
         assert!(walk.unmatched.is_empty());
         assert_eq!(walk.entries.len(), 1);
-        assert_eq!(walk.entries[0].path, b"extra");
+        assert_eq!(walk.entries[0].path, b"dst/extra");
         assert!(walk.recovery_parents.contains(b"dst/old".as_slice()));
     }
 
@@ -9105,10 +9268,10 @@ mod tests {
         std::fs::write(&file, b"contents").unwrap();
         let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
         candidate.ino = 42;
-        let seen: std::collections::HashMap<_, _> = (0..1_025)
+        let seen: std::collections::HashMap<_, _> = (0..3_073)
             .map(|index| (format!("dst/claim-{index}").into_bytes(), Claim::Leaf))
             .collect();
-        let mut walk = PruneWalk::new(&seen, b"dst");
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
         walk.push(candidate.clone(), b"dst", &[]);
         let mut unrelated = candidate.clone();
         unrelated.ino = 43;
@@ -9116,21 +9279,28 @@ mod tests {
         state.lock().unwrap().replies.extend([
             Response::Stats(vec![Some(unrelated); 512]),
             Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
             Response::Stats(vec![Some(candidate.clone())]),
         ]);
         let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[&(candidate.dev, candidate.ino)], Claim::Leaf);
-        assert_eq!(state.lock().unwrap().requests.len(), 3);
+        assert_eq!(state.lock().unwrap().requests.len(), 7);
+        assert_eq!(state.lock().unwrap().max_pending, 4);
         assert!(state.lock().unwrap().replies.is_empty());
 
         let malformed = Arc::new(Mutex::new(PipelineState::default()));
-        malformed
-            .lock()
-            .unwrap()
-            .replies
-            .push_back(Response::Stats(vec![]));
-        assert!(lookup_prune_aliases(&mut PipelineConn(malformed), &walk, None).is_err());
+        malformed.lock().unwrap().replies.extend([
+            Response::Stats(vec![]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+        ]);
+        assert!(lookup_prune_aliases(&mut PipelineConn(malformed.clone()), &walk, None).is_err());
+        assert!(malformed.lock().unwrap().replies.is_empty());
     }
 
     #[test]

@@ -803,7 +803,12 @@ fn spawn_reader(
     std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
 ) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(read_ahead);
+    // Control requests also pipeline up to the default depth. Keeping that
+    // capacity prevents a sequential helper blocking on replies while its
+    // coordinator is still sending requests (including large path batches).
+    let (tx, rx) = std::sync::mpsc::sync_channel(
+        read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH),
+    );
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         r.set_limit(MAX_HANDSHAKE_FRAME);
@@ -1538,7 +1543,8 @@ pub struct RemoteSpec {
     pub(crate) primed_control: std::sync::Arc<std::sync::Mutex<PrimedControl>>,
     /// Must cover the worker request pipeline: otherwise a helper blocked
     /// writing responses can stop reading requests while the coordinator is
-    /// still filling its pipeline. Control sessions do not need this depth.
+    /// still filling its pipeline. Readers also reserve the default depth
+    /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
     pub(crate) forwarded: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
 }
@@ -4263,63 +4269,66 @@ mod tests {
     #[test]
     fn tuning_pipeline_drains_responses_while_sending_large_requests() {
         use std::os::unix::net::UnixStream;
-        let (coordinator, helper) = UnixStream::pair().unwrap();
-        let timeout = std::time::Duration::from_secs(5);
-        for socket in [&coordinator, &helper] {
-            socket.set_read_timeout(Some(timeout)).unwrap();
-            socket.set_write_timeout(Some(timeout)).unwrap();
-        }
-        let depth = 64;
-        let server = std::thread::spawn(move || {
-            let mut requests = FrameReader::new(helper.try_clone().unwrap());
-            let mut responses = FrameWriter::new(helper, false);
-            responses.write_msg(&hello_ok()).unwrap();
-            for _ in 0..depth {
-                let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
-                    panic!("expected a range request");
-                };
-                responses
-                    .write_msg(&Response::Block {
-                        off,
-                        hash: [0; 32],
-                        data: vec![7; len as usize],
+        // Even a one-deep file pipeline must accommodate control batches.
+        for (read_ahead, depth) in [(1, 4), (64, 64)] {
+            let (coordinator, helper) = UnixStream::pair().unwrap();
+            let timeout = std::time::Duration::from_secs(5);
+            for socket in [&coordinator, &helper] {
+                socket.set_read_timeout(Some(timeout)).unwrap();
+                socket.set_write_timeout(Some(timeout)).unwrap();
+            }
+            let server = std::thread::spawn(move || {
+                let mut requests = FrameReader::new(helper.try_clone().unwrap());
+                let mut responses = FrameWriter::new(helper, false);
+                responses.write_msg(&hello_ok()).unwrap();
+                for _ in 0..depth {
+                    let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
+                        panic!("expected a range request");
+                    };
+                    responses
+                        .write_msg(&Response::Block {
+                            off,
+                            hash: [0; 32],
+                            data: vec![7; len as usize],
+                        })
+                        .unwrap();
+                }
+            });
+            let (responses, reader) =
+                spawn_reader(Box::new(coordinator.try_clone().unwrap()), read_ahead);
+            assert!(matches!(
+                responses.recv_timeout(timeout).unwrap().unwrap().value,
+                Response::HelloOk { .. }
+            ));
+            let mut requests = FrameWriter::new(coordinator, false);
+            // Both directions exceed socket buffering. A reader queue stuck at
+            // four responses deadlocks against a sequential helper while the
+            // coordinator is still sending its 64 requests.
+            for i in 0..depth {
+                requests
+                    .write_msg(&Request::ReadRange {
+                        path: vec![b'x'; 16 << 10],
+                        source: None,
+                        attempt: 0,
+                        off: i as u64 * (64 << 10),
+                        len: 64 << 10,
                     })
                     .unwrap();
             }
-        });
-        let (responses, reader) = spawn_reader(Box::new(coordinator.try_clone().unwrap()), depth);
-        assert!(matches!(
-            responses.recv_timeout(timeout).unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
-        let mut requests = FrameWriter::new(coordinator, false);
-        // Both directions exceed socket buffering. A reader queue stuck at
-        // four responses deadlocks against a sequential helper while the
-        // coordinator is still sending its 64 requests.
-        for i in 0..depth {
-            requests
-                .write_msg(&Request::ReadRange {
-                    path: vec![b'x'; 16 << 10],
-                    source: None,
-                    attempt: 0,
-                    off: i as u64 * (64 << 10),
-                    len: 64 << 10,
-                })
-                .unwrap();
-        }
-        for i in 0..depth {
-            let response = responses
-                .recv_timeout(timeout)
-                .unwrap()
-                .unwrap()
-                .into_inner();
-            assert!(matches!(response, Response::Block { off, data, .. }
+            for i in 0..depth {
+                let response = responses
+                    .recv_timeout(timeout)
+                    .unwrap()
+                    .unwrap()
+                    .into_inner();
+                assert!(matches!(response, Response::Block { off, data, .. }
                 if off == i as u64 * (64 << 10) && data == vec![7; 64 << 10]));
+            }
+            drop(responses);
+            drop(requests);
+            server.join().unwrap();
+            reader.join().unwrap();
         }
-        drop(responses);
-        drop(requests);
-        server.join().unwrap();
-        reader.join().unwrap();
     }
 
     #[test]
