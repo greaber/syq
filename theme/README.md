@@ -76,6 +76,11 @@ Shared landing-actions buttons offer installation, benchmarks, sending files
 home, server-to-server copies and programmable file placement. Quickstart
 examples follow under Try a copy.
 
+head.hbs adds Open Graph and Twitter card metadata so shared documentation
+links render a titled card rather than a bare URL. Title varies per page;
+og:image and og:url are deliberately absent, for the reasons noted in the file.
+It is not part of the shared toolkit, so site-ui.json does not map it.
+
 ## SDK documentation
 
 The SDK guide, API reference and compatibility pages in docs/ use mdBook
