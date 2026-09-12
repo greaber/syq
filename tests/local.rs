@@ -8243,6 +8243,95 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
 /// results records must match the ordinary engine's for the same copy, and
 /// anything the one-turn path declines must reach the engine unchanged.
 #[test]
+fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
+    for (source_seconds, source_nsec, destination_nsec, same_size, matches) in [
+        (10, 123_456_789, 120_000_000, true, true),
+        (10, 123_456_789, 123_456_700, true, true),
+        (10, 123_456_789, 0, true, true),
+        (10, 130_000_000, 120_000_000, true, false),
+        (10, 120_000_000, 123_456_789, true, false),
+        (11, 123_456_789, 120_000_000, true, false),
+        (10, 123_456_789, 120_000_000, false, false),
+    ] {
+        for option in [None, Some("--stats"), Some("--dry-run"), Some("--hash")] {
+            let t = Tmp::new();
+            let ssh = fake_ssh(&t);
+            write(&t.path("source"), b"new");
+            let old: &[u8] = if same_size { b"old" } else { b"older" };
+            write(&t.path("remote-home/dest/source"), old);
+            for (path, seconds, nanos) in [
+                ("source", source_seconds, source_nsec),
+                ("remote-home/dest/source", 10, destination_nsec),
+            ] {
+                File::open(t.path(path))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos),
+                    ))
+                    .unwrap();
+            }
+            let before = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-progress",
+                    "--results",
+                    &t.s("results.ndjson"),
+                    &t.s("source"),
+                    "--to",
+                    "fake.example",
+                    "--into",
+                    &t.s("remote-home/dest"),
+                ])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .env("SYQ_DEBUG", "1");
+            if let Some(option) = option {
+                command.arg(option);
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            assert_eq!(
+                stderr_of(&output).contains("small copy: published"),
+                option.is_none(),
+                "wrong dispatch for {option:?}: {}",
+                stderr_of(&output)
+            );
+            let skipped = matches && option != Some("--hash");
+            let unchanged = skipped || option == Some("--dry-run");
+            assert_eq!(read(&t.path("remote-home/dest/source")), if unchanged { old } else { b"new" },
+                "option={option:?}, source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}");
+            if unchanged {
+                let after = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+                assert_eq!(after.ino(), before.ino());
+                assert_eq!(
+                    (after.mtime(), after.mtime_nsec()),
+                    (before.mtime(), before.mtime_nsec())
+                );
+            }
+            let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(result["status"], "success");
+            assert_eq!(result["files_unchanged"], u64::from(skipped), "{records}");
+            assert_eq!(
+                result["bytes_transferred"],
+                if skipped { 0 } else { 3 },
+                "{records}"
+            );
+        }
+    }
+}
+
+#[test]
 fn small_pushes_take_one_turn_and_match_the_engine() {
     let t = Tmp::new();
     let ssh = fake_ssh(&t);

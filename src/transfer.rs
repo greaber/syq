@@ -9,7 +9,9 @@ use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
-use crate::fsops::{content_digest, is_partial_name, is_recovery_name, join};
+use crate::fsops::{
+    content_digest, destination_fraction_matches, is_partial_name, is_recovery_name, join,
+};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
@@ -4071,22 +4073,6 @@ fn kind_label(kind: Kind) -> &'static str {
 
 fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) -> bool {
     kind != Kind::Socket || destination_supports_sockets
-}
-
-/// Compare at the decimal precision suggested by the destination timestamp.
-/// Trailing zeros may reflect either filesystem truncation or a round timestamp;
-/// this is the size/mtime shortcut, not a content verification.
-fn destination_fraction_matches(source: u32, destination: u32) -> bool {
-    if destination == 0 {
-        return true;
-    }
-    let mut precision = 1;
-    let mut fraction = destination;
-    while fraction.is_multiple_of(10) {
-        precision *= 10;
-        fraction /= 10;
-    }
-    source / precision == destination / precision
 }
 
 fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
