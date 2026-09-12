@@ -4584,6 +4584,172 @@ struct FailedEntry<'a> {
     kind: Option<DeclaredKind>,
 }
 
+/// Keep destination-only candidates, borrowing source claim paths instead of
+/// copying every destination spelling. Exact matches are discarded as scanned.
+struct PruneWalk<'a> {
+    seen: &'a std::collections::HashMap<PathBytes, Claim>,
+    unmatched: std::collections::HashSet<&'a PathBytes>,
+    entries: Vec<Entry>,
+    shielded: std::collections::HashSet<PathBytes>,
+    recovery_parents: std::collections::HashSet<PathBytes>,
+}
+
+impl<'a> PruneWalk<'a> {
+    fn new(
+        seen: &'a std::collections::HashMap<PathBytes, Claim>,
+        root: &[u8],
+        sorted: Option<&[&'a PathBytes]>,
+    ) -> Self {
+        Self {
+            seen,
+            unmatched: match sorted {
+                Some(paths) => {
+                    let mut prefix = root.to_vec();
+                    if !prefix.ends_with(b"/") {
+                        prefix.push(b'/');
+                    }
+                    let start = paths.partition_point(|path| path.as_slice() < prefix.as_slice());
+                    paths[start..]
+                        .iter()
+                        .copied()
+                        .take_while(|path| path.starts_with(&prefix))
+                        .collect()
+                }
+                None => seen
+                    .keys()
+                    .filter(|path| path_is_inside(path, root))
+                    .collect(),
+            },
+            entries: Vec::new(),
+            shielded: Default::default(),
+            recovery_parents: Default::default(),
+        }
+    }
+
+    fn push(&mut self, mut entry: Entry, root: &[u8], nested: &[PathBytes]) {
+        if entry.path.is_empty() {
+            return;
+        }
+        let full = join(root, &entry.path);
+        if entry
+            .path
+            .split(|byte| *byte == b'/')
+            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
+        {
+            self.recovery_parents
+                .extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
+            return;
+        }
+        self.unmatched.remove(&full);
+        if nested
+            .iter()
+            .any(|n| *n == full || path_is_inside(&full, n))
+        {
+            return;
+        }
+        if let Some(claim) = self.seen.get(&full) {
+            if *claim != Claim::Dir && entry.kind == Kind::Dir {
+                self.shielded.insert(full);
+            }
+            return;
+        }
+        entry.path = full;
+        self.entries.push(entry);
+    }
+
+    fn finish_scan(&mut self, root: &[u8]) {
+        // Apply exact directory shields after all batches, independently of
+        // scan order. Alias directory shields are applied after lookup.
+        self.entries
+            .retain(|entry| !Planner::under_any(&self.shielded, &entry.path, root));
+    }
+}
+
+fn lookup_prune_aliases(
+    conn: &mut dyn Conn,
+    walk: &PruneWalk<'_>,
+    guard: Option<&ContainerGuard>,
+) -> Result<std::collections::HashMap<(u64, u64), Claim>> {
+    let mut aliases = std::collections::HashMap::new();
+    if walk.entries.is_empty() {
+        return Ok(aliases);
+    }
+    let candidates: std::collections::HashSet<_> = walk
+        .entries
+        .iter()
+        .map(|entry| (entry.dev, entry.ino))
+        .collect();
+    let mut unmatched = walk.unmatched.iter();
+    // Remote response queues hold at least this many replies, even when the
+    // file-data pipeline is configured smaller. Local calls execute in send.
+    let depth = if conn.supports_request_pipelining() {
+        crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH
+    } else {
+        1
+    };
+    let mut pending = std::collections::VecDeque::new();
+    let mut exhausted = false;
+    loop {
+        while !exhausted && pending.len() < depth {
+            let paths: Vec<_> = unmatched
+                .by_ref()
+                .take(512)
+                .map(|path| (**path).clone())
+                .collect();
+            if paths.is_empty() {
+                exhausted = true;
+                break;
+            }
+            if let Err(error) = conn.send(Request::PruneLookup {
+                paths: paths.clone(),
+                guard: guard.cloned(),
+            }) {
+                if !conn.is_dead() {
+                    crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                }
+                return Err(error);
+            }
+            pending.push_back(paths);
+        }
+        let Some(paths) = pending.pop_front() else {
+            break;
+        };
+        let response = conn.recv()?;
+        let stats = (|| -> Result<_> {
+            match ok(response, "inspect prune aliases")? {
+                Response::Stats(stats) if stats.len() == paths.len() => Ok(stats),
+                Response::Stats(stats) => bail!(
+                    "stat reply count {} does not match request count {}",
+                    stats.len(),
+                    paths.len()
+                ),
+                other => bail!("unexpected prune lookup response {other:?}"),
+            }
+        })();
+        let stats = match stats {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Keep the shared control connection at a request boundary.
+                crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                return Err(error);
+            }
+        };
+        for (path, entry) in paths.iter().zip(stats) {
+            if let Some(entry) = entry {
+                let identity = (entry.dev, entry.ino);
+                if candidates.contains(&identity) {
+                    aliases.insert(identity, walk.seen[path]);
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+fn path_is_inside(path: &[u8], root: &[u8]) -> bool {
+    path.starts_with(root) && (root.ends_with(b"/") || path.get(root.len()) == Some(&b'/'))
+}
+
 /// Everything the planner decided about one source entry, made once in the
 /// mapping loop so the directory pass and the per-kind arms can't disagree.
 struct Planned {
@@ -6912,16 +7078,20 @@ impl Planner<'_> {
         let mut roots = std::mem::take(&mut self.delete_roots);
         roots.sort();
         roots.dedup();
-        let inside = |p: &[u8], r: &[u8]| {
-            p.starts_with(r) && (r.ends_with(b"/") || p.get(r.len()) == Some(&b'/'))
-        };
+        // Sorting costs more than a few linear scans. Larger root sets share
+        // one index; focused timings cover this crossover.
+        let sorted_claims = (roots.len() >= 32).then(|| {
+            let mut paths: Vec<_> = self.dst_seen.keys().collect();
+            paths.sort_unstable();
+            paths
+        });
         for (root, sub) in roots.clone() {
             // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
-                .filter(|(r, _)| *r != root && inside(r, &root))
+                .filter(|(r, _)| *r != root && path_is_inside(r, &root))
                 .map(|(r, _)| r.clone())
                 .collect();
             // Not there yet (a dry run into a new destination): nothing to delete.
@@ -6940,15 +7110,8 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             let mut partial_parents = std::collections::HashMap::new();
-            let mut recovery_parents = std::collections::HashSet::new();
             let mut alias_parents = std::collections::HashSet::new();
-            // Destination directories whose path the source claims as a
-            // non-directory (a file we chose not to send, a symlink skipped
-            // without -l, ...). The source has that path, so syq doesn't touch
-            // it — and gutting the directory underneath would be touching it.
-            let mut shielded: std::collections::HashSet<PathBytes> =
-                std::collections::HashSet::new();
-            let mut entries = Vec::new();
+            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
             let res = self.dst.scan(
                 &root,
                 None,
@@ -6957,22 +7120,7 @@ impl Planner<'_> {
                 true,
                 &mut |batch: Vec<Entry>| {
                     for entry in batch {
-                        if entry.path.is_empty() {
-                            continue;
-                        }
-                        if entry
-                            .path
-                            .split(|byte| *byte == b'/')
-                            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
-                        {
-                            // A recovery entry can be a directory with old
-                            // contents. Protect the entire subtree and every
-                            // ancestor, independently of scan ordering.
-                            let full = join(&root, &entry.path);
-                            recovery_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
-                            continue;
-                        }
-                        entries.push(entry);
+                        walk.push(entry, &root, &nested);
                     }
                     Ok(())
                 },
@@ -6992,62 +7140,25 @@ impl Planner<'_> {
             if self.delete_walk_failed {
                 return Ok(());
             }
-            // Prefer exact directory-entry spellings. Only claims absent from
-            // the walk need an actual receiver lookup: case/normalization
-            // aliases can resolve to an entry whose stored spelling differs.
-            // Do this after permission repair, without guessing filesystem
-            // naming rules or adding writes to dry runs.
-            let spellings: std::collections::HashSet<_> = entries
-                .iter()
-                .map(|entry| join(&root, &entry.path))
-                .collect();
-            let unmatched: Vec<_> = self
-                .dst_seen
-                .keys()
-                .filter(|path| inside(path, &root) && !spellings.contains(*path))
-                .cloned()
-                .collect();
-            let mut aliases = std::collections::HashMap::new();
-            for paths in unmatched.chunks(512) {
-                let stats = match ok(
-                    self.dst.call(Request::PruneLookup {
-                        paths: paths.to_vec(),
-                        guard: self.container_guard.clone(),
-                    })?,
-                    "inspect prune aliases",
-                )? {
-                    Response::Stats(stats) => stats,
-                    other => bail!("unexpected prune lookup response {other:?}"),
-                };
-                for (path, entry) in paths.iter().zip(stats) {
-                    if let Some(entry) = entry {
-                        // When several hard links could be the alias, retain
-                        // all of them. Exact-spelling claims above do not
-                        // protect unrelated hard links from pruning.
-                        aliases.insert((entry.dev, entry.ino), path.clone());
-                    }
-                }
+            walk.finish_scan(&root);
+            // There is nothing for an alias to protect when no candidates
+            // remain, including dry runs whose claimed files do not exist yet.
+            if walk.entries.is_empty() {
+                continue;
             }
-            for entry in &entries {
-                let entry_path = &entry.path;
+            let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
+            let mut shielded = walk.shielded;
+            let recovery_parents = walk.recovery_parents;
+            for entry in walk.entries {
+                let full = entry.path;
+                let entry_path =
+                    &full[root.len() + usize::from(!root.is_empty() && !root.ends_with(b"/"))..];
                 let entry_kind = entry.kind;
-
-                if entry_path.is_empty() {
+                if Planner::under_any(&shielded, &full, &root) {
                     continue;
                 }
-                let full = join(&root, entry_path);
-                if nested.iter().any(|n| *n == full || inside(&full, n))
-                    || Planner::under_any(&shielded, &full, &root)
-                {
-                    continue;
-                }
-                let exact = self.dst_seen.get(&full);
-                let claimed = exact.or_else(|| {
-                    aliases
-                        .get(&(entry.dev, entry.ino))
-                        .and_then(|spelling| self.dst_seen.get(spelling))
-                });
-                if exact.is_none() && claimed.is_some() {
+                let claimed = aliases.get(&(entry.dev, entry.ino));
+                if claimed.is_some() {
                     // An ambiguous hard link may live in an otherwise extra
                     // directory. Keep its ancestors as well as the link.
                     alias_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
@@ -8911,12 +9022,19 @@ mod tests {
         requests: Vec<Request>,
         replies: std::collections::VecDeque<Response>,
         received: usize,
+        max_pending: usize,
+        local: bool,
+        latency: Option<std::time::Duration>,
+        ready: std::collections::VecDeque<std::time::Instant>,
         abort_on_receive: Option<Arc<Sched>>,
     }
 
     struct PipelineConn(Arc<Mutex<PipelineState>>);
 
     impl Conn for PipelineConn {
+        fn supports_request_pipelining(&self) -> bool {
+            !self.0.lock().unwrap().local
+        }
         fn begin_streaming_writes(&mut self) -> Result<()> {
             Ok(())
         }
@@ -8924,12 +9042,20 @@ mod tests {
             Ok(())
         }
         fn send(&mut self, request: Request) -> Result<()> {
-            self.0.lock().unwrap().requests.push(request);
+            let mut state = self.0.lock().unwrap();
+            state.requests.push(request);
+            if let Some(latency) = state.latency {
+                state.ready.push_back(std::time::Instant::now() + latency);
+            }
+            state.max_pending = state.max_pending.max(state.requests.len() - state.received);
             Ok(())
         }
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
             state.received += 1;
+            if let Some(ready) = state.ready.pop_front() {
+                std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
+            }
             if let Some(sched) = state.abort_on_receive.take() {
                 sched.abort();
             }
@@ -9021,6 +9147,195 @@ mod tests {
             benchmark: Default::default(),
             fast_batch_files: 1,
         }
+    }
+
+    #[test]
+    fn prune_index_preserves_root_boundaries() {
+        let seen: std::collections::HashMap<_, _> = [
+            "dst",
+            "dst/file",
+            "dst/sub",
+            "dst/sub/file",
+            "dst/submarine/file",
+            "dst2/file",
+            "/file",
+        ]
+        .into_iter()
+        .map(|p| (p.as_bytes().to_vec(), Claim::Leaf))
+        .collect();
+        let mut sorted: Vec<_> = seen.keys().collect();
+        sorted.sort_unstable();
+        for root in [
+            b"dst".as_slice(),
+            b"dst/",
+            b"dst/sub",
+            b"dst/sub/",
+            b"missing",
+            b"/",
+            b"",
+        ] {
+            assert_eq!(
+                PruneWalk::new(&seen, root, None).unmatched,
+                PruneWalk::new(&seen, root, Some(&sorted)).unmatched
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual planner timing; run with --release --ignored --nocapture"]
+    fn prune_index_timing() {
+        use std::time::Instant;
+        let count = 200_000;
+        for roots in [1, 2, 10, 16, 32, 100] {
+            let seen: std::collections::HashMap<_, _> = (0..count)
+                .map(|i| {
+                    (
+                        format!("destination/root-{:03}/directory/file-{i:08}", i % roots)
+                            .into_bytes(),
+                        Claim::Leaf,
+                    )
+                })
+                .collect();
+            let root_paths: Vec<_> = (0..roots)
+                .map(|i| format!("destination/root-{i:03}").into_bytes())
+                .collect();
+            let start = Instant::now();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, None));
+            }
+            let original = start.elapsed();
+            let start = Instant::now();
+            let mut sorted: Vec<_> = seen.keys().collect();
+            sorted.sort_unstable();
+            let sorting = start.elapsed();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, Some(&sorted)));
+            }
+            eprintln!("claims={count} roots={roots} scan={original:?} index_total={:?} sorting={sorting:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual simulated-latency timing; run with --ignored --nocapture"]
+    fn prune_pipeline_timing() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = crate::fsops::lstat_entry(b"extra".to_vec(), directory.path()).unwrap();
+        let seen = (0..4096)
+            .map(|i| (format!("dst/file-{i}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        walk.push(candidate, b"dst", &[]);
+        for local in [true, false] {
+            let state = Arc::new(Mutex::new(PipelineState {
+                local,
+                latency: Some(std::time::Duration::from_millis(20)),
+                ..Default::default()
+            }));
+            state
+                .lock()
+                .unwrap()
+                .replies
+                .extend((0..8).map(|_| Response::Stats(vec![None; 512])));
+            let start = std::time::Instant::now();
+            lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+            eprintln!(
+                "simulated RTT=20ms paths=4096 sequential={local} elapsed={:?}",
+                start.elapsed()
+            );
+            assert_eq!(state.lock().unwrap().max_pending, if local { 1 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let template = crate::fsops::lstat_entry(Vec::new(), &file).unwrap();
+        let seen: std::collections::HashMap<_, _> = (0..10_000)
+            .map(|index| (format!("dst/file-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        for index in 0..9_000 {
+            let mut entry = template.clone();
+            entry.path = format!("file-{index}").into_bytes();
+            walk.push(entry, b"dst", &[]);
+            assert!(walk.entries.is_empty(), "exact matches must not accumulate");
+        }
+        walk.finish_scan(b"dst");
+        assert_eq!(walk.unmatched.len(), 1_000);
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert!(aliases.is_empty());
+        assert!(state.lock().unwrap().requests.is_empty());
+    }
+
+    #[test]
+    fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
+        let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
+            .into_iter()
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        // The child deliberately arrives before its claimed directory.
+        for path in [
+            "blocked/child",
+            "blocked",
+            "nested/extra",
+            "old/.syq-swap-123-4/data",
+            "extra",
+        ] {
+            entry.path = path.as_bytes().to_vec();
+            walk.push(entry.clone(), b"dst", &[b"dst/nested".to_vec()]);
+        }
+        walk.finish_scan(b"dst");
+        assert!(walk.unmatched.is_empty());
+        assert_eq!(walk.entries.len(), 1);
+        assert_eq!(walk.entries[0].path, b"dst/extra");
+        assert!(walk.recovery_parents.contains(b"dst/old".as_slice()));
+    }
+
+    #[test]
+    fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
+        candidate.ino = 42;
+        let seen: std::collections::HashMap<_, _> = (0..3_073)
+            .map(|index| (format!("dst/claim-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        walk.push(candidate.clone(), b"dst", &[]);
+        let mut unrelated = candidate.clone();
+        unrelated.ino = 43;
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        state.lock().unwrap().replies.extend([
+            Response::Stats(vec![Some(unrelated); 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![Some(candidate.clone())]),
+        ]);
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[&(candidate.dev, candidate.ino)], Claim::Leaf);
+        assert_eq!(state.lock().unwrap().requests.len(), 7);
+        assert_eq!(state.lock().unwrap().max_pending, 4);
+        assert!(state.lock().unwrap().replies.is_empty());
+
+        let malformed = Arc::new(Mutex::new(PipelineState::default()));
+        malformed.lock().unwrap().replies.extend([
+            Response::Stats(vec![]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+        ]);
+        assert!(lookup_prune_aliases(&mut PipelineConn(malformed.clone()), &walk, None).is_err());
+        assert!(malformed.lock().unwrap().replies.is_empty());
     }
 
     #[test]

@@ -123,6 +123,26 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: pipelined prune lookup with a one-deep data pipeline\n'
+python3 - <<'PY_PRUNE'
+import pathlib
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory(prefix="syq-prune-") as directory:
+    source = pathlib.Path(directory)
+    for index in range(4096):
+        (source / f"file-{index:04}").write_bytes(b"new content")
+    destination = "/tmp/syq-real-ssh/prune-pipeline"
+    subprocess.run(["ssh", "destination", f"mkdir -p {destination}; printf extra > {destination}/extra"], check=True, timeout=30)
+    command = ["syq", "cp", "--srcs-in", str(source), "--to", "destination", "--into", destination,
+               "--prune", "--no-tcp", "--no-progress", "--tuning-options", "pipeline-depth=1"]
+    subprocess.run(command + ["--dry-run"], check=True, timeout=90)
+    subprocess.run(["ssh", "destination", f"test -f {destination}/extra && test ! -e {destination}/file-0000"], check=True, timeout=30)
+    subprocess.run(command, check=True, timeout=120)
+    subprocess.run(["ssh", "destination", f"test ! -e {destination}/extra && test $(find {destination} -type f | wc -l) -eq 4096 && test \"$(cat {destination}/file-4095)\" = 'new content'"], check=True, timeout=30)
+PY_PRUNE
+
 printf 'case: ordinary SSH directory push and pull across separate hosts\n'
 mkdir -p /tmp/syq-ordinary-source/sub
 printf 'ordinary cross-host directory copy\n' > /tmp/syq-ordinary-source/sub/file

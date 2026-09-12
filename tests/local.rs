@@ -20979,3 +20979,27 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
     );
     assert_eq!(partial_files(&t.0).len(), 1);
 }
+
+#[test]
+fn delete_many_roots_keeps_claims_in_their_own_scope() {
+    let t = Tmp::new();
+    let mut sources = Vec::new();
+    for i in 0..40 {
+        let name = format!("group-{i:02}");
+        write(&t.path(&format!("src/{name}/keep")), b"keep");
+        write(&t.path(&format!("dst/{name}/keep")), b"keep");
+        write(&t.path(&format!("dst/{name}/extra")), b"extra");
+        sources.push(t.s(&format!("src/{name}")));
+    }
+    let destination = t.s("dst");
+    for dry in [true, false] {
+        let mut args = vec![if dry { "-an" } else { "-a" }, "--delete"];
+        args.extend(sources.iter().map(String::as_str));
+        args.push(&destination);
+        run_ok(&args);
+        for i in 0..40 {
+            assert_eq!(read(&t.path(&format!("dst/group-{i:02}/keep"))), b"keep");
+            assert_eq!(t.path(&format!("dst/group-{i:02}/extra")).exists(), dry);
+        }
+    }
+}
