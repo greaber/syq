@@ -70,9 +70,19 @@ restore `design/`, or add investigation reports, benchmark dumps, or experiment
 diaries to this repository. PR descriptions should explain the actual change
 and relevant checks, without histories of abandoned work.
 
-Keep `current-plans/` limited to brief current task state and next actions;
-remove obsolete notes instead of archiving them. Guidance every session needs
-belongs here in `AGENTS.md`.
+Keep one brief handoff per active task at the top of `current-plans/`, with
+current state, decisions, and next actions. Reviews use the shared files below;
+long evidence needed for an active review may live beside its exchange file.
+Keep generated logs, binaries, and benchmark dumps in the task worktree's
+ignored `target/`, linked from the note. Do not store duplicate PR bodies or
+CI status dumps here. Guidance every session needs belongs in `AGENTS.md`.
+
+At task completion, check GitHub's current PR state and remove obsolete notes
+instead of archiving them. Before deleting a note, preserve any unfinished
+agreed work in its continuing task's brief handoff. A merged PR alone does not
+resolve every finding or finish an investigation. Do not delete notes another
+conversation is actively updating. Deferred proposals are not requirements;
+keep them only while they support an active decision, with that decision named.
 
 When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
@@ -217,6 +227,59 @@ report actual access or decision blockers instead of bypassing them.
   different SHAs mean one of them is behind and needs to act.
 - State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
   the fact the reader needs to route the next step.
+
+## Shared review exchange
+
+The user uses separate reviewer and implementer conversations. Each independent
+reviewer keeps one stable exchange file at
+`current-plans/reviews/pr-<number>/<reviewer-id>.md` for that PR, including
+reviews with no findings. Choose a unique reviewer/session label when creating
+a file; reuse it for subsequent rounds in that same conversation. Different
+reviewers use different files. Do not infer reviewer identity from the shared
+GitHub account or adopt someone else's review as your own.
+
+- Both participants pin the exact exchange path in their conversation handoff;
+  the implementer also links it from the task note. "Pin" means remember and
+  read that path when resuming, not an application subscription. On a request
+  to review or address feedback, discover the PR directory and read the relevant
+  exchanges before acting. File updates do not wake idle conversations; the
+  user can resume either side with "check the review file" without copying its
+  contents. Do not start background watchers by default.
+- At the top record the PR URL and head repository, reviewer identity,
+  implementer task/worktree, current round, exact target SHA and its source,
+  and whose turn is next: reviewer, implementer, user decision, or complete.
+  Resolve live refs under the freshness rules below; the file is coordination
+  state, not proof of the latest PR head or merge authorization.
+- The reviewer writes a numbered round with verdict, stable finding IDs
+  (R1, R2, ...), severity, code locations, reasoning/reproduction, and checks
+  with exact tested SHAs and limits. Distinguish required fixes, optional
+  suggestions, and product decisions. Then hand the turn to the implementer,
+  or mark complete if no response is needed. Complete means this review round
+  is finished at its reviewed SHA, not that the PR is merged or merge-ready.
+- The implementer reads all pending exchanges for its PR, addresses feedback
+  within the authorized scope, and adds a response to each finding: fix SHA
+  and verification, or a reasoned disagreement or decision needed. Record the
+  new head SHA and hand the turn back to the reviewer. Do not edit the
+  reviewer's findings or declare them reviewer-verified. Conflicting advice
+  should be reconciled explicitly; scope changes still require the user's
+  decision where the existing rules require it.
+- The reviewer independently checks the new authoritative head, records the
+  next round, and marks findings resolved, still open, or awaiting a decision.
+  Preserve unresolved findings and enough previous-round evidence to follow
+  the exchange; avoid appending full transcripts or repeated status dumps.
+- Treat the turn field as a handoff, not a filesystem lock. Only the participant
+  holding the turn edits that exchange; reread it immediately before writing,
+  make targeted edits, and stop if it changed unexpectedly. Do not overwrite
+  another participant's response from a stale copy. A second independent
+  reviewer creates a separate file instead of taking an active review's turn.
+- Put longer investigation text in the same file when readable, or link files
+  under `current-plans/reviews/pr-<number>/<reviewer-id>/`. Keep the exchange
+  self-contained about verdict and next action. Existing evidence must retain
+  its actual author and SHA; moving it does not constitute a fresh review.
+- When the PR closes and the exchange is no longer active, remove its files
+  after transferring any unfinished agreed work to the continuing task note.
+  Do not use another review file to skip your own independent review; the
+  freshness rules below still apply.
 
 ## PR review freshness
 
