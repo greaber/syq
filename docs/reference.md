@@ -177,16 +177,17 @@ These options do not disable `--prune`; requested pruning still removes extras.
 
 ## Preview changes
 
-`--dry-run` previews a copy without changing the destination. On its own it
-prints a summary; combine it with `-v` to list the planned changes by path:
+`--dry-run` shows planned changes without carrying out the copy or deletions.
+Add `-v` to list the changes by path:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
 ```
 
 The summary shows where files would land, what would change, and how much
-data may move. Copy data stays unchanged; a requested results file is still
-written. The filesystem can change between preview and execution.
+data may move. A requested results file is still written, and remote setup may
+cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).
+The filesystem can change between preview and execution.
 
 ## Mirror a directory
 

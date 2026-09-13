@@ -61,24 +61,6 @@ while [ \$# -gt 0 ]; do
   esac
 done
 [ -n "\${bin_dir:-}" ] || { echo 'install.sh: HOME is not set; pass --bin-dir DIR' >&2; exit 1; }
-[ -n "\${XDG_CONFIG_HOME:-}" ] || [ -n "\${HOME:-}" ] || {
-  echo 'install.sh: HOME and XDG_CONFIG_HOME are not set; cannot record a managed installation' >&2
-  exit 1
-}
-if [ -n "\${XDG_CONFIG_HOME:-}" ]; then
-  receipt_dir=\$XDG_CONFIG_HOME/syq
-else
-  receipt_dir=\$HOME/.config/syq
-fi
-mkdir -p "\$receipt_dir" || {
-  echo "install.sh: cannot prepare install receipt directory: \$receipt_dir" >&2
-  exit 1
-}
-receipt_probe=\$(mktemp "\$receipt_dir/.syq-install-preflight.XXXXXXXX") || {
-  echo "install.sh: install receipt directory is not writable: \$receipt_dir" >&2
-  exit 1
-}
-rm -f "\$receipt_probe"
 
 case "\$(uname -s):\$(uname -m)" in
 EOF

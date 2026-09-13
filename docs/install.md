@@ -12,6 +12,23 @@ Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 `PATH`. To choose another directory, download the script and run
 `sh install.sh --bin-dir DIR`.
 
+## Automatic installation on SSH servers
+
+When an official syq release installs its helper on an SSH server, it also
+tries to install the same version at `~/.local/bin/syq` for use on that server.
+Existing files and symlinks there are left alone; shell startup files are
+never edited. Syq reports installation or failure unless `--quiet` is set.
+Shell completion and background connections can also trigger installation,
+without printing a notice. Failure to install this command does not stop the
+transfer.
+
+Use `syq --self-update` on the server to update this command. To reinstall a
+removed command, run the standalone installer above on the server.
+
+Reusing a cached helper does not repeat this installation step. Development
+builds and connections using `--syq-path` or `--no-bootstrap` do not install
+the command.
+
 ## Homebrew
 
 ```sh
@@ -53,8 +70,8 @@ which provides more extensive benchmarks. Your results will depend on your machi
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
-Standalone installs print an update reminder; nothing updates automatically.
-Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
+Standalone installs may print update reminders in a terminal; nothing updates
+automatically. Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
 
 ## Shell completion
 

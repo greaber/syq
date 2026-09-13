@@ -103,7 +103,7 @@ enum FetchMode {
 /// Install the latest release when this executable came from the standalone
 /// installer. A package-manager binary cannot accidentally overwrite itself.
 pub fn self_update() -> Result<()> {
-    let (_, mut receipt) = managed_receipt().context(
+    let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
     let release = fetch_latest(FetchMode::Interactive)?;
@@ -119,7 +119,7 @@ pub fn self_update() -> Result<()> {
         }
         std::cmp::Ordering::Greater => {}
     }
-    install_release(&release, &mut receipt)?;
+    install_release(&release, &receipt_path, &mut receipt)?;
     println!("updated syq to {}", release.version);
     Ok(())
 }
@@ -127,6 +127,10 @@ pub fn self_update() -> Result<()> {
 /// Called by the generated installer after the verified binary has reached its
 /// final path. Keeping receipt creation inside syq avoids shell JSON escaping.
 pub fn register_standalone_install() -> Result<()> {
+    register_standalone_install_at(canonical_current_exe()?)
+}
+
+pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
     embedded_public_key()?;
     let target = Target::local().ok_or_else(|| {
         anyhow!(
@@ -135,8 +139,7 @@ pub fn register_standalone_install() -> Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let binary = canonical_current_exe()?;
-    let path = receipt_path()?;
+    let path = receipt_path_for(&binary)?;
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA,
         provider: "standalone".into(),
@@ -145,6 +148,27 @@ pub fn register_standalone_install() -> Result<()> {
         binary,
     };
     write_receipt(&path, &receipt)
+}
+
+/// An installation receipt records that this command was already installed. If its
+/// executable was removed, remote bootstrap preserves that choice. A receipt
+/// for a different executable (or malformed metadata) is not such a record.
+pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
+    let (parent, name) = install_path_parts(binary)?;
+    let path = receipt_read_path(receipt_path(parent, name))?;
+    match fs::metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspect previous standalone install receipt"),
+    }
+    let bytes = fs::read(&path).context("read previous standalone install receipt")?;
+    let Ok(receipt) = parse_receipt(&bytes) else {
+        return Ok(false);
+    };
+    // Resolve the parent separately: the executable itself may have been deleted.
+    let expected = canonical_or_original(parent).join(name);
+    Ok(canonical_or_original(&receipt.binary) == expected)
 }
 
 /// Check at most once per day after a successful interactive command and print
@@ -157,13 +181,13 @@ pub fn after_success(quiet: bool) {
     ) {
         return;
     }
-    if managed_receipt().is_err() {
-        return;
-    }
     let Ok(stamp) = check_stamp_path() else {
         return;
     };
     if !check_is_due(&stamp) {
+        return;
+    }
+    if managed_receipt().is_err() {
         return;
     }
     // Mark before networking so an outage does not delay every invocation.
@@ -433,7 +457,11 @@ fn validate_release_file(target: &str, file: &ReleaseFile) -> Result<()> {
     Ok(())
 }
 
-fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> Result<()> {
+fn install_release(
+    release: &VerifiedRelease,
+    receipt_path: &Path,
+    receipt: &mut InstallReceipt,
+) -> Result<()> {
     let target = Target::local().ok_or_else(|| {
         anyhow!(
             "standalone releases do not support {} {}",
@@ -473,7 +501,7 @@ fn install_release(release: &VerifiedRelease, receipt: &mut InstallReceipt) -> R
     })?;
     sync_parent(parent)?;
     receipt.version = release.version.to_string();
-    write_receipt(&receipt_path()?, receipt)?;
+    write_receipt(receipt_path, receipt)?;
     Ok(())
 }
 
@@ -714,12 +742,9 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
-    let path = receipt_path()?;
-    let receipt = read_receipt(&path)?;
-    if receipt.schema != RECEIPT_SCHEMA || receipt.provider != "standalone" {
-        bail!("unrecognized standalone install receipt");
-    }
     let current = canonical_current_exe()?;
+    let path = receipt_read_path(receipt_path_for(&current)?)?;
+    let receipt = read_receipt(&path)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -732,14 +757,24 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("parse standalone install receipt")
+    parse_receipt(&bytes)
+        .with_context(|| format!("read standalone install receipt {}", path.display()))
+}
+
+fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {
+    let receipt: InstallReceipt =
+        serde_json::from_slice(bytes).context("parse standalone install receipt")?;
+    if receipt.schema != RECEIPT_SCHEMA || receipt.provider != "standalone" {
+        bail!("unrecognized standalone install receipt");
+    }
+    Ok(receipt)
 }
 
 fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("install receipt has no parent directory"))?;
-    create_private_dir(parent)?;
+    // This directory also contains the executable; never chmod it as config.
     let temporary = TempFile::new(parent, ".receipt")?;
     let file = temporary.writer()?;
     let mut file = BufWriter::new(file);
@@ -752,7 +787,39 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     sync_parent(parent)
 }
 
-fn receipt_path() -> Result<PathBuf> {
+fn install_path_parts(binary: &Path) -> Result<(&Path, &std::ffi::OsStr)> {
+    let parent = binary
+        .parent()
+        .context("installed executable has no parent")?;
+    let name = binary
+        .file_name()
+        .context("installed executable has no filename")?;
+    Ok((parent, name))
+}
+
+fn receipt_path(parent: &Path, binary_name: &std::ffi::OsStr) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(binary_name);
+    name.push("-install.json");
+    parent.join(name)
+}
+
+fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
+    let (parent, name) = install_path_parts(binary)?;
+    Ok(receipt_path(parent, name))
+}
+
+fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
+    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
+    // when no adjacent receipt exists, keeping malformed new state visible.
+    match fs::symlink_metadata(&adjacent) {
+        Ok(_) => Ok(adjacent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),
+        Err(error) => Err(error).context("inspect standalone install receipt"),
+    }
+}
+
+fn legacy_receipt_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("install.json"))
 }
 
@@ -1026,6 +1093,31 @@ mod tests {
         let mut value = manifest();
         value.installer.size = MAX_SAFE_JSON_INTEGER + 1;
         assert!(validate_manifest(&value).is_err());
+    }
+
+    #[test]
+    fn deleted_command_requires_a_matching_standalone_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("syq");
+        let path = receipt_path_for(&binary).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        let mut receipt = InstallReceipt {
+            schema: RECEIPT_SCHEMA,
+            provider: "standalone".into(),
+            version: "0.5.2".into(),
+            target: "linux-x86_64".into(),
+            binary: root.path().join("other-syq"),
+        };
+        write_receipt(&path, &receipt).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        receipt.binary = canonical_or_original(root.path()).join("syq");
+        write_receipt(&path, &receipt).unwrap();
+        assert!(was_standalone_install(&binary).unwrap());
+        receipt.provider = "other".into();
+        write_receipt(&path, &receipt).unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
+        fs::write(&path, b"malformed receipt").unwrap();
+        assert!(!was_standalone_install(&binary).unwrap());
     }
 
     #[test]

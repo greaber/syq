@@ -113,6 +113,18 @@ exec "$program" "$@""#,
     )
 }
 
+const INSTALL_COMMAND: &str = r#"if [ ! -e "$HOME/.local/bin/syq" ] && [ ! -L "$HOME/.local/bin/syq" ]; then
+    "$program" --install-remote-command </dev/null >/dev/null || :
+fi"#;
+
+fn install_command() -> &'static str {
+    if crate::identity::is_release_build() {
+        INSTALL_COMMAND
+    } else {
+        ""
+    }
+}
+
 pub fn download_script(target: Target) -> String {
     let release = cache_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -248,7 +260,8 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+{install_command}"#,
         target_key = target.key,
         archive_url = shell_words::quote(&archive_url),
         manifest_url = shell_words::quote(&manifest_url),
@@ -257,6 +270,7 @@ trap - EXIT HUP INT TERM"#,
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = install_command(),
     )
 }
 
@@ -268,6 +282,7 @@ pub fn upload_script(target: Target) -> String {
     let expected_identity = helper_identity();
     format!(
         r#"set -u
+install_umask=$(umask)
 umask 077
 dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
 program="$dir/syq"
@@ -307,17 +322,53 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+umask "$install_umask"
+{install_command}"#,
         target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = install_command(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_command_skips_the_installer_process() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        for entry in ["absent", "file", "directory", "symlink", "dangling symlink"] {
+            let home = tempfile::tempdir().unwrap();
+            let bin = home.path().join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("syq");
+            match entry {
+                "absent" => {}
+                "file" => fs::write(&destination, b"existing").unwrap(),
+                "directory" => fs::create_dir(&destination).unwrap(),
+                "symlink" => symlink(&bin, &destination).unwrap(),
+                "dangling symlink" => symlink("missing", &destination).unwrap(),
+                _ => unreachable!(),
+            }
+            // A missing executable makes any attempted launch visible on stderr.
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", INSTALL_COMMAND])
+                .env("HOME", home.path())
+                .env("program", home.path().join("missing-installer"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{entry}: {output:?}");
+            assert_eq!(
+                output.stderr.is_empty(),
+                entry != "absent",
+                "{entry}: {output:?}"
+            );
+        }
+    }
 
     #[test]
     fn maps_supported_uname_pairs() {

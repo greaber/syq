@@ -2896,6 +2896,9 @@ impl RemoteSpec {
             .map(|captured| captured.bytes)
             .unwrap_or_default();
         let detail = output_message(&stderr);
+        if authorized {
+            self.relay_install_notices(&stderr);
+        }
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
             return if authorized {
@@ -2936,6 +2939,14 @@ impl RemoteSpec {
         }
     }
 
+    fn relay_install_notices(&self, stderr: &[u8]) {
+        if !self.quiet {
+            for notice in install_notices(stderr) {
+                crate::output::diagnostic!("syq: {}: {notice}", self.label());
+            }
+        }
+    }
+
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
         let script = remote_helper::upload_script(target);
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
@@ -2945,6 +2956,7 @@ impl RemoteSpec {
             .stderr(Stdio::piped());
         let out = run_captured(&mut cmd, Some(binary))
             .with_context(|| format!("run helper upload to {}", self.label()))?;
+        self.relay_install_notices(&out.stderr.bytes);
         if !out.status.success() {
             bail!(
                 "remote helper upload exited {}{}",
@@ -3168,6 +3180,28 @@ fn protocol_line(mut line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
+enum BootstrapStderrLine<'a> {
+    Notice(std::borrow::Cow<'a, str>),
+    Diagnostic(std::borrow::Cow<'a, str>),
+}
+
+fn bootstrap_stderr_lines(stderr: &[u8]) -> impl Iterator<Item = BootstrapStderrLine<'_>> {
+    stderr.split(|byte| *byte == b'\n').map(|line| {
+        let line = protocol_line(line);
+        match line.strip_prefix(crate::remote_user_install::NOTICE_PREFIX.as_bytes()) {
+            Some(notice) => BootstrapStderrLine::Notice(String::from_utf8_lossy(notice)),
+            None => BootstrapStderrLine::Diagnostic(String::from_utf8_lossy(line)),
+        }
+    })
+}
+
+fn install_notices(stderr: &[u8]) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    bootstrap_stderr_lines(stderr).filter_map(|line| match line {
+        BootstrapStderrLine::Notice(notice) => Some(notice),
+        BootstrapStderrLine::Diagnostic(_) => None,
+    })
+}
+
 fn output_suffix(stderr: &[u8]) -> String {
     let message = output_message(stderr);
     if message.is_empty() {
@@ -3178,7 +3212,19 @@ fn output_suffix(stderr: &[u8]) -> String {
 }
 
 fn output_message(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr);
+    let mut diagnostics = Vec::new();
+    for line in bootstrap_stderr_lines(stderr) {
+        match line {
+            BootstrapStderrLine::Diagnostic(message) => diagnostics.push(message),
+            BootstrapStderrLine::Notice(_) => {
+                // Each notice adds one leading newline; preserve other spacing.
+                if diagnostics.last().is_some_and(|line| line.is_empty()) {
+                    diagnostics.pop();
+                }
+            }
+        }
+    }
+    let message = diagnostics.join("\n");
     message
         .trim()
         .strip_prefix("syq: ")
@@ -3384,6 +3430,48 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_notices_exclude_ssh_noise_and_preserve_individual_lines() {
+        let stderr = b"Warning: new host key\nsshd banner\n\nsyq-remote-install-notice:installed syq\n\nrc noise\n\nsyq-remote-install-notice:check SSH PATH\r\n";
+        assert_eq!(
+            super::install_notices(stderr).collect::<Vec<_>>(),
+            ["installed syq", "check SSH PATH"]
+        );
+        assert_eq!(
+            super::output_suffix(stderr),
+            ": Warning: new host key\nsshd banner\n\nrc noise"
+        );
+        assert_eq!(
+            super::output_suffix(b"syq-remote-install-notice:installed syq\r\n"),
+            ""
+        );
+        assert_eq!(
+            super::output_message(b"syq: error mentions syq-remote-install-notice: tag\n"),
+            "error mentions syq-remote-install-notice: tag"
+        );
+    }
+
+    #[test]
+    fn bootstrap_errors_preserve_blank_lines_except_notice_separators() {
+        let diagnostic = "syq: first paragraph\n\nsecond paragraph\n\n\nlast paragraph\n";
+        assert_eq!(
+            super::output_message(diagnostic.as_bytes()),
+            diagnostic.trim().strip_prefix("syq: ").unwrap()
+        );
+        let stderr = b"first\n\n\nsyq-remote-install-notice:installed\n\nsyq-remote-install-notice:PATH hint\nlast\n";
+        assert_eq!(super::output_message(stderr), "first\n\nlast");
+    }
+
+    #[test]
+    fn bootstrap_stderr_preserves_invalid_utf8_in_both_channels() {
+        let stderr = b"SSH noise: \xff\nsyq-remote-install-notice:installed at \xfe\r\n";
+        assert_eq!(
+            super::install_notices(stderr).collect::<Vec<_>>(),
+            ["installed at \u{fffd}"]
+        );
+        assert_eq!(super::output_message(stderr), "SSH noise: \u{fffd}");
+    }
+
     #[test]
     fn advertised_tcp_port_must_match_requested_range() {
         for port in [47_600, 47_650, 47_699] {

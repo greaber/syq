@@ -207,7 +207,7 @@ pub struct Args {
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
     /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// leave source and destination data unchanged (remote helper setup may write cache files)
+    /// leave source and destination data unchanged (remote setup may still cache the helper or install syq)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -788,7 +788,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Preview without changing copy/removal data; requested results files are still written
+    /// Preview without changing copy/removal data; remote setup may still cache the helper or install syq; requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity

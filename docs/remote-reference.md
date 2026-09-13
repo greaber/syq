@@ -157,4 +157,5 @@ Verification never installs an enrollment.
 `--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
 overwrite policies. Filters and size limits select the entries to compare;
 special files require `--preserve=specials`. Metadata is not compared, but device
-identity is. A requested results file and remote helper caches may still be written.
+identity is. A requested results file may still be written, and remote setup may
+still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).
