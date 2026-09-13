@@ -95,7 +95,7 @@ cargo test --bin syq
 
 Also run integration tests that exercise your change. SSH, remote-helper,
 enrollment, receiver, transport, and remote-coordinator changes need
-`scripts/test-real-ssh.sh`; see the [real-SSH test setup](../tests/real-ssh/README.md).
+`scripts/test-real-ssh.sh`; see the [real-SSH test setup](https://github.com/greaber/syq/blob/master/tests/real-ssh/README.md).
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.
 

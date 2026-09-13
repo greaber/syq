@@ -1,8 +1,8 @@
 # Tuning options
 
-Syq adjusts performance automatically. These controls are for developers and
-for investigating copies where the defaults perform poorly. These experimental controls appear in `--help-all`; their keys and
-bounds may change between releases.
+Syq adjusts performance automatically. Use these controls to investigate copies
+where the defaults perform poorly. They appear in `--help-all` and are
+experimental; their keys and bounds may change between releases.
 
 `--connections N` (or `-j N`) fixes the connection count and disables automatic
 adjustment. In `syq rsync`, use `--syq-connections N`. Use the same count when
@@ -16,14 +16,11 @@ normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
 parent). The quick benchmark uses this cache, even though it disables SSH
 connection persistence. Its temporary file paths do not change the cache key.
 
-Learning takes time: syq samples every 2.5 seconds and needs a warm-up interval
-plus two stable samples for one measurement. Saving a count requires a
-successful copy with at least two measured worker counts and an unchanged
-transport. Failed or aborted copies leave the previous cached count intact.
-If a copy finishes during another probe, syq saves the last accepted count. Short copies may only use their starting count. The benchmark's
-[untimed warm-up](speed.md#quick-comparison) allows more time before scoring;
-neither its 60-second target nor the separate five-second automatic sizing
-target guarantees tuning has settled.
+Short copies may finish before syq can learn a better count. Only successful
+copies that compare enough connection counts without changing transport update
+the cache; failed or interrupted copies leave it unchanged. The benchmark's
+[untimed warm-up](speed.md#quick-comparison) gives learning more time before
+scoring, but does not guarantee that tuning has settled.
 
 `--connections N` disables automatic adjustment and cache use. Supplying
 `--tuning-options` bypasses reading and updating learned counts, but live
@@ -53,10 +50,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote
-coordinator too. They are not saved, and these runs neither read nor update
-the remembered connection count. Connection auto-tuning still runs unless you
-fix `--connections` (`--syq-connections` with `syq rsync`). These are experimental
-controls whose keys and bounds may change between releases.
+coordinator too and are not saved.
 
 Larger requests reduce overhead per byte; deeper pipelines allow more requests
 to await replies at once. Both can increase memory use. Neither changes the
@@ -84,7 +78,7 @@ To test the amount of outstanding large-file work over SSH, keep the worker
 count and copy method fixed, then vary only the request window:
 
 ```sh
-bash try-benchmark.sh --yes --mode pull --host j5 --workload large \
+bash try-benchmark.sh --yes --mode pull --host server --workload large \
   --tool syq --rounds 1 --size quick -- --no-tcp --connections 1 -v \
   --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
 ```
@@ -102,7 +96,6 @@ such as `--tuning-options batch-files=512,batch-bytes=4M`. Those are batch
 ceilings, and the scheduler may choose smaller batches. `pipeline-depth` does
 not multiply small-file batches. After testing these controls, vary
 `--connections` separately to assess parallelism and its startup cost.
-
 
 For a direct comparison without the benchmark script, use fresh scratch destinations:
 

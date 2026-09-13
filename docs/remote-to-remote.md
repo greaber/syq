@@ -104,19 +104,15 @@ syq receiver list
 syq receiver revoke ID
 ```
 
-Use the ID from `list`. Revocation stops all active restricted receivers for
-that enrollment and blocks new sessions. It waits for their shutdown before
-reporting success, then removes the enrollment from both machines. Other
-enrollments keep running. Revocation does not undo completed writes; interrupted
-copies fail and can leave partial files. Enroll again to authorize a new copy
-that can resume them.
+Use the ID from `list`. Revocation stops active copies for that enrollment,
+blocks new ones, and removes its setup from both machines. Other enrollments
+keep working. Completed writes remain; interrupted copies can leave partial
+files. Enroll again before retrying those copies.
 
-If receivers have not stopped within ten seconds, revocation reports failure
-and keeps the enrollment marked revoked. Retry `receiver revoke` to finish
-cleanup; an enrollment with unfinished revocation cannot be refreshed.
-
-For upgrading or sharing a receiver between installations, see
-[enrollment details](remote-reference.md#enrollment).
+If revocation reports that receivers have not stopped, the enrollment stays
+revoked. Retry `receiver revoke` to finish cleanup. See
+[enrollment details](remote-reference.md#enrollment) for upgrades and sharing
+between installations.
 
 If your machine reaches hostB through hostA, add `--via hostA` to `enroll` or
 `revoke`.
@@ -144,7 +140,6 @@ syq cp --coordinate-at local --from hostA --srcs-in data --to hostB --into /arch
 ```
 
 This uses your machine's bandwidth and ordinary SSH access to each endpoint.
-Syq never switches to it silently.
 
 Other authentication modes can use server-held credentials, a destination-
 restricted SSH agent, or full agent forwarding. They grant different authority;
