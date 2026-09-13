@@ -4142,8 +4142,8 @@ fn background_bootstrap_only_installs_the_cached_helper() {
 }
 
 #[test]
-fn bootstrap_disconnect_errors_exclude_install_notice_tags() {
-    for upload in [false, true] {
+fn bootstrap_disconnect_relays_install_notices_without_wire_tags() {
+    for (upload, quiet) in [(false, false), (true, false), (false, true), (true, true)] {
         let t = Tmp::new();
         setup_release_bootstrap(&t);
         if upload {
@@ -4166,7 +4166,11 @@ exec /bin/sh -c "$1""#,
         executable(&rsh, script.as_bytes());
         write(&t.path("src"), b"payload");
         let remote = format!("fake:{}", t.s("dst"));
-        let output = remote_syq(&t, &rsh, &[&t.s("src"), &remote]);
+        let mut command = remote_syq_command(&t, &rsh, &[&t.s("src"), &remote]);
+        if quiet {
+            command.arg("--quiet");
+        }
+        let output = command.output().unwrap();
         assert!(!output.status.success(), "{output:?}");
         assert!(cached_remote_helper(&t).is_file(), "{output:?}");
         assert!(t.path("remote-home/.local/bin/syq").is_file(), "{output:?}");
@@ -4177,7 +4181,11 @@ exec /bin/sh -c "$1""#,
         );
         assert!(stderr.contains("255"), "{stderr}");
         assert!(!stderr.contains("syq-remote-install-notice:"), "{stderr}");
-        assert!(!stderr.contains("installed syq"), "{stderr}");
+        assert_eq!(
+            stderr.contains("syq: fake: installed syq"),
+            !quiet,
+            "{stderr}"
+        );
     }
 }
 
@@ -4191,7 +4199,7 @@ fn managed_remote_helper_install_is_cached() {
         script
             .replace(
                 "#!/bin/sh\n",
-                "#!/bin/sh\necho 'unrelated SSH banner' >&2\n",
+                "#!/bin/sh\nprintf 'unrelated SSH banner' >&2\n",
             )
             .as_bytes(),
     );

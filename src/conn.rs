@@ -1500,6 +1500,22 @@ enum SshConnection {
     Worker,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum BootstrapMode {
+    Disabled,
+    HelperOnly,
+    HelperAndCommand,
+}
+
+impl BootstrapMode {
+    pub(crate) fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+    fn installs_command(self) -> bool {
+        matches!(self, Self::HelperAndCommand)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteSpec {
     /// Run the receiver helper as a local child. This gives local copies the
@@ -1511,10 +1527,9 @@ pub struct RemoteSpec {
     pub port: Option<u16>,
     pub rsh: Vec<String>,
     pub syq_path: Option<String>,
-    /// Install and use the versioned helper rather than resolving `syq` on PATH.
-    pub bootstrap_helper: bool,
-    /// Also install the user command during bootstrap. Background callers opt out.
-    pub install_user_command: bool,
+    /// Whether bootstrap also installs the user command. Background callers use
+    /// only the versioned helper; disabled callers resolve their configured path.
+    pub bootstrap: BootstrapMode,
     /// One-time signed authorization for a command-restricted receiver. It is
     /// sent only on the SSH control connection; TCP and SSH workers join
     /// that already-authorized receiver without redeeming the grant again.
@@ -1558,8 +1573,7 @@ impl RemoteSpec {
             port: None,
             rsh: vec!["local".into()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -1811,7 +1825,7 @@ impl RemoteSpec {
         if let Some(p) = &self.syq_path {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
-        if self.bootstrap_helper {
+        if self.bootstrap.is_enabled() {
             return remote_helper::launcher(args);
         }
         format!("syq {}", shell_words::join(args))
@@ -1843,7 +1857,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap.is_enabled() || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
         self.install_helper()?;
@@ -1873,7 +1887,7 @@ impl RemoteSpec {
         let Err(first_error) = first else {
             return first;
         };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
+        if !self.bootstrap.is_enabled() || !helper_needs_install(&first_error) {
             return Err(first_error);
         }
 
@@ -2809,7 +2823,7 @@ impl RemoteSpec {
     }
 
     fn try_remote_download(&self, target: Target) -> Result<RemoteDownloadOutcome> {
-        let script = remote_helper::download_script(target, self.install_user_command);
+        let script = remote_helper::download_script(target, self.bootstrap.installs_command());
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
@@ -2890,11 +2904,11 @@ impl RemoteSpec {
             .map(|captured| captured.bytes)
             .unwrap_or_default();
         let detail = output_message(&stderr);
+        if authorized {
+            self.relay_install_notices(&stderr);
+        }
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
-            if authorized {
-                self.relay_install_notices(&stderr);
-            }
             return if authorized {
                 Ok(RemoteDownloadOutcome::Installed)
             } else {
@@ -2942,7 +2956,7 @@ impl RemoteSpec {
     }
 
     fn upload_helper(&self, target: Target, binary: &[u8]) -> Result<()> {
-        let script = remote_helper::upload_script(target, self.install_user_command);
+        let script = remote_helper::upload_script(target, self.bootstrap.installs_command());
         let mut cmd = self.ssh_command(SshConnection::Independent, false);
         cmd.arg(format!("sh -c {}", shell_words::quote(&script)))
             .stdin(Stdio::piped())
@@ -2950,6 +2964,7 @@ impl RemoteSpec {
             .stderr(Stdio::piped());
         let out = run_captured(&mut cmd, Some(binary))
             .with_context(|| format!("run helper upload to {}", self.label()))?;
+        self.relay_install_notices(&out.stderr.bytes);
         if !out.status.success() {
             bail!(
                 "remote helper upload exited {}{}",
@@ -2957,7 +2972,6 @@ impl RemoteSpec {
                 output_suffix(&out.stderr.bytes)
             );
         }
-        self.relay_install_notices(&out.stderr.bytes);
         match out.input_error {
             Some(error) => Err(error).with_context(|| format!("upload helper to {}", self.label())),
             None => Ok(()),
@@ -3174,11 +3188,25 @@ fn protocol_line(mut line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-fn install_notices(stderr: &[u8]) -> impl Iterator<Item = &str> {
-    stderr.split(|byte| *byte == b'\n').filter_map(|line| {
-        std::str::from_utf8(protocol_line(line))
-            .ok()?
-            .strip_prefix(crate::remote_user_install::NOTICE_PREFIX)
+enum BootstrapStderrLine<'a> {
+    Notice(std::borrow::Cow<'a, str>),
+    Diagnostic(std::borrow::Cow<'a, str>),
+}
+
+fn bootstrap_stderr_lines(stderr: &[u8]) -> impl Iterator<Item = BootstrapStderrLine<'_>> {
+    stderr.split(|byte| *byte == b'\n').map(|line| {
+        let line = protocol_line(line);
+        match line.strip_prefix(crate::remote_user_install::NOTICE_PREFIX.as_bytes()) {
+            Some(notice) => BootstrapStderrLine::Notice(String::from_utf8_lossy(notice)),
+            None => BootstrapStderrLine::Diagnostic(String::from_utf8_lossy(line)),
+        }
+    })
+}
+
+fn install_notices(stderr: &[u8]) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    bootstrap_stderr_lines(stderr).filter_map(|line| match line {
+        BootstrapStderrLine::Notice(notice) => Some(notice),
+        BootstrapStderrLine::Diagnostic(_) => None,
     })
 }
 
@@ -3192,9 +3220,11 @@ fn output_suffix(stderr: &[u8]) -> String {
 }
 
 fn output_message(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr)
-        .lines()
-        .filter(|line| !line.starts_with(crate::remote_user_install::NOTICE_PREFIX))
+    let message = bootstrap_stderr_lines(stderr)
+        .filter_map(|line| match line {
+            BootstrapStderrLine::Diagnostic(message) => Some(message),
+            BootstrapStderrLine::Notice(_) => None,
+        })
         .collect::<Vec<_>>()
         .join("\n");
     message
@@ -3421,6 +3451,16 @@ mod tests {
             super::output_message(b"syq: error mentions syq-remote-install-notice: tag\n"),
             "error mentions syq-remote-install-notice: tag"
         );
+    }
+
+    #[test]
+    fn bootstrap_stderr_preserves_invalid_utf8_in_both_channels() {
+        let stderr = b"SSH noise: \xff\nsyq-remote-install-notice:installed at \xfe\r\n";
+        assert_eq!(
+            super::install_notices(stderr).collect::<Vec<_>>(),
+            ["installed at \u{fffd}"]
+        );
+        assert_eq!(super::output_message(stderr), "SSH noise: \u{fffd}");
     }
 
     #[test]
@@ -4034,8 +4074,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4638,8 +4677,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".to_string()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4692,8 +4730,7 @@ mod tests {
                 ),
             ],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
@@ -4736,8 +4773,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(multiplexer),
@@ -4884,8 +4920,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
@@ -4970,8 +5005,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            bootstrap_helper: false,
-            install_user_command: false,
+            bootstrap: BootstrapMode::Disabled,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),

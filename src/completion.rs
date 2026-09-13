@@ -1718,8 +1718,11 @@ fn connect_completion_endpoint(
             "ServerAliveCountMax=1".into(),
         ],
         syq_path: syq_path.clone(),
-        bootstrap_helper: syq_path.is_none() && !no_bootstrap,
-        install_user_command: false,
+        bootstrap: if syq_path.is_none() && !no_bootstrap {
+            crate::conn::BootstrapMode::HelperOnly
+        } else {
+            crate::conn::BootstrapMode::Disabled
+        },
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer),

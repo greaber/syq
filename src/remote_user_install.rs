@@ -10,7 +10,7 @@ pub const NOTICE_PREFIX: &str = "syq-remote-install-notice:";
 
 fn notice(message: impl std::fmt::Display) {
     for line in message.to_string().lines() {
-        crate::output::diagnostic!("{NOTICE_PREFIX}{line}");
+        crate::output::diagnostic!("\n{NOTICE_PREFIX}{line}");
     }
 }
 
@@ -22,7 +22,7 @@ pub fn install() {
         let home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .context("HOME is not set")?;
-        let source = std::env::current_exe().context("locate the installed helper")?;
+        let source = running_executable()?;
         let installed = install_from(&source, Path::new(&home))?;
         if let Some(destination) = &installed {
             let registration = destination
@@ -42,6 +42,19 @@ pub fn install() {
         }
         Ok(false) => {}
         Err(error) => notice(format!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its cached helper")),
+    }
+}
+
+fn running_executable() -> Result<PathBuf> {
+    // Open the proc link itself: readlink/current_exe may describe an unlinked
+    // inode as "path (deleted)" when another bootstrap replaces the cache entry.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().context("locate the installed helper")
     }
 }
 
@@ -122,6 +135,78 @@ fn copy_and_publish(source: &Path, bin: &Path, destination: &Path) -> Result<boo
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn installs_after_running_helper_is_replaced() {
+        const CHILD_HOME: &str = "SYQ_TEST_REPLACED_HELPER_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = PathBuf::from(home);
+            // This is a disposable copy of the test executable, never Cargo's.
+            let original = std::env::current_exe().unwrap();
+            let replacement = home.join("replacement");
+            fs::copy(&original, &replacement).unwrap();
+            fs::rename(&replacement, &original).unwrap();
+            #[cfg(target_os = "linux")]
+            assert!(std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(" (deleted)"));
+            let installed = install_from(&running_executable().unwrap(), &home)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fs::read(&installed).unwrap(), fs::read(&original).unwrap());
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let helper = home.path().join("helper");
+        fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        let output = std::process::Command::new(&helper)
+            .args([
+                "--exact",
+                "remote_user_install::tests::installs_after_running_helper_is_replaced",
+                "--nocapture",
+            ])
+            .env(CHILD_HOME, home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(home.path().join(".local/bin/syq").is_file());
+    }
+
+    #[test]
+    fn concurrent_publication_preserves_the_winning_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = prepare_bin(home.path()).unwrap();
+        let destination = bin.join("syq");
+        let sources = [home.path().join("first"), home.path().join("second")];
+        for (index, source) in sources.iter().enumerate() {
+            fs::write(source, [index as u8; 4096]).unwrap();
+        }
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    let (barrier, bin, destination) = (&barrier, &bin, &destination);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        copy_and_publish(source, bin, destination).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes.iter().filter(|won| **won).count(), 1);
+        let winner = outcomes.iter().position(|won| *won).unwrap();
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            fs::read(&sources[winner]).unwrap()
+        );
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+    }
 
     #[test]
     fn installs_independent_copy_preserves_it_and_reinstalls_after_removal() {

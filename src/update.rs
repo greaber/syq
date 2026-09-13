@@ -154,7 +154,8 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
 /// executable was removed, remote bootstrap preserves that choice. A receipt
 /// for a different executable (or malformed metadata) is not such a record.
 pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
-    let path = receipt_path_for(binary)?;
+    let (parent, name) = install_path_parts(binary)?;
+    let path = receipt_path(parent, name);
     match fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Ok(false),
         Ok(_) => {}
@@ -162,23 +163,12 @@ pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
         Err(error) => return Err(error).context("inspect previous standalone install receipt"),
     }
     let bytes = fs::read(&path).context("read previous standalone install receipt")?;
-    let Ok(receipt) = serde_json::from_slice::<InstallReceipt>(&bytes) else {
+    let Ok(receipt) = parse_receipt(&bytes) else {
         return Ok(false);
     };
     // Resolve the parent separately: the executable itself may have been deleted.
-    let expected = canonical_or_original(
-        binary
-            .parent()
-            .context("installed executable has no parent")?,
-    )
-    .join(
-        binary
-            .file_name()
-            .context("installed executable has no filename")?,
-    );
-    Ok(receipt.schema == RECEIPT_SCHEMA
-        && receipt.provider == "standalone"
-        && canonical_or_original(&receipt.binary) == expected)
+    let expected = canonical_or_original(parent).join(name);
+    Ok(canonical_or_original(&receipt.binary) == expected)
 }
 
 /// Check at most once per day after a successful interactive command and print
@@ -762,9 +752,6 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
         Err(error) => return Err(error).context("inspect standalone install receipt"),
     };
     let receipt = read_receipt(&path)?;
-    if receipt.schema != RECEIPT_SCHEMA || receipt.provider != "standalone" {
-        bail!("unrecognized standalone install receipt");
-    }
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -777,7 +764,16 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("parse standalone install receipt")
+    parse_receipt(&bytes)
+}
+
+fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {
+    let receipt: InstallReceipt =
+        serde_json::from_slice(bytes).context("parse standalone install receipt")?;
+    if receipt.schema != RECEIPT_SCHEMA || receipt.provider != "standalone" {
+        bail!("unrecognized standalone install receipt");
+    }
+    Ok(receipt)
 }
 
 fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
@@ -797,18 +793,26 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     sync_parent(parent)
 }
 
-fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
+fn install_path_parts(binary: &Path) -> Result<(&Path, &std::ffi::OsStr)> {
     let parent = binary
         .parent()
-        .ok_or_else(|| anyhow!("installed executable has no parent"))?;
+        .context("installed executable has no parent")?;
+    let name = binary
+        .file_name()
+        .context("installed executable has no filename")?;
+    Ok((parent, name))
+}
+
+fn receipt_path(parent: &Path, binary_name: &std::ffi::OsStr) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
-    name.push(
-        binary
-            .file_name()
-            .ok_or_else(|| anyhow!("installed executable has no filename"))?,
-    );
+    name.push(binary_name);
     name.push("-install.json");
-    Ok(parent.join(name))
+    parent.join(name)
+}
+
+fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
+    let (parent, name) = install_path_parts(binary)?;
+    Ok(receipt_path(parent, name))
 }
 
 fn legacy_receipt_path() -> Result<PathBuf> {

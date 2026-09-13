@@ -300,8 +300,11 @@ fn connect(
         host: endpoint.host,
         port: endpoint.port,
         rsh: vec!["ssh".into()],
-        bootstrap_helper: syq_path.is_none() && !no_bootstrap,
-        install_user_command: true,
+        bootstrap: if syq_path.is_none() && !no_bootstrap {
+            crate::conn::BootstrapMode::HelperAndCommand
+        } else {
+            crate::conn::BootstrapMode::Disabled
+        },
         syq_path,
         restricted_grant: None,
         helper_install: Default::default(),

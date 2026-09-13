@@ -220,10 +220,14 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                bootstrap_helper: args.restricted_grant.is_none()
+                bootstrap: if args.restricted_grant.is_none()
                     && args.syq_path.is_none()
-                    && !args.no_bootstrap,
-                install_user_command: true,
+                    && !args.no_bootstrap
+                {
+                    crate::conn::BootstrapMode::HelperAndCommand
+                } else {
+                    crate::conn::BootstrapMode::Disabled
+                },
                 restricted_grant: args.restricted_grant.clone(),
                 helper_install: Default::default(),
                 ssh_multiplexer,
@@ -365,7 +369,7 @@ fn interface_option<'a>(args: &Args, native: &'a str, rsync: &'a str) -> &'a str
 fn remote_helper_mode(spec: &RemoteSpec, interface: Interface) -> &'static str {
     if spec.forwarded.is_some() {
         "approved return connection"
-    } else if spec.bootstrap_helper {
+    } else if spec.bootstrap.is_enabled() {
         if *spec.helper_install.lock().unwrap() {
             "managed; installed now"
         } else {

@@ -649,8 +649,7 @@ fn connect(target: &str, install: bool) -> Result<i32> {
             .map(str::to_owned)
             .collect(),
         syq_path: None,
-        bootstrap_helper: true,
-        install_user_command: false,
+        bootstrap: crate::conn::BootstrapMode::HelperOnly,
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: None,

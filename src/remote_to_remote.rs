@@ -878,8 +878,11 @@ fn run_remote(
         port: coordinator.port,
         rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
         syq_path: args.syq_path.clone(),
-        bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
-        install_user_command: true,
+        bootstrap: if args.syq_path.is_none() && !args.no_bootstrap {
+            crate::conn::BootstrapMode::HelperAndCommand
+        } else {
+            crate::conn::BootstrapMode::Disabled
+        },
         restricted_grant: None,
         helper_install: Default::default(),
         ssh_multiplexer: None,
@@ -1185,7 +1188,7 @@ fn run_remote(
             cmd.output().with_context(|| format!("spawn {:?}", rsh[0]))
         };
         let mut out = run()?;
-        if helper_missing(out.status.code(), spec.bootstrap_helper) {
+        if helper_missing(out.status.code(), spec.bootstrap.is_enabled()) {
             spec.install_helper()?;
             out = run()?;
         }
@@ -1251,7 +1254,7 @@ fn run_remote(
         Ok::<_, anyhow::Error>((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
-    if helper_missing(status.code(), spec.bootstrap_helper) {
+    if helper_missing(status.code(), spec.bootstrap.is_enabled()) {
         spec.install_helper()?;
         (status, receipt_payload) = run()?;
     }
