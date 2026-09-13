@@ -26,8 +26,8 @@ expect_failure() {
   }
 }
 
-# Scope pull requests to affected Linux checks; broader cross-subsystem,
-# architecture, and platform checks remain cumulative after merge.
+# Select affected checks; native changes keep broader cross-subsystem,
+# architecture, and platform coverage after merge.
 assert_scope() {
   local output=$1 key=$2 expected=$3
   grep -Fx "$key=$expected" <<<"$output" >/dev/null
@@ -39,10 +39,27 @@ scope_keys=(
 )
 
 paths="$work/paths"
-printf 'README.md\n' >"$paths"
-scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-for key in "${scope_keys[@]}"; do
-  assert_scope "$scope" "$key" false
+for path in \
+  README.md \
+  sdk/README.md sdk/RELEASING.md \
+  sdk/python/README.md sdk/python/NATIVE_API.md sdk/python/API_DESIGN.md \
+  sdk/js/README.md sdk/go/README.md \
+  book.toml theme/head.hbs theme/docs.css theme/copy-demo.js \
+  .agents/skills/syq-release/SKILL.md \
+  .agents/skills/syq-release/agents/openai.yaml
+do
+  printf '%s\n' "$path" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  for key in "${scope_keys[@]}"; do
+    assert_scope "$scope" "$key" false
+  done
+done
+# Documentation exceptions must not hide SDK fixtures, build metadata, or
+# the API specification consumed by the native CLI.
+for path in sdk/python/tests/example.md sdk/python/pyproject.toml; do
+  printf '%s\n' "$path" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" python_sdk true
 done
 printf 'docs/mappings.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
@@ -218,12 +235,75 @@ assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 true
 assert_scope "$scope" full_suite true
 
+# Exercise the real macOS classification step, rather than duplicating its
+# selection logic here. Missing/renamed step boundaries fail this check.
+# shellcheck disable=SC2016 # Match literal shell expressions in the workflow.
+macos_step=$(sed -n '/^          scope=$(scripts\/ci-scope.sh/,/^          echo "needed=$needed" >> "$GITHUB_OUTPUT"/p' \
+  "$script_dir/../.github/workflows/macos.yml")
+[ -n "$macos_step" ]
+assert_macos_needed() {
+  local expected=$1
+  shift
+  printf '%s\n' "$@" >"$paths"
+  : >"$work/macos-output"
+  (cd "$script_dir/.." && \
+    SYQ_TEST_CHANGED_PATHS_FILE="$paths" GITHUB_EVENT_PATH="$push_event" \
+    GITHUB_OUTPUT="$work/macos-output" bash -euo pipefail -c "$macos_step")
+  assert_scope "$(cat "$work/macos-output")" needed "$expected"
+}
+assert_macos_needed false docs/mappings.md sdk/python/NATIVE_API.md
+assert_macos_needed false theme/docs.js book.toml
+assert_macos_needed false tests/real-ssh/scenarios.sh docs/example.sh
+assert_macos_needed true docs/mappings.md src/main.rs
+assert_macos_needed true sdk/python/native-api.json
+assert_macos_needed true sdk/python/src/syq/client.py
+assert_macos_needed true scripts/test-installer.sh
+assert_macos_needed true .github/workflows/macos.yml
+assert_macos_needed true unknown-input
+
+# Reproduce a documentation-only post-merge push, including the SDK guide and
+# executable mapping examples. Only the focused example checks are selected.
+git -C "$scope_repo" switch -qc documentation-push "$advanced_base"
+mkdir -p "$scope_repo/docs" "$scope_repo/theme"
+printf 'mapping examples\n' >"$scope_repo/docs/mappings.md"
+printf 'API guide\n' >"$scope_repo/sdk/python/NATIVE_API.md"
+printf 'body {}\n' >"$scope_repo/theme/docs.css"
+git -C "$scope_repo" add .
+git -C "$scope_repo" commit -qm documentation-push
+documentation_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg before "$advanced_base" --arg after "$documentation_head" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+for key in "${scope_keys[@]}"; do
+  case "$key" in
+    mapping_docs|full_suite) assert_scope "$scope" "$key" true ;;
+    *) assert_scope "$scope" "$key" false ;;
+  esac
+done
+
+# Both sides of a rename remain visible even when the destination is one of
+# the explicitly excluded SDK documents.
+git -C "$scope_repo" switch -qc sdk-doc-rename "$advanced_base"
+git -C "$scope_repo" mv sdk/python/mapping sdk/python/NATIVE_API.md
+git -C "$scope_repo" commit -qm sdk-doc-rename
+sdk_rename_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg before "$advanced_base" --arg after "$sdk_rename_head" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+assert_scope "$scope" python_sdk true
+
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
 for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
+# A manual release-validation run must still start the complete macOS suite.
+: >"$work/macos-output"
+(cd "$script_dir/.." && \
+  GITHUB_EVENT_PATH="$work/workflow-dispatch-event.json" \
+  GITHUB_OUTPUT="$work/macos-output" bash -euo pipefail -c "$macos_step")
+assert_scope "$(cat "$work/macos-output")" needed true
 
 # Generated Python SDK validation passes an exact checked-out commit, retaining
 # normal path selection instead of treating its workflow dispatch as a manual

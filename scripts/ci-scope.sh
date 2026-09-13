@@ -103,6 +103,15 @@ while IFS= read -r path; do
     shellcheck=true
   fi
   case "$path" in
+    sdk/README.md|sdk/RELEASING.md|sdk/python/README.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md|sdk/js/README.md|sdk/go/README.md)
+      # These are prose, not executable SDK test inputs. Keep the exception
+      # explicit: native-api.json is compiled into Rust, and files elsewhere
+      # in an SDK (including future Markdown fixtures) still select its tests.
+      ;;
+    book.toml|theme/*|.agents/*)
+      # Documentation rendering and agent guidance do not affect the product
+      # suites. Pages validates the book/theme; shell files still get linted.
+      ;;
     sdk/python/native-api.json)
       # This SDK-owned specification is compiled into the Rust CLI.
       native=true
