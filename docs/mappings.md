@@ -107,19 +107,15 @@ syq cp --from hostA -C /data --mapping pairs.ndjson --to hostB --into /archive
 ```
 
 `--mapping -` reads the manifest from stdin. File contents follow the selected
-copy route. The restricted receiver verifies the authorized manifest and permits
-writes only at its listed destinations, plus creation of necessary parent
-directories. New implicit parents use normal directory permissions subject to
-the receiver’s umask. Existing implicit parents keep their permissions, including
-restoration if copying temporarily requires write access. A listed directory
-still selects only that directory, not its unlisted children. If a file or symlink
-blocks an implicit parent, the affected entries fail and unrelated mappings
-continue. Move or remove the obstruction before retrying, even when the manifest
-explicitly lists the parent directory.
-Restricted receivers count mapped destinations and their parent directories
-against the copy’s entry limit. Each manifest line can be up to 1 MiB, and each
-destination path up to 4096 bytes. There is no separate limit on the total
-manifest size.
+copy route. The restricted receiver permits writes only at the listed
+destinations and creates missing parent directories as needed. New parents use
+permissions limited by the receiver's umask; existing parents keep theirs.
+If a file or symlink blocks a parent directory, move or remove it before
+retrying. The affected entries fail while unrelated mappings continue.
+
+Mapped destinations and their parent directories count against the receiver's
+entry limit. Each manifest line can be up to 1 MiB, and each destination path
+up to 4096 bytes. There is no separate limit on the total manifest size.
 
 ## Emitting a mapping
 
