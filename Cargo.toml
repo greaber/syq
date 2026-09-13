@@ -27,6 +27,7 @@ aws-config = { version = "1", default-features = false, features = ["rt-tokio", 
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
+aws-types = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time", "signal", "macros"] }
 futures-util = "0.3"
 http = "1"

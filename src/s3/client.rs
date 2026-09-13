@@ -69,7 +69,23 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         .clone()
         .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-    let endpoint = endpoint.or_else(|| shared.endpoint_url().map(str::to_owned));
+    // Resolve service-profile endpoints before the profile-wide fallback, just
+    // as the SDK does. The recovery identity must name the same provider that
+    // receives requests, including when two profiles use the same bucket/key.
+    let endpoint = endpoint
+        .or_else(|| {
+            shared.service_config().and_then(|service| {
+                service.load_config(
+                    aws_types::service_config::ServiceConfigKey::builder()
+                        .service_id("S3")
+                        .env("AWS_ENDPOINT_URL")
+                        .profile("endpoint_url")
+                        .build()
+                        .expect("all service configuration key fields are set"),
+                )
+            })
+        })
+        .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;

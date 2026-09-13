@@ -26,8 +26,9 @@ Without a configured region, syq uses `us-east-1`.
 
 For an S3-compatible service, set `AWS_ENDPOINT_URL_S3` or pass
 `--s3-endpoint https://storage.example`. `AWS_ENDPOINT_URL` is also accepted;
-the S3-specific variable takes precedence. Custom endpoints use path-style
-bucket addressing. Use HTTPS for a service outside your machine.
+the S3-specific variable takes precedence. Endpoint URLs in the selected AWS
+configuration profile are also honored. Custom endpoints use path-style bucket
+addressing. Use HTTPS for a service outside your machine.
 
 For example, with Tigris credentials in `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`:

@@ -58,12 +58,11 @@ impl Server {
             gate,
         }
     }
-    fn cp(&self, temp: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
+    fn command(&self, temp: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
             .args([
                 "cp",
-                "--s3-endpoint",
-                &self.address,
                 "--s3-region",
                 "us-east-1",
                 "--s3-retries",
@@ -76,16 +75,23 @@ impl Server {
                 "-c",
                 "3",
             ])
-            .args(args)
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
             .env_remove("AWS_SESSION_TOKEN")
             .env_remove("AWS_PROFILE")
+            .env_remove("AWS_ENDPOINT_URL")
+            .env_remove("AWS_ENDPOINT_URL_S3")
             .env("AWS_EC2_METADATA_DISABLED", "true")
             .env("AWS_CONFIG_FILE", temp.join("no-config"))
             .env("AWS_SHARED_CREDENTIALS_FILE", temp.join("no-credentials"))
             .env("XDG_CACHE_HOME", temp.join("cache"))
-            .current_dir(temp)
+            .current_dir(temp);
+        command
+    }
+    fn cp(&self, temp: &Path, args: &[&str]) -> Output {
+        self.command(temp)
+            .args(["--s3-endpoint", &self.address])
+            .args(args)
             .output()
             .unwrap()
     }
@@ -495,4 +501,48 @@ fn s3_temporary_name_replacement_cannot_redirect_metadata() {
         0o600
     );
     assert!(!temp.path().join("result").exists());
+}
+
+#[test]
+fn s3_service_profile_endpoints_keep_recovery_separate() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    for server in [Server::start("corrupt"), Server::start("corrupt")] {
+        std::fs::write(
+            &config,
+            format!(
+                "[profile fixture]\nservices = fixture\nendpoint_url = http://127.0.0.1:9\n\n[services fixture]\ns3 =\n  endpoint_url = {}\n",
+                server.address
+            ),
+        )
+        .unwrap();
+        let output = server
+            .command(temp.path())
+            .env("AWS_CONFIG_FILE", &config)
+            .args([
+                "--s3-profile",
+                "fixture",
+                "--from",
+                "s3://bucket",
+                "data",
+                "--as",
+                "download",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+        assert!(server.requests.load(Ordering::Relaxed) >= 3);
+    }
+    let records = std::fs::read_dir(temp.path().join("cache/syq/s3"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert_eq!(
+        records, 2,
+        "different providers must not share recovery records"
+    );
 }
