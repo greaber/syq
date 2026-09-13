@@ -62,6 +62,17 @@ class AutomationFixtureTests(unittest.TestCase):
                 if mode == "cp" and dry_run:
                     self.assertEqual(result.bytes_transferred, 8)
 
+    def test_s3_endpoint_is_explicit_and_validated(self) -> None:
+        records = [json.loads(line) for line in (FIXTURES / "success.ndjson").read_bytes().splitlines()]
+        records[0]["endpoints"][1] = {"role": "destination", "kind": "s3", "host": "s3://bucket"}
+        decoder = AutomationDecoder(prune=False, mapping=True, dry_run=False)
+        events = [decoder.feed(json.dumps(record).encode()) for record in records]
+        self.assertIs(events[0].endpoints[1].kind, syq.EndpointKind.S3)
+        decoder.finish(0)
+        records[0]["endpoints"][1]["host"] = "ssh-host"
+        with self.assertRaises(syq.SyqProtocolError):
+            AutomationDecoder(prune=False, mapping=True, dry_run=False).feed(json.dumps(records[0]).encode())
+
     def test_rm_progress_and_dry_run_failures_are_valid_events(self) -> None:
         decoder = AutomationDecoder(mode="rm", dry_run=True, selectors_total=1)
         events = [

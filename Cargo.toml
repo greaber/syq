@@ -23,6 +23,14 @@ include = [
 ]
 
 [dependencies]
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time", "signal", "macros"] }
+futures-util = "0.3"
+http = "1"
+url = "2"
 socket2 = "0.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -31,7 +39,7 @@ postcard = { version = "1", features = ["alloc", "use-std"] }
 jwalk = "0.9"
 rayon = "1.12"
 ignore = "0.4"
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 zstd = "0.13"
 libc = "0.2"
 shell-words = "1"

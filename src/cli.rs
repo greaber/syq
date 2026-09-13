@@ -65,6 +65,9 @@ pub enum CoordinateAt {
     override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
 pub struct Args {
+    /// Process-local S3 transfer settings; never serialized into helper requests.
+    #[arg(skip)]
+    pub(crate) s3: Option<crate::s3::Options>,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
     #[arg(skip)]
@@ -736,7 +739,7 @@ struct NativeSourceArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     #[command(flatten)]
@@ -1010,7 +1013,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination SSH endpoint or @NAME for a receiving machine; placement defaults to --into .
+    /// Destination SSH endpoint, @NAME, or s3://BUCKET; placement defaults to --into .
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
@@ -1059,12 +1062,14 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
-    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
-    long_about = "Copy files and directories locally or over SSH.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    about = "Copy files and directories locally, over SSH, or to/from S3.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
+    long_about = "Copy files and directories locally, over SSH, or to/from S3.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
 struct NativeCopyCommand {
+    #[command(flatten)]
+    s3: crate::s3::Flags,
     #[command(flatten)]
     copy: NativeCopyFields,
     #[command(flatten)]
@@ -1378,6 +1383,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let NativeCopyCommand {
+        s3,
         mut copy,
         size_selection,
         remote,
@@ -1390,6 +1396,31 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     if copy.delegated_operands_b64 {
         decode_delegated_operands(&mut copy)?;
+    }
+    let s3_from = copy
+        .selection
+        .from
+        .as_deref()
+        .filter(|s| s.starts_with("s3://"))
+        .map(str::to_owned);
+    let s3_to = copy
+        .to
+        .as_deref()
+        .filter(|s| s.starts_with("s3://"))
+        .map(str::to_owned);
+    let s3_options = crate::s3::Options::parse(s3, s3_from.as_deref(), s3_to.as_deref(), &matches)?;
+    if s3_options.is_some() {
+        if (s3_from.is_none() && copy.selection.from.is_some())
+            || (s3_to.is_none() && copy.to.is_some())
+        {
+            bail!("S3 copies require one local endpoint; run syq on the machine holding the files");
+        }
+        if s3_from.is_some() {
+            copy.selection.from = None;
+        }
+        if s3_to.is_some() {
+            copy.to = None;
+        }
     }
     let mapping = copy.mapping.take();
     let results = copy.results_output.results.take();
@@ -1433,7 +1464,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
         None if prune => bail!("--prune requires an explicit placement, such as --into DIR"),
-        None if copy.to.is_some() || copy.selection.from.is_some() => {
+        None if copy.to.is_some() || copy.selection.from.is_some() || s3_options.is_some() => {
             (Some(OsString::from(".")), Placement::Into, Existence::Any)
         }
         None => bail!(
@@ -1475,6 +1506,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     ));
 
     let mut args = native_engine_defaults();
+    args.s3 = s3_options;
     args.interface = Interface::NativeCp;
     args.placement = placement;
     args.target_existence = existence;
@@ -1541,6 +1573,26 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             bail!(
                 "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
             );
+        }
+    }
+    if let Some(options) = &args.s3 {
+        if args.devices {
+            bail!("--preserve=specials is not supported for S3 copies");
+        }
+        if !(1..=1024).contains(&args.connections_opt.unwrap_or(256)) {
+            bail!("S3 object workers (-j) must be between 1 and 1024");
+        }
+        let index = if options.upload {
+            args.locations.len() - 1
+        } else {
+            0
+        };
+        args.locations[index].host = Some(format!("s3://{}", options.bucket));
+        if !options.upload {
+            let count = args.locations.len() - 1;
+            for location in &mut args.locations[..count] {
+                location.host = Some(format!("s3://{}", options.bucket));
+            }
         }
     }
     Ok(args)
