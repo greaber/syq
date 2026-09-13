@@ -139,10 +139,27 @@ mod tests {
     #[test]
     fn installs_after_running_helper_is_replaced() {
         const CHILD_HOME: &str = "SYQ_TEST_REPLACED_HELPER_HOME";
+        const TEST_ARGS: [&str; 3] = [
+            "--exact",
+            "remote_user_install::tests::installs_after_running_helper_is_replaced",
+            "--nocapture",
+        ];
         if let Some(home) = std::env::var_os(CHILD_HOME) {
             let home = PathBuf::from(home);
-            // This is a disposable copy of the test executable, never Cargo's.
             let original = std::env::current_exe().unwrap();
+            if std::env::var_os("SYQ_TEST_HELPER_COPY_READY").is_none() {
+                // Prepare the executable in isolation: parallel tests can fork
+                // with its writable fd, briefly preventing exec with ETXTBSY.
+                use std::os::unix::process::CommandExt;
+                let helper = home.join("helper");
+                fs::copy(&original, &helper).unwrap();
+                let error = std::process::Command::new(helper)
+                    .args(TEST_ARGS)
+                    .env("SYQ_TEST_HELPER_COPY_READY", "1")
+                    .exec();
+                panic!("execute disposable helper: {error}");
+            }
+            // This is a disposable copy of the test executable, never Cargo's.
             let replacement = home.join("replacement");
             fs::copy(&original, &replacement).unwrap();
             fs::rename(&replacement, &original).unwrap();
@@ -158,14 +175,8 @@ mod tests {
             return;
         }
         let home = tempfile::tempdir().unwrap();
-        let helper = home.path().join("helper");
-        fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
-        let output = std::process::Command::new(&helper)
-            .args([
-                "--exact",
-                "remote_user_install::tests::installs_after_running_helper_is_replaced",
-                "--nocapture",
-            ])
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(TEST_ARGS)
             .env(CHILD_HOME, home.path())
             .output()
             .unwrap();
