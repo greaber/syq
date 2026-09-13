@@ -3061,7 +3061,10 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.get(&key).map(|file| file.try_clone()).transpose()
+        self.fds
+            .get(&key)
+            .map(|file| file.file().try_clone())
+            .transpose()
     }
 
     fn uncache(&mut self, p: &Path) -> Option<File> {
@@ -3154,7 +3157,7 @@ impl FsOps {
             );
             self.fd_order.push(key.clone());
         }
-        Ok(self.fds.get(&key).unwrap())
+        Ok(self.fds.get(&key).unwrap().file())
     }
 
     /// Batches are statted on several threads: on network filesystems each
@@ -6071,7 +6074,7 @@ impl FsOps {
         } else {
             // This is either a pre-registration test/control operation or the
             // explicit rsync --insecure-links compatibility path.
-            self.cached(&p, false, attempt, false)?
+            self.cached(&p, false, attempt, false)?.file()
         };
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
@@ -9179,12 +9182,14 @@ mod tests {
         let first_inode = operations
             .cached_rooted(Path::new("same"), &first_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();
         let second_inode = operations
             .cached_rooted(Path::new("same"), &second_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();

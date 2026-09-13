@@ -11,6 +11,39 @@ use {
     std::sync::{Arc, Mutex, OnceLock, Weak},
 };
 
+#[cfg(any(target_os = "linux", test))]
+struct Registry {
+    gates: HashMap<(u64, u64), Weak<Mutex<()>>>,
+    sweep_at: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Registry {
+    fn new() -> Self {
+        Self {
+            gates: HashMap::new(),
+            sweep_at: 1024,
+        }
+    }
+
+    fn gate(&mut self, key: (u64, u64)) -> Arc<Mutex<()>> {
+        if self.gates.len() > self.sweep_at {
+            self.gates.retain(|_, gate| gate.strong_count() != 0);
+            // Leave room above live entries so a busy registry does not rescan
+            // on every registration. A later sweep can lower the threshold.
+            self.sweep_at = self.gates.len().saturating_mul(2).max(1024);
+        }
+        self.gates
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let gate = Arc::new(Mutex::new(()));
+                self.gates.insert(key, Arc::downgrade(&gate));
+                gate
+            })
+    }
+}
+
 pub(crate) struct CachedFile {
     file: File,
     #[cfg(any(target_os = "linux", test))]
@@ -26,6 +59,10 @@ impl CachedFile {
         }
     }
 
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
     pub(crate) fn into_file(self) -> File {
         self.file
     }
@@ -35,23 +72,16 @@ impl CachedFile {
         if let Some(gate) = self.gate.get() {
             return Ok(gate);
         }
-        type Registry = Mutex<HashMap<(u64, u64), Weak<Mutex<()>>>>;
-        static GATES: OnceLock<Registry> = OnceLock::new();
+        static GATES: OnceLock<Mutex<Registry>> = OnceLock::new();
         // The open descriptor pins this inode for the lifetime of the cached gate.
         // Register lazily so reads and native copies do not pay for a write gate.
         let metadata = self.file.metadata()?;
         let key = (metadata.dev(), metadata.ino());
-        let mut gates = GATES.get_or_init(Mutex::default).lock().unwrap();
-        // Amortize sweeps across files. Idle entries hold only Weak references;
-        // live gates belong to cached descriptors, including waiting writers.
-        if gates.len() > 1024 {
-            gates.retain(|_, gate| gate.strong_count() != 0);
-        }
-        let gate = gates.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let gate = Arc::new(Mutex::new(()));
-            gates.insert(key, Arc::downgrade(&gate));
-            gate
-        });
+        let gate = GATES
+            .get_or_init(|| Mutex::new(Registry::new()))
+            .lock()
+            .unwrap()
+            .gate(key);
         Ok(self.gate.get_or_init(|| gate))
     }
 
@@ -66,18 +96,30 @@ impl CachedFile {
     }
 }
 
-impl std::ops::Deref for CachedFile {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.file
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn registry_sweeps_leave_room_for_live_gates_and_reclaim_idle_entries() {
+        let mut registry = Registry::new();
+        let live: Vec<_> = (0..1025).map(|i| registry.gate((1, i))).collect();
+        let last = registry.gate((1, 1025));
+        assert_eq!(registry.sweep_at, 2050);
+        drop(last);
+        registry.gate((1, 1026));
+        // This dead entry survives until the next scheduled sweep, proving
+        // registrations above 1024 do not each scan the live registry.
+        assert!(registry.gates.contains_key(&(1, 1025)));
+        assert!(Arc::ptr_eq(&live[0], &registry.gate((1, 0))));
+        drop(live);
+        for i in 1027..2052 {
+            registry.gate((1, i));
+        }
+        assert_eq!(registry.sweep_at, 1024);
+        assert_eq!(registry.gates.len(), 1);
+    }
 
     #[test]
     fn concurrent_opens_and_hardlinks_share_one_writer() {
@@ -98,7 +140,7 @@ mod tests {
                         let _writer = gate.lock().unwrap();
                         assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
                         std::thread::yield_now();
-                        file.write_all_at(&[i as u8], i).unwrap();
+                        file.file().write_all_at(&[i as u8], i).unwrap();
                         assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
                     }
                 });
