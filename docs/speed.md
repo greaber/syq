@@ -1,6 +1,10 @@
 # Speed
 
 Syq copies files in parallel and adjusts its connection count automatically.
+On Linux, workers in the same receiver process write to each temporary file
+one at a time, while receiving and checking blocks in parallel. TCP workers
+share this limit; separate SSH helper processes do not. In-place writes bypass
+this limit.
 Start with the defaults. For repeated remote copies, [keep the connection
 open](install.md#keep-connections-open) to avoid logging in each time.
 
