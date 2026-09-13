@@ -326,84 +326,8 @@ expect_failure 'is not checked out' env \
   SYQ_CI_SCOPE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
   bash -c "cd '$scope_repo' && '$script_dir/ci-scope.sh' '$work/workflow-dispatch-event.json'"
 
-# The generated SDK follow-up dispatches CI on a branch pinned to the exact
-# merge commit, binds the returned run to that commit, and requires its SDK job.
-post_merge_bin="$work/post-merge-bin"
-mkdir "$post_merge_bin"
-post_merge_sha=0123456789abcdef0123456789abcdef01234567
-cat >"$post_merge_bin/gh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-case "$1:$2" in
-  api:*)
-    case " $* " in
-      *'/git/ref/heads/automation/python-sdk-v0.1.9 '*)
-        jq -cn --arg sha "${SYQ_TEST_REF_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{object:{sha:$sha}}'
-        ;;
-      *'/actions/workflows/ci.yml/dispatches '*)
-        case " $* " in
-          *" inputs[scope_commit]=$SYQ_TEST_MERGE_SHA "*) ;;
-          *) echo "scoped dispatch omitted merge commit: $*" >&2; exit 2 ;;
-        esac
-        printf '{"workflow_run_id":501}\n'
-        ;;
-      *'/actions/workflows/ci.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:501,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/workflows/rsync-compat.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:502,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/workflows/macos.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:503,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/runs/501/jobs?per_page=100 '*)
-        jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
-          '{jobs:[{name:"sdks",status:"completed",conclusion:$conclusion}]}'
-        ;;
-      *'/actions/runs/'*)
-        run_id=${2##*/}
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          --argjson id "$run_id" \
-          '{id:$id,event:"workflow_dispatch",head_sha:$sha,status:"queued",conclusion:null}'
-        ;;
-      *) echo "unexpected fake gh api invocation: $*" >&2; exit 2 ;;
-    esac
-    ;;
-  run:watch)
-    [ "${SYQ_TEST_WATCH_RESULT:-success}" = success ]
-    ;;
-  *) echo "unexpected fake gh invocation: $*" >&2; exit 2 ;;
-esac
-EOF
-chmod 755 "$post_merge_bin/gh"
-SYQ_TEST_MERGE_SHA="$post_merge_sha" PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha" \
-  >"$work/post-merge.out"
-grep -F "Post-merge Python SDK validation passed for $post_merge_sha" \
-  "$work/post-merge.out" >/dev/null
-expect_failure 'does not point to expected merge commit' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
-  SYQ_TEST_REF_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml dispatch did not create' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
-  SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  SYQ_POST_MERGE_POLL_ATTEMPTS=1 \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml run 501 sdks job is completed/failure' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" SYQ_TEST_SDK_CONCLUSION=failure \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
+# Exercise dispatch identity, stale ref recovery, and exact-commit SDK gating.
+"$script_dir/test-generated-sdk-post-merge-ci.sh"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.

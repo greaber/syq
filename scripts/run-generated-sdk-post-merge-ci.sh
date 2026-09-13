@@ -26,49 +26,54 @@ trusted_repository=${SYQ_TRUSTED_REPOSITORY:-greaber/syq}
 command -v gh >/dev/null || { echo 'post-merge CI dispatch needs gh' >&2; exit 1; }
 command -v jq >/dev/null || { echo 'post-merge CI dispatch needs jq' >&2; exit 1; }
 
-reference=$(gh api "repos/$repository/git/ref/heads/$branch")
-reference_sha=$(jq -er .object.sha <<<"$reference")
-[ "$reference_sha" = "$merge_sha" ] || {
-  echo "generated branch $branch does not point to expected merge commit $merge_sha (found $reference_sha)" >&2
-  exit 1
-}
-
-workflows=(ci.yml)
-poll_attempts=${SYQ_POST_MERGE_POLL_ATTEMPTS:-30}
-[[ "$poll_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "invalid poll attempt count" >&2; exit 2; }
-run_ids=()
-for workflow in "${workflows[@]}"; do
-  gh api --method POST \
-    -H 'X-GitHub-Api-Version: 2026-03-10' \
-    "repos/$repository/actions/workflows/$workflow/dispatches" \
-    -f ref="$branch" \
-    -f "inputs[scope_commit]=$merge_sha" >/dev/null
-  run_id=
-  for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
-    runs=$(gh api "repos/$repository/actions/workflows/$workflow/runs?event=workflow_dispatch&branch=$branch&per_page=100")
-    run_id=$(jq -r --arg sha "$merge_sha" '
-      [.workflow_runs[] | select(.event == "workflow_dispatch" and .head_sha == $sha)]
-      | sort_by(.created_at) | last | .id // empty
-    ' <<<"$runs")
-    [[ "$run_id" =~ ^[0-9]+$ ]] && break
-    sleep 1
-  done
-  [[ "$run_id" =~ ^[0-9]+$ ]] || {
-    echo "$workflow dispatch did not create a workflow_dispatch run for $merge_sha within $poll_attempts seconds" >&2
+# Updating the Git ref and resolving it in Actions can briefly disagree. Track
+# the run returned by this dispatch, never an older run found by listing runs.
+# Retry only a stale SHA; a failure on the requested commit is a real failure.
+for attempt in 1 2 3; do
+  reference=$(gh api "repos/$repository/git/ref/heads/$branch")
+  reference_sha=$(jq -er .object.sha <<<"$reference")
+  [ "$reference_sha" = "$merge_sha" ] || {
+    echo "generated branch $branch does not point to expected merge commit $merge_sha (found $reference_sha)" >&2
     exit 1
   }
-  run_ids+=("$run_id")
-  echo "Dispatched $workflow run $run_id for $merge_sha"
+  dispatch=$(gh api --method POST \
+    -H 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$repository/actions/workflows/ci.yml/dispatches" \
+    -f ref="$branch" \
+    -f "inputs[scope_commit]=$merge_sha")
+  ci_run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<<"$dispatch")
+  run=$(gh api "repos/$repository/actions/runs/$ci_run_id")
+  jq -e --argjson id "$ci_run_id" --arg repository "$repository" --arg branch "$branch" '
+    .id == $id and .event == "workflow_dispatch" and
+    .head_repository.full_name == $repository and .head_branch == $branch
+  ' <<<"$run" >/dev/null || {
+    echo "ci.yml dispatch returned an unexpected workflow run: $run" >&2
+    exit 1
+  }
+  run_sha=$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' <<<"$run")
+  if [ "$run_sha" = "$merge_sha" ]; then
+    echo "Dispatched ci.yml run $ci_run_id for $merge_sha"
+    gh run watch "$ci_run_id" --repo "$repository" --exit-status
+    break
+  fi
+
+  echo "ci.yml dispatch attempt $attempt/3 started run $ci_run_id at stale commit $run_sha; expected $merge_sha" >&2
+  # The scope guard rejects this run. Let it finish before creating another;
+  # watch's failure is expected, but an API/monitor failure cannot prove it ended.
+  gh run watch "$ci_run_id" --repo "$repository" --exit-status || true
+  run=$(gh api "repos/$repository/actions/runs/$ci_run_id")
+  [ "$(jq -er .status <<<"$run")" = completed ] || {
+    echo "stale ci.yml run $ci_run_id is not completed; refusing another dispatch" >&2
+    exit 1
+  }
+  [ "$attempt" -lt 3 ] || {
+    echo "ci.yml dispatch still selected $run_sha instead of $merge_sha after 3 attempts (last run $ci_run_id)" >&2
+    exit 1
+  }
+  echo "Stale run $ci_run_id finished; retrying dispatch in 5 seconds" >&2
+  sleep 5
 done
 
-for index in "${!workflows[@]}"; do
-  workflow=${workflows[$index]}
-  run_id=${run_ids[$index]}
-  gh run watch "$run_id" --repo "$repository" --exit-status
-  echo "$workflow run $run_id passed for $merge_sha"
-done
-
-ci_run_id=${run_ids[0]}
 jobs=$(gh api "repos/$repository/actions/runs/$ci_run_id/jobs?per_page=100")
 sdk_state=$(jq -c '
   [.jobs[] | select(.name == "sdks")] |
