@@ -350,9 +350,9 @@ handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
 
-Changes to SSH, remote helpers, enrollment, restricted receivers, transports,
-or remote coordinator placement should also run the local-only three-container
-OpenSSH suite:
+Run the local-only three-container OpenSSH suite when changes materially affect
+connection setup, helper bootstrap, authentication or authorization, remote
+process lifecycle, transport behavior, or remote coordinator placement:
 
 ```bash
 scripts/test-real-ssh.sh
@@ -360,6 +360,17 @@ scripts/test-real-ssh.sh
 
 It is intentionally not part of ordinary CI or `cargo test`; see
 `tests/real-ssh/README.md` for its isolation and coverage.
+
+Choose this check by behavioral impact, not merely by which file changed.
+Small review fixes to diagnostics, documentation, or isolated validation checks
+can use focused tests when those tests adequately exercise the change. Batch
+related fixes before running the full suite. After a successful run, inspect
+the intervening changes before repeating it; rerun when they affect the SSH
+scenarios or leave meaningful uncertainty that focused tests cannot resolve.
+Report the SHA of the last successful full run, the checks on the current SHA,
+and why a repeat was unnecessary. Do not describe an earlier run as testing the
+current tree. Release validation still follows the exact-commit requirements
+under release tag lifecycle.
 
 Pull requests do not start automated test workflows. The agent remains
 responsible for running the baseline above, choosing focused integration tests,

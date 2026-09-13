@@ -102,9 +102,10 @@ The experimental streaming path also runs over TCP and SSH, with push, pull,
 source/destination coordination and a local relay. Each streaming copy has a
 25-second deadline and is compared byte for byte, including a signed receiver.
 
-This suite is intentionally outside `cargo test` and CI. Run it after changing
-SSH, remote-helper, enrollment, restricted-receiver, transport, or remote
-topology behavior, and before cutting a release. For release preparation, use
+This suite is intentionally outside `cargo test` and CI. Use the
+[verification guidance](../../AGENTS.md#verification) to decide when a change
+needs the full suite or focused tests, and run it before cutting a release.
+For release preparation, use
 `scripts/release-readiness.py v<version> --check-ssh` after committing: it records
 successful default-profile validation for the complete clean tree, reusable
 across an identical-tree merge. See `RELEASING.md` for the evidence rules.
