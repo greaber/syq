@@ -24,8 +24,8 @@ transfer.
 
 Use `syq --self-update` on the server to update this command. If you delete the
 command but leave its [installation receipt](#updates), syq leaves it absent.
-Remove both files to allow installation the next time a helper is installed.
-Removing the command does not prevent helper setup.
+Remove the command and any matching receipts to allow installation the next
+time a helper is installed. Removing the command does not prevent helper setup.
 
 Reusing a cached helper does not repeat this installation step. Development
 builds and connections using `--syq-path` or `--no-bootstrap` do not install
