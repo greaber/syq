@@ -418,9 +418,10 @@ fn remote_install_reports_receipt_failure_without_removing_the_command() {
     assert!(blocked_receipt.is_dir());
     let stderr = String::from_utf8_lossy(&install.stderr);
     assert!(stderr.contains("could not enable self-update"));
+    assert!(stderr.starts_with('\n'));
     assert!(stderr
         .lines()
-        .all(|line| line.starts_with("syq-remote-install-notice:")));
+        .all(|line| line.is_empty() || line.starts_with("syq-remote-install-notice:")));
 }
 
 // Produced by the published, checksum-verified v0.5.2 Linux x86-64 executable.
