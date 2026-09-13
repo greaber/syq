@@ -141,11 +141,13 @@ workflow advances the automation branch to the exact merge commit and
 explicitly dispatches `ci.yml` with that commit as its scope. The CI selector
 then runs the substantive `sdks` job for the generated Python-only change and
 does not repeat the native, rsync, or macOS checks already certified for the
-immutable syq release. The workflow verifies that the returned run targets the
-merge commit, waits for it, and requires its `sdks` job to succeed before
-deleting the automation branch. A failure leaves the generated SDK changes
-merged and the branch available for diagnosis; it does not block unrelated
-merges. The repository keeps the default workflow token read only and grants
+immutable syq release. The workflow tracks the run ID returned by the dispatch
+API and requires its commit to match the merge. If Actions briefly resolves the branch to its old
+commit, it waits for that run to finish and retries, up to three dispatches.
+A failed run on the correct commit stops validation. The exact merge commit
+must pass its `sdks` job before the automation branch is deleted. A failure
+leaves the generated SDK changes merged and the branch available for diagnosis;
+it does not block unrelated merges. The repository keeps the default workflow token read only and grants
 Actions, contents, and pull-request write scopes only inside this preparation
 workflow.
 
