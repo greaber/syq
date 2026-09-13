@@ -17,7 +17,7 @@ use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
-use crate::sched::{FileJob, Item, RangeHandle, Sched};
+use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched};
 use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -1662,18 +1662,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     });
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}, job-storage={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
-            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
+            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }, opts.tuning.job_storage()
         );
     }
     let mapping_contents = args.mapping_contents.clone();
-    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
+    let sched = Arc::new(Sched::with_job_storage(
+        block,
+        opts.tuning.split_min_size(block),
+        opts.tuning.job_storage(),
+    ));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -2995,9 +2999,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         !opts.verify_only
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
-                            && jobs.iter().all(|job| {
+                            && jobs.iter().enumerate().all(|(idx, job)| {
                                 job.entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref())
-                                    && job.dst_entry.is_none()
+                                    && jobs.destination(idx).is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any
                                             && job.container_guard.is_none()))
@@ -3032,7 +3036,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         && bwlimit.is_none()
                         && {
                             let jobs = sched.jobs.lock().unwrap();
-                            matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
+                            jobs.len() == 1 && jobs[0].container_guard.is_none()
                         };
                     let mut initial = if multiplex_small_files {
                         initial_fast_workers(
@@ -5467,14 +5471,17 @@ impl Planner<'_> {
 
     /// All sources scanned and the sidecar namespace preflight passed: add
     /// deferred payloads to the buffer. The caller runs the fresh-target
-    /// capacity check before replaying that buffer. Planning maps remain live
-    /// until replay because applying buffered entries still consults them.
+    /// capacity check before replaying that buffer. The directory and mapping
+    /// sets released by retire_planning_state remain live through replay,
+    /// because applying buffered entries still consults them.
     fn finish_planning(&mut self) -> Result<()> {
         // Every source has passed the sidecar collision preflight. Applying
         // buffered entries does not consult these indexes; release them before
         // the scheduler grows so their allocations can be reused for jobs.
-        self.payload_paths = std::collections::HashMap::new();
-        self.sidecar_paths = std::collections::HashMap::new();
+        if self.opts.tuning.job_storage() == crate::transfer_tuning::JobStorage::Compact {
+            self.payload_paths = std::collections::HashMap::new();
+            self.sidecar_paths = std::collections::HashMap::new();
+        }
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
@@ -5496,6 +5503,9 @@ impl Planner<'_> {
                 .into_iter()
                 .filter(|(path, ..)| self.implicit_dirs.contains(path)),
         );
+        // Inline mode preserves the previous collision-index lifetime.
+        self.payload_paths = std::collections::HashMap::new();
+        self.sidecar_paths = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -7043,19 +7053,21 @@ impl Planner<'_> {
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
-            src,
-            source,
-            dst,
-            rel,
-            rel_bytes,
-            entry,
-            dst_entry: dst_entry.map(Box::new),
-            target_condition,
-            container_guard: self.container_guard.clone(),
-            attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
-            inplace: false,
-            src_rel,
+            dst_entry,
+            data: FileJobData {
+                src,
+                source,
+                dst,
+                rel,
+                rel_bytes,
+                entry,
+                target_condition,
+                container_guard: self.container_guard.clone(),
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: false,
+                src_rel,
+            },
         });
     }
 
@@ -7749,7 +7761,7 @@ impl Worker {
         !self.opts.verify_only
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
-            && j.dst_entry.is_none()
+            && jobs.destination(idx).is_none()
             && (!self.opts.inplace
                 || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
     }
@@ -7761,7 +7773,7 @@ impl Worker {
         self.fast.files += batch.len();
         let jobs: Vec<FileJob> = {
             let all = self.sched.jobs.lock().unwrap();
-            batch.iter().map(|&i| all[i].as_ref().clone()).collect()
+            batch.iter().map(|&i| all.snapshot(i)).collect()
         };
         self.benchmark.small_batches += 1;
         self.benchmark.max_batch_files = self.benchmark.max_batch_files.max(jobs.len() as u64);
@@ -7942,7 +7954,7 @@ impl Worker {
                         ..e
                     };
                     job.attempt += 1;
-                    job.dst_entry = Some(Box::new(published));
+                    all.set_destination(*idx, published);
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
@@ -8042,7 +8054,7 @@ impl Worker {
     }
 
     fn job(&self, idx: usize) -> FileJob {
-        self.sched.jobs.lock().unwrap()[idx].as_ref().clone()
+        self.sched.jobs.lock().unwrap().snapshot(idx)
     }
 
     fn handle_file(&mut self, idx: usize) -> Result<()> {
@@ -8097,7 +8109,7 @@ impl Worker {
         // bool = a staged or in-place file still needs Finalize. A verified
         // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
-            let final_entry = job.dst_entry.as_deref().cloned();
+            let final_entry = job.dst_entry.clone();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -8858,8 +8870,8 @@ impl Worker {
                         ..e
                     };
                     j.attempt += 1;
-                    j.dst_entry = Some(Box::new(published));
                     j.done.store(0, Relaxed);
+                    jobs.set_destination(idx, published);
                     drop(jobs);
                     self.sched.requeue(idx);
                     return Ok(());
@@ -9343,22 +9355,24 @@ mod tests {
         let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
         let sched = Arc::new(Sched::new(512, 8192));
         sched.push_file(FileJob {
-            src: b"source".to_vec(),
-            source: RegisteredPath {
-                root: serde_json::from_str("0").unwrap(),
-                relative: b"source".to_vec(),
-            },
-            dst: b"destination".to_vec(),
-            rel: "innocent-file".into(),
-            entry,
             dst_entry: None,
-            target_condition: TargetCondition::Any,
-            container_guard: None,
-            attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
-            inplace: false,
-            rel_bytes: b"innocent-file".to_vec(),
-            src_rel: None,
+            data: FileJobData {
+                src: b"source".to_vec(),
+                source: RegisteredPath {
+                    root: serde_json::from_str("0").unwrap(),
+                    relative: b"source".to_vec(),
+                },
+                dst: b"destination".to_vec(),
+                rel: "innocent-file".into(),
+                entry,
+                target_condition: TargetCondition::Any,
+                container_guard: None,
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: false,
+                rel_bytes: b"innocent-file".to_vec(),
+                src_rel: None,
+            },
         });
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
@@ -9405,22 +9419,24 @@ mod tests {
                     let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
                     let sched = Arc::new(Sched::new(512, 8192));
                     let job = FileJob {
-                        src: b"first".to_vec(),
-                        source: RegisteredPath {
-                            root: serde_json::from_str("0").unwrap(),
-                            relative: b"first".to_vec(),
-                        },
-                        dst: b"first-dst".to_vec(),
-                        rel: "first".into(),
-                        entry,
                         dst_entry: None,
-                        target_condition: TargetCondition::Any,
-                        container_guard: None,
-                        attempt: 0,
-                        done: Arc::new(AtomicU64::new(0)),
-                        inplace: false,
-                        rel_bytes: b"first".to_vec(),
-                        src_rel: None,
+                        data: FileJobData {
+                            src: b"first".to_vec(),
+                            source: RegisteredPath {
+                                root: serde_json::from_str("0").unwrap(),
+                                relative: b"first".to_vec(),
+                            },
+                            dst: b"first-dst".to_vec(),
+                            rel: "first".into(),
+                            entry,
+                            target_condition: TargetCondition::Any,
+                            container_guard: None,
+                            attempt: 0,
+                            done: Arc::new(AtomicU64::new(0)),
+                            inplace: false,
+                            rel_bytes: b"first".to_vec(),
+                            src_rel: None,
+                        },
                     };
                     sched.push_file(job.clone());
                     let mut next = job;

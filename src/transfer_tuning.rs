@@ -10,7 +10,24 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\njob-storage=compact|inline: default compact reduces retained job memory and releases collision-check indexes before job replay; inline restores the previous job layout and index lifetime for troubleshooting.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+
+/// Retained job layout and lifetime of collision-preflight indexes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum JobStorage {
+    #[default]
+    Compact,
+    Inline,
+}
+
+impl std::fmt::Display for JobStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Compact => "compact",
+            Self::Inline => "inline",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -85,9 +102,13 @@ pub(crate) struct TransferTuning {
     pub batch_bytes: Option<u64>,
     pub split_min_size: Option<u64>,
     pub bw_pacing: Option<BwPacing>,
+    pub job_storage: Option<JobStorage>,
 }
 
 impl TransferTuning {
+    pub fn job_storage(self) -> JobStorage {
+        self.job_storage.unwrap_or_default()
+    }
     pub fn pipeline_depth(self) -> usize {
         self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH)
     }
@@ -254,6 +275,15 @@ impl FromStr for TransferTuning {
                     size(value, key, 1, 1 << 30)?,
                     key,
                 )?,
+                "job-storage" => set_once(
+                    &mut tuning.job_storage,
+                    match value {
+                        "compact" => JobStorage::Compact,
+                        "inline" => JobStorage::Inline,
+                        _ => bail!("job-storage must be compact or inline"),
+                    },
+                    key,
+                )?,
                 "bw-pacing" => set_once(&mut tuning.bw_pacing, value.parse()?, key)?,
                 _ => bail!("unknown tuning option {key:?}; see --help-all"),
             }
@@ -279,6 +309,7 @@ impl std::fmt::Display for TransferTuning {
         pair!("batch-bytes", self.batch_bytes);
         pair!("split-min-size", self.split_min_size);
         pair!("bw-pacing", self.bw_pacing);
+        pair!("job-storage", self.job_storage);
         f.write_str(&pairs.join(","))
     }
 }
@@ -318,6 +349,30 @@ impl BenchmarkStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_storage_defaults_and_explicit_modes_round_trip() {
+        let default = TransferTuning::default();
+        assert_eq!(default.job_storage(), JobStorage::Compact);
+        assert!(default.to_string().is_empty());
+        for (value, mode) in [
+            ("compact", JobStorage::Compact),
+            ("inline", JobStorage::Inline),
+        ] {
+            let text = format!("job-storage={value}");
+            let tuning: TransferTuning = text.parse().unwrap();
+            assert_eq!(tuning.job_storage(), mode);
+            assert_eq!(tuning.to_string(), text);
+            tuning.validate(0).unwrap();
+        }
+        for value in [
+            "job-storage=",
+            "job-storage=other",
+            "job-storage=inline,job-storage=compact",
+        ] {
+            assert!(value.parse::<TransferTuning>().is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn tuning_preserves_defaults_and_bandwidth_burst_bound() {
@@ -407,7 +462,7 @@ mod tests {
             "copy-path=streaming,request-size=1M,split-min-size=1M,bw-pacing=average",
             "copy-path=auto-streaming,request-size=1M,batch-files=32,batch-bytes=2M",
             "request-size=8M,pipeline-depth=16,copy-path=ranges,split-min-size=1M,bw-pacing=average",
-            "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G,bw-pacing=2s",
+            "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G,bw-pacing=2s,job-storage=inline",
         ] {
             let tuning: TransferTuning = value.parse().unwrap();
             tuning.validate(1 << 20).unwrap();
