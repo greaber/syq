@@ -8,6 +8,9 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
 
 Changes since 0.5.2.
 
+Highlights include safer concurrent copies, lower CPU use for large Linux
+transfers, and receiving names that remain assigned while a machine is offline.
+
 ### Upgrade notes
 
 - Receiving machines now require `@NAME`: use `--to @laptop`,
@@ -63,11 +66,14 @@ Changes since 0.5.2.
 
 ### Performance and tools
 
+- Large transfers on Linux can use substantially less CPU when several workers
+  write one file. This benefits TCP and local range copies while keeping
+  reception and hashing parallel. [PR #336](https://github.com/greaber/syq/pull/336)
+  records the measured CPU savings and copy times, which vary by workload.
+  Independent SSH helpers do not share this optimization.
 - Local destinations use directory descriptors directly without a loopback
   data connection. Metadata workers are reused between batches, large prune
   plans use less temporary storage, and remote alias checks are pipelined.
-- Linux range writes to the same file are serialized within each helper
-  process, while reception and hashing remain parallel.
 - The benchmark script defaults to small SSH uploads, adds an untimed tuning
   warm-up, supports individual tools and explicit syq tuning options, and
   separates total time from copying time. Use `--mode local` for local tests
