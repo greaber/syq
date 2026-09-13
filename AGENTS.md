@@ -242,11 +242,11 @@ GitHub account or adopt someone else's review as your own.
   the implementer also links it from the task note. "Pin" means remember and
   read that path when resuming, not an application subscription. On a request
   to review or address feedback, discover the PR directory and read the relevant
-  exchanges before acting. File updates do not wake idle conversations; the
-  user can resume either side with "check the review file" without copying its
-  contents. Do not start background watchers by default.
+  exchanges before acting. After writing a handoff, ping the other participant
+  using the notification procedure below; changing a file alone sends no ping.
 - At the top record the PR URL and head repository, reviewer identity,
-  implementer task/worktree, current round, exact target SHA and its source,
+  implementer task/worktree, both participants' exact session IDs and notification
+  endpoints when available, current round, exact target SHA and its source,
   and whose turn is next: reviewer, implementer, user decision, or complete.
   Resolve live refs under the freshness rules below; the file is coordination
   state, not proof of the latest PR head or merge authorization.
@@ -256,13 +256,32 @@ GitHub account or adopt someone else's review as your own.
   suggestions, and product decisions. Then hand the turn to the implementer,
   or mark complete if no response is needed. Complete means this review round
   is finished at its reviewed SHA, not that the PR is merged or merge-ready.
-- The implementer reads all pending exchanges for its PR, addresses feedback
-  within the authorized scope, and adds a response to each finding: fix SHA
-  and verification, or a reasoned disagreement or decision needed. Record the
-  new head SHA and hand the turn back to the reviewer. Do not edit the
-  reviewer's findings or declare them reviewer-verified. Conflicting advice
-  should be reconciled explicitly; scope changes still require the user's
-  decision where the existing rules require it.
+- The implementer reads all pending exchanges and independently assesses each
+  finding. Fix directly only when it is a real problem with a simple,
+  straightforward fix, no tradeoff that would benefit from discussion, and no
+  reason to reconsider the requirement instead. A review is advice, not a list
+  of changes to apply automatically; severity labels do not bypass this rule.
+- For anything outside that narrow category, discuss it with the reviewer
+  before implementing that finding. This includes doubtful findings, complex
+  fixes, uncertain value, competing designs, compatibility or performance
+  tradeoffs, and any possibility that the requirement should change. Record
+  the evidence, concern, alternatives, and recommended next step in the
+  exchange; hand the turn to the reviewer and ping them. Read-only inspection
+  or a disposable reproduction can inform the discussion, but do not begin
+  the proposed implementation while the question is unresolved. Independent
+  straightforward fixes may continue.
+- The reviewer responds to the reasoning and may revise or withdraw a finding.
+  Discuss until there is a clear disposition; do not ping-pong unchanged
+  positions. If the discussion establishes a straightforward fix under the
+  existing requirements, implement it. If a requirement change, consequential
+  tradeoff, complicated design, deferral of agreed work, or disagreement remains,
+  bring the user the joint options/recommendation (or explicit disagreement)
+  before implementing it. Reviewer agreement alone does not authorize changing
+  requirements or accepting such tradeoffs.
+- The implementer adds a response to each finding: fix SHA and verification,
+  or the discussion/disposition. Record the new head SHA and hand the turn back
+  to the reviewer. Do not edit the reviewer's findings or declare them
+  reviewer-verified. Do not quietly discard disputed findings.
 - The reviewer independently checks the new authoritative head, records the
   next round, and marks findings resolved, still open, or awaiting a decision.
   Preserve unresolved findings and enough previous-round evidence to follow
@@ -280,6 +299,41 @@ GitHub account or adopt someone else's review as your own.
   after transferring any unfinished agreed work to the continuing task note.
   Do not use another review file to skip your own independent review; the
   freshness rules below still apply.
+
+### Handoff notifications
+
+The user authorizes reviewer-to-implementer and implementer-to-reviewer pings
+for this workflow. Send a ping immediately after saving a completed review,
+fix response, or discussion handoff, including a review with no findings.
+Use the exchange file for substance; the ping identifies the PR, file's absolute
+path, round, SHA, next turn, and a short action such as "review response ready"
+or "design question before implementation". Identify it as an agent handoff,
+not a new user instruction. Only ping for a substantive handoff, not to
+acknowledge receipt or repeat an unchanged waiting state.
+
+For separate Codex sessions, the installed CLI supports:
+
+```bash
+codex queue --thread '<recipient-session-uuid>' --message '<handoff text>'
+```
+
+Each participant records its own session UUID (for example, from
+`CODEX_THREAD_ID` when supplied by the runtime). Use the recorded recipient UUID;
+never infer it from a branch name, worktree, or shared account. Record the
+confirmed remote endpoint if the recipient uses another app server and pass
+`--remote` for that endpoint; never put authentication secrets in the file.
+Within an existing managed agent team, use its message or idle-agent follow-up
+tool when that tool can address the recipient and schedule the needed turn.
+Do not create replacement agents or concurrent resume/exec sessions to imitate
+a notification.
+
+Check command/tool success and report queued delivery separately from the
+recipient having read or acted on it. Local `codex queue --help` confirms the
+command; end-to-end delivery depends on the recipient's reachable app server.
+If the recipient ID or transport is unavailable, or delivery fails, preserve
+the handoff and report the exact blocker; the user can resume the recipient
+with "check the review file". Do not claim a ping was delivered, start a daemon,
+change notification configuration, or launch background watchers as a fallback.
 
 ## PR review freshness
 
