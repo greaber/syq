@@ -17,7 +17,8 @@ pub struct FileJob {
     pub dst: PathBytes,
     pub rel: String,
     pub entry: Entry,
-    pub dst_entry: Option<Entry>,
+    /// Fresh files have no destination snapshot; do not reserve its full size.
+    pub dst_entry: Option<Box<Entry>>,
     /// Placement-root condition enforced by the receiver at publication.
     pub target_condition: crate::proto::TargetCondition,
     /// Opened directory identity that anchors descendant target mutations.
@@ -89,7 +90,10 @@ pub struct Sched {
     direct_fallback_workers: AtomicUsize,
     initial_range_workers: AtomicUsize,
     tune_request: AtomicUsize,
-    pub jobs: Mutex<Vec<FileJob>>,
+    // Grow an array of pointers without relocating or reserving spare copies
+    // of the much larger file records.
+    #[allow(clippy::vec_box)]
+    pub jobs: Mutex<Vec<Box<FileJob>>>,
     pub block: u64,
     pub min_split: u64,
 }
@@ -126,7 +130,7 @@ impl Sched {
         let size = job.entry.size;
         let idx = {
             let mut jobs = self.jobs.lock().unwrap();
-            jobs.push(job);
+            jobs.push(Box::new(job));
             jobs.len() - 1
         };
         self.inner.lock().unwrap().files.push((size, Reverse(idx)));

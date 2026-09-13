@@ -5470,6 +5470,11 @@ impl Planner<'_> {
     /// capacity check before replaying that buffer. Planning maps remain live
     /// until replay because applying buffered entries still consults them.
     fn finish_planning(&mut self) -> Result<()> {
+        // Every source has passed the sidecar collision preflight. Applying
+        // buffered entries does not consult these indexes; release them before
+        // the scheduler grows so their allocations can be reused for jobs.
+        self.payload_paths = std::collections::HashMap::new();
+        self.sidecar_paths = std::collections::HashMap::new();
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
@@ -5491,8 +5496,6 @@ impl Planner<'_> {
                 .into_iter()
                 .filter(|(path, ..)| self.implicit_dirs.contains(path)),
         );
-        self.payload_paths = std::collections::HashMap::new();
-        self.sidecar_paths = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -7046,7 +7049,7 @@ impl Planner<'_> {
             rel,
             rel_bytes,
             entry,
-            dst_entry,
+            dst_entry: dst_entry.map(Box::new),
             target_condition,
             container_guard: self.container_guard.clone(),
             attempt: 0,
@@ -7758,7 +7761,7 @@ impl Worker {
         self.fast.files += batch.len();
         let jobs: Vec<FileJob> = {
             let all = self.sched.jobs.lock().unwrap();
-            batch.iter().map(|&i| all[i].clone()).collect()
+            batch.iter().map(|&i| all[i].as_ref().clone()).collect()
         };
         self.benchmark.small_batches += 1;
         self.benchmark.max_batch_files = self.benchmark.max_batch_files.max(jobs.len() as u64);
@@ -7939,7 +7942,7 @@ impl Worker {
                         ..e
                     };
                     job.attempt += 1;
-                    job.dst_entry = Some(published);
+                    job.dst_entry = Some(Box::new(published));
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
@@ -8039,7 +8042,7 @@ impl Worker {
     }
 
     fn job(&self, idx: usize) -> FileJob {
-        self.sched.jobs.lock().unwrap()[idx].clone()
+        self.sched.jobs.lock().unwrap()[idx].as_ref().clone()
     }
 
     fn handle_file(&mut self, idx: usize) -> Result<()> {
@@ -8094,7 +8097,7 @@ impl Worker {
         // bool = a staged or in-place file still needs Finalize. A verified
         // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
-            let final_entry = job.dst_entry.clone();
+            let final_entry = job.dst_entry.as_deref().cloned();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -8855,7 +8858,7 @@ impl Worker {
                         ..e
                     };
                     j.attempt += 1;
-                    j.dst_entry = Some(published);
+                    j.dst_entry = Some(Box::new(published));
                     j.done.store(0, Relaxed);
                     drop(jobs);
                     self.sched.requeue(idx);
