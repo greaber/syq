@@ -57,13 +57,19 @@ def main():
                 if interface == "native-owner":
                     args.extend(["--preserve", "ownership,permissions"])
             args.append("--no-progress")
-            process = subprocess.Popen(args, env={**os.environ, "SYQ_TEST_HOLD_PARTIAL_MS": "10000"}, start_new_session=True)
+            ready = root / f"partial-ready-{interface}"
+            continuation = root / f"partial-continue-{interface}"
+            process = subprocess.Popen(args, env={
+                **os.environ,
+                "SYQ_TEST_PARTIAL_READY_FILE": str(ready),
+                "SYQ_TEST_PARTIAL_CONTINUE_FILE": str(continuation),
+            }, start_new_session=True)
             deadline = time.monotonic() + 10
             partials = []
             try:
                 while time.monotonic() < deadline:
-                    partials = list(root.glob(".*.syq-tmp.*"))
-                    if partials:
+                    if ready.exists():
+                        partials = list(root.glob(".*.syq-tmp.*"))
                         break
                     assert process.poll() is None, "copy exited before producing a partial"
                     print(f"Waiting for {interface} partial: {partials}", flush=True)

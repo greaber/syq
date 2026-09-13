@@ -3543,20 +3543,11 @@ fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
     if args.interface != Interface::Rsync || args.target_existence == Existence::Any {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_TARGET_PRECONDITION_READY_FILE") {
-        std::fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write target-precondition-ready signal {}",
-                std::path::Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    crate::fsops::test_race_barrier(
+        "SYQ_TEST_TARGET_PRECONDITION_READY_FILE",
+        "SYQ_TEST_TARGET_PRECONDITION_CONTINUE_FILE",
+        "target precondition",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -8787,7 +8778,6 @@ impl Worker {
         crate::fsops::test_race_barrier(
             "SYQ_TEST_FINALIZE_READY_FILE",
             "SYQ_TEST_FINALIZE_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_AFTER_FINALIZE_MS",
             "finalize-ready",
         )?;
         self.complete_file(idx, job, false)
