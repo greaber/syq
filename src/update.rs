@@ -150,12 +150,12 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
     write_receipt(&path, &receipt)
 }
 
-/// An adjacent receipt records that this command was already installed. If its
+/// An installation receipt records that this command was already installed. If its
 /// executable was removed, remote bootstrap preserves that choice. A receipt
 /// for a different executable (or malformed metadata) is not such a record.
 pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
     let (parent, name) = install_path_parts(binary)?;
-    let path = receipt_path(parent, name);
+    let path = receipt_read_path(receipt_path(parent, name))?;
     match fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Ok(false),
         Ok(_) => {}
@@ -743,14 +743,7 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
     let current = canonical_current_exe()?;
-    let adjacent = receipt_path_for(&current)?;
-    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
-    // when no adjacent receipt exists, keeping malformed new state visible.
-    let path = match fs::symlink_metadata(&adjacent) {
-        Ok(_) => adjacent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path()?,
-        Err(error) => return Err(error).context("inspect standalone install receipt"),
-    };
+    let path = receipt_read_path(receipt_path_for(&current)?)?;
     let receipt = read_receipt(&path)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
@@ -813,6 +806,16 @@ fn receipt_path(parent: &Path, binary_name: &std::ffi::OsStr) -> PathBuf {
 fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
     let (parent, name) = install_path_parts(binary)?;
     Ok(receipt_path(parent, name))
+}
+
+fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
+    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
+    // when no adjacent receipt exists, keeping malformed new state visible.
+    match fs::symlink_metadata(&adjacent) {
+        Ok(_) => Ok(adjacent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),
+        Err(error) => Err(error).context("inspect standalone install receipt"),
+    }
 }
 
 fn legacy_receipt_path() -> Result<PathBuf> {

@@ -509,3 +509,65 @@ fn remote_install_preserves_deleted_command_until_its_receipt_is_removed() {
     assert_eq!(registered["provider"], "standalone");
     assert!(other_bin.join("syq").is_dir());
 }
+
+#[test]
+fn legacy_receipt_preserves_deleted_command_and_is_bound_to_its_path() {
+    for custom_config in [false, true] {
+        let version = next_release_version();
+        let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+        let home = fixture.temp.path("remote-home");
+        let binary = home.join(".local/bin/syq");
+        let adjacent = binary.with_file_name(".syq-install.json");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        let config = if custom_config {
+            fixture.config.clone()
+        } else {
+            home.join(".config")
+        };
+        let legacy = config.join("syq/install.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        // Preserve the released v0.5.2 fields; only bind the old fixture to this
+        // disposable installation, without invoking the current receipt writer.
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+        receipt["binary"] = binary.to_str().unwrap().into();
+        let saved = serde_json::to_vec(&receipt).unwrap();
+        fs::write(&legacy, &saved).unwrap();
+        let install = || {
+            let mut command = Command::new(&fixture.installed);
+            command
+                .arg("--install-remote-command")
+                .env("HOME", &home)
+                .env("SYQ_TEST_RELEASE_BUILD", "1")
+                .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key);
+            if custom_config {
+                command.env("XDG_CONFIG_HOME", &config);
+            } else {
+                command.env_remove("XDG_CONFIG_HOME");
+            }
+            command.output().unwrap()
+        };
+        let skipped = install();
+        assert_success(&skipped);
+        assert!(skipped.stderr.is_empty(), "{skipped:?}");
+        assert!(!binary.exists());
+        assert!(!adjacent.exists());
+        assert_eq!(fs::read(&legacy).unwrap(), saved);
+
+        fs::remove_file(&legacy).unwrap();
+        assert_success(&install());
+        assert_eq!(fs::read(&binary).unwrap(), fixture.original);
+        assert!(adjacent.is_file());
+        assert!(!legacy.exists());
+
+        fs::remove_file(&binary).unwrap();
+        fs::remove_file(&adjacent).unwrap();
+        receipt["binary"] = fixture.installed.to_str().unwrap().into();
+        let foreign = serde_json::to_vec(&receipt).unwrap();
+        fs::write(&legacy, &foreign).unwrap();
+        assert_success(&install());
+        assert_eq!(fs::read(&binary).unwrap(), fixture.original);
+        assert!(adjacent.is_file());
+        assert_eq!(fs::read(&legacy).unwrap(), foreign);
+    }
+}
