@@ -1138,7 +1138,7 @@ mod tests {
             port: None,
             rsh: vec!["ssh".into()],
             syq_path: None,
-            bootstrap: crate::conn::BootstrapMode::Disabled,
+            bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,

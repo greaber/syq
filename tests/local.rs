@@ -4040,7 +4040,7 @@ fn add_remote_tool(t: &Tmp, name: &str) {
 }
 
 #[test]
-fn background_bootstrap_only_installs_the_cached_helper() {
+fn background_bootstrap_installs_the_command_quietly() {
     use base64::Engine;
 
     for completion in [true, false] {
@@ -4132,10 +4132,14 @@ fn background_bootstrap_only_installs_the_cached_helper() {
                 cached_remote_helper(&t).is_file(),
                 "completion={completion}, upload={upload}: {output:?}"
             );
-            assert!(!t.path("remote-home/.local/bin/syq").exists());
-            assert!(!t.path("remote-home/.local/bin/.syq-install.json").exists());
+            assert_eq!(
+                read(&t.path("remote-home/.local/bin/syq")),
+                read(&cached_remote_helper(&t))
+            );
+            assert!(t.path("remote-home/.local/bin/.syq-install.json").is_file());
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-            assert!(!log.contains("--install-remote-command"), "{log}");
+            assert!(log.contains("--install-remote-command"), "{log}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("installed syq"));
             assert!(!String::from_utf8_lossy(&output.stderr).contains("syq-remote-install-notice:"));
         }
     }

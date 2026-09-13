@@ -113,15 +113,19 @@ exec "$program" "$@""#,
     )
 }
 
-fn install_command(install_user_command: bool) -> &'static str {
-    if install_user_command && crate::identity::is_release_build() {
-        "\"$program\" --install-remote-command </dev/null >/dev/null || :"
+const INSTALL_COMMAND: &str = r#"if [ ! -e "$HOME/.local/bin/syq" ] && [ ! -L "$HOME/.local/bin/syq" ]; then
+    "$program" --install-remote-command </dev/null >/dev/null || :
+fi"#;
+
+fn install_command() -> &'static str {
+    if crate::identity::is_release_build() {
+        INSTALL_COMMAND
     } else {
         ""
     }
 }
 
-pub fn download_script(target: Target, install_user_command: bool) -> String {
+pub fn download_script(target: Target) -> String {
     let release = cache_key();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
@@ -266,13 +270,13 @@ trap - EXIT HUP INT TERM
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = install_command(install_user_command),
+        install_command = install_command(),
     )
 }
 
 /// Install a verified release asset or the client executable over authenticated SSH.
 /// This path deliberately needs no remote downloader, hasher, or decompressor.
-pub fn upload_script(target: Target, install_user_command: bool) -> String {
+pub fn upload_script(target: Target) -> String {
     let release = cache_key();
     let expected_version = format!("syq {}", env!("CARGO_PKG_VERSION"));
     let expected_identity = helper_identity();
@@ -325,13 +329,46 @@ umask "$install_umask"
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
-        install_command = install_command(install_user_command),
+        install_command = install_command(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_command_skips_the_installer_process() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        for entry in ["absent", "file", "directory", "symlink", "dangling symlink"] {
+            let home = tempfile::tempdir().unwrap();
+            let bin = home.path().join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("syq");
+            match entry {
+                "absent" => {}
+                "file" => fs::write(&destination, b"existing").unwrap(),
+                "directory" => fs::create_dir(&destination).unwrap(),
+                "symlink" => symlink(&bin, &destination).unwrap(),
+                "dangling symlink" => symlink("missing", &destination).unwrap(),
+                _ => unreachable!(),
+            }
+            // A missing executable makes any attempted launch visible on stderr.
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", INSTALL_COMMAND])
+                .env("HOME", home.path())
+                .env("program", home.path().join("missing-installer"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{entry}: {output:?}");
+            assert_eq!(
+                output.stderr.is_empty(),
+                entry != "absent",
+                "{entry}: {output:?}"
+            );
+        }
+    }
 
     #[test]
     fn maps_supported_uname_pairs() {
@@ -362,7 +399,7 @@ mod tests {
     #[test]
     fn release_download_is_pinned_and_verified() {
         let target = Target::from_uname("Linux", "x86_64").unwrap();
-        let script = download_script(target, true);
+        let script = download_script(target);
         assert!(script.contains(&format!(
             "/v{}/syq-linux-x86_64.gz",
             env!("CARGO_PKG_VERSION")
@@ -398,7 +435,7 @@ mod tests {
     #[test]
     fn upload_needs_no_download_verification_or_decompression_tools() {
         let target = Target::from_uname("Linux", "x86_64").unwrap();
-        let script = upload_script(target, true);
+        let script = upload_script(target);
         assert!(script.contains("cat > \"$tmp\""));
         assert!(script.contains("--build-identity"));
         assert!(!script.contains("curl"));

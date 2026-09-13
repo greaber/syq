@@ -418,6 +418,10 @@ fn remote_install_reports_receipt_failure_without_removing_the_command() {
     assert!(blocked_receipt.is_dir());
     let stderr = String::from_utf8_lossy(&install.stderr);
     assert!(stderr.contains("could not enable self-update"));
+    assert!(stderr.contains("rerun the standalone installer"));
+    assert!(!stderr.contains("for use on this server"));
+    assert!(!stderr.contains("on your shell PATH"));
+    assert_eq!(stderr.lines().filter(|line| !line.is_empty()).count(), 1);
     assert!(stderr.starts_with('\n'));
     assert!(stderr
         .lines()

@@ -14,33 +14,40 @@ fn notice(message: impl std::fmt::Display) {
     }
 }
 
+enum InstallOutcome {
+    Unchanged,
+    Installed,
+    Unregistered(anyhow::Error),
+}
+
 pub fn install() {
     if !crate::identity::is_release_build() {
         return;
     }
-    let result: Result<bool> = (|| {
+    let result: Result<InstallOutcome> = (|| {
         let home = std::env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .context("HOME is not set")?;
         let source = running_executable()?;
-        let installed = install_from(&source, Path::new(&home))?;
-        if let Some(destination) = &installed {
-            let registration = destination
-                .canonicalize()
-                .context("locate the installed command for self-update")
-                .and_then(crate::update::register_standalone_install_at);
-            if let Err(error) = registration {
-                notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates"));
-            }
-        }
-        Ok(installed.is_some())
+        let Some(destination) = install_from(&source, Path::new(&home))? else {
+            return Ok(InstallOutcome::Unchanged);
+        };
+        let registration = destination
+            .canonicalize()
+            .context("locate the installed command for self-update")
+            .and_then(crate::update::register_standalone_install_at);
+        Ok(match registration {
+            Ok(()) => InstallOutcome::Installed,
+            Err(error) => InstallOutcome::Unregistered(error),
+        })
     })();
     match result {
-        Ok(true) => {
+        Ok(InstallOutcome::Installed) => {
             notice(format!("installed syq {} at ~/.local/bin/syq for use on this server", env!("CARGO_PKG_VERSION")));
             notice("to use it on this server, ensure ~/.local/bin is on your shell PATH");
         }
-        Ok(false) => {}
+        Ok(InstallOutcome::Unchanged) => {}
+        Ok(InstallOutcome::Unregistered(error)) => notice(format!("installed ~/.local/bin/syq, but could not enable self-update ({error:#}); rerun the standalone installer to enable updates")),
         Err(error) => notice(format!("could not install ~/.local/bin/syq ({error:#}); the transfer can still use its cached helper")),
     }
 }

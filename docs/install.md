@@ -18,7 +18,9 @@ When an official syq release installs its helper on an SSH server, it also
 tries to install the same version at `~/.local/bin/syq` for use on that server.
 Existing files and symlinks there are left alone; shell startup files are
 never edited. Syq reports installation or failure unless `--quiet` is set.
-Failure to install this command does not stop the transfer.
+Shell completion and background connections can also trigger installation,
+without printing a notice. Failure to install this command does not stop the
+transfer.
 
 Use `syq --self-update` on the server to update this command. Its installation
 receipt is `~/.local/bin/.syq-install.json`. If you delete the command but leave
@@ -28,8 +30,7 @@ setup.
 
 Reusing a cached helper does not repeat this installation step. Development
 builds and connections using `--syq-path` or `--no-bootstrap` do not install
-the command. Shell completion and connections opened on your behalf by a
-[receiving machine](receive.md) only set up the helper cache.
+the command.
 
 ## Homebrew
 
