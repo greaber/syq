@@ -5,7 +5,8 @@ across machines.
 It aims to perform well across file sizes, directory sizes, and network speeds.
 
 [Documentation](https://greaber.github.io/syq/) ·
-[Benchmarks](https://greaber.github.io/syq-bench/)
+[Benchmarks](https://greaber.github.io/syq-bench/) ·
+[Changelog](https://github.com/greaber/syq/blob/master/CHANGELOG.md)
 
 Quick links to docs for common tasks:
 
