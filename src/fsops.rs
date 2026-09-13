@@ -61,12 +61,7 @@ const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
-pub(crate) fn test_race_barrier(
-    ready_env: &str,
-    continue_env: &str,
-    hold_env: &str,
-    label: &str,
-) -> Result<()> {
+pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
     if continuation.is_some() && ready.is_none() {
@@ -110,11 +105,6 @@ pub(crate) fn test_race_barrier(
                 next_progress += std::time::Duration::from_secs(5);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-    if let Some(ms) = std::env::var_os(hold_env) {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
         }
     }
     Ok(())
@@ -187,20 +177,11 @@ fn discard_rooted_copy_partial(
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
-    if let Some(ready) = std::env::var_os("SYQ_TEST_COPY_LOCAL_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write local-copy-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_COPY_LOCAL_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_COPY_LOCAL_READY_FILE",
+        "SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE",
+        "local-copy destination open",
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -662,22 +643,11 @@ fn hold_operator_control_path_for_test(path: &Path) -> Result<()> {
     if expected.as_bytes() != path.as_os_str().as_bytes() {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_CONTROL_PATH_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write control-path-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CONTROL_PATH_MS") {
-        let ms = ms
-            .to_string_lossy()
-            .parse::<u64>()
-            .context("parse SYQ_TEST_HOLD_CONTROL_PATH_MS")?;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_CONTROL_PATH_READY_FILE",
+        "SYQ_TEST_CONTROL_PATH_CONTINUE_FILE",
+        "control-path selection",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -1763,7 +1733,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_DESTINATION_ANCHORED_FILE",
             "SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS",
             "destination-anchor-ready",
         )?;
         Ok(ticket)
@@ -1971,7 +1940,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_SMALL_COPY_READY_FILE",
             "SYQ_TEST_SMALL_COPY_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_SMALL_COPY_MS",
             "small copy staged",
         )?;
         // Each publication/metadata repair has its own outcome. Unchanged
@@ -2299,7 +2267,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE",
             "SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_SOURCE_ROOTS_MS",
             "source-registration-ready",
         )?;
         Ok(registered)
@@ -4213,7 +4180,6 @@ fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
     test_race_barrier(
         "SYQ_TEST_GUARDED_MUTATION_READY_FILE",
         "SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE",
-        "SYQ_TEST_HOLD_GUARDED_MUTATION_MS",
         "guarded-mutation-ready",
     )
 }
@@ -4225,20 +4191,11 @@ fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
 
 #[cfg(debug_assertions)]
 fn hold_before_quick_metadata_for_test() -> Result<()> {
-    if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write quick-metadata-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_QUICK_META_READY_FILE",
+        "SYQ_TEST_QUICK_META_CONTINUE_FILE",
+        "quick metadata repair",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -5120,7 +5077,6 @@ impl FsOps {
             test_race_barrier(
                 "SYQ_TEST_PARTIAL_READY_FILE",
                 "SYQ_TEST_PARTIAL_CONTINUE_FILE",
-                "SYQ_TEST_HOLD_PARTIAL_MS",
                 "partial-ready",
             )?;
             self.cache_file(
@@ -5168,7 +5124,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_PARTIAL_READY_FILE",
             "SYQ_TEST_PARTIAL_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_PARTIAL_MS",
             "partial-ready",
         )?;
         self.cache_file(FileLocation::Path(pp), attempt, true, f);
@@ -5216,7 +5171,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_BASIS_READY_FILE",
             "SYQ_TEST_BASIS_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_BASIS_MS",
             "basis-ready",
         )?;
         // Hashing is intentionally limited to the source length. Report the
@@ -5419,7 +5373,6 @@ impl FsOps {
                     test_race_barrier(
                         "SYQ_TEST_REUSE_READY_FILE",
                         "SYQ_TEST_REUSE_CONTINUE_FILE",
-                        "SYQ_TEST_HOLD_REUSE_MS",
                         "reuse buffered bytes",
                     )?;
                     output
@@ -5755,7 +5708,6 @@ impl FsOps {
                     test_race_barrier(
                         "SYQ_TEST_COPY_LOCAL_WRITTEN_FILE",
                         "SYQ_TEST_COPY_LOCAL_CONTINUE_FILE",
-                        "SYQ_TEST_HOLD_COPY_LOCAL_WRITTEN_MS",
                         "local-copy first write",
                     )?;
                     if std::env::var_os("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE").is_some() {

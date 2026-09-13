@@ -153,15 +153,26 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
 
 #[cfg(debug_assertions)]
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !marker.exists() && std::time::Instant::now() < deadline {
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(5);
+    let mut next_progress = started + std::time::Duration::from_secs(1);
+    loop {
+        let status = child.try_wait().unwrap();
+        assert!(status.is_none(), "syq exited before {stage}: {status:?}");
+        if marker.exists() {
+            return;
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before {stage}"
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {stage}: marker {} absent, syq still running",
+            marker.display()
         );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for {stage}: {}", marker.display());
+            next_progress += std::time::Duration::from_secs(1);
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(marker.exists(), "timed out waiting for {stage}");
 }
 
 #[cfg(debug_assertions)]
@@ -590,6 +601,7 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
         write(&t.path("src/original"), b"original");
         write(&t.path("outside/replacement"), b"replacement");
         let ready = t.path("source-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args(insecure.then_some("--insecure-links"))
@@ -602,28 +614,18 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
                 "--no-progress",
             ])
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -648,6 +650,7 @@ fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
     let t = Tmp::new();
     write(&t.path("src/original"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
     let source = format!("{}/", t.s("src"));
     let destination = format!("{}/", t.s("src/out"));
 
@@ -661,25 +664,18 @@ fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
 
     fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
     fs::create_dir(t.path("src")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert_output_ok(&output);
     assert_eq!(read(&t.path("src/out/original")), b"original");
@@ -691,6 +687,7 @@ fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
     let t = Tmp::new();
     write(&t.path("src/original"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
     let source = format!("{}/", t.s("src"));
     let destination = format!("{}/", t.s("selected-and-moved/out"));
 
@@ -704,25 +701,18 @@ fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
 
     fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
     fs::create_dir(t.path("src")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -739,6 +729,7 @@ fn exact_regular_source_replacement_is_rejected_after_registration() {
     let t = Tmp::new();
     write(&t.path("selected"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -750,24 +741,17 @@ fn exact_regular_source_replacement_is_rejected_after_registration() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the exact regular source"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     write(&t.path("selected"), b"replacement");
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -786,6 +770,7 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
     write(&t.path("target-b"), b"b");
     std::os::unix::fs::symlink("target-a", t.path("selected")).unwrap();
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -797,24 +782,17 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the exact symlink source"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     std::os::unix::fs::symlink("target-b", t.path("selected")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -836,6 +814,7 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
         write(&t.path("outside/small"), b"replaced");
         write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
         let ready = t.path("source-content-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args(insecure.then_some("--insecure-links"))
@@ -852,28 +831,18 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst/small")), b"original");
@@ -891,6 +860,7 @@ fn copy_local_uses_registered_source_after_path_replacement() {
         write(&t.path("src/other"), &vec![b'o'; 5 << 20]);
         write(&t.path("outside/file"), &vec![b'r'; original.len()]);
         let ready = t.path("source-capability-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
@@ -902,7 +872,7 @@ fn copy_local_uses_registered_source_after_path_replacement() {
                 "--no-progress",
             ])
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             // A pathname fallback would read through the replacement below. A
             // streaming fallback fails instead of hiding that CopyLocal was not
             // exercised.
@@ -914,22 +884,12 @@ fn copy_local_uses_registered_source_after_path_replacement() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst/file")), original);
@@ -946,6 +906,7 @@ fn copy_local_refuses_a_replaced_destination_parent() {
         fs::create_dir_all(t.path("dst/tree")).unwrap();
         write(&t.path("outside/sentinel"), b"unchanged");
         let ready = t.path("copy-local-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
@@ -957,7 +918,7 @@ fn copy_local_refuses_a_replaced_destination_parent() {
                 "--no-progress",
             ])
             .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+            .env("SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
@@ -965,19 +926,12 @@ fn copy_local_refuses_a_replaced_destination_parent() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the local-copy destination open"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "local copy did not reach the test hook");
+        wait_for_confinement_marker(&mut child, &ready, "copy local");
 
         fs::rename(t.path("dst/tree"), t.path("dst/tree-original")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/tree")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success(), "unexpected success: {output:?}");
         assert_eq!(read(&t.path("outside/sentinel")), b"unchanged");
@@ -998,6 +952,7 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
         set_mtime(&t.path("src/file"), 1_700_000_000);
         set_mtime(&t.path("dst/file"), 1_600_000_000);
         let ready = t.path("copy-local-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
@@ -1010,7 +965,7 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
                 "--no-progress",
             ])
             .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+            .env("SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE", &continuation)
             .env("SYQ_TEST_FAIL_READ_RANGE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1019,19 +974,12 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the local-copy destination open"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "local copy did not reach the test hook");
+        wait_for_confinement_marker(&mut child, &ready, "copy local");
 
         fs::remove_file(t.path("dst/file")).unwrap();
         std::os::unix::fs::symlink("../outside", t.path("dst/file")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("outside")), b"unchanged");
@@ -1152,11 +1100,12 @@ fn start_held_control_path(
     command: &mut Command,
     selected: &Path,
     ready: &Path,
+    continuation: &Path,
 ) -> std::process::Child {
     command
         .env("SYQ_TEST_CONTROL_PATH", selected)
         .env("SYQ_TEST_CONTROL_PATH_READY_FILE", ready)
-        .env("SYQ_TEST_HOLD_CONTROL_PATH_MS", "2000")
+        .env("SYQ_TEST_CONTROL_PATH_CONTINUE_FILE", continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
@@ -1165,18 +1114,7 @@ fn start_held_control_path(
 
 #[cfg(debug_assertions)]
 fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before retaining the selected control path"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        ready.exists(),
-        "control path was not retained before timeout"
-    );
+    wait_for_confinement_marker(child, ready, "control-path selection");
 }
 
 #[cfg(debug_assertions)]
@@ -2632,6 +2570,7 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
         write(&outside, control_contents.as_bytes());
         let destination = t.path("dst");
         let ready = t.path("control-ready");
+        let continuation = t.path("control-continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         match family {
             "native-ignore" => {
@@ -2672,12 +2611,13 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
             }
             _ => unreachable!(),
         }
-        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
         wait_for_control_path_selection(&mut child, &ready);
 
         fs::rename(&selected, t.path("original-control")).unwrap();
         symlink(&outside, &selected).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = wait_for_control_path_output(child);
         assert!(
             !output.status.success(),
@@ -2704,6 +2644,7 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
     write(&selected, b"# no exclusions\n");
     let destination = t.path("dst");
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--ignore-from"])
@@ -2713,12 +2654,13 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
         .arg("--into")
         .arg(&destination)
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     fs::rename(&selected, t.path("original-control")).unwrap();
     mkfifo(&selected);
 
+    release_confinement_barrier(&continuation);
     let output = wait_for_control_path_output(child);
     assert!(!output.status.success());
     assert!(
@@ -2740,6 +2682,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
     mkfifo(&selected);
     let destination = t.path("dst");
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--ignore-from"])
@@ -2749,7 +2692,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
         .arg("--into")
         .arg(&destination)
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     let original = t.path("original-control");
@@ -2764,6 +2707,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
         writer_tx.send(result).unwrap();
     });
 
+    release_confinement_barrier(&continuation);
     let output = wait_for_control_path_output(child);
     let used_retained_fifo = match writer_rx.recv_timeout(std::time::Duration::from_secs(2)) {
         Ok(result) => {
@@ -2874,6 +2818,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
         }
         let destination = t.path("dst");
         let ready = t.path("control-ready");
+        let continuation = t.path("control-continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args(["cp", "--results"])
@@ -2882,7 +2827,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
             .arg("--as")
             .arg(&destination)
             .arg("-q");
-        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
         wait_for_control_path_selection(&mut child, &ready);
 
         if initially_exists {
@@ -2890,6 +2835,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
         }
         symlink(&outside, &selected).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert!(
             !output.status.success(),
@@ -2966,6 +2912,7 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
     let selected = t.path("results-link");
     symlink("intended-results", &selected).unwrap();
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--follow", "--results"])
@@ -2974,12 +2921,13 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
         .arg("--as")
         .arg(t.path("dst"))
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     fs::remove_file(&selected).unwrap();
     symlink(t.path("outside-results"), &selected).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert_output_ok(&output);
     assert_eq!(read(&t.path("outside-results")), b"do not replace");
@@ -3623,27 +3571,50 @@ fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
 
 #[cfg(debug_assertions)]
 fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> PathBuf {
+    let barrier = tempfile::tempdir().unwrap();
+    let ready = barrier.path().join("ready");
+    let continuation = barrier.path().join("continue");
     let mut command = compat_command();
     command
         .args(args)
         .arg("--no-progress")
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000");
+        .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+        .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
+        .process_group(0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     let mut child = command.start().unwrap();
-    let partial = (0..300).find_map(|_| {
-        let mut partials = partial_files(dir);
-        if partials.len() == 1 {
-            partials.pop()
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            None
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
         }
-    });
-    let _ = child.kill();
-    let _ = child.wait();
-    partial.expect("copy never created its job-scoped partial")
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for partial preparation in {}", dir.display());
+            next_progress += std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A helper may own the blocked preparation. Stop the whole isolated group
+    // so no writer can continue changing the partial after this fixture returns.
+    let stopped_early = child.try_wait().unwrap();
+    let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let kill_error = std::io::Error::last_os_error();
+    child.wait().unwrap();
+    assert!(
+        killed == 0 || kill_error.raw_os_error() == Some(libc::ESRCH),
+        "stop partial-copy process group: {kill_error}"
+    );
+    assert!(
+        stopped_early.is_none(),
+        "copy exited before interruption: {stopped_early:?}"
+    );
+    assert!(ready.exists(), "copy never reached partial preparation");
+    let mut partials = partial_files(dir);
+    assert_eq!(partials.len(), 1, "expected one prepared partial");
+    partials.pop().unwrap()
 }
 
 /// Keeps executable fixtures from being written while a child is forked.
@@ -8706,6 +8677,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
         )
         .unwrap();
         let ready = t.path("ready");
+        let continuation = t.path("continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args([
@@ -8726,7 +8698,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
                 format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
             )
             .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+            .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
             .env("SYQ_DEBUG", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -8734,14 +8706,10 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
             command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
         }
         let mut child = command.start().unwrap();
-        wait_for(
-            "quick-check metadata repair",
-            std::time::Duration::from_secs(5),
-            || ready.exists(),
-        );
-        assert!(child.try_wait().unwrap().is_none());
+        wait_for_confinement_marker(&mut child, &ready, "quick metadata repair");
         write(&t.path("source"), b"new contents");
         set_mtime(&t.path("source"), 1_700_000_001);
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("remote-home/dest/source")), b"old");
@@ -11083,6 +11051,8 @@ fn different_jobs_use_distinct_partial_inodes() {
     write(&t.path("first"), &first_contents);
     write(&t.path("second"), &second_contents);
 
+    let ready = t.path("partial-ready");
+    let continuation = t.path("partial-continue");
     let mut first = compat_command()
         .args([
             "-a",
@@ -11094,19 +11064,14 @@ fn different_jobs_use_distinct_partial_inodes() {
             &t.s("first"),
             &t.s("out"),
         ])
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "2000")
+        .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+        .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let first_partial = (0..300).find_map(|_| {
-        let mut partials = partial_files(&t.0);
-        if partials.len() == 1 {
-            partials.pop()
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            None
-        }
-    });
-    let first_partial = first_partial.expect("first copy never created its sidecar");
+    wait_for_confinement_marker(&mut first, &ready, "partial preparation");
+    let partials = partial_files(&t.0);
+    assert_eq!(partials.len(), 1);
+    let first_partial = &partials[0];
 
     let second = syq(&[
         "-a",
@@ -11127,6 +11092,7 @@ fn different_jobs_use_distinct_partial_inodes() {
         first_partial.exists(),
         "the second job must not rename the first job's partial"
     );
+    release_confinement_barrier(&continuation);
     assert!(first.wait().unwrap().success());
     assert_eq!(read(&t.path("out")), first_contents);
     assert!(partial_files(&t.0).is_empty());
@@ -11198,6 +11164,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
     set_mtime(&t.path("src"), 1_600_000_001);
     set_mtime(&t.path("basis"), 1_600_000_000);
     let ready = t.path("basis-ready");
+    let continuation = t.path("continue");
 
     let mut child = compat_command()
         .args([
@@ -11211,18 +11178,10 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
             &t.s("basis"),
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .env("SYQ_TEST_BASIS_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "copy never retained its destination basis");
+    wait_for_confinement_marker(&mut child, &ready, "basis");
 
     OpenOptions::new()
         .append(true)
@@ -11231,6 +11190,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         .write_all(b"trailing data")
         .unwrap();
 
+    release_confinement_barrier(&continuation);
     assert!(child.wait().unwrap().success());
     assert_eq!(read(&t.path("basis")), contents);
     assert!(partial_files(&t.0).is_empty());
@@ -11251,6 +11211,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     set_mtime(&t.path("first"), 1_600_000_001);
     set_mtime(&t.path("second"), 1_600_000_002);
     let ready = t.path("basis-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args([
@@ -11264,18 +11225,10 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
             &t.s("basis"),
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .env("SYQ_TEST_BASIS_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never retained its destination basis");
+    wait_for_confinement_marker(&mut first, &ready, "basis");
     assert!(
         partial_files(&t.0).is_empty(),
         "content comparison must not allocate a full sidecar"
@@ -11296,6 +11249,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_002);
 
+    release_confinement_barrier(&continuation);
     assert!(first.wait().unwrap().success());
     // The second job renamed a complete file over the descriptor retained by
     // the first. Metadata applied through the old descriptor cannot leak onto
@@ -11321,22 +11275,15 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     set_mtime(&t.path("first"), 1_600_000_000);
     set_mtime(&t.path("second"), 1_600_000_001);
     let ready = t.path("quick-meta-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never reached quick-check metadata repair");
+    wait_for_confinement_marker(&mut first, &ready, "quick meta");
 
     let second = syq(&["-a", &t.s("second"), &t.s("basis")]);
     assert_output_ok(&second);
@@ -11345,6 +11292,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_001);
 
+    release_confinement_barrier(&continuation);
     assert_eq!(first.wait().unwrap().code(), Some(23));
     assert_eq!(read(&t.path("basis")), b"bbbb");
     let published = fs::metadata(t.path("basis")).unwrap();
@@ -11386,24 +11334,18 @@ fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
     set_mtime(&t.path("basis"), 1_600_000_000);
     set_mtime(&t.path("first"), 1_600_000_000);
     let ready = t.path("quick-meta-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never reached quick-check metadata repair");
+    wait_for_confinement_marker(&mut first, &ready, "quick meta");
 
     assert_output_ok(&syq(&["-a", &t.s("second"), &t.s("basis")]));
+    release_confinement_barrier(&continuation);
     let status = (0..300).find_map(|_| {
         let status = first.try_wait().unwrap();
         if status.is_none() {
@@ -12204,6 +12146,7 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         fs::create_dir_all(t.path("dst")).unwrap();
         fs::create_dir_all(t.path("outside")).unwrap();
         let ready = t.path("anchor-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
         command.args(["-a", "--syq-connections", "1", &t.s("src/"), &t.s("dst/")]);
@@ -12213,28 +12156,18 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         let mut child = command
             .arg("--no-progress")
             .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "1000")
+            .env("SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before retaining the destination root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination root was not retained before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination anchor");
 
         fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
@@ -12256,6 +12189,8 @@ fn destination_file_write_refuses_descendant_symlink_swap() {
         fs::create_dir_all(t.path("dst/victim")).unwrap();
         write(&t.path("outside/sentinel"), b"outside");
 
+        let ready = t.path("partial-ready");
+        let continuation = t.path("partial-continue");
         let mut command = compat_command();
         command.args([
             "-a",
@@ -12271,31 +12206,20 @@ fn destination_file_write_refuses_descendant_symlink_swap() {
         }
         let mut child = command
             .arg("--no-progress")
-            .env("SYQ_TEST_HOLD_PARTIAL_MS", "1000")
+            .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+            .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while partial_files(&t.path("dst/victim")).len() != 1
-            && std::time::Instant::now() < deadline
-        {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before preparing the destination sidecar"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            partial_files(&t.path("dst/victim")).len(),
-            1,
-            "destination sidecar was not prepared before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "partial preparation");
+        assert_eq!(partial_files(&t.path("dst/victim")).len(), 1);
 
         fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
         assert_eq!(read(&t.path("outside/sentinel")), b"outside");
@@ -12318,6 +12242,7 @@ fn destination_prune_scan_uses_retained_root_after_replacement() {
         write(&t.path("dst/extra"), b"extra");
         write(&t.path("outside/sentinel"), b"outside");
         let ready = t.path("anchor-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
         command.args([
@@ -12334,28 +12259,18 @@ fn destination_prune_scan_uses_retained_root_after_replacement() {
         let mut child = command
             .arg("--no-progress")
             .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "750")
+            .env("SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before retaining the destination root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination root was not retained before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination anchor");
 
         fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert!(!t.path("selected-and-moved/extra").exists());
@@ -12376,6 +12291,7 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
         write(&t.path("dst/victim/extra"), b"extra");
         write(&t.path("outside/sentinel"), b"outside");
         let ready = t.path("scan-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
         command.args([
@@ -12393,28 +12309,21 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
             .arg("--no-progress")
             .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY", "victim")
             .env("SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY_MS", "750")
+            .env(
+                "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_CONTINUE_FILE",
+                &continuation,
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the descendant directory scan"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination descendant scan was not reached before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination scan directory");
 
         fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
         assert!(
@@ -14136,29 +14045,23 @@ fn native_map_scans_the_pinned_selection_after_path_replacement() {
     write(&t.path("selected/original.txt"), b"original");
     write(&t.path("outside/outside.txt"), b"outside");
     let ready = t.path("map-ready");
+    let continuation = t.path("continue");
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""))
         .env("SYQ_TEST_MAP_SELECTION_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_MAP_SELECTION_MS", "750")
+        .env("SYQ_TEST_MAP_SELECTION_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq map exited before pinning its selection"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "syq map did not reach the selection hook");
+    wait_for_confinement_marker(&mut child, &ready, "map selection");
 
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     symlink("outside", t.path("selected")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     let lines = map_lines(&output);
     let sources: Vec<_> = lines.iter().map(|line| map_path(line, "src")).collect();
