@@ -39,7 +39,7 @@ postcard = { version = "1", features = ["alloc", "use-std"] }
 jwalk = "0.9"
 rayon = "1.12"
 ignore = "0.4"
-blake3 = { version = "1", features = ["rayon"] }
+blake3 = "1"
 zstd = "0.13"
 libc = "0.2"
 shell-words = "1"

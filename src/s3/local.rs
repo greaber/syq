@@ -97,25 +97,13 @@ impl Source {
 
 pub(super) fn hash_file(mut file: File) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    let parallel = file.metadata()?.len() >= 32 * 1024 * 1024;
-    let mut buffer = vec![
-        0;
-        if parallel {
-            8 * 1024 * 1024
-        } else {
-            1024 * 1024
-        }
-    ];
+    let mut buffer = vec![0; 1024 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
         }
-        if parallel {
-            hasher.update_rayon(&buffer[..n]);
-        } else {
-            hasher.update(&buffer[..n]);
-        }
+        hasher.update(&buffer[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
