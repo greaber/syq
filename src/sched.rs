@@ -51,8 +51,26 @@ pub enum Item {
     Exit,
 }
 
+/// Tie-break equal-sized files by spreading out their planning indices.
+/// Scans usually group neighboring files by directory; taking those neighbors
+/// together makes workers contend on the same directory's create/rename locks.
+/// Bit reversal interleaves distant parts of that order without extra queue
+/// storage or changing the jobs' stable indices. File size remains primary.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileOrder(usize);
+
+impl FileOrder {
+    fn new(idx: usize) -> Self {
+        Self(idx.reverse_bits())
+    }
+
+    fn index(self) -> usize {
+        self.0.reverse_bits()
+    }
+}
+
 struct Inner {
-    files: BinaryHeap<(u64, Reverse<usize>)>,
+    files: BinaryHeap<(u64, Reverse<FileOrder>)>,
     ranges: Vec<(usize, u64, u64)>,
     finishes: Vec<(usize, bool)>,
     inflight: Vec<RangeHandle>,
@@ -129,7 +147,11 @@ impl Sched {
             jobs.push(job);
             jobs.len() - 1
         };
-        self.inner.lock().unwrap().files.push((size, Reverse(idx)));
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .push((size, Reverse(FileOrder::new(idx))));
         self.cv.notify_one();
         idx
     }
@@ -216,7 +238,11 @@ impl Sched {
 
     pub fn requeue(&self, idx: usize) {
         let size = self.jobs.lock().unwrap()[idx].entry.size;
-        self.inner.lock().unwrap().files.push((size, Reverse(idx)));
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .push((size, Reverse(FileOrder::new(idx))));
         self.cv.notify_one();
     }
 
@@ -360,7 +386,8 @@ impl Sched {
                 if let Some((idx, matched)) = g.finishes.pop() {
                     return Item::Finish { idx, matched };
                 }
-                if let Some((_, Reverse(idx))) = g.files.pop() {
+                if let Some((_, Reverse(order))) = g.files.pop() {
+                    let idx = order.index();
                     g.probing += 1;
                     return Item::File(idx);
                 }
@@ -416,7 +443,8 @@ impl Sched {
         while out.len() < max_n {
             match g.files.peek() {
                 Some(&(size, _)) if size <= max_size && bytes + size <= max_bytes => {
-                    let (size, Reverse(idx)) = g.files.pop().unwrap();
+                    let (size, Reverse(order)) = g.files.pop().unwrap();
+                    let idx = order.index();
                     bytes += size;
                     g.probing += 1;
                     out.push(idx);
@@ -524,6 +552,138 @@ impl Sched {
 mod tests {
     use super::*;
 
+    fn test_job(size: u64) -> FileJob {
+        FileJob {
+            src: b"source".to_vec(),
+            source: RegisteredPath {
+                root: serde_json::from_str("0").unwrap(),
+                relative: b"source".to_vec(),
+            },
+            dst: b"destination".to_vec(),
+            rel: "destination".into(),
+            rel_bytes: b"destination".to_vec(),
+            src_rel: None,
+            entry: Entry {
+                path: Vec::new(),
+                kind: crate::proto::Kind::File,
+                size,
+                mtime: 0,
+                mtime_nsec: 0,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                dev: 1,
+                ino: 1,
+                ctime: 0,
+                ctime_nsec: 0,
+                link: None,
+            },
+            dst_entry: None,
+            target_condition: crate::proto::TargetCondition::Any,
+            container_guard: None,
+            attempt: 0,
+            done: Arc::new(AtomicU64::new(0)),
+            inplace: false,
+        }
+    }
+
+    #[test]
+    fn equal_size_files_spread_across_directory_groups() {
+        let sched = Sched::new(64, 128);
+        // Model a scan of sixteen directories, sixteen files in each.
+        for _ in 0..256 {
+            sched.push_file(test_job(4096));
+        }
+        sched.scan_done();
+        let mut directories = HashSet::new();
+        for _ in 0..16 {
+            let Item::File(idx) = sched.next() else {
+                panic!("missing file")
+            };
+            directories.insert(idx / 16);
+            sched.ranges_ready(idx, Vec::new());
+        }
+        assert_eq!(
+            directories.len(),
+            16,
+            "workers should start in distinct directory groups"
+        );
+    }
+
+    #[test]
+    fn reordered_batches_preserve_size_priority_limits_and_every_index() {
+        let sched = Sched::new(64, 128);
+        // Include zero-length files, repeated sizes, and a non-power-of-two count.
+        let sizes: Vec<_> = (0..257).map(|i| (i % 7) * 1024).collect();
+        for &size in &sizes {
+            sched.push_file(test_job(size));
+        }
+        sched.scan_done();
+        assert!(sched.take_small(4096, 10, u64::MAX).is_empty());
+        let mut seen = HashSet::new();
+        let mut previous = u64::MAX;
+        while let Item::File(first) = sched.next() {
+            let mut batch = vec![first];
+            let extra = sched.take_small(sizes[first], 11, 8192);
+            assert!(extra.len() <= 11);
+            assert!(extra.iter().map(|&idx| sizes[idx]).sum::<u64>() <= 8192);
+            batch.extend(extra);
+            for idx in batch {
+                assert!(seen.insert(idx), "duplicate job {idx}");
+                assert!(
+                    sizes[idx] <= previous,
+                    "file size must remain the primary priority"
+                );
+                previous = sizes[idx];
+                sched.ranges_ready(idx, Vec::new());
+            }
+        }
+        assert_eq!(seen.len(), sizes.len());
+        assert!(sched.finished());
+    }
+
+    #[test]
+    fn requeued_files_keep_their_identity_with_concurrent_batch_consumers() {
+        let sched = Arc::new(Sched::new(64, 128));
+        for idx in 0..257 {
+            let mut job = test_job(4096);
+            job.done.store(idx as u64, Relaxed);
+            job.rel = idx.to_string();
+            sched.push_file(job);
+        }
+        sched.scan_done();
+        let seen = Mutex::new(Vec::new());
+        let retried = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while let Item::File(first) = sched.next() {
+                        let mut batch = vec![first];
+                        batch.extend(sched.take_small(4096, 3, 3 * 4096));
+                        for idx in batch {
+                            let jobs = sched.jobs.lock().unwrap();
+                            assert_eq!(jobs[idx].rel, idx.to_string());
+                            assert_eq!(jobs[idx].done.load(Relaxed), idx as u64);
+                            drop(jobs);
+                            seen.lock().unwrap().push(idx);
+                            if idx == 17 && !retried.swap(true, Relaxed) {
+                                sched.requeue(idx);
+                            }
+                            sched.ranges_ready(idx, Vec::new());
+                        }
+                    }
+                });
+            }
+        });
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_unstable();
+        let mut expected: Vec<_> = (0..257).chain(std::iter::once(17)).collect();
+        expected.sort_unstable();
+        assert_eq!(seen, expected);
+        assert!(sched.finished());
+    }
+
     #[test]
     fn failed_or_aborted_ranges_never_elect_a_publisher() {
         for abort in [false, true] {
@@ -609,7 +769,7 @@ mod tests {
                 let mut inner = sched.inner.lock().unwrap();
                 inner.probing = 1;
                 if queued_file {
-                    inner.files.push((64 << 20, Reverse(1)));
+                    inner.files.push((64 << 20, Reverse(FileOrder::new(1))));
                 }
             }
             sched.reserve_initial_ranges(8);
@@ -703,8 +863,8 @@ mod tests {
         {
             let mut inner = sched.inner.lock().unwrap();
             inner.scan_done = true;
-            inner.files.push((100, Reverse(0)));
-            inner.files.push((100, Reverse(1)));
+            inner.files.push((100, Reverse(FileOrder::new(0))));
+            inner.files.push((100, Reverse(FileOrder::new(1))));
         }
         assert!(sched.work_left_for(2, 1_200, 512));
         assert!(!sched.work_left_for(2, 1_300, 512));
@@ -730,7 +890,12 @@ mod tests {
         assert!(sched.needs_worker_capacity());
         sched.inner.lock().unwrap().probing -= 1;
 
-        sched.inner.lock().unwrap().files.push((100, Reverse(0)));
+        sched
+            .inner
+            .lock()
+            .unwrap()
+            .files
+            .push((100, Reverse(FileOrder::new(0))));
         assert!(sched.needs_worker_capacity());
     }
 
@@ -741,7 +906,7 @@ mod tests {
             let mut inner = sched.inner.lock().unwrap();
             inner.scan_done = true;
             for idx in 0..2000 {
-                inner.files.push((4096, Reverse(idx)));
+                inner.files.push((4096, Reverse(FileOrder::new(idx))));
             }
         }
 
