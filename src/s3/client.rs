@@ -47,6 +47,13 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
     }
     let shared = loader.load().await;
     let mut config = aws_sdk_s3::config::Builder::from(&shared)
+        .http_client(
+            aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                ))
+                .build_with_resolver(super::dns::CoalescingDns::default()),
+        )
         .region(
             shared
                 .region()

@@ -1,4 +1,5 @@
 use super::{
+    checksum::Algorithm,
     client::{self, Metadata, Object},
     local::{self, Destination, Source},
     state::State,
@@ -16,11 +17,9 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_types::byte_stream::Length;
-use base64::Engine as _;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -48,13 +47,30 @@ struct Download {
     path: String,
     size: u64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
     schema: u32,
     digest: String,
     part_size: u64,
     upload_id: String,
     metadata: Metadata,
+    #[serde(default, skip_serializing_if = "Algorithm::is_sha256")]
+    algorithm: Algorithm,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    completed: BTreeMap<i32, UploadedPart>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct UploadedPart {
+    etag: String,
+    checksum: String,
+    length: u64,
+}
+impl UploadState {
+    fn acknowledged_part(&self, number: i32, etag: &str, checksum: &str, length: u64) -> bool {
+        self.completed
+            .get(&number)
+            .is_some_and(|p| p.etag == etag && p.checksum == checksum && p.length == length)
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct DownloadState {
@@ -352,12 +368,13 @@ impl Engine {
             bail!("file exceeds the S3 multipart size limit");
         }
         let source_clone = source.clone();
+        let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
         let (digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
                 let bytes = source_clone.bytes()?;
                 return Ok((
                     blake3::hash(&bytes).to_hex().to_string(),
-                    vec![sha256(&bytes)],
+                    vec![algorithm.digest(&bytes)],
                     Some(bytes),
                 ));
             }
@@ -375,7 +392,7 @@ impl Engine {
                                 let offset = index * part_size;
                                 let length = part_size.min(size - offset);
                                 let mut buffer = vec![0; 1024 * 1024];
-                                let mut hash = Sha256::new();
+                                let mut hash = algorithm.hasher();
                                 let mut done = 0;
                                 while done < length {
                                     let n = buffer.len().min((length - done) as usize);
@@ -384,8 +401,7 @@ impl Engine {
                                     done += n as u64;
                                 }
                                 source_clone.check(&file)?;
-                                Ok(base64::engine::general_purpose::STANDARD
-                                    .encode(hash.finalize()))
+                                Ok(hash.finish())
                             })
                             .collect::<Result<Vec<_>>>()
                     },
@@ -399,7 +415,7 @@ impl Engine {
             let mut parts = Vec::new();
             let mut remaining = size;
             while remaining > 0 {
-                let mut part = Sha256::new();
+                let mut part = algorithm.hasher();
                 let mut left = remaining.min(part_size);
                 while left > 0 {
                     let want = buffer.len().min(left as usize);
@@ -408,11 +424,11 @@ impl Engine {
                     part.update(&buffer[..want]);
                     left -= want as u64;
                 }
-                parts.push(base64::engine::general_purpose::STANDARD.encode(part.finalize()));
+                parts.push(part.finish());
                 remaining = remaining.saturating_sub(part_size);
             }
             if size == 0 {
-                parts.push(sha256(&[]));
+                parts.push(algorithm.digest(&[]));
             }
             source_clone.check(&file)?;
             Ok((whole.finalize().to_hex().to_string(), parts, None))
@@ -467,7 +483,8 @@ impl Engine {
                     .key(&source.key)
                     .body(body)
                     .content_length(size as i64)
-                    .checksum_sha256(&checksums[0])
+                    .set_checksum_sha256(algorithm.is_sha256().then(|| checksums[0].clone()))
+                    .set_content_md5((algorithm == Algorithm::Md5).then(|| checksums[0].clone()))
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .send()
@@ -489,10 +506,14 @@ impl Engine {
             let state = State::open(&self.identity(&source.key, "upload"))?;
             let mut previous: Option<UploadState> = state.load()?;
             if let Some(old) = &previous {
-                if old.schema != 1 {
+                if old.schema != old.algorithm.schema() {
                     bail!("unsupported S3 upload recovery schema");
                 }
-                if old.digest != digest || old.part_size != part_size || old.metadata != metadata {
+                if old.digest != digest
+                    || old.part_size != part_size
+                    || old.metadata != metadata
+                    || old.algorithm != algorithm
+                {
                     match self
                         .client
                         .abort_multipart_upload()
@@ -532,10 +553,15 @@ impl Engine {
                     match result {
                         Ok(output) => {
                             for p in output.parts() {
-                                if let (Some(number), Some(etag), Some(checksum)) =
-                                    (p.part_number(), p.e_tag(), p.checksum_sha256())
-                                {
-                                    uploaded.insert(number, (etag.to_owned(), checksum.to_owned()));
+                                if let (Some(number), Some(etag)) = (p.part_number(), p.e_tag()) {
+                                    uploaded.insert(
+                                        number,
+                                        (
+                                            etag.to_owned(),
+                                            p.checksum_sha256().map(str::to_owned),
+                                            p.size().and_then(|n| u64::try_from(n).ok()),
+                                        ),
+                                    );
                                 }
                             }
                             if output.is_truncated() != Some(true) {
@@ -570,17 +596,23 @@ impl Engine {
                     .bucket(&self.options.bucket)
                     .key(&source.key)
                     .set_metadata(Some(metadata.encode()))
-                    .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+                    .set_checksum_algorithm(
+                        algorithm
+                            .is_sha256()
+                            .then_some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256),
+                    )
                     .send()
                     .await
                     .map_err(|e| e.into_service_error())
                     .context("create multipart upload")?;
                 let record = UploadState {
-                    schema: 1,
+                    schema: algorithm.schema(),
                     digest,
                     part_size,
                     metadata: metadata.clone(),
                     upload_id: output.upload_id().context("S3 omitted upload ID")?.into(),
+                    algorithm,
+                    completed: BTreeMap::new(),
                 };
                 if let Err(error) = state.save(&record) {
                     self.client
@@ -598,22 +630,35 @@ impl Engine {
                 }
                 record
             };
+            let saved_parts = Mutex::new(upload.completed.clone());
             let completed = stream::iter(checksums.into_iter().enumerate())
                 .map(|(index, checksum)| {
                     let source = &source;
                     let upload = &upload;
                     let uploaded = &uploaded;
+                    let saved_parts = &saved_parts;
+                    let state = &state;
                     async move {
                         let number = index as i32 + 1;
                         let offset = index as u64 * part_size;
                         let length = part_size.min(size - offset);
-                        if let Some((etag, old_checksum)) = uploaded.get(&number) {
-                            if old_checksum == &checksum {
+                        if let Some((etag, old_checksum, old_length)) = uploaded.get(&number) {
+                            let matches = match algorithm {
+                                Algorithm::Sha256 => old_checksum.as_ref() == Some(&checksum),
+                                // An ETag is opaque. Reuse only an acknowledged
+                                // part from this exact source/recovery record.
+                                Algorithm::Md5 => {
+                                    upload.acknowledged_part(number, etag, &checksum, length)
+                                }
+                            };
+                            if matches && *old_length == Some(length) {
                                 self.progress.bytes_unchanged.fetch_add(length, Relaxed);
                                 return Ok(CompletedPart::builder()
                                     .part_number(number)
                                     .e_tag(etag)
-                                    .checksum_sha256(&checksum)
+                                    .set_checksum_sha256(
+                                        algorithm.is_sha256().then(|| checksum.clone()),
+                                    )
                                     .build());
                             }
                         }
@@ -630,16 +675,38 @@ impl Engine {
                                 .part_number(number)
                                 .body(body)
                                 .content_length(length as i64)
-                                .checksum_sha256(&checksum)
+                                .set_checksum_sha256(
+                                    algorithm.is_sha256().then(|| checksum.clone()),
+                                )
+                                .set_content_md5(
+                                    (algorithm == Algorithm::Md5).then(|| checksum.clone()),
+                                )
                                 .send()
                                 .await;
                             match result {
                                 Ok(output) => {
+                                    let etag = output.e_tag().context("S3 part omitted ETag")?;
+                                    if algorithm == Algorithm::Md5 {
+                                        let mut parts = saved_parts.lock().await;
+                                        parts.insert(
+                                            number,
+                                            UploadedPart {
+                                                etag: etag.into(),
+                                                checksum: checksum.clone(),
+                                                length,
+                                            },
+                                        );
+                                        let mut record = upload.clone();
+                                        record.completed = parts.clone();
+                                        state.save(&record)?;
+                                    }
                                     self.progress.add_bytes(length);
                                     return Ok(CompletedPart::builder()
                                         .part_number(number)
-                                        .e_tag(output.e_tag().context("S3 part omitted ETag")?)
-                                        .checksum_sha256(&checksum)
+                                        .e_tag(etag)
+                                        .set_checksum_sha256(
+                                            algorithm.is_sha256().then(|| checksum.clone()),
+                                        )
                                         .build());
                                 }
                                 Err(e)
@@ -1461,9 +1528,6 @@ impl std::error::Error for Permanent {}
 fn retryable_status(status: Option<u16>) -> bool {
     status.is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
 }
-fn sha256(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
-}
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();
     let file = tokio::task::spawn_blocking(move || source.open()).await??;
@@ -1538,5 +1602,47 @@ impl Drop for PartialCleanup<'_> {
         {
             let _ = self.root.unlink(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_unchanged_upload_record_from_4be9e58() {
+        let fixture = include_str!("../../tests/fixtures/s3-upload-v1.json");
+        let record: UploadState = serde_json::from_str(fixture).unwrap();
+        assert_eq!(record.schema, 1);
+        assert_eq!(record.algorithm, Algorithm::Sha256);
+        assert!(record.completed.is_empty());
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::from_str::<serde_json::Value>(fixture).unwrap()
+        );
+    }
+
+    #[test]
+    fn md5_recovery_requires_acknowledged_opaque_etag_checksum_and_length() {
+        let mut record: UploadState =
+            serde_json::from_str(include_str!("../../tests/fixtures/s3-upload-v1.json")).unwrap();
+        record.algorithm = Algorithm::Md5;
+        record.schema = record.algorithm.schema();
+        record.completed.insert(
+            1,
+            UploadedPart {
+                etag: "opaque-etag".into(),
+                checksum: "checksum".into(),
+                length: 42,
+            },
+        );
+        let record: UploadState =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        assert_eq!(record.schema, 2); // The earlier binary rejects this schema.
+        assert!(record.acknowledged_part(1, "opaque-etag", "checksum", 42));
+        assert!(!record.acknowledged_part(2, "opaque-etag", "checksum", 42));
+        assert!(!record.acknowledged_part(1, "replaced-etag", "checksum", 42));
+        assert!(!record.acknowledged_part(1, "opaque-etag", "changed", 42));
+        assert!(!record.acknowledged_part(1, "opaque-etag", "checksum", 41));
     }
 }

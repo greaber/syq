@@ -96,8 +96,9 @@ using the object's modification time and the local umask. A zero-byte key
 ending in `/` is treated as a directory marker. Unknown syq metadata versions
 fail explicitly; syq does not guess how to restore them.
 
-Uploads compute SHA-256 checksums for the service to validate and record a
-whole-file BLAKE3 digest. Downloads check range boundaries, lengths and object
+Uploads send checksums for the service to validate: SHA-256, or Content-MD5
+with Cloudflare R2 endpoints. They also record a whole-file BLAKE3 digest.
+Downloads check range boundaries, lengths and object
 identity, then validate the stored digest when present before publishing the
 file. ETags identify the object being read; syq does not assume they are content
 hashes. Without syq metadata, syq cannot supply an independent whole-file digest
