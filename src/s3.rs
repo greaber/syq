@@ -235,12 +235,19 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             engine.run(workers).await
         })
     })();
+    let fatal = result.is_err();
     if let Err(error) = result {
         progress.error(&format!("syq: {error:#}"));
     }
     progress.scan_done.store(true, Relaxed);
     let errors = progress.errors.load(Relaxed);
-    let code = i32::from(errors != 0);
+    let code = if fatal {
+        1
+    } else if errors != 0 {
+        23
+    } else {
+        0
+    };
     progress.finish(code == 0);
     if let Some(ticker) = ticker {
         ticker
@@ -249,7 +256,11 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     }
     if let Some(writer) = progress.results_writer() {
         writer.emit_result(&crate::results::ResultRecord {
-            status: if code == 0 { "success" } else { "failed" },
+            status: match code {
+                0 => "success",
+                23 => "partial",
+                _ => "failed",
+            },
             exit_code: code,
             dry_run: args.dry_run,
             files_transferred: progress.files_done.load(Relaxed),

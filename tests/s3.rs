@@ -340,6 +340,11 @@ fn s3_bad_responses_preserve_existing_destination() {
             std::fs::read(temp.path().join("download")).unwrap(),
             b"original"
         );
+        assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+        let records = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(terminal["status"], "partial");
         validate_results(temp.path());
     }
 }
