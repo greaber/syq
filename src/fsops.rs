@@ -42,16 +42,6 @@ pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> boo
     source / precision == destination / precision
 }
 
-// Apply the gate only to staged range writes, after block verification. Native
-// copies, small-file writes and in-place writes retain their existing paths.
-fn write_received_range(file: &File, data: &[u8], offset: u64, _inplace: bool) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    if !_inplace {
-        return crate::write_gate::write_all_at(file, data, offset);
-    }
-    file.write_all_at(data, offset)
-}
-
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
 const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;
@@ -6102,7 +6092,7 @@ impl FsOps {
                 rooted_partial_target(&rooted, target.id)?
             };
             let file = self.cached_rooted(&label, &rooted.root, &relative, attempt, !inplace)?;
-            return write_received_range(file, data, off, inplace)
+            return crate::write_gate::write_all_at(file, data, off)
                 .with_context(|| format!("write {} @{off}", label.display()));
         }
         let p = resolve(target.path);
@@ -6112,7 +6102,7 @@ impl FsOps {
             self.partial_path(&p, target.id)?
         };
         let f = self.cached(&p, true, attempt, !inplace)?;
-        write_received_range(f, data, off, inplace)
+        crate::write_gate::write_all_at(f, data, off)
             .with_context(|| format!("write {} @{off}", p.display()))
     }
 

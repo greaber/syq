@@ -368,6 +368,9 @@ new file. Readers can see a mixture of old and new contents during the copy.
 If interrupted, the incomplete file stays at its final name until you finish
 the copy. Writes through a hard link also affect its other names.
 
+On Linux, local copies and copies over TCP limit concurrent writes to each file,
+including with `--inplace`, to reduce CPU use.
+
 Use the default when other programs need to read a complete file throughout
 an update. [Copies sent back to your laptop](receive.md) do not support `--inplace`.
 

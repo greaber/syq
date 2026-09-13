@@ -46,7 +46,6 @@ mod transfer_tuning;
 mod tune;
 mod update;
 mod wire_budget;
-#[cfg(target_os = "linux")]
 mod write_gate;
 
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
