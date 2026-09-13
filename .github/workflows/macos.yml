@@ -30,7 +30,9 @@ jobs:
           scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
           # ci-scope output is a machine-readable boolean contract.
           needed=false
-          for key in native sdks tooling shellcheck mapping_docs; do
+          # Mapping examples and shell-lint-only changes have focused Linux
+          # checks. They do not need the complete native/SDK macOS suite.
+          for key in native sdks tooling; do
             if [[ $'\n'"$scope"$'\n' == *$'\n'"$key=true"$'\n'* ]]; then
               needed=true
             fi
