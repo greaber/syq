@@ -10,6 +10,7 @@ use crate::rooted::{
     read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
     PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
+use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
@@ -1488,7 +1489,7 @@ fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
-    fds: HashMap<FdKey, File>,
+    fds: HashMap<FdKey, CachedFile>,
     fd_order: Vec<FdKey>,
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
@@ -3007,7 +3008,13 @@ impl FsOps {
         }
     }
 
-    fn cached(&mut self, p: &Path, write: bool, attempt: u32, private: bool) -> Result<&File> {
+    fn cached(
+        &mut self,
+        p: &Path,
+        write: bool,
+        attempt: u32,
+        private: bool,
+    ) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Path(p.to_path_buf()),
             attempt,
@@ -3022,7 +3029,7 @@ impl FsOps {
             if private {
                 require_safe_partial(&f, p)?;
             }
-            self.fds.insert(key.clone(), f);
+            self.fds.insert(key.clone(), CachedFile::new(f));
             self.fd_order.push(key.clone());
         }
         Ok(self.fds.get(&key).unwrap())
@@ -3039,7 +3046,7 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.insert(key.clone(), file);
+        self.fds.insert(key.clone(), CachedFile::new(file));
         self.fd_order.push(key);
     }
 
@@ -3054,7 +3061,10 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.get(&key).map(File::try_clone).transpose()
+        self.fds
+            .get(&key)
+            .map(|file| file.file().try_clone())
+            .transpose()
     }
 
     fn uncache(&mut self, p: &Path) -> Option<File> {
@@ -3072,7 +3082,11 @@ impl FsOps {
         let mut removed = None;
         self.fd_order.retain(|key| {
             if &key.location == location {
-                removed = self.fds.remove(key).or(removed.take());
+                removed = self
+                    .fds
+                    .remove(key)
+                    .map(CachedFile::into_file)
+                    .or(removed.take());
                 false
             } else {
                 true
@@ -3088,7 +3102,7 @@ impl FsOps {
         relative: &RelativePath,
         attempt: u32,
         private: bool,
-    ) -> Result<&File> {
+    ) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Rooted {
                 root: root.identity(),
@@ -3111,7 +3125,7 @@ impl FsOps {
                     bail!("partial {} changed while opening it", label.display());
                 }
             }
-            self.fds.insert(key.clone(), file);
+            self.fds.insert(key.clone(), CachedFile::new(file));
             self.fd_order.push(key.clone());
         }
         Ok(self.fds.get(&key).unwrap())
@@ -3137,11 +3151,13 @@ impl FsOps {
                 let victim = self.fd_order.remove(0);
                 self.fds.remove(&victim);
             }
-            self.fds
-                .insert(key.clone(), open_registered_source(target)?);
+            self.fds.insert(
+                key.clone(),
+                CachedFile::new(open_registered_source(target)?),
+            );
             self.fd_order.push(key.clone());
         }
-        Ok(self.fds.get(&key).unwrap())
+        Ok(self.fds.get(&key).unwrap().file())
     }
 
     /// Batches are statted on several threads: on network filesystems each
@@ -6058,7 +6074,7 @@ impl FsOps {
         } else {
             // This is either a pre-registration test/control operation or the
             // explicit rsync --insecure-links compatibility path.
-            self.cached(&p, false, attempt, false)?
+            self.cached(&p, false, attempt, false)?.file()
         };
         let mut data = vec![0u8; len as usize];
         f.read_exact_at(&mut data, off)
@@ -6085,26 +6101,28 @@ impl FsOps {
         if content_digest(data) != hash {
             bail!("block hash mismatch on receive @{off}");
         }
-        if let Some(rooted) = self.rooted_destination_target(target.path, target.guard)? {
+        let (file, label) = if let Some(rooted) =
+            self.rooted_destination_target(target.path, target.guard)?
+        {
             let (relative, label) = if inplace {
                 (rooted.relative.clone(), rooted.label.clone())
             } else {
                 rooted_partial_target(&rooted, target.id)?
             };
             let file = self.cached_rooted(&label, &rooted.root, &relative, attempt, !inplace)?;
-            return file
-                .write_all_at(data, off)
-                .with_context(|| format!("write {} @{off}", label.display()));
-        }
-        let p = resolve(target.path);
-        let p = if inplace {
-            p
+            (file, label)
         } else {
-            self.partial_path(&p, target.id)?
+            let path = resolve(target.path);
+            let label = if inplace {
+                path
+            } else {
+                self.partial_path(&path, target.id)?
+            };
+            let file = self.cached(&label, true, attempt, !inplace)?;
+            (file, label)
         };
-        let f = self.cached(&p, true, attempt, !inplace)?;
-        f.write_all_at(data, off)
-            .with_context(|| format!("write {} @{off}", p.display()))
+        file.write_range_at(data, off)
+            .with_context(|| format!("write {} @{off}", label.display()))
     }
 
     fn finalize(
@@ -9164,12 +9182,14 @@ mod tests {
         let first_inode = operations
             .cached_rooted(Path::new("same"), &first_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();
         let second_inode = operations
             .cached_rooted(Path::new("same"), &second_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();

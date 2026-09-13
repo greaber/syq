@@ -46,6 +46,7 @@ mod transfer_tuning;
 mod tune;
 mod update;
 mod wire_budget;
+mod write_gate;
 
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
