@@ -7141,7 +7141,7 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
-fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
         return Ok(());
     }

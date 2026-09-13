@@ -493,15 +493,25 @@ impl Engine {
                     bail!("unsupported S3 upload recovery schema");
                 }
                 if old.digest != digest || old.part_size != part_size || old.metadata != metadata {
-                    self.client
+                    match self
+                        .client
                         .abort_multipart_upload()
                         .bucket(&self.options.bucket)
                         .key(&source.key)
                         .upload_id(&old.upload_id)
                         .send()
                         .await
-                        .map_err(|e| e.into_service_error())
-                        .context("abort obsolete multipart upload")?;
+                    {
+                        Ok(_) => {}
+                        Err(error)
+                            if error
+                                .raw_response()
+                                .is_some_and(|r| r.status().as_u16() == 404) => {}
+                        Err(error) => {
+                            return Err(error.into_service_error())
+                                .context("abort obsolete multipart upload")
+                        }
+                    }
                     state.clear()?;
                     previous = None;
                 }
@@ -1151,9 +1161,8 @@ impl Engine {
                 bail!("source object changed during download");
             }
         }
-        local::apply_metadata(
-            root,
-            &partial_path,
+        local::apply_file_metadata(
+            &file,
             &metadata,
             &self.args,
             existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
@@ -1222,7 +1231,7 @@ impl Engine {
             {
                 bail!("download checksum mismatch");
             }
-            local::apply_metadata(root, &partial, metadata, &self.args, mode)?;
+            local::apply_file_metadata(&file, metadata, &self.args, mode)?;
             let m = file.metadata()?;
             if self.args.ignore_existing || self.args.target_existence == Existence::New {
                 root.publish_new_regular(&partial, path, (m.dev(), m.ino()))?;

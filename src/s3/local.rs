@@ -436,6 +436,14 @@ pub(super) fn apply_metadata(
     args: &Args,
     existing_mode: Option<u32>,
 ) -> Result<()> {
+    if metadata.kind == "file" {
+        return apply_file_metadata(
+            &root.open_regular_read(path)?,
+            metadata,
+            args,
+            existing_mode,
+        );
+    }
     if args.owner || args.group {
         root.chown(
             path,
@@ -470,4 +478,34 @@ pub(super) fn apply_metadata(
         ],
     )?;
     Ok(())
+}
+
+// Use the file we wrote, so replacement of a temporary pathname cannot redirect
+// chmod, chown or timestamp restoration to a different inode.
+pub(super) fn apply_file_metadata(
+    file: &File,
+    metadata: &Metadata,
+    args: &Args,
+    existing_mode: Option<u32>,
+) -> Result<()> {
+    use crate::proto::{flags, Meta};
+    let mode = if args.perms {
+        metadata.mode
+    } else {
+        existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
+    };
+    crate::fsops::set_meta_file(
+        file,
+        &Meta {
+            mode,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            mtime: metadata.mtime,
+            mtime_nsec: metadata.nsec,
+        },
+        flags::MODE
+            | flags::TIMES
+            | if args.owner { flags::OWNER } else { 0 }
+            | if args.group { flags::GROUP } else { 0 },
+    )
 }

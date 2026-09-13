@@ -18,6 +18,7 @@ struct Server {
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
+    gate: Arc<(AtomicBool, AtomicBool)>,
 }
 impl Server {
     fn start(fault: &'static str) -> Self {
@@ -26,6 +27,8 @@ impl Server {
         let address = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((AtomicBool::new(false), AtomicBool::new(false)));
+        let worker_gate = gate.clone();
         let stopping = stop.clone();
         let count = requests.clone();
         let handle = thread::spawn(move || {
@@ -34,7 +37,8 @@ impl Server {
                 match listener.accept() {
                     Ok((socket, _)) => {
                         let count = count.clone();
-                        workers.push(thread::spawn(move || serve(socket, fault, count)));
+                        let gate = worker_gate.clone();
+                        workers.push(thread::spawn(move || serve(socket, fault, count, gate)));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2))
@@ -51,6 +55,7 @@ impl Server {
             stop,
             requests,
             thread: Some(handle),
+            gate,
         }
     }
     fn cp(&self, temp: &Path, args: &[&str]) -> Output {
@@ -93,7 +98,12 @@ impl Drop for Server {
 }
 
 const SIZE: usize = 6 * 1024 * 1024 + 7;
-fn serve(mut socket: TcpStream, fault: &str, requests: Arc<AtomicUsize>) {
+fn serve(
+    mut socket: TcpStream,
+    fault: &str,
+    requests: Arc<AtomicUsize>,
+    gate: Arc<(AtomicBool, AtomicBool)>,
+) {
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -163,6 +173,27 @@ fn serve(mut socket: TcpStream, fault: &str, requests: Arc<AtomicUsize>) {
     }
     assert_eq!(method, "GET");
     let Some(range) = headers.get("range") else {
+        if fault == "single-swap" {
+            let mut head =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n");
+            for (name, value) in &fields {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(&data[..size / 2]).unwrap();
+            gate.0.store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !gate.1.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                gate.1.load(Ordering::Acquire),
+                "pathname-swap fixture timed out awaiting release"
+            );
+            let _ = socket.write_all(&data[size / 2..]);
+            return;
+        }
         let mut data = data;
         if fault == "single-corrupt" {
             data[0] = b'!';
@@ -401,4 +432,62 @@ fn s3_single_get_validates_metadata_length_and_contents() {
             .to_string_lossy()
             .ends_with(".partial")));
     }
+}
+
+#[test]
+fn s3_temporary_name_replacement_cannot_redirect_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start("single-swap");
+    let temp = tempfile::tempdir().unwrap();
+    let victim = temp.path().join("victim");
+    std::fs::write(&victim, b"keep this inode untouched").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    thread::scope(|scope| {
+        let copy = scope.spawn(|| {
+            server.cp(
+                temp.path(),
+                &[
+                    "--from",
+                    "s3://bucket",
+                    "object",
+                    "--as",
+                    "result",
+                    "--preserve=permissions",
+                ],
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut replaced = false;
+        while std::time::Instant::now() < deadline {
+            if server.gate.0.load(Ordering::Acquire) {
+                let partial = std::fs::read_dir(temp.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name().to_string_lossy().ends_with(".partial"));
+                if let Some(partial) = partial {
+                    std::fs::rename(partial.path(), temp.path().join("original-inode")).unwrap();
+                    std::fs::hard_link(&victim, partial.path()).unwrap();
+                    replaced = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        server.gate.1.store(true, Ordering::Release);
+        let output = copy.join().unwrap();
+        assert!(
+            replaced,
+            "temporary file did not appear before the fixture deadline"
+        );
+        assert!(!output.status.success(), "{}", output_text(&output));
+    });
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"keep this inode untouched"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(!temp.path().join("result").exists());
 }

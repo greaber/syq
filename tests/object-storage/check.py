@@ -177,6 +177,12 @@ def check():
                 assert actual.stat().st_mode & 0o7777 == path.stat().st_mode & 0o7777
                 assert actual.stat().st_mtime_ns == path.stat().st_mtime_ns
         run(['--from', remote, placement + '/source', '--into', dst, '--verify-only'])
+        owned = root / 'owned'
+        owned.mkdir()
+        run(['--from', remote, placement + '/source', '--as', owned, '--preserve=ownership'])
+        assert owned.stat().st_uid == src.stat().st_uid
+        assert owned.stat().st_gid == src.stat().st_gid
+
         # The independent reader sees ordinary object bytes and metadata.
         hdr, body = request('GET', placement + '/source/script')
         assert body == (src / 'script').read_bytes()
@@ -251,6 +257,17 @@ def check():
         terminal=json.loads(result_file.read_text().splitlines()[-1])
         assert terminal['bytes_transferred'] < (src/'large').stat().st_size, terminal
         assert download_path.read_bytes()==(src/'large').read_bytes()
+        # Provider lifecycle expiry must not strand a changed-source retry.
+        expired_key = PREFIX + '/expired-upload'
+        interrupted([src / 'large', '--to', remote, '--as', expired_key])
+        records = [json.loads(path.read_text()) for path in (root / 'cache/syq/s3').glob('*.json')]
+        expired_id = next(record['upload_id'] for record in records if 'upload_id' in record)
+        OWNED_UPLOADS.add((expired_key, expired_id))
+        request('DELETE', expired_key, query={'uploadId': expired_id})
+        os.utime(src / 'large', ns=(1_500_000_000_000000000, 1_500_000_000_000000000))
+        run([src / 'large', '--to', remote, '--as', expired_key])
+        _, body = request('GET', expired_key)
+        assert body == (src / 'large').read_bytes()
         print('S3 roundtrip, interoperability, metadata, mapping, policies, path confinement, and resume passed', flush=True)
 
 
