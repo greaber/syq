@@ -155,6 +155,13 @@ Authorization continues through retries and resumed turns for the same release
 and ends when it completes or is cancelled. Another release requires another
 invocation. Read-only or dry-run invocations stay within their stated scope.
 
+During release preparation, compare `CHANGELOG.md` with all changes since the
+previous published release. Include user-facing fixes, performance improvements,
+and consequential behavior or compatibility changes. Finalize the entry with
+the release version and date, and use it to prepare the GitHub release notes.
+Do not treat an existing changelog entry as evidence that later changes have
+already been covered. See `RELEASING.md` for the release checklist.
+
 The user chose this explicit invocation boundary to prevent accidental
 publication while allowing an invoked release to finish autonomously. Keep
 validation gates, branch protections, tag permanence, and secret boundaries;

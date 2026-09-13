@@ -161,8 +161,10 @@ For an already-prepared version with matching evidence, start at step 2. A new
 release request does not require another preparation PR or another test run.
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
-   `Cargo.lock`, then run the normal locked checks to validate it. Write the
-   curated introduction and breaking-change notes in
+   `Cargo.lock`, then run the normal locked checks to validate it. Finalize the
+   `Unreleased` entry in `CHANGELOG.md` with the version and release date,
+   checking it against the changes since the previous release. Use that entry
+   to write the curated introduction and breaking-change notes in
    `.github/release-notes/v<version>.md`; the release workflow prepends that
    file to GitHub's generated contributor and change list. Merge the version
    and release notes through the protected branch. Peer compatibility is
