@@ -3,66 +3,66 @@
     "linux-aarch64": {
       "archive": {
         "name": "syq-linux-aarch64.gz",
-        "sha256": "51f49076c3d43c55063b4f826b7f4375418d6e4c29fa1a4179359208103285c1",
-        "size": 5338087
+        "sha256": "f693a886b706122966d028c2edc0964e89019c991619d4e2c767277ee531297a",
+        "size": 5370860
       },
       "binary": {
         "name": "syq-linux-aarch64",
-        "sha256": "c38bb81cb2542834ea26feec30c814938206c1cfaa8df7ddf970581c05ae33e7",
-        "size": 11355104
+        "sha256": "be19372ece930b3455c71bbefc4fba1ad259fd084478899d8e8a02710c538c66",
+        "size": 11486288
       }
     },
     "linux-x86_64": {
       "archive": {
         "name": "syq-linux-x86_64.gz",
-        "sha256": "22f55ec4aa8b71f5e476ca3e2b4030d19a4c81ee60eb21509f9f835cf68f601e",
-        "size": 5828461
+        "sha256": "a70ebcb889d97242514621018d106a88a485acfeb20e05d26d004c3775a4215c",
+        "size": 5879944
       },
       "binary": {
         "name": "syq-linux-x86_64",
-        "sha256": "5e4586bdc9706834cc907ff087afed57180e918e7459f9cefb7fda4e7973dbff",
-        "size": 13721528
+        "sha256": "4fc2f442d88f83d05bf61a0b4eead718b681678b7c7ad6a52696c16d3f479a24",
+        "size": 13899256
       }
     },
     "macos-arm64": {
       "archive": {
         "name": "syq-macos-arm64.gz",
-        "sha256": "cceddb7be8c7a6f115a8bf3c5deae6c66259fde06146dfa727308eaee2e52cc9",
-        "size": 4706639
+        "sha256": "0f31ccc57cad53ffa78c18db0c131855c004b76d7ea4711932d65e91fad93a73",
+        "size": 4701277
       },
       "binary": {
         "name": "syq-macos-arm64",
-        "sha256": "be189643f64579ef55a5bf73ad1a593916e464208401523a767c0192201eb1ba",
-        "size": 10476144
+        "sha256": "013b580716ceee3b5009e38d5f40de8b8d87e32ef452a0f413c7648e0936c763",
+        "size": 10444352
       }
     },
     "macos-x86_64": {
       "archive": {
         "name": "syq-macos-x86_64.gz",
-        "sha256": "4afa03437890e3291854bf8caee1cc8ec325b6e7734f390bf767b3365822ab78",
-        "size": 5071815
+        "sha256": "508100265c129201aef068d83044fb5a3d7d42c525bad24c8ee75408f167e5cb",
+        "size": 5098574
       },
       "binary": {
         "name": "syq-macos-x86_64",
-        "sha256": "0d3191e1e3499725d21f10350d6384f3366c1deb68c67213d3f945503afe4a49",
-        "size": 11549980
+        "sha256": "cdf446463169db30871915d08a6bc4935387ca51f1fe3e5dde732cbca0ad60e9",
+        "size": 11616188
       }
     }
   },
   "homebrew_formula": {
     "name": "syq.rb",
-    "sha256": "7f57355fa1600006dac5ba97ac9cbf4afb801763b110d7427cf5b9f424cbc66c",
+    "sha256": "747871730f1100ccb1d9cb902282c8e25e31c80ecbf246ac12c472d751de2d0d",
     "size": 1166
   },
   "installer": {
     "name": "install.sh",
-    "sha256": "ae4dc52268bb8e8f38e722b68e143efc7355e740ca16d8b29320c367b41ea1ad",
-    "size": 4931
+    "sha256": "07ce6eb0bf5c7028de532f8a8de0122f088e739d4b9bb56c890081c2e2379d4b",
+    "size": 4338
   },
   "repository": "https://github.com/greaber/syq",
   "schema": 1,
-  "signature": "P//lTIpvoWTkmQtJmmUmNf2fxmy1IiQLAZ4ULwZJ6uUJS+P9aLNajQMJ2KyGQ+chfzbdS3E4UBMWId9VLvELCg==",
+  "signature": "qpo8KazV12hJN7hDnYNpG9Phm0NKxkVjgO42zpeWNdbqVEzj0BWvaxSyFIu5P0JVWAbSyP9/XkgOjmuoY28UCQ==",
   "signature_scheme": "ed25519-jcs-v1",
-  "tag": "v0.5.2",
-  "version": "0.5.2"
+  "tag": "v0.6.0",
+  "version": "0.6.0"
 }
