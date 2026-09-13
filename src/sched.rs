@@ -1,14 +1,35 @@
 //! Work queue with largest-first file scheduling and range work-stealing.
 
 use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
+use crate::transfer_tuning::JobStorage;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
-pub struct FileJob {
+pub struct FileJob<D = Option<Entry>> {
+    pub data: FileJobData,
+    pub dst_entry: D,
+}
+
+impl<D> Deref for FileJob<D> {
+    type Target = FileJobData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<D> DerefMut for FileJob<D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileJobData {
     pub src: PathBytes,
     /// Descriptor-session authority corresponding to `src`. Source workers,
     /// and Linux destination workers using CopyLocal, claim its root during
@@ -17,7 +38,6 @@ pub struct FileJob {
     pub dst: PathBytes,
     pub rel: String,
     pub entry: Entry,
-    pub dst_entry: Option<Entry>,
     /// Placement-root condition enforced by the receiver at publication.
     pub target_condition: crate::proto::TargetCondition,
     /// Opened directory identity that anchors descendant target mutations.
@@ -32,6 +52,95 @@ pub struct FileJob {
     /// --mapping: the entry's source path relative to the source base, kept
     /// so `--results` records round-trip as retry mapping entries.
     pub src_rel: Option<PathBytes>,
+}
+
+/// Select the retained representation once per command. Workers always receive
+/// an owned snapshot, so both layouts use identical transfer and retry logic.
+#[allow(clippy::vec_box)]
+pub enum Jobs {
+    Compact(Vec<Box<FileJob<Option<Box<Entry>>>>>),
+    Inline(Vec<FileJob>),
+}
+
+impl Jobs {
+    fn new(storage: JobStorage) -> Self {
+        match storage {
+            JobStorage::Compact => Self::Compact(Vec::new()),
+            JobStorage::Inline => Self::Inline(Vec::new()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Compact(jobs) => jobs.len(),
+            Self::Inline(jobs) => jobs.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FileJobData> {
+        (0..self.len()).map(|idx| &self[idx])
+    }
+
+    fn push(&mut self, job: FileJob) {
+        match self {
+            Self::Compact(jobs) => jobs.push(Box::new(FileJob {
+                data: job.data,
+                dst_entry: job.dst_entry.map(Box::new),
+            })),
+            Self::Inline(jobs) => jobs.push(job),
+        }
+    }
+
+    pub fn snapshot(&self, idx: usize) -> FileJob {
+        FileJob {
+            data: self[idx].clone(),
+            dst_entry: self.destination(idx).cloned(),
+        }
+    }
+
+    pub fn destination(&self, idx: usize) -> Option<&Entry> {
+        match self {
+            Self::Compact(jobs) => jobs[idx].dst_entry.as_deref(),
+            Self::Inline(jobs) => jobs[idx].dst_entry.as_ref(),
+        }
+    }
+
+    pub fn set_destination(&mut self, idx: usize, entry: Entry) {
+        match self {
+            Self::Compact(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
+            Self::Inline(jobs) => jobs[idx].dst_entry = Some(entry),
+        }
+    }
+
+    fn release(&mut self) {
+        match self {
+            Self::Compact(jobs) => *jobs = Vec::new(),
+            Self::Inline(jobs) => *jobs = Vec::new(),
+        }
+    }
+}
+
+impl Index<usize> for Jobs {
+    type Output = FileJobData;
+    fn index(&self, idx: usize) -> &Self::Output {
+        match self {
+            Self::Compact(jobs) => &jobs[idx].data,
+            Self::Inline(jobs) => &jobs[idx].data,
+        }
+    }
+}
+
+impl IndexMut<usize> for Jobs {
+    fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
+        match self {
+            Self::Compact(jobs) => &mut jobs[idx].data,
+            Self::Inline(jobs) => &mut jobs[idx].data,
+        }
+    }
 }
 
 pub struct RangeState {
@@ -107,13 +216,18 @@ pub struct Sched {
     direct_fallback_workers: AtomicUsize,
     initial_range_workers: AtomicUsize,
     tune_request: AtomicUsize,
-    pub jobs: Mutex<Vec<FileJob>>,
+    pub jobs: Mutex<Jobs>,
     pub block: u64,
     pub min_split: u64,
 }
 
 impl Sched {
+    #[cfg(test)]
     pub fn new(block: u64, min_split: u64) -> Self {
+        Self::with_job_storage(block, min_split, JobStorage::default())
+    }
+
+    pub fn with_job_storage(block: u64, min_split: u64, storage: JobStorage) -> Self {
         Sched {
             inner: Mutex::new(Inner {
                 files: BinaryHeap::new(),
@@ -134,7 +248,7 @@ impl Sched {
             direct_fallback_workers: AtomicUsize::new(0),
             initial_range_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
-            jobs: Mutex::new(Vec::new()),
+            jobs: Mutex::new(Jobs::new(storage)),
             block,
             min_split: min_split.max(2 * block),
         }
@@ -160,7 +274,7 @@ impl Sched {
     /// every worker and the tuner have joined, release their retained capacity
     /// before deletion, deferred metadata, and receipt settlement continue.
     pub fn clear_finished_work(&self) {
-        *self.jobs.lock().unwrap() = Vec::new();
+        self.jobs.lock().unwrap().release();
         let mut inner = self.inner.lock().unwrap();
         inner.files = BinaryHeap::new();
         inner.ranges = Vec::new();
@@ -682,6 +796,70 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(seen, expected);
         assert!(sched.finished());
+    }
+
+    #[test]
+    fn job_storage_preserves_indexes_snapshots_retries_and_releases_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"payload").unwrap();
+        let entry = crate::fsops::lstat_entry(b"file".to_vec(), &path).unwrap();
+        for mode in [JobStorage::Compact, JobStorage::Inline] {
+            let sched = Sched::with_job_storage(4, 8, mode);
+            for i in 0..129 {
+                let idx = sched.push_file(FileJob {
+                    dst_entry: (i % 2 == 0).then(|| entry.clone()),
+                    data: FileJobData {
+                        src: b"src/file".to_vec(),
+                        source: RegisteredPath {
+                            root: serde_json::from_str("0").unwrap(),
+                            relative: b"file".to_vec(),
+                        },
+                        dst: b"dst/file".to_vec(),
+                        rel: i.to_string(),
+                        entry: entry.clone(),
+                        target_condition: crate::proto::TargetCondition::Any,
+                        container_guard: None,
+                        attempt: 0,
+                        done: Arc::new(AtomicU64::new(0)),
+                        inplace: false,
+                        rel_bytes: i.to_string().into_bytes(),
+                        src_rel: None,
+                    },
+                });
+                assert_eq!(idx, i);
+            }
+            let mut jobs = sched.jobs.lock().unwrap();
+            assert_eq!(jobs.len(), 129);
+            for i in 0..jobs.len() {
+                assert_eq!(jobs[i].rel, i.to_string());
+                assert_eq!(jobs.destination(i).is_some(), i % 2 == 0);
+            }
+            let before = jobs.snapshot(1);
+            jobs[1].entry.size = 99;
+            jobs[1].attempt = 1;
+            jobs[1].inplace = true;
+            jobs[1].done.store(3, Relaxed);
+            jobs.set_destination(1, entry.clone());
+            let retry = jobs.snapshot(1);
+            assert_eq!(before.entry.size, 7);
+            assert_eq!(before.attempt, 0);
+            assert!(!before.inplace);
+            assert!(before.dst_entry.is_none());
+            assert_eq!(retry.entry.size, 99);
+            assert_eq!(retry.attempt, 1);
+            assert!(retry.inplace);
+            assert_eq!(retry.dst_entry.unwrap().size, 7);
+            assert_eq!(before.done.load(Relaxed), 3);
+            drop(jobs);
+            sched.clear_finished_work();
+            let jobs = sched.jobs.lock().unwrap();
+            assert!(jobs.is_empty());
+            match &*jobs {
+                Jobs::Compact(jobs) => assert_eq!(jobs.capacity(), 0),
+                Jobs::Inline(jobs) => assert_eq!(jobs.capacity(), 0),
+            }
+        }
     }
 
     #[test]

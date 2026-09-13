@@ -865,7 +865,7 @@ assert_same_tree \
     relay
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
-tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average
+tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average,job-storage=inline
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
 for transport in tcp ssh; do
     if [ "$transport" = ssh ]; then
