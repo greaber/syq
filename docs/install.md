@@ -22,10 +22,8 @@ Shell completion and background connections can also trigger installation,
 without printing a notice. Failure to install this command does not stop the
 transfer.
 
-Use `syq --self-update` on the server to update this command. If you delete the
-command but leave its [installation receipt](#updates), syq leaves it absent.
-Remove the command and any matching receipts to allow installation the next
-time a helper is installed. Removing the command does not prevent helper setup.
+Use `syq --self-update` on the server to update this command. To reinstall a
+removed command, run the standalone installer above on the server.
 
 Reusing a cached helper does not repeat this installation step. Development
 builds and connections using `--syq-path` or `--no-bootstrap` do not install
@@ -71,11 +69,6 @@ which provides more extensive benchmarks. Your results will depend on your machi
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
-
-Self-update uses an installation receipt, usually `.syq-install.json` beside
-the executable. Older installations may keep it at
-`~/.config/syq/install.json`, or `$XDG_CONFIG_HOME/syq/install.json` when that
-variable is set. Keep this file so syq can recognize the installation.
 
 Standalone installs may print update reminders in a terminal; nothing updates
 automatically. Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
