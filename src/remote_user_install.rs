@@ -79,11 +79,6 @@ fn check_directory(path: &Path) -> Result<()> {
     let metadata = fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?;
     ensure!(metadata.is_dir(), "{} is not a directory", path.display());
     ensure!(
-        metadata.uid() == unsafe { libc::geteuid() } || metadata.uid() == 0,
-        "{} is not owned by this user or root",
-        path.display()
-    );
-    ensure!(
         metadata.mode() & 0o002 == 0,
         "{} is other-writable; leaving its permissions unchanged",
         path.display()
