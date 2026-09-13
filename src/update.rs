@@ -758,6 +758,7 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     parse_receipt(&bytes)
+        .with_context(|| format!("read standalone install receipt {}", path.display()))
 }
 
 fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {

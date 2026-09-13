@@ -209,6 +209,26 @@ fn next_release_version() -> String {
 }
 
 #[test]
+fn malformed_adjacent_receipt_names_its_path_and_shadows_legacy_receipt() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    fixture.register();
+    let adjacent = fixture.installed.with_file_name(".syq-install.json");
+    let receipt = fs::read(&adjacent).unwrap();
+    let legacy = fixture.config.join("syq/install.json");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, &receipt).unwrap();
+    fs::write(&adjacent, b"invalid JSON").unwrap();
+
+    let output = fixture.command("--self-update");
+    assert_failure_contains(&output, adjacent.to_str().unwrap());
+    assert_failure_contains(&output, "parse standalone install receipt");
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    assert_eq!(fs::read(&legacy).unwrap(), receipt);
+    assert_eq!(fs::read(&adjacent).unwrap(), b"invalid JSON");
+}
+
+#[test]
 fn signed_self_update_replaces_only_the_receipted_copy() {
     let release_version = next_release_version();
     let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));

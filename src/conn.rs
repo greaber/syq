@@ -3203,13 +3203,19 @@ fn output_suffix(stderr: &[u8]) -> String {
 }
 
 fn output_message(stderr: &[u8]) -> String {
-    let message = bootstrap_stderr_lines(stderr)
-        .filter_map(|line| match line {
-            BootstrapStderrLine::Diagnostic(message) if !message.is_empty() => Some(message),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut diagnostics = Vec::new();
+    for line in bootstrap_stderr_lines(stderr) {
+        match line {
+            BootstrapStderrLine::Diagnostic(message) => diagnostics.push(message),
+            BootstrapStderrLine::Notice(_) => {
+                // Each notice adds one leading newline; preserve other spacing.
+                if diagnostics.last().is_some_and(|line| line.is_empty()) {
+                    diagnostics.pop();
+                }
+            }
+        }
+    }
+    let message = diagnostics.join("\n");
     message
         .trim()
         .strip_prefix("syq: ")
@@ -3424,7 +3430,7 @@ mod tests {
         );
         assert_eq!(
             super::output_suffix(stderr),
-            ": Warning: new host key\nsshd banner\nrc noise"
+            ": Warning: new host key\nsshd banner\n\nrc noise"
         );
         assert_eq!(
             super::output_suffix(b"syq-remote-install-notice:installed syq\r\n"),
@@ -3434,6 +3440,17 @@ mod tests {
             super::output_message(b"syq: error mentions syq-remote-install-notice: tag\n"),
             "error mentions syq-remote-install-notice: tag"
         );
+    }
+
+    #[test]
+    fn bootstrap_errors_preserve_blank_lines_except_notice_separators() {
+        let diagnostic = "syq: first paragraph\n\nsecond paragraph\n\n\nlast paragraph\n";
+        assert_eq!(
+            super::output_message(diagnostic.as_bytes()),
+            diagnostic.trim().strip_prefix("syq: ").unwrap()
+        );
+        let stderr = b"first\n\n\nsyq-remote-install-notice:installed\n\nsyq-remote-install-notice:PATH hint\nlast\n";
+        assert_eq!(super::output_message(stderr), "first\n\nlast");
     }
 
     #[test]
