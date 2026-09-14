@@ -64,6 +64,7 @@ struct Progress {
 struct Worker {
     progress: Arc<(Mutex<Progress>, Condvar)>,
     thread: Option<JoinHandle<()>>,
+    _permit: Permit,
 }
 
 impl Worker {
@@ -79,7 +80,6 @@ impl Worker {
         let thread = std::thread::Builder::new()
             .name("syq-read-ahead".into())
             .spawn(move || {
-                let _permit = permit;
                 let mut offset = copied;
                 while offset < size {
                     let (lock, wake) = &*shared;
@@ -119,6 +119,7 @@ impl Worker {
         Ok(Self {
             progress,
             thread: Some(thread),
+            _permit: permit,
         })
     }
 
@@ -227,9 +228,11 @@ mod tests {
         assert!(budget.acquire().is_none());
         let temp = crate::test_support::tempdir().unwrap();
         let source = File::create(temp.path().join("source")).unwrap();
-        // A large logical extent keeps the helper bounded until dropped even
-        // though the source is empty. Advice cannot modify its contents.
-        let worker = Worker::start(source, 0, 1 << 30, permit).unwrap();
+        // The slot remains reserved even when prefetch reaches EOF before
+        // the writer: those pages still consume the copy's lookahead budget.
+        let mut worker = Worker::start(source, 0, 0, permit).unwrap();
+        worker.thread.take().unwrap().join().unwrap();
+        assert!(budget.acquire().is_none());
         drop(worker);
         assert!(budget.acquire().is_some());
         assert_eq!(
