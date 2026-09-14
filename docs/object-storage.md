@@ -55,7 +55,8 @@ uploads. Syq does not change bucket policies or lifecycle rules.
 ## Parallelism
 
 Uploads use multipart requests and downloads use concurrent byte ranges.
-These options control the two levels of concurrency and the request size:
+These options control the two levels of concurrency and the request size.
+S3 copies use fixed defaults, without automatic tuning:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -71,8 +72,8 @@ Discovery and collision checks finish before copying starts, so planning memory
 grows with the number of selected objects.
 
 `--bwlimit` limits the aggregate scheduled data rate, with bursts up to a part
-on upload. There is no automatic tuning for S3 copies. `--no-compress` has no
-effect because object bodies are transferred without compression.
+on upload. `--no-compress` has no effect because object bodies are transferred
+without compression.
 
 ## Metadata and integrity
 

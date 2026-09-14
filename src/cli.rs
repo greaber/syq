@@ -220,11 +220,12 @@ pub struct Args {
     #[arg(long)]
     pub numeric_ids: bool,
 
-    /// Parallel connections/workers. Default for copies: auto-tuned — starts at
+    /// Parallel connections/workers. Filesystem copies auto-tune — starting at
     /// the last settled count remembered for this host path and transport, or 16
     /// over TCP, 8 over ssh, or 16 when local with at most two available CPUs
     /// (otherwise 32). It probes from 1 to 64 while the copy has enough work to
-    /// measure. Give a number to fix it.
+    /// measure. Give a number to fix it. S3 copies use 256 object workers by
+    /// default, without automatic tuning.
     #[arg(long = "syq-connections", value_name = "N")]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
@@ -800,7 +801,7 @@ struct NativeOperationalArgs {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Fix parallel connections/workers (copies otherwise tune automatically)
+    /// Fix parallel workers (S3 default: 256; filesystem copies otherwise tune automatically)
     #[arg(short = 'j', long = "connections", value_name = "N")]
     connections: Option<usize>,
     /// Show progress even when stderr is not a terminal
