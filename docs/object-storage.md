@@ -34,12 +34,10 @@ For example, with Tigris credentials in `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`:
 
 ```sh
-export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
+export AWS_ENDPOINT_URL_S3=https://t3.storage.dev
 export AWS_REGION=auto
-syq cp data --to s3://my-bucket --into backup \
-  --s3-header 'X-Tigris-Consistent: true'
-syq cp --from s3://my-bucket backup/data --into restored \
-  --s3-header 'X-Tigris-Consistent: true'
+syq cp data --to s3://my-bucket --into backup
+syq cp --from s3://my-bucket backup/data --into restored
 ```
 
 `--s3-header 'NAME: VALUE'` is repeatable. Headers are added before signing to
