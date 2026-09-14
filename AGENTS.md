@@ -70,19 +70,13 @@ restore `design/`, or add investigation reports, benchmark dumps, or experiment
 diaries to this repository. PR descriptions should explain the actual change
 and relevant checks, without histories of abandoned work.
 
-Keep one brief handoff per active task at the top of `current-plans/`, with
-current state, decisions, and next actions. Reviews use the shared files below;
-long evidence needed for an active review may live beside its exchange file.
-Keep generated logs, binaries, and benchmark dumps in the task worktree's
-ignored `target/`, linked from the note. Do not store duplicate PR bodies or
-CI status dumps here. Guidance every session needs belongs in `AGENTS.md`.
-
-At task completion, check GitHub's current PR state and remove obsolete notes
-instead of archiving them. Before deleting a note, preserve any unfinished
-agreed work in its continuing task's brief handoff. A merged PR alone does not
-resolve every finding or finish an investigation. Do not delete notes another
-conversation is actively updating. Deferred proposals are not requirements;
-keep them only while they support an active decision, with that decision named.
+Keep `current-plans/` limited to brief current task state and next actions.
+At task completion, check the PR's current state and remove obsolete notes;
+first preserve unfinished agreed work in its continuing task's handoff. Do not
+delete notes another conversation is actively updating. Keep generated logs,
+binaries, and benchmark dumps in the task's ignored `target/`, linked from the
+note; do not duplicate PR bodies or CI dumps here. Guidance every session needs
+belongs here in `AGENTS.md`.
 
 When writing any of these, record decisions as current state plus the rationale
 at the time, not as timeless policy. An assumption encoded as a requirement can
@@ -228,150 +222,20 @@ report actual access or decision blockers instead of bypassing them.
 - State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
   the fact the reader needs to route the next step.
 
-## Shared review exchange
+## Acting on review feedback
 
-Reviewers and implementers may use Codex, Claude Code, or different clients.
-The shared exchange and handoff rules must work independently of either client.
-Each independent
-reviewer keeps one stable exchange file at
-`current-plans/reviews/pr-<number>/<reviewer-id>.md` for that PR, including
-reviews with no blocking findings. Choose a unique reviewer/session label when creating
-a file; reuse it for subsequent rounds in that same conversation. Different
-reviewers use different files. Do not infer reviewer identity from the shared
-GitHub account or adopt someone else's review as your own.
+Assess each finding independently. Fix directly only confirmed real problems
+with simple, straightforward fixes, no tradeoffs worth discussing, and no
+reason to reconsider the requirement. For anything else, discuss the evidence,
+value, alternatives, and requirements with the reviewer before implementing
+that finding. Bring consequential choices and unresolved disagreement to the
+user; reviewer agreement does not authorize changing requirements or deferring
+agreed work. If the reviewer is unavailable, raise the question with the user.
 
-- Both participants pin the exact exchange path in their conversation handoff;
-  the implementer also links it from the task note. "Pin" means remember and
-  read that path when resuming, not an application subscription. On a request
-  to review or address feedback, discover the PR directory and read the relevant
-  exchanges before acting. After writing a handoff, ping the other participant
-  using the notification procedure below; changing a file alone sends no ping.
-- At the top record the PR URL and head repository, reviewer identity,
-  implementer task/worktree, each participant's client and verified notification
-  route when available (session identity, host/endpoint, delivery mechanism),
-  current round, exact target SHA and its source,
-  and whose turn is next: reviewer, implementer, user decision, or complete.
-  Resolve live refs under the freshness rules below; the file is coordination
-  state, not proof of the latest PR head or merge authorization.
-- The reviewer writes a numbered round with verdict, stable finding IDs
-  (R1, R2, ...), severity, code locations, reasoning/reproduction, and checks
-  with exact tested SHAs and limits. Distinguish required fixes, optional
-  suggestions, and product decisions. State the blocking verdict separately
-  from the rest of the feedback: distinguish blocking defects, nonblocking
-  defects, optional style/design suggestions, and observations with no requested
-  action. "No blocking findings" does not mean "nothing to say" or that every
-  remaining comment needs a fix. Include useful context without inventing
-  suggestions to fill a quota. Then hand the turn to the implementer,
-  or mark complete if no response is needed. Complete means this review round
-  is finished at its reviewed SHA, not that the PR is merged or merge-ready.
-- The implementer reads all pending exchanges and independently assesses each
-  finding. Fix directly only when it is a real problem with a simple,
-  straightforward fix, no tradeoff that would benefit from discussion, and no
-  reason to reconsider the requirement instead. A review is advice, not a list
-  of changes to apply automatically; severity labels do not bypass this rule.
-- For anything outside that narrow category, discuss it with the reviewer
-  before implementing that finding. This includes doubtful findings, complex
-  fixes, uncertain value, competing designs, compatibility or performance
-  tradeoffs, and any possibility that the requirement should change. Record
-  the evidence, concern, alternatives, and recommended next step in the
-  exchange; hand the turn to the reviewer and ping them. Read-only inspection
-  or a disposable reproduction can inform the discussion, but do not begin
-  the proposed implementation while the question is unresolved. Independent
-  straightforward fixes may continue.
-- The reviewer responds to the reasoning and may revise or withdraw a finding.
-  Discuss until there is a clear disposition; do not ping-pong unchanged
-  positions. If the discussion establishes a straightforward fix under the
-  existing requirements, implement it. If a requirement change, consequential
-  tradeoff, complicated design, deferral of agreed work, or disagreement remains,
-  bring the user the joint options/recommendation (or explicit disagreement)
-  before implementing it. Reviewer agreement alone does not authorize changing
-  requirements or accepting such tradeoffs.
-- The implementer adds a response to each finding: fix SHA and verification,
-  or the discussion/disposition. Record the new head SHA and hand the turn back
-  to the reviewer. Do not edit the reviewer's findings or declare them
-  reviewer-verified. Do not quietly discard disputed findings.
-- The reviewer independently checks the new authoritative head, records the
-  next round, and marks findings resolved, still open, or awaiting a decision.
-  Preserve unresolved findings and enough previous-round evidence to follow
-  the exchange; avoid appending full transcripts or repeated status dumps.
-- Treat the turn field as a handoff, not a filesystem lock. Only the participant
-  holding the turn edits that exchange; reread it immediately before writing,
-  make targeted edits, and stop if it changed unexpectedly. Do not overwrite
-  another participant's response from a stale copy. A second independent
-  reviewer creates a separate file instead of taking an active review's turn.
-- Put longer investigation text in the same file when readable, or link files
-  under `current-plans/reviews/pr-<number>/<reviewer-id>/`. Keep the exchange
-  self-contained about verdict and next action. Existing evidence must retain
-  its actual author and SHA; moving it does not constitute a fresh review.
-- When the PR closes and the exchange is no longer active, remove its files
-  after transferring any unfinished agreed work to the continuing task note.
-  Do not use another review file to skip your own independent review; the
-  freshness rules below still apply.
-
-### Handoff notifications
-
-The user authorizes reviewer-to-implementer and implementer-to-reviewer pings
-for this workflow. Send a ping immediately after saving a completed review,
-fix response, or discussion handoff, regardless of whether the reviewer found
-blockers, minor issues, optional suggestions, observations, or nothing to add.
-Use the exchange file for substance; the ping identifies the PR, file's absolute
-path, round, SHA, next turn, and a short action such as "review response ready"
-or "design question before implementation". Identify it as an agent handoff,
-not a new user instruction. Only ping for a substantive handoff, not to
-acknowledge receipt or repeat an unchanged waiting state.
-
-Use the common helper from either Codex or Claude Code. Select the receiving
-client, not the sending client:
-
-```bash
-python3 scripts/agent-ping.py --client codex --recipient '<session-uuid>' \
-  --file current-plans/reviews/pr-349/reviewer-a.md --pr 349 --round 2 \
-  --sha abc1234 --sender reviewer-a --message 'Review response ready'
-python3 scripts/agent-ping.py --client claude --recipient '<inbox-socket-path>' \
-  --file current-plans/reviews/pr-349/reviewer-a.md --pr 349 --round 2 \
-  --sha abc1234 --sender implementer --message 'Design question before implementation'
-```
-
-These are templates: use the actual PR, round, SHA, exchange and recorded
-recipient. `--dry-run` shows the handoff without sending. Either agent can invoke
-either command; the helper needs only Python's standard library and, for Codex
-recipients, the installed Codex CLI. It does not start replacement agent sessions.
-
-- Codex delivery uses `codex queue --thread '<session-uuid>' --message '<text>'`.
-  Record the recipient's exact session UUID (CODEX_THREAD_ID when provided by
-  that session). Pass `--remote '<endpoint>'` to the helper if needed to reach
-  that recipient's app server. CLI syntax was checked with Codex 0.154.0;
-  availability and idle/busy behavior must be verified on the actual server.
-- Claude Code delivery uses the recipient's native local inbox socket on Linux
-  or macOS. The recipient records CLAUDE_CODE_MESSAGING_SOCKET from its own
-  environment, or the Peer address in /status (the `uds:` prefix is accepted).
-  The native envelope was checked against installed Claude Code 2.1.270.
-  [Claude's messaging docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
-  describe script access and inbound controls. Accepted peer messages reach a
-  busy session between tool calls and start a turn when idle. Receiver policy
-  can hold or refuse them. The helper does not supply another session's token,
-  assert a permission class, or change inbound policy to force delivery.
-- For a Claude recipient on another host, run the helper on that host using an
-  established authorized connection; the exchange path must exist there too.
-  The helper does not copy notes across hosts. Never infer recipient identities
-  from a branch/worktree name or put authentication secrets in the exchange.
-
-The helper prints JSON: `queued` means the Codex queue command succeeded;
-`submitted` means the Claude socket write completed, without an admission/read
-acknowledgment; `not-sent` is a dry run. Exit 1 reports an error. A successful
-submission is not proof that the recipient read or acted on it; Claude may hold
-or refuse it. Verify delivery and idle/busy behavior for the actual pair before
-calling automatic handoff operational. Do not blindly retry after an uncertain
-send, since that can duplicate a message. Use the existing exchange to record
-the recipient's response, not acknowledgment-only ping loops.
-
-If either route is missing or fails, preserve the handoff and report which
-recipient cannot be reached and why. "Check the review file" is a temporary
-manual fallback, not satisfaction of automatic pinging. Do not silently switch
-to terminal keystroke injection, start daemons, change client configuration,
-or launch background watchers. Bring any needed transport/setup choice to the
-user. Native client-specific commands remain valid delivery options; the helper
-provides one common method for mixed-client pairs.
+Keep blocking defects, nonblocking defects, optional suggestions, and
+observations distinct. An observation is not automatically a request for a
+change. When the user selects particular feedback, address that selection;
+do not expand it by seeking out other review comments to act on.
 
 ## PR review freshness
 
