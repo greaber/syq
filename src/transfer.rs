@@ -7065,9 +7065,11 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                inplace: self.opts.tuning.job_storage()
-                    == crate::transfer_tuning::JobStorage::Shared
-                    && self.opts.inplace
+                inplace: matches!(
+                    self.opts.tuning.job_storage(),
+                    crate::transfer_tuning::JobStorage::Shared
+                        | crate::transfer_tuning::JobStorage::Combined
+                ) && self.opts.inplace
                     && target_condition == TargetCondition::Any
                     && self.container_guard.is_none(),
                 src_rel,

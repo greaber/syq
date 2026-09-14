@@ -7,7 +7,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -62,6 +62,10 @@ pub struct FileJobData {
 pub enum SnapshotData {
     Owned(FileJobData),
     Shared(Arc<FileJobData>),
+    Chunk {
+        slots: Arc<Vec<OnceLock<FileJobData>>>,
+        slot: usize,
+    },
 }
 
 impl Borrow<FileJobData> for SnapshotData {
@@ -69,6 +73,7 @@ impl Borrow<FileJobData> for SnapshotData {
         match self {
             Self::Owned(data) => data,
             Self::Shared(data) => data,
+            Self::Chunk { slots, slot } => slots[*slot].get().unwrap(),
         }
     }
 }
@@ -77,13 +82,65 @@ pub type WorkerJob = FileJob<Option<Entry>, SnapshotData>;
 const JOBS_PER_CHUNK: usize = 1024;
 
 /// Select the retained representation once per command. Workers always receive
-/// an owned snapshot, so both layouts use identical transfer and retry logic.
+/// a stable snapshot, so all layouts use identical transfer and retry logic.
 #[allow(clippy::vec_box)]
 pub enum Jobs {
     Compact(Vec<Box<FileJob<Option<Box<Entry>>>>>),
     Inline(Vec<FileJob>),
     Chunked(Vec<Vec<FileJob<Option<Box<Entry>>>>>),
     Shared(Vec<FileJob<Option<Box<Entry>>, Arc<FileJobData>>>),
+    Combined(SharedChunks),
+}
+
+/// Published slots never change. OnceLock permits appending jobs to a partial
+/// chunk while workers hold earlier slots, without unsafe aliasing or chunk COW.
+/// Retry versions are sparse and owned independently of the original chunk.
+#[derive(Default)]
+pub struct SharedChunks {
+    chunks: Vec<Arc<Vec<OnceLock<FileJobData>>>>,
+    destinations: Vec<Option<Box<Entry>>>,
+    retries: HashMap<usize, Arc<FileJobData>>,
+}
+
+impl SharedChunks {
+    fn original(&self, idx: usize) -> &FileJobData {
+        self.chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK]
+            .get()
+            .unwrap()
+    }
+
+    fn push(&mut self, job: FileJob) {
+        let idx = self.destinations.len();
+        if idx.is_multiple_of(JOBS_PER_CHUNK) {
+            self.chunks.push(Arc::new(
+                (0..JOBS_PER_CHUNK).map(|_| OnceLock::new()).collect(),
+            ));
+        }
+        self.chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK]
+            .set(job.data)
+            .expect("job slot published twice");
+        self.destinations.push(job.dst_entry.map(Box::new));
+    }
+
+    fn snapshot(&self, idx: usize) -> SnapshotData {
+        match self.retries.get(&idx) {
+            Some(data) => SnapshotData::Shared(data.clone()),
+            None => SnapshotData::Chunk {
+                slots: self.chunks[idx / JOBS_PER_CHUNK].clone(),
+                slot: idx % JOBS_PER_CHUNK,
+            },
+        }
+    }
+
+    fn get_mut(&mut self, idx: usize) -> &mut FileJobData {
+        // Only a changed job acquires a private allocation. Existing worker
+        // snapshots retain their previous version, including across retries.
+        if !self.retries.contains_key(&idx) {
+            self.retries
+                .insert(idx, Arc::new(self.original(idx).clone()));
+        }
+        Arc::make_mut(self.retries.get_mut(&idx).unwrap())
+    }
 }
 
 impl Jobs {
@@ -93,6 +150,7 @@ impl Jobs {
             JobStorage::Inline => Self::Inline(Vec::new()),
             JobStorage::Chunked => Self::Chunked(Vec::new()),
             JobStorage::Shared => Self::Shared(Vec::new()),
+            JobStorage::Combined => Self::Combined(SharedChunks::default()),
         }
     }
 
@@ -101,6 +159,7 @@ impl Jobs {
             Self::Compact(jobs) => jobs.len(),
             Self::Inline(jobs) => jobs.len(),
             Self::Shared(jobs) => jobs.len(),
+            Self::Combined(jobs) => jobs.destinations.len(),
             Self::Chunked(chunks) => chunks
                 .last()
                 .map_or(0, |last| (chunks.len() - 1) * JOBS_PER_CHUNK + last.len()),
@@ -122,6 +181,7 @@ impl Jobs {
                 dst_entry: job.dst_entry.map(Box::new),
             })),
             Self::Inline(jobs) => jobs.push(job),
+            Self::Combined(jobs) => jobs.push(job),
             Self::Shared(jobs) => jobs.push(FileJob {
                 data: Arc::new(job.data),
                 dst_entry: job.dst_entry.map(Box::new),
@@ -145,6 +205,7 @@ impl Jobs {
         FileJob {
             data: match self {
                 Self::Shared(jobs) => SnapshotData::Shared(jobs[idx].data.clone()),
+                Self::Combined(jobs) => jobs.snapshot(idx),
                 _ => SnapshotData::Owned(self[idx].clone()),
             },
             dst_entry: self.destination(idx).cloned(),
@@ -156,6 +217,7 @@ impl Jobs {
             Self::Compact(jobs) => jobs[idx].dst_entry.as_deref(),
             Self::Inline(jobs) => jobs[idx].dst_entry.as_ref(),
             Self::Shared(jobs) => jobs[idx].dst_entry.as_deref(),
+            Self::Combined(jobs) => jobs.destinations[idx].as_deref(),
             Self::Chunked(chunks) => chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK]
                 .dst_entry
                 .as_deref(),
@@ -167,6 +229,7 @@ impl Jobs {
             Self::Compact(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
             Self::Inline(jobs) => jobs[idx].dst_entry = Some(entry),
             Self::Shared(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
+            Self::Combined(jobs) => jobs.destinations[idx] = Some(Box::new(entry)),
             Self::Chunked(chunks) => {
                 chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].dst_entry = Some(Box::new(entry))
             }
@@ -176,7 +239,7 @@ impl Jobs {
     pub fn set_inplace(&mut self, idx: usize, value: bool) {
         // Shared jobs initialize this immutable decision before dispatch.
         // Avoid making a private retry version for a no-op assignment.
-        if matches!(self, Self::Shared(_)) && self[idx].inplace == value {
+        if matches!(self, Self::Shared(_) | Self::Combined(_)) && self[idx].inplace == value {
             return;
         }
         self[idx].inplace = value;
@@ -187,6 +250,7 @@ impl Jobs {
             Self::Compact(jobs) => *jobs = Vec::new(),
             Self::Inline(jobs) => *jobs = Vec::new(),
             Self::Shared(jobs) => *jobs = Vec::new(),
+            Self::Combined(jobs) => *jobs = SharedChunks::default(),
             Self::Chunked(chunks) => *chunks = Vec::new(),
         }
     }
@@ -199,6 +263,10 @@ impl Index<usize> for Jobs {
             Self::Compact(jobs) => &jobs[idx].data,
             Self::Inline(jobs) => &jobs[idx].data,
             Self::Shared(jobs) => &jobs[idx].data,
+            Self::Combined(jobs) => jobs
+                .retries
+                .get(&idx)
+                .map_or_else(|| jobs.original(idx), |data| data.as_ref()),
             Self::Chunked(chunks) => &chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].data,
         }
     }
@@ -210,6 +278,7 @@ impl IndexMut<usize> for Jobs {
             Self::Compact(jobs) => &mut jobs[idx].data,
             Self::Inline(jobs) => &mut jobs[idx].data,
             Self::Shared(jobs) => Arc::make_mut(&mut jobs[idx].data),
+            Self::Combined(jobs) => jobs.get_mut(idx),
             Self::Chunked(chunks) => &mut chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].data,
         }
     }
@@ -964,6 +1033,56 @@ mod tests {
     }
 
     #[test]
+    fn combined_chunks_allow_append_retry_and_release_with_live_snapshots() {
+        let mut jobs = Jobs::new(JobStorage::Combined);
+        jobs.push(test_job(7));
+        let first = jobs.snapshot(0);
+        let SnapshotData::Chunk { slots, .. } = &first.data else {
+            panic!("expected chunk");
+        };
+        let owner = Arc::downgrade(slots);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..10_000 {
+                    assert_eq!(first.entry.size, 7);
+                }
+            });
+            for _ in 0..(2 * JOBS_PER_CHUNK) {
+                jobs.push(test_job(9));
+            }
+        });
+        let second = jobs.snapshot(1);
+        let SnapshotData::Chunk {
+            slots: second_slots,
+            ..
+        } = &second.data
+        else {
+            panic!("expected chunk");
+        };
+        assert!(Arc::ptr_eq(slots, second_slots));
+        jobs.set_inplace(0, false);
+        let Jobs::Combined(storage) = &jobs else {
+            unreachable!()
+        };
+        assert!(storage.retries.is_empty());
+        assert_eq!(storage.chunks.len(), 3);
+        jobs[0].entry.size = 11;
+        let retry = jobs.snapshot(0);
+        jobs[0].entry.size = 13;
+        assert_eq!(first.entry.size, 7);
+        assert_eq!(second.entry.size, 9);
+        assert_eq!(retry.entry.size, 11);
+        assert_eq!(jobs[0].entry.size, 13);
+        jobs.release();
+        assert_eq!(first.entry.size, 7);
+        assert_eq!(retry.entry.size, 11);
+        drop(first);
+        assert!(owner.upgrade().is_some());
+        drop(second);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
     fn job_storage_preserves_indexes_snapshots_retries_and_releases_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");
@@ -974,6 +1093,7 @@ mod tests {
             JobStorage::Inline,
             JobStorage::Chunked,
             JobStorage::Shared,
+            JobStorage::Combined,
         ] {
             let sched = Sched::with_job_storage(4, 8, mode);
             for i in 0..(2 * JOBS_PER_CHUNK + 1) {
@@ -1044,6 +1164,11 @@ mod tests {
                 Jobs::Compact(jobs) => assert_eq!(jobs.capacity(), 0),
                 Jobs::Inline(jobs) => assert_eq!(jobs.capacity(), 0),
                 Jobs::Shared(jobs) => assert_eq!(jobs.capacity(), 0),
+                Jobs::Combined(jobs) => {
+                    assert_eq!(jobs.chunks.capacity(), 0);
+                    assert_eq!(jobs.destinations.capacity(), 0);
+                    assert_eq!(jobs.retries.capacity(), 0);
+                }
                 Jobs::Chunked(chunks) => assert_eq!(chunks.capacity(), 0),
             }
         }
