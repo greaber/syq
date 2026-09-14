@@ -21422,3 +21422,85 @@ fn delete_many_roots_keeps_claims_in_their_own_scope() {
         }
     }
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_overlap_experiment_preserves_staged_and_inplace_contents() {
+    for mode in ["cfr:8", "pipeline:8"] {
+        for inplace in [false, true] {
+            let t = Tmp::new();
+            let data = prng((17 << 20) + 73, 918);
+            write(&t.path("source"), &data);
+            write(&t.path("destination"), b"old destination");
+            let inode = fs::metadata(t.path("destination")).unwrap().ino();
+            let mut command = compat_command();
+            command.args(["-a", "--no-progress", &t.s("source"), &t.s("destination")]);
+            if inplace {
+                command.arg("--inplace");
+            }
+            let out = command
+                .env("SYQ_EXPERIMENT_LOCAL_OVERLAP", mode)
+                .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+                .env("SYQ_DEBUG", "1")
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert!(stderr_of(&out).contains("overlap observed"));
+            assert_eq!(read(&t.path("destination")), data);
+            if inplace {
+                assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+            }
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_overlap_experiment_shrink_keeps_old_destination() {
+    for mode in ["cfr:8", "pipeline:8"] {
+        let t = Tmp::new();
+        write(&t.path("source"), &prng(17 << 20, 919));
+        write(&t.path("destination"), b"old destination");
+        let ready = t.path("ready");
+        let resume = t.path("continue");
+        let mut child = compat_command()
+            .args(["-a", "--no-progress", &t.s("source"), &t.s("destination")])
+            .env("SYQ_EXPERIMENT_LOCAL_OVERLAP", mode)
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .env("SYQ_TEST_OVERLAP_READY", &ready)
+            .env("SYQ_TEST_OVERLAP_CONTINUE", &resume)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(child.try_wait().unwrap().is_none());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "overlap copy did not reach its first-block barrier"
+        );
+        File::create(t.path("source")).unwrap();
+        write(&resume, b"continue");
+        let out = child.wait_with_output().unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(read(&t.path("destination")), b"old destination");
+        let changed = prng(17 << 20, 920);
+        write(&t.path("source"), &changed);
+        let out = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--tuning-options=copy-path=ranges",
+                &t.s("source"),
+                &t.s("destination"),
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("destination")), changed);
+    }
+}

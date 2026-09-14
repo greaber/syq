@@ -13,6 +13,8 @@ mod fsops;
 mod help;
 mod identity;
 mod janky_cat;
+#[cfg(target_os = "linux")]
+mod local_overlap;
 mod mapping;
 mod native_map;
 mod native_rm;

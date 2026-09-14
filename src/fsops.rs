@@ -5470,6 +5470,7 @@ impl FsOps {
         size: u64,
         mode: u32,
     ) -> Result<CopyLocalOutcome> {
+        let overlap = crate::local_overlap::Experiment::from_env()?;
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
@@ -5686,6 +5687,16 @@ impl FsOps {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
         }
+        // Diagnostic only: retain existing offload/fallback decisions and all
+        // authorization/publication checks. Never enable this experiment on NFS.
+        let overlap = overlap.filter(|_| {
+            size >= 16 << 20
+                && source_fs.local_userspace_copy
+                && destination_fs.local_userspace_copy
+                && !source_fs.is_nfs
+                && !destination_fs.is_nfs
+                && !destination_fs.synchronous
+        });
         let mut source_offset: libc::off64_t = 0;
         let mut destination_offset: libc::off64_t = 0;
         let mut remaining = size;
@@ -5698,7 +5709,11 @@ impl FsOps {
                     &mut source_offset,
                     d.as_raw_fd(),
                     &mut destination_offset,
-                    remaining as usize,
+                    if overlap.is_some() {
+                        remaining.min(crate::local_overlap::BLOCK) as usize
+                    } else {
+                        remaining as usize
+                    },
                     0,
                 )
             };
@@ -5750,6 +5765,16 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
+            if let Some(experiment) = overlap {
+                #[cfg(debug_assertions)]
+                test_race_barrier(
+                    "SYQ_TEST_OVERLAP_READY",
+                    "SYQ_TEST_OVERLAP_CONTINUE",
+                    "overlap first block",
+                )?;
+                experiment.copy(&s, &d, size - remaining, size)?;
+                remaining = 0;
+            }
         }
         if userspace_fallback {
             let mut source = &s;
