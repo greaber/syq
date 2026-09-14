@@ -233,7 +233,7 @@ report actual access or decision blockers instead of bypassing them.
 The user uses separate reviewer and implementer conversations. Each independent
 reviewer keeps one stable exchange file at
 `current-plans/reviews/pr-<number>/<reviewer-id>.md` for that PR, including
-reviews with no findings. Choose a unique reviewer/session label when creating
+reviews with no blocking findings. Choose a unique reviewer/session label when creating
 a file; reuse it for subsequent rounds in that same conversation. Different
 reviewers use different files. Do not infer reviewer identity from the shared
 GitHub account or adopt someone else's review as your own.
@@ -253,7 +253,12 @@ GitHub account or adopt someone else's review as your own.
 - The reviewer writes a numbered round with verdict, stable finding IDs
   (R1, R2, ...), severity, code locations, reasoning/reproduction, and checks
   with exact tested SHAs and limits. Distinguish required fixes, optional
-  suggestions, and product decisions. Then hand the turn to the implementer,
+  suggestions, and product decisions. State the blocking verdict separately
+  from the rest of the feedback: distinguish blocking defects, nonblocking
+  defects, optional style/design suggestions, and observations with no requested
+  action. "No blocking findings" does not mean "nothing to say" or that every
+  remaining comment needs a fix. Include useful context without inventing
+  suggestions to fill a quota. Then hand the turn to the implementer,
   or mark complete if no response is needed. Complete means this review round
   is finished at its reviewed SHA, not that the PR is merged or merge-ready.
 - The implementer reads all pending exchanges and independently assesses each
@@ -304,7 +309,8 @@ GitHub account or adopt someone else's review as your own.
 
 The user authorizes reviewer-to-implementer and implementer-to-reviewer pings
 for this workflow. Send a ping immediately after saving a completed review,
-fix response, or discussion handoff, including a review with no findings.
+fix response, or discussion handoff, regardless of whether the reviewer found
+blockers, minor issues, optional suggestions, observations, or nothing to add.
 Use the exchange file for substance; the ping identifies the PR, file's absolute
 path, round, SHA, next turn, and a short action such as "review response ready"
 or "design question before implementation". Identify it as an agent handoff,
@@ -330,6 +336,12 @@ a notification.
 Check command/tool success and report queued delivery separately from the
 recipient having read or acted on it. Local `codex queue --help` confirms the
 command; end-to-end delivery depends on the recipient's reachable app server.
+A queued message is conversation input, not a desktop notification. Do not
+promise that an idle recipient starts automatically or that a busy recipient
+is interrupted unless that behavior has been verified for the actual client.
+`codex queue` addresses Codex sessions; it is not a verified way to address a
+Claude Code conversation. The shared file works across clients, but each
+recipient needs its own supported notification route.
 If the recipient ID or transport is unavailable, or delivery fails, preserve
 the handoff and report the exact blocker; the user can resume the recipient
 with "check the review file". Do not claim a ping was delivered, start a daemon,
