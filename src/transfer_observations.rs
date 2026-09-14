@@ -201,9 +201,7 @@ impl Actor {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
-        #[cfg(target_os = "linux")]
         let mut cpu = self.thread_cpu.lock().unwrap();
-        #[cfg(target_os = "linux")]
         if let Some(finished) = CpuTimes::thread() {
             cpu.completed = cpu.completed.plus(finished);
             cpu.latest = Some(cpu.completed);
@@ -398,6 +396,7 @@ enum EndpointSource {
 struct Endpoint {
     label: String,
     source: EndpointSource,
+    initial: Option<ServerSnapshot>,
     previous: Option<ServerSnapshot>,
     previous_tcp: Option<crate::proto::TcpSocketStats>,
 }
@@ -405,10 +404,13 @@ struct Endpoint {
 pub(crate) struct Observations {
     pub enabled: AtomicBool,
     pub human_summary: AtomicBool,
+    /// Stop retrying optional subscriptions if they break a connection.
+    pub remote_subscription_failed: AtomicBool,
     pub workers: Registry,
     endpoints: Mutex<Vec<Endpoint>>,
     previous: Mutex<Option<ServerSnapshot>>,
     processes: Mutex<BTreeMap<String, (u64, CpuTimes)>>,
+    initial_cpu: Mutex<BTreeMap<String, CpuTimes>>,
 }
 #[derive(Serialize)]
 pub(crate) struct Interval {
@@ -428,9 +430,11 @@ pub(crate) struct WorkerInterval {
     pub active: usize,
     pub awaiting_work: usize,
     pub parked: usize,
-    /// Sum of measured worker-state durations, including tuner parking.
+    /// Sum of measured worker-state durations, excluding tuner parking.
     pub observed_ns: u64,
     pub fractions: BTreeMap<&'static str, f64>,
+    pub parked_ns: u64,
+    pub cumulative_parked_ns: u64,
     pub cumulative_fractions: BTreeMap<&'static str, f64>,
 }
 #[derive(Serialize)]
@@ -441,6 +445,7 @@ pub(crate) struct ProcessInterval {
     pub elapsed_ms: Option<u64>,
     /// Null on the first remote sample or when no newer sample arrived.
     pub cpu: Option<CpuTimes>,
+    pub cumulative_cpu: Option<CpuTimes>,
 }
 #[derive(Serialize)]
 pub(crate) struct EndpointInterval {
@@ -450,6 +455,7 @@ pub(crate) struct EndpointInterval {
     /// Null when remote evidence has not advanced since the preceding record.
     pub elapsed_ms: Option<u64>,
     pub actors: Vec<OperationInterval>,
+    pub cumulative_actors: Vec<OperationInterval>,
     /// Current local-side TCP_INFO, or the last reading after socket retirement.
     pub tcp: Option<crate::proto::TcpSocketStats>,
     pub tcp_delta: Option<TcpDelta>,
@@ -496,6 +502,37 @@ fn time_totals(rows: &[ActorSnapshot], old: &[ActorSnapshot]) -> [u64; STATES] {
     }
     totals
 }
+fn operations(sample: &ServerSnapshot, old: &ServerSnapshot) -> Vec<OperationInterval> {
+    sample
+        .actors
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let b = old.actors.get(i);
+            let times =
+                std::array::from_fn(|j| a.times[j].saturating_sub(b.map_or(0, |b| b.times[j])));
+            let (observed_ns, fractions) = fractions(&times);
+            OperationInterval {
+                role: a.role.clone(),
+                state_at_sample: NAMES[a.state],
+                observed_ns,
+                fractions,
+                bytes: NAMES
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, name)| {
+                        let n = a.bytes[j].saturating_sub(b.map_or(0, |b| b.bytes[j]));
+                        (n > 0).then_some((*name, n))
+                    })
+                    .collect(),
+                helper_cpu: cpu_difference(
+                    a.thread_cpu,
+                    b.and_then(|b| b.thread_cpu).or(Some(CpuTimes::default())),
+                ),
+            }
+        })
+        .collect()
+}
 fn fractions(totals: &[u64; STATES]) -> (u64, BTreeMap<&'static str, f64>) {
     let total = totals.iter().fold(0u64, |a, b| a.saturating_add(*b));
     (
@@ -509,6 +546,10 @@ fn fractions(totals: &[u64; STATES]) -> (u64, BTreeMap<&'static str, f64>) {
             .collect(),
     )
 }
+fn worker_fractions(mut totals: [u64; STATES]) -> (u64, BTreeMap<&'static str, f64>) {
+    totals[Stage::Parked as usize] = 0;
+    fractions(&totals)
+}
 impl Observations {
     pub(crate) fn enable(&self) {
         self.enabled.store(true, Ordering::Relaxed);
@@ -517,6 +558,10 @@ impl Observations {
         if previous.is_none() {
             let sample = self.workers.snapshot();
             if let Some(cpu) = sample.cpu {
+                self.initial_cpu
+                    .lock()
+                    .unwrap()
+                    .insert(sample.process.clone(), cpu);
                 self.processes
                     .lock()
                     .unwrap()
@@ -526,9 +571,11 @@ impl Observations {
         }
     }
     pub(crate) fn local(&self, label: String, registry: Arc<Registry>) {
+        let initial = registry.snapshot();
         self.endpoints.lock().unwrap().push(Endpoint {
             label,
-            previous: Some(registry.snapshot()),
+            initial: Some(initial.clone()),
+            previous: Some(initial),
             previous_tcp: None,
             source: EndpointSource::Local(registry),
         });
@@ -547,6 +594,7 @@ impl Observations {
         self.endpoints.lock().unwrap().push(Endpoint {
             label,
             source: EndpointSource::Remote(sample, socket),
+            initial: None,
             previous: None,
             previous_tcp,
         });
@@ -555,7 +603,9 @@ impl Observations {
         let current = self.workers.snapshot();
         let mut previous = self.previous.lock().unwrap();
         let old = previous.as_ref().map_or(&[][..], |s| s.actors.as_slice());
-        let (observed_ns, worker_fractions) = fractions(&time_totals(&current.actors, old));
+        let totals = time_totals(&current.actors, old);
+        let cumulative = time_totals(&current.actors, &[]);
+        let (observed_ns, worker_fractions) = worker_fractions(totals);
         let count = |state: Stage| {
             current
                 .actors
@@ -570,7 +620,9 @@ impl Observations {
             parked: count(Stage::Parked),
             observed_ns,
             fractions: worker_fractions,
-            cumulative_fractions: fractions(&time_totals(&current.actors, &[])).1,
+            parked_ns: totals[Stage::Parked as usize],
+            cumulative_parked_ns: cumulative[Stage::Parked as usize],
+            cumulative_fractions: self::worker_fractions(cumulative).1,
         };
         let elapsed_ms = previous
             .as_ref()
@@ -600,6 +652,7 @@ impl Observations {
                         }
                         if endpoint.previous.is_none() {
                             endpoint.previous = sample.first.lock().unwrap().clone();
+                            endpoint.initial = endpoint.previous.clone();
                         }
                         let latest = sample.latest.lock().unwrap();
                         (
@@ -641,12 +694,16 @@ impl Observations {
                     process: sample.as_ref().map(|s| s.process.clone()),
                     elapsed_ms: None,
                     actors: Vec::new(),
+                    cumulative_actors: Vec::new(),
                     tcp: endpoint.previous_tcp.clone(),
                     tcp_delta,
                     peer_tcp: sample.as_ref().and_then(|s| s.tcp.clone()),
                     peer_tcp_delta: None,
                 };
                 if let Some(sample) = sample {
+                    if let Some(initial) = endpoint.initial.as_ref() {
+                        row.cumulative_actors = operations(&sample, initial);
+                    }
                     if sample.process != process_identity() {
                         let entry = process_samples.entry(sample.process.clone()).or_insert((
                             age.unwrap_or(0),
@@ -688,38 +745,7 @@ impl Observations {
                                     });
                             row.elapsed_ms =
                                 Some(sample.at_ns.saturating_sub(old.at_ns) / 1_000_000);
-                            row.actors = sample
-                                .actors
-                                .iter()
-                                .enumerate()
-                                .map(|(i, a)| {
-                                    let b = old.actors.get(i);
-                                    let times = std::array::from_fn(|j| {
-                                        a.times[j].saturating_sub(b.map_or(0, |b| b.times[j]))
-                                    });
-                                    let (observed_ns, fractions) = fractions(&times);
-                                    OperationInterval {
-                                        role: a.role.clone(),
-                                        state_at_sample: NAMES[a.state],
-                                        observed_ns,
-                                        fractions,
-                                        bytes: NAMES
-                                            .iter()
-                                            .enumerate()
-                                            .filter_map(|(j, name)| {
-                                                let n = a.bytes[j]
-                                                    .saturating_sub(b.map_or(0, |b| b.bytes[j]));
-                                                (n > 0).then_some((*name, n))
-                                            })
-                                            .collect(),
-                                        helper_cpu: cpu_difference(
-                                            a.thread_cpu,
-                                            b.and_then(|b| b.thread_cpu)
-                                                .or(Some(CpuTimes::default())),
-                                        ),
-                                    }
-                                })
-                                .collect();
+                            row.actors = operations(&sample, old);
                         }
                         endpoint.previous = Some(sample);
                     }
@@ -728,7 +754,9 @@ impl Observations {
             })
             .collect();
         let mut previous_cpu = self.processes.lock().unwrap();
+        let mut initial_cpu = self.initial_cpu.lock().unwrap();
         for (id, baseline) in process_baselines {
+            initial_cpu.entry(id.clone()).or_insert(baseline.1);
             previous_cpu.entry(id).or_insert(baseline);
         }
         let processes = process_samples
@@ -737,6 +765,7 @@ impl Observations {
                 let old = previous_cpu.get(&process).copied();
                 let newer = old.is_none_or(|(then, _)| at > then);
                 let row = ProcessInterval {
+                    cumulative_cpu: cpu_difference(cpu, initial_cpu.get(&process).copied()),
                     local: process == process_identity(),
                     process: process.clone(),
                     sample_age_ms,
@@ -768,27 +797,68 @@ impl Observations {
         interval
     }
 }
+fn describe_fractions(fractions: &BTreeMap<&str, f64>) -> String {
+    let mut states: Vec<_> = fractions
+        .iter()
+        .filter(|(_, fraction)| **fraction >= 0.01)
+        .collect();
+    states.sort_by(|a, b| b.1.total_cmp(a.1).then(a.0.cmp(b.0)));
+    states
+        .into_iter()
+        .map(|(name, fraction)| format!("{} {:.0}%", name.replace('_', " "), fraction * 100.0))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 impl Interval {
     pub(crate) fn summary(&self) -> &str {
         &self.summary
     }
     fn format_summary(&self) -> String {
-        let states = self
-            .workers
-            .cumulative_fractions
-            .iter()
-            .map(|(name, fraction)| format!("{} {:.0}%", name.replace('_', " "), fraction * 100.0))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "Observed worker time: {} ({} workers; wait states, not proven causes)",
-            if states.is_empty() {
-                "no worker activity"
-            } else {
-                &states
-            },
-            self.workers.observed
-        )
+        let states = describe_fractions(&self.workers.cumulative_fractions);
+        let mut lines = vec![format!(
+            "Observed worker time: {} ({} {}; parking excluded: {:.3}s; wait states, not proven causes)",
+            if states.is_empty() { "no worker activity" } else { &states },
+            self.workers.observed,
+            if self.workers.observed == 1 { "worker" } else { "workers" },
+            self.workers.cumulative_parked_ns as f64 / 1e9,
+        )];
+        for endpoint in &self.endpoints {
+            for actor in &endpoint.cumulative_actors {
+                let states = describe_fractions(&actor.fractions);
+                let bytes = actor
+                    .bytes
+                    .iter()
+                    .map(|(name, n)| format!("{} {n} bytes", name.replace('_', " ")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "  {} / {}: {}{}{} (process {}; sample age {}ms)",
+                    endpoint.label,
+                    actor.role,
+                    if states.is_empty() {
+                        "no observed operation"
+                    } else {
+                        &states
+                    },
+                    if bytes.is_empty() { "" } else { "; " },
+                    bytes,
+                    endpoint.process.as_deref().unwrap_or("unknown"),
+                    endpoint.sample_age_ms.unwrap_or(0)
+                ));
+            }
+        }
+        for process in &self.processes {
+            if let Some(cpu) = process.cumulative_cpu {
+                lines.push(format!(
+                    "  Process {}{} CPU: user {:.3}s, system {:.3}s",
+                    process.process,
+                    if process.local { " (coordinator)" } else { "" },
+                    cpu.user_ns as f64 / 1e9,
+                    cpu.system_ns as f64 / 1e9
+                ));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -821,16 +891,30 @@ fn thread_cpu(tid: u64) -> Option<CpuTimes> {
 mod tests {
     use super::*;
     #[test]
-    fn worker_fractions_include_parked_and_awaiting_work_without_inactive_time() {
+    fn worker_fractions_exclude_parking_but_include_awaiting_work() {
         let a = Actor::new("worker");
         let b = Actor::new("worker");
         a.transition(Stage::AwaitingWork as u64, 100);
         b.transition(Stage::Parked as u64, 200);
-        let (ns, values) = fractions(&time_totals(&[a.snapshot_at(400), b.snapshot_at(400)], &[]));
-        assert_eq!(ns, 500);
-        assert_eq!(values["awaiting_work"], 0.6);
-        assert_eq!(values["parked"], 0.4);
+        let totals = time_totals(&[a.snapshot_at(400), b.snapshot_at(400)], &[]);
+        let (ns, values) = worker_fractions(totals);
+        assert_eq!(ns, 300);
+        assert_eq!(values["awaiting_work"], 1.0);
+        assert_eq!(totals[Stage::Parked as usize], 200);
+        assert!(!values.contains_key("parked"));
         assert!(!values.contains_key("inactive"));
+    }
+    #[test]
+    fn human_fractions_are_sorted_and_hide_negligible_states() {
+        let values = BTreeMap::from([
+            ("awaiting_work", 0.004),
+            ("destination_ack", 0.796),
+            ("source_response", 0.2),
+        ]);
+        assert_eq!(
+            describe_fractions(&values),
+            "destination ack 80%, source response 20%"
+        );
     }
     #[test]
     fn disabled_collection_does_not_record_operations() {
@@ -886,6 +970,25 @@ mod tests {
         );
         let stale = observations.sample();
         assert!(stale.endpoints[0].actors.is_empty());
+        assert_eq!(
+            stale.endpoints[0].cumulative_actors[0].fractions["source_read"],
+            1.0
+        );
+        assert_eq!(
+            stale
+                .processes
+                .iter()
+                .find(|p| !p.local)
+                .unwrap()
+                .cumulative_cpu
+                .unwrap()
+                .system_ns,
+            40
+        );
+        assert!(stale
+            .summary()
+            .contains("source / filesystem: source read 100%"));
+        assert!(stale.summary().contains("Process remote-process CPU:"));
         assert!(stale.endpoints[0].elapsed_ms.is_none());
         assert!(stale
             .processes

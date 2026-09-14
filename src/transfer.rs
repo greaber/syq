@@ -896,8 +896,20 @@ fn attempt_small_copy(
         .load(Relaxed)
         .then(|| progress.observations.workers.actor("worker"));
     if let Some(actor) = &native_actor {
-        reader.observe(&progress.observations, actor, true)?;
-        dst_ctl.observe(&progress.observations, actor, false)?;
+        if reader
+            .observe(&progress.observations, actor, true, 0)
+            .is_err()
+        {
+            return Ok(SmallCopy::Declined);
+        }
+        if dst_ctl
+            .observe(&progress.observations, actor, false, 0)
+            .is_err()
+        {
+            // Nothing has been copied yet. Reopen the control connection before
+            // entering the ordinary transfer path; never use lost framing.
+            return Ok(SmallCopy::Reconnect);
+        }
     }
     let _native_work = native_actor
         .as_ref()
@@ -1300,7 +1312,10 @@ pub fn run(mut args: Args) -> Result<i32> {
         !args.quiet && args.progress_json,
     );
     if args.stats || debug() {
-        progress.observations.human_summary.store(true, Relaxed);
+        progress
+            .observations
+            .human_summary
+            .store(!args.suppress_summary, Relaxed);
         progress.observations.enable();
     }
     // The detach and remote-coordinator combinations were refused at
@@ -3429,7 +3444,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && !args.suppress_summary && !args.quiet && !opts.verify_only && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -7604,9 +7619,9 @@ impl Worker {
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src
-                    .observe(&self.progress.observations, &actor, true)?;
+                    .observe(&self.progress.observations, &actor, true, self.id)?;
                 self.dst
-                    .observe(&self.progress.observations, &actor, false)?;
+                    .observe(&self.progress.observations, &actor, false, self.id)?;
                 self.observation = Some(actor);
             }
             let _working = self

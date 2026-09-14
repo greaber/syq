@@ -148,9 +148,6 @@ impl Progress {
 
     pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
         let _ = self.results.set(writer);
-        if !self.rm {
-            self.observations.enable();
-        }
     }
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {
@@ -276,7 +273,7 @@ impl Progress {
             t.last_observation = Some(now);
             t.observation = Some(self.observations.sample());
         }
-        if let Some(results) = self.results.get() {
+        if let Some(results) = self.results.get().filter(|_| status.is_none() || !self.rm) {
             let now = Instant::now();
             if status.is_some()
                 || t.last_results
@@ -540,6 +537,42 @@ impl crate::tune::Meter for Progress {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn results_do_not_enable_collection_and_only_copies_emit_a_final_sample() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for removal in [false, true] {
+            let mut progress = super::Progress::new(false, false, None, false);
+            std::sync::Arc::get_mut(&mut progress).unwrap().rm = removal;
+            let sink = Sink::default();
+            progress.set_results(std::sync::Arc::new(crate::results::ResultsWriter::new(
+                Box::new(sink.clone()),
+            )));
+            assert!(!progress
+                .observations
+                .enabled
+                .load(std::sync::atomic::Ordering::Relaxed));
+            progress.finish(true);
+            let bytes = sink.0.lock().unwrap();
+            if removal {
+                assert!(bytes.is_empty());
+            } else {
+                let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(record["type"], "progress");
+                assert!(record.get("activity").is_none());
+            }
+        }
+    }
+
     #[test]
     fn finishing_wakes_a_parked_ticker() {
         let progress = super::Progress::new(false, false, None, false);

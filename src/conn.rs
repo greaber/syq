@@ -21,6 +21,7 @@ pub trait Conn: Send {
         _observations: &crate::transfer_observations::Observations,
         _actor: &std::sync::Arc<crate::transfer_observations::Actor>,
         _source: bool,
+        _worker_id: usize,
     ) -> Result<()> {
         Ok(())
     }
@@ -568,11 +569,15 @@ impl Conn for LocalConn {
         observations: &crate::transfer_observations::Observations,
         actor: &std::sync::Arc<crate::transfer_observations::Actor>,
         source: bool,
+        worker_id: usize,
     ) -> Result<()> {
         if self.rpc_observation.is_none() {
             self.ops.observations.enable();
             observations.local(
-                if source { "source" } else { "destination" }.into(),
+                format!(
+                    "{} worker {worker_id}",
+                    if source { "source" } else { "destination" }
+                ),
                 self.ops.observations.clone(),
             );
         }
@@ -1092,11 +1097,13 @@ impl Conn for RemoteConn {
         observations: &crate::transfer_observations::Observations,
         actor: &std::sync::Arc<crate::transfer_observations::Actor>,
         source: bool,
+        worker_id: usize,
     ) -> Result<()> {
-        if self.rpc_observation.is_none() {
+        let subscribe = self.rpc_observation.is_none();
+        if subscribe {
             observations.remote(
                 format!(
-                    "{}:{}",
+                    "{} worker {worker_id}:{}",
                     if source { "source" } else { "destination" },
                     self.label
                 ),
@@ -1108,13 +1115,39 @@ impl Conn for RemoteConn {
             actor: actor.clone(),
             source,
         });
+        // Pool entries are handed out once; Drop shuts down this helper rather
+        // than returning a subscribed session for another command.
         // Subscribe only while this newly attached connection has no pending
         // data replies. The reader consumes later unsolicited stats separately.
-        self.send(Request::TransportStats)?;
-        match self.recv()? {
-            Response::TransportStats(_) => Ok(()),
-            other => bail!("unexpected observation subscription response {other:?}"),
+        if subscribe
+            && !observations
+                .remote_subscription_failed
+                .load(Ordering::Relaxed)
+        {
+            match self
+                .send(Request::TransportStats)
+                .and_then(|()| self.recv())
+            {
+                Ok(Response::TransportStats(_)) => {}
+                Ok(_) => crate::output::diagnostic!(
+                    "syq: {}: telemetry unavailable; continuing copy",
+                    self.label
+                ),
+                Err(error) => {
+                    // Lost framing cannot be ignored. Let the normal connection
+                    // recovery reopen it, without repeating the subscription.
+                    observations
+                        .remote_subscription_failed
+                        .store(true, Ordering::Relaxed);
+                    crate::output::diagnostic!(
+                        "syq: {}: telemetry connection failed; recovering without remote telemetry",
+                        self.label
+                    );
+                    return Err(error);
+                }
+            }
         }
+        Ok(())
     }
 
     fn send(&mut self, req: Request) -> Result<()> {

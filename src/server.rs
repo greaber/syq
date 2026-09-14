@@ -808,6 +808,14 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
             Request::TransportStats => {
+                #[cfg(debug_assertions)]
+                if let Some(mode) = std::env::var_os("SYQ_TEST_REJECT_TELEMETRY") {
+                    if mode == "disconnect" {
+                        break;
+                    }
+                    w.write_msg(&Response::Err("telemetry unavailable (test)".into()))?;
+                    continue;
+                }
                 ops.observations.enable();
                 w.enabled = true;
                 w.write_msg(&Response::TransportStats(Box::new(TransportStatsReply {

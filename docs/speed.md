@@ -72,8 +72,9 @@ The copying interval includes waiting and per-file work, and can overlap
 planning and connection setup. Use it to diagnose syq, not to compare against
 another tool's total time. If the script flags a short copying interval or
 substantial time outside it, try a larger workload to investigate sustained
-throughput. When syq reports activity, each verified trial also prints its observed
-worker-time summary. Other tools do not provide the same measurements here.
+throughput. The script requests syq statistics explicitly. Each verified trial prints changes
+in the dominant worker and endpoint states over time, followed by cumulative
+worker, endpoint-operation and CPU summaries. Other tools do not provide the same measurements here.
 
 ## Benchmarks
 
@@ -91,7 +92,8 @@ syq cp -vv --stats data --to server --into /backup
 ```
 
 `-vv` shows the chosen transport and connections; `--stats` adds totals and
-available TCP statistics and an observed worker-time summary. These wait fractions
+available TCP statistics, worker wait fractions, endpoint operations and bytes,
+and process CPU. These wait fractions
 help locate delays; they are not proof of their cause. Add `--results run.ndjson`
 to inspect how worker waits, endpoint operations, CPU and TCP backpressure change
 over time. Remote evidence includes its age. See the

@@ -1331,6 +1331,12 @@
         },
         "cumulative_fractions": {
           "$ref": "#/$defs/activityFractions"
+        },
+        "parked_ns": {
+          "$ref": "#/$defs/u64"
+        },
+        "cumulative_parked_ns": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [
@@ -1340,7 +1346,9 @@
         "parked",
         "observed_ns",
         "fractions",
-        "cumulative_fractions"
+        "cumulative_fractions",
+        "parked_ns",
+        "cumulative_parked_ns"
       ],
       "additionalProperties": false
     },
@@ -1375,6 +1383,16 @@
               "type": "null"
             }
           ]
+        },
+        "cumulative_cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityCpu"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1382,7 +1400,8 @@
         "local",
         "sample_age_ms",
         "elapsed_ms",
-        "cpu"
+        "cpu",
+        "cumulative_cpu"
       ],
       "additionalProperties": false
     },
@@ -1761,6 +1780,12 @@
               "type": "null"
             }
           ]
+        },
+        "cumulative_actors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activityOperation"
+          }
         }
       },
       "required": [
@@ -1772,7 +1797,8 @@
         "tcp",
         "tcp_delta",
         "peer_tcp",
-        "peer_tcp_delta"
+        "peer_tcp_delta",
+        "cumulative_actors"
       ],
       "additionalProperties": false
     },

@@ -18436,7 +18436,12 @@ fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
             .unwrap()
             .iter()
             .any(|a| a["observed_ns"].as_u64().unwrap() > 0)));
-    assert!(stderr_of(&out).contains("Observed worker time:"));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("Observed worker time:"));
+    assert!(stderr.contains("worker 0 /"), "{stderr}");
+    assert!(stderr.contains("bytes"), "{stderr}");
+    assert!(stderr.contains("CPU: user"), "{stderr}");
+    assert!(!stderr.contains("1 workers"), "{stderr}");
 }
 
 #[test]
@@ -18464,6 +18469,12 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|v| v["type"] == "progress")
+        .inspect(|v| {
+            assert!(
+                v.get("activity").is_none(),
+                "plain results must not enable telemetry: {v}"
+            )
+        })
         .count();
     // ~2s at the rate limit: the ticker samples once immediately and then
     // at least once more at the one-second throttle, TTY or not.
@@ -21678,5 +21689,70 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                 }
             }
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(64 * 1024 + 123, 359);
+    write(&t.path("source"), &data);
+    for (stats, debug, failure) in [
+        (false, false, "reject"),
+        (true, false, "reject"),
+        (false, true, "reject"),
+        (true, false, "disconnect"),
+        (false, true, "disconnect"),
+    ] {
+        let destination = t.s(&format!("destination-{stats}-{debug}-{failure}"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--connections",
+            "1",
+            "--no-tcp",
+            "--no-progress",
+            "--results",
+            &t.s(&format!("results-{stats}-{debug}-{failure}")),
+        ]);
+        if stats {
+            command.arg("--stats");
+        }
+        if debug {
+            command.env("SYQ_DEBUG", "1");
+        } else {
+            command.env_remove("SYQ_DEBUG");
+        }
+        let out = command
+            .arg(t.s("source"))
+            .args(["--to", "host", "--as", &destination])
+            .env("SYQ_TEST_REJECT_TELEMETRY", failure)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        if debug && failure == "reject" {
+            assert!(stderr_of(&out).contains("small copy: published"), "{out:?}");
+        }
+        assert_eq!(read(Path::new(&destination)), data);
+        assert_eq!(
+            stderr_of(&out).contains(if failure == "reject" {
+                "telemetry unavailable; continuing copy"
+            } else {
+                "recovering without remote telemetry"
+            }),
+            stats || debug,
+            "{out:?}"
+        );
     }
 }

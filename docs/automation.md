@@ -110,10 +110,15 @@ accounting. It includes bytes, files, exclusions, scan state, and elapsed time.
 Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. The terminal record owns final totals.
 
-Copy records also include an optional `activity` object when measurements are
-available. Copies that reach transfer completion emit a final progress sample
-before their terminal result, including for short copies. Older producers may omit activity; consumers should accept that.
-The Python SDK exposes it as `ProgressEvent.activity`.
+With `--stats` (or debug logging), copy records also include an optional
+`activity` object. `--results` alone does not collect these measurements. Copies
+that reach transfer completion emit a final progress sample before their terminal
+result, including for short copies. Older producers may omit activity; consumers
+should accept that.
+The Python SDK exposes it as `ProgressEvent.activity`. A rejected telemetry
+request warns and leaves the copy running. If the subscription loses its
+connection, syq reconnects without requesting further remote telemetry; local
+measurements remain available.
 
 | Activity field | Meaning |
 |---|---|
@@ -121,12 +126,14 @@ The Python SDK exposes it as `ProgressEvent.activity`.
 | `workers` | Counts at sampling time and fractions of observed worker time |
 | `endpoints` | Local operations or the latest reports from remote connections |
 | `processes` | User and system CPU deltas in nanoseconds, once per process |
-| `summary` | The same cumulative worker-time summary printed by `--stats` |
+| `summary` | The same cumulative worker, endpoint and CPU summary printed by `--stats` |
 
 Worker `fractions` divide each state's accumulated duration by `observed_ns`,
 including waits still in progress. They sum to one when activity was observed;
 an empty object means none was observed. `cumulative_fractions` uses all observed
-worker time since collection began. These are fractions of worker time, not
+worker time since collection began. Both exclude tuner parking; `parked_ns` and
+`cumulative_parked_ns` report that time separately in nanoseconds. These are
+fractions of worker time, not
 fractions of command elapsed time. `observed` includes retired workers; `active`
 excludes retired workers and workers `parked` by connection tuning. `awaiting_work`
 counts workers waiting for a scheduler job. Compare this with `scan_done` to
@@ -139,7 +146,10 @@ bandwidth-limit waits. `other_work` is remaining worker activity. A source-respo
 wait alone cannot distinguish storage, CPU, transport or downstream backpressure.
 
 Endpoint `actors` separate filesystem operations, server communication and Linux
-read-ahead helpers. Their fractions use each actor's own observed time; do not add
+read-ahead helpers. `cumulative_actors` reports the same measurements since the
+connection subscribed, including when its latest sample has not advanced. Labels
+include worker IDs to distinguish connections. Their fractions use each actor's
+own observed time; do not add
 fractions across actors or to worker fractions. `source_read` measures demand-read
 syscalls, including reads used to hash existing destination data; `hashing` measures
 content hashing; `destination_write` measures write syscalls. `filesystem_copy`
@@ -154,7 +164,8 @@ advice before releasing or shrinking a range. Read and write byte counters count
 are logical bytes and may include cloning or offload. Helper `helper_cpu` is a subset of its process CPU, not
 additional CPU. Live Linux helper CPU uses the kernel clock-tick resolution, so
 short intervals can report zero. Process identities are temporary identifiers
-for this run.
+for this run. Process `cpu` is the interval delta; `cumulative_cpu` is the delta
+since collection began for that process.
 
 Remote reports arrive at response boundaries and on connection retirement.
 `sample_age_ms` measures time since receipt, so network delivery delay is additional
