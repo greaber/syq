@@ -69,8 +69,28 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(permit: Permit) -> std::io::Result<Self> {
-        Self::start_with(permit, |fd, offset, len| {
+    fn start(
+        permit: Permit,
+        observation: Option<Arc<crate::transfer_observations::Actor>>,
+    ) -> std::io::Result<Self> {
+        struct EndObservation(Option<Arc<crate::transfer_observations::Actor>>);
+        impl Drop for EndObservation {
+            fn drop(&mut self) {
+                if let Some(actor) = &self.0 {
+                    actor.finish_thread();
+                }
+            }
+        }
+        let end_observation = EndObservation(observation.clone());
+        let observing = observation.clone();
+        Self::start_with(permit, move |fd, offset, len| {
+            let _keep_until_thread_exit = &end_observation;
+            let span = observing
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::PrefetchAdvice));
+            if let Some(span) = &span {
+                span.bytes(len);
+            }
             // SAFETY: the caller holds the authorized descriptor and a checked
             // off_t range until this advisory operation returns.
             unsafe {
@@ -182,6 +202,8 @@ impl Drop for Worker {
 pub(crate) struct ReadAhead {
     worker: Option<Worker>,
     stream: Option<Stream>,
+    observation: Option<Arc<crate::transfer_observations::Actor>>,
+    helper_observation: Option<Arc<crate::transfer_observations::Actor>>,
 }
 
 struct Stream {
@@ -191,6 +213,16 @@ struct Stream {
 }
 
 impl ReadAhead {
+    pub(crate) fn observed(
+        registry: Arc<crate::transfer_observations::Registry>,
+        operation: Arc<crate::transfer_observations::Actor>,
+    ) -> Self {
+        Self {
+            observation: Some(operation),
+            helper_observation: Some(registry.actor("prefetch")),
+            ..Self::default()
+        }
+    }
     /// The caller already owns this interval. Demand may survive individual
     /// reads, but must be fenced before the stream stops or releases a suffix.
     pub(crate) fn begin_stream(&mut self, range: Range<u64>) {
@@ -206,6 +238,10 @@ impl ReadAhead {
         if let Some(stream) = &mut self.stream {
             if end < stream.range.end {
                 if stream.active {
+                    let _wait = self
+                        .observation
+                        .as_ref()
+                        .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
                     self.worker.as_ref().unwrap().finish();
                 }
                 stream.range.end = end;
@@ -217,6 +253,10 @@ impl ReadAhead {
 
     pub(crate) fn end_stream(&mut self) {
         if self.stream.take().is_some_and(|stream| stream.active) {
+            let _wait = self
+                .observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
             self.worker.as_ref().unwrap().finish();
         }
     }
@@ -255,6 +295,7 @@ impl ReadAhead {
                     "source range exceeds file offsets",
                 )
             })?;
+        let observation = self.observation.clone();
         let mut range = if let Some(stream) = &self.stream {
             let (bounds, active, attempted) =
                 (stream.range.clone(), stream.active, stream.attempted);
@@ -274,7 +315,15 @@ impl ReadAhead {
             let before = (range.needs_observation()
                 && copied + (chunk.len() as u64) < range.range.end)
                 .then(Activity::sample);
-            source.read_exact_at(chunk, copied)?;
+            {
+                let read = observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
+                source.read_exact_at(chunk, copied)?;
+                if let Some(read) = read {
+                    read.bytes(chunk.len() as u64);
+                }
+            }
             copied += chunk.len() as u64;
             let prepare = before.is_some_and(|before| Activity::sample().read_wait_since(before));
             range.advance(copied, prepare);
@@ -325,7 +374,8 @@ impl PreparedRange<'_> {
                 return;
             };
             self.attempted = true;
-            self.preparation.worker = Worker::start(permit).ok();
+            self.preparation.worker =
+                Worker::start(permit, self.preparation.helper_observation.clone()).ok();
         }
         self.attempted = true;
         let Some(worker) = &self.preparation.worker else {
@@ -349,6 +399,11 @@ impl Drop for PreparedRange<'_> {
     fn drop(&mut self) {
         if !self.preserve {
             if self.active {
+                let _wait = self
+                    .preparation
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
                 self.preparation.worker.as_ref().unwrap().finish();
             }
             if let Some(stream) = &mut self.preparation.stream {
@@ -406,7 +461,7 @@ mod tests {
             active: AtomicUsize::new(0),
             limit: 1,
         });
-        let worker = Worker::start(budget.acquire().unwrap()).unwrap();
+        let worker = Worker::start(budget.acquire().unwrap(), None).unwrap();
         for start in [4096, 65536] {
             worker.begin(tempfile::tempfile().unwrap(), start, start + 4096);
             worker.finish();

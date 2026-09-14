@@ -298,6 +298,7 @@ class ProgressEvent:
     scanned: int
     scan_done: bool
     elapsed_ms: int
+    activity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

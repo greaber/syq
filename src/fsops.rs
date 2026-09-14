@@ -1459,6 +1459,8 @@ fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
+    pub(crate) observations: Arc<crate::transfer_observations::Registry>,
+    operation: Arc<crate::transfer_observations::Actor>,
     #[cfg(target_os = "linux")]
     read_ahead: crate::read_ahead::ReadAhead,
     fds: HashMap<FdKey, CachedFile>,
@@ -1617,9 +1619,13 @@ impl FsOps {
     }
 
     pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
+        let observations = Arc::new(crate::transfer_observations::Registry::default());
+        let operation = observations.actor("filesystem");
         FsOps {
+            observations: observations.clone(),
+            operation: operation.clone(),
             #[cfg(target_os = "linux")]
-            read_ahead: crate::read_ahead::ReadAhead::default(),
+            read_ahead: crate::read_ahead::ReadAhead::observed(observations, operation),
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
@@ -1764,7 +1770,7 @@ impl FsOps {
         let mut total = 0u64;
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
-            if content_digest(&file.data) != file.hash {
+            if observed_digest(&self.operation, &file.data) != file.hash {
                 bail!("block hash mismatch on receive");
             }
             let bytes = file.data.len() as u64;
@@ -2079,7 +2085,7 @@ impl FsOps {
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        file.write_all_at(data, 0)
+        observed_write(&self.operation, &file, data, 0)
             .with_context(|| format!("write {}", label.display()))?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
@@ -4620,7 +4626,31 @@ fn parallel_map_init<T: Sync, R: Send, S>(
 /// Hash exactly `len` bytes in fixed blocks. A short reader contributes the
 /// bytes it has and empty hashes for the missing blocks, matching both source
 /// and destination behavior through one implementation.
+#[cfg(test)]
 fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<ContentDigest>> {
+    hash_reader_observed(reader, block, len, None)
+}
+fn observed_digest(actor: &Arc<crate::transfer_observations::Actor>, data: &[u8]) -> ContentDigest {
+    let _hash = actor.span(crate::transfer_observations::Stage::Hashing);
+    content_digest(data)
+}
+fn observed_write(
+    actor: &Arc<crate::transfer_observations::Actor>,
+    file: &File,
+    data: &[u8],
+    off: u64,
+) -> std::io::Result<()> {
+    let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
+    file.write_all_at(data, off)?;
+    writing.bytes(data.len() as u64);
+    Ok(())
+}
+fn hash_reader_observed(
+    reader: &mut impl Read,
+    block: u64,
+    len: u64,
+    actor: Option<&Arc<crate::transfer_observations::Actor>>,
+) -> Result<Vec<ContentDigest>> {
     if !hash_response_fits(block, len) {
         bail!("hash block size or response count is outside protocol limits");
     }
@@ -4632,13 +4662,24 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<Conte
         let want = remaining.min(block) as usize;
         let mut got = 0;
         while got < want {
-            let read = reader.read(&mut buf[got..want])?;
+            let read = {
+                let reading =
+                    actor.map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
+                let n = reader.read(&mut buf[got..want])?;
+                if let Some(reading) = reading {
+                    reading.bytes(n as u64);
+                }
+                n
+            };
             if read == 0 {
                 break;
             }
             got += read;
         }
-        hashes.push(content_digest(&buf[..got]));
+        {
+            let _hash = actor.map(|a| a.span(crate::transfer_observations::Stage::Hashing));
+            hashes.push(content_digest(&buf[..got]));
+        }
         if got < want {
             while hashes.len() < n {
                 hashes.push(content_digest(&[]));
@@ -5270,7 +5311,7 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
-        let hashes = hash_reader(&mut file, block, len)?;
+        let hashes = hash_reader_observed(&mut file, block, len, Some(&self.operation))?;
         self.held_basis = Some(HeldBasis {
             location,
             label,
@@ -5514,6 +5555,9 @@ impl FsOps {
         size: u64,
         mode: u32,
     ) -> Result<CopyLocalOutcome> {
+        let _copy = self
+            .operation
+            .span(crate::transfer_observations::Stage::FilesystemCopy);
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
@@ -5875,6 +5919,7 @@ impl FsOps {
             }
             d.set_len(size)?;
         }
+        _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
     }
 
@@ -5906,7 +5951,7 @@ impl FsOps {
         let flags = put.flags;
         let inplace = put.inplace;
         let condition = put.condition;
-        if content_digest(data) != hash {
+        if observed_digest(&self.operation, data) != hash {
             bail!("block hash mismatch on receive");
         }
         let staged_mode = staged_file_mode(meta, flags);
@@ -5968,7 +6013,7 @@ impl FsOps {
                         })?
                     }
                 };
-                file.write_all_at(data, 0)
+                observed_write(&self.operation, &file, data, 0)
                     .with_context(|| format!("write {}", rooted.label.display()))?;
                 set_meta_file(&file, meta, flags)
                     .with_context(|| format!("set metadata {}", rooted.label.display()))?;
@@ -5998,7 +6043,7 @@ impl FsOps {
                 let file = rooted.root.open_regular_write(&rooted.relative, false)?;
                 require_open_target(&file, &rooted.label, condition)?;
                 file.set_len(0)?;
-                file.write_all_at(data, 0)
+                observed_write(&self.operation, &file, data, 0)
                     .with_context(|| format!("write existing {}", rooted.label.display()))?;
                 file.set_len(data.len() as u64)?;
                 set_meta_file(&file, meta, flags)
@@ -6023,7 +6068,7 @@ impl FsOps {
             if basis_size.is_some() {
                 file.set_len(0)?;
             }
-            file.write_all_at(data, 0)
+            observed_write(&self.operation, &file, data, 0)
                 .with_context(|| format!("write {}", label.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", label.display()))?;
@@ -6044,7 +6089,7 @@ impl FsOps {
             let file = open_existing_regular(&p, true)?;
             require_open_target(&file, &p, condition)?;
             file.set_len(0)?;
-            file.write_all_at(data, 0)
+            observed_write(&self.operation, &file, data, 0)
                 .with_context(|| format!("write existing {}", p.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", p.display()))?;
@@ -6059,7 +6104,7 @@ impl FsOps {
         if basis_size.is_some() {
             f.set_len(0)?;
         }
-        f.write_all_at(data, 0)
+        observed_write(&self.operation, &f, data, 0)
             .with_context(|| format!("write {}", pp.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
         #[cfg(debug_assertions)]
@@ -6092,7 +6137,7 @@ impl FsOps {
             }
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file = open_registered_source(&source_target)?;
-                return hash_reader(&mut file, block, len);
+                return hash_reader_observed(&mut file, block, len, Some(&self.operation));
             }
             // Only an explicitly unconfined rsync source session can reach
             // this legacy branch after source roots have been initialized.
@@ -6115,7 +6160,7 @@ impl FsOps {
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
-            return hash_reader(&mut file, block, len);
+            return hash_reader_observed(&mut file, block, len, Some(&self.operation));
         }
         let p = resolve(target.path);
         let p = if which == Which::Partial {
@@ -6135,7 +6180,7 @@ impl FsOps {
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
         }
-        hash_reader(&mut f, block, len)
+        hash_reader_observed(&mut f, block, len, Some(&self.operation))
     }
 
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
@@ -6161,6 +6206,7 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<Response> {
+        let operation = self.operation.clone();
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
             || std::env::var_os("SYQ_TEST_FAIL_READ_RANGE_NAME")
@@ -6190,9 +6236,15 @@ impl FsOps {
             #[cfg(target_os = "linux")]
             let read = preparation.read_exact_at(f, &mut data, off);
             #[cfg(not(target_os = "linux"))]
-            let read = f.read_exact_at(&mut data, off);
+            let read = {
+                let _read = operation.span(crate::transfer_observations::Stage::SourceRead);
+                f.read_exact_at(&mut data, off)
+            };
             read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
-            let hash = content_digest(&data);
+            let hash = {
+                let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+                content_digest(&data)
+            };
             Ok(Response::Block { off, hash, data })
         })();
         #[cfg(target_os = "linux")]
@@ -6217,7 +6269,12 @@ impl FsOps {
         {
             bail!("test range write failure");
         }
-        if content_digest(data) != hash {
+        let operation = self.operation.clone();
+        let actual_hash = {
+            let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+            content_digest(data)
+        };
+        if actual_hash != hash {
             bail!("block hash mismatch on receive @{off}");
         }
         let (file, label) = if let Some(rooted) =
@@ -6240,8 +6297,12 @@ impl FsOps {
             let file = self.cached(&label, true, attempt, !inplace)?;
             (file, label)
         };
-        file.write_range_at(data, off)
-            .with_context(|| format!("write {} @{off}", label.display()))
+        let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
+        let result = file.write_range_at(data, off);
+        if result.is_ok() {
+            writing.bytes(data.len() as u64);
+        }
+        result.with_context(|| format!("write {} @{off}", label.display()))
     }
 
     fn finalize(
@@ -6479,6 +6540,9 @@ impl FsOps {
     /// Dispatch a single-response request, rewriting its paths in place.
     /// The caller must not dispatch the mapped request again.
     pub fn handle_in_place(&mut self, req: &mut Request) -> Response {
+        let _handling = self
+            .operation
+            .span(crate::transfer_observations::Stage::Handling);
         if let Err(error) = self
             .validate_source_session_request(req)
             .and_then(|()| self.validate_destination_session_request(req))

@@ -63,7 +63,9 @@ if '--results' in args:
         result['copying_elapsed_ms']=copy_ms
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
         result['copying_elapsed_ms']=999999999
-    pathlib.Path(args[args.index('--results')+1]).write_text(json.dumps(result)+'\n')
+    progress={'type':'progress','activity':{'summary':'Observed worker time: source response 100% (test fixture)'}}
+    lines=[] if os.environ.get('BENCH_TEST_OLD') else [json.dumps(progress)]
+    pathlib.Path(args[args.index('--results')+1]).write_text('\n'.join(lines+[json.dumps(result)])+'\n')
 if '--quiet' not in args and src.name == 'probe':
     print('test double: preparing matching remote helper', flush=True)
 if '--quiet' not in args and '--suppress-summary' not in args:
@@ -224,6 +226,14 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn('Command:', result.stdout)
                 self.assertNotIn('large syq', result.stdout)
                 self.assert_clean()
+
+    def test_activity_summary_is_printed_once_per_scored_trial(self):
+        for old in [False, True]:
+            result = self.invoke('--tool', 'syq', '--workload', 'small',
+                env=dict(self.env, **({'BENCH_TEST_OLD':'1'} if old else {})))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('Observed worker time:'), 0 if old else 1)
+            self.assert_clean()
 
     def test_explicit_stats_survive_concise_output(self):
         result = self.invoke('--tool', 'syq', '--', '--stats')

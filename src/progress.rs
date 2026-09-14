@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Progress {
+    pub(crate) observations: crate::transfer_observations::Observations,
     pub enabled: bool,
     pub json: bool,
     pub width: Option<usize>,
@@ -70,6 +71,8 @@ struct TermState {
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
     last_results: Option<Instant>,
+    last_observation: Option<Instant>,
+    observation: Option<crate::transfer_observations::Interval>,
 }
 
 /// Own the ticker until it has stopped. In particular, `?` must not detach a
@@ -99,6 +102,7 @@ impl Drop for ProgressTicker {
 impl Progress {
     pub fn new(enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
         Arc::new(Progress {
+            observations: Default::default(),
             enabled: enabled && !json && (force || std::io::stderr().is_terminal()),
             json,
             width,
@@ -129,6 +133,8 @@ impl Progress {
                 samples: VecDeque::from([(Instant::now(), 0)]),
                 last_json: None,
                 last_results: None,
+                last_observation: None,
+                observation: None,
             }),
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
@@ -137,6 +143,9 @@ impl Progress {
 
     pub fn set_results(&self, writer: Arc<crate::results::ResultsWriter>) {
         let _ = self.results.set(writer);
+        if !self.rm {
+            self.observations.enable();
+        }
     }
 
     pub fn results_writer(&self) -> Option<&Arc<crate::results::ResultsWriter>> {
@@ -254,10 +263,19 @@ impl Progress {
             None
         };
 
-        if let Some(results) = self.results.get().filter(|_| status.is_none()) {
+        if self.observations.enabled.load(Relaxed)
+            && (status.is_some()
+                || t.last_observation
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)))
+        {
+            t.last_observation = Some(now);
+            t.observation = Some(self.observations.sample());
+        }
+        if let Some(results) = self.results.get() {
             let now = Instant::now();
-            if t.last_results
-                .is_none_or(|last| now - last >= Duration::from_secs(1))
+            if status.is_some()
+                || t.last_results
+                    .is_none_or(|last| now - last >= Duration::from_secs(1))
             {
                 t.last_results = Some(now);
                 results.emit_progress(&crate::results::ProgressRecord {
@@ -271,6 +289,7 @@ impl Progress {
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
                     elapsed_ms: self.start.elapsed().as_millis() as u64,
+                    activity: t.observation.as_ref(),
                 });
             }
         }
@@ -362,6 +381,11 @@ impl Progress {
         if self.enabled {
             crate::output::finish_progress();
         }
+        if !self.json && self.observations.human_summary.load(Relaxed) {
+            if let Some(observation) = &self.term.lock().unwrap().observation {
+                crate::output::diagnostic!("{}", observation.summary());
+            }
+        }
     }
 
     pub fn clear(&self) {
@@ -373,7 +397,11 @@ impl Progress {
     pub fn spawn_ticker(self: &Arc<Self>) -> Option<ProgressTicker> {
         // A results stream needs the ticker too: sampled progress records
         // are emitted from render() even when stderr is not a terminal.
-        if !self.enabled && !self.json && self.results.get().is_none() {
+        if !self.enabled
+            && !self.json
+            && self.results.get().is_none()
+            && !self.observations.enabled.load(Relaxed)
+        {
             return None;
         }
         let p = self.clone();

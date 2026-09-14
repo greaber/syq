@@ -18390,6 +18390,56 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
 }
 
 #[test]
+fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), &vec![7; 2 * 1024 * 1024]);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--srcs-in",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "activity.ndjson",
+            "--stats",
+            "-q",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(read(&t.path("src/a")), read(&t.path("dst/a")));
+    let content = String::from_utf8(read(&t.path("activity.ndjson"))).unwrap();
+    assert_automation_stream(&automation_validator(), &content, "activity copy");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["type"], "result");
+    let activity = &records
+        .iter()
+        .rev()
+        .find(|r| r["type"] == "progress")
+        .unwrap()["activity"];
+    assert!(activity["workers"]["observed"].as_u64().unwrap() > 0);
+    assert_eq!(activity["workers"]["active"], 0);
+    let fractions = activity["workers"]["cumulative_fractions"]
+        .as_object()
+        .unwrap();
+    assert!((fractions.values().map(|v| v.as_f64().unwrap()).sum::<f64>() - 1.0).abs() < 1e-9);
+    assert!(activity["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["observed_ns"].as_u64().unwrap() > 0)));
+    assert!(stderr_of(&out).contains("Observed worker time:"));
+}
+
+#[test]
 fn native_cp_results_non_tty_run_emits_progress_records() {
     let t = Tmp::new();
     write(&t.path("src/big.bin"), &vec![7u8; 64 * 1024]);
@@ -21520,6 +21570,7 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
         for pull in [false, true] {
             for stream in [false, true] {
                 let destination = t.s(&format!("dst-{tcp}-{pull}-{stream}"));
+                let result_path = t.s(&format!("activity-{tcp}-{pull}-{stream}.ndjson"));
                 let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
                 command.args([
                     "cp",
@@ -21530,6 +21581,8 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     "--connections",
                     "1",
                     "--no-progress",
+                    "--results",
+                    &result_path,
                     "--tcp-ports",
                     EPHEMERAL_TCP_PORTS,
                     "--tuning-options",
@@ -21577,6 +21630,36 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     );
                 }
                 assert_eq!(read(Path::new(&destination)), data);
+                let content = fs::read_to_string(&result_path).unwrap();
+                assert_automation_stream(&automation_validator(), &content, "remote activity");
+                let records: Vec<serde_json::Value> = content
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                let samples: Vec<_> = records.iter().filter_map(|r| r.get("activity")).collect();
+                assert!(samples
+                    .iter()
+                    .any(|s| s["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["actors"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|a| a["fractions"].get("source_read").is_some()))));
+                assert!(samples.iter().any(|s| s["processes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["local"] == false && p["cpu"].is_object())));
+                if tcp {
+                    assert!(samples.iter().any(|s| s["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["peer_tcp"].is_object())));
+                }
             }
         }
     }

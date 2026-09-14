@@ -373,6 +373,18 @@ copying_interval() {
     ' "${2:-optional}" "$1"
 }
 
+activity_summary() {
+    perl -MJSON::PP -e '
+        my $summary;
+        while (<>) {
+            my $record=decode_json($_);
+            $summary=$record->{activity}{summary}
+                if ($record->{type} // "") eq "progress" && ref($record->{activity}) eq "HASH";
+        }
+        print "$summary\n" if defined($summary);
+    ' "$1"
+}
+
 summarize_syq_timings() {
     [[ -s $1 ]] || return 0
     printf '\nSyq timing breakdown (means per trial):\n'
@@ -692,6 +704,7 @@ main() {
                     printf 'Verified contents; speed %s MB/s; elapsed %s seconds.\n' "$speed" "$seconds"
                 fi
                 if [[ $tool == syq ]]; then
+                    activity_summary "$local_root/trial.json" || fail "Cannot read syq trial activity."
                     copying_ms=$(copying_interval "$local_root/trial.json") || fail 'Cannot read syq trial timing.'
                     if [[ $copying_ms != n/a ]]; then
                         awk -v ms="$copying_ms" -v seconds="$seconds" -v bytes="$bytes" 'BEGIN {
