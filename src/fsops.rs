@@ -2384,7 +2384,7 @@ impl FsOps {
                 SourceRootHandle {
                     root: Arc::new(Root::from_directory(directory)?),
                     _leaf_object: leaf_object.map(Arc::new),
-                    selection: source.selection.relative.clone(),
+                    selection: source.selection.relative().to_vec(),
                     expected_leaf: source.expected_leaf.clone(),
                 },
             );
@@ -2406,7 +2406,7 @@ impl FsOps {
             .source_roots
             .get(&source.root())
             .with_context(|| format!("unknown registered source root {}", source.root().get()))?;
-        if !handle.selection.is_empty() && source.relative != handle.selection {
+        if !handle.selection.is_empty() && source.relative() != handle.selection {
             bail!("registered source leaf does not authorize the requested path");
         }
         Ok(handle)
@@ -2416,7 +2416,7 @@ impl FsOps {
         let handle = self.registered_source_handle(source)?;
         Ok(RegisteredSourceTarget {
             root: handle.root.clone(),
-            relative: RelativePath::new(&source.relative)?,
+            relative: RelativePath::new(source.relative())?,
             expected_leaf: handle.expected_leaf.clone(),
             leaf_object: handle._leaf_object.clone(),
         })
@@ -2439,7 +2439,7 @@ impl FsOps {
             let target = self.registered_source_target(source)?;
             return Ok(Some(SourceScanRoot {
                 root: target.root,
-                relative: source.relative.clone(),
+                relative: source.relative().to_vec(),
                 expected_leaf: target.expected_leaf,
             }));
         }
@@ -3228,42 +3228,34 @@ impl FsOps {
             if sources.len() != paths.len() {
                 bail!("source stat capability count does not match path count");
             }
-            let targets = sources
+            // Validate capability authority eagerly. RegisteredPath construction
+            // and deserialization guarantee valid relative path bytes.
+            let mut targets = sources
                 .iter()
-                .map(|source| {
+                .enumerate()
+                .map(|(index, source)| {
                     let handle = self.registered_source_handle(source)?;
-                    source.validate()?;
-                    Ok((source, handle))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            // Data jobs deliberately scatter siblings to avoid destination
-            // contention. Group only these read-only metadata lookups; restore
-            // request order below, including which error is reported first.
-            let mut order: Vec<_> = (0..targets.len()).collect();
-            let key = |index: usize| {
-                let source = targets[index].0;
-                (
-                    source.root().get(),
-                    source
-                        .relative
+                    let parent = source
+                        .relative()
                         .rsplitn(2, |b| *b == b'/')
                         .nth(1)
-                        .unwrap_or(b""),
-                )
-            };
-            order.sort_unstable_by(|a, b| key(*a).cmp(&key(*b)));
+                        .unwrap_or(b"");
+                    Ok(((source.root().get(), parent), index, source, handle))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Group only metadata lookups; data-job scheduling stays unchanged.
+            targets.sort_unstable_by_key(|(key, ..)| *key);
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
             let results = parallel_map_init(
-                &order,
+                &targets,
                 || None,
-                |parent, &index| {
-                    let (source, target) = targets[index];
+                |parent, (_, _, source, target)| {
                     let Some(expected) = target.expected_leaf.as_ref() else {
-                        return Ok(stat_with_parent(&target.root, parent, &source.relative));
+                        return Ok(stat_with_parent(&target.root, parent, source.relative()));
                     };
-                    let relative = RelativePath::new(&source.relative)?;
+                    let relative = RelativePath::new(source.relative())?;
                     let metadata = target
                         .root
                         .metadata(&relative)
@@ -3284,9 +3276,15 @@ impl FsOps {
                     Ok(Some(entry))
                 },
             );
-            let mut results: Vec<_> = order.into_iter().zip(results).collect();
-            results.sort_unstable_by_key(|(index, _)| *index);
-            return results.into_iter().map(|(_, result)| result).collect();
+            // Scatter before collecting so the first error, as well as each
+            // successful entry, follows request order rather than lookup order.
+            debug_assert_eq!(targets.len(), sources.len());
+            debug_assert_eq!(results.len(), targets.len());
+            let mut ordered: Vec<_> = (0..sources.len()).map(|_| Ok(None)).collect();
+            for ((_, index, ..), result) in targets.into_iter().zip(results) {
+                ordered[index] = result;
+            }
+            return ordered.into_iter().collect();
         }
         if self.destination_root.is_none()
             && !self.source_roots.is_empty()
@@ -4529,9 +4527,17 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
 // this observes the selected directory if it is renamed during the chunk.
 // Symlink reads and identity checks use that same parent; the next chunk or
 // request starts without a retained handle and resolves the path again.
+struct HeldMetadataParent {
+    // Device/inode can coincide across bind-mount views. Retain the actual
+    // opened root so its distinct object identity cannot be recycled.
+    root: Arc<Root>,
+    path: PathBytes,
+    directory: File,
+}
+
 fn stat_with_parent(
-    root: &Root,
-    parent: &mut Option<(RootIdentity, PathBytes, File)>,
+    root: &Arc<Root>,
+    parent: &mut Option<HeldMetadataParent>,
     path: &[u8],
 ) -> Option<Entry> {
     if path.starts_with(b"/") {
@@ -4547,17 +4553,21 @@ fn stat_with_parent(
     let name = &path[separator + 1..];
     if parent
         .as_ref()
-        .is_none_or(|(identity, key, _)| *identity != root.identity() || key != parent_path)
+        .is_none_or(|held| !Arc::ptr_eq(&held.root, root) || held.path != parent_path)
     {
         *parent = None;
         let directory = root
             .open_directory(&RelativePath::new(parent_path).ok()?)
             .ok()?;
-        *parent = Some((root.identity(), parent_path.to_vec(), directory));
+        *parent = Some(HeldMetadataParent {
+            root: root.clone(),
+            path: parent_path.to_vec(),
+            directory,
+        });
     }
     // The held parent's key was validated when opened. This operation validates
     // the leaf, so siblings do not need an allocated RelativePath for validation.
-    let directory = &parent.as_ref()?.2;
+    let directory = &parent.as_ref()?.directory;
     let metadata = root.metadata_in_directory(directory, name).ok()?;
     rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
 }
@@ -5508,7 +5518,7 @@ impl FsOps {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
-        let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
+        let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         let s = open_registered_source(&source_target)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
         // The kernel copy reads the source through the page cache, so the
@@ -6099,9 +6109,9 @@ impl FsOps {
         let target = self.source_content_target(source)?;
         let p = resolve(path);
         let f = if let Some((root_id, target)) = target {
-            let relative_bytes = &source
+            let relative_bytes = source
                 .expect("rooted source target requires a registered reference")
-                .relative;
+                .relative();
             self.cached_source_read(root_id, relative_bytes, &target, attempt)?
         } else {
             // This is either a pre-registration test/control operation or the
@@ -10320,7 +10330,7 @@ mod tests {
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
-        assert_eq!(roots[0].selection.relative, b"selected");
+        assert_eq!(roots[0].selection.relative(), b"selected");
         assert!(roots[0].expected_leaf.is_some());
         assert!(control.source_roots[&roots[0].selection.root()]
             ._leaf_object
@@ -10506,6 +10516,46 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, Kind::Symlink);
         assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
+    }
+
+    #[test]
+    fn metadata_parent_cache_distinguishes_opened_roots_with_same_inode() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"old").unwrap();
+        let first = Arc::new(Root::open(base).unwrap());
+        let second = Arc::new(Root::open(base).unwrap());
+        assert_eq!(first.identity(), second.identity());
+        let mut parent = None;
+        assert_eq!(
+            stat_with_parent(&first, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            3
+        );
+        // Force the held parent to differ from a fresh lookup without requiring
+        // mount privileges. The second opened root must start a new lookup even
+        // though its device/inode match: bind-mount views can differ this way too.
+        fs::rename(base.join("parent"), base.join("old-parent")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"replacement").unwrap();
+        assert_eq!(
+            stat_with_parent(&second, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            11
+        );
+        // The second root keeps its own parent pinned across sibling lookups.
+        fs::rename(base.join("parent"), base.join("second-parent")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"new").unwrap();
+        assert_eq!(
+            stat_with_parent(&second, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            11
+        );
     }
 
     #[test]
@@ -10742,18 +10792,36 @@ mod tests {
             registered_source_worker(&[&roots[0], &roots[1]], false);
         // Adjacent siblings exercise reuse; identical relative parents under
         // distinct source roots must never share the held directory. Cover
-        // both the inline and parallel chunk paths, with misleading labels.
-        for count in [12, 384] {
+        // both paths with misleading labels.
+        let parallel_count = 386;
+        assert!(parallel_count >= PAR_MIN);
+        for count in [parallel_count, 12] {
             let sources: Vec<_> = (0..count)
                 .map(|index| {
                     selections[(index / 3) % 2]
-                        .join(
+                        .join(if count >= PAR_MIN {
+                            // Every boundary lookup must find a file, so a
+                            // cached wrong root cannot hide as None == None.
+                            b"parent/file".as_slice()
+                        } else {
                             [b"parent/file".as_slice(), b"parent/link", b"parent/missing"]
-                                [index % 3],
-                        )
+                                [index % 3]
+                        })
                         .unwrap()
                 })
                 .collect();
+            if count == parallel_count {
+                let chunk = sources.len().div_ceil(PAR_THREADS).max(1);
+                let first_root_count = sources
+                    .iter()
+                    .filter(|source| source.root() == selections[0].root())
+                    .count();
+                assert_ne!(
+                    first_root_count % chunk,
+                    0,
+                    "the root boundary must fall inside a parallel chunk"
+                );
+            }
             let paths = vec![b"/ignored/display/path".to_vec(); count];
             let expected: Vec<_> = sources
                 .iter()
@@ -10766,24 +10834,14 @@ mod tests {
             let actual = worker
                 .stat_many_request(&paths, Some(&sources), true, None)
                 .unwrap();
-            assert_eq!(
-                serde_json::to_value(actual).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-        }
-        // The allocation-free pre-pass must reject malformed authority before
-        // the lookup path can turn it into an ordinary missing-file result.
-        for invalid in [
-            b"/parent/file".as_slice(),
-            b"parent//file",
-            b"parent/../file",
-            b"parent/f\0",
-        ] {
-            let mut source = selections[0].clone();
-            source.relative = invalid.to_vec();
-            assert!(worker
-                .stat_many_request(&[b"ignored".to_vec()], Some(&[source]), false, None)
-                .is_err());
+            assert_eq!(actual.len(), expected.len());
+            for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "batch of {count}, item {index}"
+                );
+            }
         }
         let sources = vec![selections[0].join(b"parent/file").unwrap(); 64];
         let paths = vec![b"ignored".to_vec(); sources.len()];

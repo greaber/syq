@@ -2367,7 +2367,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let roots = source_roots.get().expect("source roots registered");
         let mut source_checks = Vec::new();
         let mut ancestry_checks = Vec::new();
-        let may_prune = opts.delete && roots.iter().any(|root| root.selection.relative.is_empty());
+        let may_prune = opts.delete
+            && roots
+                .iter()
+                .any(|root| root.selection.relative().is_empty());
         let primary_suffix = if expand_exact_home || dst_is_dir {
             Vec::new()
         } else {
@@ -2380,7 +2383,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let prune_suffixes: Vec<_> = if may_prune {
             srcs.iter()
                 .zip(roots)
-                .filter(|(_, root)| root.selection.relative.is_empty())
+                .filter(|(_, root)| root.selection.relative().is_empty())
                 .map(|(candidate, _)| {
                     if candidate.copies_contents()
                         || args.files_from.is_some()
@@ -2400,7 +2403,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // path beneath that directory descriptor. Exact files and
             // symlinks cannot recurse, but pruning another source's copied
             // directory must not remove an exact source selected beneath it.
-            let source_is_directory = root.selection.relative.is_empty();
+            let source_is_directory = root.selection.relative().is_empty();
             if !source_is_directory && !may_prune {
                 continue;
             }
@@ -9347,10 +9350,8 @@ mod tests {
             dst_entry: None,
             data: FileJobData {
                 src: b"source".to_vec(),
-                source: RegisteredPath {
-                    root: serde_json::from_str("0").unwrap(),
-                    relative: b"source".to_vec(),
-                },
+                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
+                    .unwrap(),
                 dst: b"destination".to_vec(),
                 rel: "innocent-file".into(),
                 entry,
@@ -9411,10 +9412,11 @@ mod tests {
                         dst_entry: None,
                         data: FileJobData {
                             src: b"first".to_vec(),
-                            source: RegisteredPath {
-                                root: serde_json::from_str("0").unwrap(),
-                                relative: b"first".to_vec(),
-                            },
+                            source: RegisteredPath::new(
+                                serde_json::from_str("0").unwrap(),
+                                b"first".to_vec(),
+                            )
+                            .unwrap(),
                             dst: b"first-dst".to_vec(),
                             rel: "first".into(),
                             entry,
