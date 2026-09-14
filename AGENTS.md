@@ -224,18 +224,27 @@ report actual access or decision blockers instead of bypassing them.
 
 ## Acting on review feedback
 
-Assess each finding independently. Fix directly only confirmed real problems
-with simple, straightforward fixes, no tradeoffs worth discussing, and no
-reason to reconsider the requirement. For anything else, discuss the evidence,
-value, alternatives, and requirements with the reviewer before implementing
-that finding. Bring consequential choices and unresolved disagreement to the
-user; reviewer agreement does not authorize changing requirements or deferring
-agreed work. If the reviewer is unavailable, raise the question with the user.
+Assess every finding and observation on its merits. "Pre-existing", "out of
+scope", "nonblocking", and "optional" describe context, not importance; none
+is a reason to dismiss a point without consideration. Keep defects, suggestions,
+and observations distinct, and discuss their value rather than treating every
+comment as a change request. A worthwhile observation may belong in this PR,
+in separate work, or need no change; decide that explicitly. Respect an explicit
+user decision to exclude a topic, but do not infer exclusion from reviewer labels.
 
-Keep blocking defects, nonblocking defects, optional suggestions, and
-observations distinct. An observation is not automatically a request for a
-change. When the user selects particular feedback, address that selection;
-do not expand it by seeking out other review comments to act on.
+Reconsider the underlying requirements as part of this assessment, using the
+principles below. Fix directly only independently confirmed, worthwhile problems
+with simple, straightforward fixes, no tradeoffs that would benefit from
+discussion, and no unresolved question about the requirements. For anything else,
+discuss the evidence, value, alternatives, and requirements with the reviewer
+before implementing that finding. If the reviewer is unavailable, raise the
+question with the user.
+
+Bring consequential choices and unresolved disagreement to the user before
+implementing them, including changes to requirements, substantial complexity,
+and expansion or reduction of scope. Reviewer agreement does not itself
+authorize those choices. Considering all feedback does not mean automatically
+implementing it all.
 
 ## PR review freshness
 
@@ -268,10 +277,19 @@ do not expand it by seeking out other review comments to act on.
   plain words; a reader should not need project jargon such as "retained" or
   "the ordinary engine" to follow them. The code is authoritative for
   everything else.
-- Distinguish explicit requirements from assumptions and design choices. If a
-  supposed requirement creates substantial complexity, question the premise
-  and look for a simpler interpretation. Ask the user when the answer would
-  materially change the product.
+- Routinely reconsider whether requirements are actually required and how much
+  they matter; no special reason or failure is needed to ask. Distinguish the
+  user's goals from assumptions, design choices, and incidental safeguards.
+  A casual request or a check intended to catch common user mistakes must not
+  silently become a guarantee covering every possible case.
+- Weigh a scenario's likelihood and consequences against the complexity,
+  maintenance cost, and disadvantages of preventing it. The fact that a case
+  can occur does not by itself establish that it needs prevention; a rare case
+  can still matter greatly when its consequences are serious. When a small
+  safeguard starts requiring substantial machinery, discuss whether to narrow
+  it, accept a limitation, change the requirement, or choose another design.
+  Bring consequential choices to the user before implementing them; do not
+  silently expand the scope or drop agreed behavior.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
