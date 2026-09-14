@@ -1186,6 +1186,13 @@ fn attempt_small_copy(
 
 /// The one summary line a completed copy prints, rendered from the same
 /// record the results stream settles with.
+fn show_statistics(args: &Args) -> bool {
+    // Restricted coordinators suppress their outcome summary because the
+    // invoking machine prints the verified receipt. That receipt does not
+    // contain diagnostics, so requested statistics still come from here.
+    !args.suppress_summary || args.restricted_grant.is_some()
+}
+
 fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64, deletions: &str) {
     crate::output::human_stdout!(
         "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
@@ -1315,7 +1322,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         progress
             .observations
             .human_summary
-            .store(!args.suppress_summary, Relaxed);
+            .store(show_statistics(&args), Relaxed);
         progress.observations.enable();
     }
     // The detach and remote-coordinator combinations were refused at
@@ -3444,7 +3451,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && !args.suppress_summary && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && show_statistics(&args) && !args.quiet && !opts.verify_only && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -9986,6 +9993,23 @@ mod tests {
                 b"/destination/c/d".as_slice()
             ]
         );
+    }
+
+    #[test]
+    fn attested_outcome_summary_does_not_hide_coordinator_statistics() {
+        let mut args = Args::parse_args(&[
+            "cp".into(),
+            "source".into(),
+            "--as".into(),
+            "destination".into(),
+            "--stats".into(),
+        ])
+        .unwrap();
+        assert!(show_statistics(&args));
+        args.suppress_summary = true;
+        assert!(!show_statistics(&args));
+        args.restricted_grant = Some("coordinator grant".into());
+        assert!(show_statistics(&args));
     }
 
     #[test]
