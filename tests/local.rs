@@ -18438,7 +18438,7 @@ fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
             .any(|a| a["observed_ns"].as_u64().unwrap() > 0)));
     let stderr = stderr_of(&out);
     assert!(stderr.contains("Observed worker time:"));
-    assert!(stderr.contains("worker 0 /"), "{stderr}");
+    assert!(stderr.contains("worker 0 (process "), "{stderr}");
     assert!(stderr.contains("bytes"), "{stderr}");
     assert!(stderr.contains("CPU: user"), "{stderr}");
     assert!(!stderr.contains("1 workers"), "{stderr}");

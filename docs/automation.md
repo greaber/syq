@@ -126,7 +126,7 @@ measurements remain available.
 | `workers` | Counts at sampling time and fractions of observed worker time |
 | `endpoints` | Local operations or the latest reports from remote connections |
 | `processes` | User and system CPU deltas in nanoseconds, once per process |
-| `summary` | The same cumulative worker, endpoint and CPU summary printed by `--stats` |
+| `summary` | The same cumulative worker, endpoint and CPU summary printed by `--stats`, with observed seconds beside the fractions; idle actors are omitted |
 
 Worker `fractions` divide each state's accumulated duration by `observed_ns`,
 including waits still in progress. They sum to one when activity was observed;

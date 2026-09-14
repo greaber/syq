@@ -435,6 +435,8 @@ pub(crate) struct WorkerInterval {
     pub fractions: BTreeMap<&'static str, f64>,
     pub parked_ns: u64,
     pub cumulative_parked_ns: u64,
+    #[serde(skip)]
+    cumulative_observed_ns: u64,
     pub cumulative_fractions: BTreeMap<&'static str, f64>,
 }
 #[derive(Serialize)]
@@ -605,6 +607,7 @@ impl Observations {
         let old = previous.as_ref().map_or(&[][..], |s| s.actors.as_slice());
         let totals = time_totals(&current.actors, old);
         let cumulative = time_totals(&current.actors, &[]);
+        let (cumulative_observed_ns, cumulative_fractions) = worker_fractions(cumulative);
         let (observed_ns, worker_fractions) = worker_fractions(totals);
         let count = |state: Stage| {
             current
@@ -622,7 +625,8 @@ impl Observations {
             fractions: worker_fractions,
             parked_ns: totals[Stage::Parked as usize],
             cumulative_parked_ns: cumulative[Stage::Parked as usize],
-            cumulative_fractions: self::worker_fractions(cumulative).1,
+            cumulative_observed_ns,
+            cumulative_fractions,
         };
         let elapsed_ms = previous
             .as_ref()
@@ -816,14 +820,31 @@ impl Interval {
     fn format_summary(&self) -> String {
         let states = describe_fractions(&self.workers.cumulative_fractions);
         let mut lines = vec![format!(
-            "Observed worker time: {} ({} {}; parking excluded: {:.3}s; wait states, not proven causes)",
+            "Observed worker time: {} ({:.6}s observed; {} {}; parking excluded: {:.3}s; wait states, not proven causes)",
             if states.is_empty() { "no worker activity" } else { &states },
+            self.workers.cumulative_observed_ns as f64 / 1e9,
             self.workers.observed,
             if self.workers.observed == 1 { "worker" } else { "workers" },
             self.workers.cumulative_parked_ns as f64 / 1e9,
         )];
         for endpoint in &self.endpoints {
-            for actor in &endpoint.cumulative_actors {
+            let mut actors = endpoint
+                .cumulative_actors
+                .iter()
+                .filter(|actor| {
+                    actor.observed_ns > 0 || actor.bytes.values().any(|bytes| *bytes > 0)
+                })
+                .peekable();
+            if actors.peek().is_none() {
+                continue;
+            }
+            lines.push(format!(
+                "  {} (process {}; sample age {}ms):",
+                endpoint.label,
+                endpoint.process.as_deref().unwrap_or("unknown"),
+                endpoint.sample_age_ms.unwrap_or(0)
+            ));
+            for actor in actors {
                 let states = describe_fractions(&actor.fractions);
                 let bytes = actor
                     .bytes
@@ -832,18 +853,16 @@ impl Interval {
                     .collect::<Vec<_>>()
                     .join(", ");
                 lines.push(format!(
-                    "  {} / {}: {}{}{} (process {}; sample age {}ms)",
-                    endpoint.label,
+                    "    {}: {} ({:.6}s observed){}{}",
                     actor.role,
                     if states.is_empty() {
                         "no observed operation"
                     } else {
                         &states
                     },
+                    actor.observed_ns as f64 / 1e9,
                     if bytes.is_empty() { "" } else { "; " },
-                    bytes,
-                    endpoint.process.as_deref().unwrap_or("unknown"),
-                    endpoint.sample_age_ms.unwrap_or(0)
+                    bytes
                 ));
             }
         }
@@ -904,6 +923,48 @@ mod tests {
         assert!(!values.contains_key("parked"));
         assert!(!values.contains_key("inactive"));
     }
+    #[test]
+    fn summary_shows_cumulative_seconds_and_groups_only_measured_actors() {
+        let observations = Observations::default();
+        observations.enable();
+        let registry = Arc::new(Registry::default());
+        registry.actor("filesystem");
+        registry.actor("prefetch");
+        registry.actor("server");
+        observations.local("source worker 0".into(), registry);
+        let mut interval = observations.sample();
+        // A short latest interval must not be paired with cumulative fractions.
+        interval.workers.observed_ns = 1_000;
+        interval.workers.cumulative_observed_ns = 2_000_000_000;
+        interval.workers.cumulative_fractions = BTreeMap::from([("source_response", 1.0)]);
+        let endpoint = &mut interval.endpoints[0];
+        endpoint.process = Some("endpoint-process".into());
+        endpoint.cumulative_actors[0].observed_ns = 17_000;
+        endpoint.cumulative_actors[0].fractions = BTreeMap::from([("handling", 1.0)]);
+        endpoint.cumulative_actors[0]
+            .bytes
+            .insert("source_read", 42);
+        endpoint.cumulative_actors[2].observed_ns = 2_000;
+        endpoint.cumulative_actors[2].fractions = BTreeMap::from([("request_wait", 1.0)]);
+        let summary = interval.format_summary();
+        assert!(
+            summary.contains("source response 100% (2.000000s observed"),
+            "{summary}"
+        );
+        assert!(
+            summary
+                .contains("filesystem: handling 100% (0.000017s observed); source read 42 bytes"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("server: request wait 100% (0.000002s observed)"),
+            "{summary}"
+        );
+        assert_eq!(summary.matches("endpoint-process").count(), 1);
+        assert!(!summary.contains("prefetch"));
+        assert!(!summary.contains("no observed operation"));
+    }
+
     #[test]
     fn human_fractions_are_sorted_and_hide_negligible_states() {
         let values = BTreeMap::from([
@@ -987,7 +1048,7 @@ mod tests {
         );
         assert!(stale
             .summary()
-            .contains("source / filesystem: source read 100%"));
+            .contains("filesystem: source read 100% (0.001000s observed)"));
         assert!(stale.summary().contains("Process remote-process CPU:"));
         assert!(stale.endpoints[0].elapsed_ms.is_none());
         assert!(stale
