@@ -780,6 +780,7 @@ mod tests {
     #[ignore = "manual storage and scheduler-lock experiment"]
     fn job_storage_probe() {
         use std::time::Instant;
+        crate::tune_allocator();
         let mode = std::env::var("SYQ_JOB_PROBE_MODE").unwrap_or_else(|_| "compact".into());
         let tuning: crate::transfer_tuning::TransferTuning =
             format!("job-storage={mode}").parse().unwrap();
