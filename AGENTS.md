@@ -320,33 +320,58 @@ or "design question before implementation". Identify it as an agent handoff,
 not a new user instruction. Only ping for a substantive handoff, not to
 acknowledge receipt or repeat an unchanged waiting state.
 
-Notification routing belongs to the recipient, not the sender's client. Record
-how to address each existing conversation and which supported mechanism can
-deliver to it. The same handoff must work for Codex-to-Claude, Claude-to-Codex,
-and same-client pairs; a command that supports only one recipient client is
-not the workflow's notification interface. Keep client-specific setup outside
-the shared protocol. Never infer a recipient from a branch name, worktree, or
-shared account, and never put authentication secrets in the exchange.
+Use the common helper from either Codex or Claude Code. Select the receiving
+client, not the sending client:
 
-Use the recipient's verified route immediately after saving the handoff. An
-existing cross-client dispatcher may provide this route, but naming a command
-or recording a session ID does not implement one. Do not invent a dispatcher,
-assume client-specific session IDs are interchangeable, or create replacement
-agents/concurrent resume sessions to imitate delivery to the existing agent.
+```bash
+python3 scripts/agent-ping.py --client codex --recipient '<session-uuid>' \
+  --file current-plans/reviews/pr-349/reviewer-a.md --pr 349 --round 2 \
+  --sha abc1234 --sender reviewer-a --message 'Review response ready'
+python3 scripts/agent-ping.py --client claude --recipient '<inbox-socket-path>' \
+  --file current-plans/reviews/pr-349/reviewer-a.md --pr 349 --round 2 \
+  --sha abc1234 --sender implementer --message 'Design question before implementation'
+```
 
-Verify both directions for the actual client pair before calling automatic
-handoff operational: delivery to the intended conversation, what happens while
-it is busy, and whether an idle conversation starts a turn. Distinguish a
-notification to the user, queued agent input, and an agent actually reading or
-acting on it. Check delivery success; do not promise wake-up from queueing alone.
-Only substantive handoffs trigger pings; no acknowledgment loops.
+These are templates: use the actual PR, round, SHA, exchange and recorded
+recipient. `--dry-run` shows the handoff without sending. Either agent can invoke
+either command; the helper needs only Python's standard library and, for Codex
+recipients, the installed Codex CLI. It does not start replacement agent sessions.
+
+- Codex delivery uses `codex queue --thread '<session-uuid>' --message '<text>'`.
+  Record the recipient's exact session UUID (CODEX_THREAD_ID when provided by
+  that session). Pass `--remote '<endpoint>'` to the helper if needed to reach
+  that recipient's app server. CLI syntax was checked with Codex 0.154.0;
+  availability and idle/busy behavior must be verified on the actual server.
+- Claude Code delivery uses the recipient's native local inbox socket on Linux
+  or macOS. The recipient records CLAUDE_CODE_MESSAGING_SOCKET from its own
+  environment, or the Peer address in /status (the `uds:` prefix is accepted).
+  The native envelope was checked against installed Claude Code 2.1.270.
+  [Claude's messaging docs](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket)
+  describe script access and inbound controls. Accepted peer messages reach a
+  busy session between tool calls and start a turn when idle. Receiver policy
+  can hold or refuse them. The helper does not supply another session's token,
+  assert a permission class, or change inbound policy to force delivery.
+- For a Claude recipient on another host, run the helper on that host using an
+  established authorized connection; the exchange path must exist there too.
+  The helper does not copy notes across hosts. Never infer recipient identities
+  from a branch/worktree name or put authentication secrets in the exchange.
+
+The helper prints JSON: `queued` means the Codex queue command succeeded;
+`submitted` means the Claude socket write completed, without an admission/read
+acknowledgment; `not-sent` is a dry run. Exit 1 reports an error. A successful
+submission is not proof that the recipient read or acted on it; Claude may hold
+or refuse it. Verify delivery and idle/busy behavior for the actual pair before
+calling automatic handoff operational. Do not blindly retry after an uncertain
+send, since that can duplicate a message. Use the existing exchange to record
+the recipient's response, not acknowledgment-only ping loops.
 
 If either route is missing or fails, preserve the handoff and report which
-recipient cannot be reached and why. Automatic handoff remains incomplete;
-"check the review file" is a temporary manual fallback, not satisfaction of
-the cross-client ping requirement. Do not silently downgrade the workflow to
-Codex-only, start a daemon, change client configuration, or launch background
-watchers as a fallback. Bring any needed transport/setup choice to the user.
+recipient cannot be reached and why. "Check the review file" is a temporary
+manual fallback, not satisfaction of automatic pinging. Do not silently switch
+to terminal keystroke injection, start daemons, change client configuration,
+or launch background watchers. Bring any needed transport/setup choice to the
+user. Native client-specific commands remain valid delivery options; the helper
+provides one common method for mixed-client pairs.
 
 ## PR review freshness
 
