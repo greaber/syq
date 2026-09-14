@@ -21569,6 +21569,13 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     stderr.contains("source read-ahead started"),
                     "tcp={tcp} pull={pull} stream={stream}: {stderr}"
                 );
+                if stream {
+                    assert_eq!(
+                        stderr.matches("source read-ahead started").count(),
+                        1,
+                        "stream should keep one preparation interval: {stderr}"
+                    );
+                }
                 assert_eq!(read(Path::new(&destination)), data);
             }
         }

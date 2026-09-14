@@ -559,6 +559,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     continue;
                 }
                 w.write_msg(&Response::Ok)?;
+                ops.begin_source_range(stream.off..stream.end);
                 let mut limit = stream.end;
                 let mut done_sent = false;
                 loop {
@@ -568,12 +569,14 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     // the client's later commands follow it on the same
                     // ordered connection, including late shrink notifications.
                     if stream.off >= limit && !done_sent {
+                        ops.end_source_range();
                         w.write_msg(&Response::ReadStreamDone)?;
                         done_sent = true;
                     }
                     if reader.stream_stopped(stream.off, &mut limit, done_sent)? {
                         break;
                     }
+                    ops.shrink_source_range(limit);
                     if stream.off >= limit {
                         // A late shrink crossed the current offset: send Done
                         // on the next iteration, without another read or RTT.
@@ -588,11 +591,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         bytes += data.len() as u64;
                     } else {
                         stream.off = stream.end;
+                        ops.end_source_range();
                     }
                     let t0 = std::time::Instant::now();
                     w.write_msg(&response)?;
                     t[2] += t0.elapsed().as_secs_f64();
                 }
+                ops.end_source_range();
                 if !done_sent {
                     w.write_msg(&Response::ReadStreamDone)?;
                 }

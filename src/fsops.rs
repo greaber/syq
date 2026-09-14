@@ -6128,6 +6128,21 @@ impl FsOps {
         hash_reader(&mut f, block, len)
     }
 
+    pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.begin_stream(_range);
+    }
+
+    pub(crate) fn shrink_source_range(&mut self, _end: u64) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.shrink_stream(_end);
+    }
+
+    pub(crate) fn end_source_range(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.end_stream();
+    }
+
     pub fn read_range(
         &mut self,
         path: &[u8],

@@ -588,6 +588,7 @@ impl Conn for LocalConn {
                 } else if let Err(error) = stream.validate() {
                     self.pending.push_back(Response::Err(error.to_string()));
                 } else {
+                    self.ops.begin_source_range(stream.off..stream.end);
                     self.read_stream_limit = stream.end;
                     self.read_stream_done_sent = false;
                     self.read_stream = Some(stream);
@@ -601,9 +602,12 @@ impl Conn for LocalConn {
                         .push_back(Response::Err("no read stream is active".into()));
                     return Ok(());
                 }
-                return crate::streaming::shrink_limit(&mut self.read_stream_limit, end);
+                crate::streaming::shrink_limit(&mut self.read_stream_limit, end)?;
+                self.ops.shrink_source_range(end);
+                return Ok(());
             }
             Request::StopReadStream => {
+                self.ops.end_source_range();
                 if self.read_stream.take().is_none() {
                     self.pending
                         .push_back(Response::Err("no read stream is active".into()));
@@ -631,6 +635,7 @@ impl Conn for LocalConn {
                         stream.off += data.len() as u64;
                     } else {
                         stream.off = stream.end;
+                        self.ops.end_source_range();
                     }
                     return Ok(response);
                 }
@@ -638,6 +643,7 @@ impl Conn for LocalConn {
                 // or adding a local producer thread. Stop still clears the
                 // active mode, and never queues a second completion marker.
                 if !self.read_stream_done_sent {
+                    self.ops.end_source_range();
                     self.read_stream_done_sent = true;
                     return Ok(Response::ReadStreamDone);
                 }

@@ -181,9 +181,46 @@ impl Drop for Worker {
 #[derive(Default)]
 pub(crate) struct ReadAhead {
     worker: Option<Worker>,
+    stream: Option<Stream>,
+}
+
+struct Stream {
+    range: Range<u64>,
+    active: bool,
+    attempted: bool,
 }
 
 impl ReadAhead {
+    /// The caller already owns this interval. Demand may survive individual
+    /// reads, but must be fenced before the stream stops or releases a suffix.
+    pub(crate) fn begin_stream(&mut self, range: Range<u64>) {
+        self.end_stream();
+        self.stream = Some(Stream {
+            range,
+            active: false,
+            attempted: false,
+        });
+    }
+
+    pub(crate) fn shrink_stream(&mut self, end: u64) {
+        if let Some(stream) = &mut self.stream {
+            if end < stream.range.end {
+                if stream.active {
+                    self.worker.as_ref().unwrap().finish();
+                }
+                stream.range.end = end;
+                stream.active = false;
+                stream.attempted = false;
+            }
+        }
+    }
+
+    pub(crate) fn end_stream(&mut self) {
+        if self.stream.take().is_some_and(|stream| stream.active) {
+            self.worker.as_ref().unwrap().finish();
+        }
+    }
+
     pub(crate) fn range<'a>(
         &'a mut self,
         source: &'a File,
@@ -195,6 +232,7 @@ impl ReadAhead {
             range,
             active: false,
             attempted: false,
+            preserve: false,
         }
     }
 
@@ -217,16 +255,31 @@ impl ReadAhead {
                     "source range exceeds file offsets",
                 )
             })?;
-        let mut range = self.range(source, off..end);
+        let mut range = if let Some(stream) = &self.stream {
+            let (bounds, active, attempted) =
+                (stream.range.clone(), stream.active, stream.attempted);
+            PreparedRange {
+                preparation: self,
+                source,
+                range: bounds,
+                active,
+                attempted,
+                preserve: false,
+            }
+        } else {
+            self.range(source, off..end)
+        };
         let mut copied = off;
         for chunk in data.chunks_mut(BLOCK as usize) {
-            let before = (range.needs_observation() && copied + (chunk.len() as u64) < end)
+            let before = (range.needs_observation()
+                && copied + (chunk.len() as u64) < range.range.end)
                 .then(Activity::sample);
             source.read_exact_at(chunk, copied)?;
             copied += chunk.len() as u64;
             let prepare = before.is_some_and(|before| Activity::sample().read_wait_since(before));
             range.advance(copied, prepare);
         }
+        range.preserve_stream();
         Ok(())
     }
 }
@@ -237,9 +290,18 @@ pub(crate) struct PreparedRange<'a> {
     range: Range<u64>,
     active: bool,
     attempted: bool,
+    preserve: bool,
 }
 
 impl PreparedRange<'_> {
+    fn preserve_stream(&mut self) {
+        if let Some(stream) = &mut self.preparation.stream {
+            stream.active = self.active;
+            stream.attempted = self.attempted;
+            self.preserve = true;
+        }
+    }
+
     pub(crate) fn needs_observation(&self) -> bool {
         !self.active && !self.attempted
     }
@@ -285,8 +347,14 @@ impl PreparedRange<'_> {
 
 impl Drop for PreparedRange<'_> {
     fn drop(&mut self) {
-        if self.active {
-            self.preparation.worker.as_ref().unwrap().finish();
+        if !self.preserve {
+            if self.active {
+                self.preparation.worker.as_ref().unwrap().finish();
+            }
+            if let Some(stream) = &mut self.preparation.stream {
+                stream.active = false;
+                stream.attempted = false;
+            }
         }
     }
 }
@@ -393,6 +461,55 @@ mod tests {
         release.send(()).unwrap();
         worker.finish();
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_preparation_survives_a_response_but_stops_on_shrink_and_read_error() {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(8 * BLOCK).unwrap();
+        let mut preparation = ReadAhead::default();
+        preparation.begin_stream(0..8 * BLOCK);
+        {
+            let mut range = preparation.range(&source, 0..8 * BLOCK);
+            range.advance(BLOCK, true);
+            range.preserve_stream();
+        }
+        assert!(preparation.stream.as_ref().unwrap().active);
+        preparation.shrink_stream(2 * BLOCK);
+        assert_eq!(preparation.stream.as_ref().unwrap().range.end, 2 * BLOCK);
+        assert!(preparation
+            .worker
+            .as_ref()
+            .unwrap()
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .window
+            .is_none());
+        {
+            let mut range = preparation.range(&source, BLOCK..2 * BLOCK);
+            range.advance(BLOCK, true);
+            range.preserve_stream();
+        }
+        source.set_len(0).unwrap();
+        let error = preparation
+            .read_exact_at(&source, &mut [0; 16], BLOCK)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(!preparation.stream.as_ref().unwrap().active);
+        assert!(preparation
+            .worker
+            .as_ref()
+            .unwrap()
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .window
+            .is_none());
+        preparation.end_stream();
+        assert!(preparation.stream.is_none());
     }
 
     #[test]
