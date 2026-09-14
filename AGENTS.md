@@ -230,7 +230,9 @@ report actual access or decision blockers instead of bypassing them.
 
 ## Shared review exchange
 
-The user uses separate reviewer and implementer conversations. Each independent
+Reviewers and implementers may use Codex, Claude Code, or different clients.
+The shared exchange and handoff rules must work independently of either client.
+Each independent
 reviewer keeps one stable exchange file at
 `current-plans/reviews/pr-<number>/<reviewer-id>.md` for that PR, including
 reviews with no blocking findings. Choose a unique reviewer/session label when creating
@@ -245,8 +247,9 @@ GitHub account or adopt someone else's review as your own.
   exchanges before acting. After writing a handoff, ping the other participant
   using the notification procedure below; changing a file alone sends no ping.
 - At the top record the PR URL and head repository, reviewer identity,
-  implementer task/worktree, both participants' exact session IDs and notification
-  endpoints when available, current round, exact target SHA and its source,
+  implementer task/worktree, each participant's client and verified notification
+  route when available (session identity, host/endpoint, delivery mechanism),
+  current round, exact target SHA and its source,
   and whose turn is next: reviewer, implementer, user decision, or complete.
   Resolve live refs under the freshness rules below; the file is coordination
   state, not proof of the latest PR head or merge authorization.
@@ -317,35 +320,33 @@ or "design question before implementation". Identify it as an agent handoff,
 not a new user instruction. Only ping for a substantive handoff, not to
 acknowledge receipt or repeat an unchanged waiting state.
 
-For separate Codex sessions, the installed CLI supports:
+Notification routing belongs to the recipient, not the sender's client. Record
+how to address each existing conversation and which supported mechanism can
+deliver to it. The same handoff must work for Codex-to-Claude, Claude-to-Codex,
+and same-client pairs; a command that supports only one recipient client is
+not the workflow's notification interface. Keep client-specific setup outside
+the shared protocol. Never infer a recipient from a branch name, worktree, or
+shared account, and never put authentication secrets in the exchange.
 
-```bash
-codex queue --thread '<recipient-session-uuid>' --message '<handoff text>'
-```
+Use the recipient's verified route immediately after saving the handoff. An
+existing cross-client dispatcher may provide this route, but naming a command
+or recording a session ID does not implement one. Do not invent a dispatcher,
+assume client-specific session IDs are interchangeable, or create replacement
+agents/concurrent resume sessions to imitate delivery to the existing agent.
 
-Each participant records its own session UUID (for example, from
-`CODEX_THREAD_ID` when supplied by the runtime). Use the recorded recipient UUID;
-never infer it from a branch name, worktree, or shared account. Record the
-confirmed remote endpoint if the recipient uses another app server and pass
-`--remote` for that endpoint; never put authentication secrets in the file.
-Within an existing managed agent team, use its message or idle-agent follow-up
-tool when that tool can address the recipient and schedule the needed turn.
-Do not create replacement agents or concurrent resume/exec sessions to imitate
-a notification.
+Verify both directions for the actual client pair before calling automatic
+handoff operational: delivery to the intended conversation, what happens while
+it is busy, and whether an idle conversation starts a turn. Distinguish a
+notification to the user, queued agent input, and an agent actually reading or
+acting on it. Check delivery success; do not promise wake-up from queueing alone.
+Only substantive handoffs trigger pings; no acknowledgment loops.
 
-Check command/tool success and report queued delivery separately from the
-recipient having read or acted on it. Local `codex queue --help` confirms the
-command; end-to-end delivery depends on the recipient's reachable app server.
-A queued message is conversation input, not a desktop notification. Do not
-promise that an idle recipient starts automatically or that a busy recipient
-is interrupted unless that behavior has been verified for the actual client.
-`codex queue` addresses Codex sessions; it is not a verified way to address a
-Claude Code conversation. The shared file works across clients, but each
-recipient needs its own supported notification route.
-If the recipient ID or transport is unavailable, or delivery fails, preserve
-the handoff and report the exact blocker; the user can resume the recipient
-with "check the review file". Do not claim a ping was delivered, start a daemon,
-change notification configuration, or launch background watchers as a fallback.
+If either route is missing or fails, preserve the handoff and report which
+recipient cannot be reached and why. Automatic handoff remains incomplete;
+"check the review file" is a temporary manual fallback, not satisfaction of
+the cross-client ping requirement. Do not silently downgrade the workflow to
+Codex-only, start a daemon, change client configuration, or launch background
+watchers as a fallback. Bring any needed transport/setup choice to the user.
 
 ## PR review freshness
 
