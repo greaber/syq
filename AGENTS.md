@@ -236,15 +236,15 @@ Reconsider the underlying requirements as part of this assessment, using the
 principles below. Fix directly only independently confirmed, worthwhile problems
 with simple, straightforward fixes, no tradeoffs that would benefit from
 discussion, and no unresolved question about the requirements. For anything else,
-discuss the evidence, value, alternatives, and requirements with the reviewer
-before implementing that finding. If the reviewer is unavailable, raise the
-question with the user.
+discuss the evidence, value, alternatives, and requirements with the user
+before implementing that finding.
 
-Bring consequential choices and unresolved disagreement to the user before
-implementing them, including changes to requirements, substantial complexity,
-and expansion or reduction of scope. Reviewer agreement does not itself
-authorize those choices. Considering all feedback does not mean automatically
-implementing it all.
+The user may forward review from a reviewer without having understood it or even
+without having read it. Just because a point appears in a review pasted directly by
+the user does not mean that the user agrees with it. Similarly, the reviewer is just
+another agent, and the reviewer's job is to find possible issues with the work. Many
+issues raised by the reviewer might actually best be addressed by doing nothing even
+though the reviewer was not wrong about how the code works.
 
 ## PR review freshness
 
