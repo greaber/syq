@@ -85,7 +85,12 @@ pub struct ProgressTicker {
 impl ProgressTicker {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.progress.stop();
-        self.thread.take().map_or(Ok(()), |thread| thread.join())
+        self.thread.take().map_or(Ok(()), |thread| {
+            // Collection must not add the remainder of a refresh interval to
+            // command latency. The token also covers stopping before park.
+            thread.thread().unpark();
+            thread.join()
+        })
     }
 
     pub fn join(mut self) -> std::thread::Result<()> {
@@ -408,7 +413,7 @@ impl Progress {
         let thread = std::thread::spawn(move || {
             while !p.stop.load(Relaxed) {
                 p.render();
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::park_timeout(Duration::from_millis(100));
             }
             p.clear();
         });
@@ -535,6 +540,30 @@ impl crate::tune::Meter for Progress {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finishing_wakes_a_parked_ticker() {
+        let progress = super::Progress::new(false, false, None, false);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let start = std::time::Instant::now();
+            std::thread::park_timeout(std::time::Duration::from_secs(10));
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "ticker was not woken on shutdown"
+            );
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        super::ProgressTicker {
+            progress,
+            thread: Some(thread),
+        }
+        .join()
+        .unwrap();
+    }
+
     use super::*;
     use crate::tune::Meter;
 
