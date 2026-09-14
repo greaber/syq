@@ -11,6 +11,11 @@ The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
 see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
+On Linux, syq asks the kernel to read ahead in source files when reads show
+storage activity or waits. This works for local and remote copies and uses a
+small, bounded number of helper threads. Local copies can also use faster
+filesystem copy operations when available.
+
 ## See where files go
 
 A named directory brings its name along. `--srcs-in` copies its contents;
@@ -243,11 +248,7 @@ Rerun the command. Completed files are skipped, and syq can reuse matching
 parts of an interrupted file. It writes a new temporary file beside the
 destination and replaces the final file only when complete. Previous partials
 stay unchanged. Reuse is not guaranteed; local copies may use the filesystem's
-faster copy operations instead. On Linux, syq can automatically prepare source
-data ahead of local or remote copies when reads encounter storage activity or
-waits. Preparation stays within the requested data and uses a bounded number
-of helpers. Filesystem-assisted copies remain available without additional
-userspace data buffers.
+faster copy operations instead.
 
 Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
