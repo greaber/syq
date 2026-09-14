@@ -17,7 +17,7 @@ use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
-use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched};
+use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched, WorkerJob};
 use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -5478,7 +5478,7 @@ impl Planner<'_> {
         // Every source has passed the sidecar collision preflight. Applying
         // buffered entries does not consult these indexes; release them before
         // the scheduler grows so their allocations can be reused for jobs.
-        if self.opts.tuning.job_storage() == crate::transfer_tuning::JobStorage::Compact {
+        if self.opts.tuning.job_storage() != crate::transfer_tuning::JobStorage::Inline {
             self.payload_paths = std::collections::HashMap::new();
             self.sidecar_paths = std::collections::HashMap::new();
         }
@@ -7065,7 +7065,9 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                inplace: false,
+                inplace: self.opts.inplace
+                    && target_condition == TargetCondition::Any
+                    && self.container_guard.is_none(),
                 src_rel,
             },
         });
@@ -7574,7 +7576,7 @@ struct BlockDiff {
 impl Worker {
     /// Every content request carries the source capability, including when
     /// the operator allowed a foreign-owned symlink in the typed root path.
-    fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
+    fn source_reference(&self, job: &WorkerJob) -> Option<RegisteredPath> {
         Some(job.source.clone())
     }
 
@@ -7762,8 +7764,7 @@ impl Worker {
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs.destination(idx).is_none()
-            && (!self.opts.inplace
-                || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
+            && (!self.opts.inplace || j.inplace)
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
@@ -7771,7 +7772,7 @@ impl Worker {
         record_worker_event_for_test("batch", self.id, batch.len())?;
         self.fast.batches += 1;
         self.fast.files += batch.len();
-        let jobs: Vec<FileJob> = {
+        let jobs: Vec<WorkerJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all.snapshot(i)).collect()
         };
@@ -8026,7 +8027,7 @@ impl Worker {
     /// counted and printed by the caller.
     fn emit_file_result_failed(
         &self,
-        job: &FileJob,
+        job: &WorkerJob,
         retryable: &'static str,
         os_kind: Option<&'static str>,
         message: &str,
@@ -8053,7 +8054,7 @@ impl Worker {
         }
     }
 
-    fn job(&self, idx: usize) -> FileJob {
+    fn job(&self, idx: usize) -> WorkerJob {
         self.sched.jobs.lock().unwrap().snapshot(idx)
     }
 
@@ -8066,9 +8067,7 @@ impl Worker {
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
+        let inplace = job.inplace;
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or an eligible sequential userspace writer) instead of
         // framing, hashing and scheduling them through the transport.
@@ -8109,7 +8108,7 @@ impl Worker {
         // bool = a staged or in-place file still needs Finalize. A verified
         // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
-            let final_entry = job.dst_entry.clone();
+            let final_entry = job.dst_entry.as_deref();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -8120,7 +8119,6 @@ impl Worker {
             // Unless --inplace was explicit, changed files are published
             // through a sidecar + atomic rename. Small new files normally take
             // the batched small-file path instead of reaching this worker path.
-            self.set_inplace(idx, inplace);
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
@@ -8245,25 +8243,16 @@ impl Worker {
         Ok(())
     }
 
-    /// Record the in-place decision on the job so every range worker and the
-    /// finalize agree.
-    fn set_inplace(&self, idx: usize, v: bool) {
-        self.sched.jobs.lock().unwrap()[idx].inplace = v;
-    }
-
     /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
     /// receiver cannot use its direct path, so the caller should stream;
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
-    fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
+    fn try_copy_local(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
         // Write to a partial and let finish_file rename it, so an interrupted
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
         // directly.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
-        self.set_inplace(idx, inplace);
+        let inplace = job.inplace;
         let mode = self.create_mode(job);
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
@@ -8302,7 +8291,7 @@ impl Worker {
     /// The mode the finished file should have (rsync semantics):
     /// with -p the source mode; without -p an existing file keeps its own mode
     /// and a new file gets the source mode minus the umask.
-    fn create_mode(&self, job: &FileJob) -> u32 {
+    fn create_mode(&self, job: &WorkerJob) -> u32 {
         match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
             Some(d) if !self.opts.perms => d.mode & 0o7777,
             _ => fresh_file_mode(&self.opts, &job.entry),
@@ -8316,7 +8305,7 @@ impl Worker {
     /// Metadata for the whole file just atomically published at the
     /// destination. A retry can use it as a block-diff basis without changing
     /// the no-`-p` mode chosen for the first attempt.
-    fn published_entry(&self, job: &FileJob) -> Entry {
+    fn published_entry(&self, job: &WorkerJob) -> Entry {
         let mut entry = job.entry.clone();
         entry.path = job.dst.clone();
         entry.mode = (entry.mode & !0o7777) | self.create_mode(job);
@@ -8324,7 +8313,7 @@ impl Worker {
     }
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
-    fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
+    fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
         if which == Which::Partial {
             return self
                 .diff_with(job, self.seed_request(job), "seed and hash destination")
@@ -8349,7 +8338,7 @@ impl Worker {
 
     fn reuse_blocks(
         &mut self,
-        job: &FileJob,
+        job: &WorkerJob,
         hashes: Vec<ContentDigest>,
     ) -> Result<Vec<(u64, u64)>> {
         let response = self.dst.call(self.seed_request(job))?;
@@ -8362,7 +8351,7 @@ impl Worker {
         ))
     }
 
-    fn seed_request(&self, job: &FileJob) -> Request {
+    fn seed_request(&self, job: &WorkerJob) -> Request {
         Request::SeedBasis {
             path: job.dst.clone(),
             copy_id: self.copy_id(),
@@ -8375,7 +8364,7 @@ impl Worker {
 
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
-    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<BlockDiff> {
+    fn diff_final_and_hold(&mut self, job: &WorkerJob) -> Result<BlockDiff> {
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
@@ -8395,7 +8384,7 @@ impl Worker {
 
     fn diff_with(
         &mut self,
-        job: &FileJob,
+        job: &WorkerJob,
         destination_request: Request,
         destination_label: &str,
     ) -> Result<BlockDiff> {
@@ -8798,7 +8787,7 @@ impl Worker {
         self.complete_file(idx, job, false)
     }
 
-    fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
+    fn contents_match(&mut self, job: &WorkerJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
             source: self.source_reference(job),
@@ -8840,7 +8829,7 @@ impl Worker {
     /// Recheck the source after either an atomic publication or a verified
     /// metadata-only completion, and retry from the completed destination when
     /// the source changed during that work.
-    fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
+    fn complete_file(&mut self, idx: usize, job: WorkerJob, matched: bool) -> Result<()> {
         // Did the source change under us?
         let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
         let changed = match &now {
