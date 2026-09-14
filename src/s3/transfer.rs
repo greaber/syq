@@ -411,7 +411,7 @@ impl Engine {
             }
             let mut file = source_clone.open()?;
             let mut whole = blake3::Hasher::new();
-            let mut buffer = vec![0; 1024 * 1024];
+            let mut buffer = vec![0; size.min(1024 * 1024) as usize];
             let mut parts = Vec::new();
             let mut remaining = size;
             while remaining > 0 {
@@ -863,19 +863,39 @@ impl Engine {
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
         for (key, path, selection, declared_kind) in selectors {
-            let exact = if key.is_empty() {
-                None
-            } else {
-                client::head(&self.client, &self.options.bucket, &key).await?
-            };
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
                 SourceSelection::Contents | SourceSelection::Directory
             );
-            if exact.is_some() && directory && self.args.native_mapping.is_none() {
-                bail!("S3 selector requires a prefix but an object exists at {key:?}");
-            }
+            let prefix = if key.is_empty() {
+                String::new()
+            } else {
+                format!("{key}/")
+            };
+            let exact = async {
+                let exact = if key.is_empty() {
+                    None
+                } else {
+                    client::head(&self.client, &self.options.bucket, &key).await?
+                };
+                if exact.is_some() && directory && self.args.native_mapping.is_none() {
+                    bail!("S3 selector requires a prefix but an object exists at {key:?}");
+                }
+                Ok::<_, anyhow::Error>(exact)
+            };
+            // Explicit prefix selectors need both reads. Start the listing
+            // while checking for a conflicting object, but validate both
+            // results before any file transfer or publication can begin.
+            let (exact, listed) = if directory && self.args.native_mapping.is_none() {
+                let (exact, listed) = tokio::try_join!(
+                    exact,
+                    client::list(&self.client, &self.options.bucket, &prefix)
+                )?;
+                (exact, Some(listed))
+            } else {
+                (exact.await?, None)
+            };
             let objects = if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -895,12 +915,10 @@ impl Engine {
                 if selection == SourceSelection::File {
                     bail!("S3 source object {key:?} is missing");
                 }
-                let prefix = if key.is_empty() {
-                    String::new()
-                } else {
-                    format!("{key}/")
+                let listed = match listed {
+                    Some(listed) => listed,
+                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
                 };
-                let listed = client::list(&self.client, &self.options.bucket, &prefix).await?;
                 if listed.is_empty() {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
@@ -970,12 +988,13 @@ impl Engine {
         {
             return Ok(None);
         }
-        // A fresh small file can obtain metadata and body in the same GET.
+        // A fresh file obtains metadata with its first data request. For a
+        // multipart download, receiving these headers is enough to start the
+        // other ranges; the first body is consumed alongside them.
         // Existing files still use HEAD so an unchanged object is not fetched.
         let initial = if existing.is_none()
             && !self.args.dry_run
             && !self.args.verify_only
-            && job.size <= self.options.part_size
             && !job.key.ends_with('/')
         {
             Some(
@@ -983,6 +1002,10 @@ impl Engine {
                     .get_object()
                     .bucket(&self.options.bucket)
                     .key(&job.key)
+                    .set_range(
+                        (job.size > self.options.part_size)
+                            .then(|| format!("bytes=0-{}", self.options.part_size - 1)),
+                    )
                     .send()
                     .await
                     .map_err(|e| e.into_service_error())
@@ -992,7 +1015,7 @@ impl Engine {
             None
         };
         let object = if let Some(output) = &initial {
-            client::from_get(&job.key, job.size, output)?
+            client::from_get(&job.key, job.size, self.options.part_size, output)?
         } else {
             client::head(&self.client, &self.options.bucket, &job.key)
                 .await?
@@ -1003,7 +1026,7 @@ impl Engine {
             "symlink" => "symlink",
             _ => "file",
         };
-        let initial = initial.map(|output| output.body);
+        let mut initial = initial.map(|output| output.body);
         let metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind().into(),
             mode: if object.kind() == "dir" { 0o777 } else { 0o666 },
@@ -1185,6 +1208,7 @@ impl Engine {
                 let record = record.clone();
                 let object = &object;
                 let state = &state;
+                let initial = if index == 0 { initial.take() } else { None };
                 async move {
                     let offset = index * part_size;
                     let length = part_size.min(object.size - offset);
@@ -1199,7 +1223,9 @@ impl Engine {
                             return Ok::<_, anyhow::Error>(());
                         }
                     }
-                    let hash = self.download_range(object, file, offset, length).await?;
+                    let hash = self
+                        .download_body(object, file, offset, length, initial)
+                        .await?;
                     let mut record = record.lock().await;
                     record.parts.insert(index, hash);
                     state.save(&*record)?;
@@ -1273,22 +1299,10 @@ impl Engine {
             identity: (file.metadata()?.dev(), file.metadata()?.ino()),
         };
         let result = async {
-            let hash = if let Some(body) = initial {
-                match self.read_body(body, file.clone(), 0, object.size).await {
-                    Ok(hash) => {
-                        self.progress.add_bytes(object.size);
-                        hash
-                    }
-                    Err(_) if self.options.retries > 0 && object.size > 0 => {
-                        self.download_range(object, file.clone(), 0, object.size)
-                            .await?
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else if object.size == 0 {
+            let hash = if object.size == 0 && initial.is_none() {
                 blake3::hash(&[]).to_hex().to_string()
             } else {
-                self.download_range(object, file.clone(), 0, object.size)
+                self.download_body(object, file.clone(), 0, object.size, initial)
                     .await?
             };
             if metadata
@@ -1409,6 +1423,26 @@ impl Engine {
         }
         Ok(hash.finalize().to_hex().to_string())
     }
+    async fn download_body(
+        &self,
+        object: &Object,
+        file: Arc<File>,
+        offset: u64,
+        length: u64,
+        initial: Option<ByteStream>,
+    ) -> Result<String> {
+        if let Some(body) = initial {
+            match self.read_body(body, file.clone(), offset, length).await {
+                Ok(hash) => {
+                    self.progress.add_bytes(length);
+                    return Ok(hash);
+                }
+                Err(_) if self.options.retries > 0 && length > 0 => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.download_range(object, file, offset, length).await
+    }
     async fn download_range(
         &self,
         object: &Object,
@@ -1486,7 +1520,7 @@ impl Engine {
         length: u64,
     ) -> Result<String> {
         let mut body = body.into_async_read();
-        let mut buffer = vec![0; 1024 * 1024];
+        let mut buffer = vec![0; length.min(1024 * 1024) as usize];
         let mut written = 0;
         let mut hash = blake3::Hasher::new();
         while written < length {
@@ -1535,7 +1569,7 @@ async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStre
         .file(tokio::fs::File::from_std(file))
         .offset(offset)
         .length(Length::Exact(length))
-        .buffer_size(1024 * 1024)
+        .buffer_size(length.clamp(1, 1024 * 1024) as usize)
         .build()
         .await?)
 }

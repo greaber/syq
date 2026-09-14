@@ -263,9 +263,13 @@ pub(super) async fn list(
 pub(super) fn from_get(
     key: &str,
     size: u64,
+    part_size: u64,
     output: &aws_sdk_s3::operation::get_object::GetObjectOutput,
 ) -> Result<Object> {
-    if output.content_length() != Some(size as i64) || output.content_range().is_some() {
+    let range = (size > part_size).then(|| format!("bytes 0-{}/{}", part_size - 1, size));
+    if output.content_length() != Some(size.min(part_size) as i64)
+        || output.content_range() != range.as_deref()
+    {
         bail!("S3 object size changed after listing or GET returned an unexpected range");
     }
     let object = Object {

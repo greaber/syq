@@ -150,7 +150,7 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single") {
+    let size = if fault.starts_with("single") || fault.starts_with("prefix-") {
         65536
     } else {
         SIZE
@@ -172,6 +172,46 @@ fn serve(
         ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
         ("x-amz-meta-syq-blake3".into(), hash),
     ];
+    if fault.starts_with("prefix-") {
+        let target = first.split_whitespace().nth(1).unwrap();
+        let path = target.split('?').next().unwrap();
+        if method == "HEAD" && path == "/bucket/data" {
+            // Hold HEAD until LIST arrives: sequential discovery cannot pass.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut report = std::time::Instant::now() + Duration::from_secs(1);
+            while !gate.1.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+                if std::time::Instant::now() >= report {
+                    eprintln!("prefix fixture: HEAD is waiting for LIST");
+                    report += Duration::from_secs(1);
+                }
+            }
+            assert!(gate.1.load(Ordering::Acquire), "LIST did not overlap HEAD");
+            if fault != "prefix-collision" {
+                reply(&mut socket, 404, &[], b"", false);
+                return;
+            }
+        } else if method == "GET" && target.contains("list-type=2") {
+            assert!(target.contains("prefix=data%2F"));
+            gate.1.store(true, Ordering::Release);
+            if fault == "prefix-list-error" {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code></Error>",
+                    false,
+                );
+            } else {
+                let listing = format!("<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>data/file</Key><Size>{size}</Size></Contents></ListBucketResult>");
+                reply(&mut socket, 200, &[], listing.as_bytes(), false);
+            }
+            return;
+        } else {
+            assert_eq!(path, "/bucket/data/file");
+            assert_eq!(fault, "prefix-ok", "copied before validating discovery");
+        }
+    }
     if method == "HEAD" {
         fields.push(("Content-Length".into(), size.to_string()));
         reply(&mut socket, 200, &fields, b"", true);
@@ -233,6 +273,39 @@ fn serve(
         fields[0].1 = "\"different\"".into();
     }
     let mut body = data[start..=end].to_vec();
+    if fault == "initial-range-overlap" {
+        if start == 0 {
+            let mut head = format!(
+                "HTTP/1.1 206 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in &fields {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
+            socket.write_all(head.as_bytes()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut report = std::time::Instant::now() + Duration::from_secs(1);
+            while !gate.1.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+                if std::time::Instant::now() >= report {
+                    eprintln!("range fixture: first body is waiting for the next range");
+                    report += Duration::from_secs(1);
+                }
+            }
+            assert!(
+                gate.1.load(Ordering::Acquire),
+                "next range did not overlap first body"
+            );
+            let _ = socket.write_all(&body);
+            return;
+        }
+        assert_eq!(
+            headers.get("if-match").map(String::as_str),
+            Some("\"fixture-v1\"")
+        );
+        gate.1.store(true, Ordering::Release);
+    }
     if fault == "corrupt" {
         body[0] = b'!';
     }
@@ -318,6 +391,86 @@ fn s3_ranges_signed_headers_metadata_and_results() {
     );
     validate_results(temp.path());
     assert!(server.requests.load(Ordering::Relaxed) >= 3);
+}
+#[test]
+fn s3_prefix_discovery_overlaps_reads_and_checks_both_results() {
+    for fault in ["prefix-ok", "prefix-collision", "prefix-list-error"] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "download",
+            ],
+        );
+        assert_eq!(
+            output.status.success(),
+            fault == "prefix-ok",
+            "{fault}: {}",
+            output_text(&output)
+        );
+        if fault == "prefix-ok" {
+            assert_eq!(
+                std::fs::read(temp.path().join("download/file")).unwrap(),
+                vec![b'x'; 65536]
+            );
+            assert_eq!(server.requests.load(Ordering::Relaxed), 3);
+        } else {
+            assert!(!temp.path().join("download/file").exists());
+            assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+            let error = output_text(&output);
+            assert!(
+                error.contains(if fault == "prefix-collision" {
+                    "selector requires a prefix but an object exists"
+                } else {
+                    "S3 listing failed"
+                }),
+                "{error}"
+            );
+        }
+    }
+}
+#[test]
+fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
+    let server = Server::start("initial-range-overlap");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &["--from", "s3://bucket", "data", "--as", "download"],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        std::fs::read(temp.path().join("download")).unwrap(),
+        vec![b'x'; SIZE]
+    );
+    // One selector HEAD, two range GETs, and the final identity HEAD.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
+    for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &["--from", "s3://bucket", "data", "--as", "download"],
+        );
+        assert!(
+            !output.status.success(),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert!(
+            !temp.path().join("download").exists(),
+            "{fault}: incomplete file was published"
+        );
+    }
 }
 #[test]
 fn s3_bad_responses_preserve_existing_destination() {
