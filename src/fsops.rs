@@ -4507,9 +4507,12 @@ fn stat_with_parent(
     parent: &mut Option<(PathBytes, File)>,
     path: &[u8],
 ) -> Option<Entry> {
-    let relative = RelativePath::new(path).ok()?;
+    if path.starts_with(b"/") {
+        return None;
+    }
     let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
         *parent = None;
+        let relative = RelativePath::new(path).ok()?;
         let metadata = root.metadata(&relative).ok()?;
         return rooted_entry(root, &relative, Vec::new(), metadata).ok();
     };
@@ -4522,6 +4525,8 @@ fn stat_with_parent(
             .ok()?;
         *parent = Some((parent_path.to_vec(), directory));
     }
+    // The held parent's key was validated when opened. This operation validates
+    // the leaf, so siblings do not need an allocated RelativePath for validation.
     let directory = &parent.as_ref()?.1;
     let metadata = root.metadata_in_directory(directory, name).ok()?;
     rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
@@ -10528,6 +10533,7 @@ mod tests {
         let root = Arc::new(Root::open(base).unwrap());
         let mut ops = FsOps::new();
         ops.destination_root = Some(root.clone());
+        fs::write(base.join("a").join(OsStr::from_bytes(b"raw-\xff")), b"raw").unwrap();
         let names = [
             b"a/file".as_slice(),
             b"a/missing",
@@ -10537,6 +10543,15 @@ mod tests {
             b"",
             b"../a/file",
             b"a//file",
+            b"/a",
+            b"/a/file",
+            b"/",
+            b"a/.",
+            b"a/..",
+            b"a/file/",
+            b"a\0/file",
+            b"a/f\0",
+            b"a/raw-\xff",
         ];
         let paths: Vec<_> = names
             .iter()
