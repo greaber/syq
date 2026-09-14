@@ -1005,8 +1005,10 @@ impl Root {
     fn open_leaf(&self, path: &RelativePath, flags: libc::c_int, mode: u32) -> Result<File> {
         path.leaf()?;
         #[cfg(target_os = "linux")]
-        if let Ok(file) = open_components_openat2(&self.directory, &path.components, flags, mode) {
-            return Ok(file);
+        match open_components_openat2(&self.directory, &path.components, flags, mode) {
+            Ok(file) => return Ok(file),
+            Err(error) if expected_open_failure(&error) => return Err(error.into()),
+            Err(_) => {}
         }
         let parent = self.resolve_parent(path)?;
         open_at(parent.directory.as_raw_fd(), &parent.leaf, flags, mode).map_err(Into::into)
@@ -2125,11 +2127,21 @@ fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<Fil
     }
 }
 
+// Missing entries and exclusive-create collisions already answer the lookup.
+// Retrying them with a descriptor walk adds allocation and close contention.
+// Preserve fallback for other errors, including unavailable syscalls, long paths,
+// and resolution races that the component walk can handle independently.
+#[cfg(target_os = "linux")]
+fn expected_open_failure(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EEXIST))
+}
+
 fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
     #[cfg(target_os = "linux")]
     {
         match open_directory_components_fast(parent, components) {
             Ok(directory) => Ok(directory),
+            Err(error) if expected_open_failure(&error) => Err(error),
             Err(_) => open_directory_components_one_at_a_time(parent, components),
         }
     }
@@ -3484,6 +3496,40 @@ mod tests {
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(fs::read(&inside).unwrap(), b"updated");
         assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn missing_entries_and_exclusive_collisions_preserve_errno_and_contents() {
+        let tree = TestDir::new("expected-open-failures");
+        let root = Root::open(tree.path()).unwrap();
+        fs::create_dir(tree.path().join("parent")).unwrap();
+        fs::write(tree.path().join("parent/existing"), b"preserve").unwrap();
+        symlink("existing", tree.path().join("parent/link")).unwrap();
+        for path in [b"parent/missing".as_slice(), b"absent/child"] {
+            for error in [
+                root.open_regular_read(&relative(path)).unwrap_err(),
+                root.open_directory(&relative(path)).unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+            }
+        }
+        for path in [b"parent/existing".as_slice(), b"parent/link", b"parent"] {
+            let error = root.create_file(&relative(path), 0o600).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EEXIST)
+            );
+        }
+        assert_eq!(
+            fs::read(tree.path().join("parent/existing")).unwrap(),
+            b"preserve"
+        );
+        assert!(fs::symlink_metadata(tree.path().join("parent/link"))
+            .unwrap()
+            .is_symlink());
     }
 
     #[test]
