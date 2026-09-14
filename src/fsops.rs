@@ -2401,7 +2401,7 @@ impl FsOps {
             .map(|source| source.root.identity())
     }
 
-    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+    fn registered_source_handle(&self, source: &RegisteredPath) -> Result<&SourceRootHandle> {
         let handle = self
             .source_roots
             .get(&source.root())
@@ -2409,6 +2409,11 @@ impl FsOps {
         if !handle.selection.is_empty() && source.relative != handle.selection {
             bail!("registered source leaf does not authorize the requested path");
         }
+        Ok(handle)
+    }
+
+    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+        let handle = self.registered_source_handle(source)?;
         Ok(RegisteredSourceTarget {
             root: handle.root.clone(),
             relative: RelativePath::new(&source.relative)?,
@@ -3225,41 +3230,63 @@ impl FsOps {
             }
             let targets = sources
                 .iter()
-                .map(|source| self.registered_source_target(source))
+                .map(|source| {
+                    let handle = self.registered_source_handle(source)?;
+                    source.validate()?;
+                    Ok((source, handle))
+                })
                 .collect::<Result<Vec<_>>>()?;
+            // Data jobs deliberately scatter siblings to avoid destination
+            // contention. Group only these read-only metadata lookups; restore
+            // request order below, including which error is reported first.
+            let mut order: Vec<_> = (0..targets.len()).collect();
+            let key = |index: usize| {
+                let source = targets[index].0;
+                (
+                    source.root().get(),
+                    source
+                        .relative
+                        .rsplitn(2, |b| *b == b'/')
+                        .nth(1)
+                        .unwrap_or(b""),
+                )
+            };
+            order.sort_unstable_by(|a, b| key(*a).cmp(&key(*b)));
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            return parallel_map(&targets, |target| {
-                let Some(expected) = target.expected_leaf.as_ref() else {
-                    let Some(metadata) = target.root.metadata(&target.relative).ok() else {
-                        return Ok(None);
+            let results = parallel_map_init(
+                &order,
+                || None,
+                |parent, &index| {
+                    let (source, target) = targets[index];
+                    let Some(expected) = target.expected_leaf.as_ref() else {
+                        return Ok(stat_with_parent(&target.root, parent, &source.relative));
                     };
-                    return Ok(
-                        rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok(),
-                    );
-                };
-                let metadata = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("inspect registered source leaf")?;
-                require_source_leaf_identity(expected, metadata)?;
-                let entry = rooted_source_entry(
-                    &target.root,
-                    &target.relative,
-                    Vec::new(),
-                    metadata,
-                    Some(expected),
-                )?;
-                let after = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("recheck registered source leaf")?;
-                require_source_leaf_identity(expected, after)?;
-                Ok(Some(entry))
-            })
-            .into_iter()
-            .collect();
+                    let relative = RelativePath::new(&source.relative)?;
+                    let metadata = target
+                        .root
+                        .metadata(&relative)
+                        .context("inspect registered source leaf")?;
+                    require_source_leaf_identity(expected, metadata)?;
+                    let entry = rooted_source_entry(
+                        &target.root,
+                        &relative,
+                        Vec::new(),
+                        metadata,
+                        Some(expected),
+                    )?;
+                    let after = target
+                        .root
+                        .metadata(&relative)
+                        .context("recheck registered source leaf")?;
+                    require_source_leaf_identity(expected, after)?;
+                    Ok(Some(entry))
+                },
+            );
+            let mut results: Vec<_> = order.into_iter().zip(results).collect();
+            results.sort_unstable_by_key(|(index, _)| *index);
+            return results.into_iter().map(|(_, result)| result).collect();
         }
         if self.destination_root.is_none()
             && !self.source_roots.is_empty()
@@ -4504,7 +4531,7 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
 // request starts without a retained handle and resolves the path again.
 fn stat_with_parent(
     root: &Root,
-    parent: &mut Option<(PathBytes, File)>,
+    parent: &mut Option<(RootIdentity, PathBytes, File)>,
     path: &[u8],
 ) -> Option<Entry> {
     if path.starts_with(b"/") {
@@ -4518,16 +4545,19 @@ fn stat_with_parent(
     };
     let parent_path = &path[..separator];
     let name = &path[separator + 1..];
-    if parent.as_ref().is_none_or(|(key, _)| key != parent_path) {
+    if parent
+        .as_ref()
+        .is_none_or(|(identity, key, _)| *identity != root.identity() || key != parent_path)
+    {
         *parent = None;
         let directory = root
             .open_directory(&RelativePath::new(parent_path).ok()?)
             .ok()?;
-        *parent = Some((parent_path.to_vec(), directory));
+        *parent = Some((root.identity(), parent_path.to_vec(), directory));
     }
     // The held parent's key was validated when opened. This operation validates
     // the leaf, so siblings do not need an allocated RelativePath for validation.
-    let directory = &parent.as_ref()?.1;
+    let directory = &parent.as_ref()?.2;
     let metadata = root.metadata_in_directory(directory, name).ok()?;
     rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
 }
@@ -10691,12 +10721,23 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
+        for parent in 0..4 {
+            fs::create_dir(temporary.path().join(format!("p{parent}"))).unwrap();
+        }
         for idx in 0..129 {
-            fs::write(temporary.path().join(format!("f{idx}")), vec![0; idx]).unwrap();
+            fs::write(
+                temporary.path().join(format!("p{}/f{idx}", idx % 4)),
+                vec![0; idx],
+            )
+            .unwrap();
         }
         for count in [31, 32, 65, 128, 7, 129] {
             let sources: Vec<_> = (0..count)
-                .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
+                .map(|idx| {
+                    selections[0]
+                        .join(format!("p{}/f{idx}", idx % 4).as_bytes())
+                        .unwrap()
+                })
                 .collect();
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
@@ -10712,6 +10753,109 @@ mod tests {
                 assert_eq!(entry.map(|e| e.size), Some(idx as u64));
             }
         }
+    }
+
+    #[test]
+    fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let roots: Vec<_> = ["first", "second"]
+            .iter()
+            .map(|name| temporary.path().join(name))
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            fs::create_dir_all(root.join("parent")).unwrap();
+            fs::write(root.join("parent/file"), vec![0; index + 1]).unwrap();
+            symlink(format!("target-{index}"), root.join("parent/link")).unwrap();
+        }
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&roots[0], &roots[1]], false);
+        // Adjacent siblings exercise reuse; identical relative parents under
+        // distinct source roots must never share the held directory. Cover
+        // both the inline and parallel chunk paths, with misleading labels.
+        for count in [12, 384] {
+            let sources: Vec<_> = (0..count)
+                .map(|index| {
+                    selections[(index / 3) % 2]
+                        .join(
+                            [b"parent/file".as_slice(), b"parent/link", b"parent/missing"]
+                                [index % 3],
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let paths = vec![b"/ignored/display/path".to_vec(); count];
+            let expected: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    let target = worker.registered_source_target(source).unwrap();
+                    let metadata = target.root.metadata(&target.relative).ok()?;
+                    rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
+                })
+                .collect();
+            let actual = worker
+                .stat_many_request(&paths, Some(&sources), true, None)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        // The allocation-free pre-pass must reject malformed authority before
+        // the lookup path can turn it into an ordinary missing-file result.
+        for invalid in [
+            b"/parent/file".as_slice(),
+            b"parent//file",
+            b"parent/../file",
+            b"parent/f\0",
+        ] {
+            let mut source = selections[0].clone();
+            source.relative = invalid.to_vec();
+            assert!(worker
+                .stat_many_request(&[b"ignored".to_vec()], Some(&[source]), false, None)
+                .is_err());
+        }
+        let sources = vec![selections[0].join(b"parent/file").unwrap(); 64];
+        let paths = vec![b"ignored".to_vec(); sources.len()];
+        fs::rename(roots[0].join("parent"), roots[0].join("moved")).unwrap();
+        fs::create_dir(roots[0].join("parent")).unwrap();
+        fs::write(roots[0].join("parent/file"), b"replacement").unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), false, None)
+            .unwrap();
+        assert!(actual
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 11)));
+        fs::remove_dir_all(roots[0].join("parent")).unwrap();
+        symlink("moved", roots[0].join("parent")).unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), true, None)
+            .unwrap();
+        assert!(actual.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn source_stat_grouping_reports_the_first_error_in_request_order() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&first, &second], false);
+        fs::rename(&first, temporary.path().join("held-first")).unwrap();
+        fs::write(&first, b"replacement").unwrap();
+        fs::remove_file(&second).unwrap();
+        // Sorting processes the lower registered root first, but its identity
+        // failure must not mask the missing-file error requested first.
+        let sources = vec![selections[1].clone(), selections[0].clone()];
+        let error = worker
+            .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false, None)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "inspect registered source leaf");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
