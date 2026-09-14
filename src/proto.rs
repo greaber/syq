@@ -55,7 +55,7 @@ pub type PathBytes = Vec<u8>;
 /// the parallel legacy pathname is only a display/compatibility spelling.
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
-    pub(crate) root: RegisteredRootId,
+    root: RegisteredRootId,
     relative: PathBytes,
 }
 

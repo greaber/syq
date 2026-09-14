@@ -3229,7 +3229,7 @@ impl FsOps {
                 bail!("source stat capability count does not match path count");
             }
             // Validate capability authority eagerly. RegisteredPath construction
-            // and deserialization already guarantee valid relative path bytes.
+            // and deserialization guarantee valid relative path bytes.
             let mut targets = sources
                 .iter()
                 .enumerate()
@@ -3278,6 +3278,8 @@ impl FsOps {
             );
             // Scatter before collecting so the first error, as well as each
             // successful entry, follows request order rather than lookup order.
+            debug_assert_eq!(targets.len(), sources.len());
+            debug_assert_eq!(results.len(), targets.len());
             let mut ordered: Vec<_> = (0..sources.len()).map(|_| Ok(None)).collect();
             for ((_, index, ..), result) in targets.into_iter().zip(results) {
                 ordered[index] = result;
@@ -10544,6 +10546,16 @@ mod tests {
                 .size,
             11
         );
+        // The second root keeps its own parent pinned across sibling lookups.
+        fs::rename(base.join("parent"), base.join("second-parent")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"new").unwrap();
+        assert_eq!(
+            stat_with_parent(&second, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            11
+        );
     }
 
     #[test]
@@ -10780,9 +10792,10 @@ mod tests {
             registered_source_worker(&[&roots[0], &roots[1]], false);
         // Adjacent siblings exercise reuse; identical relative parents under
         // distinct source roots must never share the held directory. Cover
-        // both paths with misleading labels. At 386 items, the first root
-        // has 194 entries and chunks have 13: a root switch is inside a chunk.
-        for count in [386, 12] {
+        // both paths with misleading labels.
+        let parallel_count = 386;
+        assert!(parallel_count >= PAR_MIN);
+        for count in [parallel_count, 12] {
             let sources: Vec<_> = (0..count)
                 .map(|index| {
                     selections[(index / 3) % 2]
@@ -10797,6 +10810,18 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
+            if count == parallel_count {
+                let chunk = sources.len().div_ceil(PAR_THREADS).max(1);
+                let first_root_count = sources
+                    .iter()
+                    .filter(|source| source.root() == selections[0].root())
+                    .count();
+                assert_ne!(
+                    first_root_count % chunk,
+                    0,
+                    "the root boundary must fall inside a parallel chunk"
+                );
+            }
             let paths = vec![b"/ignored/display/path".to_vec(); count];
             let expected: Vec<_> = sources
                 .iter()
