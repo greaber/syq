@@ -46,21 +46,21 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
-| `job-storage` | `compact` | `compact` or `inline` |
+| `job-storage` | `combined` | `combined`, `compact`, or `inline` |
 | `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote
 coordinator too and are not saved.
 
-Use `--tuning-options job-storage=inline` to turn off the job-memory
-optimization when troubleshooting performance. The default `compact` stores
-jobs separately and releases collision-check indexes before queuing buffered
-jobs. `inline` restores the previous contiguous job storage, including inline
-destination metadata, and keeps those indexes until buffered entries have been
-applied. Both modes use the same copy, retry, and integrity checks. As with other
-tuning overrides, this setting bypasses learned connection counts; use the same
-explicit `--connections` value when comparing modes.
+The default `combined` shares job metadata between workers and stores jobs in
+chunks to reduce allocation and cloning. Use `--tuning-options job-storage=compact`
+to restore individually allocated jobs and copied worker metadata when comparing
+performance. `inline` also restores the earlier contiguous job layout and keeps
+collision-check indexes until buffered entries have been applied. All modes use
+the same copy, retry, and integrity checks. As with other tuning overrides, this
+setting bypasses learned connection counts; use the same explicit `--connections`
+value when comparing modes.
 
 Larger requests reduce overhead per byte; deeper pipelines allow more requests
 to await replies at once. Both can increase memory use. Neither changes the

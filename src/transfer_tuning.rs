@@ -10,16 +10,14 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\njob-storage=compact|inline|chunked|shared|combined: default compact reduces retained job memory and releases collision-check indexes before job replay; inline restores the previous job layout and index lifetime for troubleshooting. Investigation modes chunked and shared test pooled storage and shared snapshots respectively; combined shares immutable chunk storage.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
+pub(crate) const HELP: &str = "Override copy internals for performance troubleshooting and controlled benchmarks with comma-separated KEY=VALUE pairs. Normal copies tune automatically; leave these overrides unset unless investigating a performance issue. Keys:\n\njob-storage=combined|compact|inline: default combined shares job metadata in chunks to reduce allocation and cloning. compact restores individually allocated jobs and deep-cloned worker snapshots; inline also restores the previous inline job layout and collision-index lifetime.\nrequest-size=SIZE: 512 bytes..64M; ordinary default is the hash block size, normally 4M; streaming defaults to at most 2M.\npipeline-depth=N: 1..64 outstanding range requests per endpoint per worker; default 4. In-process endpoints remain synchronous.\ncopy-path=auto|ranges|streaming|auto-streaming: default auto; ranges bypasses whole-file and small-file copy shortcuts. Experimental streaming also bypasses those shortcuts, streams source blocks and drains checked write replies without a block-credit window. auto-streaming keeps normal whole-file and small-file shortcuts, streaming only range transfers. Auto streams remote ranges larger than one default request window, keeping ordinary requests for local or shorter ranges. An explicit pipeline-depth selects ordinary requests. The forced streaming modes are incompatible with pipeline-depth; forced streaming also rejects batch controls.\nbatch-files=N: 1..4096 files per worker batch; default 128 or 512 depending on transport/latency.\nbatch-bytes=SIZE: 512 bytes..64M per worker batch; default 16M, including the first file. Explicit batch controls bypass the native small-copy shortcut.\nsplit-min-size=SIZE: 1..1G bytes; default 32M, raised to at least two hash blocks.\nbw-pacing=average|INTERVAL: requires --bwlimit. Default 125ms. Intervals accept integer ms or s, from 1ms through 10s. Timed pacing caps request size at max(rate * interval, 512 bytes). Average pacing preserves request size and waits for each block's full byte budget before issuing its request (or its destination write in streaming mode). Neither mode guarantees a network burst ceiling. Restricted receivers retain their signed 125ms request-size ceiling in both modes.\n\nK/M/G sizes use powers of 1024. Hash/resume blocks stay unchanged. Overrides are not saved and bypass the remembered connection count. Use -v to report effective settings and observed paths; fix the connection count for comparisons. See the Speed guide for benchmark examples.";
 
 /// Retained job layout and lifetime of collision-preflight indexes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum JobStorage {
-    #[default]
     Compact,
     Inline,
-    Chunked,
-    Shared,
+    #[default]
     Combined,
 }
 
@@ -28,8 +26,6 @@ impl std::fmt::Display for JobStorage {
         f.write_str(match self {
             Self::Compact => "compact",
             Self::Inline => "inline",
-            Self::Chunked => "chunked",
-            Self::Shared => "shared",
             Self::Combined => "combined",
         })
     }
@@ -286,10 +282,8 @@ impl FromStr for TransferTuning {
                     match value {
                         "compact" => JobStorage::Compact,
                         "inline" => JobStorage::Inline,
-                        "chunked" => JobStorage::Chunked,
-                        "shared" => JobStorage::Shared,
                         "combined" => JobStorage::Combined,
-                        _ => bail!("job-storage must be compact, inline, chunked or shared"),
+                        _ => bail!("job-storage must be combined, compact or inline"),
                     },
                     key,
                 )?,
@@ -362,9 +356,10 @@ mod tests {
     #[test]
     fn job_storage_defaults_and_explicit_modes_round_trip() {
         let default = TransferTuning::default();
-        assert_eq!(default.job_storage(), JobStorage::Compact);
+        assert_eq!(default.job_storage(), JobStorage::Combined);
         assert!(default.to_string().is_empty());
         for (value, mode) in [
+            ("combined", JobStorage::Combined),
             ("compact", JobStorage::Compact),
             ("inline", JobStorage::Inline),
         ] {

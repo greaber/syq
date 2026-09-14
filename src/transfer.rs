@@ -7067,8 +7067,7 @@ impl Planner<'_> {
                 done: Arc::new(AtomicU64::new(0)),
                 inplace: matches!(
                     self.opts.tuning.job_storage(),
-                    crate::transfer_tuning::JobStorage::Shared
-                        | crate::transfer_tuning::JobStorage::Combined
+                    crate::transfer_tuning::JobStorage::Combined
                 ) && self.opts.inplace
                     && target_condition == TargetCondition::Any
                     && self.container_guard.is_none(),
