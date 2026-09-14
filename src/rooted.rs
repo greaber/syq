@@ -1353,13 +1353,18 @@ impl Root {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> io::Result<()> {
-        let parent = self
-            .resolve_parent(path)
-            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        let (directory, leaf) = if path.is_empty() {
+            (self.directory.try_clone()?, component_cstring(b"."))
+        } else {
+            let parent = self
+                .resolve_parent(path)
+                .map_err(|error| io::Error::other(format!("{error:#}")))?;
+            (parent.directory, parent.leaf)
+        };
         retry_zero(|| unsafe {
             libc::fchownat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
                 uid.unwrap_or(u32::MAX),
                 gid.unwrap_or(u32::MAX),
                 libc::AT_SYMLINK_NOFOLLOW,

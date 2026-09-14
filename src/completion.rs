@@ -1455,6 +1455,11 @@ fn complete_path_for(
             path_policy(command, args, false, true),
         ));
     };
+    if endpoint_text.starts_with("s3://") {
+        // S3 keys are not SSH paths. Tab must not open an SSH connection or
+        // start a credential-provider process just to complete an object key.
+        return Ok(Vec::new());
+    }
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
         return Ok(local_path_candidates_at(
             current,
@@ -1515,6 +1520,11 @@ fn complete_source_path(
     ) else {
         return Ok(local_path_candidates_at(current, false, base, policy));
     };
+    if endpoint_text.starts_with("s3://") {
+        // S3 keys are not SSH paths. Tab must not open an SSH connection or
+        // start a credential-provider process just to complete an object key.
+        return Ok(Vec::new());
+    }
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
         return Ok(local_path_candidates_at(current, false, base, policy));
     };

@@ -290,7 +290,11 @@ impl ResultsWriter {
             .map(|endpoint| {
                 let mut value = serde_json::json!({
                     "role": endpoint.role,
-                    "kind": if endpoint.host.is_some() { "ssh" } else { "local" },
+                    "kind": match endpoint.host.as_deref() {
+                        Some(host) if host.starts_with("s3://") => "s3",
+                        Some(_) => "ssh",
+                        None => "local",
+                    },
                 });
                 let object = value.as_object_mut().expect("endpoint is an object");
                 if let Some(host) = &endpoint.host {
