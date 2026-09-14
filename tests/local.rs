@@ -21448,7 +21448,7 @@ fn local_read_ahead_preserves_staged_and_inplace_contents() {
                 .unwrap();
             assert_output_ok(&out);
             if force_read_ahead {
-                assert!(stderr_of(&out).contains("local read-ahead started"));
+                assert!(stderr_of(&out).contains("source read-ahead started"));
             }
             assert_eq!(read(&t.path("destination")), data);
             if inplace {
@@ -21506,5 +21506,71 @@ fn local_read_ahead_shrink_keeps_old_destination() {
             .unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("destination")), changed);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(17 * 1024 * 1024 + 123, 357);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for pull in [false, true] {
+            for stream in [false, true] {
+                let destination = t.s(&format!("dst-{tcp}-{pull}-{stream}"));
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--connections",
+                    "1",
+                    "--no-progress",
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--tuning-options",
+                    if stream {
+                        "copy-path=streaming,request-size=4194304"
+                    } else {
+                        "copy-path=ranges,request-size=4194304,pipeline-depth=8"
+                    },
+                ]);
+                if tcp {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                } else {
+                    command.arg("--no-tcp");
+                }
+                if pull {
+                    command.args(["--from", "host"]);
+                }
+                command.arg(t.s("source"));
+                if !pull {
+                    command.args(["--to", "host"]);
+                }
+                let out = command
+                    .args(["--as", &destination])
+                    .env("SYQ_DEBUG", "1")
+                    .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"))
+                    .run()
+                    .unwrap();
+                assert_output_ok(&out);
+                let stderr = stderr_of(&out);
+                assert!(
+                    stderr.contains("source read-ahead started"),
+                    "tcp={tcp} pull={pull} stream={stream}: {stderr}"
+                );
+                assert_eq!(read(Path::new(&destination)), data);
+            }
+        }
     }
 }
