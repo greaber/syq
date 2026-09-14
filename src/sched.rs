@@ -2,6 +2,7 @@
 
 use crate::proto::{ContainerGuard, Entry, PathBytes, RegisteredPath};
 use crate::transfer_tuning::JobStorage;
+use std::borrow::{Borrow, BorrowMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
@@ -10,21 +11,21 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
-pub struct FileJob<D = Option<Entry>> {
-    pub data: FileJobData,
+pub struct FileJob<D = Option<Entry>, S = FileJobData> {
+    pub data: S,
     pub dst_entry: D,
 }
 
-impl<D> Deref for FileJob<D> {
+impl<D, S: Borrow<FileJobData>> Deref for FileJob<D, S> {
     type Target = FileJobData;
     fn deref(&self) -> &Self::Target {
-        &self.data
+        self.data.borrow()
     }
 }
 
-impl<D> DerefMut for FileJob<D> {
+impl<D, S: BorrowMut<FileJobData>> DerefMut for FileJob<D, S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
+        self.data.borrow_mut()
     }
 }
 
@@ -54,12 +55,35 @@ pub struct FileJobData {
     pub src_rel: Option<PathBytes>,
 }
 
+// Owned snapshots remain inline to preserve the existing control's allocation
+// behavior. Shared snapshots retain a version; rare retry writes use COW.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SnapshotData {
+    Owned(FileJobData),
+    Shared(Arc<FileJobData>),
+}
+
+impl Borrow<FileJobData> for SnapshotData {
+    fn borrow(&self) -> &FileJobData {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+
+pub type WorkerJob = FileJob<Option<Entry>, SnapshotData>;
+const JOBS_PER_CHUNK: usize = 1024;
+
 /// Select the retained representation once per command. Workers always receive
 /// an owned snapshot, so both layouts use identical transfer and retry logic.
 #[allow(clippy::vec_box)]
 pub enum Jobs {
     Compact(Vec<Box<FileJob<Option<Box<Entry>>>>>),
     Inline(Vec<FileJob>),
+    Chunked(Vec<Vec<FileJob<Option<Box<Entry>>>>>),
+    Shared(Vec<FileJob<Option<Box<Entry>>, Arc<FileJobData>>>),
 }
 
 impl Jobs {
@@ -67,6 +91,8 @@ impl Jobs {
         match storage {
             JobStorage::Compact => Self::Compact(Vec::new()),
             JobStorage::Inline => Self::Inline(Vec::new()),
+            JobStorage::Chunked => Self::Chunked(Vec::new()),
+            JobStorage::Shared => Self::Shared(Vec::new()),
         }
     }
 
@@ -74,6 +100,10 @@ impl Jobs {
         match self {
             Self::Compact(jobs) => jobs.len(),
             Self::Inline(jobs) => jobs.len(),
+            Self::Shared(jobs) => jobs.len(),
+            Self::Chunked(chunks) => chunks
+                .last()
+                .map_or(0, |last| (chunks.len() - 1) * JOBS_PER_CHUNK + last.len()),
         }
     }
 
@@ -92,12 +122,31 @@ impl Jobs {
                 dst_entry: job.dst_entry.map(Box::new),
             })),
             Self::Inline(jobs) => jobs.push(job),
+            Self::Shared(jobs) => jobs.push(FileJob {
+                data: Arc::new(job.data),
+                dst_entry: job.dst_entry.map(Box::new),
+            }),
+            Self::Chunked(chunks) => {
+                if chunks
+                    .last()
+                    .is_none_or(|chunk| chunk.len() == JOBS_PER_CHUNK)
+                {
+                    chunks.push(Vec::with_capacity(JOBS_PER_CHUNK));
+                }
+                chunks.last_mut().unwrap().push(FileJob {
+                    data: job.data,
+                    dst_entry: job.dst_entry.map(Box::new),
+                });
+            }
         }
     }
 
-    pub fn snapshot(&self, idx: usize) -> FileJob {
+    pub fn snapshot(&self, idx: usize) -> WorkerJob {
         FileJob {
-            data: self[idx].clone(),
+            data: match self {
+                Self::Shared(jobs) => SnapshotData::Shared(jobs[idx].data.clone()),
+                _ => SnapshotData::Owned(self[idx].clone()),
+            },
             dst_entry: self.destination(idx).cloned(),
         }
     }
@@ -106,6 +155,10 @@ impl Jobs {
         match self {
             Self::Compact(jobs) => jobs[idx].dst_entry.as_deref(),
             Self::Inline(jobs) => jobs[idx].dst_entry.as_ref(),
+            Self::Shared(jobs) => jobs[idx].dst_entry.as_deref(),
+            Self::Chunked(chunks) => chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK]
+                .dst_entry
+                .as_deref(),
         }
     }
 
@@ -113,13 +166,28 @@ impl Jobs {
         match self {
             Self::Compact(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
             Self::Inline(jobs) => jobs[idx].dst_entry = Some(entry),
+            Self::Shared(jobs) => jobs[idx].dst_entry = Some(Box::new(entry)),
+            Self::Chunked(chunks) => {
+                chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].dst_entry = Some(Box::new(entry))
+            }
         }
+    }
+
+    pub fn set_inplace(&mut self, idx: usize, value: bool) {
+        // Shared jobs initialize this immutable decision before dispatch.
+        // Avoid making a private retry version for a no-op assignment.
+        if matches!(self, Self::Shared(_)) && self[idx].inplace == value {
+            return;
+        }
+        self[idx].inplace = value;
     }
 
     fn release(&mut self) {
         match self {
             Self::Compact(jobs) => *jobs = Vec::new(),
             Self::Inline(jobs) => *jobs = Vec::new(),
+            Self::Shared(jobs) => *jobs = Vec::new(),
+            Self::Chunked(chunks) => *chunks = Vec::new(),
         }
     }
 }
@@ -130,6 +198,8 @@ impl Index<usize> for Jobs {
         match self {
             Self::Compact(jobs) => &jobs[idx].data,
             Self::Inline(jobs) => &jobs[idx].data,
+            Self::Shared(jobs) => &jobs[idx].data,
+            Self::Chunked(chunks) => &chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].data,
         }
     }
 }
@@ -139,6 +209,8 @@ impl IndexMut<usize> for Jobs {
         match self {
             Self::Compact(jobs) => &mut jobs[idx].data,
             Self::Inline(jobs) => &mut jobs[idx].data,
+            Self::Shared(jobs) => Arc::make_mut(&mut jobs[idx].data),
+            Self::Chunked(chunks) => &mut chunks[idx / JOBS_PER_CHUNK][idx % JOBS_PER_CHUNK].data,
         }
     }
 }
@@ -668,38 +740,130 @@ mod tests {
 
     fn test_job(size: u64) -> FileJob {
         FileJob {
-            src: b"source".to_vec(),
-            source: RegisteredPath {
-                root: serde_json::from_str("0").unwrap(),
-                relative: b"source".to_vec(),
-            },
-            dst: b"destination".to_vec(),
-            rel: "destination".into(),
-            rel_bytes: b"destination".to_vec(),
-            src_rel: None,
-            entry: Entry {
-                path: Vec::new(),
-                kind: crate::proto::Kind::File,
-                size,
-                mtime: 0,
-                mtime_nsec: 0,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                dev: 1,
-                ino: 1,
-                ctime: 0,
-                ctime_nsec: 0,
-                link: None,
+            data: FileJobData {
+                src: b"source".to_vec(),
+                source: RegisteredPath {
+                    root: serde_json::from_str("0").unwrap(),
+                    relative: b"source".to_vec(),
+                },
+                dst: b"destination".to_vec(),
+                rel: "destination".into(),
+                rel_bytes: b"destination".to_vec(),
+                src_rel: None,
+                entry: Entry {
+                    path: Vec::new(),
+                    kind: crate::proto::Kind::File,
+                    size,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    dev: 1,
+                    ino: 1,
+                    ctime: 0,
+                    ctime_nsec: 0,
+                    link: None,
+                },
+                target_condition: crate::proto::TargetCondition::Any,
+                container_guard: None,
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: false,
             },
             dst_entry: None,
-            target_condition: crate::proto::TargetCondition::Any,
-            container_guard: None,
-            attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
-            inplace: false,
         }
+    }
+
+    #[test]
+    #[ignore = "manual storage and scheduler-lock experiment"]
+    fn job_storage_probe() {
+        use std::time::Instant;
+        let mode = std::env::var("SYQ_JOB_PROBE_MODE").unwrap_or_else(|_| "compact".into());
+        let tuning: crate::transfer_tuning::TransferTuning =
+            format!("job-storage={mode}").parse().unwrap();
+        let count = std::env::var("SYQ_JOB_PROBE_COUNT")
+            .unwrap_or_else(|_| "200000".into())
+            .parse::<usize>()
+            .unwrap();
+        let workers = std::env::var("SYQ_JOB_PROBE_WORKERS")
+            .unwrap_or_else(|_| "32".into())
+            .parse::<usize>()
+            .unwrap();
+        let passes = 3;
+        let mut jobs = Jobs::new(tuning.job_storage());
+        let start = Instant::now();
+        for i in 0..count {
+            let mut job = test_job(4194);
+            job.src = format!("/fixture/source/d{:03}/f{i:06}", i % 256).into_bytes();
+            job.dst = format!("/fixture/destination/d{:03}/f{i:06}", i % 256).into_bytes();
+            job.rel = format!("d{:03}/f{i:06}", i % 256);
+            job.rel_bytes = job.rel.as_bytes().to_vec();
+            job.entry.path = job.rel_bytes.clone();
+            job.source.relative = job.rel_bytes.clone();
+            jobs.push(job);
+        }
+        let create_s = start.elapsed().as_secs_f64();
+        let mut order: Vec<_> = (0..count).collect();
+        order.sort_unstable_by_key(|idx| idx.reverse_bits());
+        let jobs = Mutex::new(jobs);
+        let next = AtomicUsize::new(0);
+        let start = Instant::now();
+        let totals = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..workers {
+                let jobs = &jobs;
+                let next = &next;
+                let order = &order;
+                threads.push(scope.spawn(move || {
+                    let mut wait_s = 0.0;
+                    let mut hold_s = 0.0;
+                    let mut snapshots = 0;
+                    loop {
+                        let first = next.fetch_add(128, Relaxed);
+                        if first >= count * passes {
+                            break;
+                        }
+                        let end = (first + 128).min(count * passes);
+                        let waiting = Instant::now();
+                        let guard = jobs.lock().unwrap();
+                        wait_s += waiting.elapsed().as_secs_f64();
+                        let holding = Instant::now();
+                        let batch: Vec<_> = (first..end)
+                            .map(|i| guard.snapshot(order[i % count]))
+                            .collect();
+                        hold_s += holding.elapsed().as_secs_f64();
+                        drop(guard);
+                        for job in &batch {
+                            std::hint::black_box((&job.src, &job.entry, job.done.load(Relaxed)));
+                        }
+                        snapshots += batch.len();
+                    }
+                    (wait_s, hold_s, snapshots)
+                }));
+            }
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .fold((0.0, 0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+        });
+        let snapshot_s = start.elapsed().as_secs_f64();
+        assert_eq!(totals.2, count * passes);
+        let start = Instant::now();
+        jobs.lock().unwrap().release();
+        let release_s = start.elapsed().as_secs_f64();
+        println!(
+            "JOB_PROBE {}",
+            serde_json::json!({
+                "mode": mode, "jobs": count, "workers": workers, "snapshots": totals.2,
+                "create_s": create_s, "snapshot_wall_s": snapshot_s,
+                "lock_wait_thread_s": totals.0, "lock_hold_thread_s": totals.1,
+                "release_s": release_s,
+                "compact_record_bytes": std::mem::size_of::<FileJob<Option<Box<Entry>>>>(),
+                "worker_snapshot_bytes": std::mem::size_of::<WorkerJob>(),
+            })
+        );
     }
 
     #[test]
@@ -804,9 +968,14 @@ mod tests {
         let path = dir.path().join("file");
         std::fs::write(&path, b"payload").unwrap();
         let entry = crate::fsops::lstat_entry(b"file".to_vec(), &path).unwrap();
-        for mode in [JobStorage::Compact, JobStorage::Inline] {
+        for mode in [
+            JobStorage::Compact,
+            JobStorage::Inline,
+            JobStorage::Chunked,
+            JobStorage::Shared,
+        ] {
             let sched = Sched::with_job_storage(4, 8, mode);
-            for i in 0..129 {
+            for i in 0..(2 * JOBS_PER_CHUNK + 1) {
                 let idx = sched.push_file(FileJob {
                     dst_entry: (i % 2 == 0).then(|| entry.clone()),
                     data: FileJobData {
@@ -830,12 +999,27 @@ mod tests {
                 assert_eq!(idx, i);
             }
             let mut jobs = sched.jobs.lock().unwrap();
-            assert_eq!(jobs.len(), 129);
+            assert_eq!(jobs.len(), 2 * JOBS_PER_CHUNK + 1);
             for i in 0..jobs.len() {
                 assert_eq!(jobs[i].rel, i.to_string());
                 assert_eq!(jobs.destination(i).is_some(), i % 2 == 0);
             }
             let before = jobs.snapshot(1);
+            if mode == JobStorage::Shared {
+                let second = jobs.snapshot(1);
+                let (SnapshotData::Shared(a), SnapshotData::Shared(b)) =
+                    (&before.data, &second.data)
+                else {
+                    panic!("missing shared version");
+                };
+                assert!(Arc::ptr_eq(a, b));
+                jobs.set_inplace(1, false);
+                let after_noop = jobs.snapshot(1);
+                let SnapshotData::Shared(after_noop) = &after_noop.data else {
+                    unreachable!()
+                };
+                assert!(Arc::ptr_eq(a, after_noop));
+            }
             jobs[1].entry.size = 99;
             jobs[1].attempt = 1;
             jobs[1].inplace = true;
@@ -858,6 +1042,8 @@ mod tests {
             match &*jobs {
                 Jobs::Compact(jobs) => assert_eq!(jobs.capacity(), 0),
                 Jobs::Inline(jobs) => assert_eq!(jobs.capacity(), 0),
+                Jobs::Shared(jobs) => assert_eq!(jobs.capacity(), 0),
+                Jobs::Chunked(chunks) => assert_eq!(chunks.capacity(), 0),
             }
         }
     }

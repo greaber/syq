@@ -6244,7 +6244,7 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
 
 #[test]
 fn tuning_options_job_storage_copies_and_updates_with_both_interfaces() {
-    for mode in ["compact", "inline"] {
+    for mode in ["compact", "inline", "chunked", "shared"] {
         for interface in ["cp", "rsync"] {
             for engine in ["auto", "ranges"] {
                 let t = Tmp::new();
@@ -6285,6 +6285,36 @@ fn tuning_options_job_storage_copies_and_updates_with_both_interfaces() {
                 write(&t.path("source/nested/large"), &prng(2 << 20, 351));
                 copy(); // Same-size changed destinations require fresh metadata.
             }
+        }
+    }
+}
+
+#[test]
+fn tuning_options_shared_and_chunked_inplace_preserve_hardlinks() {
+    for mode in ["compact", "inline", "chunked", "shared"] {
+        for engine in ["auto", "ranges"] {
+            let t = Tmp::new();
+            write(&t.path("source"), &prng(4194, 351));
+            write(&t.path("destination"), b"old destination");
+            fs::hard_link(t.path("destination"), t.path("alias")).unwrap();
+            let inode = fs::metadata(t.path("destination")).unwrap().ino();
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    &t.s("source"),
+                    "--as",
+                    &t.s("destination"),
+                    "--inplace",
+                    "--no-progress",
+                    "--connections",
+                    "2",
+                    &format!("--tuning-options=job-storage={mode},copy-path={engine}"),
+                ])
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+            assert_eq!(read(&t.path("alias")), read(&t.path("source")));
         }
     }
 }
@@ -12221,7 +12251,7 @@ fn impossible_sidecar_name_fails_one_file_and_continues() {
 #[cfg(debug_assertions)]
 #[test]
 fn changed_source_retry_uses_published_file_as_block_basis() {
-    for storage in ["compact", "inline"] {
+    for storage in ["compact", "inline", "chunked", "shared"] {
         changed_source_retry_uses_published_file_as_block_basis_with_storage(storage);
     }
 }
@@ -12302,7 +12332,7 @@ fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage:
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn changed_source_retry_still_uses_copy_file_range() {
-    for storage in ["compact", "inline"] {
+    for storage in ["compact", "inline", "chunked", "shared"] {
         changed_source_retry_still_uses_copy_file_range_with_storage(storage);
     }
 }
