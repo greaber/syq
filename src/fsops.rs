@@ -10533,7 +10533,13 @@ mod tests {
         let root = Arc::new(Root::open(base).unwrap());
         let mut ops = FsOps::new();
         ops.destination_root = Some(root.clone());
-        fs::write(base.join("a").join(OsStr::from_bytes(b"raw-\xff")), b"raw").unwrap();
+        // Exercise raw filename bytes only where the filesystem accepts them.
+        let raw_path = if crate::test_support::filesystem_accepts_non_utf8_names() {
+            b"a/raw-\xff".as_slice()
+        } else {
+            b"a/raw-plain".as_slice()
+        };
+        fs::write(base.join(OsStr::from_bytes(raw_path)), b"raw").unwrap();
         let names = [
             b"a/file".as_slice(),
             b"a/missing",
@@ -10551,7 +10557,7 @@ mod tests {
             b"a/file/",
             b"a\0/file",
             b"a/f\0",
-            b"a/raw-\xff",
+            raw_path,
         ];
         let paths: Vec<_> = names
             .iter()
