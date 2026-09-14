@@ -7065,10 +7065,7 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                inplace: matches!(
-                    self.opts.tuning.job_storage(),
-                    crate::transfer_tuning::JobStorage::Combined
-                ) && self.opts.inplace
+                inplace: self.opts.inplace
                     && target_condition == TargetCondition::Any
                     && self.container_guard.is_none(),
                 src_rel,
@@ -7767,8 +7764,7 @@ impl Worker {
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs.destination(idx).is_none()
-            && (!self.opts.inplace
-                || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
+            && (!self.opts.inplace || j.inplace)
     }
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
@@ -8071,9 +8067,7 @@ impl Worker {
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
+        let inplace = job.inplace;
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or an eligible sequential userspace writer) instead of
         // framing, hashing and scheduling them through the transport.
@@ -8114,7 +8108,7 @@ impl Worker {
         // bool = a staged or in-place file still needs Finalize. A verified
         // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
-            let final_entry = job.dst_entry.clone();
+            let final_entry = job.dst_entry.as_deref();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -8125,7 +8119,6 @@ impl Worker {
             // Unless --inplace was explicit, changed files are published
             // through a sidecar + atomic rename. Small new files normally take
             // the batched small-file path instead of reaching this worker path.
-            self.set_inplace(idx, inplace);
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
@@ -8250,12 +8243,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Record the in-place decision on the job so every range worker and the
-    /// finalize agree.
-    fn set_inplace(&self, idx: usize, v: bool) {
-        self.sched.jobs.lock().unwrap().set_inplace(idx, v);
-    }
-
     /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
     /// receiver cannot use its direct path, so the caller should stream;
     /// Err = real failure.
@@ -8265,10 +8252,7 @@ impl Worker {
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
         // directly.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
-        self.set_inplace(idx, inplace);
+        let inplace = job.inplace;
         let mode = self.create_mode(job);
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
