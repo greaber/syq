@@ -70,8 +70,12 @@ restore `design/`, or add investigation reports, benchmark dumps, or experiment
 diaries to this repository. PR descriptions should explain the actual change
 and relevant checks, without histories of abandoned work.
 
-Keep `current-plans/` limited to brief current task state and next actions;
-remove obsolete notes instead of archiving them. Guidance every session needs
+Keep `current-plans/` limited to brief current task state and next actions.
+At task completion, check the PR's current state and remove obsolete notes;
+first preserve unfinished agreed work in its continuing task's handoff. Do not
+delete notes another conversation is actively updating. Keep generated logs,
+binaries, and benchmark dumps in the task's ignored `target/`, linked from the
+note; do not duplicate PR bodies or CI dumps here. Guidance every session needs
 belongs here in `AGENTS.md`.
 
 When writing any of these, record decisions as current state plus the rationale
@@ -218,6 +222,30 @@ report actual access or decision blockers instead of bypassing them.
 - State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
   the fact the reader needs to route the next step.
 
+## Acting on review feedback
+
+Assess every finding and observation on its merits. "Pre-existing", "out of
+scope", "nonblocking", and "optional" describe context, not importance; none
+is a reason to dismiss a point without consideration. Keep defects, suggestions,
+and observations distinct, and discuss their value rather than treating every
+comment as a change request. A worthwhile observation may belong in this PR,
+in separate work, or need no change; decide that explicitly. Respect an explicit
+user decision to exclude a topic, but do not infer exclusion from reviewer labels.
+
+Reconsider the underlying requirements as part of this assessment, using the
+principles below. Fix directly only independently confirmed, worthwhile problems
+with simple, straightforward fixes, no tradeoffs that would benefit from
+discussion, and no unresolved question about the requirements. For anything else,
+discuss the evidence, value, alternatives, and requirements with the user
+before implementing that finding.
+
+The user may forward review from a reviewer without having understood it or even
+without having read it. Just because a point appears in a review pasted directly by
+the user does not mean that the user agrees with it. Similarly, the reviewer is just
+another agent, and the reviewer's job is to find possible issues with the work. Many
+issues raised by the reviewer might actually best be addressed by doing nothing even
+though the reviewer was not wrong about how the code works.
+
 ## PR review freshness
 
 - For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName`, `headRefOid`, and head-repository identity (owner and repository) first. Treat the GitHub `headRefOid` as authoritative unless a fresher local commit is verified as described below.
@@ -249,10 +277,19 @@ report actual access or decision blockers instead of bypassing them.
   plain words; a reader should not need project jargon such as "retained" or
   "the ordinary engine" to follow them. The code is authoritative for
   everything else.
-- Distinguish explicit requirements from assumptions and design choices. If a
-  supposed requirement creates substantial complexity, question the premise
-  and look for a simpler interpretation. Ask the user when the answer would
-  materially change the product.
+- Routinely reconsider whether requirements are actually required and how much
+  they matter; no special reason or failure is needed to ask. Distinguish the
+  user's goals from assumptions, design choices, and incidental safeguards.
+  A casual request or a check intended to catch common user mistakes must not
+  silently become a guarantee covering every possible case.
+- Weigh a scenario's likelihood and consequences against the complexity,
+  maintenance cost, and disadvantages of preventing it. The fact that a case
+  can occur does not by itself establish that it needs prevention; a rare case
+  can still matter greatly when its consequences are serious. When a small
+  safeguard starts requiring substantial machinery, discuss whether to narrow
+  it, accept a limitation, change the requirement, or choose another design.
+  Bring consequential choices to the user before implementing them; do not
+  silently expand the scope or drop agreed behavior.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
