@@ -1459,6 +1459,8 @@ fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
+    #[cfg(target_os = "linux")]
+    read_ahead: crate::read_ahead::ReadAhead,
     fds: HashMap<FdKey, CachedFile>,
     fd_order: Vec<FdKey>,
     /// One final-file descriptor retained between the hash response and the
@@ -1616,6 +1618,8 @@ impl FsOps {
 
     pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
         FsOps {
+            #[cfg(target_os = "linux")]
+            read_ahead: crate::read_ahead::ReadAhead::default(),
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
@@ -5726,9 +5730,22 @@ impl FsOps {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
         }
+        // Preserve physical clones before considering read-ahead. A clone
+        // needs no source data in memory; metadata I/O is not a reason to
+        // prefetch the contents of a successfully cloned file.
+        let local_read_ahead = source_fs.local_userspace_copy
+            && destination_fs.local_userspace_copy
+            && !source_fs.is_nfs
+            && !destination_fs.is_nfs
+            && !destination_fs.synchronous
+            && !userspace_fallback;
+        let cloned = local_read_ahead && crate::local_copy::try_clone(&s, &d, size);
+        let preparation = &mut self.read_ahead;
+        let mut read_ahead = (local_read_ahead && !cloned).then(|| preparation.range(&s, 0..size));
         let mut source_offset: libc::off64_t = 0;
         let mut destination_offset: libc::off64_t = 0;
-        let mut remaining = size;
+        let mut remaining = if cloned { 0 } else { size };
+        let mut previous_input = crate::read_ahead::Activity::sample();
         while remaining > 0 && !userspace_fallback {
             // SAFETY: each offset is its own local that outlives the call, so
             // the kernel reads and advances the two through distinct pointers.
@@ -5738,7 +5755,11 @@ impl FsOps {
                     &mut source_offset,
                     d.as_raw_fd(),
                     &mut destination_offset,
-                    remaining as usize,
+                    if read_ahead.is_some() {
+                        remaining.min(crate::read_ahead::BLOCK) as usize
+                    } else {
+                        remaining as usize
+                    },
                     0,
                 )
             };
@@ -5790,8 +5811,30 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
+            if let Some(read_ahead) = &mut read_ahead {
+                let prepare = if read_ahead.needs_observation() {
+                    let current = crate::read_ahead::Activity::sample();
+                    let input = current.input_since(previous_input);
+                    previous_input = current;
+                    input
+                } else {
+                    false
+                };
+                read_ahead.advance(size - remaining, prepare);
+                #[cfg(debug_assertions)]
+                if size - remaining == n as u64 {
+                    test_race_barrier(
+                        "SYQ_TEST_OVERLAP_READY",
+                        "SYQ_TEST_OVERLAP_CONTINUE",
+                        "local copy first block",
+                    )?;
+                }
+            }
         }
+        drop(read_ahead);
+
         if userspace_fallback {
+            let mut prepared = preparation.range(&s, 0..size);
             let mut source = &s;
             let mut destination = &d;
             source.seek(SeekFrom::Start(0))?;
@@ -5800,12 +5843,18 @@ impl FsOps {
             let mut remaining = size;
             while remaining > 0 {
                 let want = remaining.min(buffer.len() as u64) as usize;
+                let before = prepared
+                    .needs_observation()
+                    .then(crate::read_ahead::Activity::sample);
                 let n = source
                     .read(&mut buffer[..want])
                     .with_context(|| format!("read {}", source_label.display()))?;
                 if n == 0 {
                     bail!("source shortened while copying {}", source_label.display());
                 }
+                let prepare = before.is_some_and(|before| {
+                    crate::read_ahead::Activity::sample().read_wait_since(before)
+                });
                 destination
                     .write_all(&buffer[..n])
                     .with_context(|| format!("write {}", target_label.display()))?;
@@ -5822,6 +5871,7 @@ impl FsOps {
                     }
                 }
                 remaining -= n as u64;
+                prepared.advance(size - remaining, prepare);
             }
             d.set_len(size)?;
         }
@@ -6088,6 +6138,21 @@ impl FsOps {
         hash_reader(&mut f, block, len)
     }
 
+    pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.begin_stream(_range);
+    }
+
+    pub(crate) fn shrink_source_range(&mut self, _end: u64) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.shrink_stream(_end);
+    }
+
+    pub(crate) fn end_source_range(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.end_stream();
+    }
+
     pub fn read_range(
         &mut self,
         path: &[u8],
@@ -6106,23 +6171,35 @@ impl FsOps {
         if u64::from(len) > MAX_READ_BYTES {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
-        let target = self.source_content_target(source)?;
-        let p = resolve(path);
-        let f = if let Some((root_id, target)) = target {
-            let relative_bytes = source
-                .expect("rooted source target requires a registered reference")
-                .relative();
-            self.cached_source_read(root_id, relative_bytes, &target, attempt)?
-        } else {
-            // This is either a pre-registration test/control operation or the
-            // explicit rsync --insecure-links compatibility path.
-            self.cached(&p, false, attempt, false)?.file()
-        };
-        let mut data = vec![0u8; len as usize];
-        f.read_exact_at(&mut data, off)
-            .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
-        let hash = content_digest(&data);
-        Ok(Response::Block { off, hash, data })
+        #[cfg(target_os = "linux")]
+        let mut preparation = std::mem::take(&mut self.read_ahead);
+        let result = (|| {
+            let target = self.source_content_target(source)?;
+            let p = resolve(path);
+            let f = if let Some((root_id, target)) = target {
+                let relative_bytes = source
+                    .expect("rooted source target requires a registered reference")
+                    .relative();
+                self.cached_source_read(root_id, relative_bytes, &target, attempt)?
+            } else {
+                // This is either a pre-registration test/control operation or the
+                // explicit rsync --insecure-links compatibility path.
+                self.cached(&p, false, attempt, false)?.file()
+            };
+            let mut data = vec![0u8; len as usize];
+            #[cfg(target_os = "linux")]
+            let read = preparation.read_exact_at(f, &mut data, off);
+            #[cfg(not(target_os = "linux"))]
+            let read = f.read_exact_at(&mut data, off);
+            read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
+            let hash = content_digest(&data);
+            Ok(Response::Block { off, hash, data })
+        })();
+        #[cfg(target_os = "linux")]
+        {
+            self.read_ahead = preparation;
+        }
+        result
     }
 
     fn write_range(

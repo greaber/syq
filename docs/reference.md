@@ -11,6 +11,11 @@ The final summary shows what was copied or skipped, how long it took, and any
 errors. Add `-v` to list copied paths. For connection and performance details,
 see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
+On Linux, syq asks the kernel to read ahead in source files when reads show
+storage activity or waits. This works for local and remote copies and uses a
+small, bounded number of helper threads. Local copies can also use faster
+filesystem copy operations when available.
+
 ## See where files go
 
 A named directory brings its name along. `--srcs-in` copies its contents;
