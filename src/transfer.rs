@@ -1184,8 +1184,6 @@ fn attempt_small_copy(
     Ok(SmallCopy::Done(exit_code))
 }
 
-/// The one summary line a completed copy prints, rendered from the same
-/// record the results stream settles with.
 fn show_statistics(args: &Args) -> bool {
     // Restricted coordinators suppress their outcome summary because the
     // invoking machine prints the verified receipt. That receipt does not
@@ -1193,6 +1191,8 @@ fn show_statistics(args: &Args) -> bool {
     !args.suppress_summary || args.restricted_grant.is_some()
 }
 
+/// The one summary line a completed copy prints, rendered from the same
+/// record the results stream settles with.
 fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64, deletions: &str) {
     crate::output::human_stdout!(
         "syq: transferred {} files ({}), {} unchanged ({} files), {} dirs created{}{}{}",
