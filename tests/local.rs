@@ -21653,6 +21653,22 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     .unwrap()
                     .iter()
                     .any(|p| p["local"] == false && p["cpu"].is_object())));
+                assert!(
+                    samples.iter().any(|sample| sample["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(
+                            |endpoint| endpoint["actors"].as_array().unwrap().iter().any(|actor| {
+                                actor["role"] == "prefetch"
+                                    && actor["bytes"]["prefetch_advice"]
+                                        .as_u64()
+                                        .is_some_and(|n| n > 0)
+                                    && actor["helper_cpu"].is_object()
+                            })
+                        )),
+                    "helper advice and CPU must be observable: {samples:?}"
+                );
                 if tcp {
                     assert!(samples.iter().any(|s| s["endpoints"]
                         .as_array()

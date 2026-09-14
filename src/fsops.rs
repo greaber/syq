@@ -6237,8 +6237,12 @@ impl FsOps {
             let read = preparation.read_exact_at(f, &mut data, off);
             #[cfg(not(target_os = "linux"))]
             let read = {
-                let _read = operation.span(crate::transfer_observations::Stage::SourceRead);
-                f.read_exact_at(&mut data, off)
+                let reading = operation.span(crate::transfer_observations::Stage::SourceRead);
+                let result = f.read_exact_at(&mut data, off);
+                if result.is_ok() {
+                    reading.bytes(u64::from(len));
+                }
+                result
             };
             read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
             let hash = {

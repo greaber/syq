@@ -37,10 +37,16 @@ pub(crate) enum Stage {
     /// Write/write_all_at call, with no additional durability fence.
     DestinationWrite,
     /// Whole local filesystem-copy operation, including its fallback.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Stable cross-platform wire state IDs.
     FilesystemCopy,
     /// Helper advisory syscall; byte count is requested advice length.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Stable cross-platform wire state IDs.
     PrefetchAdvice,
     /// Waiting for an in-flight advisory call before releasing an interval.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Stable cross-platform wire state IDs.
     PrefetchFence,
     /// Server request queue recv through receipt or disconnect.
     RequestWait,
@@ -74,6 +80,7 @@ const NAMES: [&str; STATES] = [
 /// The sequence lock makes counters and the unfinished state one snapshot.
 pub(crate) struct Actor {
     enabled: AtomicBool,
+    #[cfg(target_os = "linux")]
     thread_id: AtomicU64,
     thread_cpu: Mutex<HelperCpu>,
     role: &'static str,
@@ -88,6 +95,7 @@ impl Actor {
     pub(crate) fn new(role: &'static str) -> Arc<Self> {
         Arc::new(Self {
             enabled: AtomicBool::new(true),
+            #[cfg(target_os = "linux")]
             thread_id: AtomicU64::new(0),
             thread_cpu: Mutex::new(HelperCpu::default()),
             role,
@@ -185,6 +193,7 @@ impl Actor {
         sample.thread_cpu = cpu.latest;
         sample
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn finish_thread(&self) {
         if self.thread_id.load(Ordering::Relaxed) == 0 {
             return;

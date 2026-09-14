@@ -111,8 +111,8 @@ Removal has zero byte and unchanged/excluded counts; its file counts reflect
 outcomes received so far. The terminal record owns final totals.
 
 Copy records also include an optional `activity` object when measurements are
-available. A final progress sample precedes the terminal result, including for
-short copies. Older producers may omit activity; consumers should accept that.
+available. Copies that reach transfer completion emit a final progress sample
+before their terminal result, including for short copies. Older producers may omit activity; consumers should accept that.
 The Python SDK exposes it as `ProgressEvent.activity`.
 
 | Activity field | Meaning |
@@ -152,7 +152,9 @@ and writing replies. Server idleness does not by itself prove a transport limit.
 bytes, not bytes physically read. `prefetch_fence` measures waiting for outstanding
 advice before releasing or shrinking a range. Read and write byte counters count completed operations; filesystem-copy bytes
 are logical bytes and may include cloning or offload. Helper `helper_cpu` is a subset of its process CPU, not
-additional CPU. Process identities are temporary identifiers for this run.
+additional CPU. Live Linux helper CPU uses the kernel clock-tick resolution, so
+short intervals can report zero. Process identities are temporary identifiers
+for this run.
 
 Remote reports arrive at response boundaries and on connection retirement.
 `sample_age_ms` measures time since receipt, so network delivery delay is additional
