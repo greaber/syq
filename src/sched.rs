@@ -808,10 +808,8 @@ mod tests {
         FileJob {
             data: FileJobData {
                 src: b"source".to_vec(),
-                source: RegisteredPath {
-                    root: serde_json::from_str("0").unwrap(),
-                    relative: b"source".to_vec(),
-                },
+                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
+                    .unwrap(),
                 dst: b"destination".to_vec(),
                 rel: "destination".into(),
                 rel_bytes: b"destination".to_vec(),
@@ -1044,10 +1042,11 @@ mod tests {
                     dst_entry: (i % 2 == 0).then(|| entry.clone()),
                     data: FileJobData {
                         src: b"src/file".to_vec(),
-                        source: RegisteredPath {
-                            root: serde_json::from_str("0").unwrap(),
-                            relative: b"file".to_vec(),
-                        },
+                        source: RegisteredPath::new(
+                            serde_json::from_str("0").unwrap(),
+                            b"file".to_vec(),
+                        )
+                        .unwrap(),
                         dst: b"dst/file".to_vec(),
                         rel: i.to_string(),
                         entry: entry.clone(),
