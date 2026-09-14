@@ -16,6 +16,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Conn: Send {
+    fn observe(
+        &mut self,
+        _observations: &crate::transfer_observations::Observations,
+        _actor: &std::sync::Arc<crate::transfer_observations::Actor>,
+        _source: bool,
+        _worker_id: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn send(&mut self, req: Request) -> Result<()>;
     fn recv(&mut self) -> Result<Response>;
     /// The experimental writer must not retain one reply per sent block.
@@ -492,7 +501,24 @@ pub fn endpoint_error(error: WireError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
 
+#[derive(Clone)]
+struct RpcObservation {
+    actor: std::sync::Arc<crate::transfer_observations::Actor>,
+    source: bool,
+}
+impl RpcObservation {
+    fn span(&self, sending: bool) -> crate::transfer_observations::Span {
+        use crate::transfer_observations::Stage;
+        self.actor.span(match (self.source, sending) {
+            (true, true) => Stage::SourceRequest,
+            (true, false) => Stage::SourceResponse,
+            (false, true) => Stage::DestinationSend,
+            (false, false) => Stage::DestinationAck,
+        })
+    }
+}
 pub struct LocalConn {
+    rpc_observation: Option<RpcObservation>,
     ops: FsOps,
     pending: VecDeque<Response>,
     role: LocalConnectionRole,
@@ -531,13 +557,39 @@ impl LocalConn {
             read_stream: None,
             read_stream_limit: 0,
             read_stream_done_sent: false,
+            rpc_observation: None,
             write_stream: None,
         }
     }
 }
 
 impl Conn for LocalConn {
+    fn observe(
+        &mut self,
+        observations: &crate::transfer_observations::Observations,
+        actor: &std::sync::Arc<crate::transfer_observations::Actor>,
+        source: bool,
+        worker_id: usize,
+    ) -> Result<()> {
+        if self.rpc_observation.is_none() {
+            self.ops.observations.enable();
+            observations.local(
+                format!(
+                    "{} worker {worker_id}",
+                    if source { "source" } else { "destination" }
+                ),
+                self.ops.observations.clone(),
+            );
+        }
+        self.rpc_observation = Some(RpcObservation {
+            actor: actor.clone(),
+            source,
+        });
+        Ok(())
+    }
+
     fn send(&mut self, mut req: Request) -> Result<()> {
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
         anyhow::ensure!(
             self.write_stream.is_none() || matches!(req, Request::WriteRange { .. }),
             "only range writes are valid during streaming writes"
@@ -627,6 +679,7 @@ impl Conn for LocalConn {
         Ok(())
     }
     fn recv(&mut self) -> Result<Response> {
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         if self.pending.is_empty() {
             if let Some(stream) = &mut self.read_stream {
                 if stream.off < self.read_stream_limit {
@@ -771,6 +824,8 @@ impl Conn for LocalConn {
 }
 
 pub struct RemoteConn {
+    rpc_observation: Option<RpcObservation>,
+    observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
     child: Option<Child>,
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
@@ -780,7 +835,7 @@ pub struct RemoteConn {
     label: String,
     dead: bool,
     peer: Option<PeerInfo>,
-    tcp_socket: Option<TcpStream>,
+    tcp_socket: Option<std::sync::Arc<TcpStream>>,
     named_socket: Option<std::os::unix::net::UnixStream>,
     multiplexed_ssh: bool,
     /// A session taken from the session pool: no child of ours to wait for,
@@ -802,9 +857,20 @@ fn streaming_result(error: Option<crate::streaming::Failure>) -> Result<()> {
 
 const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(test)]
 fn spawn_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
+) -> (
+    std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_observed_reader(input, read_ahead, Default::default())
+}
+fn spawn_observed_reader(
+    input: Box<dyn Read + Send>,
+    read_ahead: usize,
+    observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
 ) -> (
     std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
@@ -831,6 +897,18 @@ fn spawn_reader(
         r.set_limit(MAX_FRAME);
         loop {
             let msg = r.read_budgeted::<Response>();
+            if let Ok(message) = &msg {
+                if let Response::TransportStats(stats) = &message.value {
+                    if let Some(value) = &stats.observation {
+                        let mut value = value.clone();
+                        value.tcp = stats.tcp.clone();
+                        observation.update(value);
+                    }
+                    if !stats.solicited {
+                        continue;
+                    }
+                }
+            }
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
                 break;
@@ -848,7 +926,7 @@ fn receive_transport_stats(
         .recv_timeout(timeout)
         .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
     {
-        Ok(Ok(Response::TransportStats(stats))) => stats,
+        Ok(Ok(Response::TransportStats(stats))) => stats.tcp,
         _ => None,
     }
 }
@@ -913,21 +991,26 @@ impl RemoteConn {
         compress: bool,
         label: String,
     ) -> Self {
-        let (rx, reader) = spawn_reader(
+        let observation =
+            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let (rx, reader) = spawn_observed_reader(
             Box::new(session.stdout),
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+            observation.clone(),
         );
         let mut stderr = session.stderr;
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
         });
         RemoteConn {
+            observation,
             child: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
             reader: Some(reader),
             label,
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -941,8 +1024,8 @@ impl RemoteConn {
         &mut self,
         timeout: std::time::Duration,
     ) -> Option<TcpPairStats> {
-        let socket = self.tcp_socket.as_ref()?.try_clone().ok()?;
-        let local = tcp_socket_stats(&socket);
+        let local = self.tcp_socket.as_deref().and_then(tcp_socket_stats);
+        *self.observation.final_tcp.lock().unwrap() = local.clone();
         // Changing SO_RCVTIMEO cannot wake a reader already blocked on another
         // clone. Bound the actual response wait instead. This connection is
         // retired immediately after collection, so a late reply cannot become
@@ -1009,7 +1092,66 @@ impl RemoteConn {
 }
 
 impl Conn for RemoteConn {
+    fn observe(
+        &mut self,
+        observations: &crate::transfer_observations::Observations,
+        actor: &std::sync::Arc<crate::transfer_observations::Actor>,
+        source: bool,
+        worker_id: usize,
+    ) -> Result<()> {
+        let subscribe = self.rpc_observation.is_none();
+        if subscribe {
+            observations.remote(
+                format!(
+                    "{} worker {worker_id}:{}",
+                    if source { "source" } else { "destination" },
+                    self.label
+                ),
+                self.observation.clone(),
+                self.tcp_socket.as_ref().map(std::sync::Arc::downgrade),
+            );
+        }
+        self.rpc_observation = Some(RpcObservation {
+            actor: actor.clone(),
+            source,
+        });
+        // Pool entries are handed out once; Drop shuts down this helper rather
+        // than returning a subscribed session for another command.
+        // Subscribe only while this newly attached connection has no pending
+        // data replies. The reader consumes later unsolicited stats separately.
+        if subscribe
+            && !observations
+                .remote_subscription_failed
+                .load(Ordering::Relaxed)
+        {
+            match self
+                .send(Request::TransportStats)
+                .and_then(|()| self.recv())
+            {
+                Ok(Response::TransportStats(_)) => {}
+                Ok(_) => crate::output::diagnostic!(
+                    "syq: {}: telemetry unavailable; continuing copy",
+                    self.label
+                ),
+                Err(error) => {
+                    // Lost framing cannot be ignored. Let the normal connection
+                    // recovery reopen it, without repeating the subscription.
+                    observations
+                        .remote_subscription_failed
+                        .store(true, Ordering::Relaxed);
+                    crate::output::diagnostic!(
+                        "syq: {}: telemetry connection failed; recovering without remote telemetry",
+                        self.label
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn send(&mut self, req: Request) -> Result<()> {
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
         anyhow::ensure!(
             self.write_stream.is_none()
                 || matches!(req, Request::WriteRange { .. } | Request::WriteStreamFence),
@@ -1018,6 +1160,7 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         match self
             .rx
             .as_ref()
@@ -1070,6 +1213,7 @@ impl Conn for RemoteConn {
         }
     }
     fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         let stream = self
             .write_stream
             .take()
@@ -1089,7 +1233,7 @@ impl Conn for RemoteConn {
     }
     fn tcp_rtt_us(&self) -> Option<u64> {
         self.tcp_socket
-            .as_ref()
+            .as_deref()
             .and_then(tcp_socket_stats)
             .and_then(|stats| stats.rtt_us)
     }
@@ -1993,14 +2137,22 @@ impl RemoteSpec {
             None
         };
         if let Some(stream) = return_stream {
-            let (rx, reader) = spawn_reader(Box::new(stream.try_clone()?), self.read_ahead);
+            let observation =
+                std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+            let (rx, reader) = spawn_observed_reader(
+                Box::new(stream.try_clone()?),
+                self.read_ahead,
+                observation.clone(),
+            );
             let conn = RemoteConn {
+                observation,
                 child: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
                 rx: Some(rx),
                 reader: Some(reader),
                 label: self.label(),
                 dead: false,
+                rpc_observation: None,
                 write_stream: None,
                 peer: None,
                 tcp_socket: None,
@@ -2067,14 +2219,19 @@ impl RemoteSpec {
         })?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let (rx, reader) = spawn_reader(Box::new(stdout), self.read_ahead);
+        let observation =
+            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let (rx, reader) =
+            spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
         let conn = RemoteConn {
+            observation,
             child: Some(child),
             w: FrameWriter::new(Box::new(stdin), compress),
             rx: Some(rx),
             reader: Some(reader),
             label: self.label(),
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -2403,17 +2560,22 @@ impl RemoteSpec {
             let writer = RecordWriter::new(stream.try_clone()?, wc);
             let tcp_socket = stream.try_clone()?;
             let reader = RecordReader::new(stream, rc);
-            let (rx, reader) = spawn_reader(Box::new(reader), self.read_ahead);
+            let observation =
+                std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+            let (rx, reader) =
+                spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
             let conn = RemoteConn {
+                observation,
                 child: None,
                 w: FrameWriter::new(Box::new(writer), compress),
                 rx: Some(rx),
                 reader: Some(reader),
                 label: format!("{} (tcp {addr_s})", self.label()),
                 dead: false,
+                rpc_observation: None,
                 write_stream: None,
                 peer: None,
-                tcp_socket: Some(tcp_socket),
+                tcp_socket: Some(std::sync::Arc::new(tcp_socket)),
                 named_socket: None,
                 multiplexed_ssh: false,
                 detached: false,
@@ -3522,6 +3684,55 @@ mod tests {
     }
 
     #[test]
+    fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
+        for accepted in [true, false] {
+            let mut wire = Vec::new();
+            let mut writer = FrameWriter::new(&mut wire, false);
+            let mut hello = hello_ok();
+            if !accepted {
+                if let Response::HelloOk { identity, .. } = &mut hello {
+                    *identity = "v0.6.0".into();
+                }
+            }
+            writer.write_msg(&hello).unwrap();
+            for solicited in [false, false, true] {
+                writer
+                    .write_msg(&Response::TransportStats(Box::new(TransportStatsReply {
+                        tcp: None,
+                        observation: Some(
+                            crate::transfer_observations::Registry::default().snapshot(),
+                        ),
+                        solicited,
+                    })))
+                    .unwrap();
+            }
+            writer.write_msg(&Response::Ok).unwrap();
+            drop(writer);
+            let observation =
+                std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+            let (rx, thread) =
+                spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone());
+            assert!(matches!(
+                rx.recv().unwrap().unwrap().value,
+                Response::HelloOk { .. }
+            ));
+            if accepted {
+                assert!(matches!(
+                    rx.recv().unwrap().unwrap().value,
+                    Response::TransportStats(_)
+                ));
+                assert!(matches!(rx.recv().unwrap().unwrap().value, Response::Ok));
+                assert!(observation.latest.lock().unwrap().is_some());
+            } else {
+                assert!(rx.recv().is_err());
+                assert!(observation.latest.lock().unwrap().is_none());
+            }
+            drop(rx);
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
     fn client_handshake_limit_applies_before_reading_the_body() {
         let mut wire = Vec::new();
         FrameWriter::new(&mut wire, false).write_preamble().unwrap();
@@ -3632,12 +3843,14 @@ mod tests {
                 drop(writer);
                 let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
                 let mut conn = RemoteConn {
+                    observation: Default::default(),
                     child: None,
                     w: FrameWriter::new(Box::new(std::io::sink()), false),
                     rx: Some(rx),
                     reader: Some(reader),
                     label: "hostile vector reply".into(),
                     dead: false,
+                    rpc_observation: None,
                     write_stream: None,
                     peer: None,
                     tcp_socket: None,
@@ -3975,12 +4188,14 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let writes = Arc::new(AtomicUsize::new(0));
         let mut conn = RemoteConn {
+            observation: Default::default(),
             child: None,
             w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
             rx: Some(rx),
             reader: None,
             label: "inactive stream test".into(),
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -4239,12 +4454,14 @@ mod tests {
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         );
         let conn = RemoteConn {
+            observation: Default::default(),
             child: None,
             w: FrameWriter::new(Box::new(socket), false),
             rx: Some(rx),
             reader: Some(reader),
             label: "pipelined hello test".into(),
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -4290,12 +4507,14 @@ mod tests {
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         );
         let conn = RemoteConn {
+            observation: Default::default(),
             child: None,
             w: FrameWriter::new(Box::new(socket), false),
             rx: Some(rx),
             reader: Some(reader),
             label: "version-skew test".into(),
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -4333,12 +4552,14 @@ mod tests {
             .spawn()
             .unwrap();
         let mut conn = RemoteConn {
+            observation: Default::default(),
             child: Some(child),
             w: FrameWriter::new(Box::new(std::io::sink()), false),
             rx: None,
             reader: None,
             label: "retryable SSH test".into(),
             dead: false,
+            rpc_observation: None,
             write_stream: None,
             peer: None,
             tcp_socket: None,
@@ -4463,15 +4684,17 @@ mod tests {
                 crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
             );
             let mut connection = RemoteConn {
+                observation: Default::default(),
                 child: None,
                 w: FrameWriter::new(Box::new(writer), false),
                 rx: Some(rx),
                 reader: Some(reader),
                 label: "test tcp".into(),
                 dead: false,
+                rpc_observation: None,
                 write_stream: None,
                 peer: None,
-                tcp_socket: Some(tcp_socket),
+                tcp_socket: Some(std::sync::Arc::new(tcp_socket)),
                 named_socket: None,
                 multiplexed_ssh: false,
                 detached: false,
@@ -4533,12 +4756,14 @@ mod tests {
             drop(writer);
             let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
             let mut remote = RemoteConn {
+                observation: Default::default(),
                 child: None,
                 w: FrameWriter::new(Box::new(Vec::new()), false),
                 rx: Some(rx),
                 reader: Some(reader),
                 label: "hostile source".into(),
                 dead: false,
+                rpc_observation: None,
                 write_stream: None,
                 peer: None,
                 tcp_socket: None,

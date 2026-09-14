@@ -282,7 +282,7 @@ warm_up() {
 
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--preserve=permissions --results "$local_root/trial.json")
+    local command=() syq_options=(--preserve=permissions --stats --results "$local_root/trial.json")
     $show_syq_summary || syq_options+=(--suppress-summary)
     # Always suppress the tiny setup copy's summary, keeping bootstrap
     # diagnostics and authentication prompts live. Supported
@@ -371,6 +371,40 @@ copying_interval() {
             defined($result->{copying_elapsed_ms}) && $result->{copying_elapsed_ms} =~ /^\d+$/;
         print $result->{copying_elapsed_ms}, "\n";
     ' "${2:-optional}" "$1"
+}
+
+activity_summary() {
+    perl -MJSON::PP -e '
+        my ($summary, %previous, $header);
+        sub dominant {
+            my ($fractions)=@_;
+            return unless ref($fractions) eq "HASH";
+            my @states=sort { $fractions->{$b} <=> $fractions->{$a} || $a cmp $b } keys %$fractions;
+            return @states ? $states[0] : undef;
+        }
+        while (<>) {
+            my $record=decode_json($_);
+            next unless ($record->{type} // "") eq "progress" && ref($record->{activity}) eq "HASH";
+            my $activity=$record->{activity};
+            $summary=$activity->{summary};
+            my %current;
+            $current{workers}=dominant($activity->{workers}{fractions});
+            for my $endpoint (@{$activity->{endpoints} // []}) {
+                for my $actor (@{$endpoint->{actors} // []}) {
+                    $current{"$endpoint->{label} / $actor->{role}"}=dominant($actor->{fractions});
+                }
+            }
+            for my $label (sort keys %current) {
+                next unless defined($current{$label});
+                next if defined($previous{$label}) && $previous{$label} eq $current{$label};
+                print "Activity changes (interval dominant states; not proven causes):\n" unless $header++;
+                my $state=$current{$label}; $state =~ s/_/ /g;
+                printf "  %7.2fs  %s: %s\n", ($record->{elapsed_ms} // 0)/1000, $label, $state;
+                $previous{$label}=$current{$label};
+            }
+        }
+        print "$summary\n" if defined($summary);
+    ' "$1"
 }
 
 summarize_syq_timings() {
@@ -692,6 +726,7 @@ main() {
                     printf 'Verified contents; speed %s MB/s; elapsed %s seconds.\n' "$speed" "$seconds"
                 fi
                 if [[ $tool == syq ]]; then
+                    activity_summary "$local_root/trial.json" || fail "Cannot read syq trial activity."
                     copying_ms=$(copying_interval "$local_root/trial.json") || fail 'Cannot read syq trial timing.'
                     if [[ $copying_ms != n/a ]]; then
                         awk -v ms="$copying_ms" -v seconds="$seconds" -v bytes="$bytes" 'BEGIN {

@@ -328,6 +328,8 @@ class AutomationDecoder:
         if record_type == "run":
             raise SyqProtocolError("automation stream contains more than one run record")
         if record_type == "progress":
+            if "activity" in record and not isinstance(record["activity"], dict):
+                raise SyqProtocolError("progress activity must be an object")
             return ProgressEvent(
                 **common,
                 bytes_done=_integer(record, "bytes_done"),
@@ -340,6 +342,7 @@ class AutomationDecoder:
                 scanned=_integer(record, "scanned"),
                 scan_done=_boolean(record, "scan_done"),
                 elapsed_ms=_integer(record, "elapsed_ms"),
+                activity=record.get("activity"),
             )
         if record_type == "trace":
             if self.run.mode != "cp":

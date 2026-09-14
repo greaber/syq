@@ -890,6 +890,30 @@ fn attempt_small_copy(
             len: entry.size as u32,
         })
         .collect();
+    let native_actor = progress
+        .observations
+        .enabled
+        .load(Relaxed)
+        .then(|| progress.observations.workers.actor("worker"));
+    if let Some(actor) = &native_actor {
+        if reader
+            .observe(&progress.observations, actor, true, 0)
+            .is_err()
+        {
+            return Ok(SmallCopy::Declined);
+        }
+        if dst_ctl
+            .observe(&progress.observations, actor, false, 0)
+            .is_err()
+        {
+            // Nothing has been copied yet. Reopen the control connection before
+            // entering the ordinary transfer path; never use lost framing.
+            return Ok(SmallCopy::Reconnect);
+        }
+    }
+    let _native_work = native_actor
+        .as_ref()
+        .map(|a| a.span(crate::transfer_observations::Stage::Work));
     let copying = progress.copying_interval();
     let mut blocks = if reads.is_empty() {
         Vec::new()
@@ -1145,6 +1169,11 @@ fn attempt_small_copy(
         deletions_completed: None,
         deletions_blocked: None,
     };
+    if progress.observations.enabled.load(Relaxed) {
+        reader.transport_stats();
+        dst_ctl.transport_stats();
+    }
+    drop(_native_work);
     progress.finish(exit_code == 0);
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
@@ -1153,6 +1182,13 @@ fn attempt_small_copy(
         results.emit_result(&terminal);
     }
     Ok(SmallCopy::Done(exit_code))
+}
+
+fn show_statistics(args: &Args) -> bool {
+    // Restricted coordinators suppress their outcome summary because the
+    // invoking machine prints the verified receipt. That receipt does not
+    // contain diagnostics, so requested statistics still come from here.
+    !args.suppress_summary || args.restricted_grant.is_some()
 }
 
 /// The one summary line a completed copy prints, rendered from the same
@@ -1282,6 +1318,13 @@ pub fn run(mut args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if args.stats || debug() {
+        progress
+            .observations
+            .human_summary
+            .store(show_statistics(&args), Relaxed);
+        progress.observations.enable();
+    }
     // The detach and remote-coordinator combinations were refused at
     // argument parsing (exit 2, no stream); every request that reaches this
     // point settles with a terminal record.
@@ -1731,7 +1774,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             connect_after_file_plan.clone(),
         );
         let compress = args.compress;
-        let collect_tcp_stats = args.stats;
+        let collect_tcp_stats = progress.observations.enabled.load(Relaxed);
         Arc::new(move |id: usize| {
             let (
                 src_ep,
@@ -1853,8 +1896,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts: opts.clone(),
                         bwlimit: bwlimit.clone(),
                         gate: gate.clone(),
-                        t: [0.0; 4],
-                        fast: FastTiming::default(),
+                        observation: None,
                         benchmark: Default::default(),
                         fast_batch_files,
                     };
@@ -3409,7 +3451,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && show_statistics(&args) && !args.quiet && !opts.verify_only && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -7561,22 +7603,9 @@ struct Worker {
     opts: Arc<Opts>,
     bwlimit: Option<Arc<BandwidthLimit>>,
     gate: Arc<Gate>,
-    /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
-    t: [f64; 4],
-    fast: FastTiming,
+    observation: Option<Arc<crate::transfer_observations::Actor>>,
     benchmark: crate::transfer_tuning::BenchmarkStats,
     fast_batch_files: usize,
-}
-
-#[derive(Default)]
-struct FastTiming {
-    batches: usize,
-    files: usize,
-    source: f64,
-    dest_send: f64,
-    dest_ack: f64,
-    restat: f64,
-    bookkeeping: f64,
 }
 
 struct BlockDiff {
@@ -7593,7 +7622,21 @@ impl Worker {
     }
 
     fn run(&mut self) -> Result<()> {
-        let r = self.run_inner();
+        let r = (|| {
+            if self.progress.observations.enabled.load(Relaxed) {
+                let actor = self.progress.observations.workers.actor("worker");
+                self.src
+                    .observe(&self.progress.observations, &actor, true, self.id)?;
+                self.dst
+                    .observe(&self.progress.observations, &actor, false, self.id)?;
+                self.observation = Some(actor);
+            }
+            let _working = self
+                .observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::Work));
+            self.run_inner()
+        })();
         if r.as_ref()
             .is_err_and(|error| error.is::<RangeReplyMismatch>() || !self.transport_dead())
         {
@@ -7622,6 +7665,10 @@ impl Worker {
     fn run_inner(&mut self) -> Result<()> {
         loop {
             if !self.gate.allowed(self.id) {
+                let _parked = self
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::Parked));
                 // Parked by the tuner: keep the connections, take no work.
                 let sched = self.sched.clone();
                 if !self
@@ -7631,28 +7678,15 @@ impl Worker {
                     return Ok(());
                 }
             }
-            let t0 = std::time::Instant::now();
-            let item = self.sched.next();
-            self.t[3] += t0.elapsed().as_secs_f64();
+            let item = {
+                let _awaiting = self
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
+                self.sched.next()
+            };
             match item {
                 Item::Exit => {
-                    if debug() {
-                        crate::output::diagnostic!(
-                            "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s; small: {} files in {} batches, src {:.2}s, dst send {:.2}s, dst ack {:.2}s, restat {:.2}s, bookkeeping {:.2}s",
-                            self.id,
-                            self.t[0],
-                            self.t[1],
-                            self.t[2],
-                            self.t[3],
-                            self.fast.files,
-                            self.fast.batches,
-                            self.fast.source,
-                            self.fast.dest_send,
-                            self.fast.dest_ack,
-                            self.fast.restat,
-                            self.fast.bookkeeping,
-                        );
-                    }
                     return Ok(());
                 }
                 Item::File(idx) => {
@@ -7782,8 +7816,6 @@ impl Worker {
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
         #[cfg(debug_assertions)]
         record_worker_event_for_test("batch", self.id, batch.len())?;
-        self.fast.batches += 1;
-        self.fast.files += batch.len();
         let jobs: Vec<WorkerJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all.snapshot(i)).collect()
@@ -7795,7 +7827,6 @@ impl Worker {
             .max_batch_bytes
             .max(jobs.iter().map(|j| j.entry.size).sum());
         // Reads.
-        let phase = std::time::Instant::now();
         for j in &jobs {
             if j.entry.size > 0 {
                 self.limit(j.entry.size);
@@ -7841,10 +7872,8 @@ impl Worker {
                 }
             })
             .collect();
-        self.fast.source += phase.elapsed().as_secs_f64();
         // One batch request: the server still publishes every file through its
         // own sidecar, but framing, compression and encryption are amortized.
-        let phase = std::time::Instant::now();
         let flags = publication_metadata_flags(self.opts.flags);
         let mut sent: Vec<bool> = Vec::with_capacity(jobs.len());
         let mut puts = Vec::with_capacity(jobs.len());
@@ -7880,8 +7909,6 @@ impl Worker {
         if !puts.is_empty() {
             self.dst.send(Request::PutSmallBatch(puts))?;
         }
-        self.fast.dest_send += phase.elapsed().as_secs_f64();
-        let phase = std::time::Instant::now();
         let mut applied = if sent.iter().any(|sent| *sent) {
             match ok(self.dst.recv()?, "put small batch")? {
                 Response::Applied(results)
@@ -7909,14 +7936,10 @@ impl Worker {
             };
             results.push(res);
         }
-        self.fast.dest_ack += phase.elapsed().as_secs_f64();
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
-        let phase = std::time::Instant::now();
         let registered = jobs.iter().map(|job| job.source.clone()).collect();
         let now = stat_many_registered(&mut *self.src, paths, Some(registered), false)?;
-        self.fast.restat += phase.elapsed().as_secs_f64();
-        let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
@@ -8007,7 +8030,6 @@ impl Worker {
                 self.progress.println(&j.rel);
             }
         }
-        self.fast.bookkeeping += phase.elapsed().as_secs_f64();
         Ok(())
     }
 
@@ -8539,17 +8561,14 @@ impl Worker {
                 if pending_reads.is_empty() {
                     break;
                 }
-                let t0 = std::time::Instant::now();
                 let response = self.src.recv();
                 let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
-                self.t[0] += t0.elapsed().as_secs_f64();
                 let (off, hash, data) = match ok(response?, "read")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     other => bail!("unexpected response {other:?}"),
                 };
                 validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
-                let t0 = std::time::Instant::now();
                 self.dst.send(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace,
@@ -8560,13 +8579,10 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
                 writes_out += 1;
                 if writes_out >= write_window {
-                    let t0 = std::time::Instant::now();
                     let response = self.dst.recv();
                     writes_out -= 1;
-                    self.t[2] += t0.elapsed().as_secs_f64();
                     ok(response?, "write")?;
                 }
                 self.progress.add_bytes(n);
@@ -8588,13 +8604,9 @@ impl Worker {
         // connection. Drain all previously issued reads and writes before any
         // later file (including an automatically streamed range) can use it.
         // Evaluate both drains even if the operation or first drain failed.
-        let t0 = std::time::Instant::now();
         let source_end =
             crate::conn::drain_range_replies(&mut *self.src, pending_reads.len(), "read");
-        self.t[0] += t0.elapsed().as_secs_f64();
-        let t0 = std::time::Instant::now();
         let destination_end = crate::conn::drain_range_replies(&mut *self.dst, writes_out, "write");
-        self.t[2] += t0.elapsed().as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 
@@ -8659,12 +8671,10 @@ impl Worker {
                     self.benchmark.stream_shrink_requests += 1;
                 }
                 self.dst.check_streaming_writes()?;
-                let t0 = std::time::Instant::now();
                 let (off, mut hash, mut data) = match ok(self.src.recv()?, "read stream")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     _ => bail!("unexpected response in read stream"),
                 };
-                self.t[0] += t0.elapsed().as_secs_f64();
                 let requested = (end - expected).min(block);
                 validate_range_reply(expected, requested, off, data.len())?;
                 expected += requested;
@@ -8674,7 +8684,6 @@ impl Worker {
                     break;
                 }
                 self.limit(claimed);
-                let t0 = std::time::Instant::now();
                 self.dst.send(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
@@ -8685,7 +8694,6 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
@@ -8706,12 +8714,11 @@ impl Worker {
         }
         // Always restore both protocol boundaries, even after a local write
         // error. No following file can consume this one's data or late errors.
-        let (source_end, destination_end, destination_wait) =
+        let (source_end, destination_end, _destination_wait) =
             crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
         let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });
-        self.t[2] += destination_wait.as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 
@@ -8735,6 +8742,10 @@ impl Worker {
 
     fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
+            let _pacing = self
+                .observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
             if self.opts.tuning.bw_pacing == Some(crate::transfer_tuning::BwPacing::Average) {
                 limit.wait_prepaid(bytes);
             } else {
@@ -9151,8 +9162,7 @@ mod tests {
             opts,
             bwlimit: None,
             gate: Gate::new(1),
-            t: [0.0; 4],
-            fast: FastTiming::default(),
+            observation: None,
             benchmark: Default::default(),
             fast_batch_files: 1,
         }
@@ -9983,6 +9993,23 @@ mod tests {
                 b"/destination/c/d".as_slice()
             ]
         );
+    }
+
+    #[test]
+    fn attested_outcome_summary_does_not_hide_coordinator_statistics() {
+        let mut args = Args::parse_args(&[
+            "cp".into(),
+            "source".into(),
+            "--as".into(),
+            "destination".into(),
+            "--stats".into(),
+        ])
+        .unwrap();
+        assert!(show_statistics(&args));
+        args.suppress_summary = true;
+        assert!(!show_statistics(&args));
+        args.restricted_grant = Some("coordinator grant".into());
+        assert!(show_statistics(&args));
     }
 
     #[test]

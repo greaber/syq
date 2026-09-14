@@ -48,6 +48,7 @@ mod tcp_records;
 #[cfg(test)]
 mod test_support;
 mod transfer;
+mod transfer_observations;
 mod transfer_tuning;
 mod tune;
 mod update;

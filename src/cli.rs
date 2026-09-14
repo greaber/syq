@@ -255,7 +255,7 @@ pub struct Args {
     /// Syq extension: emit machine-readable progress lines (JSON) on stderr
     #[arg(long = "syq-progress-json")]
     pub progress_json: bool,
-    /// Print transfer statistics at the end
+    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     pub stats: bool,
 
@@ -851,7 +851,7 @@ struct NativeCopyOperationalArgs {
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
     tuning_options: Option<crate::transfer_tuning::TransferTuning>,
-    /// Print transfer statistics at the end
+    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     stats: bool,
     /// Skip paths matching a gitignore-style pattern (repeatable)

@@ -4,6 +4,7 @@
 Remote tests here fake only SSH and syq; rsync still runs its real client/server
 protocol. tests/real-ssh additionally exercises real syq over real OpenSSH.
 """
+import json
 import os
 from pathlib import Path
 import pty
@@ -63,7 +64,9 @@ if '--results' in args:
         result['copying_elapsed_ms']=copy_ms
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
         result['copying_elapsed_ms']=999999999
-    pathlib.Path(args[args.index('--results')+1]).write_text(json.dumps(result)+'\n')
+    progress={'type':'progress','activity':{'summary':'Observed worker time: source response 100% (test fixture)'}}
+    lines=[] if os.environ.get('BENCH_TEST_OLD') or '--stats' not in args else [json.dumps(progress)]
+    pathlib.Path(args[args.index('--results')+1]).write_text('\n'.join(lines+[json.dumps(result)])+'\n')
 if '--quiet' not in args and src.name == 'probe':
     print('test double: preparing matching remote helper', flush=True)
 if '--quiet' not in args and '--suppress-summary' not in args:
@@ -224,6 +227,35 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn('Command:', result.stdout)
                 self.assertNotIn('large syq', result.stdout)
                 self.assert_clean()
+
+    def test_activity_summary_is_printed_once_per_scored_trial(self):
+        for old in [False, True]:
+            result = self.invoke('--tool', 'syq', '--workload', 'small',
+                env=dict(self.env, **({'BENCH_TEST_OLD':'1'} if old else {})))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('Observed worker time:'), 0 if old else 1)
+            self.assert_clean()
+
+    def test_activity_timeline_reports_changes_without_repeating_stable_states(self):
+        records = self.root / 'timeline.ndjson'
+        def sample(ms, worker, operation):
+            return {'type':'progress', 'elapsed_ms':ms, 'activity': {
+                'summary':'final summary', 'workers':{'fractions':{worker:1}},
+                'endpoints':[{'label':'destination worker 0', 'actors':[
+                    {'role':'filesystem', 'fractions':{operation:1}}]}]}}
+        records.write_text('\n'.join(json.dumps(row) for row in [
+            sample(1000,'destination_ack','filesystem_copy'),
+            sample(2000,'destination_ack','filesystem_copy'),
+            sample(3000,'source_response','destination_write')])+'\n')
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        result = subprocess.run(['bash', '-c',
+            definitions + '\nactivity_summary "$1"', 'timeline-test', str(records)],
+            text=True, capture_output=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count('workers: destination ack'), 1)
+        self.assertIn('3.00s  workers: source response', result.stdout)
+        self.assertIn('destination worker 0 / filesystem: destination write', result.stdout)
+        self.assertNotIn('2.00s', result.stdout)
 
     def test_explicit_stats_survive_concise_output(self):
         result = self.invoke('--tool', 'syq', '--', '--stats')

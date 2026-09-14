@@ -356,6 +356,14 @@ pub struct TcpSocketStats {
     pub ecn_ce_delivered: Option<u64>,
 }
 
+/// Exact-build helper telemetry; never read before Hello identity acceptance.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TransportStatsReply {
+    pub tcp: Option<TcpSocketStats>,
+    pub(crate) observation: Option<crate::transfer_observations::ServerSnapshot>,
+    pub solicited: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Which {
     Final,
@@ -1104,7 +1112,7 @@ pub enum Response {
         hash: ContentDigest,
     },
     Path(PathBytes),
-    TransportStats(Option<TcpSocketStats>),
+    TransportStats(Box<TransportStatsReply>),
     /// One bounded frame of a signed receipt stream. The final frame is marked
     /// inside the canonical frame encoding.
     Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
