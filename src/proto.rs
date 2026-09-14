@@ -56,7 +56,7 @@ pub type PathBytes = Vec<u8>;
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
     pub(crate) root: RegisteredRootId,
-    pub relative: PathBytes,
+    relative: PathBytes,
 }
 
 impl RegisteredPath {
@@ -65,8 +65,8 @@ impl RegisteredPath {
         Ok(Self { root, relative })
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
-        validate_relative_path(&self.relative)
+    pub(crate) fn relative(&self) -> &[u8] {
+        &self.relative
     }
 
     pub(crate) fn root(&self) -> RegisteredRootId {
