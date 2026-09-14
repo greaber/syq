@@ -463,7 +463,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     r.set_limit(MAX_FRAME);
     let reader = RequestReader::spawn(r, tcp_socket, named_socket);
 
-    let mut t = [0f64; 3];
+    let mut timings = crate::transfer_observations::ServerTimings::default();
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let t0 = std::time::Instant::now();
@@ -474,7 +474,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Err(_) => break,
         };
         let (mut req, _request_hold) = queued.into_parts();
-        t[0] += t0.elapsed().as_secs_f64();
+        timings.request_wait_seconds += t0.elapsed().as_secs_f64();
         if !is_control
             && matches!(
                 &req,
@@ -584,7 +584,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                     let t0 = std::time::Instant::now();
                     let response = ops.handle_in_place(&mut stream.next_request());
-                    t[1] += t0.elapsed().as_secs_f64();
+                    timings.handling_seconds += t0.elapsed().as_secs_f64();
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
                         blocks += 1;
@@ -595,7 +595,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                     let t0 = std::time::Instant::now();
                     w.write_msg(&response)?;
-                    t[2] += t0.elapsed().as_secs_f64();
+                    timings.response_send_seconds += t0.elapsed().as_secs_f64();
                 }
                 ops.end_source_range();
                 if !done_sent {
@@ -835,13 +835,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }
-                t[1] += t0.elapsed().as_secs_f64();
+                timings.handling_seconds += t0.elapsed().as_secs_f64();
                 if drop_after_handling_for_test(&other) {
                     return Ok(());
                 }
                 let t0 = std::time::Instant::now();
                 w.write_msg(&resp)?;
-                t[2] += t0.elapsed().as_secs_f64();
+                timings.response_send_seconds += t0.elapsed().as_secs_f64();
             }
         }
     }
@@ -850,9 +850,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
             "syq server{}: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
             if over_ssh { "" } else { " (tcp)" },
             bytes >> 20,
-            t[0],
-            t[1],
-            t[2]
+            timings.request_wait_seconds,
+            timings.handling_seconds,
+            timings.response_send_seconds
         );
     }
     Ok(())

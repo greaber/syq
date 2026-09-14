@@ -1853,7 +1853,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts: opts.clone(),
                         bwlimit: bwlimit.clone(),
                         gate: gate.clone(),
-                        t: [0.0; 4],
+                        waits: crate::transfer_observations::WorkerWaits::default(),
                         fast: FastTiming::default(),
                         benchmark: Default::default(),
                         fast_batch_files,
@@ -7559,7 +7559,7 @@ struct Worker {
     bwlimit: Option<Arc<BandwidthLimit>>,
     gate: Arc<Gate>,
     /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
-    t: [f64; 4],
+    waits: crate::transfer_observations::WorkerWaits,
     fast: FastTiming,
     benchmark: crate::transfer_tuning::BenchmarkStats,
     fast_batch_files: usize,
@@ -7630,17 +7630,17 @@ impl Worker {
             }
             let t0 = std::time::Instant::now();
             let item = self.sched.next();
-            self.t[3] += t0.elapsed().as_secs_f64();
+            self.waits.scheduling_seconds += t0.elapsed().as_secs_f64();
             match item {
                 Item::Exit => {
                     if debug() {
                         crate::output::diagnostic!(
                             "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s; small: {} files in {} batches, src {:.2}s, dst send {:.2}s, dst ack {:.2}s, restat {:.2}s, bookkeeping {:.2}s",
                             self.id,
-                            self.t[0],
-                            self.t[1],
-                            self.t[2],
-                            self.t[3],
+                            self.waits.source_response_seconds,
+                            self.waits.destination_send_seconds,
+                            self.waits.destination_ack_seconds,
+                            self.waits.scheduling_seconds,
                             self.fast.files,
                             self.fast.batches,
                             self.fast.source,
@@ -8539,7 +8539,7 @@ impl Worker {
                 let t0 = std::time::Instant::now();
                 let response = self.src.recv();
                 let (expected_off, expected_len) = pending_reads.pop_front().expect("pending read");
-                self.t[0] += t0.elapsed().as_secs_f64();
+                self.waits.source_response_seconds += t0.elapsed().as_secs_f64();
                 let (off, hash, data) = match ok(response?, "read")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     other => bail!("unexpected response {other:?}"),
@@ -8557,13 +8557,13 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
+                self.waits.destination_send_seconds += t0.elapsed().as_secs_f64();
                 writes_out += 1;
                 if writes_out >= write_window {
                     let t0 = std::time::Instant::now();
                     let response = self.dst.recv();
                     writes_out -= 1;
-                    self.t[2] += t0.elapsed().as_secs_f64();
+                    self.waits.destination_ack_seconds += t0.elapsed().as_secs_f64();
                     ok(response?, "write")?;
                 }
                 self.progress.add_bytes(n);
@@ -8588,10 +8588,10 @@ impl Worker {
         let t0 = std::time::Instant::now();
         let source_end =
             crate::conn::drain_range_replies(&mut *self.src, pending_reads.len(), "read");
-        self.t[0] += t0.elapsed().as_secs_f64();
+        self.waits.source_response_seconds += t0.elapsed().as_secs_f64();
         let t0 = std::time::Instant::now();
         let destination_end = crate::conn::drain_range_replies(&mut *self.dst, writes_out, "write");
-        self.t[2] += t0.elapsed().as_secs_f64();
+        self.waits.destination_ack_seconds += t0.elapsed().as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 
@@ -8661,7 +8661,7 @@ impl Worker {
                     Response::Block { off, hash, data } => (off, hash, data),
                     _ => bail!("unexpected response in read stream"),
                 };
-                self.t[0] += t0.elapsed().as_secs_f64();
+                self.waits.source_response_seconds += t0.elapsed().as_secs_f64();
                 let requested = (end - expected).min(block);
                 validate_range_reply(expected, requested, off, data.len())?;
                 expected += requested;
@@ -8682,7 +8682,7 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
+                self.waits.destination_send_seconds += t0.elapsed().as_secs_f64();
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
@@ -8708,7 +8708,7 @@ impl Worker {
         let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });
-        self.t[2] += destination_wait.as_secs_f64();
+        self.waits.destination_ack_seconds += destination_wait.as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 
@@ -9148,7 +9148,7 @@ mod tests {
             opts,
             bwlimit: None,
             gate: Gate::new(1),
-            t: [0.0; 4],
+            waits: crate::transfer_observations::WorkerWaits::default(),
             fast: FastTiming::default(),
             benchmark: Default::default(),
             fast_batch_files: 1,
