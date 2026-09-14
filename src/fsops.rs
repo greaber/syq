@@ -3225,39 +3225,45 @@ impl FsOps {
             }
             let targets = sources
                 .iter()
-                .map(|source| self.registered_source_target(source))
+                .map(|source| Ok((source, self.registered_source_target(source)?)))
                 .collect::<Result<Vec<_>>>()?;
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            return parallel_map(&targets, |target| {
-                let Some(expected) = target.expected_leaf.as_ref() else {
-                    let Some(metadata) = target.root.metadata(&target.relative).ok() else {
-                        return Ok(None);
+            return parallel_map_init(
+                &targets,
+                || (None, None),
+                |(root_id, parent), (source, target)| {
+                    // Relative names from different registered roots are not
+                    // interchangeable. Keep at most one parent per chunk, and
+                    // discard it on every root switch and at request completion.
+                    if *root_id != Some(source.root()) {
+                        *parent = None;
+                        *root_id = Some(source.root());
+                    }
+                    let Some(expected) = target.expected_leaf.as_ref() else {
+                        return Ok(stat_with_parent(&target.root, parent, &source.relative));
                     };
-                    return Ok(
-                        rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok(),
-                    );
-                };
-                let metadata = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("inspect registered source leaf")?;
-                require_source_leaf_identity(expected, metadata)?;
-                let entry = rooted_source_entry(
-                    &target.root,
-                    &target.relative,
-                    Vec::new(),
-                    metadata,
-                    Some(expected),
-                )?;
-                let after = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("recheck registered source leaf")?;
-                require_source_leaf_identity(expected, after)?;
-                Ok(Some(entry))
-            })
+                    let metadata = target
+                        .root
+                        .metadata(&target.relative)
+                        .context("inspect registered source leaf")?;
+                    require_source_leaf_identity(expected, metadata)?;
+                    let entry = rooted_source_entry(
+                        &target.root,
+                        &target.relative,
+                        Vec::new(),
+                        metadata,
+                        Some(expected),
+                    )?;
+                    let after = target
+                        .root
+                        .metadata(&target.relative)
+                        .context("recheck registered source leaf")?;
+                    require_source_leaf_identity(expected, after)?;
+                    Ok(Some(entry))
+                },
+            )
             .into_iter()
             .collect();
         }
@@ -10683,6 +10689,70 @@ mod tests {
                 assert_eq!(entry.map(|e| e.size), Some(idx as u64));
             }
         }
+    }
+
+    #[test]
+    fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let roots: Vec<_> = ["first", "second"]
+            .iter()
+            .map(|name| temporary.path().join(name))
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            fs::create_dir_all(root.join("parent")).unwrap();
+            fs::write(root.join("parent/file"), vec![0; index + 1]).unwrap();
+            symlink(format!("target-{index}"), root.join("parent/link")).unwrap();
+        }
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&roots[0], &roots[1]], false);
+        // Adjacent siblings exercise reuse; identical relative parents under
+        // distinct source roots must never share the held directory. Cover
+        // both the inline and parallel chunk paths, with misleading labels.
+        for count in [12, 384] {
+            let sources: Vec<_> = (0..count)
+                .map(|index| {
+                    selections[(index / 3) % 2]
+                        .join(
+                            [b"parent/file".as_slice(), b"parent/link", b"parent/missing"]
+                                [index % 3],
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let paths = vec![b"/ignored/display/path".to_vec(); count];
+            let expected: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    let target = worker.registered_source_target(source).unwrap();
+                    let metadata = target.root.metadata(&target.relative).ok()?;
+                    rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
+                })
+                .collect();
+            let actual = worker
+                .stat_many_request(&paths, Some(&sources), true, None)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        let sources = vec![selections[0].join(b"parent/file").unwrap(); 64];
+        let paths = vec![b"ignored".to_vec(); sources.len()];
+        fs::rename(roots[0].join("parent"), roots[0].join("moved")).unwrap();
+        fs::create_dir(roots[0].join("parent")).unwrap();
+        fs::write(roots[0].join("parent/file"), b"replacement").unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), false, None)
+            .unwrap();
+        assert!(actual
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 11)));
+        fs::remove_dir_all(roots[0].join("parent")).unwrap();
+        symlink("moved", roots[0].join("parent")).unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), true, None)
+            .unwrap();
+        assert!(actual.iter().all(Option::is_none));
     }
 
     #[test]
