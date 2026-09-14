@@ -341,8 +341,16 @@ every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
-Run checks proportionate to the change. For a Rust change, the normal
-pre-merge baseline is:
+Choose checks from the behavior changed, not every workflow available. For a
+narrow change confined to one test or its private fixture, run formatting and
+that exact test on the affected platform. The full Rust baseline below is not
+required for that case. Broaden only when shared fixtures, runtime code, or a
+concrete unresolved risk makes other tests relevant. Do not dispatch a full
+workflow merely to reach one test, or wait for unrelated checks once the
+needed result is available. State the selected checks and why before running
+expensive validation.
+
+For a Rust runtime change, the normal pre-merge baseline is:
 
 ```bash
 cargo fmt --all -- --check
@@ -356,6 +364,23 @@ the built binary against temporary trees. Run `cargo test --all-targets` before
 handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
+
+For one exact Rust unit test, use
+`cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
+integration test, replace `--bin syq` with its target, such as `--test local`.
+Confirm the named test ran; a zero-test or ignored result is not validation.
+For macOS, dispatch the focused job on the pushed task branch:
+
+```bash
+gh workflow run macos.yml --ref <task-branch> \
+  -f test_target=syq -f test_name='module::tests::name'
+```
+
+`test_target` also accepts the integration target names. This runs only the
+exact test, including it if marked ignored, and rejects a name absent on that
+platform. It does not produce full-suite release certification. Monitor the
+returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
+empty selects the full workflow; use that only when broad validation is needed.
 
 Run the local-only three-container OpenSSH suite when changes materially affect
 connection setup, helper bootstrap, authentication or authorization, remote
@@ -380,7 +405,7 @@ current tree. Release validation still follows the exact-commit requirements
 under release tag lifecycle.
 
 Pull requests do not start automated test workflows. The agent remains
-responsible for running the baseline above, choosing focused integration tests,
+responsible for selecting checks under the rules above, choosing integration tests,
 and reporting exactly what was and was not verified before review. The
 cumulative `master` workflows execute the complete native and cross-platform
 suites after merge. Pay particular attention to remote, TCP, platform-specific,
