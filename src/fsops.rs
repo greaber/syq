@@ -10805,6 +10805,31 @@ mod tests {
     }
 
     #[test]
+    fn source_stat_grouping_reports_the_first_error_in_request_order() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&first, &second], false);
+        fs::rename(&first, temporary.path().join("held-first")).unwrap();
+        fs::write(&first, b"replacement").unwrap();
+        fs::remove_file(&second).unwrap();
+        // Sorting processes the lower registered root first, but its identity
+        // failure must not mask the missing-file error requested first.
+        let sources = vec![selections[1].clone(), selections[0].clone()];
+        let error = worker
+            .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false, None)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "inspect registered source leaf");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
         let temporary = crate::test_support::tempdir().unwrap();
         let path = temporary.path().join("selected");
