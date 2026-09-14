@@ -2401,7 +2401,7 @@ impl FsOps {
             .map(|source| source.root.identity())
     }
 
-    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+    fn registered_source_handle(&self, source: &RegisteredPath) -> Result<&SourceRootHandle> {
         let handle = self
             .source_roots
             .get(&source.root())
@@ -2409,6 +2409,11 @@ impl FsOps {
         if !handle.selection.is_empty() && source.relative != handle.selection {
             bail!("registered source leaf does not authorize the requested path");
         }
+        Ok(handle)
+    }
+
+    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+        let handle = self.registered_source_handle(source)?;
         Ok(RegisteredSourceTarget {
             root: handle.root.clone(),
             relative: RelativePath::new(&source.relative)?,
@@ -3225,40 +3230,38 @@ impl FsOps {
             }
             let targets = sources
                 .iter()
-                .map(|source| Ok((source, self.registered_source_target(source)?)))
+                .map(|source| {
+                    let handle = self.registered_source_handle(source)?;
+                    source.validate()?;
+                    Ok((source, handle))
+                })
                 .collect::<Result<Vec<_>>>()?;
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
             return parallel_map_init(
                 &targets,
-                || (None, None),
-                |(root_id, parent), (source, target)| {
-                    // Relative names from different registered roots are not
-                    // interchangeable. Keep at most one parent per chunk, and
-                    // discard it on every root switch and at request completion.
-                    if *root_id != Some(source.root()) {
-                        *parent = None;
-                        *root_id = Some(source.root());
-                    }
+                || None,
+                |parent, (source, target)| {
                     let Some(expected) = target.expected_leaf.as_ref() else {
                         return Ok(stat_with_parent(&target.root, parent, &source.relative));
                     };
+                    let relative = RelativePath::new(&source.relative)?;
                     let metadata = target
                         .root
-                        .metadata(&target.relative)
+                        .metadata(&relative)
                         .context("inspect registered source leaf")?;
                     require_source_leaf_identity(expected, metadata)?;
                     let entry = rooted_source_entry(
                         &target.root,
-                        &target.relative,
+                        &relative,
                         Vec::new(),
                         metadata,
                         Some(expected),
                     )?;
                     let after = target
                         .root
-                        .metadata(&target.relative)
+                        .metadata(&relative)
                         .context("recheck registered source leaf")?;
                     require_source_leaf_identity(expected, after)?;
                     Ok(Some(entry))
@@ -4510,7 +4513,7 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
 // request starts without a retained handle and resolves the path again.
 fn stat_with_parent(
     root: &Root,
-    parent: &mut Option<(PathBytes, File)>,
+    parent: &mut Option<(RootIdentity, PathBytes, File)>,
     path: &[u8],
 ) -> Option<Entry> {
     if path.starts_with(b"/") {
@@ -4524,16 +4527,19 @@ fn stat_with_parent(
     };
     let parent_path = &path[..separator];
     let name = &path[separator + 1..];
-    if parent.as_ref().is_none_or(|(key, _)| key != parent_path) {
+    if parent
+        .as_ref()
+        .is_none_or(|(identity, key, _)| *identity != root.identity() || key != parent_path)
+    {
         *parent = None;
         let directory = root
             .open_directory(&RelativePath::new(parent_path).ok()?)
             .ok()?;
-        *parent = Some((parent_path.to_vec(), directory));
+        *parent = Some((root.identity(), parent_path.to_vec(), directory));
     }
     // The held parent's key was validated when opened. This operation validates
     // the leaf, so siblings do not need an allocated RelativePath for validation.
-    let directory = &parent.as_ref()?.1;
+    let directory = &parent.as_ref()?.2;
     let metadata = root.metadata_in_directory(directory, name).ok()?;
     rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
 }
@@ -10735,6 +10741,20 @@ mod tests {
                 serde_json::to_value(actual).unwrap(),
                 serde_json::to_value(expected).unwrap()
             );
+        }
+        // The allocation-free pre-pass must reject malformed authority before
+        // the lookup path can turn it into an ordinary missing-file result.
+        for invalid in [
+            b"/parent/file".as_slice(),
+            b"parent//file",
+            b"parent/../file",
+            b"parent/f\0",
+        ] {
+            let mut source = selections[0].clone();
+            source.relative = invalid.to_vec();
+            assert!(worker
+                .stat_many_request(&[b"ignored".to_vec()], Some(&[source]), false, None)
+                .is_err());
         }
         let sources = vec![selections[0].join(b"parent/file").unwrap(); 64];
         let paths = vec![b"ignored".to_vec(); sources.len()];

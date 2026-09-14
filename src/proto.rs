@@ -65,6 +65,10 @@ impl RegisteredPath {
         Ok(Self { root, relative })
     }
 
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_relative_path(&self.relative)
+    }
+
     pub(crate) fn root(&self) -> RegisteredRootId {
         self.root
     }
