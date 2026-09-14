@@ -1,11 +1,17 @@
-//! Read ahead of a local kernel copy after it starts doing filesystem input.
+//! Bounded source-page preparation, independent of copy operation and transport.
+//!
+//! The caller owns an explicit contiguous range and decides when preparation
+//! is useful. Drop this state before releasing or reassigning that range. A
+//! sparse-range scheduler supplies a separate window for each owned interval;
+//! this component never assumes that the rest of the file should be read.
 use std::fs::File;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-pub(crate) const BLOCK: u64 = 1 << 20;
+const BLOCK: u64 = 1 << 20;
 const LOOKAHEAD: u64 = 4 * BLOCK;
 // Large WILLNEED requests can be truncated to the device's readahead window.
 // Submit smaller requests so the helper prepares the entire bounded window.
@@ -44,15 +50,6 @@ fn budget() -> &'static Arc<Budget> {
             limit: (std::thread::available_parallelism().map_or(1, usize::from) / 2).clamp(1, 8),
         })
     })
-}
-
-fn input_activity() -> Option<libc::c_long> {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: getrusage initializes the complete structure on success.
-    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    Some(unsafe { usage.assume_init() }.ru_inblock)
 }
 
 #[derive(Default)]
@@ -144,37 +141,37 @@ impl Drop for Worker {
 }
 
 pub(crate) struct ReadAhead {
-    previous_input: Option<libc::c_long>,
+    range: Range<u64>,
     worker: Option<Worker>,
     attempted: bool,
 }
 
 impl ReadAhead {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(range: Range<u64>) -> Self {
         Self {
-            previous_input: input_activity(),
+            range,
             worker: None,
             attempted: false,
         }
     }
 
-    pub(crate) fn advance(&mut self, source: &File, copied: u64, size: u64) {
+    pub(crate) fn advance(
+        &mut self,
+        source: &File,
+        copied: u64,
+        should_prepare: impl FnOnce() -> bool,
+    ) {
+        if copied < self.range.start || copied >= self.range.end {
+            return;
+        }
         if let Some(worker) = &self.worker {
             worker.advance(copied);
             return;
         }
-        if self.attempted || copied >= size {
+        if self.attempted {
             return;
         }
-        let current = input_activity();
-        let input = self
-            .previous_input
-            .zip(current)
-            .is_some_and(|(before, after)| after > before);
-        self.previous_input = current;
-        #[cfg(debug_assertions)]
-        let input = input || std::env::var_os("SYQ_TEST_LOCAL_READ_AHEAD").is_some();
-        if !input {
+        if !should_prepare() {
             return;
         }
         let Some(permit) = budget().acquire() else {
@@ -186,32 +183,11 @@ impl ReadAhead {
         let Ok(source) = source.try_clone() else {
             return;
         };
-        self.worker = Worker::start(source, copied, size, permit).ok();
+        self.worker = Worker::start(source, copied, self.range.end, permit).ok();
         if self.worker.is_some() && std::env::var_os("SYQ_DEBUG").is_some() {
             eprintln!("syq: local read-ahead started: {copied}");
         }
     }
-}
-
-/// Try the exact planned range before scheduling any physical source reads.
-/// Both descriptors have already passed the local copy's identity checks.
-pub(crate) fn try_clone(source: &File, destination: &File, size: u64) -> bool {
-    if size == 0 {
-        return true;
-    }
-    #[cfg(debug_assertions)]
-    if std::env::var_os("SYQ_TEST_LOCAL_READ_AHEAD").is_some() {
-        return false;
-    }
-    let range = libc::file_clone_range {
-        src_fd: source.as_raw_fd().into(),
-        src_offset: 0,
-        src_length: size,
-        dest_offset: 0,
-    };
-    // SAFETY: range has the UAPI layout and remains alive for the ioctl;
-    // both fds are live. A failed clone is followed by copying from offset zero.
-    unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONERANGE, &range) == 0 }
 }
 
 #[cfg(test)]
@@ -242,11 +218,30 @@ mod tests {
     }
 
     #[test]
+    fn preparation_is_limited_to_the_callers_range_and_signal() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let source = File::create(temp.path().join("source")).unwrap();
+        let mut preparation = ReadAhead::new(4096..8192);
+        for offset in [0, 4095, 8192, 16384] {
+            preparation.advance(&source, offset, || panic!("outside owned range"));
+        }
+        let mut consulted = false;
+        preparation.advance(&source, 4096, || {
+            consulted = true;
+            false
+        });
+        assert!(consulted);
+        assert!(preparation.worker.is_none());
+    }
+
+    #[test]
     fn completed_copy_never_starts_a_helper() {
         let temp = crate::test_support::tempdir().unwrap();
         let source = File::create(temp.path().join("source")).unwrap();
-        let mut read_ahead = ReadAhead::new();
-        read_ahead.advance(&source, 1, 1);
+        let mut read_ahead = ReadAhead::new(0..1);
+        read_ahead.advance(&source, 1, || {
+            panic!("finished ranges need no activation check")
+        });
         assert!(read_ahead.worker.is_none());
     }
 }

@@ -127,7 +127,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
             opts.tuning
                 .request_size(opts.block, bwlimit, opts.restricted_receiver),
         );
-    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
+    if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
         limit
@@ -179,6 +179,17 @@ pub struct Opts {
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+}
+
+impl Opts {
+    fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
+        crate::copy_policy::CopyPolicy {
+            same_host: self.same_host,
+            checksum: self.checksum,
+            force_ranges: self.tuning.force_ranges(),
+            bandwidth_limited,
+        }
+    }
 }
 
 fn print_benchmark_observations(opts: &Opts) {
@@ -1783,11 +1794,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
-                                initial_sources.clone()
-                            } else {
-                                Vec::new()
-                            };
+                            let copy_sources =
+                                if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
+                                    initial_sources.clone()
+                                } else {
+                                    Vec::new()
+                                };
                             Ok((
                                 src,
                                 dst_ep.connect_with_copy_capabilities(
@@ -1978,7 +1990,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // source capabilities from the source endpoint's broker before reporting
     // ready. These are foreign-session claims even when both logical endpoints
     // are local to the coordinator process.
-    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
+    let copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
         maximum_workers
     } else {
         0
@@ -3029,11 +3041,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
                     let single_direct_candidate = autotune
-                        && !opts.tuning.force_ranges()
-                        && opts.same_host
-                        && !opts.checksum
+                        && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
                         && !opts.verify_only
-                        && bwlimit.is_none()
                         && {
                             let jobs = sched.jobs.lock().unwrap();
                             jobs.len() == 1 && jobs[0].container_guard.is_none()
@@ -8073,12 +8082,11 @@ impl Worker {
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self.opts.same_host
-            && !self.opts.tuning.force_ranges()
-            && !self.opts.checksum
-            && self.bwlimit.is_none()
-            && job.entry.size > 0
-            && job.container_guard.is_none()
+        if self
+            .opts
+            .copy_policy(self.bwlimit.is_some())
+            .file_operation(job.entry.size, job.container_guard.is_some())
+            == crate::copy_policy::FileOperation::ReceiverCopy
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {

@@ -4,6 +4,7 @@ mod cli;
 mod completion;
 mod completion_details;
 mod conn;
+mod copy_policy;
 mod delegation;
 #[allow(dead_code)]
 mod descriptor_broker;
@@ -14,7 +15,7 @@ mod help;
 mod identity;
 mod janky_cat;
 #[cfg(target_os = "linux")]
-mod local_overlap;
+mod local_copy;
 mod mapping;
 mod native_map;
 mod native_rm;
@@ -24,6 +25,8 @@ mod private_broker;
 mod process_group;
 mod progress;
 mod proto;
+#[cfg(target_os = "linux")]
+mod read_ahead;
 mod receipt;
 mod receive_approval;
 mod receive_service;

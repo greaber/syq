@@ -5725,9 +5725,9 @@ impl FsOps {
             && !destination_fs.is_nfs
             && !destination_fs.synchronous
             && !userspace_fallback;
-        let cloned = local_read_ahead && crate::local_overlap::try_clone(&s, &d, size);
+        let cloned = local_read_ahead && crate::local_copy::try_clone(&s, &d, size);
         let mut read_ahead =
-            (local_read_ahead && !cloned).then(crate::local_overlap::ReadAhead::new);
+            (local_read_ahead && !cloned).then(|| crate::local_copy::SourcePreparation::new(size));
         let mut source_offset: libc::off64_t = 0;
         let mut destination_offset: libc::off64_t = 0;
         let mut remaining = if cloned { 0 } else { size };
@@ -5741,7 +5741,7 @@ impl FsOps {
                     d.as_raw_fd(),
                     &mut destination_offset,
                     if read_ahead.is_some() {
-                        remaining.min(crate::local_overlap::BLOCK) as usize
+                        remaining.min(crate::local_copy::BLOCK) as usize
                     } else {
                         remaining as usize
                     },
@@ -5797,7 +5797,7 @@ impl FsOps {
             }
             remaining -= n as u64;
             if let Some(read_ahead) = &mut read_ahead {
-                read_ahead.advance(&s, size - remaining, size);
+                read_ahead.advance(&s, size - remaining);
                 #[cfg(debug_assertions)]
                 if size - remaining == n as u64 {
                     test_race_barrier(
