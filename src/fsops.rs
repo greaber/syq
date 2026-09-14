@@ -5470,7 +5470,6 @@ impl FsOps {
         size: u64,
         mode: u32,
     ) -> Result<CopyLocalOutcome> {
-        let overlap = crate::local_overlap::Experiment::from_env()?;
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
@@ -5687,19 +5686,21 @@ impl FsOps {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
         }
-        // Diagnostic only: retain existing offload/fallback decisions and all
-        // authorization/publication checks. Never enable this experiment on NFS.
-        let overlap = overlap.filter(|_| {
-            size >= 16 << 20
-                && source_fs.local_userspace_copy
-                && destination_fs.local_userspace_copy
-                && !source_fs.is_nfs
-                && !destination_fs.is_nfs
-                && !destination_fs.synchronous
-        });
+        // Preserve physical clones before considering read-ahead. A clone
+        // needs no source data in memory; metadata I/O is not a reason to
+        // prefetch the contents of a successfully cloned file.
+        let local_read_ahead = source_fs.local_userspace_copy
+            && destination_fs.local_userspace_copy
+            && !source_fs.is_nfs
+            && !destination_fs.is_nfs
+            && !destination_fs.synchronous
+            && !userspace_fallback;
+        let cloned = local_read_ahead && crate::local_overlap::try_clone(&s, &d, size);
+        let mut read_ahead =
+            (local_read_ahead && !cloned).then(crate::local_overlap::ReadAhead::new);
         let mut source_offset: libc::off64_t = 0;
         let mut destination_offset: libc::off64_t = 0;
-        let mut remaining = size;
+        let mut remaining = if cloned { 0 } else { size };
         while remaining > 0 && !userspace_fallback {
             // SAFETY: each offset is its own local that outlives the call, so
             // the kernel reads and advances the two through distinct pointers.
@@ -5709,7 +5710,7 @@ impl FsOps {
                     &mut source_offset,
                     d.as_raw_fd(),
                     &mut destination_offset,
-                    if overlap.is_some() {
+                    if read_ahead.is_some() {
                         remaining.min(crate::local_overlap::BLOCK) as usize
                     } else {
                         remaining as usize
@@ -5765,17 +5766,20 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
-            if let Some(experiment) = overlap {
+            if let Some(read_ahead) = &mut read_ahead {
+                read_ahead.advance(&s, size - remaining, size);
                 #[cfg(debug_assertions)]
-                test_race_barrier(
-                    "SYQ_TEST_OVERLAP_READY",
-                    "SYQ_TEST_OVERLAP_CONTINUE",
-                    "overlap first block",
-                )?;
-                experiment.copy(&s, &d, size - remaining, size)?;
-                remaining = 0;
+                if size - remaining == n as u64 {
+                    test_race_barrier(
+                        "SYQ_TEST_OVERLAP_READY",
+                        "SYQ_TEST_OVERLAP_CONTINUE",
+                        "local copy first block",
+                    )?;
+                }
             }
         }
+        drop(read_ahead);
+
         if userspace_fallback {
             let mut source = &s;
             let mut destination = &d;

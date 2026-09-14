@@ -21425,8 +21425,8 @@ fn delete_many_roots_keeps_claims_in_their_own_scope() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn local_overlap_experiment_preserves_staged_and_inplace_contents() {
-    for mode in ["cfr:8", "pipeline:8"] {
+fn local_read_ahead_preserves_staged_and_inplace_contents() {
+    for force_read_ahead in [false, true] {
         for inplace in [false, true] {
             let t = Tmp::new();
             let data = prng((17 << 20) + 73, 918);
@@ -21438,14 +21438,18 @@ fn local_overlap_experiment_preserves_staged_and_inplace_contents() {
             if inplace {
                 command.arg("--inplace");
             }
+            if force_read_ahead {
+                command.env("SYQ_TEST_LOCAL_READ_AHEAD", "1");
+            }
             let out = command
-                .env("SYQ_EXPERIMENT_LOCAL_OVERLAP", mode)
                 .env("SYQ_TEST_COPY_LOCAL_FS", "local")
                 .env("SYQ_DEBUG", "1")
                 .run()
                 .unwrap();
             assert_output_ok(&out);
-            assert!(stderr_of(&out).contains("overlap observed"));
+            if force_read_ahead {
+                assert!(stderr_of(&out).contains("local read-ahead started"));
+            }
             assert_eq!(read(&t.path("destination")), data);
             if inplace {
                 assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
@@ -21457,8 +21461,8 @@ fn local_overlap_experiment_preserves_staged_and_inplace_contents() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn local_overlap_experiment_shrink_keeps_old_destination() {
-    for mode in ["cfr:8", "pipeline:8"] {
+fn local_read_ahead_shrink_keeps_old_destination() {
+    {
         let t = Tmp::new();
         write(&t.path("source"), &prng(17 << 20, 919));
         write(&t.path("destination"), b"old destination");
@@ -21466,7 +21470,7 @@ fn local_overlap_experiment_shrink_keeps_old_destination() {
         let resume = t.path("continue");
         let mut child = compat_command()
             .args(["-a", "--no-progress", &t.s("source"), &t.s("destination")])
-            .env("SYQ_EXPERIMENT_LOCAL_OVERLAP", mode)
+            .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .env("SYQ_TEST_OVERLAP_READY", &ready)
             .env("SYQ_TEST_OVERLAP_CONTINUE", &resume)

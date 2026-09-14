@@ -243,7 +243,9 @@ Rerun the command. Completed files are skipped, and syq can reuse matching
 parts of an interrupted file. It writes a new temporary file beside the
 destination and replaces the final file only when complete. Previous partials
 stay unchanged. Reuse is not guaranteed; local copies may use the filesystem's
-faster copy operations instead.
+faster copy operations instead. On Linux, local whole-file copies can read ahead
+after they begin fetching data from storage. This is automatic, uses a bounded
+number of helpers, and preserves filesystem cloning when available.
 
 Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
