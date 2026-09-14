@@ -3236,13 +3236,30 @@ impl FsOps {
                     Ok((source, handle))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Data jobs deliberately scatter siblings to avoid destination
+            // contention. Group only these read-only metadata lookups; restore
+            // request order below, including which error is reported first.
+            let mut order: Vec<_> = (0..targets.len()).collect();
+            let key = |index: usize| {
+                let source = targets[index].0;
+                (
+                    source.root().get(),
+                    source
+                        .relative
+                        .rsplitn(2, |b| *b == b'/')
+                        .nth(1)
+                        .unwrap_or(b""),
+                )
+            };
+            order.sort_unstable_by(|a, b| key(*a).cmp(&key(*b)));
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            return parallel_map_init(
-                &targets,
+            let results = parallel_map_init(
+                &order,
                 || None,
-                |parent, (source, target)| {
+                |parent, &index| {
+                    let (source, target) = targets[index];
                     let Some(expected) = target.expected_leaf.as_ref() else {
                         return Ok(stat_with_parent(&target.root, parent, &source.relative));
                     };
@@ -3266,9 +3283,10 @@ impl FsOps {
                     require_source_leaf_identity(expected, after)?;
                     Ok(Some(entry))
                 },
-            )
-            .into_iter()
-            .collect();
+            );
+            let mut results: Vec<_> = order.into_iter().zip(results).collect();
+            results.sort_unstable_by_key(|(index, _)| *index);
+            return results.into_iter().map(|(_, result)| result).collect();
         }
         if self.destination_root.is_none()
             && !self.source_roots.is_empty()
@@ -10674,12 +10692,23 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
+        for parent in 0..4 {
+            fs::create_dir(temporary.path().join(format!("p{parent}"))).unwrap();
+        }
         for idx in 0..129 {
-            fs::write(temporary.path().join(format!("f{idx}")), vec![0; idx]).unwrap();
+            fs::write(
+                temporary.path().join(format!("p{}/f{idx}", idx % 4)),
+                vec![0; idx],
+            )
+            .unwrap();
         }
         for count in [31, 32, 65, 128, 7, 129] {
             let sources: Vec<_> = (0..count)
-                .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
+                .map(|idx| {
+                    selections[0]
+                        .join(format!("p{}/f{idx}", idx % 4).as_bytes())
+                        .unwrap()
+                })
                 .collect();
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
