@@ -3149,11 +3149,11 @@ impl FsOps {
             if follow {
                 return vec![None; paths.len()];
             }
-            return parallel_map(paths, |path| {
-                let relative = RelativePath::new(path).ok()?;
-                let metadata = root.metadata(&relative).ok()?;
-                rooted_entry(&root, &relative, Vec::new(), metadata).ok()
-            });
+            return parallel_map_init(
+                paths,
+                || None,
+                |parent, path| stat_with_parent(&root, parent, path),
+            );
         }
         parallel_map(paths, |p| {
             let full = resolve(p);
@@ -4498,12 +4498,53 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
     Ok(())
 }
 
+// Retain only the last parent in a metadata chunk. Like descriptor scanning,
+// this observes the selected directory if it is renamed during the chunk.
+// Symlink reads and identity checks use that same parent; the next chunk or
+// request starts without a retained handle and resolves the path again.
+fn stat_with_parent(
+    root: &Root,
+    parent: &mut Option<(PathBytes, File)>,
+    path: &[u8],
+) -> Option<Entry> {
+    let relative = RelativePath::new(path).ok()?;
+    let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
+        *parent = None;
+        let metadata = root.metadata(&relative).ok()?;
+        return rooted_entry(root, &relative, Vec::new(), metadata).ok();
+    };
+    let parent_path = &path[..separator];
+    let name = &path[separator + 1..];
+    if parent.as_ref().is_none_or(|(key, _)| key != parent_path) {
+        *parent = None;
+        let directory = root
+            .open_directory(&RelativePath::new(parent_path).ok()?)
+            .ok()?;
+        *parent = Some((parent_path.to_vec(), directory));
+    }
+    let directory = &parent.as_ref()?.1;
+    let metadata = root.metadata_in_directory(directory, name).ok()?;
+    rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
+}
+
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    parallel_map_init(items, || (), |_, item| f(item))
+}
+
+// State belongs to one bounded input chunk and is discarded before returning.
+// Metadata lookups can reuse a held parent for adjacent siblings, while later
+// requests resolve the namespace afresh. No state is shared between workers.
+fn parallel_map_init<T: Sync, R: Send, S>(
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) -> R + Sync,
+) -> Vec<R> {
     if items.len() < PAR_MIN {
-        return items.iter().map(&f).collect();
+        let mut state = init();
+        return items.iter().map(|item| f(&mut state, item)).collect();
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
@@ -4518,7 +4559,11 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
     pool.install(|| {
         items
             .par_chunks(chunk)
-            .flat_map_iter(|chunk| chunk.iter().map(&f))
+            .flat_map_iter(|chunk| {
+                let mut state = init();
+                let f = &f;
+                chunk.iter().map(move |item| f(&mut state, item))
+            })
             .collect()
     })
 }
@@ -10426,6 +10471,92 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, Kind::Symlink);
         assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
+    }
+
+    #[test]
+    fn metadata_chunk_pins_parent_and_new_request_resolves_replacement() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"original").unwrap();
+        symlink("original-target", base.join("parent/link")).unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut parent = None;
+        let original = stat_with_parent(&root, &mut parent, b"parent/file").unwrap();
+        fs::rename(base.join("parent"), base.join("moved")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"replacement").unwrap();
+        symlink("replacement-target", base.join("parent/link")).unwrap();
+        assert_eq!(
+            stat_with_parent(&root, &mut parent, b"parent/file")
+                .unwrap()
+                .ino,
+            original.ino
+        );
+        assert_eq!(
+            stat_with_parent(&root, &mut parent, b"parent/link")
+                .unwrap()
+                .link
+                .as_deref(),
+            Some(b"original-target".as_slice())
+        );
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(root);
+        let paths = vec![b"parent/file".to_vec(), b"parent/link".to_vec()];
+        let entries = ops.stat_many(&paths, false, None);
+        assert_ne!(entries[0].as_ref().unwrap().ino, original.ino);
+        assert_eq!(
+            entries[1].as_ref().unwrap().link.as_deref(),
+            Some(b"replacement-target".as_slice())
+        );
+        fs::remove_dir_all(base.join("parent")).unwrap();
+        symlink("moved", base.join("parent")).unwrap();
+        assert!(ops
+            .stat_many(&paths, false, None)
+            .iter()
+            .all(Option::is_none));
+    }
+
+    #[test]
+    fn metadata_chunks_keep_input_order_and_do_not_reuse_a_different_parent() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        for directory in ["a", "b"] {
+            fs::create_dir(base.join(directory)).unwrap();
+            fs::write(base.join(directory).join("file"), directory.as_bytes()).unwrap();
+        }
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(root.clone());
+        let names = [
+            b"a/file".as_slice(),
+            b"a/missing",
+            b"b/file",
+            b"absent/file",
+            b"a",
+            b"",
+            b"../a/file",
+            b"a//file",
+        ];
+        let paths: Vec<_> = names
+            .iter()
+            .cycle()
+            .take(1024)
+            .map(|p| p.to_vec())
+            .collect();
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let relative = RelativePath::new(path).ok()?;
+                let metadata = root.metadata(&relative).ok()?;
+                rooted_entry(&root, &relative, Vec::new(), metadata).ok()
+            })
+            .collect();
+        let actual = ops.stat_many(&paths, false, None);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
     fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
