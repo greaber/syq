@@ -9,15 +9,21 @@ from syq.bundled import bundled_executable
 
 
 class BundledTests(unittest.TestCase):
+    def setUp(self):
+        bundled_executable.cache_clear()
+        self.addCleanup(bundled_executable.cache_clear)
+
     def test_distribution_record_selects_its_own_executable(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "syq"
             executable.write_bytes(b"binary")
             package = Mock()
             package.files = [PackagePath("../../../bin/syq"), PackagePath("syq/client.py")]
-            package.locate_file.return_value = executable
+            (Path(directory) / "bin").mkdir()
+            package.locate_file.return_value = Path(directory) / "bin" / ".." / "syq"
             with patch("syq.bundled.distribution", return_value=package):
-                self.assertEqual(bundled_executable(), executable)
+                self.assertEqual(bundled_executable(), executable.resolve())
+                self.assertEqual(bundled_executable(), executable.resolve())
             package.locate_file.assert_called_once_with(PackagePath("../../../bin/syq"))
 
     def test_missing_distribution_has_actionable_error(self):

@@ -42,7 +42,7 @@ paths="$work/paths"
 for path in \
   README.md \
   sdk/README.md sdk/RELEASING.md \
-  sdk/python/README.md sdk/python/NATIVE_API.md sdk/python/API_DESIGN.md \
+  sdk/python/README-PYTHON.md sdk/python/NATIVE_API.md sdk/python/API_DESIGN.md \
   sdk/js/README.md sdk/go/README.md \
   book.toml theme/head.hbs theme/docs.css theme/copy-demo.js \
   .agents/skills/syq-release/SKILL.md \

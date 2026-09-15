@@ -1,11 +1,13 @@
 """Locate the executable installed by this Python distribution."""
 
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 from .managed import SyqInstallError
 
 
+@lru_cache(maxsize=1)
 def bundled_executable() -> Path:
     """Return this distribution's binary without downloading or searching PATH."""
     try:
@@ -26,4 +28,4 @@ def bundled_executable() -> Path:
             "the installed syq package has no bundled executable; "
             "reinstall its wheel or pass executable= explicitly"
         )
-    return Path(matches[0])
+    return Path(matches[0]).resolve()

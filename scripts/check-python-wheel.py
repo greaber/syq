@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import os
+from importlib.metadata import metadata
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -17,6 +18,10 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--identity")
     args = parser.parse_args()
+    expected_readme = Path(__file__).resolve().parent.parent / "sdk/python/README-PYTHON.md"
+    assert metadata("syq").get_payload().strip() == expected_readme.read_text().strip(), (
+        "wheel long description does not match the Python README"
+    )
     with tempfile.TemporaryDirectory(prefix="syq-wheel-") as directory:
         root = Path(directory).resolve()
         unavailable = root / "not-a-directory"
