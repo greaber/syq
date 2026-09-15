@@ -46,6 +46,7 @@ strip = true
 include = [
     { path = "NATIVE_API.md", format = "sdist" },
     { path = "native-api.json", format = "sdist" },
+    { path = ".cargo_vcs_info.json", format = "sdist" },
 ]
 
 [tool.uv]
