@@ -258,6 +258,7 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python 3.10 \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          rm -rf -- target/sdk-python-from-sdist
           MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
             target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
           set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
