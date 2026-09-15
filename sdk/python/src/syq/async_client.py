@@ -23,6 +23,7 @@ from typing import BinaryIO, TypeVar
 from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
 from ._mapping import AsyncMapping, _ContextMapping, _source_options
 from .managed import managed_executable
+from .bundled import bundled_executable
 from .client import (
     Argument,
     IgnoreSelector,
@@ -499,7 +500,7 @@ class AsyncClient:
         if self._executable is not None:
             return self._executable
         if self._cache_dir is None:
-            executable = await asyncio.to_thread(managed_executable)
+            executable = bundled_executable()
         else:
             executable = await asyncio.to_thread(
                 managed_executable, cache_dir=self._cache_dir

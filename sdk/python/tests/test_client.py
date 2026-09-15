@@ -153,9 +153,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result.stdout, argument.encode())
         self.assertEqual(result.stderr, b"diagnostic")
 
-    def test_default_run_uses_the_managed_executable(self) -> None:
+    def test_default_run_uses_the_bundled_executable(self) -> None:
         with mock.patch(
-            "syq.client.managed_executable", return_value=self.executable
+            "syq.client.bundled_executable", return_value=self.executable
         ) as managed:
             result = syq.run(["emit", "managed"])
 

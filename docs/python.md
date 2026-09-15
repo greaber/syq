@@ -16,5 +16,9 @@ on Linux and macOS:
 python -m pip install syq
 ```
 
-On first use, it downloads and verifies the matching syq executable, then caches
-it for later calls. You do not need to install the command-line tool separately.
+Prebuilt wheels include the matching syq executable. Installation needs no Rust
+compiler, and SDK calls need no executable download or writable home directory
+for installation. The `syq` command is also available in the Python environment.
+
+Installing from a source distribution builds the executable and requires Rust
+and a C compiler.

@@ -92,6 +92,8 @@ assert_scope "$scope" python_sdk true
 for sdk_script in \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
+  scripts/check-python-wheel.py \
+  scripts/stage-python-sdk.py \
   scripts/prepare-python-sdk-release.py \
   scripts/run-generated-sdk-post-merge-ci.sh \
   scripts/select-trusted-pr.jq \

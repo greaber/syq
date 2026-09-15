@@ -21,8 +21,8 @@ and `AsyncClient(...)` accept:
 
 | Argument | Meaning |
 |---|---|
-| `executable` | Custom executable path, or name to find on `PATH`; default: managed syq |
-| `cache_dir` | Managed executable cache root |
+| `executable` | Custom executable path, or name to find on `PATH`; default: bundled syq |
+| `cache_dir` | Opt into a separately downloaded executable at this cache root |
 | `process_cwd` | Local subprocess working directory; default: inherit |
 | `env` | Subprocess environment mapping; default: inherit |
 | `timeout` | Operation timeout in seconds; default: no limit |
@@ -583,7 +583,7 @@ operation from a broken results stream.
 
 | Exception | Meaning / useful attributes |
 |---|---|
-| `SyqInstallError` | Managed executable installation or verification failed |
+| `SyqInstallError` | Bundled executable is missing, or managed installation or verification failed |
 | `SyqInvocationError` | Invalid Python arguments |
 | `SyqOperationError` | Typed operation was unsuccessful; `.result` and `.stderr` (last 8 KiB) |
 | `SyqProtocolError` | Invalid, unsupported, inconsistent, or incomplete results; `.returncode`, `.stderr` |
@@ -667,12 +667,20 @@ package uses the matching syq release. `syq.__version__` and
 `syq.PINNED_SYQ_VERSION` report those versions. Pin the package in your dependency
 file to keep the pairing.
 
+### Bundled executable
+
+By default, the SDK runs the executable installed with its Python wheel. It
+locates that executable through the package's installation record, without
+searching `PATH`, downloading files, or creating an executable cache. Each
+Python environment has its own installation. Removing the package also removes
+its executable.
+
 ### Managed executable
 
-The default client downloads the matching executable on first use and verifies
+For callers using a separate cache, `Client(cache_dir=...)` downloads the matching executable on first use and verifies
 it against the package's embedded release manifest. It checks the cached binary
 before every use and replaces missing or corrupt entries. It does not search
-`PATH`.
+`PATH`. The existing `syq.managed_executable()` API also keeps this behavior.
 
 The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
 `XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
@@ -682,7 +690,7 @@ Use `Client(cache_dir=...)` to change the cache root, or
 ### Custom executable
 
 `Client(executable="/opt/bin/syq")` uses that binary;
-`Client(executable="syq")` searches `PATH`. Overrides bypass managed download
+`Client(executable="syq")` searches `PATH`. Overrides bypass bundled selection and managed download
 and verification, so you are responsible for compatibility and origin. Typed
 calls still validate automation output. A failed executable selection does not
 fall back to another binary.
