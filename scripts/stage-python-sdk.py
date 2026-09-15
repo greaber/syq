@@ -28,9 +28,6 @@ def stage(root: Path, output: Path) -> None:
     shutil.copytree(root / "sdk/python", sdk, ignore=shutil.ignore_patterns(
         ".venv", "__pycache__", "*.egg-info", "dist", "target"
     ))
-    # Maturin relocates the Cargo crate when making an sdist. This metadata
-    # preserves source provenance for ordinary (non-release) source builds.
-    (output / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": revision}}))
     print(f"Staged Python SDK with {tag} native source at {revision[:12]}")
 
 
