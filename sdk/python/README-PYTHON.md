@@ -186,7 +186,7 @@ result = client.cp("data", into="backup", timeout=None)
 ```
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
-This bypasses the managed version; see
+This bypasses the bundled version; see
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility).
 
 <a id="native-api-reference"></a>
