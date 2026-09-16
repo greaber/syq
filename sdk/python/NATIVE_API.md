@@ -662,7 +662,7 @@ Frozen dataclass returned by `run()` and held in `SyqProcessError.result`:
 
 ## Compatibility
 
-Python 3.10+ on Linux and macOS; no runtime Python dependencies. Each Python
+Python 3.13.4+ on Linux and macOS; no runtime Python dependencies. Each Python
 package uses the matching syq release. `syq.__version__` and
 `syq.PINNED_SYQ_VERSION` report those versions. Pin the package in your dependency
 file to keep the pairing.
