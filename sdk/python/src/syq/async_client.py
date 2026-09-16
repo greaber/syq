@@ -33,6 +33,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _s3_arguments,
     _insert_mapping_option,
     _map_stream_cwd,
     _mapping_line,
@@ -53,6 +54,7 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    Digest,
     MappingEntry,
     OperationStatus,
     OperationSummary,
@@ -645,13 +647,19 @@ class AsyncClient:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        integrity_checking: str | None = None,
+        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
         no_compress: bool = False,
-        bwlimit: str | int | None = None,
-        connections: int | None = None,
+        resource_limits: str | None = None,
+        performance_tuning: str | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
@@ -690,6 +698,8 @@ class AsyncClient:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        if expected_digest is not None and mapping is not None:
+            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -719,13 +729,15 @@ class AsyncClient:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            integrity_checking=integrity_checking,
+            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
             no_compress=no_compress,
-            bwlimit=bwlimit,
-            connections=connections,
+            resource_limits=resource_limits,
+            performance_tuning=performance_tuning,
             receiver_max_entries=receiver_max_entries,
             receiver_max_bytes=receiver_max_bytes,
             receiver_receipt=receiver_receipt,
@@ -737,6 +749,7 @@ class AsyncClient:
             min_size=min_size,
             max_delete=max_delete,
         )
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if auth_from is not None and via is not None:
             raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:
@@ -845,7 +858,7 @@ class AsyncClient:
         follow_src: bool = False,
         results: BinaryIO | None = None,
         dry_run: bool = False,
-        connections: int | None = None,
+        performance_tuning: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
         pscope: PathArgument | None = None,
@@ -868,7 +881,7 @@ class AsyncClient:
             follow=follow,
             follow_src=follow_src,
             dry_run=dry_run,
-            connections=connections,
+            performance_tuning=performance_tuning,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
             pscope=pscope,
@@ -944,8 +957,8 @@ class AsyncClient:
             only_existing=False,
             skip_newer=False,
             no_compress=False,
-            bwlimit=None,
-            connections=None,
+            resource_limits=None,
+            performance_tuning=None,
             receiver_max_entries=None,
             receiver_max_bytes=None,
             receiver_receipt=None,

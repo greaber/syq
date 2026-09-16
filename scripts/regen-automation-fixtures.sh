@@ -45,7 +45,7 @@ mkdir -p "$dir/src/Berlin"
 printf 'img' >"$dir/src/Berlin/IMG.JPG"
 printf 'hello' >"$dir/src/Notes.TXT"
 (cd "$dir" && printf '%s\n' "$mapping_manifest" |
-    "$syq" cp -j1 -C src --mapping - --into dst --results raw.ndjson -q)
+    "$syq" cp --performance-tuning workers=1 -C src --mapping - --into dst --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/success.ndjson"
 
 # partial: one mapping entry's source is missing; the rest settle. Exit 23.
@@ -55,7 +55,7 @@ printf 'ok' >"$dir/src/present.txt"
 (cd "$dir" && printf '%s\n' \
     '{"src":{"encoding":"utf-8","value":"present.txt"},"dst":{"encoding":"utf-8","value":"present.txt"},"kind":"file"}' \
     '{"src":{"encoding":"utf-8","value":"missing.txt"},"dst":{"encoding":"utf-8","value":"missing.txt"},"kind":"file"}' |
-    "$syq" cp -j1 -C src --mapping - --into dst --results raw.ndjson -q) || true
+    "$syq" cp --performance-tuning workers=1 -C src --mapping - --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/partial.ndjson"
 
 # dry-run: the success scenario against a stale destination, emitting
@@ -71,7 +71,7 @@ printf 'stale' >"$dir/dst/berlin/2024/07/img.jpg"
 find "$dir/src" -exec touch -h -d '2024-07-01T12:00:00Z' {} +
 find "$dir/dst" -exec touch -h -d '2024-01-01T00:00:00Z' {} +
 (cd "$dir" && printf '%s\n' "$mapping_manifest" |
-    "$syq" cp -j1 -C src --mapping - --into dst -n --results raw.ndjson -q)
+    "$syq" cp --performance-tuning workers=1 -C src --mapping - --into dst -n --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/dry-run.ndjson"
 
 # refused: --prune finds more destination-only entries than --max-delete
@@ -83,7 +83,7 @@ printf 'k' >"$dir/dst/keep.txt"
 printf 'x' >"$dir/dst/extra-1.txt"
 printf 'x' >"$dir/dst/extra-2.txt"
 (cd "$dir" &&
-    "$syq" cp -j1 --prune --max-delete 1 --srcs-in src --into dst \
+    "$syq" cp --performance-tuning workers=1 --prune --max-delete 1 --srcs-in src --into dst \
         --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 
@@ -92,7 +92,7 @@ normalize <"$dir/raw.ndjson" >"$out/refused.ndjson"
 dir="$work/failed"
 mkdir -p "$dir"
 (cd "$dir" &&
-    "$syq" cp -j1 --srcs-in missing --into dst --results raw.ndjson -q) || true
+    "$syq" cp --performance-tuning workers=1 --srcs-in missing --into dst --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/failed.ndjson"
 
 # rm-success: one directory tree is removed and one explicit selector is
@@ -101,7 +101,7 @@ dir="$work/rm-success"
 mkdir -p "$dir/tree/sub"
 printf 'remove' >"$dir/tree/sub/file"
 (cd "$dir" &&
-    "$syq" rm -j1 --src-dir tree --src missing --results raw.ndjson -q)
+    "$syq" rm --performance-tuning workers=1 --src-dir tree --src missing --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/rm-success.ndjson"
 
 # rm-dry-run: removal traces describe every intended mutation and no object is
@@ -110,7 +110,7 @@ dir="$work/rm-dry-run"
 mkdir -p "$dir/tree/sub"
 printf 'keep' >"$dir/tree/sub/file"
 (cd "$dir" &&
-    "$syq" rm -j1 -n --src-dir tree --results raw.ndjson -q)
+    "$syq" rm --performance-tuning workers=1 -n --src-dir tree --results raw.ndjson -q)
 normalize <"$dir/raw.ndjson" >"$out/rm-dry-run.ndjson"
 
 # rm-dry-partial: preview can resolve the selected root but cannot inspect one
@@ -120,7 +120,7 @@ dir="$work/rm-dry-partial"
 mkdir -p "$dir/tree/blocked"
 chmod 000 "$dir/tree/blocked"
 (cd "$dir" &&
-    "$syq" rm -j1 -n --srcs-in tree --results raw.ndjson -q) || true
+    "$syq" rm --performance-tuning workers=1 -n --srcs-in tree --results raw.ndjson -q) || true
 chmod 700 "$dir/tree/blocked"
 normalize <"$dir/raw.ndjson" >"$out/rm-dry-partial.ndjson"
 
@@ -131,7 +131,7 @@ mkdir -p "$dir/tree"
 printf 'blocked' >"$dir/tree/file"
 chmod 500 "$dir/tree"
 (cd "$dir" &&
-    "$syq" rm -j1 --src-dir tree --results raw.ndjson -q) || true
+    "$syq" rm --performance-tuning workers=1 --src-dir tree --results raw.ndjson -q) || true
 chmod 700 "$dir/tree"
 normalize <"$dir/raw.ndjson" >"$out/rm-partial.ndjson"
 
@@ -139,7 +139,7 @@ normalize <"$dir/raw.ndjson" >"$out/rm-partial.ndjson"
 dir="$work/rm-failed"
 mkdir -p "$dir"
 (cd "$dir" &&
-    "$syq" rm -j1 --cwd missing --src victim --results raw.ndjson -q) || true
+    "$syq" rm --performance-tuning workers=1 --cwd missing --src victim --results raw.ndjson -q) || true
 normalize <"$dir/raw.ndjson" >"$out/rm-failed.ndjson"
 
 fixture_count=0

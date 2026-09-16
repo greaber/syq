@@ -82,10 +82,14 @@ created as needed.
 
 ## Syq extensions
 
-Syq-specific options carry a `--syq-` prefix. Common ones are
-`--syq-connections`, `--syq-ignore`, `--syq-ignore-from`, and
+Most syq-specific options carry a `--syq-` prefix. Common ones are
+`--syq-ignore`, `--syq-ignore-from`, and
 `--syq-verify-only`. The last compares selected contents without writing;
 it does not produce rsync's itemized-change format.
+
+The [hashing controls](reference.md#check-file-contents) are
+`--integrity-checking` and `--syq-expected-hash`
+in rsync mode. `-c` still selects content comparison.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when
@@ -102,3 +106,7 @@ syq rsync -a --syq-verify-only project/ backup/
 
 Hashes selected contents on both sides, writes nothing, and reports `DIFFERS`
 or `MISSING`. Differences or inspection failures produce a nonzero exit status.
+
+Performance controls use `--performance-tuning`; resource ceilings use
+`--resource-limits`. The standard rsync spelling `--bwlimit` remains available
+in `syq rsync`, as does `--checksum` for BLAKE3 content comparison.

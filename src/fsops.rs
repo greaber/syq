@@ -117,6 +117,7 @@ struct NameMaxCache {
     devices: HashMap<u64, usize>,
 }
 
+#[cfg(test)]
 pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
     *blake3::hash(data).as_bytes()
 }
@@ -1400,7 +1401,7 @@ fn source_descriptor_requirement(
 /// descriptors. Its directory descriptor is visible in the listing, which is
 /// a harmless conservative overcount. The portable fallback scans the finite
 /// descriptor range and treats unexpected `fcntl` errors as open.
-fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
+pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
     for fd_directory in ["/proc/self/fd", "/dev/fd"] {
         if let Ok(entries) = fs::read_dir(fd_directory) {
             return Ok(entries.count());
@@ -1451,7 +1452,7 @@ fn require_source_descriptor_capacity(
     )?;
     if required as u128 > limit.rlim_cur as u128 {
         bail!(
-            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
+            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller performance-tuning workers value",
             limit.rlim_cur
         );
     }
@@ -1459,6 +1460,7 @@ fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
+    hash_policy: crate::hashing::HashPolicy,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
     #[cfg(target_os = "linux")]
@@ -1614,6 +1616,17 @@ impl Default for FsOps {
 }
 
 impl FsOps {
+    pub(crate) fn set_hash_policy(&mut self, policy: crate::hashing::HashPolicy) {
+        self.hash_policy = policy;
+    }
+
+    fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
+        let _hash = self
+            .operation
+            .span(crate::transfer_observations::Stage::Hashing);
+        self.hash_policy.payload_algorithm().hash(bytes)
+    }
+
     pub fn new() -> Self {
         Self::with_descriptor_session(DescriptorSessionSlot::default())
     }
@@ -1622,6 +1635,11 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            hash_policy: crate::hashing::HashPolicy {
+                algorithm: crate::hashing::HashAlgorithm::Blake3,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            },
             observations: observations.clone(),
             operation: operation.clone(),
             #[cfg(target_os = "linux")]
@@ -1770,7 +1788,9 @@ impl FsOps {
         let mut total = 0u64;
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
-            if observed_digest(&self.operation, &file.data) != file.hash {
+            if self.hash_policy.transfer_integrity
+                && self.observed_payload_hash(&file.data) != file.hash
+            {
                 bail!("block hash mismatch on receive");
             }
             let bytes = file.data.len() as u64;
@@ -1899,10 +1919,10 @@ impl FsOps {
                 Read::by_ref(&mut opened)
                     .take(file.data.len() as u64 + 1)
                     .read_to_end(&mut bytes)?;
-                Ok(
-                    (bytes.len() == file.data.len() && content_digest(&bytes) == file.hash)
-                        .then_some((target, opened)),
-                )
+                if bytes.len() != file.data.len() {
+                    return Ok(None);
+                }
+                Ok((bytes == file.data).then_some((target, opened)))
             })();
             match check {
                 Ok(Some(held)) => {
@@ -2486,6 +2506,7 @@ impl FsOps {
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. }
             | Request::FileHash { guard, .. }
+            | Request::ValidateDigest { guard, .. }
             | Request::Canonicalize { guard, .. } => guard.is_some(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
             _ => false,
@@ -2827,6 +2848,7 @@ impl FsOps {
             | Request::WriteRange { path, guard, .. }
             | Request::Finalize { path, guard, .. }
             | Request::FileHash { path, guard, .. }
+            | Request::ValidateDigest { path, guard, .. }
             | Request::Canonicalize { path, guard } => {
                 if guard.is_none() {
                     map(path)?;
@@ -2846,7 +2868,8 @@ impl FsOps {
                     }
                 }
             }
-            Request::Hello { .. }
+            Request::ConfigureHashing(_)
+            | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
             | Request::ListDirDetails { .. }
@@ -4471,7 +4494,7 @@ fn set_meta_handle_known_portable(
 }
 
 #[cfg(target_os = "linux")]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     let fd = file.as_raw_fd();
     let r = unsafe { libc::fchmodat(fd, c"".as_ptr(), mode as libc::mode_t, libc::AT_EMPTY_PATH) };
     if r == 0 {
@@ -4495,7 +4518,7 @@ fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     Ok(())
 }
@@ -4628,11 +4651,13 @@ fn parallel_map_init<T: Sync, R: Send, S>(
 /// and destination behavior through one implementation.
 #[cfg(test)]
 fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<ContentDigest>> {
-    hash_reader_observed(reader, block, len, None)
-}
-fn observed_digest(actor: &Arc<crate::transfer_observations::Actor>, data: &[u8]) -> ContentDigest {
-    let _hash = actor.span(crate::transfer_observations::Stage::Hashing);
-    content_digest(data)
+    hash_reader_observed(
+        reader,
+        block,
+        len,
+        None,
+        crate::hashing::HashAlgorithm::Blake3,
+    )
 }
 fn observed_write(
     actor: &Arc<crate::transfer_observations::Actor>,
@@ -4650,6 +4675,7 @@ fn hash_reader_observed(
     block: u64,
     len: u64,
     actor: Option<&Arc<crate::transfer_observations::Actor>>,
+    algorithm: crate::hashing::HashAlgorithm,
 ) -> Result<Vec<ContentDigest>> {
     if !hash_response_fits(block, len) {
         bail!("hash block size or response count is outside protocol limits");
@@ -4678,11 +4704,11 @@ fn hash_reader_observed(
         }
         {
             let _hash = actor.map(|a| a.span(crate::transfer_observations::Stage::Hashing));
-            hashes.push(content_digest(&buf[..got]));
+            hashes.push(algorithm.hash(&buf[..got]));
         }
         if got < want {
             while hashes.len() < n {
-                hashes.push(content_digest(&[]));
+                hashes.push(algorithm.hash(&[]));
             }
             break;
         }
@@ -5311,7 +5337,13 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
-        let hashes = hash_reader_observed(&mut file, block, len, Some(&self.operation))?;
+        let hashes = hash_reader_observed(
+            &mut file,
+            block,
+            len,
+            Some(&self.operation),
+            self.hash_policy.algorithm,
+        )?;
         self.held_basis = Some(HeldBasis {
             location,
             label,
@@ -5518,7 +5550,7 @@ impl FsOps {
                     // The controller treats an absent hash as a block to transfer.
                     break;
                 }
-                let hash = content_digest(bytes);
+                let hash = self.hash_policy.payload_algorithm().hash(bytes);
                 if input.is_some() {
                     #[cfg(debug_assertions)]
                     test_race_barrier(
@@ -5951,7 +5983,7 @@ impl FsOps {
         let flags = put.flags;
         let inplace = put.inplace;
         let condition = put.condition;
-        if observed_digest(&self.operation, data) != hash {
+        if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let staged_mode = staged_file_mode(meta, flags);
@@ -6137,7 +6169,13 @@ impl FsOps {
             }
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file = open_registered_source(&source_target)?;
-                return hash_reader_observed(&mut file, block, len, Some(&self.operation));
+                return hash_reader_observed(
+                    &mut file,
+                    block,
+                    len,
+                    Some(&self.operation),
+                    self.hash_policy.algorithm,
+                );
             }
             // Only an explicitly unconfined rsync source session can reach
             // this legacy branch after source roots have been initialized.
@@ -6160,7 +6198,13 @@ impl FsOps {
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
-            return hash_reader_observed(&mut file, block, len, Some(&self.operation));
+            return hash_reader_observed(
+                &mut file,
+                block,
+                len,
+                Some(&self.operation),
+                self.hash_policy.algorithm,
+            );
         }
         let p = resolve(target.path);
         let p = if which == Which::Partial {
@@ -6180,7 +6224,13 @@ impl FsOps {
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
         }
-        hash_reader_observed(&mut f, block, len, Some(&self.operation))
+        hash_reader_observed(
+            &mut f,
+            block,
+            len,
+            Some(&self.operation),
+            self.hash_policy.algorithm,
+        )
     }
 
     pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
@@ -6246,8 +6296,12 @@ impl FsOps {
             };
             read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
             let hash = {
-                let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-                content_digest(&data)
+                if self.hash_policy.transfer_integrity {
+                    let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+                    self.hash_policy.payload_algorithm().hash(&data)
+                } else {
+                    [0; 32]
+                }
             };
             Ok(Response::Block { off, hash, data })
         })();
@@ -6275,10 +6329,14 @@ impl FsOps {
         }
         let operation = self.operation.clone();
         let actual_hash = {
-            let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-            content_digest(data)
+            if self.hash_policy.transfer_integrity {
+                let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+                self.hash_policy.payload_algorithm().hash(data)
+            } else {
+                [0; 32]
+            }
         };
-        if actual_hash != hash {
+        if self.hash_policy.transfer_integrity && actual_hash != hash {
             bail!("block hash mismatch on receive @{off}");
         }
         let (file, label) = if let Some(rooted) =
@@ -6309,6 +6367,71 @@ impl FsOps {
         result.with_context(|| format!("write {} @{off}", label.display()))
     }
 
+    fn verify_expected_inode(
+        writer: &File,
+        reader: &File,
+        expected: &crate::hashing::Digest,
+    ) -> Result<()> {
+        let written = writer.metadata()?;
+        let read = reader.metadata()?;
+        if written.dev() != read.dev() || written.ino() != read.ino() {
+            bail!("destination changed before digest validation");
+        }
+        Self::verify_expected_file(reader, expected)
+    }
+
+    fn verify_expected_file(file: &File, expected: &crate::hashing::Digest) -> Result<()> {
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut hasher = expected.algorithm.hasher();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        expected
+            .verify(&hasher.finalize())
+            .context("expected file digest mismatch")
+    }
+
+    fn validate_expected_path(
+        &self,
+        path: &[u8],
+        expected: &crate::hashing::Digest,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<()> {
+        let file = if let Some(target) = self.rooted_destination_target(path, guard)? {
+            target.root.open_regular_read(&target.relative)?
+        } else {
+            open_existing_regular(&resolve(path), false)?
+        };
+        Self::verify_expected_file(&file, expected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_basis_expected(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        meta: &Meta,
+        flags: u8,
+        condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+        expected: Option<&crate::hashing::Digest>,
+    ) -> Result<()> {
+        if let Some(expected) = expected {
+            Self::verify_expected_file(
+                &self.held_basis.as_ref().context("no retained basis")?.file,
+                expected,
+            )?;
+        }
+        self.finish_basis(path, copy_id, meta, flags, condition, guard)
+    }
+
+    #[cfg(test)]
     fn finalize(
         &mut self,
         path: &[u8],
@@ -6318,8 +6441,23 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
     ) -> Result<()> {
+        self.finalize_expected(None, path, inplace, copy_id, meta, flags, mutation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_expected(
+        &mut self,
+        expected: Option<&crate::hashing::Digest>,
+        path: &[u8],
+        inplace: bool,
+        copy_id: &CopyId,
+        meta: &Meta,
+        flags: u8,
+        mutation: TargetMutation<'_>,
+    ) -> Result<()> {
         if let Some(target) = self.rooted_destination_target(path, mutation.guard)? {
-            return self.finalize_rooted(&target, inplace, copy_id, meta, flags, mutation);
+            return self
+                .finalize_rooted(&target, inplace, copy_id, meta, flags, mutation, expected);
         }
         let TargetMutation { condition, .. } = mutation;
         let p = resolve(path);
@@ -6339,6 +6477,10 @@ impl FsOps {
             require_open_target(&f, &p, condition)?;
         } else {
             require_safe_partial(&f, &src)?;
+        }
+        if let Some(expected) = expected {
+            let reader = open_existing_regular(&src, false)?;
+            Self::verify_expected_inode(&f, &reader, expected)?;
         }
         if !inplace
             && matches!(
@@ -6385,6 +6527,7 @@ impl FsOps {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_rooted(
         &mut self,
         target: &RootedTarget,
@@ -6393,6 +6536,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
+        expected: Option<&crate::hashing::Digest>,
     ) -> Result<()> {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
@@ -6402,6 +6546,10 @@ impl FsOps {
                 .map(Ok)
                 .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
             require_open_target(&file, &target.label, condition)?;
+            if let Some(expected) = expected {
+                let reader = target.root.open_regular_read(&target.relative)?;
+                Self::verify_expected_inode(&file, &reader, expected)?;
+            }
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             if guarded || condition != TargetCondition::Any {
@@ -6421,6 +6569,10 @@ impl FsOps {
             .map(Ok)
             .unwrap_or_else(|| target.root.open_regular_write(&src_relative, false))?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        if let Some(expected) = expected {
+            let reader = target.root.open_regular_read(&src_relative)?;
+            Self::verify_expected_inode(&file, &reader, expected)?;
+        }
 
         if !guarded
             && matches!(
@@ -6517,7 +6669,7 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
-        let mut h = blake3::Hasher::new();
+        let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
         loop {
@@ -6530,7 +6682,7 @@ impl FsOps {
         }
         Ok(Response::FileHash {
             size,
-            hash: *h.finalize().as_bytes(),
+            hash: h.finalize(),
         })
     }
 
@@ -6560,6 +6712,17 @@ impl FsOps {
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
         let r: Result<Response> = match &req {
+            Request::ConfigureHashing(policy) => {
+                self.hash_policy = *policy;
+                Ok(Response::Ok)
+            }
+            Request::ValidateDigest {
+                path,
+                expected,
+                guard,
+            } => self
+                .validate_expected_path(path, expected, guard.as_ref())
+                .map(|_| Response::Ok),
             Request::ListDir {
                 directory,
                 confined_root,
@@ -6738,6 +6901,7 @@ impl FsOps {
                 .hash_and_hold(path, copy_id, *block, *len, *condition, guard.as_ref())
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
+                expected_digest,
                 path,
                 copy_id,
                 meta,
@@ -6745,7 +6909,15 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .finish_basis(path, copy_id, meta, *flags, *condition, guard.as_ref())
+                .finish_basis_expected(
+                    path,
+                    copy_id,
+                    meta,
+                    *flags,
+                    *condition,
+                    guard.as_ref(),
+                    expected_digest.as_ref(),
+                )
                 .map(|_| Response::Ok),
             Request::SeedBasis {
                 path,
@@ -6877,6 +7049,7 @@ impl FsOps {
                 )
                 .map(|_| Response::Ok),
             Request::Finalize {
+                expected_digest,
                 path,
                 inplace,
                 copy_id,
@@ -6885,7 +7058,8 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .finalize(
+                .finalize_expected(
+                    expected_digest.as_ref(),
                     path,
                     *inplace,
                     copy_id,
@@ -7376,7 +7550,7 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
-fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
         return Ok(());
     }
@@ -7538,6 +7712,210 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::{symlink, FileTypeExt};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn selected_hash_is_independent_of_payload_integrity() {
+        use crate::hashing::{HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        fs::write(&path, b"file contents").unwrap();
+        for algorithm in [
+            HashAlgorithm::Blake3,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Xxh3,
+        ] {
+            let mut operations = FsOps::new();
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: false,
+                transfer_hash_type: None,
+            });
+            let response = operations
+                .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
+                .unwrap();
+            assert!(matches!(response, Response::Block { hash, .. } if hash == [0;32]));
+            let response = operations
+                .file_hash(path.as_os_str().as_bytes(), None, None)
+                .unwrap();
+            assert!(
+                matches!(response, Response::FileHash { hash, .. } if hash == algorithm.hash(b"file contents"))
+            );
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            });
+            let response = operations
+                .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
+                .unwrap();
+            assert!(
+                matches!(response, Response::Block { hash, .. } if hash == algorithm.hash(b"file contents"))
+            );
+        }
+    }
+
+    #[test]
+    fn payload_integrity_checks_are_explicit() {
+        use crate::hashing::{HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        let path = path.as_os_str().as_bytes();
+        let copy_id = [3; 16];
+        let mut operations = FsOps::new();
+        operations.set_hash_policy(HashPolicy::default());
+        operations
+            .prepare(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                PrepareOptions {
+                    size: 3,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap();
+        operations
+            .write_range(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                false,
+                0,
+                0,
+                [19; 32],
+                b"old",
+            )
+            .unwrap();
+        for algorithm in [
+            HashAlgorithm::Blake3,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Xxh3,
+        ] {
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            });
+            assert!(operations
+                .write_range(
+                    PartialTarget {
+                        path,
+                        id: &copy_id,
+                        guard: None
+                    },
+                    false,
+                    0,
+                    0,
+                    [19; 32],
+                    b"new"
+                )
+                .is_err());
+            operations
+                .write_range(
+                    PartialTarget {
+                        path,
+                        id: &copy_id,
+                        guard: None,
+                    },
+                    false,
+                    0,
+                    0,
+                    algorithm.hash(b"new"),
+                    b"new",
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn expected_digest_failure_preserves_existing_destination() {
+        use crate::hashing::{Digest, HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        fs::write(&path, b"old").unwrap();
+        let path = path.as_os_str().as_bytes();
+        let copy_id = [7; 16];
+        let mut operations = FsOps::new();
+        operations.set_hash_policy(HashPolicy::default());
+        operations
+            .prepare(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                PrepareOptions {
+                    size: 3,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap();
+        operations
+            .write_range(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                false,
+                0,
+                0,
+                [0; 32],
+                b"new",
+            )
+            .unwrap();
+        let meta = Meta {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"bad");
+        assert!(operations
+            .finalize_expected(
+                Some(&expected),
+                path,
+                false,
+                &copy_id,
+                &meta,
+                0,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None
+                }
+            )
+            .is_err());
+        assert_eq!(fs::read(resolve(path)).unwrap(), b"old");
+        let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"new");
+        operations
+            .finalize_expected(
+                Some(&expected),
+                path,
+                false,
+                &copy_id,
+                &meta,
+                0,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(resolve(path)).unwrap(), b"new");
+    }
 
     fn test_dir() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

@@ -309,7 +309,7 @@ exec /bin/sh -c "$1"
                 rsh=os.fspath(rsh),
                 syq_path=EXECUTABLE,
                 no_tcp=True,
-                connections=1,
+                performance_tuning="workers=1",
             )
 
             self.assertEqual(result.status, syq.OperationStatus.SUCCESS)

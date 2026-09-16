@@ -197,10 +197,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "follow_dst" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
-                "bwlimit" => "Bandwidth",
-                "connections" | "connections_opt" | "block_size" | "tuning_options" => {
-                    "Performance troubleshooting"
-                }
+                "resource_limits_arg" => "Resource limits",
+                "integrity_checking_arg" | "hash" | "expected_digest" => "Integrity checking",
+                "performance_tuning" | "block_size" => "Performance tuning",
                 "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",

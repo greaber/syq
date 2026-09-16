@@ -9,9 +9,9 @@ use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
-use crate::fsops::{
-    content_digest, destination_fraction_matches, is_partial_name, is_recovery_name, join,
-};
+#[cfg(test)]
+use crate::fsops::content_digest;
+use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
@@ -135,6 +135,9 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 }
 
 pub struct Opts {
+    pub hash_policy: crate::hashing::HashPolicy,
+    pub expected_digest: Option<crate::hashing::Digest>,
+    pub mapping_expected_digests: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -182,9 +185,38 @@ pub struct Opts {
 }
 
 impl Opts {
+    fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
+        let mut changes = 0;
+        if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
+            changes |= flags::MODE;
+        }
+        if self.flags & flags::OWNER != 0 && source.uid != destination.uid {
+            changes |= flags::OWNER;
+        }
+        if self.flags & flags::GROUP != 0 && source.gid != destination.gid {
+            changes |= flags::GROUP;
+        }
+        changes
+    }
+
+    fn metadata_matches(&self, source: &Entry, destination: &Entry) -> bool {
+        destination.kind == Kind::File
+            && destination.size == source.size
+            && self.flags & flags::TIMES != 0
+            && destination.mtime == source.mtime
+            && (!self.precise_mtime
+                || destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec))
+    }
+
+    fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
+        self.mapping_expected_digests
+            .get(path)
+            .or(self.expected_digest.as_ref())
+    }
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
+            // Payload checks do not disable same-host copy shortcuts.
             checksum: self.checksum,
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
@@ -299,12 +331,29 @@ fn control_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
 /// Open a control connection. It bypasses the data-connection connect
 /// limiter: the scan, and therefore every worker, waits on it.
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    match ep {
+    let mut connection = match ep {
         Endpoint::Local { .. } => ep.connect_control(args.compress),
         Endpoint::Remote(spec) => spec
             .connect_with(args.compress, false)
             .map(|c| Box::new(c) as Box<dyn Conn>),
-    }
+    }?;
+    configure_hashing(
+        &mut *connection,
+        crate::hashing::HashPolicy {
+            algorithm: args.hash_algorithm,
+            transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
+        },
+    )?;
+    Ok(connection)
+}
+
+fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
+    ok(
+        connection.call(Request::ConfigureHashing(policy))?,
+        "configure hashing",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
@@ -767,6 +816,7 @@ fn small_copy_eligible(
         && !args.delete
         && !args.update
         && !args.checksum
+        && args.expected_digest.is_none()
         && !args.ignore_existing
         && !args.existing
         && !args.stats
@@ -890,6 +940,7 @@ fn attempt_small_copy(
             len: entry.size as u32,
         })
         .collect();
+    configure_hashing(&mut *reader, opts.hash_policy)?;
     let native_actor = progress
         .observations
         .enabled
@@ -930,7 +981,7 @@ fn attempt_small_copy(
     let mut files = Vec::with_capacity(srcs.len());
     for (entry, (dst_path, _, _)) in entries.iter().zip(&targets) {
         let (data, hash) = if entry.size == 0 {
-            (Vec::new(), content_digest(&[]))
+            (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
         } else {
             match blocks.next() {
                 Some(Ok(block)) if block.data.len() as u64 == entry.size => {
@@ -1678,6 +1729,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let opts = Arc::new(Opts {
+        hash_policy: crate::hashing::HashPolicy {
+            algorithm: args.hash_algorithm,
+            transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
+        },
+        expected_digest: args.expected_digest.clone(),
+        mapping_expected_digests: mapping_entries
+            .as_ref()
+            .map(|(entries, _)| {
+                entries
+                    .iter()
+                    .filter_map(|(_, entry)| {
+                        entry
+                            .expected_digest
+                            .clone()
+                            .map(|digest| (entry.dst.clone(), digest))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         block,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
@@ -2047,6 +2118,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
+    if args.expected_digest.is_some() {
+        let entry = stat_one_registered(
+            &mut *src_ctl,
+            &srcs[0].path,
+            &registered_sources[0].selection,
+            false,
+        )?;
+        if !entry.is_some_and(|entry| entry.kind == Kind::File) {
+            bail!("--expected-hash requires one regular source file");
+        }
+    }
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
@@ -5598,6 +5680,26 @@ impl Planner<'_> {
                 continue;
             }
             let dst_rel = join(sub, &e.path);
+            if opts.expected_for(&dst_rel).is_some()
+                && e.kind != Kind::File
+                && !self.implicit_dirs.contains(&join(dst_root, &dst_rel))
+            {
+                let message = "expected digest requires a regular file";
+                self.progress.error(message);
+                let source = self.mapping_source_rel(&dst_rel);
+                self.emit_entry_failed(
+                    FailedEntry {
+                        dst: &dst_rel,
+                        src: source.as_deref(),
+                        kind: Some(DeclaredKind::File),
+                    },
+                    "no",
+                    "conflict",
+                    None,
+                    message,
+                );
+                continue;
+            }
             let dst = join(dst_root, &dst_rel);
             let rel = self.rel_name(src_root, sub, &e.path);
             // Every source entry claims its destination here, before any
@@ -6286,13 +6388,9 @@ impl Planner<'_> {
                     {
                         continue;
                     }
-                    let same = dst_entry.as_ref().is_some_and(|d| {
-                        d.kind == Kind::File
-                            && d.size == e.size
-                            && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
-                            && (!opts.precise_mtime
-                                || destination_fraction_matches(e.mtime_nsec, d.mtime_nsec))
-                    });
+                    let same = dst_entry
+                        .as_ref()
+                        .is_some_and(|d| opts.metadata_matches(&e, d));
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {
                             d.kind == Kind::File
@@ -6315,21 +6413,12 @@ impl Planner<'_> {
                         } else {
                             self.progress.error(&format!("MISSING {rel}"));
                         }
-                    } else if same && !opts.checksum {
+                    } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
                         // Content is up to date, but still reconcile metadata
                         // (mode/owner/group) the way rsync does — a skipped file
                         // shouldn't keep stale permissions.
                         if let Some(d) = &dst_entry {
-                            let mut ff = 0u8;
-                            if opts.flags & flags::MODE != 0 && d.mode & 0o7777 != e.mode & 0o7777 {
-                                ff |= flags::MODE;
-                            }
-                            if opts.flags & flags::OWNER != 0 && d.uid != e.uid {
-                                ff |= flags::OWNER;
-                            }
-                            if opts.flags & flags::GROUP != 0 && d.gid != e.gid {
-                                ff |= flags::GROUP;
-                            }
+                            let ff = opts.metadata_fix_flags(&e, d);
                             if ff != 0 {
                                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                                 self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
@@ -6908,6 +6997,7 @@ impl Planner<'_> {
                 .error_classified(&message, Some("conflict"), None);
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
+                    expected_digest: self.opts.expected_for(dst_rel).cloned(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),
@@ -6972,19 +7062,22 @@ impl Planner<'_> {
                 Some(DeclaredKind::Special) => ("create_special", "special"),
                 _ => ("transfer_file", "file"),
             };
-            results.emit_operation(&crate::results::OperationRecord {
-                action,
-                dst: entry.dst,
-                src: entry.src,
-                kind,
-                disposition: "failed",
-                bytes: None,
-                attempts: None,
-                retryable: Some(retryable),
-                class: Some(class),
-                os_kind,
-                message: Some(message),
-            });
+            results.emit_operation_expected(
+                &crate::results::OperationRecord {
+                    action,
+                    dst: entry.dst,
+                    src: entry.src,
+                    kind,
+                    disposition: "failed",
+                    bytes: None,
+                    attempts: None,
+                    retryable: Some(retryable),
+                    class: Some(class),
+                    os_kind,
+                    message: Some(message),
+                },
+                self.opts.expected_for(entry.dst),
+            );
         }
     }
 
@@ -7623,6 +7716,8 @@ impl Worker {
 
     fn run(&mut self) -> Result<()> {
         let r = (|| {
+            configure_hashing(&mut *self.src, self.opts.hash_policy)?;
+            configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src
@@ -7807,6 +7902,7 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
+            && self.opts.expected_for(&j.rel_bytes).is_none()
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs.destination(idx).is_none()
@@ -7861,7 +7957,7 @@ impl Worker {
                 if job.entry.size == 0 {
                     return Ok(SmallBlock {
                         data: Vec::new(),
-                        hash: content_digest(&[]),
+                        hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
                     });
                 }
                 match blocks.next() {
@@ -7883,7 +7979,7 @@ impl Worker {
                     block,
                     SmallBlock {
                         data: Vec::new(),
-                        hash: content_digest(&[]),
+                        hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
                     },
                 ),
                 Err(_) => {
@@ -8072,19 +8168,22 @@ impl Worker {
             return;
         }
         if let Some(results) = self.progress.results_writer() {
-            results.emit_operation(&crate::results::OperationRecord {
-                action: "transfer_file",
-                dst: &job.rel_bytes,
-                src: job.src_rel.as_deref(),
-                kind: "file",
-                disposition: "failed",
-                bytes: None,
-                attempts: Some(u64::from(job.attempt) + 1),
-                retryable: Some(retryable),
-                class: Some("io"),
-                os_kind,
-                message: Some(message),
-            });
+            results.emit_operation_expected(
+                &crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &job.rel_bytes,
+                    src: job.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "failed",
+                    bytes: None,
+                    attempts: Some(u64::from(job.attempt) + 1),
+                    retryable: Some(retryable),
+                    class: Some("io"),
+                    os_kind,
+                    message: Some(message),
+                },
+                self.opts.expected_for(&job.rel_bytes),
+            );
         }
     }
 
@@ -8097,6 +8196,30 @@ impl Worker {
         let size = job.entry.size;
         let opts = self.opts.clone();
         let _ = &opts;
+
+        match self.try_expected_match(&job) {
+            Ok(true) => {
+                job.done.store(size, Relaxed);
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                self.progress.bytes_total.fetch_sub(size, Relaxed);
+                self.sched.ranges_ready(idx, vec![]);
+                if let Err(error) = self.finish_matched_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, true);
+                    }
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.sched.ranges_ready(idx, vec![]);
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
+                return Err(error);
+            }
+        }
 
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
@@ -8197,6 +8320,7 @@ impl Worker {
                     meta.mode = self.create_mode(&job);
                     ok(
                         self.dst.call(Request::FinishBasis {
+                            expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
                             path: job.dst.clone(),
                             copy_id: self.copy_id(),
                             meta,
@@ -8678,7 +8802,23 @@ impl Worker {
                 let requested = (end - expected).min(block);
                 validate_range_reply(expected, requested, off, data.len())?;
                 expected += requested;
-                let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
+                let policy = self.opts.hash_policy;
+                if !policy.transfer_integrity {
+                    hash = [0; 32];
+                }
+                let claimed = crate::streaming::claim_block_with_digest(
+                    h,
+                    off,
+                    &mut hash,
+                    &mut data,
+                    |data| {
+                        if policy.transfer_integrity {
+                            policy.payload_algorithm().hash(data)
+                        } else {
+                            [0; 32]
+                        }
+                    },
+                )?;
                 self.benchmark.stream_discarded_bytes += requested - claimed;
                 if claimed == 0 {
                     break;
@@ -8767,6 +8907,7 @@ impl Worker {
         let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
+                expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
@@ -8799,6 +8940,7 @@ impl Worker {
             if !partial_missing || !self.contents_match(&job)? {
                 return Err(error);
             }
+            self.validate_expected_destination(&job)?;
         }
         #[cfg(debug_assertions)]
         crate::fsops::test_race_barrier(
@@ -8896,19 +9038,22 @@ impl Worker {
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
-                results.emit_operation(&crate::results::OperationRecord {
-                    action: "transfer_file",
-                    dst: &job.rel_bytes,
-                    src: job.src_rel.as_deref(),
-                    kind: "file",
-                    disposition: "succeeded",
-                    bytes: Some(job.entry.size),
-                    attempts: Some(u64::from(job.attempt) + 1),
-                    retryable: None,
-                    class: None,
-                    os_kind: None,
-                    message: None,
-                });
+                results.emit_operation_expected(
+                    &crate::results::OperationRecord {
+                        action: "transfer_file",
+                        dst: &job.rel_bytes,
+                        src: job.src_rel.as_deref(),
+                        kind: "file",
+                        disposition: "succeeded",
+                        bytes: Some(job.entry.size),
+                        attempts: Some(u64::from(job.attempt) + 1),
+                        retryable: None,
+                        class: None,
+                        os_kind: None,
+                        message: None,
+                    },
+                    self.opts.expected_for(&job.rel_bytes),
+                );
             }
         }
         if !matched && self.opts.verbose > 0 {
@@ -8917,10 +9062,76 @@ impl Worker {
         Ok(())
     }
 
+    // Keep digest reads in workers so one large file cannot stall directory
+    // planning. A failed check takes the normal repair path; publication still
+    // validates the expected digest. Explicit --hash continues to compare both
+    // endpoints regardless of matching metadata or an expected digest.
+    fn try_expected_match(&mut self, job: &WorkerJob) -> Result<bool> {
+        let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() else {
+            return Ok(false);
+        };
+        let Some(destination) = job.dst_entry.as_deref() else {
+            return Ok(false);
+        };
+        if self.opts.checksum || !self.opts.metadata_matches(&job.entry, destination) {
+            return Ok(false);
+        }
+        match self.dst.call(Request::ValidateDigest {
+            path: job.dst.clone(),
+            expected,
+            guard: job.container_guard.clone(),
+        })? {
+            Response::Ok => {}
+            Response::Err(_) | Response::EndpointError(_) => return Ok(false),
+            other => bail!("unexpected response validating destination digest: {other:?}"),
+        }
+        // Preserve the ordinary quick check's metadata reconciliation and
+        // require the same destination inode observed by the planner.
+        let response = ok(
+            self.dst.call(Request::Apply {
+                ops: vec![Op::SetFileMetaIfSame {
+                    path: job.dst.clone(),
+                    condition: match job.target_condition {
+                        TargetCondition::Any => target_identity(destination),
+                        condition => condition,
+                    },
+                    meta: job.entry.meta(),
+                    flags: self.opts.metadata_fix_flags(&job.entry, destination),
+                }],
+                guard: job.container_guard.clone(),
+            })?,
+            "update metadata after expected digest match",
+        )?;
+        match response {
+            Response::Applied(results) if results.len() == 1 => {
+                if let Some(error) = &results[0] {
+                    bail!("update metadata after expected digest match: {error}");
+                }
+            }
+            other => bail!("unexpected metadata response: {other:?}"),
+        }
+        Ok(true)
+    }
+
+    fn validate_expected_destination(&mut self, job: &WorkerJob) -> Result<()> {
+        if let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() {
+            ok(
+                self.dst.call(Request::ValidateDigest {
+                    path: job.dst.clone(),
+                    expected,
+                    guard: job.container_guard.clone(),
+                })?,
+                "validate expected digest",
+            )?;
+        }
+        Ok(())
+    }
+
     fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
 
         let r = (|| -> Result<bool> {
+            self.validate_expected_destination(&job)?;
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
                 source: self.source_reference(&job),
@@ -9116,6 +9327,9 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
+            hash_policy: Default::default(),
+            expected_digest: None,
+            mapping_expected_digests: Default::default(),
             block: 512,
             tuning: crate::transfer_tuning::TransferTuning {
                 copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -9459,6 +9673,7 @@ mod tests {
                         sched.retry_range(&range, 0);
                     }
                     let src = Arc::new(Mutex::new(PipelineState::default()));
+                    src.lock().unwrap().replies.push_back(Response::Ok); // ConfigureHashing
                     if streaming {
                         src.lock().unwrap().replies.push_back(Response::Ok);
                     }
@@ -9475,6 +9690,7 @@ mod tests {
                         });
                     }
                     let dst = Arc::new(Mutex::new(PipelineState::default()));
+                    dst.lock().unwrap().replies.push_back(Response::Ok); // ConfigureHashing
                     if !queued_range {
                         dst.lock()
                             .unwrap()
@@ -9491,21 +9707,26 @@ mod tests {
                         "protocol failure, not a lost socket"
                     );
                     let source = src.lock().unwrap();
-                    assert_eq!(source.received, 2 + usize::from(streaming));
+                    assert_eq!(source.received, 3 + usize::from(streaming));
+                    assert!(matches!(source.requests[0], Request::ConfigureHashing(_)));
                     assert_eq!(source.replies.len(), 3);
                     if streaming {
-                        assert_eq!(source.requests.len(), 1);
+                        assert_eq!(source.requests.len(), 2);
                         assert!(
-                            matches!(&source.requests[0], Request::ReadStream(stream) if stream.path == b"first")
+                            matches!(&source.requests[1], Request::ReadStream(stream) if stream.path == b"first")
                         );
                     } else {
-                        assert_eq!(source.requests.len(), 5);
-                        assert!(source.requests.iter().all(|request| matches!(
+                        assert_eq!(source.requests.len(), 6);
+                        assert!(source.requests[1..].iter().all(|request| matches!(
                             request, Request::ReadRange { path, .. } if path == b"first"
                         )));
                     }
                     let destination = dst.lock().unwrap();
-                    assert_eq!(destination.received, usize::from(!queued_range));
+                    assert_eq!(destination.received, 1 + usize::from(!queued_range));
+                    assert!(matches!(
+                        destination.requests[0],
+                        Request::ConfigureHashing(_)
+                    ));
                     assert_eq!(
                         destination.replies.len(),
                         1,
@@ -9520,7 +9741,7 @@ mod tests {
                     assert!(
                         matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
                     );
-                    assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
+                    assert_eq!(destination.requests.len(), 2 + usize::from(!queued_range));
                 }
             }
         }

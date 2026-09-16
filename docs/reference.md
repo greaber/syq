@@ -88,7 +88,12 @@ The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` requires that receiver to be connected and pass its identity check.
 See [Send files home from a server](receive.md) for setup and destination paths.
 
-For two remote endpoints, see [Copy between servers](remote-to-remote.md).
+For object storage, use `--to s3://BUCKET` or `--from s3://BUCKET` and select
+keys with the same source and placement options. See
+[Copy to and from object storage](object-storage.md) for credentials, headers,
+metadata, and tuning.
+
+For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
 ## Progress
 
@@ -272,7 +277,7 @@ and run:
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 # Search several remote trees with the parallel removal workers.
-syq clean-partials --on server --cwd /data -j 8 backup archive
+syq clean-partials --on server --cwd /data --performance-tuning workers=8 backup archive
 ```
 
 This command removes regular files with the current partial-name format. It
@@ -326,9 +331,56 @@ copies, syq still compares blocks when size or modification time differs,
 even without `--hash`, so it can reuse unchanged data. Local and small copies
 may use faster paths instead.
 
-Transferred data is always checked for corruption. For files being changed by
-another program, stop the writer or copy a snapshot. No copy makes the whole
-tree transactional or guarantees durability across power loss.
+Advanced controls keep resource policy, performance choices and integrity
+checking separate:
+
+| Option | Purpose |
+|---|---|
+| `--resource-limits bandwidth=RATE` | Caps aggregate logical file-data throughput |
+| `--performance-tuning workers=N` | Fixes filesystem copy-worker slots instead of adjusting them automatically |
+| `--integrity-checking compare=HASH,transfer=HASH` | Chooses content comparison and extra payload checks independently |
+
+Each option accepts comma-separated `KEY=VALUE` pairs and can be repeated with
+different keys. Duplicate keys are errors. See [performance tuning](tuning.md)
+for the worker and S3 request controls. These tune parallelism; they do not
+bound total sockets, file descriptors, CPU or memory.
+
+Comparison defaults to `compare=size-mtime`. If those attributes are insufficient,
+use `compare=blake3`, also available as `--hash`. Other choices are `sha256`,
+`md5`, and `xxh3-128`. MD5 supports existing manifests; XXH3-128 is a fast
+noncryptographic checksum. Neither provides cryptographic collision resistance.
+`--hash` conflicts with a different explicit comparison choice.
+
+Extra payload checks default to `transfer=off`. Enable them with, for example,
+`--integrity-checking transfer=blake3`; the same four hash types are supported.
+The comparison and transfer hash types can differ. SSH and encrypted TCP retain
+their transport protection independently, and `--tcp-plain` does not enable
+payload checks automatically. Same-host copies keep their kernel-copy and
+whole-file shortcuts. Use `--expected-hash` to validate the complete local result.
+Content comparison, verification and recovery still hash data when needed.
+[S3 provider checksums](object-storage.md#metadata-and-integrity) also stay enabled.
+
+To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
+with one named regular file:
+
+```sh
+syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
+```
+
+This checks all resulting bytes, including reused data, before reporting success;
+a metadata match alone is insufficient. When size and modification time match,
+syq validates the existing destination and skips copying if its digest matches.
+Otherwise it copies and validates the result; a mismatch fails that file. With normal
+staging, validation happens before replacing the destination. With `--inplace`,
+the file has already been modified when validation finishes. Use
+[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
+filters still exclude files, and excluded files are not digest-verified.
+The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
+preview changes without validating the expectation.
+
+For files being changed by another program, stop the writer or copy a snapshot.
+No copy makes the whole tree transactional or guarantees durability across
+power loss.
 
 To compare without writing, use `--verify-only`:
 

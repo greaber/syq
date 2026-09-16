@@ -1,4 +1,5 @@
 """Mapping and timestamp selection across actual source/destination SSH edges."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,8 +20,66 @@ def ssh(host, script):
     return run(["ssh", host, "python3 -c " + shlex.quote(script)])
 
 
-def manifest(entries):
-    return "".join(json.dumps({"src": {"encoding": "utf-8", "value": src}, "dst": {"encoding": "utf-8", "value": dst}, "kind": kind}) + "\n" for src, dst, kind in entries).encode()
+def manifest(entries, expected=None):
+    records = []
+    for src, dst, kind in entries:
+        record = {"src": {"encoding": "utf-8", "value": src}, "dst": {"encoding": "utf-8", "value": dst}, "kind": kind}
+        if expected is not None:
+            record["expected_digest"] = expected
+        records.append(json.dumps(record) + "\n")
+    return "".join(records).encode()
+
+
+def hashing(root, source, temporary):
+    """Exercise checksum policy on real transports and signed mapping grants."""
+    payload = b"hash policy over real SSH\n" * 8192
+    local = Path(temporary) / "hash-source"
+    local.write_bytes(payload)
+    sha256 = hashlib.sha256(payload).hexdigest()
+    md5 = hashlib.md5(payload).hexdigest()
+    wrong_md5 = hashlib.md5(b"different bytes").hexdigest()
+    for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
+        print(f"hash policy: ordinary {name} TCP", flush=True)
+        destination = root + "/hash-" + name
+        command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", str(local), "--to", "destination", "--as", destination,
+                   "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3", "--performance-tuning", "copy-path=ranges"] + flags
+        run(command + ["--expected-hash", "sha256:" + sha256])
+        results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
+        run(command + ["--expected-hash", "sha256:" + sha256, "--results", results])
+        summary = json.loads(Path(results).read_text().splitlines()[-1])
+        assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
+        # compare=xxh3-128 checks the existing file with the selected algorithm.
+        run(command + ["--expected-hash", "md5:" + md5])
+        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        ssh("destination", f"from pathlib import Path; import hashlib; assert hashlib.sha256(Path({destination!r}).read_bytes()).hexdigest()=={sha256!r}")
+        # A changed target must remain intact when staged validation fails.
+        ssh("destination", f"from pathlib import Path; Path({destination!r}).write_bytes(b'keep existing')")
+        run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
+        ssh("destination", f"from pathlib import Path; assert Path({destination!r}).read_bytes()==b'keep existing'")
+
+    print("hash policy: signed mapping with independent expected digest", flush=True)
+    destination = root + "/hash-signed"
+    expected = {"algorithm": "md5", "value": hashlib.md5(b"mapped contents").hexdigest()}
+    selected = [("file", "checked", "file")]
+    command = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=1", "--from", "source", "-C", source,
+               "--mapping", "-", "--to", "destination", "--into", destination,
+               "--integrity-checking", "compare=xxh3-128", "--integrity-checking=transfer=blake3"]
+    run(command, data=manifest(selected, expected))
+    results = str(Path(temporary) / "hash-repeat-signed.ndjson")
+    inode_query = f"from pathlib import Path; print((Path({destination!r})/'checked').stat().st_ino)"
+    inode = ssh("destination", inode_query).stdout
+    run(command + ["--results", results], data=manifest(selected, expected))
+    summary = json.loads(Path(results).read_text().splitlines()[-1])
+    # Receiver-attested summaries count confirmed mutations, not source skips.
+    assert summary["provenance"] == "receiver_attested" and summary["bytes_transferred"] == 0, summary
+    assert summary["status"] == "success" and summary["receipt_status"] == "clean", summary
+    assert ssh("destination", inode_query).stdout == inode
+    wrong = {"algorithm": "sha256", "value": hashlib.sha256(b"different bytes").hexdigest()}
+    run(command, data=manifest(selected, wrong), expected=23)
+    ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'checked').read_bytes()==b'mapped contents'")
+    ssh("destination", f"from pathlib import Path; (Path({destination!r})/'checked').write_bytes(b'keep signed target')")
+    run(command + ["--no-tcp"], data=manifest(selected, wrong), expected=23)
+    ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'checked').read_bytes()==b'keep signed target'")
 
 
 def direct():
@@ -30,8 +89,9 @@ def direct():
     ssh("source", f"from pathlib import Path; import os; p=Path({source!r}); p.mkdir(parents=True); (p/'file').write_bytes(b'mapped contents'); (p/'directory').mkdir(); (p/'directory'/'unselected').write_bytes(b'exclude'); (p/'link').symlink_to('nested/renamed'); os.utime(p/'file',(1600000000,1600000000))")
     entries = [("file", "nested/renamed", "file"), ("link", "link", "symlink"), ("directory", "directory", "dir")]
     contents = manifest(entries)
-    prefix = ["syq", "cp", "--no-progress", "-j", "2", "--from", "source", "-C", source]
+    prefix = ["syq", "cp", "--no-progress", "--performance-tuning", "workers=2", "--from", "source", "-C", source]
     with tempfile.TemporaryDirectory(prefix="syq-mapping-") as temporary:
+        hashing(root, source, temporary)
         path = Path(temporary) / "manifest.ndjson"
         path.write_bytes(contents)
         routes = [

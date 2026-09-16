@@ -21,6 +21,7 @@ from .models import (
     ErrorClass,
     ErrorEvent,
     AttestedDigest,
+    Digest,
     FinalObjectKind,
     FinalObjectState,
     FinalStateEvent,
@@ -157,9 +158,21 @@ def _tagged(value: Any, *, label: str) -> PathValue:
     return PathValue(raw=raw)
 
 
+def _expected_digest(record: dict[str, Any]) -> Digest | None:
+    if "expected_digest" not in record:
+        return None
+    digest = record["expected_digest"]
+    if not isinstance(digest, dict) or set(digest) != {"algorithm", "value"}:
+        raise SyqProtocolError("expected_digest must contain algorithm and value")
+    try:
+        return Digest(digest["algorithm"], digest["value"])
+    except (TypeError, ValueError) as error:
+        raise SyqProtocolError(f"invalid expected_digest: {error}") from error
+
+
 def parse_mapping_line(line: bytes) -> MappingEntry:
     record = _object(line, label="mapping record")
-    unknown = set(record) - {"src", "dst", "kind", "size", "mtime"}
+    unknown = set(record) - {"src", "dst", "kind", "size", "mtime", "expected_digest"}
     if unknown:
         raise SyqProtocolError(
             f"mapping record has unknown field {sorted(unknown)[0]!r}"
@@ -175,7 +188,7 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
         _integer(record, "mtime", nonnegative=False) if "mtime" in record else None
     )
     try:
-        return MappingEntry(src.raw, dst.raw, kind, size, mtime)
+        return MappingEntry(src.raw, dst.raw, kind, size, mtime, _expected_digest(record))
     except (TypeError, ValueError) as error:
         raise SyqProtocolError(f"mapping path is invalid: {error}") from error
 
@@ -195,6 +208,8 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
             raise SyqProtocolError("a local endpoint may not contain host or user")
         if kind is EndpointKind.SSH and not host:
             raise SyqProtocolError("an SSH endpoint must contain a host")
+        if kind is EndpointKind.S3 and (not host or not host.startswith("s3://") or user is not None):
+            raise SyqProtocolError("an S3 endpoint requires an s3:// bucket and no user")
         endpoints.append(
             Endpoint(
                 role=_enum(value, "role", EndpointRole),
@@ -395,6 +410,7 @@ class AutomationDecoder:
                 provenance=provenance,
                 scope=_optional_integer(record, "scope"),
                 code=_optional_enum(record, "code", ReceiptCode),
+                expected_digest=_expected_digest(record),
             )
         if record_type == "selection_result":
             if self.run.mode != "rm":

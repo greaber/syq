@@ -60,7 +60,7 @@ fn prune_is_suppressed_after_an_ordinary_file_read_failure() {
         .args([
             "-a",
             "--delete",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             &t.s("src/"),
             &t.s("dst/"),
         ])
@@ -163,7 +163,7 @@ fn copy_and_prune_preserve_distinct_unix_filename_bytes() {
         // pruning on an existing tree. Run on the caller's test filesystem.
         let src = t.s("src");
         let dst = t.s("dst");
-        let tuning = format!("--tuning-options=copy-path={mode}");
+        let tuning = format!("--performance-tuning=copy-path={mode}");
         let mut args = vec!["cp", &tuning, "--srcs-in", &src, "--into", &dst];
         run_native_ok(&args);
         write(&t.path("dst/extra"), b"extra");
@@ -476,7 +476,7 @@ fn resume_accepts_pre_path_hash_partial_filename() {
         "cp",
         "--results",
         &t.s("results"),
-        "--tuning-options=copy-path=ranges",
+        "--performance-tuning=copy-path=ranges",
         "--srcs-in",
         &t.s("src"),
         "--into",

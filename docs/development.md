@@ -198,6 +198,20 @@ cargo test --bin syq
 Also run integration tests that exercise your change. SSH, remote-helper,
 enrollment, receiver, transport, and remote-coordinator changes need
 `scripts/test-real-ssh.sh`; see the [real-SSH test setup](https://github.com/greaber/syq/blob/master/tests/real-ssh/README.md).
+Object-storage changes also need `scripts/test-s3.sh`, which starts a pinned,
+disposable MinIO container on loopback and checks interoperability and resume.
+With provider credentials and an existing bucket, run
+`python3 tests/object-storage/check.py target/debug/syq` with
+`AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `SYQ_TEST_BUCKET` set. Optional `SYQ_TEST_HEADERS`
+is a JSON object of headers. The test creates a unique `syq-tests/` prefix and
+removes only its own objects and multipart uploads. To compare an optimized
+build with s5cmd under the same environment, run
+`python3 tests/object-storage/benchmark.py target/release/syq --s5cmd /path/to/s5cmd --output target/s3-benchmark.json`.
+It alternates tool order, checks downloaded bytes, and removes its test prefix.
+The benchmark requires Python 3.11 or newer. If your provider requires a custom
+header, ensure both clients send it: stock s5cmd has no arbitrary-header option.
+
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.
 

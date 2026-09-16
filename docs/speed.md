@@ -37,7 +37,7 @@ To try your own syq options, put them after `--`:
 
 ```sh
 bash try-benchmark.sh --yes --mode pull --host server --tool syq --rounds 1 \
-  -- --no-tcp --connections 1 -v
+  -- --no-tcp --performance-tuning workers=1 -v
 ```
 
 These options also apply to setup and warm-up copies. Path, removal, and
@@ -132,10 +132,10 @@ for how the source and destination filesystems affect performance.
 
 ## Limit bandwidth
 
-Use `--bwlimit` to leave bandwidth for other work:
+Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work:
 
 ```sh
-syq cp data --to server --into /backup --bwlimit 10M
+syq cp data --to server --into /backup --resource-limits bandwidth=10M
 ```
 
 This limits file data to 10 MiB/s across the copy's workers. It controls the

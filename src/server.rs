@@ -373,6 +373,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let is_control = matches!(&role, ConnectionRole::Control);
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
+    if let Some(authority) = &authority {
+        ops.set_hash_policy(authority.hash_policy());
+    }
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
