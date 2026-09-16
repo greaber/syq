@@ -106,6 +106,8 @@ checks that digest, when present, before publishing a download. Choose its
 algorithm with `--hash-algorithm`. A single-part upload shares this computation
 with the provider checksum when their algorithms match. Multipart provider
 checksums cover individual parts and cannot replace an expected whole-file hash.
+When an upload has an expected digest, syq stores and reuses that digest for
+whole-file checks, avoiding a second whole-file hash with another algorithm.
 
 `--expected-hash ALGORITHM:HEX` checks one selected regular file, including an
 existing destination that passes the usual size/time quick check. Explicit
