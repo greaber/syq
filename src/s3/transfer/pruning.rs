@@ -7,6 +7,7 @@ struct Candidate {
     // An S3 marker retains its trailing slash; local directories do not.
     key: Option<String>,
     kind: &'static str,
+    identity: Option<(u64, u64)>,
 }
 
 impl Engine {
@@ -16,14 +17,73 @@ impl Engine {
         destination: Option<&Destination>,
     ) -> Result<()> {
         self.check_cancelled()?;
+        if !self.args.delete {
+            return Ok(());
+        }
+        if self.progress.errors.load(Relaxed) != 0 {
+            self.progress
+                .eprintln("syq: copy or scan reported errors; skipping deletions");
+            return Ok(());
+        }
         if plan.scopes.is_empty() {
             return Ok(());
         }
+        let found = match self.deletion_candidates(&mut plan, destination).await {
+            Ok(found) => found,
+            Err(error) => {
+                self.check_cancelled()?;
+                self.progress.error(&format!("plan deletions: {error:#}"));
+                self.progress
+                    .eprintln("syq: destination walk reported errors; skipping deletions");
+                return Ok(());
+            }
+        };
+        let count = found.len() as u64;
+        self.progress.deletions_planned.store(count, Relaxed);
+        if self.args.max_delete.is_some_and(|max| count > max) {
+            self.progress.deletions_blocked.store(count, Relaxed);
+            for c in &found {
+                self.deletion_record(c, "blocked", Some("safety_limit"), None);
+            }
+            return Err(prune::Limit.into());
+        }
+        if destination.is_none() && !self.args.dry_run {
+            self.delete_objects(&found).await?;
+        } else {
+            for candidate in found {
+                self.check_cancelled()?;
+                let result = if self.args.dry_run {
+                    Ok(())
+                } else {
+                    let root = &destination.unwrap().root;
+                    let path = RelativePath::new(&candidate.path)?;
+                    if candidate.kind == "dir" {
+                        root.remove_directory(&path)
+                    } else {
+                        root.unlink(&path)
+                    }
+                };
+                self.deletion_finished(&candidate, result, "io");
+            }
+        }
+        Ok(())
+    }
+
+    async fn deletion_candidates(
+        &self,
+        plan: &mut Plan,
+        destination: Option<&Destination>,
+    ) -> Result<Vec<Candidate>> {
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
-        // Preserve alternate spellings and hard-link aliases of claimed local paths.
         let mut identities = BTreeSet::new();
+        // Claims outside the walked scopes can still have aliases inside them.
         if let Some(dst) = destination {
-            for path in &plan.claims {
+            for path in plan.claimed_paths().filter(|path| {
+                !plan
+                    .scopes
+                    .iter()
+                    .any(|(scope, _)| prune::beneath(path, scope).is_some())
+            }) {
                 if let Some(meta) = metadata_optional(&dst.root, &RelativePath::new(path)?)? {
                     identities.insert((meta.dev, meta.ino));
                 }
@@ -39,19 +99,19 @@ impl Engine {
                     if !seen.insert(path.clone()) {
                         continue;
                     }
-                    if plan.shields(&path) {
-                        continue;
-                    }
                     let rel = RelativePath::new(&path)?;
                     let Some(meta) = metadata_optional(&dst.root, &rel)? else {
                         continue;
                     };
-                    let directory = meta.is_dir();
-                    if prune::recovery(&path) || plan.ignores(&path, directory, matcher.as_ref()) {
-                        plan.protect(&path);
+                    if plan.keeps(&path) {
+                        identities.insert((meta.dev, meta.ino));
+                    }
+                    if plan.shields(&path) {
                         continue;
                     }
-                    if !plan.keeps(&path) && identities.contains(&(meta.dev, meta.ino)) {
+                    let directory = meta.is_dir();
+                    if prune::recovery(&path) || plan.ignores(&path, directory, matcher.as_ref()) {
+                        self.kept_recovery(&path);
                         plan.protect(&path);
                         continue;
                     }
@@ -68,6 +128,7 @@ impl Engine {
                     found.push(Candidate {
                         path,
                         key: None,
+                        identity: Some((meta.dev, meta.ino)),
                         kind: if directory {
                             "dir"
                         } else if meta.is_symlink() {
@@ -82,8 +143,15 @@ impl Engine {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
-                for (key, size) in client::list(&self.client, &self.options.bucket, &prefix).await?
-                {
+                let listed = match self.upload_keys.get() {
+                    Some(keys) => keys
+                        .iter()
+                        .filter(|(key, _)| key.starts_with(&prefix))
+                        .map(|(key, size)| (key.clone(), *size))
+                        .collect(),
+                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                };
+                for (key, size) in listed {
                     self.check_cancelled()?;
                     anyhow::ensure!(
                         key.starts_with(&prefix),
@@ -98,91 +166,124 @@ impl Engine {
                     } else {
                         &key
                     };
-                    // Reject keys that cannot be interpreted under the same path rules as copying.
-                    local::key_path(path.as_bytes())?;
                     let path = path.as_bytes().to_vec();
                     if prune::recovery(&path) || plan.ignores(&path, directory, matcher.as_ref()) {
+                        self.kept_recovery(&path);
                         plan.protect(&path);
+                        continue;
                     }
+                    // Ignored keys need not be representable as local paths.
+                    local::key_path(&path)?;
                     found.push(Candidate {
                         path,
                         key: Some(key),
+                        identity: None,
                         kind: if directory { "dir" } else { "file" },
                     });
                 }
             }
         }
-        found.retain(|c| !plan.keeps(&c.path));
-        // Children first. Never recursively remove a directory: a new child must cause failure.
-        found.sort_by(|a, b| b.path.cmp(&a.path));
-        let count = found.len() as u64;
-        self.progress.deletions_planned.store(count, Relaxed);
-        if self.args.max_delete.is_some_and(|max| count > max) {
-            self.progress.deletions_blocked.store(count, Relaxed);
-            for c in &found {
-                self.deletion_record(c, "blocked", Some("safety_limit"), None);
+        for c in &found {
+            if !plan.keeps(&c.path) && c.identity.is_some_and(|id| identities.contains(&id)) {
+                plan.protect(&c.path);
             }
-            return Err(prune::Limit.into());
         }
-        for candidate in found {
-            self.check_cancelled()?;
-            let result = if self.args.dry_run {
-                Ok(())
-            } else if let Some(key) = &candidate.key {
-                self.client
-                    .delete_object()
-                    .bucket(&self.options.bucket)
-                    .key(key)
-                    .send()
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+        found.retain(|c| {
+            if c.key.is_some() {
+                !plan.keeps_object(&c.path, c.kind == "dir")
             } else {
-                let root = &destination.unwrap().root;
-                let path = RelativePath::new(&candidate.path)?;
-                if candidate.kind == "dir" {
-                    root.remove_directory(&path)
-                } else {
-                    root.unlink(&path)
-                }
-            };
-            match result {
-                Ok(()) => {
-                    self.progress.deletions_completed.fetch_add(1, Relaxed);
-                    if self.args.verbose > 0 {
-                        self.progress.println(&format!(
-                            "{} {}",
-                            if self.args.dry_run {
-                                "would delete"
-                            } else {
-                                "deleted"
-                            },
-                            String::from_utf8_lossy(&candidate.path)
-                        ));
-                    }
-                    self.deletion_record(&candidate, "succeeded", None, None);
-                }
-                Err(error) => {
-                    let message = format!(
-                        "delete {}: {error:#}",
-                        String::from_utf8_lossy(&candidate.path)
-                    );
-                    self.progress.error(&message);
-                    self.deletion_record(
-                        &candidate,
-                        "failed",
-                        Some(if destination.is_some() {
-                            "io"
+                !plan.keeps(&c.path)
+            }
+        });
+        // Children first; never recursively remove a local directory.
+        found.sort_by(|a, b| b.path.cmp(&a.path));
+        Ok(found)
+    }
+
+    fn kept_recovery(&self, path: &[u8]) {
+        if self.args.verbose > 0 && prune::recovery(path) {
+            self.progress.println(&format!(
+                "keeping recovery entry {}",
+                String::from_utf8_lossy(path)
+            ));
+        }
+    }
+
+    async fn delete_objects(&self, candidates: &[Candidate]) -> Result<()> {
+        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+        for batch in candidates.chunks(1000) {
+            self.check_cancelled()?;
+            let objects = batch
+                .iter()
+                .map(|c| {
+                    ObjectIdentifier::builder()
+                        .key(c.key.as_ref().unwrap())
+                        .build()
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let result = self
+                .client
+                .delete_objects()
+                .bucket(&self.options.bucket)
+                .delete(
+                    Delete::builder()
+                        .set_objects(Some(objects))
+                        .quiet(false)
+                        .build()?,
+                )
+                .send()
+                .await;
+            for c in batch {
+                let key = c.key.as_deref().unwrap();
+                let outcome = match &result {
+                    Err(error) => Err(anyhow::anyhow!("{error}")),
+                    Ok(response) => {
+                        if let Some(error) = response.errors().iter().find(|e| e.key() == Some(key))
+                        {
+                            Err(anyhow::anyhow!(
+                                "{}: {}",
+                                error.code().unwrap_or("S3 deletion error"),
+                                error.message().unwrap_or("")
+                            ))
+                        } else if response.deleted().iter().any(|d| d.key() == Some(key)) {
+                            Ok(())
                         } else {
-                            "transport"
-                        }),
-                        Some(&message),
-                    );
-                    break;
-                }
+                            Err(anyhow::anyhow!("S3 deletion response omitted key {key:?}"))
+                        }
+                    }
+                };
+                self.deletion_finished(c, outcome, "transport");
             }
         }
         Ok(())
+    }
+
+    fn deletion_finished(&self, candidate: &Candidate, result: Result<()>, class: &'static str) {
+        match result {
+            Ok(()) => {
+                self.progress.deletions_completed.fetch_add(1, Relaxed);
+                if self.args.verbose > 0 {
+                    self.progress.println(&format!(
+                        "{} {}",
+                        if self.args.dry_run {
+                            "would delete"
+                        } else {
+                            "deleted"
+                        },
+                        String::from_utf8_lossy(&candidate.path)
+                    ));
+                }
+                self.deletion_record(candidate, "succeeded", None, None);
+            }
+            Err(error) => {
+                let message = format!(
+                    "delete {}: {error:#}",
+                    String::from_utf8_lossy(&candidate.path)
+                );
+                self.progress.error(&message);
+                self.deletion_record(candidate, "failed", Some(class), Some(&message));
+            }
+        }
     }
 
     fn deletion_record(

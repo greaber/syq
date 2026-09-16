@@ -324,8 +324,10 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             if args.delete {
                 if source.kind() == "dir" {
                     prune.claim(source.key.as_bytes());
-                } else {
+                } else if args.existing || args.ignore_existing {
                     prune.protect(source.key.as_bytes());
+                } else {
+                    prune.claim_file(source.key.as_bytes());
                 }
             }
             if source.kind() == "dir" {

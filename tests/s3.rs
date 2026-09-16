@@ -148,22 +148,59 @@ fn serve(
     );
     if fault.starts_with("prune-") {
         if method == "GET" {
-            let key = if fault == "prune-outside" {
-                "elsewhere/extra"
-            } else {
-                "mirror/extra"
+            let keys: Vec<String> = match fault {
+                "prune-outside" => vec!["elsewhere/extra".into()],
+                "prune-invalid" => vec!["mirror/bad//key".into()],
+                "prune-folder-content" => vec!["mirror/bad/".into()],
+                "prune-batch" | "prune-request-failure" => {
+                    (0..1001).map(|i| format!("mirror/extra{i:04}")).collect()
+                }
+                "prune-mixed" => vec!["mirror/extra".into(), "mirror/good".into()],
+                _ => vec!["mirror/extra".into()],
             };
-            let body = format!("<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>{key}</Key><Size>0</Size></Contents></ListBucketResult>");
+            let contents = keys
+                .iter()
+                .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+                .collect::<String>();
+            let body = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+            );
             reply(&mut socket, 200, &[], body.as_bytes(), false);
         } else {
-            assert_eq!(method, "DELETE");
-            reply(
-                &mut socket,
-                403,
-                &[],
-                b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
-                false,
-            );
+            assert_eq!(method, "POST");
+            assert!(first.contains("delete"));
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let keys: Vec<_> = body
+                .split("<Key>")
+                .skip(1)
+                .map(|s| s.split("</Key>").next().unwrap())
+                .collect();
+            assert!(!keys.is_empty() && keys.len() <= 1000);
+            if fault == "prune-denied" || (fault == "prune-request-failure" && keys.len() == 1000) {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                    false,
+                );
+            } else {
+                let entries = keys.iter().map(|key| if fault == "prune-mixed" && *key == "mirror/extra" {
+                    format!("<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>denied</Message></Error>")
+                } else {
+                    format!("<Deleted><Key>{key}</Key></Deleted>")
+                }).collect::<String>();
+                reply(
+                    &mut socket,
+                    200,
+                    &[],
+                    format!("<DeleteResult>{entries}</DeleteResult>").as_bytes(),
+                    false,
+                );
+            }
         }
         return;
     }
@@ -1223,8 +1260,12 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
 
 #[test]
 fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
-    for (fault, code, requests, planned) in [("prune-denied", 23, 2, 1), ("prune-outside", 1, 1, 0)]
-    {
+    for (fault, code, requests, planned) in [
+        ("prune-denied", 23, 2, 1),
+        ("prune-outside", 23, 1, 0),
+        ("prune-invalid", 23, 1, 0),
+        ("prune-folder-content", 23, 1, 0),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("empty")).unwrap();
         let server = Server::start(fault);
@@ -1292,4 +1333,94 @@ fn s3_prune_limit_refuses_without_sending_delete() {
     assert_eq!(result["deletions_planned"], 1);
     assert_eq!(result["deletions_blocked"], 1);
     assert_eq!(result["deletions_completed"], 0);
+}
+
+#[test]
+fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
+    for (fault, code, planned, completed, requests) in [
+        ("prune-batch", 0, 1001, 1001, 3),
+        ("prune-mixed", 23, 2, 1, 2),
+        ("prune-request-failure", 23, 1001, 1, 3),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--srcs-in",
+                "empty",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "mirror",
+                "--prune",
+                "--results",
+                "results.ndjson",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let text = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(records.last().unwrap()["deletions_planned"], planned);
+        assert_eq!(records.last().unwrap()["deletions_completed"], completed);
+        assert_eq!(
+            records.iter().filter(|r| r["action"] == "delete").count(),
+            planned as usize
+        );
+    }
+}
+
+#[test]
+fn s3_prune_can_ignore_unrepresentable_destination_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("empty")).unwrap();
+    let server = Server::start("prune-invalid");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--ignore",
+            "bad/",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--delete-excluded",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--delete-excluded'")
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
 }

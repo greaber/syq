@@ -51,6 +51,70 @@ def check():
         c.run([source / 'keep', '--to', remote, '--into', named + '/other', '--prune'])
         assert named + '/other/extra' in c.listing()
 
+        # Mirror both type changes without leaving an object/prefix collision.
+        changes = root / 'changes'
+        changes.mkdir()
+        (changes / 'file').write_bytes(b'new file')
+        (changes / 'dir').mkdir()
+        (changes / 'dir/child').write_bytes(b'new child')
+        changed = c.PREFIX + '/changed'
+        c.request('PUT', changed + '/file/')
+        c.request('PUT', changed + '/file/stale', b'old child')
+        c.request('PUT', changed + '/dir', b'old file')
+        c.run(['--srcs-in', changes, '--to', remote, '--into', changed, '--prune'])
+        assert set(c.listing(changed + '/')) == {changed + '/' + key for key in ['file', 'dir/', 'dir/child']}
+        c.run(['--from', remote, '--srcs-in', changed, '--into', root / 'roundtrip'])
+        assert (root / 'roundtrip/file').read_bytes() == b'new file'
+        assert (root / 'roundtrip/dir/child').read_bytes() == b'new child'
+
+        # Final read-only directory metadata must not block pruning children.
+        modes = root / 'modes'
+        modes.mkdir()
+        (modes / 'keep').write_bytes(b'keep')
+        modes.chmod(0o555)
+        mode_prefix = c.PREFIX + '/modes'
+        c.run(['--preserve=permissions', modes, '--to', remote, '--as', mode_prefix])
+        mode_dst = root / 'mode-dst'
+        mode_dst.mkdir()
+        (mode_dst / 'extra').write_bytes(b'extra')
+        c.run(['--preserve=permissions', '--from', remote, mode_prefix, '--as', mode_dst, '--prune'])
+        assert not (mode_dst / 'extra').exists()
+        assert mode_dst.stat().st_mode & 0o777 == 0o555
+        mode_dst.chmod(0o755)
+        modes.chmod(0o755)
+
+        # A failed local deletion must not stop unrelated later candidates.
+        if os.geteuid() != 0:
+            stubborn = mode_dst / 'z-stubborn'
+            stubborn.mkdir()
+            (stubborn / 'child').write_bytes(b'keep on failure')
+            stubborn.chmod(0o555)
+            (mode_dst / 'a-extra').write_bytes(b'extra')
+            failed = c.run(['--from', remote, '--srcs-in', mode_prefix, '--into', mode_dst, '--prune'], ok=False, capture=True)
+            assert failed.returncode == 23, failed.stderr
+            assert not (mode_dst / 'a-extra').exists()
+            assert (stubborn / 'child').exists()
+            stubborn.chmod(0o755)
+            # An unreadable destination must suppress all deletions, after copying.
+            stubborn.chmod(0)
+            (mode_dst / 'a-extra').write_bytes(b'preserve')
+            failed = c.run(['--from', remote, '--srcs-in', mode_prefix, '--into', mode_dst, '--prune'], ok=False, capture=True)
+            assert failed.returncode == 23, failed.stderr
+            assert 'skipping deletions' in failed.stderr
+            assert (mode_dst / 'a-extra').exists()
+            stubborn.chmod(0o755)
+
+        # Alias preservation must not depend on destination enumeration order.
+        aliases = root / 'aliases'
+        aliases.mkdir()
+        (aliases / 'keep').write_bytes(b'keep')
+        for name in ['a-alias', 'z-alias']:
+            os.link(aliases / 'keep', aliases / name)
+        (aliases / 'extra').write_bytes(b'extra')
+        c.run(['--from', remote, '--srcs-in', mode_prefix, '--into', aliases, '--prune', '--only-new'])
+        assert (aliases / 'a-alias').exists() and (aliases / 'z-alias').exists()
+        assert not (aliases / 'extra').exists()
+
         dst = root / 'dst'
         dst.mkdir()
         for name in ['extra', 'small', '.syq-s3-test.partial']:
@@ -96,7 +160,8 @@ def check():
         (dst / 'keep').mkdir()
         (dst / 'keep/obstacle').write_bytes(b'cannot replace')
         (dst / 'extra').write_bytes(b'must stay')
-        c.run(download, ok=False)
+        failed = c.run(download, ok=False, capture=True)
+        assert 'skipping deletions' in failed.stderr
         assert (dst / 'extra').exists()
         # --only-new protects the entire skipped destination entry.
         c.run(download + ['--only-new'])

@@ -6,6 +6,7 @@ pub(super) struct Plan {
     pub scopes: Vec<(Vec<u8>, Vec<u8>)>,
     pub claims: BTreeSet<Vec<u8>>,
     protected: BTreeSet<Vec<u8>>,
+    files: BTreeSet<Vec<u8>>,
 }
 
 pub(super) fn beneath<'a>(path: &'a [u8], root: &[u8]) -> Option<&'a [u8]> {
@@ -25,18 +26,41 @@ impl Plan {
     }
     pub fn claim(&mut self, path: &[u8]) {
         self.claims.insert(path.to_vec());
-        for (i, &c) in path.iter().enumerate() {
-            if c == b'/' {
-                self.claims.insert(path[..i].to_vec());
-            }
+    }
+    pub fn claim_file(&mut self, path: &[u8]) {
+        self.files.insert(path.to_vec());
+    }
+    fn ancestor(&self, path: &[u8]) -> bool {
+        let mut prefix = path.to_vec();
+        if !prefix.is_empty() {
+            prefix.push(b'/');
         }
+        [&self.claims, &self.files].into_iter().any(|set| {
+            set.range(prefix.clone()..)
+                .next()
+                .is_some_and(|p| p.starts_with(&prefix))
+        })
+    }
+    pub fn keeps_object(&self, path: &[u8], directory: bool) -> bool {
+        self.shields(path)
+            || if directory {
+                self.claims.contains(path) || self.ancestor(path)
+            } else {
+                self.files.contains(path)
+            }
+    }
+    pub fn claimed_paths(&self) -> impl Iterator<Item = &[u8]> {
+        self.claims.iter().chain(&self.files).map(Vec::as_slice)
     }
     pub fn protect(&mut self, path: &[u8]) {
         self.claim(path);
         self.protected.insert(path.to_vec());
     }
     pub fn keeps(&self, path: &[u8]) -> bool {
-        self.claims.contains(path) || self.shields(path)
+        self.claims.contains(path)
+            || self.files.contains(path)
+            || self.ancestor(path)
+            || self.shields(path)
     }
     pub fn shields(&self, path: &[u8]) -> bool {
         self.protected.contains(path)
@@ -71,12 +95,22 @@ impl Plan {
     }
 }
 
+const PARTIAL_PREFIX: &str = ".syq-s3-";
+const PARTIAL_SUFFIX: &str = ".partial";
+pub(super) fn partial_name(random: &[u8]) -> String {
+    format!(
+        "{PARTIAL_PREFIX}{}{PARTIAL_SUFFIX}",
+        blake3::hash(random).to_hex()
+    )
+}
+
 pub(super) fn recovery(path: &[u8]) -> bool {
     path.split(|c| *c == b'/').any(|name| {
         let name = OsStr::from_bytes(name);
         crate::fsops::is_partial_name(name)
             || crate::fsops::is_recovery_name(name)
-            || (name.as_bytes().starts_with(b".syq-s3-") && name.as_bytes().ends_with(b".partial"))
+            || (name.as_bytes().starts_with(PARTIAL_PREFIX.as_bytes())
+                && name.as_bytes().ends_with(PARTIAL_SUFFIX.as_bytes()))
     })
 }
 
@@ -92,6 +126,22 @@ impl std::error::Error for Limit {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_and_prefix_claims_are_distinct() {
+        let mut plan = Plan::default();
+        plan.scope(b"root", b"source");
+        plan.claim_file(b"root/file");
+        plan.claim(b"root/dir");
+        plan.claim_file(b"root/dir/child");
+        assert!(plan.keeps_object(b"root/file", false));
+        assert!(!plan.keeps_object(b"root/file", true));
+        assert!(!plan.keeps_object(b"root/file/old", false));
+        assert!(plan.keeps_object(b"root/dir", true));
+        assert!(!plan.keeps_object(b"root/dir", false));
+        assert!(plan.keeps(b"root"));
+        assert_eq!(plan.claims.len(), 2);
+    }
 
     #[test]
     fn protected_children_keep_ancestors_without_protecting_siblings() {

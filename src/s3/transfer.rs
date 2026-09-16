@@ -26,7 +26,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::Read,
     os::unix::fs::{FileExt, MetadataExt},
@@ -43,7 +43,7 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
-    upload_keys: OnceLock<HashSet<String>>,
+    upload_keys: OnceLock<HashMap<String, u64>>,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -158,12 +158,25 @@ impl Engine {
                 } else {
                     format!("{target}/")
                 };
-                let keys = client::list(&self.client, &self.options.bucket, &prefix)
-                    .await?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
-                let _ = self.upload_keys.set(keys);
+                let listing = client::list(&self.client, &self.options.bucket, &prefix)
+                    .await
+                    .and_then(|keys| {
+                        anyhow::ensure!(
+                            keys.iter().all(|(key, _)| key.starts_with(&prefix)),
+                            "S3 listing returned a key outside the requested prefix"
+                        );
+                        Ok(keys)
+                    });
+                match listing {
+                    Ok(keys) => {
+                        let _ = self.upload_keys.set(keys.into_iter().collect());
+                    }
+                    Err(error) if self.args.delete => {
+                        self.progress
+                            .error(&format!("list S3 destination: {error:#}"));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
             self.tuning.observe_control(planning.elapsed());
@@ -195,9 +208,7 @@ impl Engine {
                 }
             })
             .await?;
-            if self.args.delete && self.progress.errors.load(Relaxed) == 0 {
-                self.prune(prune, None).await?;
-            }
+            self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let planning = std::time::Instant::now();
@@ -236,15 +247,11 @@ impl Engine {
                 }
             })
             .await?;
-            // Finish copying metadata before authorizing removals. Restore it
-            // again after pruning, which can change directory modification times.
+            // Prune while directories are writable, then restore their modes and times.
+            // Apply metadata even when the deletion budget refuses pruning.
+            let pruned = self.prune(prune, Some(&destination)).await;
             self.finish_directories(&destination, &directories).await?;
-            if self.args.delete && self.progress.errors.load(Relaxed) == 0 {
-                self.prune(prune, Some(&destination)).await?;
-                if self.progress.deletions_completed.load(Relaxed) != 0 {
-                    self.finish_directories(&destination, &directories).await?;
-                }
-            }
+            pruned?;
         }
         Ok(())
     }
@@ -444,7 +451,7 @@ impl Engine {
         let existing = if self
             .upload_keys
             .get()
-            .is_some_and(|keys| !keys.contains(&source.key))
+            .is_some_and(|keys| !keys.contains_key(&source.key))
         {
             None
         } else {
@@ -1706,11 +1713,7 @@ impl Engine {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
         let partial = RelativePath::new(
-            local::join(
-                parent,
-                &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-            )
-            .as_bytes(),
+            local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
         let file = Arc::new(root.create_file(&partial, 0o600)?);
         let _cleanup = PartialCleanup {
@@ -1779,10 +1782,7 @@ impl Engine {
         let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
-        let partial = local::join(
-            parent,
-            &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-        );
+        let partial = local::join(parent, &super::prune::partial_name(&random));
         let file = root.create_file(&RelativePath::new(partial.as_bytes())?, 0o600)?;
         file.set_len(object.size)?;
         let m = file.metadata()?;
