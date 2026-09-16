@@ -331,9 +331,41 @@ copies, syq still compares blocks when size or modification time differs,
 even without `--hash`, so it can reuse unchanged data. Local and small copies
 may use faster paths instead.
 
-Transferred data is always checked for corruption. For files being changed by
-another program, stop the writer or copy a snapshot. No copy makes the whole
-tree transactional or guarantees durability across power loss.
+`--hash-algorithm` chooses `blake3` (the default), `sha256`, `md5`, or
+`xxh3-128` for content comparisons and optional transfer checks. Choosing an
+algorithm does not enable `--hash`. MD5 supports compatibility with existing
+file manifests; XXH3-128 is a fast noncryptographic checksum. Neither provides
+cryptographic collision resistance.
+
+Syq's extra payload checksums are opt-in with `--transfer-integrity`. This is
+independent of encryption: SSH and encrypted TCP retain their transport
+protection, and `--tcp-plain` does not enable payload checksums automatically.
+Same-host copies keep their kernel-copy and whole-file shortcuts. Use
+`--expected-hash` when you need to validate the complete local result.
+Comparisons for `--hash`, verification, and reuse of existing data still hash
+contents when needed, even without `--transfer-integrity`.
+
+To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
+with one named regular file:
+
+```sh
+syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
+```
+
+This checks all resulting bytes, including reused data, before reporting success;
+a metadata match alone is insufficient. When size and modification time match,
+syq validates the existing destination and skips copying if its digest matches.
+Otherwise it copies and validates the result; a mismatch fails that file. With normal
+staging, validation happens before replacing the destination. With `--inplace`,
+the file has already been modified when validation finishes. Use
+[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
+filters still exclude files, and excluded files are not digest-verified.
+The expected digest's algorithm can differ from `--hash-algorithm`. Dry runs
+preview changes without validating the expectation.
+
+For files being changed by another program, stop the writer or copy a snapshot.
+No copy makes the whole tree transactional or guarantees durability across
+power loss.
 
 To compare without writing, use `--verify-only`:
 

@@ -266,6 +266,15 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
+    /// Algorithm for file content comparisons and optional transfer checks
+    #[arg(long = "syq-hash-algorithm", value_enum, default_value = "blake3")]
+    pub hash_algorithm: crate::hashing::HashAlgorithm,
+    /// Add payload checksums independently of transport encryption
+    #[arg(long = "syq-transfer-integrity")]
+    pub transfer_integrity: bool,
+    /// Require one regular file to match ALGORITHM:HEX
+    #[arg(long = "syq-expected-hash", value_name = "ALGORITHM:HEX")]
+    pub expected_digest: Option<crate::hashing::Digest>,
     /// Syq extension: only compare source and destination contents; transfer nothing
     #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
@@ -490,6 +499,7 @@ impl Args {
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let args = Args::from_arg_matches(&matches)?;
+        validate_expected_hash_selection(&args)?;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
     }
@@ -548,6 +558,34 @@ impl Args {
         }
         f
     }
+}
+
+fn validate_expected_hash_selection(args: &Args) -> Result<()> {
+    if args.expected_digest.is_none() {
+        return Ok(());
+    }
+    let one_file = if args.interface == Interface::Rsync {
+        // Reject selection lists before finish_parse reads files or stdin.
+        args.paths.len() == 2
+            && args.files_from.is_none()
+            && !Location::parse(&args.paths[0])?.copies_contents()
+    } else {
+        args.locations.len() == 2
+            && matches!(
+                args.locations[0].selection,
+                SourceSelection::Named | SourceSelection::NamedNoFollow | SourceSelection::File
+            )
+    };
+    if !one_file {
+        let option = if args.interface == Interface::Rsync {
+            "--syq-expected-hash"
+        } else {
+            "--expected-hash"
+        };
+        bail!("{option} requires one named regular file; use per-file expected_digest values in a mapping for batches");
+    }
+    // The source endpoint checks the actual object kind before copying.
+    Ok(())
 }
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
@@ -834,6 +872,19 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Algorithm for file content comparisons and optional transfer checks
+    #[arg(long, value_enum, default_value = "blake3")]
+    hash_algorithm: crate::hashing::HashAlgorithm,
+    /// Add payload checksums independently of transport encryption
+    #[arg(long)]
+    transfer_integrity: bool,
+    /// Require one regular file to match ALGORITHM:HEX
+    #[arg(
+        long = "expected-hash",
+        value_name = "ALGORITHM:HEX",
+        conflicts_with = "mapping"
+    )]
+    expected_digest: Option<crate::hashing::Digest>,
     /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
@@ -1939,6 +1990,9 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        hash_algorithm,
+        transfer_integrity,
+        expected_digest,
         verify_only,
         ignore_existing,
         existing,
@@ -1959,6 +2013,10 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.hash_algorithm = hash_algorithm;
+    args.transfer_integrity = transfer_integrity;
+    args.expected_digest = expected_digest;
+    validate_expected_hash_selection(args)?;
     args.verify_only = verify_only;
     args.ignore_existing = ignore_existing;
     args.existing = existing;
@@ -2633,10 +2691,150 @@ mod tests {
     }
 
     #[test]
+    fn expected_hash_accepts_native_named_and_file_selectors() {
+        for selectors in [
+            vec!["source"],
+            vec!["--src", "source"],
+            vec!["--src-non-dir", "source"],
+        ] {
+            let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
+            argv.extend(selectors);
+            argv.extend(["--into", "destination"]);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert!(parse_native_copy(&argv).unwrap().expected_digest.is_some());
+        }
+    }
+
+    #[test]
+    fn expected_hash_rejects_native_batch_and_directory_selectors() {
+        for selectors in [
+            vec!["first", "second"],
+            vec!["--srcs-in", "source"],
+            vec!["--src-dir", "source"],
+        ] {
+            let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
+            argv.extend(selectors);
+            argv.extend(["--into", "destination"]);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let error = parse_native_copy(&argv).unwrap_err().to_string();
+            assert!(
+                error.contains("--expected-hash requires one named regular file"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_hash_rejects_rsync_batch_and_contents_before_reading_inputs() {
+        for operands in [
+            vec!["first", "second", "destination"],
+            vec!["source/", "destination"],
+            vec!["host:source/", "destination"],
+            vec![".", "destination"],
+            vec!["source/..", "destination"],
+            vec!["--files-from", "-", "source", "destination"],
+            vec!["--files-from", "/missing/list", "source", "destination"],
+        ] {
+            let mut argv = vec![
+                "--syq-expected-hash",
+                "md5:900150983cd24fb0d6963f7d28e17f72",
+            ];
+            argv.extend(operands);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let error = Args::parse_rsync(&argv).unwrap_err().to_string();
+            assert!(
+                error.contains("--syq-expected-hash requires one named regular file"),
+                "{error}"
+            );
+        }
+        for operands in [
+            ["source", "destination"],
+            ["host:source", "destination"],
+            ["source", "host:destination"],
+        ] {
+            let mut argv = vec![
+                "--syq-expected-hash",
+                "md5:900150983cd24fb0d6963f7d28e17f72",
+            ];
+            argv.extend(operands);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert!(Args::parse_rsync(&argv).unwrap().expected_digest.is_some());
+        }
+    }
+
+    #[test]
+    fn rsync_hash_controls_use_syq_prefix() {
+        let parsed = Args::try_parse_from([
+            "syq",
+            "--syq-hash-algorithm",
+            "xxh3-128",
+            "--syq-transfer-integrity",
+            "--syq-expected-hash",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+            "source",
+            "destination",
+        ])
+        .unwrap();
+        assert_eq!(parsed.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
+        assert!(parsed.transfer_integrity);
+        assert!(parsed.expected_digest.is_some());
+        for option in [
+            "--hash-algorithm=md5",
+            "--transfer-integrity",
+            "--expected-hash=md5:900150983cd24fb0d6963f7d28e17f72",
+        ] {
+            assert!(Args::try_parse_from(["syq", option, "source", "destination"]).is_err());
+        }
+    }
+
+    #[test]
     fn native_hash_selects_content_comparison() {
         let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
         assert!(args.checksum);
+    }
+
+    #[test]
+    fn payload_checks_and_encryption_are_independent() {
+        for plain in [false, true] {
+            for integrity in [false, true] {
+                let mut argv = vec![
+                    "source",
+                    "--into",
+                    "destination",
+                    "--hash-algorithm=xxh3-128",
+                ];
+                if plain {
+                    argv.push("--tcp-plain");
+                }
+                if integrity {
+                    argv.push("--transfer-integrity");
+                }
+                let args = parse_native_copy(
+                    &argv
+                        .iter()
+                        .map(std::ffi::OsString::from)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(args.tcp_plain, plain);
+                assert_eq!(args.transfer_integrity, integrity);
+                assert_eq!(args.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
+                assert!(!args.checksum);
+            }
+        }
     }
 
     #[test]

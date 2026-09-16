@@ -6052,6 +6052,399 @@ fn checksum_repairs_silent_corruption() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn hash_policy_verify_only_expected_mismatch_exits() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--verify-only",
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--results",
+            &t.s("results.ndjson"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    let output = wait_for_control_path_output(child);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("expected md5 hash"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read(&t.path("destination")), b"abc");
+    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+    let terminal: serde_json::Value =
+        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "partial");
+}
+
+#[test]
+fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    let copy = |results: &str| {
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--preserve=permissions",
+            "--expected-hash",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+            "--results",
+            &t.s(results),
+        ]);
+        assert_output_ok(&output);
+        let records = fs::read_to_string(t.path(results)).unwrap();
+        serde_json::from_str::<serde_json::Value>(records.lines().last().unwrap()).unwrap()
+    };
+    let summary = copy("match.jsonl");
+    assert_eq!(summary["files_unchanged"], 1);
+    assert_eq!(summary["bytes_transferred"], 0);
+    let metadata = fs::metadata(t.path("destination")).unwrap();
+    assert_eq!(metadata.ino(), inode, "matching destination was replaced");
+    assert_eq!(metadata.mode() & 0o777, 0o640);
+    // Equal size and mtime must not hide differing bytes.
+    write(&t.path("destination"), b"bad");
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    let summary = copy("repair.jsonl");
+    assert_eq!(summary["bytes_transferred"], 3);
+    assert_eq!(read(&t.path("destination")), b"abc");
+    // --hash must still compare source contents even when the expectation
+    // matches the destination and metadata agrees.
+    write(&t.path("source"), b"bad");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    let output = native_syq(&[
+        "cp",
+        "--hash",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        "md5:900150983cd24fb0d6963f7d28e17f72",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("destination")), b"abc");
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
+    let t = Tmp::new();
+    let contents = prng(5 << 20, 993);
+    write(&t.path("source"), &contents);
+    let correct = format!("blake3:{}", blake3::hash(&contents).to_hex());
+    let wrong = format!("blake3:{}", "0".repeat(64));
+    for (name, expected, succeeds) in [
+        ("plain", None, true),
+        ("expected", Some(correct.as_str()), true),
+        ("mismatch", Some(wrong.as_str()), false),
+    ] {
+        write(&t.path(name), b"previous contents");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s(name),
+            "--transfer-integrity",
+            "--hash-algorithm=xxh3-128",
+        ]);
+        if let Some(expected) = expected {
+            command.args(["--expected-hash", expected]);
+        }
+        let output = command
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+            .run()
+            .unwrap();
+        if succeeds {
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path(name)), contents);
+            let observed = tuning_observed(&output);
+            assert_eq!(observed["local_whole_files"], 1);
+            assert_eq!(observed["range_requests"], 0);
+        } else {
+            assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+            assert!(
+                stderr_of(&output).contains("expected blake3 hash"),
+                "{}",
+                stderr_of(&output)
+            );
+            assert_eq!(read(&t.path(name)), b"previous contents");
+        }
+    }
+}
+
+#[test]
+fn hash_policy_expected_mismatch_preserves_destination() {
+    for size in [3, 5 * 1024 * 1024] {
+        let t = Tmp::new();
+        write(&t.path("source"), &vec![b'n'; size]);
+        write(&t.path("destination"), b"previous contents");
+        let output = native_syq(&[
+            "cp",
+            "--src",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--results",
+            &t.s("results.ndjson"),
+        ]);
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("expected"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(read(&t.path("destination")), b"previous contents");
+        let results = fs::read_to_string(t.path("results.ndjson")).unwrap();
+        assert_automation_stream(
+            &automation_validator(),
+            &results,
+            "expected digest mismatch",
+        );
+        let failed: serde_json::Value = results
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "operation_result" && record["disposition"] == "failed"
+            })
+            .unwrap();
+        assert_eq!(
+            failed["expected_digest"],
+            serde_json::json!({"algorithm": "md5", "value": "0".repeat(32)})
+        );
+    }
+}
+
+#[test]
+fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
+    let validator = automation_validator();
+    let mut record = serde_json::json!({
+        "schema": "syq.automation", "schema_version": 1, "seq": 1,
+        "type": "operation_result", "action": "transfer_file", "kind": "file",
+        "dst": {"encoding": "utf-8", "value": "file"}, "disposition": "failed",
+    });
+    assert!(
+        validator.is_valid(&record),
+        "old records need no expectation"
+    );
+    for (algorithm, length) in [
+        ("blake3", 64),
+        ("sha256", 64),
+        ("md5", 32),
+        ("xxh3-128", 32),
+    ] {
+        record["expected_digest"] =
+            serde_json::json!({"algorithm": algorithm, "value": "a".repeat(length)});
+        assert!(validator.is_valid(&record), "{record}");
+        record["expected_digest"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
+        assert!(!validator.is_valid(&record), "{record}");
+        record["expected_digest"]["value"] = "g".repeat(length).into();
+        assert!(!validator.is_valid(&record), "{record}");
+    }
+    record["expected_digest"] =
+        serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
+    assert!(!validator.is_valid(&record));
+}
+
+#[test]
+fn hash_policy_expected_empty_file_is_checked_before_publication() {
+    let t = Tmp::new();
+    write(&t.path("empty"), b"");
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("empty"),
+        "--as",
+        &t.s("good"),
+        "--expected-hash",
+        "md5:d41d8cd98f00b204e9800998ecf8427e",
+        "--hash-algorithm",
+        "xxh3-128",
+        "--transfer-integrity",
+    ]);
+    assert_eq!(read(&t.path("good")), b"");
+    let output = native_syq(&[
+        "cp",
+        "--src",
+        &t.s("empty"),
+        "--as",
+        &t.s("bad"),
+        "--expected-hash",
+        "md5:00000000000000000000000000000000",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        !t.path("bad").exists(),
+        "a mismatching empty file must not be published"
+    );
+}
+
+#[test]
+fn hash_policy_inplace_mismatch_reports_changed_contents() {
+    let t = Tmp::new();
+    let contents = prng(5 * 1024 * 1024, 991);
+    write(&t.path("source"), &contents);
+    write(&t.path("destination"), &vec![b'o'; contents.len()]);
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    let output = native_syq(&[
+        "cp",
+        "--inplace",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        "md5:00000000000000000000000000000000",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("destination")), contents);
+    assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
+fn hash_policy_xxh3_compares_repairs_and_verifies() {
+    let t = Tmp::new();
+    let contents = prng(5 * 1024 * 1024, 992);
+    let mut bad = contents.clone();
+    bad[1_234_567] ^= 1;
+    write(&t.path("source"), &contents);
+    write(&t.path("destination"), &bad);
+    set_mtime(&t.path("source"), 1_600_000_000);
+    set_mtime(&t.path("destination"), 1_600_000_000);
+    // Selecting the algorithm alone must not imply --hash.
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--hash-algorithm",
+        "xxh3-128",
+    ]);
+    assert_eq!(read(&t.path("destination")), bad);
+    run_native_ok(&[
+        "cp",
+        "--hash",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--hash-algorithm",
+        "xxh3-128",
+        "--transfer-integrity",
+    ]);
+    assert_eq!(read(&t.path("destination")), contents);
+    run_native_ok(&[
+        "cp",
+        "--verify-only",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--hash-algorithm",
+        "xxh3-128",
+    ]);
+    write(&t.path("destination"), &bad);
+    let output = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--hash-algorithm",
+        "xxh3-128",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(
+        read(&t.path("destination")),
+        bad,
+        "verification must not repair"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
+    let t = Tmp::new();
+    let contents = prng(9 * 1024 * 1024 + 123, 993);
+    write(&t.path("source"), &contents);
+    let partial = interrupted_partial(
+        &[
+            "-a",
+            "--block-size",
+            "4M",
+            "--bwlimit",
+            "1G",
+            &t.s("source"),
+            &t.s("destination"),
+        ],
+        &t.0,
+    );
+    let reused = 4 * 1024 * 1024;
+    {
+        let file = File::create(&partial).unwrap();
+        (&file).write_all(&contents[..reused]).unwrap();
+        file.set_len(contents.len() as u64).unwrap();
+    }
+    let expected = format!(
+        "sha256:{}",
+        Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        &expected,
+        "--hash-algorithm",
+        "xxh3-128",
+        "--bwlimit",
+        "1G",
+        "--results",
+        &t.s("results.ndjson"),
+    ]);
+    assert_eq!(read(&t.path("destination")), contents);
+    assert!(
+        partial.exists(),
+        "another invocation's partial remains untouched"
+    );
+    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+    let summary: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert!(
+        summary["bytes_unchanged"].as_u64().unwrap() >= reused as u64,
+        "{summary}"
+    );
+}
+
+#[test]
 fn verify_only_detects_differences() {
     let t = Tmp::new();
     make_tree(&t.path("src"));
@@ -15755,7 +16148,9 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
         else .[] | select(.type == "operation_result"
                           and .disposition == "failed"
                           and .retryable != "no")
-             | {src, dst, kind} end"#;
+             | {src, dst, kind}
+               + (if has("expected_digest") then {expected_digest} else {} end)
+        end"#;
 
 /// Assert the doc contains the complete invocation — flags included — that
 /// the test executes, so an undocumented flag can never make a broken
@@ -15850,11 +16245,14 @@ fn mappings_md_min_size_example_works_verbatim() {
 fn mappings_md_retry_gate_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/ok.txt"), b"ok");
-    let manifest = format!(
-        "{}{}",
-        entry_line("gone.txt", "g.txt", None),
-        entry_line("ok.txt", "ok.txt", None),
-    );
+    let expected = serde_json::json!({
+        "algorithm": "md5",
+        "value": "f2c67381db28fa11c59fe7a6df0f2587",
+    });
+    let mut missing: serde_json::Value =
+        serde_json::from_str(&entry_line("gone.txt", "g.txt", None)).unwrap();
+    missing["expected_digest"] = expected.clone();
+    let manifest = format!("{missing}\n{}", entry_line("ok.txt", "ok.txt", None));
     let cp = syq_cp_in(
         &t.path(""),
         &[
@@ -15878,6 +16276,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     assert!(out.status.success());
     let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
     assert_eq!(retry["dst"]["value"], "g.txt");
+    assert_eq!(retry["expected_digest"], expected);
     // The emitted entry executes as a mapping after the source appears.
     write(&t.path("src/gone.txt"), b"late");
     let cp = syq_cp_in(

@@ -75,6 +75,9 @@ In addition to the shared arguments above, it accepts:
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
+| `hash_algorithm` | `HashAlgorithm` or `"blake3"`, `"sha256"`, `"md5"`, `"xxh3-128"`; chooses ordinary content-comparison hashing; default BLAKE3 |
+| `transfer_integrity` | Boolean: request syq's additional transfer checks; default `False`; independent of transport encryption |
+| `expected_digest` | `Digest` for one regular-file source; with mappings, set it on each `MappingEntry` instead |
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
@@ -192,6 +195,32 @@ remain independent. `map(root=..., srcs_in=...)` carries the selected directory
 as the consuming copy's root. The copy resolves that root again; it does not
 inherit an open directory handle or a snapshot of the source tree.
 
+### Digest and HashAlgorithm
+
+`Digest(algorithm, value)` describes the expected digest of all bytes in one
+regular file. `algorithm` accepts a `HashAlgorithm` value or its string:
+`"blake3"`, `"sha256"`, `"md5"`, or `"xxh3-128"`. `value` is hexadecimal:
+64 digits for BLAKE3 and SHA-256, 32 for MD5 and XXH3-128. The immutable object
+validates the length and characters and stores lowercase hex.
+
+```python
+client.cp(
+    "data.bin", as_="verified.bin",
+    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+)
+```
+
+The expectation covers the complete resulting file, including reused bytes.
+A mismatch fails the file rather than reporting a successful copy. Files excluded
+by selection rules are not digest-verified. `hash=True` still controls whether
+existing contents are compared instead of trusting size and modification time;
+`hash_algorithm` selects the algorithm without enabling that comparison policy.
+Dry runs preview changes without validating the expectation. An expected
+whole-file digest is independent of the algorithm used for block comparison or
+transport checks. MD5 and XXH3-128 are useful for compatibility
+and accidental-error detection, but do not provide cryptographic collision
+resistance. Receiver receipt digests continue to use BLAKE3.
+
 ### MappingEntry
 
 Frozen dataclass describing one source-to-destination mapping. Pass an iterable
@@ -204,10 +233,24 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 | `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
 | `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
+| `expected_digest` | `Digest` or `None` | Expected whole-file digest; requires a regular file; default `None` |
 
-`MappingEntry(src, dst, kind=None, size=None, mtime=None)` also accepts text or
+`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_digest=None)` also accepts text or
 byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
-`mtime` do not impose preconditions on the copy.
+`mtime` do not impose preconditions on the copy. `expected_digest` does: a file
+cannot succeed unless its contents match. For example, an adapter can supply
+an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
+
+```python
+entry = syq.MappingEntry(
+    "cache/object", "data.bin", kind="file",
+    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+)
+client.cp(mapping=[entry], cwd="source", into="download")
+```
+
+Mapping files encode it as `"expected_digest": {"algorithm": "md5", "value": "..."}`.
+Older syq versions that do not support this field reject the mapping.
 
 ### RelativePath and PathValue
 
@@ -368,8 +411,8 @@ It withholds the terminal record if stream validation, process completion, or
 a callback fails. Sink failures raise and abort the operation.
 
 `OperationResult.is_retryable` identifies retryable failures; `retry_entry()`
-returns a `MappingEntry` when a complete mapping identity is available, otherwise
-`None`. Only use collected entries after the call returns a validated `success`
+preserves `expected_digest` and returns a `MappingEntry` when a complete mapping
+identity is available, otherwise `None`. Only use collected entries after the call returns a validated `success`
 or `partial` result. A terminal callback alone does not establish completion.
 The client does not retry automatically.
 
@@ -455,6 +498,7 @@ retryable: Retryability | None
 class_: ErrorClass | None
 os_kind: OsKind | None
 message: str | None
+expected_digest: Digest | None
 provenance: str | None
 scope: int | None
 code: ReceiptCode | None

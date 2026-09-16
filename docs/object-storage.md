@@ -92,8 +92,7 @@ without compression.
 
 A regular file remains an ordinary object body, readable with other S3 tools.
 Syq adds versioned `x-amz-meta-syq-*` fields for its type, permission bits,
-numeric owner/group, modification time with nanoseconds, and, with full integrity,
-a BLAKE3 digest.
+numeric owner/group, modification time with nanoseconds, and an optional content digest.
 Directories use empty objects whose keys end in `/`; symlinks store the link
 target as the body. Directory times and permissions are restored after children.
 
@@ -109,13 +108,35 @@ using the object's modification time and the local umask. A zero-byte key
 ending in `/` is treated as a directory marker. Unknown syq metadata versions
 fail explicitly; syq does not guess how to restore them.
 
-With `--s3-integrity=full` (the default), uploads send checksums for the service to validate: SHA-256, or Content-MD5
-with Cloudflare R2 endpoints. They also record a whole-file BLAKE3 digest.
-Downloads check range boundaries, lengths and object
-identity, then validate the stored digest when present before publishing the
-file. ETags identify the object being read; syq does not assume they are content
-hashes. Without syq metadata, syq cannot supply an independent whole-file digest
-that the object did not contain.
+Uploads send checksums for the service to validate: SHA-256, or Content-MD5
+with Cloudflare R2 endpoints. These provider checks remain active regardless of
+`--transfer-integrity`. Syq reuses their part checksums to identify interrupted
+uploads, without computing another whole-file hash by default. ETags identify
+objects; syq does not assume they are content hashes.
+
+`--transfer-integrity` additionally records a whole-file digest on upload and
+checks that digest, when present, before publishing a download. Choose its
+algorithm with `--hash-algorithm`. A single-part upload shares this computation
+with the provider checksum when their algorithms match. Multipart provider
+checksums cover individual parts and cannot replace an expected whole-file hash.
+When an upload has an expected digest, syq stores and reuses that digest for
+whole-file checks, avoiding a second whole-file hash with another algorithm.
+
+`--expected-hash ALGORITHM:HEX` checks one selected regular file, including an
+existing destination that passes the usual size/time quick check. Explicit
+selection filters such as `--only-new` still exclude files. A mismatch prevents
+publishing the replacement. Downloads can use expected hashes for objects
+uploaded by any tool. For batches, put `expected_digest` on each regular-file
+[mapping entry](mappings.md); failed result records preserve it for retry.
+Resumed or parallel multipart downloads verify the
+assembled temporary file before publication. Without an expected or stored
+digest, syq cannot invent an independent whole-file checksum for an object.
+Download length, range, and object-identity checks always apply; available SDK
+response-checksum checks also remain enabled.
+
+Existing BLAKE3 object metadata remains readable. Other digest algorithms use
+metadata format 2; older syq binaries reject those objects explicitly rather
+than interpreting the digest as BLAKE3.
 
 `--s3-integrity=none` omits payload hashes, optional SDK checksum validation,
 final object rechecks, and resumable recovery records. Uploads use unsigned
@@ -148,7 +169,7 @@ in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
 the destination. Syq checks their identity and rehashes saved ranges before
 reuse. Single-request downloads restart and discard their temporary file on
 failure or cancellation. Existing destination files remain visible until a
-verified replacement is ready.
+replacement has passed the requested checks.
 
 With `--s3-integrity=none`, interrupted files restart. Syq removes download
 partials and attempts to abort failed or interrupted multipart uploads after

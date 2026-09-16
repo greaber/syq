@@ -149,11 +149,24 @@ pub(super) struct Metadata {
     pub mtime: i64,
     pub nsec: u32,
     pub hash: Option<String>,
+    #[serde(default, skip_serializing_if = "is_blake3")]
+    pub hash_algorithm: crate::hashing::HashAlgorithm,
+}
+fn is_blake3(algorithm: &crate::hashing::HashAlgorithm) -> bool {
+    *algorithm == crate::hashing::HashAlgorithm::Blake3
 }
 impl Metadata {
     pub fn encode(&self) -> HashMap<String, String> {
         let mut values = HashMap::from([
-            ("syq-format".into(), "1".into()),
+            (
+                "syq-format".into(),
+                if self.hash.is_some() && !is_blake3(&self.hash_algorithm) {
+                    "2"
+                } else {
+                    "1"
+                }
+                .into(),
+            ),
             ("syq-kind".into(), self.kind.clone()),
             ("syq-mode".into(), self.mode.to_string()),
             ("syq-uid".into(), self.uid.to_string()),
@@ -162,7 +175,15 @@ impl Metadata {
             ("syq-mtime-nsec".into(), self.nsec.to_string()),
         ]);
         if let Some(hash) = &self.hash {
-            values.insert("syq-blake3".into(), hash.clone());
+            if is_blake3(&self.hash_algorithm) {
+                values.insert("syq-blake3".into(), hash.clone());
+            } else {
+                values.insert(
+                    "syq-hash-algorithm".into(),
+                    self.hash_algorithm.as_str().into(),
+                );
+                values.insert("syq-hash".into(), hash.clone());
+            }
         }
         values
     }
@@ -173,7 +194,7 @@ impl Metadata {
         let Some(version) = values.get("syq-format") else {
             return Ok(None);
         };
-        if version != "1" {
+        if version != "1" && version != "2" {
             bail!("unsupported syq object metadata version {version}; use a syq version that supports this format");
         }
         let get = |name| {
@@ -192,13 +213,28 @@ impl Metadata {
             gid: get("syq-gid")?.parse()?,
             mtime: get("syq-mtime")?.parse()?,
             nsec: get("syq-mtime-nsec")?.parse()?,
-            hash: values.get("syq-blake3").cloned(),
+            hash: if version == "1" {
+                values.get("syq-blake3").cloned()
+            } else {
+                Some(get("syq-hash")?.clone())
+            },
+            hash_algorithm: if version == "1" {
+                crate::hashing::HashAlgorithm::Blake3
+            } else {
+                serde_json::from_value(serde_json::Value::String(
+                    get("syq-hash-algorithm")?.clone(),
+                ))?
+            },
         };
         if result.nsec >= 1_000_000_000 || result.mode > 0o7777 {
             bail!("invalid syq object metadata");
         }
         if let Some(hash) = &result.hash {
-            blake3::Hash::from_hex(hash).context("invalid syq object digest")?;
+            let digest = crate::hashing::Digest {
+                algorithm: result.hash_algorithm,
+                value: hash.clone(),
+            };
+            digest.validate().context("invalid syq object digest")?;
         }
         Ok(Some(result))
     }
@@ -321,4 +357,57 @@ pub(super) fn from_get(
         bail!("invalid syq directory marker");
     }
     Ok(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hashing::{Digest, HashAlgorithm};
+
+    #[test]
+    fn legacy_blake3_metadata_remains_readable() {
+        // Literal metadata emitted by the original S3 format, not a round trip
+        // through the current writer.
+        let values = HashMap::from([
+            ("syq-format", "1"),
+            ("syq-kind", "file"),
+            ("syq-mode", "420"),
+            ("syq-uid", "0"),
+            ("syq-gid", "0"),
+            ("syq-mtime", "1700000000"),
+            ("syq-mtime-nsec", "0"),
+            (
+                "syq-blake3",
+                "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            ),
+        ])
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let metadata = Metadata::decode(Some(&values)).unwrap().unwrap();
+        assert_eq!(metadata.hash_algorithm, HashAlgorithm::Blake3);
+        assert_eq!(
+            metadata.hash.unwrap(),
+            Digest::hash_bytes(HashAlgorithm::Blake3, b"").value
+        );
+    }
+
+    #[test]
+    fn alternate_digest_metadata_has_explicit_version_and_algorithm() {
+        let metadata = Metadata {
+            kind: "file".into(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            nsec: 0,
+            hash: Some(Digest::hash_bytes(HashAlgorithm::Md5, b"abc").value),
+            hash_algorithm: HashAlgorithm::Md5,
+        };
+        let values = metadata.encode();
+        assert_eq!(values["syq-format"], "2");
+        assert_eq!(values["syq-hash-algorithm"], "md5");
+        assert!(!values.contains_key("syq-blake3"));
+        assert_eq!(Metadata::decode(Some(&values)).unwrap(), Some(metadata));
+    }
 }

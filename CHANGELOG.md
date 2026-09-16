@@ -12,6 +12,19 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
   a maintainer-run host that counts requests by version, platform, and
   country before redirecting to the GitHub release files. The reminder check
   also honors `DO_NOT_TRACK=1`. See the install guide for what is recorded.
+- Extra transfer integrity checks are now opt-in with `--transfer-integrity`,
+  independently of encryption. Content comparison, resume checks, and required
+  storage-provider checks remain active when needed.
+- Choose BLAKE3, SHA-256, MD5, or XXH3-128 with `--hash-algorithm`. BLAKE3 remains
+  the default; `--hash` still selects content comparison instead of size/time
+  shortcuts.
+- Require a whole-file digest with `--expected-hash ALGORITHM:HEX` or an
+  `expected_digest` on each mapping entry. The Python API supports the same
+  controls and preserves expectations in retry entries. Staged replacements
+  are checked before publication; `--inplace` may leave changed bytes on failure.
+- S3-compatible uploads reuse provider part checksums for recovery, avoiding
+  the separate whole-file BLAKE3 pass by default. Optional whole-file checks
+  share single-part provider hashes when the algorithm matches.
 
 ## 0.6.0 — 2026-09-13
 

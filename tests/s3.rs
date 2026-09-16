@@ -146,6 +146,58 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("upload-") {
+        if method == "HEAD" {
+            reply(&mut socket, 404, &[], b"", true);
+            return;
+        }
+        assert_eq!(method, "PUT");
+        let length: usize = headers["content-length"].parse().unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        assert_eq!(
+            headers["x-amz-checksum-sha256"],
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body))
+        );
+        assert!(!headers.contains_key("x-amz-meta-syq-blake3"));
+        if fault == "upload-default" {
+            assert_eq!(headers["x-amz-meta-syq-format"], "1");
+            assert!(!headers.contains_key("x-amz-meta-syq-hash"));
+        } else {
+            let digest = if fault == "upload-md5" {
+                md5::Md5::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            } else {
+                sha2::Sha256::digest(&body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            };
+            assert_eq!(headers["x-amz-meta-syq-format"], "2");
+            assert_eq!(headers["x-amz-meta-syq-hash"], digest);
+            assert_eq!(
+                headers["x-amz-meta-syq-hash-algorithm"],
+                if fault == "upload-md5" {
+                    "md5"
+                } else {
+                    "sha256"
+                }
+            );
+        }
+        gate.0.store(true, Ordering::Release);
+        reply(
+            &mut socket,
+            200,
+            &[("ETag".into(), "\"uploaded\"".into())],
+            b"",
+            false,
+        );
+        return;
+    }
     if fault == "missing" {
         reply(&mut socket, 404, &[], b"", false);
         return;
@@ -176,6 +228,28 @@ fn serve(
         ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
         ("x-amz-meta-syq-blake3".into(), hash),
     ];
+    if fault.starts_with("single-upload-") {
+        if fault == "single-upload-nohash" {
+            fields.retain(|(key, _)| key != "x-amz-meta-syq-blake3");
+        }
+        if method == "PUT" {
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            gate.0.store(true, Ordering::Release);
+            reply(
+                &mut socket,
+                200,
+                &[("ETag".into(), "\"replaced\"".into())],
+                b"",
+                false,
+            );
+            return;
+        }
+        if method == "GET" {
+            gate.1.store(true, Ordering::Release);
+        }
+    }
     if fault.starts_with("prefix-") {
         let target = first.split_whitespace().nth(1).unwrap();
         let path = target.split('?').next().unwrap();
@@ -271,7 +345,7 @@ fn serve(
     }
     fields.push((
         "Content-Range".into(),
-        format!("bytes {start}-{end}/{SIZE}"),
+        format!("bytes {start}-{end}/{size}"),
     ));
     if fault == "etag" {
         fields[0].1 = "\"different\"".into();
@@ -461,10 +535,11 @@ fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
-        let output = server.cp(
-            temp.path(),
-            &["--from", "s3://bucket", "data", "--as", "download"],
-        );
+        let mut args = vec!["--from", "s3://bucket", "data", "--as", "download"];
+        if fault == "corrupt" {
+            args.push("--transfer-integrity");
+        }
+        let output = server.cp(temp.path(), &args);
         assert!(
             !output.status.success(),
             "{fault}: {}",
@@ -521,6 +596,7 @@ fn s3_bad_responses_preserve_existing_destination() {
         let output = server.cp(
             temp.path(),
             &[
+                "--transfer-integrity",
                 "--from",
                 "s3://bucket",
                 "data",
@@ -606,6 +682,7 @@ fn s3_single_get_validates_metadata_length_and_contents() {
         let output = server.cp(
             temp.path(),
             &[
+                "--transfer-integrity",
                 "--from",
                 "s3://bucket",
                 "object",
@@ -713,6 +790,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
             .command(temp.path())
             .env("AWS_CONFIG_FILE", &config)
             .args([
+                "--transfer-integrity",
                 "--s3-profile",
                 "fixture",
                 "--from",
@@ -737,5 +815,376 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
     assert_eq!(
         records, 2,
         "different providers must not share recovery records"
+    );
+}
+
+#[test]
+fn s3_expected_hash_checks_single_and_multipart_before_publication() {
+    use sha2::Digest as _;
+    for (fault, size) in [("single-ok", 65536), ("ok", SIZE)] {
+        for correct in [true, false] {
+            let server = Server::start(fault);
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("result"), b"original").unwrap();
+            let bytes = vec![if correct { b'x' } else { b'y' }; size];
+            let expected = format!(
+                "md5:{}",
+                md5::Md5::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            let output = server.cp(
+                temp.path(),
+                &[
+                    "--expected-hash",
+                    &expected,
+                    "--from",
+                    "s3://bucket",
+                    "object",
+                    "--as",
+                    "result",
+                ],
+            );
+            assert_eq!(
+                output.status.success(),
+                correct,
+                "{fault}: {}",
+                output_text(&output)
+            );
+            let actual = std::fs::read(temp.path().join("result")).unwrap();
+            assert_eq!(actual, if correct { bytes } else { b"original".to_vec() });
+        }
+    }
+}
+
+#[test]
+fn s3_expected_hash_checks_unchanged_destination_and_recovers_corruption() {
+    use sha2::Digest as _;
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    let expected = format!(
+        "sha256:{}",
+        sha2::Sha256::digest(vec![b'x'; 65536])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let args = [
+        "--expected-hash",
+        &expected,
+        "--from",
+        "s3://bucket",
+        "object",
+        "--as",
+        "result",
+    ];
+    let output = server.cp(temp.path(), &args);
+    assert!(output.status.success(), "{}", output_text(&output));
+    let destination = temp.path().join("result");
+    let time = std::fs::metadata(&destination).unwrap().modified().unwrap();
+    std::fs::write(&destination, vec![b'y'; 65536]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&destination)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+    let output = server.cp(temp.path(), &args);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read(destination).unwrap(), vec![b'x'; 65536]);
+}
+
+#[test]
+fn s3_transfer_integrity_is_opt_in_but_framing_stays_mandatory() {
+    for fault in ["single-corrupt", "single-truncated"] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &["--from", "s3://bucket", "object", "--as", "result"],
+        );
+        assert_eq!(
+            output.status.success(),
+            fault == "single-corrupt",
+            "{}",
+            output_text(&output)
+        );
+    }
+}
+
+#[test]
+fn s3_upload_native_checksum_reuse_and_expected_hash() {
+    use sha2::Digest as _;
+    for (fault, options) in [
+        ("upload-default", Vec::new()),
+        (
+            "upload-sha256",
+            vec![
+                "--transfer-integrity".to_owned(),
+                "--hash-algorithm".to_owned(),
+                "sha256".to_owned(),
+            ],
+        ),
+        (
+            "upload-md5",
+            vec![
+                "--expected-hash".to_owned(),
+                format!(
+                    "md5:{}",
+                    md5::Md5::digest(b"payload")
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ),
+            ],
+        ),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"payload").unwrap();
+        let output = server
+            .command(temp.path())
+            .args(["--s3-endpoint", &server.address])
+            .args(options)
+            .args(["source", "--to", "s3://bucket", "--as", "object"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert!(server.gate.0.load(Ordering::Acquire));
+    }
+    let server = Server::start("upload-default");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"payload").unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+        ],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        !server.gate.0.load(Ordering::Acquire),
+        "mismatching source was uploaded"
+    );
+}
+
+#[test]
+fn s3_mapping_preserves_expected_hashes_in_failed_results() {
+    use sha2::Digest as _;
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    let digest = md5::Md5::digest(vec![b'x'; 65536])
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let entries = [
+        ("good", digest.as_str()),
+        ("bad", "00000000000000000000000000000000"),
+    ]
+    .map(|(name, value)| {
+        serde_json::json!({
+        "src": {"encoding": "utf-8", "value": name}, "dst": {"encoding": "utf-8", "value": name},
+        "kind": "file", "expected_digest": {"algorithm": "md5", "value": value},
+    }).to_string()
+    })
+    .join("\n");
+    std::fs::write(temp.path().join("mapping"), entries).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--mapping",
+            "mapping",
+            "--from",
+            "s3://bucket",
+            "--into",
+            "output",
+            "--results",
+            "results.jsonl",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    assert_eq!(
+        std::fs::read(temp.path().join("output/good")).unwrap(),
+        vec![b'x'; 65536]
+    );
+    assert!(!temp.path().join("output/bad").exists());
+    let records = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
+    let failed = records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["disposition"] == "failed")
+        .unwrap();
+    assert_eq!(failed["expected_digest"]["algorithm"], "md5");
+    assert_eq!(
+        failed["expected_digest"]["value"],
+        "00000000000000000000000000000000"
+    );
+}
+
+#[test]
+fn s3_hash_comparison_reuses_only_the_selected_algorithm() {
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
+    let mut counts = Vec::new();
+    for algorithm in ["blake3", "sha256"] {
+        let before = server.requests.load(Ordering::Relaxed);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--hash",
+                "--hash-algorithm",
+                algorithm,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ],
+        );
+        assert!(output.status.success(), "{}", output_text(&output));
+        counts.push(server.requests.load(Ordering::Relaxed) - before);
+    }
+    // The fixture publishes only BLAKE3 metadata. SHA256 comparison must
+    // obtain object bytes instead of silently comparing using BLAKE3.
+    assert_eq!(counts[1], counts[0] + 1);
+}
+
+#[test]
+fn s3_dry_run_does_not_validate_expected_hash() {
+    let expected = "md5:00000000000000000000000000000000";
+    let server = Server::start("upload-default");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"payload").unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--dry-run",
+            "--expected-hash",
+            expected,
+            "source",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        !server.gate.0.load(Ordering::Acquire),
+        "dry run uploaded bytes"
+    );
+
+    let server = Server::start("single-ok");
+    let destination = temp.path().join("result");
+    std::fs::write(&destination, vec![b'x'; 65536]).unwrap();
+    let remote_time = std::time::UNIX_EPOCH + Duration::from_secs(1700000000);
+    std::fs::File::options()
+        .write(true)
+        .open(&destination)
+        .unwrap()
+        .set_modified(remote_time)
+        .unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--dry-run",
+            "-v",
+            "--expected-hash",
+            expected,
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "result",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        !output_text(&output).contains("would copy"),
+        "dry run compared an expected digest instead of keeping the metadata quick check: {}",
+        output_text(&output)
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), vec![b'x'; 65536]);
+}
+
+#[test]
+fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
+    for (fault, algorithm, changed) in [
+        ("single-upload-nohash", "blake3", false),
+        ("single-upload-otherhash", "sha256", false),
+        ("single-upload-nohash", "blake3", true),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::write(&source, vec![if changed { b'y' } else { b'x' }; 65536]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+            .unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--hash",
+                "--hash-algorithm",
+                algorithm,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert!(
+            server.gate.1.load(Ordering::Acquire),
+            "{fault}: --hash did not compare object contents"
+        );
+        assert_eq!(
+            server.gate.0.load(Ordering::Acquire),
+            changed,
+            "{fault}: unchanged object was uploaded again"
+        );
+    }
+}
+
+#[test]
+fn s3_review_verify_only_reports_expected_hash_mismatch() {
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--verify-only",
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "result",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    let message = output_text(&output);
+    assert!(message.contains("expected md5 hash"), "{message}");
+    assert!(
+        !message.contains("file missing, type differs, or size differs"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("result")).unwrap(),
+        vec![b'x'; 65536]
     );
 }

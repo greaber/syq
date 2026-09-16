@@ -460,6 +460,14 @@ impl ResultsWriter {
     }
 
     pub fn emit_operation(&self, op: &OperationRecord) {
+        self.emit_operation_expected(op, None);
+    }
+
+    pub(crate) fn emit_operation_expected(
+        &self,
+        op: &OperationRecord,
+        expected: Option<&crate::hashing::Digest>,
+    ) {
         let mut record = serde_json::json!({
             "type": "operation_result",
             "action": op.action,
@@ -468,6 +476,9 @@ impl ResultsWriter {
             "disposition": op.disposition,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(expected) = expected {
+            object.insert("expected_digest".into(), serde_json::json!(expected));
+        }
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));
         }
