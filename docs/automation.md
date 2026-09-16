@@ -88,8 +88,11 @@ count fields are non-negative integers within the `u64` range.
 
 Always first. Identifies the invocation with `run_id`, `started_at` (Unix
 seconds), `syq_version`, `mode` (`cp` or `rm`), `dry_run`, and `endpoints`.
-Endpoints identify role, local/SSH kind, and SSH host/user; they omit
-credentials, ports, and raw command arguments.
+Endpoints identify role and kind (`local`, `ssh`, or `s3`). SSH endpoints carry
+host/user; S3 endpoints carry `host: "s3://BUCKET"` without a user. They omit
+credentials, headers, ports, and raw command arguments. Clients that predate S3
+must be upgraded to decode S3 endpoint kinds; local and SSH streams retain
+their existing representation.
 
 Copy runs also carry `prune` and `mapping`. Compare-only runs add optional
 `verify_only: true`; absence means false. Removal has one source endpoint

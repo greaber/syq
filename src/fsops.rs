@@ -4471,7 +4471,7 @@ fn set_meta_handle_known_portable(
 }
 
 #[cfg(target_os = "linux")]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     let fd = file.as_raw_fd();
     let r = unsafe { libc::fchmodat(fd, c"".as_ptr(), mode as libc::mode_t, libc::AT_EMPTY_PATH) };
     if r == 0 {
@@ -4495,7 +4495,7 @@ fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     Ok(())
 }
@@ -7376,7 +7376,7 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
-fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
         return Ok(());
     }

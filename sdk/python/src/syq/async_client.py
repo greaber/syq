@@ -33,6 +33,7 @@ from .client import (
     _append_remote_arguments,
     _argument,
     _copy_arguments,
+    _s3_arguments,
     _insert_mapping_option,
     _map_stream_cwd,
     _mapping_line,
@@ -652,6 +653,13 @@ class AsyncClient:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_concurrency: int | None = None,
+        s3_part_size: int | None = None,
+        s3_retries: int | None = None,
         auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
@@ -737,6 +745,8 @@ class AsyncClient:
             min_size=min_size,
             max_delete=max_delete,
         )
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header,
+                      s3_concurrency, s3_part_size, s3_retries)
         if auth_from is not None and via is not None:
             raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:

@@ -191,7 +191,8 @@
               "kind": {
                 "enum": [
                   "local",
-                  "ssh"
+                  "ssh",
+                  "s3"
                 ]
               },
               "host": {

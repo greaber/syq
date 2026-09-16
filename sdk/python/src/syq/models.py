@@ -24,6 +24,7 @@ class EntryKind(_StringEnum):
 class EndpointKind(_StringEnum):
     LOCAL = "local"
     SSH = "ssh"
+    S3 = "s3"
 
 
 class EndpointRole(_StringEnum):

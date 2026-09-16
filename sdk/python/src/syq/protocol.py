@@ -195,6 +195,8 @@ def _endpoints(record: dict[str, Any]) -> tuple[Endpoint, ...]:
             raise SyqProtocolError("a local endpoint may not contain host or user")
         if kind is EndpointKind.SSH and not host:
             raise SyqProtocolError("an SSH endpoint must contain a host")
+        if kind is EndpointKind.S3 and (not host or not host.startswith("s3://") or user is not None):
+            raise SyqProtocolError("an S3 endpoint requires an s3:// bucket and no user")
         endpoints.append(
             Endpoint(
                 role=_enum(value, "role", EndpointRole),

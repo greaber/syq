@@ -69,7 +69,7 @@ In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
 |---|---|
-| `from_`, `to` | SSH endpoint strings; omitted endpoints are local |
+| `from_`, `to` | SSH endpoint strings or `s3://BUCKET`; omitted endpoints are local |
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
@@ -82,7 +82,10 @@ In addition to the shared arguments above, it accepts:
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
 | `bwlimit`, `min_size`, `max_size` | Native rate/size strings or integers |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
-| `connections` | Positive integer connection count |
+| `connections` | Positive integer connection count; for S3, concurrent objects |
+| `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
+| `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
+| `s3_concurrency`, `s3_part_size`, `s3_retries` | Integer parts per object, MiB per part, and transient retry budget |
 | `auth_from`, `via` | Credential source string; aliases, so use only one |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
@@ -94,7 +97,14 @@ In addition to the shared arguments above, it accepts:
 | `on_event`, `results`, `check` | See events and failures below |
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
-and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
+[Remote copy details](https://greaber.github.io/syq/remote-reference.html),
+and [Object storage](https://greaber.github.io/syq/object-storage.html).
+
+For example, `client.cp("data", to="s3://bucket", into="backup",
+s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
+from the subprocess environment or AWS configuration. S3 copies require one
+local endpoint. S3 results use `EndpointKind.S3`; older SDKs reject this new
+endpoint kind instead of interpreting it as SSH.
 
 `pscope` selects an isolated scope for reusing SSH connections. For return
 copies or commands, use `syq persist connect server` and omit `pscope`. See

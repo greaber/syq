@@ -54,7 +54,14 @@
         "preserve",
         "inplace",
         "max-size",
-        "min-size"
+        "min-size",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header",
+        "s3-concurrency",
+        "s3-part-size",
+        "s3-retries"
       ],
       "internal": [
         "delegated-operands-b64",
