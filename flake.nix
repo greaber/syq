@@ -44,9 +44,8 @@
             preBuild = lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET=${if system == "x86_64-darwin" then "10.12" else "11.0"}
             '';
-            # Cargo strips once. Avoid host-specific postprocessing of Mach-O
-            # files and preserve the compiler's deterministic ad-hoc signature.
-            dontStrip = true;
+            # buildRustPackage delegates stripping to Nix's pinned tools.
+            # Compress only after final stripping and Darwin signing fixups.
             dontPatchELF = true;
             postFixup = ''
               test "$("$out/bin/syq" --version)" = "syq ${manifest.package.version}"

@@ -44,7 +44,9 @@ else
     echo 'Release executable unexpectedly links to the Nix store.' >&2
     exit 1
   fi
-  minimum=$(otool -l "$dist/$asset" | awk '$1 == "minos" || ($1 == "version" && NF == 2) { print $2 }')
+  minimum=$(otool -l "$dist/$asset" | awk '$1 == "cmd" { command = $2 }
+    (command == "LC_BUILD_VERSION" && $1 == "minos") ||
+    (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2 }')
   if [ "$(uname -m)" = arm64 ]; then
     test "$minimum" = 11.0
     codesign --verify "$dist/$asset"
