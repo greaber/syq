@@ -237,6 +237,7 @@ pub(super) struct Object {
     pub size: u64,
     pub etag: String,
     pub version: Option<String>,
+    pub website_redirect: Option<String>,
     pub metadata: Option<Metadata>,
     pub mtime: i64,
 }
@@ -280,6 +281,7 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
         size,
         etag,
         version: output.version_id().map(str::to_owned),
+        website_redirect: output.website_redirect_location().map(str::to_owned),
         metadata,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
     }))
@@ -341,6 +343,7 @@ pub(super) fn from_get(
         size,
         etag: output.e_tag().context("S3 GET omitted ETag")?.into(),
         version: output.version_id().map(str::to_owned),
+        website_redirect: output.website_redirect_location().map(str::to_owned),
         metadata: Metadata::decode(output.metadata())?,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
     };

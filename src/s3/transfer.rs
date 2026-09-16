@@ -1,5 +1,6 @@
 mod fast;
 mod pruning;
+mod server_copy;
 
 use super::{
     checksum::Algorithm,
@@ -139,6 +140,9 @@ impl Engine {
     }
 
     async fn copy(self: Arc<Self>) -> Result<()> {
+        if self.options.source_bucket.is_some() {
+            return self.server_copy().await;
+        }
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
@@ -212,7 +216,7 @@ impl Engine {
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let planning = std::time::Instant::now();
-            let (plan, prune) = self.download_plan(&destination).await?;
+            let (plan, prune) = self.download_plan(&destination.prefix).await?;
             self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
@@ -1098,7 +1102,7 @@ impl Engine {
     }
     async fn download_plan(
         &self,
-        destination: &Destination,
+        destination_prefix: &str,
     ) -> Result<(Vec<Download>, super::prune::Plan)> {
         let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
@@ -1134,7 +1138,7 @@ impl Engine {
             for (_, entry) in manifest.entries {
                 selectors.push((
                     local::join(&base, &local::key_path(&entry.src)?),
-                    local::join(&destination.prefix, &local::key_path(&entry.dst)?),
+                    local::join(destination_prefix, &local::key_path(&entry.dst)?),
                     match entry.kind.map(|k| k.label()) {
                         Some("dir") => SourceSelection::Directory,
                         Some("file" | "symlink") => SourceSelection::File,
@@ -1148,10 +1152,10 @@ impl Engine {
             for location in &self.args.locations[..count] {
                 let key = local::join(&base, &local::key_path(&location.path)?);
                 let path = if self.args.placement == Placement::As || location.copies_contents() {
-                    destination.prefix.clone()
+                    destination_prefix.to_owned()
                 } else {
                     local::join(
-                        &destination.prefix,
+                        destination_prefix,
                         &local::key_path(
                             crate::cli::native_basename(&location.path)
                                 .context("source has no basename")?,
@@ -1159,6 +1163,22 @@ impl Engine {
                     )
                 };
                 selectors.push((key, path, location.selection, None, None));
+            }
+        }
+        if self.options.source_bucket.is_some() {
+            if selectors.iter().any(|s| s.4.is_some()) {
+                bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
+            }
+            if self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str()) {
+                for (source, _, _, _, _) in &selectors {
+                    for (_, target, _, _, _) in &selectors {
+                        if super::prune::beneath(source.as_bytes(), target.as_bytes()).is_some()
+                            || super::prune::beneath(target.as_bytes(), source.as_bytes()).is_some()
+                        {
+                            bail!("S3 source and destination paths overlap in the same bucket");
+                        }
+                    }
+                }
             }
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
@@ -1193,7 +1213,15 @@ impl Engine {
                 let exact = if key.is_empty() {
                     None
                 } else {
-                    client::head(&self.client, &self.options.bucket, &key).await?
+                    client::head(
+                        &self.client,
+                        self.options
+                            .source_bucket
+                            .as_deref()
+                            .unwrap_or(&self.options.bucket),
+                        &key,
+                    )
+                    .await?
                 };
                 if exact.is_some() && directory && self.args.native_mapping.is_none() {
                     bail!("S3 selector requires a prefix but an object exists at {key:?}");
@@ -1206,7 +1234,14 @@ impl Engine {
             let (exact, listed) = if directory && self.args.native_mapping.is_none() {
                 let (exact, listed) = tokio::try_join!(
                     exact,
-                    client::list(&self.client, &self.options.bucket, &prefix)
+                    client::list(
+                        &self.client,
+                        self.options
+                            .source_bucket
+                            .as_deref()
+                            .unwrap_or(&self.options.bucket),
+                        &prefix
+                    )
                 )?;
                 (exact, Some(listed))
             } else {
@@ -1217,9 +1252,16 @@ impl Engine {
                 // copies its marker, while explicit child entries copy children.
                 let object = match exact {
                     Some(object) => object,
-                    None => client::head(&self.client, &self.options.bucket, &format!("{key}/"))
-                        .await?
-                        .context("S3 mapping source object or directory marker is missing")?,
+                    None => client::head(
+                        &self.client,
+                        self.options
+                            .source_bucket
+                            .as_deref()
+                            .unwrap_or(&self.options.bucket),
+                        &format!("{key}/"),
+                    )
+                    .await?
+                    .context("S3 mapping source object or directory marker is missing")?,
                 };
                 if declared_kind.is_some_and(|kind| kind != object.kind()) {
                     bail!("S3 source type does not match mapping");
@@ -1236,7 +1278,17 @@ impl Engine {
                 }
                 let listed = match listed {
                     Some(listed) => listed,
-                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                    None => {
+                        client::list(
+                            &self.client,
+                            self.options
+                                .source_bucket
+                                .as_deref()
+                                .unwrap_or(&self.options.bucket),
+                            &prefix,
+                        )
+                        .await?
+                    }
                 };
                 if listed.is_empty() {
                     bail!("S3 source prefix {key:?} contains no objects");

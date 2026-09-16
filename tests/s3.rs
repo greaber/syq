@@ -146,6 +146,90 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("server-copy") {
+        let path = first.split_whitespace().nth(1).unwrap();
+        if method == "HEAD" {
+            if path.starts_with("/source/") {
+                reply(
+                    &mut socket,
+                    200,
+                    &[
+                        (
+                            "Content-Length".into(),
+                            if fault == "server-copy-multipart-fails" {
+                                (6 * 1024 * 1024).to_string()
+                            } else {
+                                "4".into()
+                            },
+                        ),
+                        ("ETag".into(), "\"source-etag\"".into()),
+                        (
+                            "x-amz-website-redirect-location".into(),
+                            "/new-location".into(),
+                        ),
+                    ],
+                    b"",
+                    true,
+                );
+            } else {
+                reply(&mut socket, 404, &[], b"", true);
+            }
+        } else if fault == "server-copy-multipart-fails" && path.contains("tagging") {
+            assert_eq!(method, "GET");
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<Tagging><TagSet/></Tagging>",
+                false,
+            );
+        } else if fault == "server-copy-multipart-fails" && method == "POST" {
+            assert!(path.contains("uploads"));
+            reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
+        } else if fault == "server-copy-multipart-fails" && method == "DELETE" {
+            assert!(path.contains("uploadId=owned"));
+            reply(&mut socket, 204, &[], b"", false);
+        } else if method == "GET" && path.contains("list-type=2") {
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                false,
+            );
+        } else if method == "PUT" {
+            assert_eq!(path.split('?').next().unwrap(), "/destination/copied");
+            assert_eq!(headers["x-amz-copy-source"], "source/original");
+            assert_eq!(headers["x-amz-copy-source-if-match"], "\"source-etag\"");
+            if fault == "server-copy-multipart-fails" {
+                assert!(path.contains("uploadId=owned"));
+                assert_eq!(headers["x-amz-copy-source-range"], "bytes=0-5242879");
+            } else {
+                assert_eq!(headers["if-none-match"], "*");
+                assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
+            }
+            if fault.ends_with("fails") {
+                reply(
+                    &mut socket,
+                    412,
+                    &[],
+                    b"<Error><Code>PreconditionFailed</Code></Error>",
+                    false,
+                );
+            } else {
+                reply(
+                    &mut socket,
+                    200,
+                    &[],
+                    b"<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>",
+                    false,
+                );
+            }
+        } else {
+            panic!("server-side copy must not read or relay contents: {first}");
+        }
+        return;
+    }
     if fault.starts_with("prune-") {
         if method == "GET" {
             let keys: Vec<String> = match fault {
@@ -1484,5 +1568,43 @@ fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
                 "checksum did not read source"
             ),
         }
+    }
+}
+
+#[test]
+fn server_copy_never_reads_or_relays_object_contents() {
+    for fault in [
+        "server-copy",
+        "server-copy-fails",
+        "server-copy-multipart-fails",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "original",
+                "--to",
+                "s3://destination",
+                "--as",
+                "copied",
+            ],
+        );
+        assert_eq!(
+            output.status.success(),
+            fault == "server-copy",
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            if fault == "server-copy-multipart-fails" {
+                9
+            } else {
+                5
+            }
+        );
     }
 }

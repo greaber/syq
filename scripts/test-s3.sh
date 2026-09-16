@@ -44,3 +44,5 @@ python3 tests/object-storage/prune.py "$_syq_s3_binary"
 
 python3 tests/object-storage/fast.py "$_syq_s3_binary"
 python3 tests/object-storage/fast-provider.py "$_syq_s3_binary"
+
+python3 tests/object-storage/server-copy.py "$_syq_s3_binary"

@@ -104,6 +104,34 @@ with the number of selected objects.
 with bursts up to a part on upload. `--no-compress` has no effect because object
 bodies are transferred without compression.
 
+## Copy between buckets or prefixes
+
+Use two S3 endpoints to copy within the same service:
+
+```sh
+syq cp --from s3://source-bucket --srcs-in reports --to s3://destination-bucket --into archive --prune
+```
+
+The service copies object contents directly. Syq sends listing, metadata, and
+copy requests; it does not download or relay object bodies. Both buckets use
+the same configured endpoint, region, and credentials. Copying between different
+providers is not supported, and failed server-side copies never fall back to
+local downloads and uploads. Overlapping source and destination paths in the
+same bucket are rejected.
+
+Placement, selection filters, overwrite choices, `--dry-run`, `--results`, and
+`--prune` work as for local/S3 copies. Object metadata and tags are copied,
+including syq metadata and stored digests. Preserving a digest does not verify
+the object's contents. `--hash`, `--verify-only`, `--expected-hash`, mapping
+expected digests, and transfer hashing are rejected because they require
+reading object contents. The destination uses its bucket's default encryption
+unless request headers specify otherwise; source ACLs are not copied.
+
+Large objects use multipart server-side copying. Failed or cancelled multipart
+copies attempt to abort their unfinished upload; retries restart that object.
+If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
+objects remain available. Existing upload and download resume behavior is unchanged.
+
 ## Metadata and integrity
 
 A regular file remains an ordinary object body, readable with other S3 tools.
@@ -200,5 +228,5 @@ not remove uploaded parts. Syq does not delete unrelated objects.
 
 S3 copies support `--results` and the Python `cp` API. Automation endpoints use
 `kind: "s3"` and `host: "s3://BUCKET"`, requiring an SDK that understands S3
-endpoints. SSH delegation, `--inplace`, `rm`, and S3-to-S3 copies are
+endpoints. SSH delegation, `--inplace`, and `rm` are
 not supported for object storage.
