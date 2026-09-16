@@ -152,6 +152,8 @@ public_key=$(jq -er '.[] | select(.name == "SYQ_RELEASE_PUBLIC_KEY") | .value' <
   || die 'repository variable is missing: SYQ_RELEASE_PUBLIC_KEY'
 [ "$(printf '%s' "$public_key" | openssl base64 -d -A | wc -c | tr -d '[:space:]')" -eq 32 ] \
   || die 'SYQ_RELEASE_PUBLIC_KEY is not a base64-encoded 32-byte key'
+[ "$public_key" = "$(cat src/release-public-key.txt)" ] \
+  || die 'SYQ_RELEASE_PUBLIC_KEY differs from src/release-public-key.txt; update the source-build trust anchor when rotating keys'
 
 releases=$(gh api --paginate --slurp "repos/$CANONICAL_REPOSITORY/releases?per_page=100")
 jq -e --arg tag "$tag" 'flatten | any(.[]; .tag_name == $tag) | not' <<<"$releases" >/dev/null \

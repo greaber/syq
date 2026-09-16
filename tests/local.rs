@@ -4751,7 +4751,11 @@ fn development_build_rejects_cross_platform_upload() {
 fn development_build_does_not_install_an_unrunnable_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Model a host on which the uploaded binary cannot execute.
+    // Model an unlisted host on which the uploaded binary cannot execute.
+    executable(
+        &t.path("remote-bin/uname"),
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+    );
     executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
     write(&t.path("src"), b"must not copy");
     let remote = format!("fake:{}", t.s("dst"));
@@ -4762,8 +4766,14 @@ fn development_build_does_not_install_an_unrunnable_upload() {
         stderr.contains("uploaded helper cannot run on this host"),
         "{stderr}"
     );
+    assert!(stderr.contains("Linux riscv64"), "{stderr}");
     assert!(!t.path("dst").exists());
-    let helper = cached_remote_helper(&t);
+    let helper = cached_remote_helper(&t)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("self/syq");
     assert!(!helper.exists());
     assert_eq!(fs::read_dir(helper.parent().unwrap()).unwrap().count(), 0);
 }

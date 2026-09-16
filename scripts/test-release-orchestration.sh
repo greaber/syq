@@ -336,8 +336,9 @@ expect_failure 'is not checked out' env \
 preflight_repo="$work/preflight-repo"
 preflight_bin="$work/preflight-bin"
 mkdir -p "$preflight_repo/.github/release-notes" "$preflight_repo/.github/workflows" "$preflight_repo/scripts" \
-  "$preflight_repo/sdk/python" "$preflight_bin"
+  "$preflight_repo/sdk/python" "$preflight_repo/src" "$preflight_bin"
 cp "$script_dir/check-python-api-sync.py" "$preflight_repo/scripts/"
+printf '%s\n' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' >"$preflight_repo/src/release-public-key.txt"
 cat >"$preflight_repo/sdk/python/native-api.json" <<'EOF'
 {"schema":1,"commands":{}}
 EOF
@@ -401,7 +402,7 @@ fi
 case "$1:$2" in
   repo:view) printf 'greaber/syq\n' ;;
   secret:list) printf '[{"name":"SYQ_RELEASE_SIGNING_KEY_PEM_B64"},{"name":"HOMEBREW_TAP_DEPLOY_KEY"}]\n' ;;
-  variable:list) printf '[{"name":"SYQ_RELEASE_PUBLIC_KEY","value":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]\n' ;;
+  variable:list) jq -n --arg key "${SYQ_TEST_PUBLIC_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}" '[{name:"SYQ_RELEASE_PUBLIC_KEY",value:$key}]' ;;
   api:user) printf 'greaber\n' ;;
   api:*)
     case " $* " in
@@ -447,6 +448,14 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+# Rotating the repository key must also update the embedded source-build key.
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB= \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/key-drift.out" 2>&1; then
+  echo 'preflight unexpectedly accepted a stale source-build verification key' >&2
+  exit 1
+fi
+grep -F 'SYQ_RELEASE_PUBLIC_KEY differs from src/release-public-key.txt' "$work/key-drift.out" >/dev/null
 # Exercise preflight with allowlist options whose quoted whitespace changes
 # awk field positions. Keep the repository's real allowlist untouched.
 option_scripts="$work/tag-option-scripts"

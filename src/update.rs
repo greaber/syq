@@ -362,10 +362,11 @@ fn embedded_public_key() -> Result<Cow<'static, str>> {
     }
     RELEASE_PUBLIC_KEY
         .or_else(|| {
-            // Public upstream trust anchor, also used by the release installer.
+            // Release preflight checks this public trust anchor against the
+            // repository variable used to build official releases.
             // Source builds opting into official helpers need no private key.
             (env!("SYQ_RELEASE_HELPERS") == "1" && !crate::identity::is_release_build()).then_some(
-                "5eh0FvhNFutyQ9BLYCHZ3W8Ad2caKg2cIP+QYrnjQjo="
+                include_str!("release-public-key.txt")
             )
         })
         .map(str::trim)
