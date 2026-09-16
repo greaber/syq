@@ -141,8 +141,9 @@ wheels are stripped explicitly by release CI. For a standalone debug executable,
 ## Reproduce a release binary
 
 The Nix recipe builds the standalone Linux x86-64/ARM64 and macOS Intel/Apple
-Silicon artifacts on a host of the same OS and architecture. Install
-[Nix](https://nix.dev/install-nix), check out the release tag you want to verify,
+Silicon artifacts on a host of the same OS and architecture. The pinned macOS
+build tools need macOS 14 or newer; the executables retain deployment targets of
+10.12 on Intel and 11.0 on Apple Silicon. Install [Nix](https://nix.dev/install-nix), check out the release tag you want to verify,
 and run:
 
 ```sh
