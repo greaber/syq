@@ -1,3 +1,4 @@
+mod advanced;
 mod agent_broker;
 mod bwlimit;
 mod cli;

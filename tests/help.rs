@@ -272,19 +272,16 @@ fn everyday_copy_controls_stay_visible_but_performance_overrides_do_not() {
     for command in ["cp", "rsync"] {
         let short = help(&[command, "--help"]);
         let full = help(&[command, "--help-all"]);
-        for option in ["--bwlimit", "--no-progress"] {
-            assert!(short.contains(option), "{command}: {short}");
-        }
-        let connections = if command == "cp" {
-            "--connections"
-        } else {
-            "--syq-connections"
-        };
-        for option in [connections, "--tuning-options"] {
+        assert!(short.contains("--no-progress"));
+        for option in [
+            "--resource-limits",
+            "--performance-tuning",
+            "--integrity-checking",
+        ] {
             assert!(!short.contains(option), "{command}: {short}");
             assert!(full.contains(option), "{command}: {full}");
         }
-        assert!(full.contains("Performance troubleshooting"));
+        assert!(full.contains("Performance tuning"));
         assert!(full.contains("Normal copies tune automatically"));
     }
     let short = help(&["cp", "--help"]);

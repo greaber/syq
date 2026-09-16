@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory(prefix='syq-s3-bench-') as temp:
                         base = [executables[tool], '--endpoint-url', c.ENDPOINT, '--numworkers', str(args.workers), 'cp', '-c', str(args.concurrency), '-p', str(args.part_size)]
                         upload = base + [str(src / '*'), f's3://{c.BUCKET}/{prefix}/']
                     else:
-                        base = [executables[tool], 'cp', '--no-progress', '-j', str(args.workers), '-c', str(args.concurrency), '-p', str(args.part_size), *flags]
+                        base = [executables[tool], 'cp', '--no-progress', '--performance-tuning', f's3-object-workers={args.workers},s3-part-workers={args.concurrency},s3-part-size={args.part_size}M', *flags]
                         upload = base + ['--srcs-in', str(src), '--to', 's3://' + c.BUCKET, '--into', prefix]
                     seconds = timed(upload, tool)
                     row = dict(workload=label, direction='upload', tool=tool, repeat=repeat, seconds=seconds, MiB_s=count * size / 2**20 / seconds)

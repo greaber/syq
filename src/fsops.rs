@@ -1452,7 +1452,7 @@ fn require_source_descriptor_capacity(
     )?;
     if required as u128 > limit.rlim_cur as u128 {
         bail!(
-            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
+            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller performance-tuning workers value",
             limit.rlim_cur
         );
     }
@@ -1620,11 +1620,11 @@ impl FsOps {
         self.hash_policy = policy;
     }
 
-    fn observed_content_hash(&self, bytes: &[u8]) -> ContentDigest {
+    fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
             .span(crate::transfer_observations::Stage::Hashing);
-        self.hash_policy.algorithm.hash(bytes)
+        self.hash_policy.payload_algorithm().hash(bytes)
     }
 
     pub fn new() -> Self {
@@ -1638,6 +1638,7 @@ impl FsOps {
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
+                transfer_hash_type: None,
             },
             observations: observations.clone(),
             operation: operation.clone(),
@@ -1788,7 +1789,7 @@ impl FsOps {
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
             if self.hash_policy.transfer_integrity
-                && self.observed_content_hash(&file.data) != file.hash
+                && self.observed_payload_hash(&file.data) != file.hash
             {
                 bail!("block hash mismatch on receive");
             }
@@ -5549,7 +5550,7 @@ impl FsOps {
                     // The controller treats an absent hash as a block to transfer.
                     break;
                 }
-                let hash = self.hash_policy.algorithm.hash(bytes);
+                let hash = self.hash_policy.payload_algorithm().hash(bytes);
                 if input.is_some() {
                     #[cfg(debug_assertions)]
                     test_race_barrier(
@@ -5982,7 +5983,7 @@ impl FsOps {
         let flags = put.flags;
         let inplace = put.inplace;
         let condition = put.condition;
-        if self.hash_policy.transfer_integrity && self.observed_content_hash(data) != hash {
+        if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let staged_mode = staged_file_mode(meta, flags);
@@ -6297,7 +6298,7 @@ impl FsOps {
             let hash = {
                 if self.hash_policy.transfer_integrity {
                     let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-                    self.hash_policy.algorithm.hash(&data)
+                    self.hash_policy.payload_algorithm().hash(&data)
                 } else {
                     [0; 32]
                 }
@@ -6330,7 +6331,7 @@ impl FsOps {
         let actual_hash = {
             if self.hash_policy.transfer_integrity {
                 let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-                self.hash_policy.algorithm.hash(data)
+                self.hash_policy.payload_algorithm().hash(data)
             } else {
                 [0; 32]
             }
@@ -7728,6 +7729,7 @@ mod tests {
             operations.set_hash_policy(HashPolicy {
                 algorithm,
                 transfer_integrity: false,
+                transfer_hash_type: None,
             });
             let response = operations
                 .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
@@ -7742,6 +7744,7 @@ mod tests {
             operations.set_hash_policy(HashPolicy {
                 algorithm,
                 transfer_integrity: true,
+                transfer_hash_type: None,
             });
             let response = operations
                 .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
@@ -7800,6 +7803,7 @@ mod tests {
             operations.set_hash_policy(HashPolicy {
                 algorithm,
                 transfer_integrity: true,
+                transfer_hash_type: None,
             });
             assert!(operations
                 .write_range(

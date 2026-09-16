@@ -17,8 +17,12 @@ pub(super) struct Writer {
     size: u64,
 }
 impl Writer {
-    pub fn new(file: Arc<File>, size: u64) -> Result<Self> {
-        let direct = direct_file(&file, size)?.map(Arc::new);
+    pub fn with_readback(file: Arc<File>, size: u64, readback: bool) -> Result<Self> {
+        let direct = if readback {
+            None
+        } else {
+            direct_file(&file, size)?.map(Arc::new)
+        };
         let original = file.clone();
         // At most 64 batches of 128 KiB queued. SDK chunks can share
         // larger backing allocations with the active response reader.
@@ -371,7 +375,7 @@ mod tests {
             let path = dir.path().join("output");
             std::fs::write(&path, b"original").unwrap();
             let file = Arc::new(File::open(&path).unwrap());
-            let writer = Writer::new(file, 8).unwrap();
+            let writer = Writer::with_readback(file, 8, false).unwrap();
             if batched {
                 writer
                     .write_batch(

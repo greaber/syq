@@ -1,5 +1,5 @@
 use crate::proto::OperatorSymlinkPolicy;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -220,13 +220,8 @@ pub struct Args {
     #[arg(long)]
     pub numeric_ids: bool,
 
-    /// Parallel connections/workers. Filesystem copies auto-tune — starting at
-    /// the last settled count remembered for this host path and transport, or 16
-    /// over TCP, 8 over ssh, or 16 when local with at most two available CPUs
-    /// (otherwise 32). It probes from 1 to 64 while the copy has enough work to
-    /// measure. Give a number to fix it. S3 copies use 256 object workers by
-    /// default, without automatic tuning.
-    #[arg(long = "syq-connections", value_name = "N")]
+    /// Normalized fixed parallelism override; omitted means automatic tuning.
+    #[arg(skip)]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
     pub connections: usize,
@@ -236,8 +231,30 @@ pub struct Args {
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
     /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    pub performance_tuning: Vec<String>,
+    #[arg(skip)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
+    /// Limit aggregate logical file-data bandwidth
+    #[arg(
+        long = "resource-limits",
+        long_help = crate::advanced::RESOURCE_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    pub resource_limits_arg: Vec<String>,
+    #[arg(skip)]
+    pub resource_limits: Option<crate::advanced::ResourceLimits>,
+    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    #[arg(
+        long = "integrity-checking",
+        long_help = crate::advanced::INTEGRITY_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    pub integrity_checking_arg: Vec<String>,
+    #[arg(skip)]
+    pub integrity_checking: Option<crate::advanced::IntegrityChecking>,
     /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
@@ -267,11 +284,13 @@ pub struct Args {
     #[arg(short = 'c', long)]
     pub checksum: bool,
     /// Algorithm for file content comparisons and optional transfer checks
-    #[arg(long = "syq-hash-algorithm", value_enum, default_value = "blake3")]
+    #[arg(skip)]
     pub hash_algorithm: crate::hashing::HashAlgorithm,
     /// Add payload checksums independently of transport encryption
-    #[arg(long = "syq-transfer-integrity")]
+    #[arg(skip)]
     pub transfer_integrity: bool,
+    #[arg(skip)]
+    pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
     /// Require one regular file to match ALGORITHM:HEX
     #[arg(long = "syq-expected-hash", value_name = "ALGORITHM:HEX")]
     pub expected_digest: Option<crate::hashing::Digest>,
@@ -538,7 +557,78 @@ impl Args {
             self.partial = true;
         }
         self.connections_default = self.connections_opt.is_none();
-        self.connections = self.connections_opt.unwrap_or(8).max(1);
+        self.connections = self.connections_opt.unwrap_or(8);
+    }
+
+    fn apply_advanced(&mut self) -> Result<()> {
+        if !self.performance_tuning.is_empty() {
+            self.tuning_options = Some(
+                self.performance_tuning
+                    .join(",")
+                    .parse()
+                    .context("invalid --performance-tuning")?,
+            );
+        }
+        if !self.resource_limits_arg.is_empty() {
+            self.resource_limits = Some(
+                self.resource_limits_arg
+                    .join(",")
+                    .parse()
+                    .context("invalid --resource-limits")?,
+            );
+        }
+        if !self.integrity_checking_arg.is_empty() {
+            self.integrity_checking = Some(
+                self.integrity_checking_arg
+                    .join(",")
+                    .parse()
+                    .context("invalid --integrity-checking")?,
+            );
+        }
+
+        if let Some(tuning) = self.tuning_options {
+            if self.s3.is_none() && tuning.has_s3_controls() {
+                bail!("S3 performance tuning requires an S3 endpoint");
+            }
+            if self.rm
+                && tuning
+                    != (crate::transfer_tuning::TransferTuning {
+                        workers: tuning.workers,
+                        ..Default::default()
+                    })
+            {
+                bail!("removal supports only performance-tuning workers");
+            }
+            self.connections_opt = tuning.workers;
+        }
+        if let Some(limits) = &self.resource_limits {
+            if limits.bandwidth.is_some() && self.bwlimit.is_some() {
+                bail!("--bwlimit conflicts with --resource-limits bandwidth");
+            }
+            self.bwlimit = limits.bandwidth.clone().or(self.bwlimit.clone());
+            self.bwlimit_bytes = self
+                .bwlimit
+                .as_deref()
+                .map(crate::bwlimit::parse_rate)
+                .transpose()?
+                .unwrap_or(0);
+        }
+        if let Some(checks) = self.integrity_checking {
+            if let Some(compare) = checks.compare {
+                if self.checksum && compare != Some(crate::hashing::HashAlgorithm::Blake3) {
+                    bail!("--hash/--checksum conflicts with integrity-checking compare");
+                }
+                self.checksum = compare.is_some();
+                self.hash_algorithm = compare.unwrap_or_default();
+            }
+            if let Some(transfer) = checks.transfer {
+                self.transfer_integrity = transfer.is_some();
+                self.transfer_hash_type = transfer;
+            }
+        }
+        self.connections_default = self.connections_opt.is_none();
+        self.connections = self.connections_opt.unwrap_or(8);
+        Ok(())
     }
 
     pub fn meta_flags(&self) -> u8 {
@@ -589,6 +679,7 @@ fn validate_expected_hash_selection(args: &Args) -> Result<()> {
 }
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
+    args.apply_advanced()?;
     args.bwlimit_bytes = args
         .bwlimit
         .as_deref()
@@ -839,9 +930,9 @@ struct NativeOperationalArgs {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Fix parallel workers (S3 default: 256; filesystem copies otherwise tune automatically)
-    #[arg(short = 'j', long = "connections", value_name = "N")]
-    connections: Option<usize>,
+    /// Override performance settings (normally automatic)
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    performance_tuning: Vec<String>,
     /// Show progress even when stderr is not a terminal
     #[arg(long, overrides_with = "no_progress")]
     progress: bool,
@@ -872,12 +963,6 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Algorithm for file content comparisons and optional transfer checks
-    #[arg(long, value_enum, default_value = "blake3")]
-    hash_algorithm: crate::hashing::HashAlgorithm,
-    /// Add payload checksums independently of transport encryption
-    #[arg(long)]
-    transfer_integrity: bool,
     /// Require one regular file to match ALGORITHM:HEX
     #[arg(
         long = "expected-hash",
@@ -900,12 +985,22 @@ struct NativeCopyOperationalArgs {
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
-    /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
-    #[arg(long, value_name = "RATE")]
-    bwlimit: Option<String>,
-    /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
-    tuning_options: Option<crate::transfer_tuning::TransferTuning>,
+    /// Limit aggregate logical file-data bandwidth
+    #[arg(
+        long = "resource-limits",
+        long_help = crate::advanced::RESOURCE_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    resource_limits_arg: Vec<String>,
+    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    #[arg(
+        long = "integrity-checking",
+        long_help = crate::advanced::INTEGRITY_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    integrity_checking_arg: Vec<String>,
     /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     stats: bool,
@@ -1280,7 +1375,7 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         parsed.operational,
         parsed.helper,
         parsed.results_output,
-    );
+    )?;
     args.clean_partials = true;
     args.locations = parsed
         .trees
@@ -1631,9 +1726,6 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
         if args.devices {
             bail!("--preserve=specials is not supported for S3 copies");
         }
-        if !(1..=1024).contains(&args.connections_opt.unwrap_or(256)) {
-            bail!("S3 object workers (-j) must be between 1 and 1024");
-        }
         let index = if options.upload {
             args.locations.len() - 1
         } else {
@@ -1798,7 +1890,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         parsed.operational,
         parsed.helper,
         parsed.results_output,
-    );
+    )?;
     args.locations = locations;
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
@@ -1814,7 +1906,7 @@ fn native_removal_args(
     operational: NativeOperationalArgs,
     helper: NativeRemoteHelperArgs,
     results: NativeResultsArgs,
-) -> Args {
+) -> Result<Args> {
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeRm;
     args.rm = true;
@@ -1825,7 +1917,8 @@ fn native_removal_args(
     args.syq_path = helper.syq_path;
     args.no_bootstrap = helper.no_bootstrap;
     apply_native_operational(&mut args, operational);
-    args
+    args.apply_advanced()?;
+    Ok(args)
 }
 
 fn validate_native_results_fd(results_fd: Option<i32>) -> Result<()> {
@@ -1899,7 +1992,7 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.dry_run = operational.dry_run;
     args.verbose = operational.verbose;
     args.quiet = operational.quiet;
-    args.connections_opt = operational.connections;
+    args.performance_tuning = operational.performance_tuning;
     args.progress = operational.progress;
     args.no_progress = operational.no_progress;
     args.progress_json = operational.progress_json;
@@ -1990,16 +2083,14 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
-        hash_algorithm,
-        transfer_integrity,
         expected_digest,
         verify_only,
         ignore_existing,
         existing,
         update,
         no_compress,
-        bwlimit,
-        tuning_options,
+        integrity_checking_arg,
+        resource_limits_arg,
         stats,
         ignore,
         ignore_from,
@@ -2013,8 +2104,6 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
-    args.hash_algorithm = hash_algorithm;
-    args.transfer_integrity = transfer_integrity;
     args.expected_digest = expected_digest;
     validate_expected_hash_selection(args)?;
     args.verify_only = verify_only;
@@ -2025,13 +2114,8 @@ fn apply_native_copy_operational(
     if no_compress {
         args.compress = false;
     }
-    args.bwlimit_bytes = bwlimit
-        .as_deref()
-        .map(crate::bwlimit::parse_rate)
-        .transpose()?
-        .unwrap_or(0);
-    args.bwlimit = bwlimit;
-    args.tuning_options = tuning_options;
+    args.integrity_checking_arg = integrity_checking_arg;
+    args.resource_limits_arg = resource_limits_arg;
     args.stats = stats;
     args.pending_ignore_inputs = ordered_ignore_inputs(&ignore, &ignore_from, matches);
     args.ignore = ignore;
@@ -2048,6 +2132,7 @@ fn apply_native_copy_operational(
         }
     }
     apply_native_operational(args, common);
+    args.apply_advanced()?;
     Ok(())
 }
 
@@ -2324,10 +2409,10 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
         "--rsh",
         "--syq-ignore",
         "--syq-ignore-from",
-        "--syq-connections",
+        "--resource-limits",
         "--block-size",
-        "--tuning-options",
-        "--bwlimit",
+        "--performance-tuning",
+        "--integrity-checking",
         "--max-size",
         "--min-size",
         "--files-from",
@@ -2498,12 +2583,13 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
-        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Placement,
-        SourceSelection,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, NativeCopyCommand,
+        Placement, SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
     use clap::Parser;
+    use std::ffi::OsString;
 
     fn read_files_from_buffered_reference(raw: &[u8], nul: bool) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
@@ -2662,32 +2748,61 @@ mod tests {
     }
 
     #[test]
-    fn s3_integrity_policy_is_explicit_and_rejects_content_verification() {
-        let argv = [
-            "source",
-            "--to",
-            "s3://bucket",
-            "--as",
-            "object",
-            "--s3-integrity=none",
-        ]
-        .map(std::ffi::OsString::from);
-        let args = parse_native_copy(&argv).unwrap();
-        assert_eq!(args.s3.unwrap().integrity, crate::s3::Integrity::None);
-        for flag in ["--hash", "--verify-only"] {
-            let mut with_hash = argv.to_vec();
-            with_hash.push(flag.into());
-            assert!(parse_native_copy(&with_hash)
-                .unwrap_err()
-                .to_string()
-                .contains("cannot be combined"));
+    fn advanced_groups_separate_limits_tuning_and_integrity() {
+        let args = parse_native_copy(
+            &[
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+                "--resource-limits=bandwidth=1M",
+                "--performance-tuning=s3-requests=4,s3-part-workers=2,s3-part-size=8M",
+                "--integrity-checking=compare=blake3,transfer=sha256",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.tuning_options.unwrap().s3_requests, Some(4));
+        assert_eq!(args.bwlimit_bytes, 1 << 20);
+        assert!(args.checksum);
+        assert!(args.transfer_integrity);
+        assert_eq!(
+            args.transfer_hash_type,
+            Some(crate::hashing::HashAlgorithm::Sha256)
+        );
+        let options = args.s3.unwrap();
+        assert_eq!(options.concurrency, 2);
+        assert_eq!(options.part_size, 8 << 20);
+        for flags in [
+            vec!["--resource-limits=connections=2"],
+            vec!["--hash", "--integrity-checking=compare=sha256"],
+            vec![
+                "--performance-tuning=workers=2",
+                "--performance-tuning=workers=3",
+            ],
+        ] {
+            let mut argv = vec!["source", "--as", "target"];
+            argv.extend(flags);
+            assert!(
+                parse_native_copy(&argv.into_iter().map(OsString::from).collect::<Vec<_>>())
+                    .is_err()
+            );
         }
-        let local =
-            ["source", "--as", "destination", "--s3-integrity=none"].map(std::ffi::OsString::from);
-        assert!(parse_native_copy(&local)
-            .unwrap_err()
-            .to_string()
-            .contains("S3 options require"));
+        for old in [
+            "--connections=2",
+            "--bwlimit=1M",
+            "--tuning-options=workers=2",
+            "--s3-concurrency=2",
+            "--s3-part-size=8",
+            "--s3-integrity=none",
+            "--hash-algorithm=sha256",
+            "--transfer-integrity",
+        ] {
+            assert!(
+                NativeCopyCommand::try_parse_from(["cp", "source", "--as", "target", old]).is_err()
+            );
+        }
     }
 
     #[test]
@@ -2776,17 +2891,18 @@ mod tests {
 
     #[test]
     fn rsync_hash_controls_use_syq_prefix() {
-        let parsed = Args::try_parse_from([
+        let mut parsed = Args::try_parse_from([
             "syq",
-            "--syq-hash-algorithm",
-            "xxh3-128",
-            "--syq-transfer-integrity",
+            "--integrity-checking",
+            "compare=xxh3-128",
+            "--integrity-checking=transfer=blake3",
             "--syq-expected-hash",
             "md5:900150983cd24fb0d6963f7d28e17f72",
             "source",
             "destination",
         ])
         .unwrap();
+        parsed.apply_advanced().unwrap();
         assert_eq!(parsed.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
         assert!(parsed.transfer_integrity);
         assert!(parsed.expected_digest.is_some());
@@ -2814,13 +2930,13 @@ mod tests {
                     "source",
                     "--into",
                     "destination",
-                    "--hash-algorithm=xxh3-128",
+                    "--integrity-checking=compare=xxh3-128",
                 ];
                 if plain {
                     argv.push("--tcp-plain");
                 }
                 if integrity {
-                    argv.push("--transfer-integrity");
+                    argv.push("--integrity-checking=transfer=blake3");
                 }
                 let args = parse_native_copy(
                     &argv
@@ -2832,7 +2948,7 @@ mod tests {
                 assert_eq!(args.tcp_plain, plain);
                 assert_eq!(args.transfer_integrity, integrity);
                 assert_eq!(args.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
-                assert!(!args.checksum);
+                assert!(args.checksum);
             }
         }
     }

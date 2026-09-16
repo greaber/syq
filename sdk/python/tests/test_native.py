@@ -286,8 +286,8 @@ class NativeClientTests(unittest.TestCase):
             dry_run=True,
             hash=True,
             no_compress=True,
-            bwlimit="10M",
-            connections=4,
+            resource_limits="bandwidth=10M",
+            performance_tuning="workers=4",
             receiver_max_entries=100,
             receiver_max_bytes="2G",
             receiver_receipt="digests",
@@ -321,7 +321,7 @@ class NativeClientTests(unittest.TestCase):
             "cp", "--src", "--src-dir", "--from", "--root", "--follow-src",
             "--follow-dst", "--to",
             "--into-existing", "--prune", "--max-delete", "--dry-run",
-            "--hash", "--no-compress", "--bwlimit", "--connections",
+            "--hash", "--no-compress", "--resource-limits", "--performance-tuning",
             "--receiver-max-entries", "--receiver-max-bytes",
             "--receiver-receipt", "--ignore", "--ignore-from",
             "--preserve",
@@ -387,7 +387,7 @@ class NativeClientTests(unittest.TestCase):
             root="source-root",
             follow_src=True,
             dry_run=True,
-            connections=4,
+            performance_tuning="workers=4",
             syq_path="/opt/syq",
             pscope="scope",
             results=output,
@@ -421,7 +421,7 @@ class NativeClientTests(unittest.TestCase):
             "--root",
             "--follow-src",
             "--dry-run",
-            "--connections",
+            "--performance-tuning",
             "--syq-path",
             "--pscope",
         ):
@@ -537,17 +537,17 @@ class NativeClientTests(unittest.TestCase):
         self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",
                        s3_profile="archive", s3_header=["X-Policy: a:b", "X-Other: yes"],
-                       s3_concurrency=7, s3_part_size=64, s3_retries=2, s3_integrity="none")
+                       performance_tuning="s3-part-workers=7,s3-part-size=64M,s3-retries=2")
         argv = self.argv()
         for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
                          "--s3-profile=archive", "--s3-header=X-Policy: a:b",
-                         "--s3-header=X-Other: yes", "--s3-concurrency=7",
-                         "--s3-part-size=64", "--s3-retries=2", "--s3-integrity=none"]:
+                         "--s3-header=X-Other: yes", "--performance-tuning",
+                         "s3-part-workers=7,s3-part-size=64M,s3-retries=2"]:
             self.assertIn(expected, argv)
         with self.assertRaises(syq.SyqInvocationError):
             self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
         with self.assertRaises(syq.SyqInvocationError):
-            self.client.cp("source", to="s3://bucket", into="prefix", s3_concurrency=True)
+            self.client.cp("source", to="s3://bucket", into="prefix", performance_tuning=True)
 
     def test_cp_selects_an_authorizer_and_rejects_conflicting_selectors(self) -> None:
         self.client.cp("source", to="backup", auth_from="@laptop", into="out")

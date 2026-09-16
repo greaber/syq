@@ -32,7 +32,6 @@ from .models import (
     AutomationEvent,
     CpResult,
     Digest,
-    HashAlgorithm,
     IgnoreFrom,
     MappingEntry,
     OperationStatus,
@@ -558,20 +557,11 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
 
 def _s3_arguments(
     argv: list[Argument], endpoint: str | None, region: str | None,
-    profile: str | None, headers: Iterable[str] | None, concurrency: int | None,
-    part_size: int | None, retries: int | None, integrity: str | None,
+    profile: str | None, headers: Iterable[str] | None,
 ) -> None:
-    if integrity is not None:
-        if integrity not in ("full", "none"):
-            raise SyqInvocationError("s3_integrity must be full or none")
-        argv.append("--s3-integrity=" + integrity)
     for option, value in (("s3_endpoint", endpoint), ("s3_region", region), ("s3_profile", profile)):
         if value is not None:
             argv.append("--" + option.replace("_", "-") + "=" + _text_arg(value, label=option))
-    for option, value in (("s3_concurrency", concurrency), ("s3_part_size", part_size), ("s3_retries", retries)):
-        if value is not None:
-            _nonnegative_integer(value, option=option)
-            argv.append("--" + option.replace("_", "-") + "=" + str(value))
     if headers is not None:
         if isinstance(headers, (str, bytes)):
             raise SyqInvocationError("s3_header must be an iterable of header strings")
@@ -608,8 +598,8 @@ def _copy_arguments(
     only_existing: bool,
     skip_newer: bool,
     no_compress: bool,
-    bwlimit: str | int | None,
-    connections: int | None,
+    resource_limits: str | None,
+    performance_tuning: str | None,
     receiver_max_entries: int | None,
     receiver_max_bytes: str | int | None,
     receiver_receipt: str | None,
@@ -620,8 +610,7 @@ def _copy_arguments(
     max_size: str | int | None,
     min_size: str | int | None,
     max_delete: int | None,
-    hash_algorithm: HashAlgorithm | str | None = None,
-    transfer_integrity: bool = False,
+    integrity_checking: str | None = None,
     expected_digest: Digest | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
@@ -692,16 +681,7 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
-    if hash_algorithm is not None:
-        try:
-            algorithm = HashAlgorithm(hash_algorithm)
-        except (TypeError, ValueError) as error:
-            raise SyqInvocationError("hash_algorithm must be blake3, sha256, md5, or xxh3-128") from error
-        argv.extend(("--hash-algorithm", algorithm.value))
-    if not isinstance(transfer_integrity, bool):
-        raise SyqInvocationError("transfer_integrity must be a boolean")
-    if transfer_integrity:
-        argv.append("--transfer-integrity")
+    _append_text(argv, "--integrity-checking", integrity_checking)
     if expected_digest is not None:
         if not isinstance(expected_digest, Digest):
             raise SyqInvocationError("expected_digest must be a Digest")
@@ -726,10 +706,8 @@ def _copy_arguments(
             argv.append(option)
     if no_compress:
         argv.append("--no-compress")
-    _append_text(argv, "--bwlimit", bwlimit)
-    connections = _positive_integer(connections, option="--connections")
-    if connections is not None:
-        argv.extend(("--connections", str(connections)))
+    _append_text(argv, "--resource-limits", resource_limits)
+    _append_text(argv, "--performance-tuning", performance_tuning)
     receiver_max_entries = _nonnegative_integer(
         receiver_max_entries, option="--receiver-max-entries"
     )
@@ -790,7 +768,7 @@ def _rm_arguments(
     follow: bool,
     follow_src: bool,
     dry_run: bool,
-    connections: int | None,
+    performance_tuning: str | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
     pscope: PathArgument | None,
@@ -824,9 +802,7 @@ def _rm_arguments(
         argv.append("--follow-src")
     if dry_run:
         argv.append("--dry-run")
-    connections = _positive_integer(connections, option="--connections")
-    if connections is not None:
-        argv.extend(("--connections", str(connections)))
+    _append_text(argv, "--performance-tuning", performance_tuning)
     if on is None and (syq_path is not None or no_bootstrap):
         raise SyqInvocationError(
             "syq_path and no_bootstrap apply only to a remote removal endpoint"
@@ -1063,24 +1039,19 @@ class Client:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
-        hash_algorithm: HashAlgorithm | str | None = None,
-        transfer_integrity: bool = False,
+        integrity_checking: str | None = None,
         expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
         no_compress: bool = False,
-        bwlimit: str | int | None = None,
-        connections: int | None = None,
+        resource_limits: str | None = None,
+        performance_tuning: str | None = None,
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
-        s3_concurrency: int | None = None,
-        s3_part_size: int | None = None,
-        s3_retries: int | None = None,
-        s3_integrity: str | None = None,
         auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
@@ -1148,16 +1119,15 @@ class Client:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
-            hash_algorithm=hash_algorithm,
-            transfer_integrity=transfer_integrity,
+            integrity_checking=integrity_checking,
             expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
             no_compress=no_compress,
-            bwlimit=bwlimit,
-            connections=connections,
+            resource_limits=resource_limits,
+            performance_tuning=performance_tuning,
             receiver_max_entries=receiver_max_entries,
             receiver_max_bytes=receiver_max_bytes,
             receiver_receipt=receiver_receipt,
@@ -1169,8 +1139,7 @@ class Client:
             min_size=min_size,
             max_delete=max_delete,
         )
-        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header,
-                      s3_concurrency, s3_part_size, s3_retries, s3_integrity)
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if auth_from is not None and via is not None:
             raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:
@@ -1261,7 +1230,7 @@ class Client:
         follow_src: bool = False,
         results: BinaryIO | None = None,
         dry_run: bool = False,
-        connections: int | None = None,
+        performance_tuning: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
         pscope: PathArgument | None = None,
@@ -1282,7 +1251,7 @@ class Client:
             follow=follow,
             follow_src=follow_src,
             dry_run=dry_run,
-            connections=connections,
+            performance_tuning=performance_tuning,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
             pscope=pscope,
@@ -1350,8 +1319,8 @@ class Client:
             only_existing=False,
             skip_newer=False,
             no_compress=False,
-            bwlimit=None,
-            connections=None,
+            resource_limits=None,
+            performance_tuning=None,
             receiver_max_entries=None,
             receiver_max_bytes=None,
             receiver_receipt=None,

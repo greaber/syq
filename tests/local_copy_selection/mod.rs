@@ -17,10 +17,10 @@ fn local_batch_boundary_and_scheduler_agree() {
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections",
-                connections,
+                "--performance-tuning",
+                &format!("workers={connections}"),
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 "--no-progress",
                 &t.s("src/"),
                 &t.s("dst/"),
@@ -61,9 +61,9 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=2",
+            "--performance-tuning=workers=2",
             "--block-size=4M",
-            "--tuning-options=request-size=4M",
+            "--performance-tuning=request-size=4M",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -84,14 +84,14 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
 
 #[test]
 fn checksum_and_paced_medium_files_keep_batches() {
-    for control in ["--checksum", "--bwlimit=1G"] {
+    for control in ["--checksum", "--resource-limits=bandwidth=1G"] {
         let t = Tmp::new();
         write(&t.path("src/file"), &prng(1 << 20, 80));
         let out = compat_command()
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections=1",
+                "--performance-tuning=workers=1",
                 "--no-progress",
                 control,
                 &t.s("src/"),
@@ -134,7 +134,7 @@ fn remote_medium_files_keep_batches() {
                 env!("CARGO_BIN_EXE_syq"),
                 "--syq-no-bootstrap",
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 &src,
                 &dst,
             ],
@@ -191,7 +191,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let out = compat_command()
         .args([
             "-a",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -277,7 +277,7 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
         fs::remove_file(t.path("dst/tiny")).unwrap();
     }
     let resumed = run()
-        .arg("--tuning-options=copy-path=ranges")
+        .arg("--performance-tuning=copy-path=ranges")
         .run()
         .unwrap();
     assert_output_ok(&resumed);

@@ -342,6 +342,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
         },
     )?;
     Ok(connection)
@@ -980,7 +981,7 @@ fn attempt_small_copy(
     let mut files = Vec::with_capacity(srcs.len());
     for (entry, (dst_path, _, _)) in entries.iter().zip(&targets) {
         let (data, hash) = if entry.size == 0 {
-            (Vec::new(), opts.hash_policy.algorithm.hash(&[]))
+            (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
         } else {
             match blocks.next() {
                 Some(Ok(block)) if block.data.len() as u64 == entry.size => {
@@ -1731,6 +1732,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hash_policy: crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
         },
         expected_digest: args.expected_digest.clone(),
         mapping_expected_digests: mapping_entries
@@ -2805,9 +2807,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_TCP;
             gate.set_active(args.connections);
         }
-        let tuning_key = (autotune && args.tuning_options.is_none())
-            .then(|| tune::path_key(&src_ep, &dst_ep))
-            .flatten();
+        let tuning_key =
+            (autotune && args.tuning_options.is_none() && args.resource_limits.is_none())
+                .then(|| tune::path_key(&src_ep, &dst_ep))
+                .flatten();
         let remembered_start = tuning_key.as_deref().and_then(tune::cached);
         if let Some(remembered) = remembered_start {
             args.connections = remembered;
@@ -7955,7 +7958,7 @@ impl Worker {
                 if job.entry.size == 0 {
                     return Ok(SmallBlock {
                         data: Vec::new(),
-                        hash: self.opts.hash_policy.algorithm.hash(&[]),
+                        hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
                     });
                 }
                 match blocks.next() {
@@ -7977,7 +7980,7 @@ impl Worker {
                     block,
                     SmallBlock {
                         data: Vec::new(),
-                        hash: self.opts.hash_policy.algorithm.hash(&[]),
+                        hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
                     },
                 ),
                 Err(_) => {
@@ -8811,7 +8814,7 @@ impl Worker {
                     &mut data,
                     |data| {
                         if policy.transfer_integrity {
-                            policy.algorithm.hash(data)
+                            policy.payload_algorithm().hash(data)
                         } else {
                             [0; 32]
                         }

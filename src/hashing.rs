@@ -119,6 +119,14 @@ impl Hasher {
 pub(crate) struct HashPolicy {
     pub algorithm: HashAlgorithm,
     pub transfer_integrity: bool,
+    #[serde(default)]
+    pub transfer_hash_type: Option<HashAlgorithm>,
+}
+
+impl HashPolicy {
+    pub fn payload_algorithm(self) -> HashAlgorithm {
+        self.transfer_hash_type.unwrap_or(self.algorithm)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +141,7 @@ impl CopyHashing {
             policy: HashPolicy {
                 algorithm: args.hash_algorithm,
                 transfer_integrity: args.transfer_integrity,
+                transfer_hash_type: args.transfer_hash_type,
             },
             expected_digest: args.expected_digest.clone(),
         }

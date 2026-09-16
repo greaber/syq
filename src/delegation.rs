@@ -524,7 +524,7 @@ impl SignedGrantEnvelope {
                         postcard::from_bytes(rest)?;
                     (tcp, Some(mapping), None)
                 }
-                "copy-hashing-v1" => {
+                "copy-hashing-v2" => {
                     let (tcp, mapping, hashing): (
                         Option<String>,
                         Option<crate::mapping::Authorization>,
@@ -749,7 +749,7 @@ fn canonical_body_bytes(
             }
         }
         bytes.extend(postcard::to_stdvec(&(
-            "copy-hashing-v1",
+            "copy-hashing-v2",
             tcp_congestion,
             mapping,
             hashing,
@@ -2311,6 +2311,7 @@ mod tests {
             policy: HashPolicy {
                 algorithm: HashAlgorithm::Xxh3,
                 transfer_integrity: false,
+                transfer_hash_type: None,
             },
             expected_digest: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"expected file")),
         };
@@ -2328,9 +2329,11 @@ mod tests {
         let replay = fixture.replay("hashing-replay");
         let mut changed = hashing.clone();
         changed.policy.transfer_integrity = true;
+        let mut other_payload = hashing.clone();
+        other_payload.policy.transfer_hash_type = Some(HashAlgorithm::Sha256);
         let mut omitted = hashing.clone();
         omitted.expected_digest = None;
-        for policy in [None, Some(changed), Some(omitted)] {
+        for policy in [None, Some(changed), Some(other_payload), Some(omitted)] {
             let mut tampered = decoded.clone();
             tampered.hashing = policy;
             assert!(verify_and_redeem(

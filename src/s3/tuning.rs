@@ -1,5 +1,5 @@
 //! Process-local admission control. Samples are useful copies, not calibration traffic.
-use super::{Integrity, Options};
+use super::Options;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -11,14 +11,16 @@ use tokio::sync::Notify;
 
 pub(super) struct Tuning {
     control_ns: AtomicU64,
+    fixed_requests: Option<usize>,
     tigris: bool,
     pub requests: Arc<Budget>,
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
-    pub fn new(options: &Options) -> Self {
+    pub fn new(options: &Options, args: &crate::cli::Args) -> Self {
         Self {
             control_ns: AtomicU64::new(u64::MAX),
+            fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
             // not change the data route, integrity policy, or explicit overrides.
@@ -33,12 +35,10 @@ impl Tuning {
                         || host.ends_with(".tigris.dev")
                 }),
             requests: Arc::new(Budget::new(
-                if options.integrity == Integrity::None && options.automatic_concurrency {
-                    64
-                } else {
-                    256
-                },
-                options.integrity == Integrity::None && options.automatic_concurrency,
+                args.tuning_options
+                    .and_then(|t| t.s3_requests)
+                    .unwrap_or(64),
+                args.tuning_options.and_then(|t| t.s3_requests).is_none(),
             )),
         }
     }
@@ -54,11 +54,12 @@ impl Tuning {
         !self.tigris && ns != u64::MAX && ns >= 50_000_000
     }
     pub fn configure(&self, tiny: bool, workers: usize, request_cap: usize) {
+        let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
         let ns = self.control_ns.load(Relaxed);
         let mut s = self.requests.state.lock().unwrap();
         s.max = request_cap;
         s.limit = s.limit.min(request_cap);
-        if tiny && self.high_latency() {
+        if self.fixed_requests.is_none() && tiny && self.high_latency() {
             // At high request latency, starting below the measured capacity
             // leaves short queues waiting through an extra response cycle.
             s.limit = request_cap;

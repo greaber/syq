@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Local fault-injection checks for --s3-integrity=none. No cloud credentials."""
-import http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, urllib.parse
+"""Local fault-injection checks for automatic S3 transfers. No cloud credentials."""
+import base64, hashlib, shutil, http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, urllib.parse
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 events = []
 scenario = "upload"
@@ -31,14 +31,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             events.append(("create",time.monotonic())); self.respond(200,b"<InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>")
     def do_PUT(self):
         assert self.headers.get("x-amz-content-sha256")=="UNSIGNED-PAYLOAD"
-        assert not any(k.lower().startswith("x-amz-checksum") or k.lower() in ("content-md5","x-amz-meta-syq-blake3") for k in self.headers)
+        assert self.headers.get("x-amz-checksum-sha256")
+        assert not self.headers.get("x-amz-meta-syq-blake3")
         part=int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("partNumber",[0])[0])
         events.append(("put-start",time.monotonic(),part))
         left=int(self.headers["Content-Length"])
+        digest=hashlib.sha256()
         while left:
             block=self.rfile.read(min(left,1024*1024))
             if not block: break
+            digest.update(block)
             left-=len(block)
+        assert base64.b64encode(digest.digest()).decode()==self.headers["x-amz-checksum-sha256"]
         if part==2: time.sleep(.4)
         if scenario in ("upload-delayed", "upload-single-delayed"): time.sleep(7)
         events.append(("put-end",time.monotonic(),part))
@@ -53,11 +57,12 @@ try:
     with tempfile.TemporaryDirectory(prefix="syq-s3-fast-") as temp:
         root=pathlib.Path(temp); source=root/"source"; source.write_bytes(os.urandom(11*2**20))
         env={**os.environ,"AWS_ACCESS_KEY_ID":"fixture","AWS_SECRET_ACCESS_KEY":"fixture","AWS_REGION":"us-east-1","AWS_EC2_METADATA_DISABLED":"true","AWS_ENDPOINT_URL_S3":"http://127.0.0.1:"+str(server.server_address[1]),"XDG_CACHE_HOME":str(root/"cache")}
-        base=[binary,"cp","--no-progress","--s3-integrity=none","--s3-retries","0","-p","5","-c","2"]
+        base=[binary,"cp","--no-progress","--performance-tuning", "s3-retries=0,s3-part-size=5M,s3-part-workers=2"]
         for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated"]:
+            shutil.rmtree(root/"cache",ignore_errors=True)
             events.clear(); destination=root/"download"; destination.unlink(missing_ok=True)
             command=base+([str(source),"--to","s3://fixture","--as","object"] if scenario.startswith("upload") else ["--from","s3://fixture","object","--as",str(destination)])
-            if scenario.startswith("upload-single"): command[command.index("-p")+1]="16"
+            if scenario.startswith("upload-single"): command[command.index("--performance-tuning")+1]="s3-retries=0,s3-part-size=16M,s3-part-workers=2"
             if scenario=="upload-interrupted":
                 child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 deadline=time.monotonic()+10
@@ -69,9 +74,10 @@ try:
             expected=scenario in ("upload","upload-delayed","upload-single","upload-single-delayed","download")
             assert (code==0)==expected,(scenario,code,err.decode())
             if scenario in ("upload-failure","upload-interrupted"):
-                assert sum(e[0]=="abort" for e in events)==1,events
+                assert not any(e[0]=="abort" for e in events),events
                 assert not any(e[0]=="complete" for e in events),events
-                assert next(e[1] for e in events if e[0]=="abort") > max(e[1] for e in events if e[0]=="put-end"),events
+                assert sorted(e[2] for e in events if e[0]=="put-start")==sorted(e[2] for e in events if e[0]=="put-end"),events
+                assert list((root/"cache"/"syq"/"s3").glob("*.json"))
             if scenario.startswith("upload-single"):
                 assert not any(e[0] in ("create","complete","abort") for e in events),events
                 assert any(e[0]=="put-end" for e in events),events
@@ -83,10 +89,7 @@ try:
             if scenario=="download": assert destination.read_bytes()==b"hello world"
             if scenario=="download-truncated": assert not destination.exists()
             assert not list(root.glob(".syq-s3-*.partial")),list(root.iterdir())
-            assert not (root/"cache"/"syq"/"s3").exists()
+            if expected: assert not list((root/"cache"/"syq"/"s3").glob("*.json"))
             print(scenario,"passed",flush=True)
-        for flag in ["--hash","--verify-only"]:
-            result=subprocess.run(base+[flag,str(source),"--to","s3://fixture","--as","object"],env=env,capture_output=True,timeout=10)
-            assert result.returncode and b"cannot be combined" in result.stderr,result.stderr
 finally:
     server.shutdown();server.server_close();thread.join(timeout=5)

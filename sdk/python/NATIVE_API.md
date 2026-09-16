@@ -75,21 +75,19 @@ In addition to the shared arguments above, it accepts:
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
-| `hash_algorithm` | `HashAlgorithm` or `"blake3"`, `"sha256"`, `"md5"`, `"xxh3-128"`; chooses ordinary content-comparison hashing; default BLAKE3 |
-| `transfer_integrity` | Boolean: request syq's additional transfer checks; default `False`; independent of transport encryption |
+| `integrity_checking` | Comma-separated string, e.g. `"compare=blake3,transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `expected_digest` | `Digest` for one regular-file source; with mappings, set it on each `MappingEntry` instead |
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `preserve` | Preservation string or iterable of strings |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
-| `bwlimit`, `min_size`, `max_size` | Native rate/size strings or integers |
+| `min_size`, `max_size` | Native size strings or integer bytes |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
-| `connections` | Positive integer connection count; for S3, concurrent objects |
+| `resource_limits` | Comma-separated ceilings, e.g. `"bandwidth=10M"` |
+| `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-object-workers=32,s3-part-workers=8,s3-part-size=16M"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
-| `s3_integrity` | `"full"` (default) or `"none"`; none omits payload verification and recovery, and selects automatic performance settings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
-| `s3_concurrency`, `s3_part_size`, `s3_retries` | Integer parts per object, MiB per part, and transient retry budget |
 | `auth_from`, `via` | Credential source string; aliases, so use only one |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
@@ -143,7 +141,7 @@ Directory and contents selectors reject a final symlink even with following
 enabled.
 
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
-arguments, it accepts `on`, `dry_run`, `connections`, `syq_path`,
+arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local and ordinary SSH endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
@@ -214,7 +212,8 @@ The expectation covers the complete resulting file, including reused bytes.
 A mismatch fails the file rather than reporting a successful copy. Files excluded
 by selection rules are not digest-verified. `hash=True` still controls whether
 existing contents are compared instead of trusting size and modification time;
-`hash_algorithm` selects the algorithm without enabling that comparison policy.
+`integrity_checking="compare=HASH"` selects and enables content comparison;
+`hash=True` is a shorthand for `compare=blake3`.
 Dry runs preview changes without validating the expectation. An expected
 whole-file digest is independent of the algorithm used for block comparison or
 transport checks. MD5 and XXH3-128 are useful for compatibility

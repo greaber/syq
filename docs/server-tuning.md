@@ -61,7 +61,7 @@ ask the server administrator to enable it; see the
 The option cannot tune SSH's own connections.
 
 Compare with `--tcp-congestion cubic` using the same data and an empty test
-destination each time. Try both directions. Use `--bwlimit` if you need to
+destination each time. Try both directions. Use `--resource-limits bandwidth=RATE` if you need to
 leave bandwidth for other users.
 
 ## Let SSH connections start promptly
@@ -130,7 +130,7 @@ system settings:
 
 - **Transport and parallelism:** inspect the selected transport and connection
   count with `-vv --stats`. For a controlled worker-count comparison, use
-  `--connections N`; see [benchmark tuning](tuning.md). Use the
+  `--performance-tuning workers=N`; see [benchmark tuning](tuning.md). Use the
   same reporting options in each run, and start with defaults for everyday
   copies. More workers need not help once storage or an NFS service is saturated;
   compare repeated runs before choosing a lower count.

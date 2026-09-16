@@ -132,7 +132,7 @@ class BenchmarkTests(unittest.TestCase):
         log = self.root / 'args.jsonl'
         tuning = 'batch-files=256,batch-bytes=2M'
         result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
-                             '--', '-vv', '--no-tcp', '--connections', '4', '--tuning-options', tuning,
+                             '--', '-vv', '--no-tcp', '--performance-tuning', 'workers=4', '--performance-tuning', tuning,
                              env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count('Command:'), 1)
@@ -144,8 +144,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(len(copies), 2)  # setup and one scored copy
         for args in copies:
             self.assertIn('--no-tcp', args)
-            self.assertEqual(args[args.index('--connections')+1], '4')
-            self.assertEqual(args[args.index('--tuning-options')+1], tuning)
+            self.assertEqual(args[args.index('--performance-tuning')+1], 'workers=4')
+            self.assertEqual([args[i+1] for i, a in enumerate(args) if a == '--performance-tuning'], ['workers=4', tuning])
         self.assert_clean()
 
     def test_warmup_precedes_scored_copies_in_both_directions(self):
@@ -170,9 +170,9 @@ class BenchmarkTests(unittest.TestCase):
                 self.assert_clean()
 
     def test_warmup_can_be_skipped_and_manual_tuning_skips_it(self):
-        options = [('--warmup', 'off'), ('--', '--connections', '1'), ('--', '-j1'),
-                   ('--', '--connections=1'), ('--', '--tuning-options', 'request-size=1M'),
-                   ('--', '--tuning-options=request-size=1M'), ('--tool', 'rsync')]
+        options = [('--warmup', 'off'), ('--', '--performance-tuning', 'workers=1'),
+                   ('--', '--performance-tuning=workers=1'), ('--', '--performance-tuning', 'request-size=1M'),
+                   ('--', '--performance-tuning=request-size=1M'), ('--tool', 'rsync')]
         for args in options:
             with self.subTest(args=args):
                 result = self.invoke('--mode', 'push', '--host', 'test-host', *args)
@@ -266,7 +266,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_tuning_cannot_redirect_copy_or_output(self):
         for args in [('--', '--as', str(self.scratch)), ('--', '--results', str(self.sentinel)),
-                     ('--', '--prune'), ('--', '--connections'),
+                     ('--', '--prune'), ('--', '--performance-tuning'),
                      ('--tool', 'cp', '--mode', 'push', '--host', 'test-host'),
                      ('--tool', 'rsync', '--', '--no-tcp')]:
             with self.subTest(args=args):

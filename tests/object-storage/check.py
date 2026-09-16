@@ -103,7 +103,7 @@ def clean():
 
 
 def run(args, *, ok=True, env=None, capture=False):
-    command = [SYQ, 'cp', '--no-progress', '-p', '5', '-c', '3', '--s3-retries', '1']
+    command = [SYQ, 'cp', '--no-progress', '--performance-tuning=s3-part-size=5M,s3-part-workers=3,s3-retries=1']
     for name, value in HEADERS.items():
         command += ['--s3-header', name + ': ' + value]
     completed = subprocess.run(command + list(map(str, args)), env=env, text=True, capture_output=capture, timeout=180)
@@ -112,7 +112,7 @@ def run(args, *, ok=True, env=None, capture=False):
 
 
 def interrupted(args, threshold=5*1024*1024):
-    command=[SYQ,'cp','--no-progress','--progress-json','-p','5','-c','1','--bwlimit','1MiB','--s3-retries','1']
+    command=[SYQ,'cp','--no-progress','--progress-json','--performance-tuning=s3-part-size=5M,s3-part-workers=1,s3-retries=1','--resource-limits=bandwidth=1MiB']
     for name,value in HEADERS.items(): command+=['--s3-header',name+': '+value]
     process=subprocess.Popen(command+list(map(str,args)),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,start_new_session=True)
     deadline=time.monotonic()+60
@@ -224,7 +224,7 @@ def check():
         _, body = request('GET', PREFIX + '/mapping/renamed')
         assert body == (src / 'script').read_bytes()
         run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',
-             '--expected-hash', 'md5:' + script_md5, '--transfer-integrity'])
+             '--expected-hash', 'md5:' + script_md5, '--integrity-checking=transfer=blake3'])
         assert (root / 'expected').read_bytes() == body
         (root / 'expected').write_bytes(b'keep on mismatch')
         run(['--from', remote, PREFIX + '/mapping/renamed', '--as', root / 'expected',

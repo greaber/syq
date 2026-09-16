@@ -12,19 +12,25 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
   a maintainer-run host that counts requests by version, platform, and
   country before redirecting to the GitHub release files. The reminder check
   also honors `DO_NOT_TRACK=1`. See the install guide for what is recorded.
-- Extra transfer integrity checks are now opt-in with `--transfer-integrity`,
+- Extra transfer integrity checks are now opt-in with `--integrity-checking transfer=blake3`,
   independently of encryption. Content comparison, resume checks, and required
   storage-provider checks remain active when needed.
-- Choose BLAKE3, SHA-256, MD5, or XXH3-128 with `--hash-algorithm`. BLAKE3 remains
-  the default; `--hash` still selects content comparison instead of size/time
-  shortcuts.
+- `--integrity-checking compare=HASH` selects and enables content comparison;
+  `--hash` is shorthand for `compare=blake3`. Comparison and transfer checks can
+  independently use BLAKE3, SHA-256, MD5, or XXH3-128.
+- Native performance controls now use `--performance-tuning`, including
+  `workers=N` for filesystem copies and separate S3 object, part and request
+  counts. `--resource-limits bandwidth=RATE` replaces native `--bwlimit`.
+  The old native tuning flags and SDK keywords have been removed.
 - Require a whole-file digest with `--expected-hash ALGORITHM:HEX` or an
   `expected_digest` on each mapping entry. The Python API supports the same
   controls and preserves expectations in retry entries. Staged replacements
   are checked before publication; `--inplace` may leave changed bytes on failure.
-- S3-compatible uploads reuse provider part checksums for recovery, avoiding
-  the separate whole-file BLAKE3 pass by default. Optional whole-file checks
-  share single-part provider hashes when the algorithm matches.
+- Copy to and from S3-compatible object storage with native selectors,
+  metadata preservation, custom request headers and resumable multipart transfers.
+  Default copies use automatic parallelism and the optimized upload/download
+  paths independently of optional integrity checks. Provider part checksums
+  support recovery without a separate whole-file BLAKE3 pass by default.
 
 ## 0.6.0 — 2026-09-13
 

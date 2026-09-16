@@ -167,7 +167,7 @@ self-updates is verified against a signed release manifest before use.
 That verification cannot protect a machine whose trusted account or programs
 have already been compromised.
 
-Optional `--transfer-integrity` checks detect accidental data corruption; they
+Optional `--integrity-checking transfer=blake3` checks detect accidental data corruption; they
 do not authenticate plaintext traffic because an attacker can replace both
 data and checksums. An expected whole-file digest supplied through a trusted
 channel checks the resulting file against that expectation. Use BLAKE3 or

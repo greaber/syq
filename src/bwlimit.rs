@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Parse an rsync-style `--bwlimit` rate into bytes per second.
+/// Parse an rsync-style `bandwidth` rate into bytes per second.
 ///
 /// A bare value is in KiB/s. Single-letter and IEC suffixes use powers of
 /// 1024 (`M`, `MiB`); SI `KB`/`MB`/etc. suffixes use powers of 1000. A final
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 pub fn parse_rate(value: &str) -> Result<u64> {
     let value = value.trim();
     if value.is_empty() {
-        bail!("empty --bwlimit rate");
+        bail!("empty bandwidth rate");
     }
 
     let (scaled, adjustment) = if let Some(s) = value.strip_suffix("+1") {
@@ -31,9 +31,9 @@ pub fn parse_rate(value: &str) -> Result<u64> {
     let (number, suffix) = scaled.split_at(suffix_at);
     let number: f64 = number
         .parse()
-        .map_err(|_| anyhow::anyhow!("bad --bwlimit rate {value:?}"))?;
+        .map_err(|_| anyhow::anyhow!("bad bandwidth rate {value:?}"))?;
     if !number.is_finite() || number < 0.0 {
-        bail!("bad --bwlimit rate {value:?}");
+        bail!("bad bandwidth rate {value:?}");
     }
 
     let multiplier = match suffix.to_ascii_lowercase().as_str() {
@@ -49,20 +49,20 @@ pub fn parse_rate(value: &str) -> Result<u64> {
         "tb" => 1_000_000_000_000,
         "p" | "pib" => 1u64 << 50,
         "pb" => 1_000_000_000_000_000,
-        _ => bail!("bad --bwlimit suffix in {value:?}"),
+        _ => bail!("bad bandwidth suffix in {value:?}"),
     };
     let bytes = number * multiplier as f64 + adjustment;
     if !bytes.is_finite() || bytes < 0.0 {
-        bail!("bad --bwlimit rate {value:?}");
+        bail!("bad bandwidth rate {value:?}");
     }
     if bytes > u64::MAX as f64 {
-        bail!("--bwlimit rate is too large: {value:?}");
+        bail!("bandwidth rate is too large: {value:?}");
     }
     if bytes == 0.0 {
         return Ok(0);
     }
     if bytes < 512.0 {
-        bail!("--bwlimit rate must be 0 or at least 512 bytes/s");
+        bail!("bandwidth rate must be 0 or at least 512 bytes/s");
     }
 
     // Match rsync's nearest-KiB compatibility rounding.
@@ -71,7 +71,7 @@ pub fn parse_rate(value: &str) -> Result<u64> {
     let rate = kib
         .checked_mul(1024)
         .filter(|n| *n <= u64::MAX as u128)
-        .ok_or_else(|| anyhow::anyhow!("--bwlimit rate is too large: {value:?}"))?;
+        .ok_or_else(|| anyhow::anyhow!("bandwidth rate is too large: {value:?}"))?;
     Ok(rate as u64)
 }
 

@@ -33,7 +33,7 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
 
-After --, tune syq with --connections/-j, --tuning-options, --bwlimit,
+After --, tune syq with --performance-tuning, --resource-limits,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
 --tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
 These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
@@ -486,12 +486,12 @@ main() {
                 shift
                 while [[ $# -gt 0 ]]; do
                     case $1 in
-                        --connections|-j|--tuning-options|--bwlimit|--tcp-ports|--tcp-congestion)
+                        --performance-tuning|--resource-limits|--tcp-ports|--tcp-congestion)
                             [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
-                            case $1 in --connections|-j|--tuning-options) manual_tuning=true ;; esac
+                            case $1 in --performance-tuning) manual_tuning=true ;; esac
                             syq_extra+=("$1" "$2"); shift 2 ;;
-                        --connections=?*|--tuning-options=?*|--bwlimit=?*|--tcp-ports=?*|--tcp-congestion=?*|-j[0-9]*)
-                            case $1 in --connections=*|--tuning-options=*|-j[0-9]*) manual_tuning=true ;; esac
+                        --performance-tuning=?*|--resource-limits=?*|--tcp-ports=?*|--tcp-congestion=?*)
+                            case $1 in --performance-tuning=*) manual_tuning=true ;; esac
                             syq_extra+=("$1"); shift ;;
                         -v|-vv|--verbose)
                             verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;

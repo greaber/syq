@@ -65,15 +65,15 @@ impl Server {
                 "cp",
                 "--s3-region",
                 "us-east-1",
-                "--s3-retries",
-                "0",
+                "--performance-tuning",
+                "s3-retries=0",
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",
-                "-p",
-                "5",
-                "-c",
-                "3",
+                "--performance-tuning",
+                "s3-part-size=5M",
+                "--performance-tuning",
+                "s3-part-workers=3",
             ])
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
@@ -537,7 +537,7 @@ fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
         let temp = tempfile::tempdir().unwrap();
         let mut args = vec!["--from", "s3://bucket", "data", "--as", "download"];
         if fault == "corrupt" {
-            args.push("--transfer-integrity");
+            args.push("--integrity-checking=transfer=blake3");
         }
         let output = server.cp(temp.path(), &args);
         assert!(
@@ -559,15 +559,7 @@ fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
         std::fs::write(temp.path().join("download"), b"original").unwrap();
         let output = server.cp(
             temp.path(),
-            &[
-                "--s3-integrity",
-                "none",
-                "--from",
-                "s3://bucket",
-                "data",
-                "--as",
-                "download",
-            ],
+            &["--from", "s3://bucket", "data", "--as", "download"],
         );
         assert_eq!(
             output.status.success(),
@@ -588,6 +580,31 @@ fn s3_fast_queued_ranges_preserve_bytes_and_fail_without_publication() {
 }
 
 #[test]
+fn s3_one_request_slot_supports_multipart_and_content_verification() {
+    let server = Server::start("ok");
+    let temp = tempfile::tempdir().unwrap();
+    for extra in [None, Some("--verify-only")] {
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "result",
+            "--performance-tuning=s3-requests=1",
+        ];
+        if let Some(flag) = extra {
+            args.push(flag);
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{}", output_text(&output));
+    }
+    assert_eq!(
+        std::fs::metadata(temp.path().join("result")).unwrap().len(),
+        SIZE as u64
+    );
+}
+
+#[test]
 fn s3_bad_responses_preserve_existing_destination() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
         let server = Server::start(fault);
@@ -596,7 +613,7 @@ fn s3_bad_responses_preserve_existing_destination() {
         let output = server.cp(
             temp.path(),
             &[
-                "--transfer-integrity",
+                "--integrity-checking=transfer=blake3",
                 "--from",
                 "s3://bucket",
                 "data",
@@ -682,7 +699,7 @@ fn s3_single_get_validates_metadata_length_and_contents() {
         let output = server.cp(
             temp.path(),
             &[
-                "--transfer-integrity",
+                "--integrity-checking=transfer=blake3",
                 "--from",
                 "s3://bucket",
                 "object",
@@ -790,7 +807,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
             .command(temp.path())
             .env("AWS_CONFIG_FILE", &config)
             .args([
-                "--transfer-integrity",
+                "--integrity-checking=transfer=blake3",
                 "--s3-profile",
                 "fixture",
                 "--from",
@@ -920,11 +937,7 @@ fn s3_upload_native_checksum_reuse_and_expected_hash() {
         ("upload-default", Vec::new()),
         (
             "upload-sha256",
-            vec![
-                "--transfer-integrity".to_owned(),
-                "--hash-algorithm".to_owned(),
-                "sha256".to_owned(),
-            ],
+            vec!["--integrity-checking=transfer=sha256".to_owned()],
         ),
         (
             "upload-md5",
@@ -1039,9 +1052,8 @@ fn s3_hash_comparison_reuses_only_the_selected_algorithm() {
         let output = server.cp(
             temp.path(),
             &[
-                "--hash",
-                "--hash-algorithm",
-                algorithm,
+                "--integrity-checking",
+                &format!("compare={algorithm}"),
                 "--from",
                 "s3://bucket",
                 "object",
@@ -1135,9 +1147,8 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
         let output = server.cp(
             temp.path(),
             &[
-                "--hash",
-                "--hash-algorithm",
-                algorithm,
+                "--integrity-checking",
+                &format!("compare={algorithm}"),
                 "source",
                 "--to",
                 "s3://bucket",

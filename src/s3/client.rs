@@ -1,10 +1,7 @@
 use super::{Header, Options};
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
-    config::{
-        retry::RetryConfig, timeout::TimeoutConfig, Region, RequestChecksumCalculation,
-        ResponseChecksumValidation,
-    },
+    config::{retry::RetryConfig, timeout::TimeoutConfig, Region, RequestChecksumCalculation},
     Client,
 };
 use aws_smithy_runtime_api::{
@@ -81,11 +78,7 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
-    let transport = if options.integrity == super::Integrity::None {
-        super::upload_http::client(transport)
-    } else {
-        transport
-    };
+    let transport = super::upload_http::client(transport);
     let mut config = aws_sdk_s3::config::Builder::from(&shared)
         .http_client(transport)
         .region(
@@ -105,9 +98,7 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
         .interceptor(Headers(options.headers.clone()));
-    if options.integrity == super::Integrity::None {
-        config = config.response_checksum_validation(ResponseChecksumValidation::WhenRequired);
-    }
+
     let endpoint = options
         .endpoint
         .clone()

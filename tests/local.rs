@@ -137,7 +137,7 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
     command
         .arg("-e")
         .arg(rsh)
-        .args(["--syq-no-bootstrap", "--syq-connections", "1"])
+        .args(["--syq-no-bootstrap", "--performance-tuning", "workers=1"])
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -226,8 +226,8 @@ fn source_fd_budget_handles_deep_tree_with_96_slots() {
     let mut command = compat_command();
     command.args([
         "-a",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         "--no-progress",
         &t.s("source/"),
         &t.s("destination/"),
@@ -250,7 +250,7 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
     }
 
     let mut command = compat_command();
-    command.args(["-a", "--syq-connections", "1", "--no-progress"]);
+    command.args(["-a", "--performance-tuning", "workers=1", "--no-progress"]);
     command.args(&sources);
     command.arg(t.s("destination/"));
     command.env("SYQ_DEBUG", "1");
@@ -273,8 +273,8 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
     let mut command = compat_command();
     command.args([
         "-a",
-        "--syq-connections",
-        "64",
+        "--performance-tuning",
+        "workers=64",
         "--no-progress",
         &t.s("source"),
         &t.s("destination"),
@@ -533,7 +533,7 @@ fn confinement_matrix_remote_destination_parent_swap_is_confined_for_tcp_and_ssh
         let destination = format!("127.0.0.1:{}/", t.s("dst"));
 
         let mut child = confinement_remote_command(&t, tcp)
-            .args(["-a", "--bwlimit", "1G"])
+            .args(["-a", "--resource-limits", "bandwidth=1G"])
             .arg(t.s("src/"))
             .arg(&destination)
             .arg("--no-progress")
@@ -607,8 +607,8 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
             .args(insecure.then_some("--insecure-links"))
             .args([
                 "-anv",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -657,8 +657,8 @@ fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &source,
             &destination,
             "--no-progress",
@@ -694,8 +694,8 @@ fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &source,
             &destination,
             "--no-progress",
@@ -820,8 +820,8 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             .args(insecure.then_some("--insecure-links"))
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -865,8 +865,8 @@ fn copy_local_uses_registered_source_after_path_replacement() {
         let mut child = compat_command()
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -911,8 +911,8 @@ fn copy_local_refuses_a_replaced_destination_parent() {
         let mut child = compat_command()
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -958,8 +958,8 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
             .args([
                 "-a",
                 "--inplace",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -1812,8 +1812,8 @@ fn native_copy_accepts_copy_only_operational_controls() {
             &t.s("src/file"),
             "--as-new",
             &t.s("copied"),
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-compress",
             "--stats",
             "--no-progress",
@@ -1833,11 +1833,11 @@ fn native_copy_accepts_copy_only_operational_controls() {
         &t.s("src/file"),
         "--as-new",
         &t.s("invalid"),
-        "--bwlimit",
-        "fast",
+        "--resource-limits",
+        "bandwidth=fast",
     ]);
     assert_eq!(invalid.status.code(), Some(2));
-    assert!(stderr_of(&invalid).contains("bad --bwlimit"));
+    assert!(stderr_of(&invalid).contains("bad bandwidth"));
     assert!(!t.path("invalid").exists());
 }
 
@@ -2069,7 +2069,12 @@ fn native_remote_destination_socket_policy_uses_handshake_capability() {
             .args(["cp", "--rsh"])
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-            .args(["--no-tcp", "-j", "1", "--preserve=specials"])
+            .args([
+                "--no-tcp",
+                "--performance-tuning",
+                "workers=1",
+                "--preserve=specials",
+            ])
             .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
             .arg(t.path(destination))
             .arg("--no-progress")
@@ -3816,8 +3821,8 @@ fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
         "-e",
         rsh.to_str().unwrap(),
         "--syq-no-tcp",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
     ])
     .args(args)
     .arg("--no-progress")
@@ -5043,7 +5048,13 @@ fn single_verbose_keeps_file_listing_semantics() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--syq-no-tcp", "-v", "-a", "--syq-connections", "1"])
+        .args([
+            "--syq-no-tcp",
+            "-v",
+            "-a",
+            "--performance-tuning",
+            "workers=1",
+        ])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -5150,8 +5161,8 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
             "--syq-tcp-plain",
             "--inplace",
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5206,7 +5217,7 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path(label));
         if fixed {
-            command.args(["--syq-connections", "8"]);
+            command.args(["--performance-tuning", "workers=8"]);
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
@@ -5301,7 +5312,7 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     let out = compat_command()
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--syq-no-tcp", "-a", "--syq-connections", "1"])
+        .args(["--syq-no-tcp", "-a", "--performance-tuning", "workers=1"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -5353,8 +5364,8 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
             "--syq-tcp-congestion=reno",
             "--stats",
             "-avv",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5399,8 +5410,8 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
         .args([
             "--syq-tcp-congestion=syq_missing_cc",
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5447,8 +5458,8 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
             "--syq-tcp-congestion=reno",
             &format!("--syq-tcp-ports={port}-{port}"),
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5492,7 +5503,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
             .arg(env!("CARGO_BIN_EXE_syq"))
             .args(["--syq-no-tcp", "--stats", "-avv"]);
         if let Some(fixed) = fixed {
-            command.args(["--syq-connections", &fixed.to_string()]);
+            command.args(["--performance-tuning", &format!("workers={fixed}")]);
         }
         command
             .arg(t.s("src"))
@@ -5604,7 +5615,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
             "-a",
             "--syq-no-bootstrap",
             "--block-size=64K",
-            "--bwlimit=4M",
+            "--resource-limits=bandwidth=4M",
             "--stats",
             &t.s("src/"),
             &remote,
@@ -5980,7 +5991,15 @@ fn resume_from_partial() {
     fs::create_dir_all(t.path("dst")).unwrap();
     let src = t.s("src/big.bin");
     let dst = t.s("dst/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     // Fake an interrupted transfer: first half present, rest preallocated.
     let partial = interrupted_partial(&args, &t.path("dst"));
     {
@@ -6008,10 +6027,26 @@ fn checksum_toggle_accepts_prior_partial_candidates() {
     set_mtime(&t.path("src"), 1_600_000_000);
     let src = t.s("src");
     let dst = t.s("dst");
-    let initial = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let initial = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&initial, &t.0);
 
-    run_ok(&["-ac", "--block-size", "1M", "--bwlimit", "1G", &src, &dst]);
+    run_ok(&[
+        "-ac",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ]);
 
     assert_eq!(read(&t.path("dst")), data);
     assert!(
@@ -6089,6 +6124,44 @@ fn hash_policy_verify_only_expected_mismatch_exits() {
 }
 
 #[test]
+fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(5 * 1024 * 1024 + 13, 999);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for path in ["ranges", "streaming"] {
+            let destination = format!("destination-{tcp}-{path}");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "fake",
+                "--as",
+                &t.s(&destination),
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--performance-tuning",
+                &format!("workers=2,copy-path={path}"),
+                "--integrity-checking=compare=xxh3-128,transfer=sha256",
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--no-progress",
+            ]);
+            if !tcp {
+                command.arg("--no-tcp");
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            assert!(read(&t.path(&destination)) == data);
+        }
+    }
+}
+
+#[test]
 fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     let t = Tmp::new();
     write(&t.path("source"), b"abc");
@@ -6163,8 +6236,7 @@ fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
             &t.s("source"),
             "--as",
             &t.s(name),
-            "--transfer-integrity",
-            "--hash-algorithm=xxh3-128",
+            "--integrity-checking=transfer=xxh3-128",
         ]);
         if let Some(expected) = expected {
             command.args(["--expected-hash", expected]);
@@ -6279,9 +6351,9 @@ fn hash_policy_expected_empty_file_is_checked_before_publication() {
         &t.s("good"),
         "--expected-hash",
         "md5:d41d8cd98f00b204e9800998ecf8427e",
-        "--hash-algorithm",
-        "xxh3-128",
-        "--transfer-integrity",
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--integrity-checking=transfer=blake3",
     ]);
     assert_eq!(read(&t.path("good")), b"");
     let output = native_syq(&[
@@ -6333,27 +6405,18 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
     write(&t.path("destination"), &bad);
     set_mtime(&t.path("source"), 1_600_000_000);
     set_mtime(&t.path("destination"), 1_600_000_000);
-    // Selecting the algorithm alone must not imply --hash.
-    run_native_ok(&[
-        "cp",
-        "--src",
-        &t.s("source"),
-        "--as",
-        &t.s("destination"),
-        "--hash-algorithm",
-        "xxh3-128",
-    ]);
+    // The default metadata comparison cannot detect this same-size, same-time edit.
+    run_native_ok(&["cp", "--src", &t.s("source"), "--as", &t.s("destination")]);
     assert_eq!(read(&t.path("destination")), bad);
     run_native_ok(&[
         "cp",
-        "--hash",
         "--src",
         &t.s("source"),
         "--as",
         &t.s("destination"),
-        "--hash-algorithm",
-        "xxh3-128",
-        "--transfer-integrity",
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--integrity-checking=transfer=blake3",
     ]);
     assert_eq!(read(&t.path("destination")), contents);
     run_native_ok(&[
@@ -6363,8 +6426,8 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
         &t.s("source"),
         "--as",
         &t.s("destination"),
-        "--hash-algorithm",
-        "xxh3-128",
+        "--integrity-checking",
+        "compare=xxh3-128",
     ]);
     write(&t.path("destination"), &bad);
     let output = native_syq(&[
@@ -6374,8 +6437,8 @@ fn hash_policy_xxh3_compares_repairs_and_verifies() {
         &t.s("source"),
         "--as",
         &t.s("destination"),
-        "--hash-algorithm",
-        "xxh3-128",
+        "--integrity-checking",
+        "compare=xxh3-128",
     ]);
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert_eq!(
@@ -6396,8 +6459,8 @@ fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
             "-a",
             "--block-size",
             "4M",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             &t.s("source"),
             &t.s("destination"),
         ],
@@ -6424,10 +6487,10 @@ fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
         &t.s("destination"),
         "--expected-hash",
         &expected,
-        "--hash-algorithm",
-        "xxh3-128",
-        "--bwlimit",
-        "1G",
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--resource-limits",
+        "bandwidth=1G",
         "--results",
         &t.s("results.ndjson"),
     ]);
@@ -6494,8 +6557,8 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
     let copy = syq(&[
         "-a",
         "-c",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -6513,8 +6576,8 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
         "-a",
         "--syq-verify-only",
         "-v",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -6540,8 +6603,8 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
-        "--syq-connections",
-        "8",
+        "--performance-tuning",
+        "workers=8",
         "--block-size",
         "1M",
         &t.s("src/"),
@@ -6555,12 +6618,12 @@ fn large_file_parallel_chunks() {
     let dst = t.s("dst/");
     let args = [
         "-a",
-        "--syq-connections",
-        "8",
+        "--performance-tuning",
+        "workers=8",
         "--block-size",
         "1M",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         &src,
         &dst,
     ];
@@ -6587,10 +6650,10 @@ fn progress_bar_slow_copy_stays_on_one_line_and_leaves_final_counts() {
             "--as",
             &t.s("dst"),
             "--progress",
-            "--connections",
-            "4",
-            "--bwlimit",
-            "1M",
+            "--performance-tuning",
+            "workers=4",
+            "--resource-limits",
+            "bandwidth=1M",
         ])
         .run()
         .unwrap();
@@ -6659,8 +6722,8 @@ fn progress_bar_does_not_mix_with_json_progress() {
             &t.s("dst"),
             "--progress",
             "--progress-json",
-            "--bwlimit",
-            "1M",
+            "--resource-limits",
+            "bandwidth=1M",
         ])
         .run()
         .unwrap();
@@ -6708,13 +6771,9 @@ fn tuning_options_job_storage_copies_and_updates_with_both_interfaces() {
                         interface,
                         "--no-progress",
                         "--stats",
-                        if interface == "cp" {
-                            "--connections"
-                        } else {
-                            "--syq-connections"
-                        },
-                        "2",
-                        &format!("--tuning-options=job-storage={mode},copy-path={engine}"),
+                        "--performance-tuning",
+                        "workers=2",
+                        &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
                     ]);
                     if interface == "cp" {
                         command.args(["--hash", "--preserve=permissions"]);
@@ -6757,9 +6816,9 @@ fn tuning_options_job_storage_inplace_preserves_hardlinks() {
                     &t.s("destination"),
                     "--inplace",
                     "--no-progress",
-                    "--connections",
-                    "2",
-                    &format!("--tuning-options=job-storage={mode},copy-path={engine}"),
+                    "--performance-tuning",
+                    "workers=2",
+                    &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
                 ])
                 .run()
                 .unwrap();
@@ -6783,9 +6842,9 @@ fn tuning_options_force_ranges_for_small_and_whole_local_files() {
             &t.s("source"),
             "--into",
             &t.s("destination"),
-            "--tuning-options=copy-path=ranges,request-size=1M,split-min-size=1M",
-            "-j",
-            "2",
+            "--performance-tuning=copy-path=ranges,request-size=1M,split-min-size=1M",
+            "--performance-tuning",
+            "workers=2",
             "-v",
             "--no-progress",
             "--preserve=permissions",
@@ -6829,14 +6888,14 @@ fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                "2",
+                "--performance-tuning",
+                "workers=2",
                 "--no-progress",
                 "--no-tcp",
                 "--stats",
                 "--preserve=permissions",
                 "-v",
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("copy-path={mode},request-size=1M"),
             ]);
             if route == "pull" {
@@ -6892,8 +6951,8 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "--no-progress",
                 "--no-tcp",
                 "--stats",
@@ -6966,8 +7025,8 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
                 "-v",
                 "--stats",
                 "--no-compress",
-                "--bwlimit=512K",
-                "--connections=1",
+                "--resource-limits=bandwidth=512K",
+                "--performance-tuning=workers=1",
                 "--no-progress",
                 "--rsh",
                 rsh.to_str().unwrap(),
@@ -7039,14 +7098,14 @@ fn streaming_copies_local_trees_and_remote_ranges() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                &workers.to_string(),
+                "--performance-tuning",
+                &format!("workers={workers}"),
                 "--no-progress",
                 "--preserve=permissions",
                 "-v",
                 "--tcp-ports",
                 EPHEMERAL_TCP_PORTS,
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("copy-path=streaming,request-size={request},split-min-size=1M"),
             ]);
             if route.starts_with("ssh") {
@@ -7103,8 +7162,8 @@ fn streaming_and_default_copies_share_resume_partials() {
             &[
                 "-a",
                 "--block-size=1M",
-                "--bwlimit=1G",
-                &format!("--tuning-options=copy-path={before}"),
+                "--resource-limits=bandwidth=1G",
+                &format!("--performance-tuning=copy-path={before}"),
                 &src,
                 &dst,
             ],
@@ -7117,8 +7176,8 @@ fn streaming_and_default_copies_share_resume_partials() {
         let out = run_ok(&[
             "-a",
             "--block-size=1M",
-            "--bwlimit=1G",
-            &format!("--tuning-options=copy-path={after},request-size=128K,bw-pacing=average"),
+            "--resource-limits=bandwidth=1G",
+            &format!("--performance-tuning=copy-path={after},request-size=128K,bw-pacing=average"),
             &src,
             &dst,
         ]);
@@ -7150,7 +7209,7 @@ fn streaming_reopens_a_dropped_write_connection() {
         &[
             "-a",
             "--syq-no-bootstrap",
-            "--tuning-options=copy-path=streaming,request-size=64K",
+            "--performance-tuning=copy-path=streaming,request-size=64K",
             &t.s("src"),
             &format!("fake:{}", t.s("dst")),
         ],
@@ -7258,8 +7317,8 @@ fn streaming_read_errors_do_not_publish_a_file() {
     write(&t.path("src"), &data);
     let args = [
         "-a",
-        "--syq-connections=1",
-        "--tuning-options=copy-path=streaming,request-size=64K",
+        "--performance-tuning=workers=1",
+        "--performance-tuning=copy-path=streaming,request-size=64K",
         &t.s("src"),
         &t.s("dst"),
     ];
@@ -7291,10 +7350,10 @@ fn tuning_options_batch_limits_include_the_first_file() {
                 &t.s("source"),
                 "--into",
                 &destination,
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("batch-files={files},batch-bytes={bytes}"),
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
                 "--preserve=permissions",
@@ -7335,11 +7394,11 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
                 "--no-tcp",
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
-                "--tuning-options",
+                "--performance-tuning",
                 options,
             ])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -7374,12 +7433,12 @@ fn tuning_options_average_pacing_pays_for_one_large_request() {
                 &t.s("source"),
                 "--as",
                 &t.s(pacing),
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
-                "--bwlimit=2M",
-                "--tuning-options",
+                "--resource-limits=bandwidth=2M",
+                "--performance-tuning",
                 &format!("copy-path=ranges,request-size=2M,bw-pacing={pacing}"),
             ])
             .run()
@@ -7408,7 +7467,7 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             .run()
             .unwrap();
         assert_output_ok(&help);
-        assert!(!String::from_utf8_lossy(&help.stdout).contains("--tuning-options"));
+        assert!(!String::from_utf8_lossy(&help.stdout).contains("--performance-tuning"));
         let help = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([interface, "--help-all"])
             .run()
@@ -7416,7 +7475,7 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
         assert_output_ok(&help);
         let text = String::from_utf8_lossy(&help.stdout);
         assert!(
-            text.contains("--tuning-options")
+            text.contains("--performance-tuning")
                 && text.contains("pipeline-depth")
                 && text.contains("job-storage=combined|compact|inline"),
             "{text}"
@@ -7434,13 +7493,13 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             "bw-pacing=average",
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-            command.args([interface, "--tuning-options", options, &t.s("source")]);
+            command.args([interface, "--performance-tuning", options, &t.s("source")]);
             if interface == "cp" {
                 command.arg("--as");
             }
             let out = command.arg(t.s("destination")).run().unwrap();
             assert!(!out.status.success(), "{out:?}");
-            assert!(stderr_of(&out).contains("--tuning-options"), "{out:?}");
+            assert!(stderr_of(&out).contains("--performance-tuning"), "{out:?}");
             assert!(!t.path("destination").exists());
         }
     }
@@ -7467,13 +7526,13 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     rsh.to_str().unwrap(),
                     "--syq-path",
                     env!("CARGO_BIN_EXE_syq"),
-                    "--connections",
-                    "1",
+                    "--performance-tuning",
+                    "workers=1",
                     "--no-progress",
                     "--stats",
                     "--tcp-ports",
                     EPHEMERAL_TCP_PORTS,
-                    "--tuning-options",
+                    "--performance-tuning",
                     &format!("request-size={size},pipeline-depth={depth},job-storage={storage}"),
                 ]);
                 if !tcp {
@@ -7526,7 +7585,13 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     set_mtime(&t.path("source"), 1_600_000_000);
     let src = t.s("source");
     let dst = t.s("destination");
-    let initial = ["-a", "--block-size=1M", "--bwlimit=1G", &src, &dst];
+    let initial = [
+        "-a",
+        "--block-size=1M",
+        "--resource-limits=bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&initial, &t.0);
     let f = File::create(&partial).unwrap();
     (&f).write_all(&data[..3 * 1024 * 1024]).unwrap();
@@ -7535,8 +7600,8 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     let out = run_ok(&[
         "-a",
         "--block-size=1M",
-        "--bwlimit=1G",
-        "--tuning-options=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
+        "--resource-limits=bandwidth=1G",
+        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
         &src,
         &dst,
     ]);
@@ -7556,9 +7621,9 @@ fn tuning_options_keep_the_aggregate_bandwidth_limit() {
     let start = std::time::Instant::now();
     let out = run_ok(&[
         "-a",
-        "--bwlimit=1M",
-        "--syq-connections=4",
-        "--tuning-options=request-size=64M,pipeline-depth=64",
+        "--resource-limits=bandwidth=1M",
+        "--performance-tuning=workers=4",
+        "--performance-tuning=request-size=64M,pipeline-depth=64",
         &t.s("source"),
         &t.s("destination"),
     ]);
@@ -7585,10 +7650,10 @@ fn bwlimit_is_aggregate_across_workers() {
     let start = std::time::Instant::now();
     run_ok(&[
         "-a",
-        "--syq-connections",
-        "4",
-        "--bwlimit",
-        "1M",
+        "--performance-tuning",
+        "workers=4",
+        "--resource-limits",
+        "bandwidth=1M",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -7604,10 +7669,16 @@ fn bwlimit_is_aggregate_across_workers() {
 fn bwlimit_rejects_invalid_rates() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"x");
-    let out = syq(&["-a", "--bwlimit", "fast", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&[
+        "-a",
+        "--resource-limits",
+        "bandwidth=fast",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bad --bwlimit"),
+        String::from_utf8_lossy(&out.stderr).contains("bad bandwidth"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -7831,10 +7902,10 @@ fn fallocate_no_space_is_fatal_and_stops_later_files() {
             "-a",
             "--block-size",
             "64K",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst"),
             "--no-progress",
@@ -7870,10 +7941,10 @@ fn fallocate_unsupported_filesystem_still_uses_sparse_fallback() {
             "-a",
             "--block-size",
             "64K",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst"),
             "--no-progress",
@@ -7900,10 +7971,10 @@ fn fallocate_quota_error_is_preserved_in_results() {
             "src",
             "--into-existing",
             "dst",
-            "--bwlimit",
-            "1G",
-            "--connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             "--results",
             "results.ndjson",
             "-q",
@@ -8489,7 +8560,7 @@ fn partial_symlink_is_not_followed() {
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
     let src = t.s("src");
     let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::remove_file(&partial).unwrap();
     // A malicious/stale partial symlink pointing outside must not be followed.
@@ -8527,7 +8598,12 @@ fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
     write(&t.path("src/foo"), b"source");
     write(&t.path("dest/foo/keep"), b"keep");
 
-    let out = syq(&["--syq-connections", "1", &t.s("src/foo"), &t.s("dest")]);
+    let out = syq(&[
+        "--performance-tuning",
+        "workers=1",
+        &t.s("src/foo"),
+        &t.s("dest"),
+    ]);
 
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -8674,8 +8750,8 @@ fn small_inplace_files_use_one_batched_worker() {
         .args([
             "-a",
             "--inplace",
-            "--syq-connections",
-            "32",
+            "--performance-tuning",
+            "workers=32",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -8808,7 +8884,7 @@ fn hardlinked_partial_does_not_corrupt_external_file() {
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
     let src = t.s("src");
     let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::remove_file(&partial).unwrap();
     // A partial hardlinked to an external file (as a dedup/backup tool might make).
@@ -10087,8 +10163,8 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "z",
         "--cwd",
         &t.s("sources"),
-        "--connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         "--into",
         &t.s("dest"),
     ]);
@@ -10608,7 +10684,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/ok"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     assert!(partial.exists());
@@ -10624,7 +10706,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/gone"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::remove_file(t.path("src/gone")).unwrap();
@@ -10637,7 +10725,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/bad"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -11193,8 +11287,8 @@ fn delete_with_inplace_replacing_many_symlinks() {
         "-a",
         "--inplace",
         "--delete",
-        "--syq-connections",
-        "16",
+        "--performance-tuning",
+        "workers=16",
         &t.s("src/"),
         &t.s("dst"),
     ]);
@@ -11323,7 +11417,13 @@ fn delete_keeps_partials_of_filtered_files() {
     write(&t.path("src/big"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     run_ok(&[
@@ -11341,7 +11441,13 @@ fn delete_keeps_partials_of_filtered_files() {
     write(&t.path("src/f"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     write(&t.path("dst/f"), b"newer on dst");
@@ -11668,7 +11774,15 @@ fn previous_partial_name_can_be_copied_as_payload() {
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     let src = t.s("src/");
     let dst = t.s("dst/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&args, &t.path("dst"));
     let collision_name = partial.file_name().unwrap().to_owned();
     fs::remove_file(&partial).unwrap();
@@ -11694,7 +11808,15 @@ fn previous_partial_name_can_be_copied_with_dot_destination() {
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     fs::create_dir(t.path("dst")).unwrap();
     let src = t.s("src/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, "."];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        ".",
+    ];
     let partial = interrupted_partial_from(&args, &t.path("dst"), Some(&t.path("dst")));
     let collision_name = partial.file_name().unwrap().to_owned();
     fs::remove_file(&partial).unwrap();
@@ -11835,10 +11957,10 @@ fn different_jobs_use_distinct_partial_inodes() {
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("out"),
@@ -11854,10 +11976,10 @@ fn different_jobs_use_distinct_partial_inodes() {
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("out"),
     ]);
@@ -11896,10 +12018,10 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("basis"),
@@ -11916,10 +12038,10 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("basis"),
     ]);
@@ -11948,10 +12070,10 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("src"),
             &t.s("basis"),
@@ -11995,10 +12117,10 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("basis"),
@@ -12015,10 +12137,10 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("basis"),
     ]);
@@ -12156,7 +12278,13 @@ fn checksum_identical_file_preserves_destination_inode() {
     set_mtime(&t.path("dst"), 1_600_000_000);
     let before = fs::metadata(t.path("dst")).unwrap();
 
-    let output = run_ok(&["-ac", "--bwlimit", "1G", &t.s("src"), &t.s("dst")]);
+    let output = run_ok(&[
+        "-ac",
+        "--resource-limits",
+        "bandwidth=1G",
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
 
     assert_eq!(transferred(&output), 0, "{output}");
     let after = fs::metadata(t.path("dst")).unwrap();
@@ -12177,7 +12305,7 @@ fn unreadable_interrupted_partials_are_left_alone() {
     for (i, mode) in [0o444, 0o000].into_iter().enumerate() {
         let src = t.s("src");
         let dst = t.s(&format!("out-{i}"));
-        let args = ["-a", "--bwlimit", "1G", &src, &dst];
+        let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
         let partial = interrupted_partial(&args, &t.0);
         fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
 
@@ -12196,7 +12324,7 @@ fn unchmodable_interrupted_partial_is_left_alone() {
     write(&t.path("src"), &contents);
     let src = t.s("src");
     let dst = t.s("dst");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o000)).unwrap();
 
@@ -12220,7 +12348,7 @@ fn writable_interrupted_partial_is_left_unchanged() {
     write(&t.path("src"), &contents);
     let src = t.s("src");
     let dst = t.s("dst");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     write(&partial, &contents);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
@@ -12243,8 +12371,8 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     let out = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--no-progress",
             &t.s("src"),
             &t.s("dst"),
@@ -12328,7 +12456,7 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         let mut command = compat_command();
         command.args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")]);
         if let Some(connections) = connections {
-            command.args(["--syq-connections", connections]);
+            command.args(["--performance-tuning", &format!("workers={connections}")]);
         }
         let out = command
             .env("SYQ_DEBUG", "1")
@@ -12378,8 +12506,8 @@ fn copy_local_disk_whole_files_write_concurrently() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "2",
+            "--performance-tuning",
+            "workers=2",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -12431,7 +12559,7 @@ fn copy_local_disk_single_file_retains_parallel_ranges() {
         let mut command = compat_command();
         command.args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")]);
         if let Some(connections) = connections {
-            command.args(["--syq-connections", connections]);
+            command.args(["--performance-tuning", &format!("workers={connections}")]);
         }
         let out = command
             .env("SYQ_DEBUG", "1")
@@ -12462,7 +12590,7 @@ fn copy_local_disk_single_file_retains_parallel_ranges() {
 fn copy_local_disk_exdev_preserves_range_controls() {
     for (args, synchronous) in [
         (vec!["--checksum"], false),
-        (vec!["--bwlimit", "1G"], false),
+        (vec!["--resource-limits", "bandwidth=1G"], false),
         (vec![], true),
     ] {
         let t = Tmp::new();
@@ -12525,7 +12653,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     let out = compat_command()
         .args([
             "-a",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -12602,7 +12730,7 @@ fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
     let cases: &[(&[&str], Option<&str>)] = &[
         (&[], Some("SYQ_TEST_COPY_LOCAL_SOURCE_NFS")),
         (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC")),
-        (&["--syq-connections", "2"], None),
+        (&["--performance-tuning", "workers=2"], None),
     ];
     for (extra_args, extra_env) in cases {
         let t = Tmp::new();
@@ -12642,7 +12770,7 @@ fn long_basename_partial_is_truncated_and_retry_copies_correctly() {
     fs::create_dir_all(t.path("dst")).unwrap();
     let src = t.s(&format!("src/{basename}"));
     let dst = t.s("dst/");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.path("dst"));
     assert!(partial.file_name().unwrap().as_encoded_bytes().len() <= 255);
     assert!(partial
@@ -12721,12 +12849,12 @@ fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage:
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
-        .arg(format!("--tuning-options=job-storage={storage}"))
+        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args([
             "-a",
             "--stats",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -12801,7 +12929,7 @@ fn changed_source_retry_still_uses_copy_file_range_with_storage(storage: &str) {
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
-        .arg(format!("--tuning-options=job-storage={storage}"))
+        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
         .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
@@ -12944,7 +13072,13 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         let continuation = t.path("continue");
 
         let mut command = compat_command();
-        command.args(["-a", "--syq-connections", "1", &t.s("src/"), &t.s("dst/")]);
+        command.args([
+            "-a",
+            "--performance-tuning",
+            "workers=1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
         if no_tcp {
             command.arg("--syq-no-tcp");
         }
@@ -12989,10 +13123,10 @@ fn destination_file_write_refuses_descendant_symlink_swap() {
         let mut command = compat_command();
         command.args([
             "-a",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -13043,8 +13177,8 @@ fn destination_prune_scan_uses_retained_root_after_replacement() {
         command.args([
             "-a",
             "--delete",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -13092,8 +13226,8 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
         command.args([
             "-a",
             "--delete",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -13472,8 +13606,8 @@ fn stats_report_connection_tuning_mode() {
     let out = run_ok(&[
         "-a",
         "--stats",
-        "--syq-connections",
-        "3",
+        "--performance-tuning",
+        "workers=3",
         &t.s("src/"),
         &t.s("fixed/"),
     ]);
@@ -13814,13 +13948,19 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
     write(&t.path(&format!("src/{long}")), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     let so = run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         "--max-size",
         "1K",
@@ -13833,8 +13973,8 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
     fs::remove_file(t.path(&format!("src/{long}"))).unwrap();
     run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         &t.s("src/"),
         &t.s("dst"),
@@ -13849,15 +13989,21 @@ fn partial_survives_when_target_becomes_a_directory() {
     write(&t.path("src/x"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::remove_file(t.path("src/x")).unwrap();
     write(&t.path("src/x/inside"), b"now a directory");
     run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         &t.s("src/"),
         &t.s("dst"),
@@ -14003,15 +14149,21 @@ fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
         fs::create_dir_all(t.path("dst")).unwrap();
         let dst = format!("{}{spelling}", t.s("dst"));
         let partial = interrupted_partial(
-            &["-a", "--bwlimit", "1G", &t.s("src/"), &dst],
+            &[
+                "-a",
+                "--resource-limits",
+                "bandwidth=1G",
+                &t.s("src/"),
+                &dst,
+            ],
             &t.path("dst"),
         );
         // Filtered target: the sidecar is resume state and must survive, in
         // this spelling and cross-spelling alike.
         let so = run_ok(&[
             "-a",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--delete",
             "--max-size",
             "10",
@@ -14021,8 +14173,8 @@ fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
         assert!(partial.exists(), "{spelling}: {so}");
         let so = run_ok(&[
             "-a",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--delete",
             "--max-size",
             "10",
@@ -14148,7 +14300,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--inplace",
             "--prune",
             "--max-delete=1",
-            "--tuning-options=job-storage=inline",
+            "--performance-tuning=job-storage=inline",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -14180,7 +14332,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--inplace",
         "--prune",
         "--max-delete=1",
-        "--tuning-options=job-storage=inline",
+        "--performance-tuning=job-storage=inline",
     ] {
         assert!(
             log.contains(option),
@@ -14202,8 +14354,8 @@ fn native_coordinate_at_dst_reverses_the_remote_ssh_edge() {
         .args([
             "--no-tcp",
             "--tcp-ports=49000-49002",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--srcs-in",
@@ -14335,8 +14487,8 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--srcs-in",
@@ -14406,8 +14558,8 @@ fn native_endpoint_port_reaches_ssh() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src"),
             "--to",
             "backup.example:2222",
@@ -14458,8 +14610,8 @@ fn native_remote_exact_bare_home_expands_before_identity_check() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--src",
             &t.s("src"),
             "--to",
@@ -14489,8 +14641,8 @@ fn native_detach_waits_for_coordinator_readiness() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--detach",
             "--from",
             "hostA",
@@ -14578,8 +14730,8 @@ fn native_detach_broken_stdout_reports_running_job_without_panicking() {
             "--syq-path",
             env!("CARGO_BIN_EXE_syq"),
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--detach",
             "--from",
             "hostA",
@@ -15033,14 +15185,14 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--dry-run",
         "--verbose",
         "--quiet",
-        "--connections",
+        "--performance-tuning",
         "--progress",
         "--no-progress",
         "--progress-json",
         "--hash",
         "--no-compress",
-        "--bwlimit",
-        "--stats",
+        "--resource-limits",
+        "bandwidth=--stats",
         "--ignore",
         "--ignore-from",
         "--preserve",
@@ -15338,8 +15490,8 @@ fn native_cp_results_copying_interval_covers_paced_content_but_not_unchanged_fil
                 "dst",
                 "--results",
                 result,
-                "--bwlimit",
-                "1M",
+                "--resource-limits",
+                "bandwidth=1M",
                 "--stats",
                 "--no-progress",
             ],
@@ -18467,7 +18619,7 @@ fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
         .to_owned();
     let mut copy = Command::new(env!("CARGO_BIN_EXE_syq"));
     copy.args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1"])
+        .args(["--no-tcp", "--performance-tuning", "workers=1"])
         .arg(t.path("src"))
         .args(["--to", "backup.example:2222", "--as"])
         .arg(t.path("global-dst"))
@@ -18537,7 +18689,7 @@ exit 0
         .args(["cp", "--pscope"])
         .arg(&scope)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1"])
+        .args(["--no-tcp", "--performance-tuning", "workers=1"])
         .arg(t.path("src"))
         .args(["--to", "backup.example:2222", "--as"])
         .arg(t.path("scoped-dst"))
@@ -18912,8 +19064,8 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
             "src",
             "--into",
             "dst",
-            "--bwlimit",
-            "32",
+            "--resource-limits",
+            "bandwidth=32",
             "--results",
             "r1.ndjson",
             "-q",
@@ -19410,8 +19562,8 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--src",
@@ -19470,7 +19622,14 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
         .args(["cp", "--rsh"])
         .arg(&rsh)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1", "--from", "hostA", "--root"])
+        .args([
+            "--no-tcp",
+            "--performance-tuning",
+            "workers=1",
+            "--from",
+            "hostA",
+            "--root",
+        ])
         .arg(&source_base)
         .arg("--src")
         .arg(name)
@@ -21418,7 +21577,14 @@ fn clean_partials_selects_only_current_regular_files() {
     let preview = String::from_utf8_lossy(&preview.stdout);
     assert!(preview.contains("would remove 2 entries"), "{preview}");
     assert_eq!(listing(&t.path("tree")), before);
-    run_native_ok(&["clean-partials", "-j", "4", "--root", &t.s(""), "tree"]);
+    run_native_ok(&[
+        "clean-partials",
+        "--performance-tuning",
+        "workers=4",
+        "--root",
+        &t.s(""),
+        "tree",
+    ]);
     assert!(!t.path(&format!("tree/{current}")).exists());
     assert!(!t.path(&format!("tree/nested/{compact}")).exists());
     assert_eq!(read(&t.path(&format!("tree/{old}"))), b"old format");
@@ -21465,10 +21631,10 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "cp",
                     "--hash",
                     "--no-tcp",
-                    "--bwlimit",
-                    "1G",
-                    "-j",
-                    "2",
+                    "--resource-limits",
+                    "bandwidth=1G",
+                    "--performance-tuning",
+                    "workers=2",
                     "--no-progress",
                     &t.s("first"),
                     "--as",
@@ -21489,10 +21655,10 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "cp",
                     "--hash",
                     "--no-tcp",
-                    "--bwlimit",
-                    "1G",
-                    "-j",
-                    "2",
+                    "--resource-limits",
+                    "bandwidth=1G",
+                    "--performance-tuning",
+                    "workers=2",
                     "--no-progress",
                     &t.s("second"),
                     "--as",
@@ -21541,8 +21707,8 @@ fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
                 "-ac",
                 "--block-size",
                 "1M",
-                "--bwlimit",
-                "1G",
+                "--resource-limits",
+                "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
@@ -21787,8 +21953,8 @@ fn seeding_preallocates_before_copying_donor_bytes() {
         let out = compat_command()
             .args([
                 "-ac",
-                "--bwlimit",
-                "1G",
+                "--resource-limits",
+                "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
@@ -21824,7 +21990,7 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
     let out = run_ok(&[
         "-ac",
         "--block-size=1M",
-        "--bwlimit=1G",
+        "--resource-limits=bandwidth=1G",
         &t.s("src"),
         &t.s("out"),
     ]);
@@ -22016,7 +22182,7 @@ fn local_read_ahead_shrink_keeps_old_destination() {
             .args([
                 "-a",
                 "--no-progress",
-                "--tuning-options=copy-path=ranges",
+                "--performance-tuning=copy-path=ranges",
                 &t.s("source"),
                 &t.s("destination"),
             ])
@@ -22046,14 +22212,14 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     rsh.to_str().unwrap(),
                     "--syq-path",
                     env!("CARGO_BIN_EXE_syq"),
-                    "--connections",
-                    "1",
+                    "--performance-tuning",
+                    "workers=1",
                     "--no-progress",
                     "--results",
                     &result_path,
                     "--tcp-ports",
                     EPHEMERAL_TCP_PORTS,
-                    "--tuning-options",
+                    "--performance-tuning",
                     if stream {
                         "copy-path=streaming,request-size=4194304"
                     } else {
@@ -22171,8 +22337,8 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
             rsh.to_str().unwrap(),
             "--syq-path",
             env!("CARGO_BIN_EXE_syq"),
-            "--connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--no-tcp",
             "--no-progress",
             "--results",

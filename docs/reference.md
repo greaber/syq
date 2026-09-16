@@ -277,7 +277,7 @@ and run:
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 # Search several remote trees with the parallel removal workers.
-syq clean-partials --on server --cwd /data -j 8 backup archive
+syq clean-partials --on server --cwd /data --performance-tuning workers=8 backup archive
 ```
 
 This command removes regular files with the current partial-name format. It
@@ -331,19 +331,34 @@ copies, syq still compares blocks when size or modification time differs,
 even without `--hash`, so it can reuse unchanged data. Local and small copies
 may use faster paths instead.
 
-`--hash-algorithm` chooses `blake3` (the default), `sha256`, `md5`, or
-`xxh3-128` for content comparisons and optional transfer checks. Choosing an
-algorithm does not enable `--hash`. MD5 supports compatibility with existing
-file manifests; XXH3-128 is a fast noncryptographic checksum. Neither provides
-cryptographic collision resistance.
+Advanced controls keep resource policy, performance choices and integrity
+checking separate:
 
-Syq's extra payload checksums are opt-in with `--transfer-integrity`. This is
-independent of encryption: SSH and encrypted TCP retain their transport
-protection, and `--tcp-plain` does not enable payload checksums automatically.
-Same-host copies keep their kernel-copy and whole-file shortcuts. Use
-`--expected-hash` when you need to validate the complete local result.
-Comparisons for `--hash`, verification, and reuse of existing data still hash
-contents when needed, even without `--transfer-integrity`.
+| Option | Purpose |
+|---|---|
+| `--resource-limits bandwidth=RATE` | Caps aggregate logical file-data throughput |
+| `--performance-tuning workers=N` | Fixes filesystem copy-worker slots instead of adjusting them automatically |
+| `--integrity-checking compare=HASH,transfer=HASH` | Chooses content comparison and extra payload checks independently |
+
+Each option accepts comma-separated `KEY=VALUE` pairs and can be repeated with
+different keys. Duplicate keys are errors. See [performance tuning](tuning.md)
+for the worker and S3 request controls. These tune parallelism; they do not
+bound total sockets, file descriptors, CPU or memory.
+
+Comparison defaults to `compare=size-mtime`. If those attributes are insufficient,
+use `compare=blake3`, also available as `--hash`. Other choices are `sha256`,
+`md5`, and `xxh3-128`. MD5 supports existing manifests; XXH3-128 is a fast
+noncryptographic checksum. Neither provides cryptographic collision resistance.
+`--hash` conflicts with a different explicit comparison choice.
+
+Extra payload checks default to `transfer=off`. Enable them with, for example,
+`--integrity-checking transfer=blake3`; the same four hash types are supported.
+The comparison and transfer hash types can differ. SSH and encrypted TCP retain
+their transport protection independently, and `--tcp-plain` does not enable
+payload checks automatically. Same-host copies keep their kernel-copy and
+whole-file shortcuts. Use `--expected-hash` to validate the complete local result.
+Content comparison, verification and recovery still hash data when needed.
+[S3 provider checksums](object-storage.md#metadata-and-integrity) also stay enabled.
 
 To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
 with one named regular file:
@@ -360,7 +375,7 @@ staging, validation happens before replacing the destination. With `--inplace`,
 the file has already been modified when validation finishes. Use
 [per-file mapping expectations](mappings.md#the-format) for a batch. Selection
 filters still exclude files, and excluded files are not digest-verified.
-The expected digest's algorithm can differ from `--hash-algorithm`. Dry runs
+The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
 preview changes without validating the expectation.
 
 For files being changed by another program, stop the writer or copy a snapshot.

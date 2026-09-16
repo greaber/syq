@@ -62,13 +62,6 @@ impl std::str::FromStr for Header {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Integrity {
-    #[default]
-    Full,
-    None,
-}
-
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct Flags {
     /// S3 API endpoint URL (also AWS_ENDPOINT_URL_S3 or AWS_ENDPOINT_URL)
@@ -83,23 +76,6 @@ pub(crate) struct Flags {
     /// Add a header before signing every S3 request (repeatable)
     #[arg(long, value_name = "NAME: VALUE", help_heading = "Object storage")]
     s3_header: Vec<Header>,
-    /// Payload verification and resumable recovery (none omits both)
-    #[arg(
-        long,
-        value_enum,
-        default_value = "full",
-        help_heading = "Object storage"
-    )]
-    s3_integrity: Integrity,
-    /// Maximum concurrent parts per S3 object (automatic with integrity=none; otherwise 5); -j controls objects
-    #[arg(short = 'c', long, value_name = "N", help_heading = "Object storage")]
-    s3_concurrency: Option<usize>,
-    /// S3 upload part / download range size in MiB (automatic with integrity=none; otherwise 50, minimum: 5)
-    #[arg(short = 'p', long, value_name = "MIB", help_heading = "Object storage")]
-    s3_part_size: Option<u64>,
-    /// Retries after transient S3 failures (default: 10)
-    #[arg(long, value_name = "N", help_heading = "Object storage")]
-    s3_retries: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,7 +89,6 @@ pub(crate) struct Options {
     pub concurrency: usize,
     pub part_size: u64,
     pub retries: u32,
-    pub integrity: Integrity,
     pub automatic_concurrency: bool,
     pub automatic_part_size: bool,
 }
@@ -124,20 +99,23 @@ impl Options {
         to: Option<&str>,
         matches: &clap::ArgMatches,
     ) -> Result<Option<Self>> {
+        let tuning = matches
+            .get_many::<String>("performance_tuning")
+            .map(|v| v.cloned().collect::<Vec<_>>().join(","))
+            .map(|v| {
+                v.parse::<crate::transfer_tuning::TransferTuning>()
+                    .context("invalid --performance-tuning")
+            })
+            .transpose()?
+            .unwrap_or_default();
         let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
         if from.is_none() && to.is_none() {
-            if [
-                "s3_endpoint",
-                "s3_region",
-                "s3_profile",
-                "s3_header",
-                "s3_concurrency",
-                "s3_part_size",
-                "s3_retries",
-                "s3_integrity",
-            ]
-            .iter()
-            .any(|id| explicit(id))
+            if tuning.has_s3_controls() {
+                bail!("S3 performance tuning requires --from s3://BUCKET or --to s3://BUCKET");
+            }
+            if ["s3_endpoint", "s3_region", "s3_profile", "s3_header"]
+                .iter()
+                .any(|id| explicit(id))
             {
                 bail!("S3 options require --from s3://BUCKET or --to s3://BUCKET");
             }
@@ -150,7 +128,6 @@ impl Options {
             "prune",
             "max_delete",
             "inplace",
-            "tuning_options",
             "auth_from",
             "via",
             "coordinate_at",
@@ -174,9 +151,6 @@ impl Options {
                 bail!("--{} is not supported for S3 copies", id.replace('_', "-"));
             }
         }
-        if flags.s3_integrity == Integrity::None && (explicit("hash") || explicit("verify_only")) {
-            bail!("--s3-integrity=none cannot be combined with --hash or --verify-only");
-        }
         let bucket = from.or(to).unwrap().strip_prefix("s3://").unwrap();
         if bucket.is_empty()
             || bucket
@@ -187,17 +161,22 @@ impl Options {
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
-        let concurrency = flags.s3_concurrency.unwrap_or(5);
-        let part_size = flags.s3_part_size.unwrap_or(50);
-        if !(1..=1024).contains(&concurrency) {
-            bail!("--s3-concurrency must be between 1 and 1024");
+        if tuning.workers.is_some()
+            || tuning.request_size.is_some()
+            || tuning.pipeline_depth.is_some()
+            || tuning.copy_path.is_some()
+            || tuning.batch_files.is_some()
+            || tuning.batch_bytes.is_some()
+            || tuning.split_min_size.is_some()
+            || tuning.bw_pacing.is_some()
+            || tuning.job_storage.is_some()
+        {
+            bail!(
+                "filesystem performance tuning is not supported for S3 copies; use the s3-* keys"
+            );
         }
-        if !(5..=5120).contains(&part_size) {
-            bail!("--s3-part-size must be between 5 and 5120 MiB");
-        }
-        if flags.s3_retries.unwrap_or(10) > 100 {
-            bail!("--s3-retries must be at most 100");
-        }
+        let concurrency = tuning.s3_part_workers.unwrap_or(64);
+        let part_size = tuning.s3_part_size.unwrap_or(16 << 20);
         if let Some(endpoint) = &flags.s3_endpoint {
             validate_endpoint(endpoint)?;
         }
@@ -208,12 +187,11 @@ impl Options {
             region: flags.s3_region,
             profile: flags.s3_profile,
             headers: flags.s3_header,
-            integrity: flags.s3_integrity,
-            automatic_concurrency: flags.s3_concurrency.is_none(),
-            automatic_part_size: flags.s3_part_size.is_none(),
+            automatic_concurrency: tuning.s3_part_workers.is_none(),
+            automatic_part_size: tuning.s3_part_size.is_none(),
             concurrency,
-            part_size: part_size * 1024 * 1024,
-            retries: flags.s3_retries.unwrap_or(10),
+            part_size,
+            retries: tuning.s3_retries.unwrap_or(10) as u32,
         }))
     }
 }
@@ -233,7 +211,6 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
-    let workers = args.connections_opt.unwrap_or(256);
     let writer = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
@@ -263,7 +240,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             .build()?;
         runtime.block_on(async {
             let engine = transfer::Engine::new(Arc::new(args.clone()), progress.clone()).await?;
-            engine.run(workers).await
+            engine.run().await
         })
     })();
     diagnostics::finish();

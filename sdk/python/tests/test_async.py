@@ -242,17 +242,17 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         await self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",
                        s3_profile="archive", s3_header=["X-Policy: a:b", "X-Other: yes"],
-                       s3_concurrency=7, s3_part_size=64, s3_retries=2, s3_integrity="none")
+                       performance_tuning="s3-part-workers=7,s3-part-size=64M,s3-retries=2")
         argv = self.argv()
         for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
                          "--s3-profile=archive", "--s3-header=X-Policy: a:b",
-                         "--s3-header=X-Other: yes", "--s3-concurrency=7",
-                         "--s3-part-size=64", "--s3-retries=2", "--s3-integrity=none"]:
+                         "--s3-header=X-Other: yes", "--performance-tuning",
+                         "s3-part-workers=7,s3-part-size=64M,s3-retries=2"]:
             self.assertIn(expected, argv)
         with self.assertRaises(syq.SyqInvocationError):
             await self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
         with self.assertRaises(syq.SyqInvocationError):
-            await self.client.cp("source", to="s3://bucket", into="prefix", s3_concurrency=True)
+            await self.client.cp("source", to="s3://bucket", into="prefix", performance_tuning=True)
 
     async def test_cp_selects_an_authorizer_and_rejects_conflicting_selectors(self) -> None:
         await self.client.cp("source", to="backup", auth_from="@laptop", into="out")

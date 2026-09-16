@@ -20,7 +20,7 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_types::byte_stream::Length;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -45,6 +45,7 @@ pub(super) struct Engine {
     upload_keys: OnceLock<HashSet<String>>,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
+    cancel_wake: tokio::sync::Notify,
 }
 #[derive(Clone)]
 struct Download {
@@ -104,8 +105,9 @@ impl Engine {
         let client = client::connect(&mut options).await?;
         super::diagnostics::elapsed(setup, "client_setup", 0);
         Ok(Arc::new(Self {
-            tuning: super::tuning::Tuning::new(&options),
+            tuning: super::tuning::Tuning::new(&options, &args),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancel_wake: tokio::sync::Notify::new(),
             args,
             options,
             client,
@@ -114,8 +116,8 @@ impl Engine {
             upload_keys: OnceLock::new(),
         }))
     }
-    pub async fn run(self: Arc<Self>, workers: usize) -> Result<()> {
-        let work = self.clone().copy(workers);
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        let work = self.clone().copy();
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::pin!(work);
@@ -125,11 +127,9 @@ impl Engine {
             _ = terminate.recv() => "terminated",
         };
         self.cancelled.store(true, Relaxed);
-        if self.options.integrity == super::Integrity::None {
-            // Let in-flight requests settle and abort owned multipart uploads.
-            // Dropping the futures alone can race an abort with an active PUT.
-            let _ = work.await;
-        }
+        self.cancel_wake.notify_waiters();
+        // Drain started requests, including synchronous file bodies, before exit.
+        let _ = work.await;
         bail!("S3 copy {interrupted}; rerun the command to continue")
     }
     fn check_cancelled(&self) -> Result<()> {
@@ -137,7 +137,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn copy(self: Arc<Self>, workers: usize) -> Result<()> {
+    async fn copy(self: Arc<Self>) -> Result<()> {
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
@@ -165,7 +165,7 @@ impl Engine {
             }
 
             self.tuning.observe_control(planning.elapsed());
-            let workers = self.object_workers(workers, plan.iter().map(|s| s.meta.len))?;
+            let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
                 plan.iter()
@@ -198,7 +198,7 @@ impl Engine {
             let planning = std::time::Instant::now();
             let plan = self.download_plan(&destination).await?;
             self.tuning.observe_control(planning.elapsed());
-            let workers = self.object_workers(workers, plan.iter().map(|s| s.size))?;
+            let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
                 bail!("an expected digest requires exactly one regular file");
             }
@@ -340,16 +340,26 @@ impl Engine {
             }
         }
     }
-    async fn pace(&self, n: u64) {
+    async fn pace(&self, n: u64) -> Result<()> {
+        self.check_cancelled()?;
         if self.args.bwlimit_bytes == 0 {
-            return;
+            return Ok(());
         }
         let mut next = self.pace.lock().await;
         let now = tokio::time::Instant::now();
         let start = (*next).max(now);
         *next = start + Duration::from_secs_f64(n as f64 / self.args.bwlimit_bytes as f64);
         drop(next);
-        tokio::time::sleep_until(start).await;
+        let cancelled = self.cancel_wake.notified();
+        tokio::pin!(cancelled);
+        // Register before checking the flag so a concurrent signal cannot be lost.
+        cancelled.as_mut().enable();
+        self.check_cancelled()?;
+        tokio::select! {
+            _ = &mut cancelled => {},
+            _ = tokio::time::sleep_until(start) => {},
+        }
+        self.check_cancelled()
     }
     fn identity(&self, key: &str, extra: &str) -> Vec<u8> {
         let mut hash = blake3::Hasher::new();
@@ -439,18 +449,37 @@ impl Engine {
         } else {
             source.meta.len
         };
-        let part_size = self.options.part_size.max(size.div_ceil(10_000));
+        let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
         }
-        if self.options.integrity == super::Integrity::None {
-            return self.upload_fast(source, existing, size).await;
-        }
+        let buffer_limit = if self.tuning.tigris() {
+            8 << 20
+        } else {
+            1 << 20
+        };
+        let reservation = if source.kind() == "file" && size <= part_size && size <= buffer_limit {
+            Some(
+                self.tuning
+                    .upload_buffers
+                    .clone()
+                    .acquire_many_owned(size.max(1) as u32)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
         let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
-            (self.args.transfer_integrity || self.args.checksum || self.args.verify_only)
-                .then_some(self.args.hash_algorithm)
+            if self.args.transfer_integrity {
+                Some(self.args.transfer_hash_type.unwrap_or_default())
+            } else if self.args.checksum || self.args.verify_only {
+                Some(self.args.hash_algorithm)
+            } else {
+                None
+            }
         });
         let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
@@ -458,7 +487,35 @@ impl Engine {
                 return Ok((
                     whole_algorithm.map(|a| Digest::hash_bytes(a, &bytes).value),
                     vec![algorithm.digest(&bytes)],
-                    Some(bytes),
+                    Some(bytes::Bytes::from(bytes)),
+                ));
+            }
+            if let Some(reservation) = reservation {
+                let mut file = source_clone.open()?;
+                let mut bytes = vec![0; size as usize];
+                file.read_exact(&mut bytes)?;
+                source_clone.check(&file)?;
+                let native_algorithm = if algorithm.is_sha256() {
+                    HashAlgorithm::Sha256
+                } else {
+                    HashAlgorithm::Md5
+                };
+                let hash = native_algorithm.hash(&bytes);
+                let checksum = encode_native_parts(native_algorithm, &[hash]).remove(0);
+                let whole = whole_algorithm.map(|a| {
+                    if a == native_algorithm {
+                        Digest::from_hash(a, &hash).value
+                    } else {
+                        Digest::hash_bytes(a, &bytes).value
+                    }
+                });
+                return Ok((
+                    whole,
+                    vec![checksum],
+                    Some(bytes::Bytes::from_owner(fast::UploadBuffer {
+                        bytes,
+                        _reservation: reservation,
+                    })),
                 ));
             }
             // Independent native part checksums provide both upload validation
@@ -566,13 +623,29 @@ impl Engine {
                             || (m.uid == metadata.uid && m.gid == metadata.gid))
                 })
         });
+        let comparison_digest = if self.args.checksum || self.args.verify_only {
+            if whole_algorithm == Some(self.args.hash_algorithm) {
+                whole_digest.clone()
+            } else {
+                let source = source.clone();
+                let algorithm = self.args.hash_algorithm;
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        local::hash_file_as(source.open()?, algorithm)
+                    })
+                    .await??,
+                )
+            }
+        } else {
+            None
+        };
         if self.args.checksum {
             if let Some(object) = &existing {
                 unchanged = unchanged
                     && self
-                        .remote_hash_as(object, whole_algorithm.unwrap())
+                        .remote_hash_as(object, self.args.hash_algorithm)
                         .await?
-                        == *whole_digest.as_ref().unwrap();
+                        == *comparison_digest.as_ref().unwrap();
             }
         }
         if self.args.verify_only {
@@ -580,8 +653,8 @@ impl Engine {
             self.verify_upload(
                 &source,
                 &object,
-                whole_digest.as_deref().unwrap(),
-                whole_algorithm.unwrap(),
+                comparison_digest.as_deref().unwrap(),
+                self.args.hash_algorithm,
             )
             .await?;
             return Ok(None);
@@ -603,15 +676,22 @@ impl Engine {
         let _interval = self.progress.copying_interval();
         let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
         if size <= part_size || small.is_some() {
+            let _slot = self.tuning.requests.acquire().await;
+            let synchronous =
+                source.kind() == "file" && small.is_none() && self.tuning.local_latency();
+            let sync_file =
+                synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             let mut attempt = 0;
             loop {
                 let body = if let Some(bytes) = &small {
                     ByteStream::from(bytes.clone())
+                } else if synchronous {
+                    crate::s3::upload_http::body(size)
                 } else {
                     file_body(&source, 0, size).await?
                 };
-                self.pace(size).await;
-                let result = self
+                self.pace(size).await?;
+                let request = self
                     .client
                     .put_object()
                     .bucket(&self.options.bucket)
@@ -622,8 +702,17 @@ impl Engine {
                     .set_content_md5((algorithm == Algorithm::Md5).then(|| checksums[0].clone()))
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
-                    .send()
-                    .await;
+                    .customize()
+                    .disable_payload_signing();
+                let request = if let Some(file) = &sync_file {
+                    request.interceptor(file.clone())
+                } else {
+                    request
+                };
+                let result = request.send().await;
+                if let Some(file) = &sync_file {
+                    file.drain().await;
+                }
                 match result {
                     Ok(_) => break,
                     Err(e)
@@ -636,6 +725,7 @@ impl Engine {
                     Err(e) => return Err(e.into_service_error()).context("S3 PUT failed"),
                 }
             }
+            self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
         } else {
             let state = State::open(&self.identity(&source.key, "upload"))?;
@@ -766,7 +856,10 @@ impl Engine {
                 record
             };
             let saved_parts = Mutex::new(upload.completed.clone());
+            // Stop admitting parts on failure, but drain requests already in flight.
+            let failed = std::sync::atomic::AtomicBool::new(false);
             let completed = stream::iter(checksums.into_iter().enumerate())
+                .take_while(|_| std::future::ready(!failed.load(Relaxed)))
                 .map(|(index, checksum)| {
                     let source = &source;
                     let upload = &upload;
@@ -797,11 +890,20 @@ impl Engine {
                                     .build());
                             }
                         }
+                        let _slot = self.tuning.requests.acquire().await;
+                        let sync_file = self.tuning.local_latency().then(|| {
+                            crate::s3::upload_http::FileBody::new(source.clone(), offset, length)
+                        });
                         let mut attempt = 0;
                         loop {
-                            let body = file_body(source, offset, length).await?;
-                            self.pace(length).await;
-                            let result = self
+                            self.check_cancelled()?;
+                            let body = if sync_file.is_some() {
+                                crate::s3::upload_http::body(length)
+                            } else {
+                                file_body(source, offset, length).await?
+                            };
+                            self.pace(length).await?;
+                            let request = self
                                 .client
                                 .upload_part()
                                 .bucket(&self.options.bucket)
@@ -816,8 +918,17 @@ impl Engine {
                                 .set_content_md5(
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
-                                .send()
-                                .await;
+                                .customize()
+                                .disable_payload_signing();
+                            let request = if let Some(file) = &sync_file {
+                                request.interceptor(file.clone())
+                            } else {
+                                request
+                            };
+                            let result = request.send().await;
+                            if let Some(file) = &sync_file {
+                                file.drain().await;
+                            }
                             match result {
                                 Ok(output) => {
                                     let etag = output.e_tag().context("S3 part omitted ETag")?;
@@ -835,6 +946,7 @@ impl Engine {
                                         record.completed = parts.clone();
                                         state.save(&record)?;
                                     }
+                                    self.tuning.requests.completed(length);
                                     self.progress.add_bytes(length);
                                     return Ok(CompletedPart::builder()
                                         .part_number(number)
@@ -860,9 +972,17 @@ impl Engine {
                         }
                     }
                 })
-                .buffer_unordered(self.options.concurrency)
-                .try_collect::<Vec<_>>()
-                .await?;
+                .buffer_unordered(self.part_workers())
+                .inspect(|result| {
+                    if result.is_err() {
+                        failed.store(true, Relaxed);
+                    }
+                })
+                .collect::<Vec<Result<_>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            self.check_cancelled()?;
             source.check(&source.open()?)?;
             let mut completed = completed;
             completed.sort_by_key(|p| p.part_number());
@@ -895,6 +1015,7 @@ impl Engine {
         digest: &str,
         algorithm: HashAlgorithm,
     ) -> Result<()> {
+        let _slot = self.tuning.requests.acquire().await;
         if object.kind() != source.kind()
             || object.size != source.meta.len && source.kind() != "dir"
         {
@@ -1155,9 +1276,7 @@ impl Engine {
             && !self.args.verify_only
             && !job.key.ends_with('/')
         {
-            if self.options.integrity == super::Integrity::None {
-                initial_slot = Some(self.tuning.requests.acquire().await);
-            }
+            initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
                     .get_object()
@@ -1238,7 +1357,7 @@ impl Engine {
             if object.size > 1024 * 1024 {
                 bail!("S3 symlink target is too large");
             }
-            let bytes = self.get_small(&object, initial).await?;
+            let bytes = self.get_small(&object, initial, initial_slot).await?;
             if let Some(hash) = metadata
                 .hash
                 .as_ref()
@@ -1330,20 +1449,6 @@ impl Engine {
             return Ok(Some(object.size));
         }
         root.create_missing_parents(&path, 0o777)?;
-        if self.options.integrity == super::Integrity::None {
-            return self
-                .download_fast(
-                    &object,
-                    root,
-                    &path,
-                    &metadata,
-                    existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
-                    initial,
-                    initial_slot,
-                    part_size,
-                )
-                .await;
-        }
         if object.size <= part_size {
             return self
                 .download_single(
@@ -1353,6 +1458,7 @@ impl Engine {
                     (&metadata, expected_digest),
                     existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
                     initial,
+                    initial_slot,
                 )
                 .await;
         }
@@ -1396,15 +1502,32 @@ impl Engine {
         let range_algorithm = record.hash_algorithm;
         let record = Arc::new(Mutex::new(record));
         let file = Arc::new(file);
+        let allocation = file.clone();
+        let size = object.size;
+        tokio::task::spawn_blocking(move || super::writer::allocate(&allocation, size)).await??;
+        let output = super::writer::Writer::with_readback(
+            file.clone(),
+            object.size,
+            !part_size.is_multiple_of(4096)
+                || !self.download_digests(&metadata, expected_digest).is_empty(),
+        )?;
         let parts = object.size.div_ceil(part_size);
         let _interval = self.progress.copying_interval();
-        stream::iter(0..parts)
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let copied = stream::iter(0..parts)
+            .take_while(|_| std::future::ready(!failed.load(Relaxed)))
             .map(|index| {
+                let output = output.clone();
                 let file = file.clone();
                 let record = record.clone();
                 let object = &object;
                 let state = &state;
                 let initial = if index == 0 { initial.take() } else { None };
+                let slot = if index == 0 {
+                    initial_slot.take()
+                } else {
+                    None
+                };
                 async move {
                     let offset = index * part_size;
                     let length = part_size.min(object.size - offset);
@@ -1421,17 +1544,36 @@ impl Engine {
                         }
                     }
                     let hash = self
-                        .download_body(object, file, offset, length, initial, Some(range_algorithm))
+                        .download_fast_range(
+                            object,
+                            &output,
+                            offset,
+                            length,
+                            initial,
+                            slot,
+                            Some(range_algorithm),
+                        )
                         .await?;
+                    output.finish().await?;
                     let mut record = record.lock().await;
                     record.parts.insert(index, hash);
                     state.save(&*record)?;
                     Ok(())
                 }
             })
-            .buffer_unordered(self.options.concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .buffer_unordered(self.part_workers())
+            .inspect(|result| {
+                if result.is_err() {
+                    failed.store(true, Relaxed);
+                }
+            })
+            .collect::<Vec<Result<_>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>();
+        let flushed = output.finish().await;
+        copied?;
+        flushed?;
         let partial = record.lock().await.partial.clone();
         let partial_path = RelativePath::new(partial.as_bytes())?;
         for expected in self.download_digests(&metadata, expected_digest) {
@@ -1448,6 +1590,7 @@ impl Engine {
                 bail!("source object changed during download");
             }
         }
+        self.check_cancelled()?;
         local::apply_file_metadata(
             &file,
             &metadata,
@@ -1506,6 +1649,7 @@ impl Engine {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     async fn download_single(
         &self,
         object: &Object,
@@ -1514,6 +1658,7 @@ impl Engine {
         validation: (&Metadata, Option<&Digest>),
         mode: Option<u32>,
         initial: Option<ByteStream>,
+        initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
         let (metadata, expected_digest) = validation;
         let path_buf = path.to_path_buf();
@@ -1539,13 +1684,28 @@ impl Engine {
         let result = async {
             let digests = self.download_digests(metadata, expected_digest);
             let algorithm = digests.first().map(|d| d.algorithm);
+            let output =
+                super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;
             let hash = if object.size == 0 && initial.is_none() {
                 algorithm
                     .map(|a| Digest::hash_bytes(a, &[]).value)
                     .unwrap_or_default()
             } else {
-                self.download_body(object, file.clone(), 0, object.size, initial, algorithm)
-                    .await?
+                let copied = self
+                    .download_fast_range(
+                        object,
+                        &output,
+                        0,
+                        object.size,
+                        initial,
+                        initial_slot,
+                        algorithm,
+                    )
+                    .await;
+                let flushed = output.finish().await;
+                let hash = copied?;
+                flushed?;
+                hash
             };
             if digests
                 .first()
@@ -1559,6 +1719,7 @@ impl Engine {
                 let f = file.clone();
                 tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
+            self.check_cancelled()?;
             local::apply_file_metadata(&file, metadata, &self.args, mode)?;
             let m = file.metadata()?;
             if self.args.ignore_existing || self.args.target_existence == Existence::New {
@@ -1593,7 +1754,7 @@ impl Engine {
             etag: object.etag.clone(),
             version: object.version.clone(),
             size: object.size,
-            part_size: self.options.part_size,
+            part_size: self.part_size(object.size),
             partial,
             dev: m.dev(),
             ino: m.ino(),
@@ -1603,7 +1764,16 @@ impl Engine {
         state.save(&record)?;
         Ok((record, file))
     }
-    async fn get_small(&self, object: &Object, initial: Option<ByteStream>) -> Result<Vec<u8>> {
+    async fn get_small(
+        &self,
+        object: &Object,
+        initial: Option<ByteStream>,
+        initial_slot: Option<super::tuning::Permit>,
+    ) -> Result<Vec<u8>> {
+        let _slot = match initial_slot {
+            Some(slot) => slot,
+            None => self.tuning.requests.acquire().await,
+        };
         let body = match initial {
             Some(body) => body,
             None => {
@@ -1648,6 +1818,7 @@ impl Engine {
         self.remote_hash_as(object, self.args.hash_algorithm).await
     }
     async fn remote_hash_as(&self, object: &Object, algorithm: HashAlgorithm) -> Result<String> {
+        let _slot = self.tuning.requests.acquire().await;
         let output = self
             .client
             .get_object()
@@ -1675,148 +1846,6 @@ impl Engine {
             bail!("S3 response was truncated or exceeded its advertised size");
         }
         Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
-    }
-    async fn download_body(
-        &self,
-        object: &Object,
-        file: Arc<File>,
-        offset: u64,
-        length: u64,
-        initial: Option<ByteStream>,
-        algorithm: Option<HashAlgorithm>,
-    ) -> Result<String> {
-        if let Some(body) = initial {
-            match self
-                .read_body(body, file.clone(), offset, length, algorithm)
-                .await
-            {
-                Ok(hash) => {
-                    self.progress.add_bytes(length);
-                    return Ok(hash);
-                }
-                Err(_) if self.options.retries > 0 && length > 0 => {}
-                Err(error) => return Err(error),
-            }
-        }
-        self.download_range(object, file, offset, length, algorithm)
-            .await
-    }
-    async fn download_range(
-        &self,
-        object: &Object,
-        file: Arc<File>,
-        offset: u64,
-        length: u64,
-        algorithm: Option<HashAlgorithm>,
-    ) -> Result<String> {
-        let mut attempt = 0;
-        loop {
-            let result = self
-                .read_range(object, file.clone(), offset, length, algorithm)
-                .await;
-            match result {
-                Ok(hash) => {
-                    self.progress.add_bytes(length);
-                    return Ok(hash);
-                }
-                Err(e)
-                    if attempt < self.options.retries
-                        && e.downcast_ref::<Permanent>().is_none() =>
-                {
-                    super::backoff(attempt).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    async fn read_range(
-        &self,
-        object: &Object,
-        file: Arc<File>,
-        offset: u64,
-        length: u64,
-        algorithm: Option<HashAlgorithm>,
-    ) -> Result<String> {
-        let end = offset + length - 1;
-        let output = match self
-            .client
-            .get_object()
-            .bucket(&self.options.bucket)
-            .key(&object.key)
-            .range(format!("bytes={offset}-{end}"))
-            .if_match(&object.etag)
-            .set_version_id(object.version.clone())
-            .send()
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                if !retryable_status(e.raw_response().map(|r| r.status().as_u16())) {
-                    return Err(Permanent(format!(
-                        "S3 range GET failed: {}",
-                        e.into_service_error()
-                    ))
-                    .into());
-                }
-                return Err(e.into_service_error()).context("S3 range GET failed");
-            }
-        };
-        if output.content_length() != Some(length as i64)
-            || output.content_range()
-                != Some(format!("bytes {offset}-{end}/{}", object.size).as_str())
-            || output.e_tag() != Some(object.etag.as_str())
-        {
-            return Err(Permanent(
-                "S3 range response has a different length, range, or ETag".into(),
-            )
-            .into());
-        }
-        self.read_body(output.body, file, offset, length, algorithm)
-            .await
-    }
-    async fn read_body(
-        &self,
-        body: ByteStream,
-        file: Arc<File>,
-        offset: u64,
-        length: u64,
-        algorithm: Option<HashAlgorithm>,
-    ) -> Result<String> {
-        let mut body = body.into_async_read();
-        let mut buffer = vec![0; length.min(1024 * 1024) as usize];
-        let mut written = 0;
-        let mut hash = algorithm.map(HashAlgorithm::hasher);
-        while written < length {
-            let want = buffer.len().min((length - written) as usize);
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                body.read_exact(&mut buffer[..want]),
-            )
-            .await??;
-            let n = want;
-            self.pace(n as u64).await;
-            let file = file.clone();
-            let at = offset + written;
-            (buffer, hash) = tokio::task::spawn_blocking(move || -> Result<_> {
-                if let Some(hash) = &mut hash {
-                    hash.update(&buffer[..n]);
-                }
-                file.write_all_at(&buffer[..n], at)?;
-                Ok((buffer, hash))
-            })
-            .await??;
-            written += n as u64;
-        }
-        let mut extra = [0];
-        if tokio::time::timeout(Duration::from_secs(60), body.read(&mut extra)).await?? != 0 {
-            return Err(
-                Permanent("S3 range response exceeded its advertised length".into()).into(),
-            );
-        }
-        Ok(hash
-            .map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
-            .unwrap_or_default())
     }
 }
 #[derive(Debug)]

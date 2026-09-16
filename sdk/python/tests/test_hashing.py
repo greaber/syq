@@ -87,23 +87,21 @@ class HashArgumentsTests(unittest.TestCase):
         self.client = syq.Client(executable=self.executable, env={**os.environ, "SYQ_FAKE_ARGV": str(self.log)})
 
     def test_choices_forward_independently_of_comparison_and_encryption(self):
-        self.client.cp("source", as_="destination", hash=True, hash_algorithm=syq.HashAlgorithm.XXH3_128,
-                       transfer_integrity=True, expected_digest=syq.Digest("md5", "A" * 32))
-        argv = json.loads(self.log.read_bytes())
-        self.assertIn("--hash", argv)
-        self.assertIn("--transfer-integrity", argv)
-        self.assertEqual(argv[argv.index("--hash-algorithm") + 1], "xxh3-128")
-        self.assertEqual(argv[argv.index("--expected-hash") + 1], "md5:" + "a" * 32)
-        self.assertNotIn("--tcp-plain", argv)
-        self.client.cp("source", as_="destination", hash_algorithm="sha256")
+        self.client.cp("source", as_="destination", integrity_checking="compare=xxh3-128,transfer=sha256", expected_digest=syq.Digest("md5", "A" * 32))
         argv = json.loads(self.log.read_bytes())
         self.assertNotIn("--hash", argv)
-        self.assertNotIn("--transfer-integrity", argv)
+        self.assertEqual(argv[argv.index("--integrity-checking") + 1], "compare=xxh3-128,transfer=sha256")
+        self.assertEqual(argv[argv.index("--expected-hash") + 1], "md5:" + "a" * 32)
+        self.assertNotIn("--tcp-plain", argv)
+        self.client.cp("source", as_="destination", integrity_checking="compare=sha256")
+        argv = json.loads(self.log.read_bytes())
+        self.assertNotIn("--hash", argv)
+        self.assertEqual(argv[argv.index("--integrity-checking") + 1], "compare=sha256")
         self.assertNotIn("--expected-hash", argv)
 
     def test_invalid_options_fail_before_starting_process(self):
         digest = syq.Digest("md5", "a" * 32)
-        for options in ({"hash_algorithm": "rolling"}, {"transfer_integrity": "false"},
+        for options in ({"integrity_checking": False}, {"integrity_checking": ["compare=md5"]},
                         {"expected_digest": "md5:abc"}, {"expected_digest": digest, "src": ["other"]},
                         {"expected_digest": digest, "mapping": [syq.MappingEntry("a", "b")]}):
             with self.subTest(options=options), self.assertRaises(syq.SyqInvocationError):
@@ -120,12 +118,11 @@ class AsyncHashArgumentsTests(unittest.IsolatedAsyncioTestCase):
             executable.chmod(0o755)
             log = root / "argv.json"
             client = syq.AsyncClient(executable=executable, env={**os.environ, "SYQ_FAKE_ARGV": str(log)})
-            await client.cp("source", as_="destination", hash_algorithm="md5", transfer_integrity=True,
+            await client.cp("source", as_="destination", integrity_checking="compare=md5,transfer=sha256",
                             expected_digest=syq.Digest("md5", "b" * 32))
             argv = json.loads(log.read_bytes())
-            self.assertEqual(argv[argv.index("--hash-algorithm") + 1], "md5")
+            self.assertEqual(argv[argv.index("--integrity-checking") + 1], "compare=md5,transfer=sha256")
             self.assertEqual(argv[argv.index("--expected-hash") + 1], "md5:" + "b" * 32)
-            self.assertIn("--transfer-integrity", argv)
 
 
 @unittest.skipUnless(os.environ.get("SYQ_CANDIDATE_EXECUTABLE"), "candidate binary required")
@@ -137,7 +134,7 @@ class CandidateHashingTests(unittest.TestCase):
             client = syq.Client(executable=os.environ["SYQ_CANDIDATE_EXECUTABLE"], process_cwd=root)
             expected = syq.Digest("md5", hashlib.md5(b"abc").hexdigest())
             result = client.cp("source", as_="destination", expected_digest=expected,
-                               hash_algorithm="xxh3-128", transfer_integrity=True)
+                               integrity_checking="compare=xxh3-128,transfer=sha256")
             self.assertIs(result.status, syq.OperationStatus.SUCCESS)
             self.assertEqual((root / "destination").read_bytes(), b"abc")
             original = (root / "destination").stat()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in provider checks for the automatic hash-free path; owns one key prefix."""
+"""Opt-in provider checks for the automatic transfer path; owns one key prefix."""
 import hashlib, importlib.util, os, pathlib, subprocess, sys, tempfile
 spec=importlib.util.spec_from_file_location('checks',pathlib.Path(__file__).with_name('check.py'))
 c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
@@ -8,7 +8,7 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
     root=pathlib.Path(tmp);source=root/'source';source.mkdir();cache=root/'cache'
     env={**os.environ,'XDG_CACHE_HOME':str(cache)}
     def run(*args):
-        subprocess.run([binary,'cp','--no-progress','--s3-integrity=none',*map(str,args)],env=env,check=True,timeout=180)
+        subprocess.run([binary,'cp','--no-progress',*map(str,args)],env=env,check=True,timeout=180)
     try:
         block=os.urandom(1024*1024)
         expected={}
@@ -33,9 +33,9 @@ with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
         before={p.name:p.stat().st_ino for p in target.iterdir()}
         run('--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',target)
         assert {p.name:p.stat().st_ino for p in target.iterdir()}==before
-        assert not (cache/'syq'/'s3').exists()
+        assert not list((cache/'syq'/'s3').glob('*.json'))
         assert not list(target.glob('.syq-s3-*'))
-        # Full mode can independently verify objects written without digests.
+        # Verification independently checks objects written without digests.
         subprocess.run([binary,'cp','--no-progress','--verify-only','--from','s3://'+c.BUCKET,'--srcs-in',c.PREFIX,'--into',str(target)],env=env,check=True,timeout=180)
-        print('Automatic sizes, direct-I/O tail, quick check, metadata, and full-mode interoperability passed',flush=True)
+        print('Automatic sizes, direct-I/O tail, quick check, metadata, and content verification passed',flush=True)
     finally:c.clean()

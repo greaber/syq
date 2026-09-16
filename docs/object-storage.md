@@ -54,39 +54,46 @@ uploads. Syq does not change bucket policies or lifecycle rules.
 
 ## Parallelism
 
-Uploads use multipart requests and downloads use concurrent byte ranges.
-These options control the two levels of concurrency and the request size.
-With the default `--s3-integrity=full`, S3 copies use these fixed defaults:
+Uploads use multipart requests and downloads use concurrent byte ranges. Syq
+chooses starting settings from file sizes, the backend and observed request
+latency, then adjusts its shared data-request budget during the copy. Short
+copies may finish before enough requests complete to adjust it. These choices
+apply independently of integrity checking, and S3 tuning writes no cache files.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `-j N`, `--connections N` | 256 | Objects being processed at once; 1–1024 |
-| `-c N`, `--s3-concurrency N` | 5 | Concurrent parts or ranges per object; 1–1024 |
-| `-p MIB`, `--s3-part-size MIB` | 50 | Part/range size in MiB; 5–5120 |
-| `--s3-retries N` | 10 | Retry budget for transient failures; 0–100 |
+For deliberate overrides, use `--performance-tuning`. These settings choose
+parallelism rather than bounding the process's total resource use:
 
-With `--s3-integrity=none`, omitted concurrency and part-size settings are chosen
-automatically. Syq uses file sizes, the backend and request latency to choose starting settings,
-then can increase the shared request budget when completed transfers show a benefit.
-Short copies may finish before there is enough data to adjust it. Explicit `-j`,
-`-c`, and `-p` values override their respective choices; the fast path always caps
-active data requests at 256 except for uploads consisting entirely of files up
-through 1 MiB. Those uploads can use up to 4,096 requests, with lower limits based
-on available file descriptors and a 256 MiB payload-buffer budget. Explicit
-object concurrency is also bounded by those resources. TLS and request bookkeeping
-use additional memory. Tigris uploads can also buffer individual files up to 8 MiB,
-sharing the same 256 MiB payload budget across active uploads and retries.
-Tuning is process-local and writes no cache files.
+| Key | Meaning |
+|---|---|
+| `s3-requests=N` | Shared data-request slots across objects; 1–65536 |
+| `s3-object-workers=N` | Objects processed concurrently; 1–65536 |
+| `s3-part-workers=N` | Concurrent parts or ranges per object; 1–1024 |
+| `s3-part-size=SIZE` | Part/range size; 5M–5G |
+| `s3-retries=N` | Transient retry budget; 0–100, default 10 |
 
+Object workers include hashing, metadata and recovery work. Part workers divide
+one object's data transfer; each part also needs a shared `s3-requests` slot.
+For example, `s3-object-workers=4,s3-part-workers=8,s3-requests=16` processes
+up to four objects and up to eight parts per object, with at most sixteen data
+requests active across them. Single-request objects use one slot each.
+
+A fixed count disables automatic adjustment of that count; slots can remain idle
+when there is insufficient ready work. Metadata requests and idle SDK sockets
+are separate, so none of these settings caps total open sockets. The payload
+buffer budget still applies; an explicit object-worker count beyond the available
+small-upload capacity is rejected. Requests include uploads, range downloads and
+content-verification GETs.
 An object no larger than the part size uses one data request. Upload part size
-increases when necessary to stay within 10,000 parts. Memory use is bounded by
-active workers and their buffers; syq does not buffer whole large objects.
-Discovery and collision checks finish before copying starts, so planning memory
-grows with the number of selected objects.
+increases when necessary to stay within 10,000 parts.
 
-`--bwlimit` limits the aggregate scheduled data rate, with bursts up to a part
-on upload. `--no-compress` has no effect because object bodies are transferred
-without compression.
+Small uploads share a 256 MiB payload-buffer budget. TLS and request bookkeeping
+use additional memory. Large objects stream through bounded buffers. Discovery
+and collision checks finish before copying starts, so planning memory grows
+with the number of selected objects.
+
+`--resource-limits bandwidth=RATE` limits the aggregate scheduled data rate,
+with bursts up to a part on upload. `--no-compress` has no effect because object
+bodies are transferred without compression.
 
 ## Metadata and integrity
 
@@ -110,13 +117,13 @@ fail explicitly; syq does not guess how to restore them.
 
 Uploads send checksums for the service to validate: SHA-256, or Content-MD5
 with Cloudflare R2 endpoints. These provider checks remain active regardless of
-`--transfer-integrity`. Syq reuses their part checksums to identify interrupted
+`--integrity-checking transfer=blake3`. Syq reuses their part checksums to identify interrupted
 uploads, without computing another whole-file hash by default. ETags identify
 objects; syq does not assume they are content hashes.
 
-`--transfer-integrity` additionally records a whole-file digest on upload and
+`--integrity-checking transfer=blake3` records a whole-file digest on upload and
 checks that digest, when present, before publishing a download. Choose its
-algorithm with `--hash-algorithm`. A single-part upload shares this computation
+algorithm in the `transfer` value, for example `transfer=sha256`. A single-part upload shares this computation
 with the provider checksum when their algorithms match. Multipart provider
 checksums cover individual parts and cannot replace an expected whole-file hash.
 When an upload has an expected digest, syq stores and reuses that digest for
@@ -138,17 +145,10 @@ Existing BLAKE3 object metadata remains readable. Other digest algorithms use
 metadata format 2; older syq binaries reject those objects explicitly rather
 than interpreting the digest as BLAKE3.
 
-`--s3-integrity=none` omits payload hashes, optional SDK checksum validation,
-final object rechecks, and resumable recovery records. Uploads use unsigned
-payloads while still authenticating the request; HTTPS still protects the
-connection. Downloads enforce object identity on range requests, exact ranges
-and lengths, and atomic file publication, but do not verify a content digest.
-Existing files are compared using size and native modification time instead of
-hashing. This mode cannot be combined with `--hash` or `--verify-only`.
-
-Large downloads in this mode can use direct I/O when supported, so their data
-may not populate the page cache. This does not promise crash durability.
-Other downloads use buffered writes with one bounded queue per file.
+Large downloads can use direct I/O when supported, so their data may not
+populate the page cache. This does not promise crash durability. Downloads
+requiring an assembled-file digest use buffered writes to avoid an expensive
+disk readback. Buffered writes share one bounded queue per file.
 
 `--hash` uses contents to decide whether an existing file needs copying.
 `--verify-only` reads both sides and reports differences without copying.
@@ -163,7 +163,7 @@ objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
 
-With full integrity, rerun an interrupted copy with the same endpoint, keys,
+Rerun an interrupted copy with the same endpoint, keys,
 destination and options to resume completed multipart uploads or download ranges. Recovery records live
 in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
 the destination. Syq checks their identity and rehashes saved ranges before
@@ -171,13 +171,7 @@ reuse. Single-request downloads restart and discard their temporary file on
 failure or cancellation. Existing destination files remain visible until a
 replacement has passed the requested checks.
 
-With `--s3-integrity=none`, interrupted files restart. Syq removes download
-partials and attempts to abort failed or interrupted multipart uploads after
-outstanding requests finish. A killed process or failed cleanup can leave parts
-at the provider. Existing recovery records from full-integrity copies are left
-untouched and are never reused by this mode.
-
-With full integrity, incomplete multipart uploads remain at the provider for recovery. If you
+Incomplete multipart uploads remain at the provider for recovery. If you
 abandon one, abort it using your provider's tools; a bucket lifecycle rule can
 also expire incomplete uploads. Removing only the local recovery record does
 not remove uploaded parts. Syq does not delete unrelated objects.

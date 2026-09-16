@@ -381,6 +381,7 @@ impl RestrictedAuthority {
             crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
+                transfer_hash_type: None,
             },
             |hashing| hashing.policy,
         )
@@ -8645,6 +8646,7 @@ esac
         let policy = HashPolicy {
             algorithm: HashAlgorithm::Xxh3,
             transfer_integrity: false,
+            transfer_hash_type: None,
         };
         let expected = Digest::hash_bytes(HashAlgorithm::Sha256, b"data");
         authority.hashing = Some(CopyHashing {
@@ -8655,6 +8657,7 @@ esac
         authority.authorize(&mut accepted, false).unwrap();
         let mut changed = Request::ConfigureHashing(HashPolicy {
             transfer_integrity: true,
+            transfer_hash_type: None,
             ..policy
         });
         assert!(authority.authorize(&mut changed, false).is_err());

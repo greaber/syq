@@ -60,7 +60,7 @@ finish within seven days of authorization.
 | `--skip-newer` | Timestamp selection uses source-reported modification times |
 | `--min-size` | Unsupported |
 | `--max-size` with `--prune` | Unsupported |
-| Fixed `--connections` above 64 | Unsupported |
+| Fixed `workers` above 64 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
