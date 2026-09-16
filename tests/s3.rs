@@ -319,7 +319,7 @@ fn serve(
     }
     fields.push((
         "Content-Range".into(),
-        format!("bytes {start}-{end}/{SIZE}"),
+        format!("bytes {start}-{end}/{size}"),
     ));
     if fault == "etag" {
         fields[0].1 = "\"different\"".into();
@@ -509,10 +509,11 @@ fn s3_invalid_initial_ranges_never_publish_a_fresh_download() {
     for fault in ["ignore-range", "etag", "corrupt", "truncated"] {
         let server = Server::start(fault);
         let temp = tempfile::tempdir().unwrap();
-        let output = server.cp(
-            temp.path(),
-            &["--from", "s3://bucket", "data", "--as", "download"],
-        );
+        let mut args = vec!["--from", "s3://bucket", "data", "--as", "download"];
+        if fault == "corrupt" {
+            args.push("--transfer-integrity");
+        }
+        let output = server.cp(temp.path(), &args);
         assert!(
             !output.status.success(),
             "{fault}: {}",
@@ -727,6 +728,7 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
             .command(temp.path())
             .env("AWS_CONFIG_FILE", &config)
             .args([
+                "--transfer-integrity",
                 "--s3-profile",
                 "fixture",
                 "--from",
