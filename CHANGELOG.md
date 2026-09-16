@@ -4,6 +4,14 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## Unreleased
+
+- Release downloads, the installer, the Homebrew formula, the remote helper
+  bootstrap, and the daily update reminder check now use `dl.syq.christmas`,
+  a maintainer-run host that counts requests by version, platform, and
+  country before redirecting to the GitHub release files. The reminder check
+  also honors `DO_NOT_TRACK=1`. See the install guide for what is recorded.
+
 ## 0.6.0 — 2026-09-13
 
 Changes since 0.5.2.

@@ -13,7 +13,8 @@ URL shapes mirror GitHub's release URLs:
 
 `migrations/0001_events.sql` holds the schema and two reporting views:
 `daily_checks` (daily update checks from installed clients, a daily-active
-proxy) and `daily_installs` (archive downloads by tag, target, and country).
+proxy) and `daily_installs` (downloads by kind, tag, target, and country; kind `archive`
+is the installer or a remote helper bootstrap, kind `binary` is Homebrew).
 
 ## Deploying
 

@@ -581,7 +581,7 @@ class BenchmarkTests(unittest.TestCase):
         installer = '#!/bin/sh\nset -eu\nmkdir -p "$HOME/.local/bin"\ncp ' + shlex.quote(str(template)) + ' "$HOME/.local/bin/syq"\n'
         curl = self.bin / 'curl'
         curl.write_text('#!/usr/bin/env python3\nimport pathlib, sys\n'
-                        'assert "https://github.com/greaber/syq/releases/latest/download/install.sh" in sys.argv\n'
+                        'assert "https://dl.syq.christmas/latest/install.sh" in sys.argv\n'
                         'pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text(' + repr(installer) + ')\n')
         curl.chmod(0o755)
         result = self.invoke('--install', env=env)

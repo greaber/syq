@@ -22,8 +22,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const REPOSITORY: &str = "https://github.com/greaber/syq";
-const RELEASE_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/download";
-const LATEST_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/latest/download";
+/// Maintainer-run download host. It records each request and redirects to
+/// the GitHub release asset; the signed manifest verified below is what makes
+/// the bytes trustworthy, not the host.
+const RELEASE_DOWNLOADS: &str = "https://dl.syq.christmas";
+const LATEST_DOWNLOADS: &str = "https://dl.syq.christmas/latest";
 const MANIFEST_NAME: &str = "syq-release-manifest.json";
 const RECEIPT_SCHEMA: u32 = 1;
 const MANIFEST_SCHEMA: u32 = 1;
@@ -181,7 +184,7 @@ pub fn after_success(quiet: bool) {
     if !should_check_for_updates(
         quiet,
         std::io::stderr().is_terminal(),
-        std::env::var_os("SYQ_NO_UPDATE_CHECK").is_some(),
+        update_checks_disabled(),
     ) {
         return;
     }
@@ -257,6 +260,13 @@ fn is_homebrew_keg_path(executable: &Path) -> bool {
 
 fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: bool) -> bool {
     !quiet && stderr_is_terminal && !disabled
+}
+
+/// `SYQ_NO_UPDATE_CHECK` is syq's own switch; `DO_NOT_TRACK` is the shared
+/// console convention, honored because the check reaches a maintainer-run host.
+fn update_checks_disabled() -> bool {
+    std::env::var_os("SYQ_NO_UPDATE_CHECK").is_some()
+        || std::env::var_os("DO_NOT_TRACK").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// Return the artifact metadata for this exact release after verifying its
@@ -758,13 +768,16 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
         .build()
         .new_agent();
 
+    // Lets the download host count checks by platform without an identifier.
+    let target = crate::remote_helper::Target::local().map(|target| target.key);
     let mut last_error = None;
     for attempt in 0..attempts {
         let result = (|| -> Result<()> {
-            let mut response = agent
-                .get(url)
-                .call()
-                .with_context(|| format!("request {url}"))?;
+            let mut request = agent.get(url);
+            if let Some(target) = target {
+                request = request.header("x-syq-target", target);
+            }
+            let mut response = request.call().with_context(|| format!("request {url}"))?;
             let file = destination.writer()?;
             let mut file = BufWriter::new(file);
             copy_bounded(&mut response.body_mut().as_reader(), &mut file, limit)
