@@ -155,6 +155,8 @@ jobs:
           export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
           RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          # macOS debug maps contain temporary Rust object names; strip them
+          # before comparing wheels, as release builds already strip symbols.
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
             # Restored Cargo caches can contain distributions from an older SDK.
             rm -rf -- "$output"
