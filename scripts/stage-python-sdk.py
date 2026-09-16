@@ -22,7 +22,13 @@ def stage(root: Path, output: Path) -> None:
     archive = subprocess.check_output(["git", "-C", str(root), "archive", revision])
     output.mkdir(parents=True, exist_ok=False)
     with tarfile.open(fileobj=io.BytesIO(archive)) as source:
-        source.extractall(output, filter="data")
+        if hasattr(tarfile, "data_filter"):
+            source.extractall(output, filter="data")
+        else:
+            # Python 3.10.0–3.10.11 has no extraction filters. This archive was
+            # just produced by local Git from the selected source commit; this
+            # path does not accept downloaded or user-supplied tar archives.
+            source.extractall(output)
     sdk = output / "sdk/python"
     shutil.rmtree(sdk)
     shutil.copytree(root / "sdk/python", sdk, ignore=shutil.ignore_patterns(
