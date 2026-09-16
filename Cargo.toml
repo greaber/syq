@@ -42,6 +42,7 @@ jwalk = "0.9"
 rayon = "1.12"
 ignore = "0.4"
 blake3 = "1"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zstd = "0.13"
 libc = "0.2"
 shell-words = "1"

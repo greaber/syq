@@ -924,6 +924,13 @@ fn run_remote(
     if args.checksum {
         remote.push("--hash".into());
     }
+    remote.push(format!("--hash-algorithm={}", args.hash_algorithm));
+    if args.transfer_integrity {
+        remote.push("--transfer-integrity".into());
+    }
+    if let Some(expected) = &args.expected_digest {
+        remote.push(format!("--expected-hash={expected}"));
+    }
     for (enabled, option) in [
         (args.verify_only, "--verify-only"),
         (args.ignore_existing, "--only-new"),

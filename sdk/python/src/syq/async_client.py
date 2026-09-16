@@ -54,6 +54,8 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    Digest,
+    HashAlgorithm,
     MappingEntry,
     OperationStatus,
     OperationSummary,
@@ -646,6 +648,9 @@ class AsyncClient:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        hash_algorithm: HashAlgorithm | str | None = None,
+        transfer_integrity: bool = False,
+        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
@@ -698,6 +703,8 @@ class AsyncClient:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        if expected_digest is not None and mapping is not None:
+            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -727,6 +734,9 @@ class AsyncClient:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            hash_algorithm=hash_algorithm,
+            transfer_integrity=transfer_integrity,
+            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,

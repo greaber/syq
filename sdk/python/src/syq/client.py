@@ -31,6 +31,8 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    Digest,
+    HashAlgorithm,
     IgnoreFrom,
     MappingEntry,
     OperationStatus,
@@ -614,6 +616,9 @@ def _copy_arguments(
     max_size: str | int | None,
     min_size: str | int | None,
     max_delete: int | None,
+    hash_algorithm: HashAlgorithm | str | None = None,
+    transfer_integrity: bool = False,
+    expected_digest: Digest | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
     source_count = 0
@@ -683,6 +688,22 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
+    if hash_algorithm is not None:
+        try:
+            algorithm = HashAlgorithm(hash_algorithm)
+        except (TypeError, ValueError) as error:
+            raise SyqInvocationError("hash_algorithm must be blake3, sha256, md5, or xxh3-128") from error
+        argv.extend(("--hash-algorithm", algorithm.value))
+    if not isinstance(transfer_integrity, bool):
+        raise SyqInvocationError("transfer_integrity must be a boolean")
+    if transfer_integrity:
+        argv.append("--transfer-integrity")
+    if expected_digest is not None:
+        if not isinstance(expected_digest, Digest):
+            raise SyqInvocationError("expected_digest must be a Digest")
+        if source_count != 1 or contents_count or src_dir is not None:
+            raise SyqInvocationError("expected_digest requires exactly one regular-file source")
+        argv.extend(("--expected-hash", f"{expected_digest.algorithm}:{expected_digest.value}"))
     if verify_only and (dry_run or prune or inplace or only_new or only_existing or skip_newer):
         raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
     if only_new and (only_existing or skip_newer or inplace):
@@ -1038,6 +1059,9 @@ class Client:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        hash_algorithm: HashAlgorithm | str | None = None,
+        transfer_integrity: bool = False,
+        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
@@ -1090,6 +1114,8 @@ class Client:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        if expected_digest is not None and mapping is not None:
+            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -1117,6 +1143,9 @@ class Client:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            hash_algorithm=hash_algorithm,
+            transfer_integrity=transfer_integrity,
+            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,

@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     cli::{Args, Existence, Placement, SourceSelection},
+    hashing::{Digest, HashAlgorithm},
     progress::Progress,
     rooted::{RelativePath, Root},
 };
@@ -46,6 +47,7 @@ struct Download {
     key: String,
     path: String,
     size: u64,
+    expected_digest: Option<Digest>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UploadState {
@@ -83,6 +85,8 @@ struct DownloadState {
     dev: u64,
     ino: u64,
     parts: BTreeMap<u64, String>,
+    #[serde(default)]
+    hash_algorithm: HashAlgorithm,
 }
 
 impl Engine {
@@ -116,6 +120,10 @@ impl Engine {
         if self.options.upload {
             let args = self.args.clone();
             let plan = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
+            {
+                bail!("an expected digest requires exactly one regular file");
+            }
             self.check_upload_placement(&plan).await?;
             if plan.len() > 1 && !self.args.existing && !self.args.ignore_existing {
                 let target = local::key_path(&self.args.locations.last().unwrap().path)?;
@@ -147,8 +155,13 @@ impl Engine {
                     let key = source.key.clone();
                     let label = source.label.clone();
                     let kind = source.kind();
+                    let expected = source
+                        .expected_digest
+                        .as_ref()
+                        .or(engine.args.expected_digest.as_ref())
+                        .cloned();
                     let result = engine.upload(source).await;
-                    engine.settle(&label, &key, kind, &result);
+                    engine.settle(&label, &key, kind, &result, expected.as_ref());
                     Ok(())
                 }
             })
@@ -156,6 +169,9 @@ impl Engine {
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let plan = self.download_plan(&destination).await?;
+            if self.args.expected_digest.is_some() && plan.len() != 1 {
+                bail!("an expected digest requires exactly one regular file");
+            }
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress
                 .bytes_total
@@ -171,7 +187,15 @@ impl Engine {
                 async move {
                     let mut kind = "file";
                     let result = engine.download(&job, &dst, dirs, &mut kind).await;
-                    engine.settle(job.key.as_bytes(), &job.path, kind, &result);
+                    engine.settle(
+                        job.key.as_bytes(),
+                        &job.path,
+                        kind,
+                        &result,
+                        job.expected_digest
+                            .as_ref()
+                            .or(engine.args.expected_digest.as_ref()),
+                    );
                     Ok(())
                 }
             })
@@ -192,7 +216,14 @@ impl Engine {
         }
         Ok(())
     }
-    fn settle(&self, src: &[u8], dst: &str, kind: &'static str, result: &Result<Option<u64>>) {
+    fn settle(
+        &self,
+        src: &[u8],
+        dst: &str,
+        kind: &'static str,
+        result: &Result<Option<u64>>,
+        expected: Option<&Digest>,
+    ) {
         let action = match kind {
             "dir" => "create_directory",
             "symlink" => "create_symlink",
@@ -230,19 +261,22 @@ impl Engine {
                             reason: "content_differs",
                         });
                     } else {
-                        writer.emit_operation(&crate::results::OperationRecord {
-                            action,
-                            src: Some(src),
-                            dst: dst.as_bytes(),
-                            kind,
-                            disposition: "succeeded",
-                            bytes: Some(*bytes),
-                            attempts: None,
-                            retryable: None,
-                            class: None,
-                            os_kind: None,
-                            message: None,
-                        });
+                        writer.emit_operation_expected(
+                            &crate::results::OperationRecord {
+                                action,
+                                src: Some(src),
+                                dst: dst.as_bytes(),
+                                kind,
+                                disposition: "succeeded",
+                                bytes: Some(*bytes),
+                                attempts: None,
+                                retryable: None,
+                                class: None,
+                                os_kind: None,
+                                message: None,
+                            },
+                            expected,
+                        );
                     }
                 }
             }
@@ -255,19 +289,22 @@ impl Engine {
                 let message = format!("S3 {dst}: {error:#}");
                 self.progress.error(&message);
                 if let Some(writer) = self.progress.results_writer() {
-                    writer.emit_operation(&crate::results::OperationRecord {
-                        action,
-                        src: Some(src),
-                        dst: dst.as_bytes(),
-                        kind,
-                        disposition: "failed",
-                        bytes: None,
-                        attempts: None,
-                        retryable: None,
-                        class: Some("transport"),
-                        os_kind: None,
-                        message: Some(&message),
-                    });
+                    writer.emit_operation_expected(
+                        &crate::results::OperationRecord {
+                            action,
+                            src: Some(src),
+                            dst: dst.as_bytes(),
+                            kind,
+                            disposition: "failed",
+                            bytes: None,
+                            attempts: None,
+                            retryable: None,
+                            class: Some("transport"),
+                            os_kind: None,
+                            message: Some(&message),
+                        },
+                        expected,
+                    );
                 }
             }
         }
@@ -337,6 +374,11 @@ impl Engine {
         Ok(())
     }
     async fn upload(&self, source: Source) -> Result<Option<u64>> {
+        let expected_digest = source
+            .expected_digest
+            .as_ref()
+            .or(self.args.expected_digest.as_ref())
+            .filter(|_| !self.args.dry_run);
         let existing = if self
             .upload_keys
             .get()
@@ -369,77 +411,116 @@ impl Engine {
         }
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let (digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
+            (self.args.transfer_integrity || self.args.checksum || self.args.verify_only)
+                .then_some(self.args.hash_algorithm)
+        });
+        let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
                 let bytes = source_clone.bytes()?;
                 return Ok((
-                    blake3::hash(&bytes).to_hex().to_string(),
+                    whole_algorithm.map(|a| Digest::hash_bytes(a, &bytes).value),
                     vec![algorithm.digest(&bytes)],
                     Some(bytes),
                 ));
             }
-            if size > part_size && size >= 32 * 1024 * 1024 {
-                // The object's digest must be available before initiating the
-                // upload. Hash independent parts and the whole file in parallel
-                // so this pass can use the same cores as the transfer workers.
-                let (whole, parts) = rayon::join(
-                    || local::hash_file(source_clone.open()?),
-                    || {
-                        (0..size.div_ceil(part_size))
-                            .into_par_iter()
-                            .map(|index| {
-                                let file = source_clone.open()?;
-                                let offset = index * part_size;
-                                let length = part_size.min(size - offset);
-                                let mut buffer = vec![0; 1024 * 1024];
-                                let mut hash = algorithm.hasher();
-                                let mut done = 0;
-                                while done < length {
-                                    let n = buffer.len().min((length - done) as usize);
-                                    file.read_exact_at(&mut buffer[..n], offset + done)?;
-                                    hash.update(&buffer[..n]);
-                                    done += n as u64;
-                                }
-                                source_clone.check(&file)?;
-                                Ok(hash.finish())
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    },
-                );
-                source_clone.check(&source_clone.open()?)?;
-                return Ok((whole?, parts?, None));
-            }
-            let mut file = source_clone.open()?;
-            let mut whole = blake3::Hasher::new();
-            let mut buffer = vec![0; size.min(1024 * 1024) as usize];
-            let mut parts = Vec::new();
-            let mut remaining = size;
-            while remaining > 0 {
-                let mut part = algorithm.hasher();
-                let mut left = remaining.min(part_size);
-                while left > 0 {
-                    let want = buffer.len().min(left as usize);
-                    file.read_exact(&mut buffer[..want])?;
-                    whole.update(&buffer[..want]);
-                    part.update(&buffer[..want]);
-                    left -= want as u64;
+            // Independent native part checksums provide both upload validation
+            // and resume identity. A whole-file hash is optional unless requested.
+            let native_algorithm = match algorithm {
+                Algorithm::Sha256 => HashAlgorithm::Sha256,
+                Algorithm::Md5 => HashAlgorithm::Md5,
+            };
+            let reuse_native = size <= part_size && whole_algorithm == Some(native_algorithm);
+            if size <= part_size || size < 32 * 1024 * 1024 {
+                // For small files, feed every required digest from one read.
+                // Large multipart files retain independent parallel hash work.
+                let mut file = source_clone.open()?;
+                let mut whole = whole_algorithm
+                    .filter(|_| !reuse_native)
+                    .map(HashAlgorithm::hasher);
+                let mut buffer = vec![0; 1024 * 1024];
+                let mut parts = Vec::new();
+                let mut remaining = size;
+                for _ in 0..size.div_ceil(part_size).max(1) {
+                    let mut part = native_algorithm.hasher();
+                    let mut left = remaining.min(part_size);
+                    while left > 0 {
+                        let n = buffer.len().min(left as usize);
+                        file.read_exact(&mut buffer[..n])?;
+                        part.update(&buffer[..n]);
+                        if let Some(whole) = &mut whole {
+                            whole.update(&buffer[..n]);
+                        }
+                        left -= n as u64;
+                    }
+                    parts.push(part.finalize());
+                    remaining = remaining.saturating_sub(part_size);
                 }
-                parts.push(part.finish());
-                remaining = remaining.saturating_sub(part_size);
+                source_clone.check(&file)?;
+                let whole = if reuse_native {
+                    Some(Digest::from_hash(native_algorithm, &parts[0]).value)
+                } else {
+                    whole.map(|h| Digest::from_hash(whole_algorithm.unwrap(), &h.finalize()).value)
+                };
+                return Ok((whole, encode_native_parts(native_algorithm, &parts), None));
             }
-            if size == 0 {
-                parts.push(algorithm.digest(&[]));
-            }
-            source_clone.check(&file)?;
-            Ok((whole.finalize().to_hex().to_string(), parts, None))
+            let (whole, parts) = rayon::join(
+                || -> Result<Option<String>> {
+                    whole_algorithm
+                        .filter(|_| !reuse_native)
+                        .map(|a| local::hash_file_as(source_clone.open()?, a))
+                        .transpose()
+                },
+                || {
+                    (0..size.div_ceil(part_size).max(1))
+                        .into_par_iter()
+                        .map(|index| {
+                            let file = source_clone.open()?;
+                            let offset = index * part_size;
+                            let length = part_size.min(size.saturating_sub(offset));
+                            let mut buffer = vec![0; 1024 * 1024];
+                            let mut hash = native_algorithm.hasher();
+                            let mut done = 0;
+                            while done < length {
+                                let n = buffer.len().min((length - done) as usize);
+                                file.read_exact_at(&mut buffer[..n], offset + done)?;
+                                hash.update(&buffer[..n]);
+                                done += n as u64;
+                            }
+                            source_clone.check(&file)?;
+                            Ok(hash.finalize())
+                        })
+                        .collect::<Result<Vec<_>>>()
+                },
+            );
+            let parts = parts?;
+            let whole = if reuse_native {
+                Some(Digest::from_hash(native_algorithm, &parts[0]).value)
+            } else {
+                whole?
+            };
+            let checksums = encode_native_parts(native_algorithm, &parts);
+            source_clone.check(&source_clone.open()?)?;
+            Ok((whole, checksums, None))
         })
         .await??;
-        let metadata = source.metadata(Some(digest.clone()));
+        if let Some(expected) = expected_digest {
+            if !whole_digest
+                .as_ref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.value))
+            {
+                bail!("source does not match expected digest");
+            }
+        }
+        let mut metadata = source.metadata(whole_digest.clone());
+        metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
+        let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut unchanged = existing.as_ref().is_some_and(|o| {
             o.kind() == source.kind()
                 && o.size == size
                 && o.metadata.as_ref().is_some_and(|m| {
-                    m.hash.as_ref() == Some(&digest)
+                    (whole_digest.is_none()
+                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm))
                         && m.mtime == metadata.mtime
                         && m.nsec == metadata.nsec
                         && (!self.args.perms || m.mode == metadata.mode)
@@ -449,13 +530,29 @@ impl Engine {
         });
         if self.args.checksum {
             if let Some(object) = &existing {
-                unchanged = unchanged && self.remote_hash(object).await? == digest;
+                unchanged = unchanged
+                    && self
+                        .remote_hash_as(object, whole_algorithm.unwrap())
+                        .await?
+                        == *whole_digest.as_ref().unwrap();
             }
         }
         if self.args.verify_only {
             let object = existing.context("verification failed: destination object is missing")?;
-            self.verify_upload(&source, &object, &digest).await?;
+            self.verify_upload(
+                &source,
+                &object,
+                whole_digest.as_deref().unwrap(),
+                whole_algorithm.unwrap(),
+            )
+            .await?;
             return Ok(None);
+        }
+        if unchanged && expected_digest.is_some() {
+            unchanged = self
+                .verify_expected_remote(existing.as_ref().unwrap(), expected_digest)
+                .await
+                .is_ok();
         }
         if unchanged {
             self.progress.bytes_unchanged.fetch_add(size, Relaxed);
@@ -753,7 +850,13 @@ impl Engine {
         }
         Ok(Some(size))
     }
-    async fn verify_upload(&self, source: &Source, object: &Object, digest: &str) -> Result<()> {
+    async fn verify_upload(
+        &self,
+        source: &Source,
+        object: &Object,
+        digest: &str,
+        algorithm: HashAlgorithm,
+    ) -> Result<()> {
         if object.kind() != source.kind()
             || object.size != source.meta.len && source.kind() != "dir"
         {
@@ -770,7 +873,7 @@ impl Engine {
             .await
             .map_err(|e| e.into_service_error())?;
         let mut reader = output.body.into_async_read();
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = algorithm.hasher();
         let mut buffer = vec![0; 1024 * 1024];
         loop {
             let n =
@@ -780,7 +883,7 @@ impl Engine {
             }
             hasher.update(&buffer[..n]);
         }
-        if hasher.finalize().to_hex().as_str() != digest {
+        if Digest::from_hash(algorithm, &hasher.finalize()).value != digest {
             bail!("verification failed: contents differ");
         }
         Ok(())
@@ -826,6 +929,7 @@ impl Engine {
                         _ => SourceSelection::Named,
                     },
                     entry.kind.map(|kind| kind.label()),
+                    entry.expected_digest,
                 ));
             }
         } else {
@@ -842,7 +946,7 @@ impl Engine {
                         )?,
                     )
                 };
-                selectors.push((key, path, location.selection, None));
+                selectors.push((key, path, location.selection, None, None));
             }
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
@@ -862,7 +966,7 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
-        for (key, path, selection, declared_kind) in selectors {
+        for (key, path, selection, declared_kind, expected_digest) in selectors {
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -907,6 +1011,9 @@ impl Engine {
                 };
                 if declared_kind.is_some_and(|kind| kind != object.kind()) {
                     bail!("S3 source type does not match mapping");
+                }
+                if expected_digest.is_some() && object.kind() != "file" {
+                    bail!("an expected digest requires a regular file");
                 }
                 vec![(object.key, object.size, path.clone())]
             } else if let Some(exact) = exact {
@@ -957,7 +1064,12 @@ impl Engine {
                     bail!("cannot replace the destination directory with an object");
                 }
                 local::claim(&mut claims, &path, directory)?;
-                out.push(Download { key, path, size });
+                out.push(Download {
+                    key,
+                    path,
+                    size,
+                    expected_digest: expected_digest.clone(),
+                });
             }
         }
         Ok(out)
@@ -969,6 +1081,12 @@ impl Engine {
         directories: DirectoryMetadata,
         kind: &mut &'static str,
     ) -> Result<Option<u64>> {
+        let expected_digest = job
+            .expected_digest
+            .as_ref()
+            .or(self.args.expected_digest.as_ref());
+        let requires_regular_file = expected_digest.is_some();
+        let expected_digest = expected_digest.filter(|_| !self.args.dry_run);
         let root = &destination.root;
         let path = RelativePath::new(job.path.as_bytes())?;
         let existing = match root.metadata_optional(&path) {
@@ -1035,6 +1153,7 @@ impl Engine {
             mtime: object.mtime,
             nsec: 0,
             hash: None,
+            hash_algorithm: HashAlgorithm::Blake3,
         });
         if self.args.update && existing.is_some_and(|m| m.is_file() && m.mtime > metadata.mtime) {
             return Ok(None);
@@ -1043,6 +1162,9 @@ impl Engine {
             if m.is_dir() != (object.kind() == "dir") {
                 bail!("refusing to replace a directory with a non-directory or the reverse");
             }
+        }
+        if requires_regular_file && object.kind() != "file" {
+            bail!("an expected digest requires a regular file");
         }
         if object.kind() == "dir" {
             if self.args.verify_only {
@@ -1077,8 +1199,12 @@ impl Engine {
                 bail!("S3 symlink target is too large");
             }
             let bytes = self.get_small(&object, initial).await?;
-            if let Some(hash) = &metadata.hash {
-                if blake3::hash(&bytes).to_hex().as_str() != hash {
+            if let Some(hash) = metadata
+                .hash
+                .as_ref()
+                .filter(|_| self.args.transfer_integrity)
+            {
+                if Digest::hash_bytes(metadata.hash_algorithm, &bytes).value != *hash {
                     bail!("symlink checksum mismatch");
                 }
             }
@@ -1110,17 +1236,28 @@ impl Engine {
         let mut unchanged = false;
         if let Some(m) = existing.filter(|m| m.is_file() && m.len == object.size) {
             if self.args.verify_only || self.args.checksum {
-                if self.args.verify_only || metadata.hash.is_none() {
+                if self.args.verify_only
+                    || metadata.hash.is_none()
+                    || metadata.hash_algorithm != self.args.hash_algorithm
+                {
                     unchanged = self.verify_download(root, &path, &object).await?;
                 } else {
                     let file = root.open_regular_read(&path)?;
+                    let algorithm = metadata.hash_algorithm;
                     let hash =
-                        tokio::task::spawn_blocking(move || local::hash_file(file)).await??;
+                        tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm))
+                            .await??;
                     unchanged = metadata.hash.as_ref() == Some(&hash);
                 }
             } else {
                 unchanged = m.mtime == metadata.mtime && m.mtime_nsec == metadata.nsec;
             }
+        }
+        if unchanged && expected_digest.is_some() {
+            unchanged = self
+                .verify_expected_local(root, &path, expected_digest)
+                .await
+                .is_ok();
         }
         if self.args.verify_only {
             if !unchanged {
@@ -1154,7 +1291,7 @@ impl Engine {
                     &object,
                     root,
                     &path,
-                    &metadata,
+                    (&metadata, expected_digest),
                     existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
                     initial,
                 )
@@ -1169,7 +1306,7 @@ impl Engine {
         let state = State::open(&self.identity(&object.key, &extra))?;
         let mut saved: Option<DownloadState> = state.load()?;
         if let Some(old) = &saved {
-            if old.schema != 1 {
+            if old.schema != 1 && old.schema != 2 {
                 bail!("unsupported S3 download recovery schema");
             }
             if old.etag != object.etag
@@ -1197,6 +1334,7 @@ impl Engine {
         } else {
             self.new_download_state(root, &job.path, &object, &state)?
         };
+        let range_algorithm = record.hash_algorithm;
         let record = Arc::new(Mutex::new(record));
         let file = Arc::new(file);
         let part_size = self.options.part_size;
@@ -1215,16 +1353,17 @@ impl Engine {
                     let previous = record.lock().await.parts.get(&index).cloned();
                     if let Some(hash) = previous {
                         let f = file.clone();
-                        let actual =
-                            tokio::task::spawn_blocking(move || hash_range(&f, offset, length))
-                                .await??;
+                        let actual = tokio::task::spawn_blocking(move || {
+                            hash_range(&f, offset, length, range_algorithm)
+                        })
+                        .await??;
                         if actual == hash {
                             self.progress.bytes_unchanged.fetch_add(length, Relaxed);
                             return Ok::<_, anyhow::Error>(());
                         }
                     }
                     let hash = self
-                        .download_body(object, file, offset, length, initial)
+                        .download_body(object, file, offset, length, initial, Some(range_algorithm))
                         .await?;
                     let mut record = record.lock().await;
                     record.parts.insert(index, hash);
@@ -1237,12 +1376,9 @@ impl Engine {
             .await?;
         let partial = record.lock().await.partial.clone();
         let partial_path = RelativePath::new(partial.as_bytes())?;
-        if let Some(expected) = &metadata.hash {
+        for expected in self.download_digests(&metadata, expected_digest) {
             let f = root.open_regular_read(&partial_path)?;
-            let actual = tokio::task::spawn_blocking(move || local::hash_file(f)).await??;
-            if &actual != expected {
-                bail!("download checksum mismatch; partial file preserved");
-            }
+            tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
         }
         // A version ID pins immutable content; otherwise confirm the source
         // still has the identity used on every range request.
@@ -1269,15 +1405,59 @@ impl Engine {
         state.clear()?;
         Ok(Some(object.size))
     }
+    fn download_digests(&self, metadata: &Metadata, expected: Option<&Digest>) -> Vec<Digest> {
+        let mut digests = expected.cloned().into_iter().collect::<Vec<_>>();
+        if self.args.transfer_integrity {
+            if let Some(value) = &metadata.hash {
+                let digest = Digest {
+                    algorithm: metadata.hash_algorithm,
+                    value: value.clone(),
+                };
+                if !digests.contains(&digest) {
+                    digests.push(digest);
+                }
+            }
+        }
+        digests
+    }
+    async fn verify_expected_local(
+        &self,
+        root: &Root,
+        path: &RelativePath,
+        expected: Option<&Digest>,
+    ) -> Result<()> {
+        if let Some(expected) = expected.cloned() {
+            let mut file = root.open_regular_read(path)?;
+            tokio::task::spawn_blocking(move || expected.verify_reader(&mut file)).await??;
+        }
+        Ok(())
+    }
+    async fn verify_expected_remote(
+        &self,
+        object: &Object,
+        expected: Option<&Digest>,
+    ) -> Result<()> {
+        if let Some(expected) = expected {
+            if object.kind() != "file" {
+                bail!("an expected digest requires a regular file");
+            }
+            let actual = self.remote_hash_as(object, expected.algorithm).await?;
+            if actual != expected.value {
+                bail!("remote object does not match expected digest");
+            }
+        }
+        Ok(())
+    }
     async fn download_single(
         &self,
         object: &Object,
         root: &Root,
         path: &RelativePath,
-        metadata: &Metadata,
+        validation: (&Metadata, Option<&Digest>),
         mode: Option<u32>,
         initial: Option<ByteStream>,
     ) -> Result<Option<u64>> {
+        let (metadata, expected_digest) = validation;
         let path_buf = path.to_path_buf();
         let label = path_buf
             .to_str()
@@ -1299,18 +1479,27 @@ impl Engine {
             identity: (file.metadata()?.dev(), file.metadata()?.ino()),
         };
         let result = async {
+            let digests = self.download_digests(metadata, expected_digest);
+            let algorithm = digests.first().map(|d| d.algorithm);
             let hash = if object.size == 0 && initial.is_none() {
-                blake3::hash(&[]).to_hex().to_string()
+                algorithm
+                    .map(|a| Digest::hash_bytes(a, &[]).value)
+                    .unwrap_or_default()
             } else {
-                self.download_body(object, file.clone(), 0, object.size, initial)
+                self.download_body(object, file.clone(), 0, object.size, initial, algorithm)
                     .await?
             };
-            if metadata
-                .hash
-                .as_ref()
-                .is_some_and(|expected| expected != &hash)
+            if digests
+                .first()
+                .is_some_and(|expected| expected.value != hash)
             {
                 bail!("download checksum mismatch");
+            }
+            // If the caller requires a second algorithm, reread only for that
+            // distinct requirement, never rehash the same digest twice.
+            for expected in digests.into_iter().skip(1) {
+                let f = file.clone();
+                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
             local::apply_file_metadata(&file, metadata, &self.args, mode)?;
             let m = file.metadata()?;
@@ -1342,7 +1531,7 @@ impl Engine {
         file.set_len(object.size)?;
         let m = file.metadata()?;
         let record = DownloadState {
-            schema: 1,
+            schema: 2,
             etag: object.etag.clone(),
             version: object.version.clone(),
             size: object.size,
@@ -1351,6 +1540,7 @@ impl Engine {
             dev: m.dev(),
             ino: m.ino(),
             parts: BTreeMap::new(),
+            hash_algorithm: self.args.hash_algorithm,
         };
         state.save(&record)?;
         Ok((record, file))
@@ -1391,10 +1581,15 @@ impl Engine {
         object: &Object,
     ) -> Result<bool> {
         let file = root.open_regular_read(path)?;
-        let expected = tokio::task::spawn_blocking(move || local::hash_file(file)).await??;
+        let algorithm = self.args.hash_algorithm;
+        let expected =
+            tokio::task::spawn_blocking(move || local::hash_file_as(file, algorithm)).await??;
         Ok(self.remote_hash(object).await? == expected)
     }
     async fn remote_hash(&self, object: &Object) -> Result<String> {
+        self.remote_hash_as(object, self.args.hash_algorithm).await
+    }
+    async fn remote_hash_as(&self, object: &Object, algorithm: HashAlgorithm) -> Result<String> {
         let output = self
             .client
             .get_object()
@@ -1407,7 +1602,7 @@ impl Engine {
             .map_err(|e| e.into_service_error())?;
         let mut body = output.body.into_async_read();
         let mut buffer = vec![0; 1024 * 1024];
-        let mut hash = blake3::Hasher::new();
+        let mut hash = algorithm.hasher();
         let mut n = 0;
         loop {
             let got =
@@ -1421,7 +1616,7 @@ impl Engine {
         if n != object.size {
             bail!("S3 response was truncated or exceeded its advertised size");
         }
-        Ok(hash.finalize().to_hex().to_string())
+        Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
     }
     async fn download_body(
         &self,
@@ -1430,9 +1625,13 @@ impl Engine {
         offset: u64,
         length: u64,
         initial: Option<ByteStream>,
+        algorithm: Option<HashAlgorithm>,
     ) -> Result<String> {
         if let Some(body) = initial {
-            match self.read_body(body, file.clone(), offset, length).await {
+            match self
+                .read_body(body, file.clone(), offset, length, algorithm)
+                .await
+            {
                 Ok(hash) => {
                     self.progress.add_bytes(length);
                     return Ok(hash);
@@ -1441,7 +1640,8 @@ impl Engine {
                 Err(error) => return Err(error),
             }
         }
-        self.download_range(object, file, offset, length).await
+        self.download_range(object, file, offset, length, algorithm)
+            .await
     }
     async fn download_range(
         &self,
@@ -1449,10 +1649,13 @@ impl Engine {
         file: Arc<File>,
         offset: u64,
         length: u64,
+        algorithm: Option<HashAlgorithm>,
     ) -> Result<String> {
         let mut attempt = 0;
         loop {
-            let result = self.read_range(object, file.clone(), offset, length).await;
+            let result = self
+                .read_range(object, file.clone(), offset, length, algorithm)
+                .await;
             match result {
                 Ok(hash) => {
                     self.progress.add_bytes(length);
@@ -1475,6 +1678,7 @@ impl Engine {
         file: Arc<File>,
         offset: u64,
         length: u64,
+        algorithm: Option<HashAlgorithm>,
     ) -> Result<String> {
         let end = offset + length - 1;
         let output = match self
@@ -1510,7 +1714,8 @@ impl Engine {
             )
             .into());
         }
-        self.read_body(output.body, file, offset, length).await
+        self.read_body(output.body, file, offset, length, algorithm)
+            .await
     }
     async fn read_body(
         &self,
@@ -1518,11 +1723,12 @@ impl Engine {
         file: Arc<File>,
         offset: u64,
         length: u64,
+        algorithm: Option<HashAlgorithm>,
     ) -> Result<String> {
         let mut body = body.into_async_read();
         let mut buffer = vec![0; length.min(1024 * 1024) as usize];
         let mut written = 0;
-        let mut hash = blake3::Hasher::new();
+        let mut hash = algorithm.map(HashAlgorithm::hasher);
         while written < length {
             let want = buffer.len().min((length - written) as usize);
             tokio::time::timeout(
@@ -1535,7 +1741,9 @@ impl Engine {
             let file = file.clone();
             let at = offset + written;
             (buffer, hash) = tokio::task::spawn_blocking(move || -> Result<_> {
-                hash.update(&buffer[..n]);
+                if let Some(hash) = &mut hash {
+                    hash.update(&buffer[..n]);
+                }
                 file.write_all_at(&buffer[..n], at)?;
                 Ok((buffer, hash))
             })
@@ -1548,7 +1756,9 @@ impl Engine {
                 Permanent("S3 range response exceeded its advertised length".into()).into(),
             );
         }
-        Ok(hash.finalize().to_hex().to_string())
+        Ok(hash
+            .map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
+            .unwrap_or_default())
     }
 }
 #[derive(Debug)]
@@ -1573,17 +1783,46 @@ async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStre
         .build()
         .await?)
 }
-fn hash_range(file: &File, offset: u64, length: u64) -> Result<String> {
+fn encode_native_parts(algorithm: HashAlgorithm, parts: &[[u8; 32]]) -> Vec<String> {
+    use base64::Engine as _;
+    parts
+        .iter()
+        .map(|p| base64::engine::general_purpose::STANDARD.encode(&p[..algorithm.output_len()]))
+        .collect()
+}
+
+fn upload_identity(
+    algorithm: Algorithm,
+    size: u64,
+    part_size: u64,
+    checksums: &[String],
+) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"syq-s3-native-parts-v1\0");
+    hash.update(&[match algorithm {
+        Algorithm::Sha256 => 1,
+        Algorithm::Md5 => 2,
+    }]);
+    hash.update(&size.to_le_bytes());
+    hash.update(&part_size.to_le_bytes());
+    for checksum in checksums {
+        hash.update(checksum.as_bytes());
+        hash.update(&[0]);
+    }
+    format!("parts:{}", hash.finalize().to_hex())
+}
+
+fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -> Result<String> {
     let mut buffer = vec![0; 1024 * 1024];
     let mut done = 0;
-    let mut hash = blake3::Hasher::new();
+    let mut hash = algorithm.hasher();
     while done < length {
         let n = buffer.len().min((length - done) as usize);
         file.read_exact_at(&mut buffer[..n], offset + done)?;
         hash.update(&buffer[..n]);
         done += n as u64;
     }
-    Ok(hash.finalize().to_hex().to_string())
+    Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
 fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
     let path = RelativePath::new(record.partial.as_bytes())?;
@@ -1642,6 +1881,25 @@ impl Drop for PartialCleanup<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_upload_identity_binds_parts_algorithm_and_boundaries() {
+        let checksums = vec!["first".to_string(), "second".to_string()];
+        let identity = upload_identity(Algorithm::Sha256, 10, 5, &checksums);
+        assert_ne!(identity, upload_identity(Algorithm::Md5, 10, 5, &checksums));
+        assert_ne!(
+            identity,
+            upload_identity(Algorithm::Sha256, 11, 5, &checksums)
+        );
+        assert_ne!(
+            identity,
+            upload_identity(Algorithm::Sha256, 10, 6, &checksums)
+        );
+        assert_ne!(
+            identity,
+            upload_identity(Algorithm::Sha256, 10, 5, &["second".into(), "first".into()])
+        );
+    }
 
     #[test]
     fn reads_unchanged_upload_record_from_4be9e58() {

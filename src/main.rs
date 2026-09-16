@@ -11,6 +11,7 @@ mod descriptor_broker;
 mod destination;
 pub mod enrollment;
 mod fsops;
+mod hashing;
 mod help;
 mod identity;
 mod janky_cat;

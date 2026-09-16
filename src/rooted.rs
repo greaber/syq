@@ -1354,7 +1354,10 @@ impl Root {
         gid: Option<u32>,
     ) -> io::Result<()> {
         let (directory, leaf) = if path.is_empty() {
-            (self.directory.try_clone()?, component_cstring(b"."))
+            (
+                DirectoryHandle::Borrowed(&self.directory),
+                component_cstring(b"."),
+            )
         } else {
             let parent = self
                 .resolve_parent(path)

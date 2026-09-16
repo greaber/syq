@@ -22,6 +22,7 @@ pub(super) struct Source {
     pub meta: RootMetadata,
     pub key: String,
     pub label: Vec<u8>,
+    pub expected_digest: Option<crate::hashing::Digest>,
     // Keep a selected leaf alive so an unlink cannot recycle its inode.
     _pin: Option<Arc<File>>,
 }
@@ -77,6 +78,7 @@ impl Source {
             mtime: self.meta.mtime,
             nsec: self.meta.mtime_nsec,
             hash,
+            hash_algorithm: crate::hashing::HashAlgorithm::Blake3,
         }
     }
     pub fn bytes(&self) -> Result<Vec<u8>> {
@@ -95,8 +97,11 @@ impl Source {
     }
 }
 
-pub(super) fn hash_file(mut file: File) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
+pub(super) fn hash_file_as(
+    mut file: File,
+    algorithm: crate::hashing::HashAlgorithm,
+) -> Result<String> {
+    let mut hasher = algorithm.hasher();
     let mut buffer = vec![0; 1024 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
@@ -105,7 +110,7 @@ pub(super) fn hash_file(mut file: File) -> Result<String> {
         }
         hasher.update(&buffer[..n]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(crate::hashing::Digest::from_hash(algorithm, &hasher.finalize()).value)
 }
 
 pub(super) fn key_path(bytes: &[u8]) -> Result<String> {
@@ -194,6 +199,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
                 join(&target, &key_path(&entry.dst)?),
                 SourceSelection::Named,
                 entry.kind,
+                entry.expected_digest,
             ));
         }
     } else {
@@ -209,12 +215,18 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
                     )?,
                 )
             };
-            selectors.push((location.path.clone(), destination, location.selection, None));
+            selectors.push((
+                location.path.clone(),
+                destination,
+                location.selection,
+                None,
+                None,
+            ));
         }
     }
     let mut out = Vec::new();
     let mut claims = BTreeMap::new();
-    for (path, destination, selection, declared_kind) in selectors {
+    for (path, destination, selection, declared_kind, expected_digest) in selectors {
         let resolved = crate::fsops::resolve(&path);
         let pinned = if resolved.is_absolute() {
             if args.native_source_root.is_some() {
@@ -249,6 +261,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
                     meta,
                     key: destination,
                     label: path,
+                    expected_digest,
                     _pin: None,
                 }
             }
@@ -260,6 +273,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
                     meta,
                     key: destination,
                     label: path,
+                    expected_digest,
                     _pin: pin.map(Arc::new),
                 }
             }
@@ -277,6 +291,9 @@ pub(super) fn upload_plan(args: &Args) -> Result<Vec<Source>> {
             if kind.label() != source.kind() {
                 bail!("source type does not match mapping");
             }
+        }
+        if source.expected_digest.is_some() && source.kind() != "file" {
+            bail!("an expected digest requires a regular file");
         }
         let mut stack = vec![(source, selection == SourceSelection::Contents)];
         while let Some((mut source, contents)) = stack.pop() {

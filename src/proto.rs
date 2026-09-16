@@ -756,6 +756,7 @@ pub enum Request {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -825,6 +826,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     Finalize {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -902,6 +904,13 @@ pub enum Request {
     /// than a missing path fail the request rather than looking absent.
     PruneLookup {
         paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
+    // Append new variants: released completion payloads retain their indexes.
+    ConfigureHashing(crate::hashing::HashPolicy),
+    ValidateDigest {
+        path: PathBytes,
+        expected: crate::hashing::Digest,
         guard: Option<ContainerGuard>,
     },
 }
@@ -1029,7 +1038,8 @@ impl Request {
     pub(crate) fn allowed_on_source_worker(&self) -> bool {
         matches!(
             self,
-            Request::Scan { .. }
+            Request::ConfigureHashing(_)
+                | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
                 | Request::ReadRange { .. }

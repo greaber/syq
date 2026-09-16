@@ -211,6 +211,30 @@ class RelativePath:
         return RelativePath(self.raw + b"/" + _path_bytes(other))
 
 
+class HashAlgorithm(_StringEnum):
+    BLAKE3 = "blake3"
+    SHA256 = "sha256"
+    MD5 = "md5"
+    XXH3_128 = "xxh3-128"
+
+
+@dataclass(frozen=True, slots=True)
+class Digest:
+    """An expected digest of all file bytes, independent of transfer blocks."""
+
+    algorithm: HashAlgorithm
+    value: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "algorithm", HashAlgorithm(self.algorithm))
+        length = 32 if self.algorithm in {HashAlgorithm.MD5, HashAlgorithm.XXH3_128} else 64
+        if not isinstance(self.value, str):
+            raise TypeError("digest value must be a hexadecimal string")
+        if len(self.value) != length or any(c not in "0123456789abcdefABCDEF" for c in self.value):
+            raise ValueError(f"{self.algorithm} digest must contain {length} hexadecimal digits")
+        object.__setattr__(self, "value", self.value.lower())
+
+
 @dataclass(frozen=True, slots=True)
 class MappingEntry:
     src: RelativePath
@@ -218,6 +242,7 @@ class MappingEntry:
     kind: EntryKind | None = None
     size: int | None = None
     mtime: int | None = None
+    expected_digest: Digest | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.src, RelativePath):
@@ -232,6 +257,11 @@ class MappingEntry:
         for label, value in (("size", self.size), ("mtime", self.mtime)):
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
                 raise TypeError(f"{label} must be an integer or None")
+        if self.expected_digest is not None:
+            if not isinstance(self.expected_digest, Digest):
+                raise TypeError("expected_digest must be a Digest or None")
+            if self.kind not in {None, EntryKind.FILE}:
+                raise ValueError("expected_digest requires a regular file")
         if self.size is not None and self.size < 0:
             raise ValueError("size must not be negative")
 
@@ -330,6 +360,7 @@ class OperationResult:
     provenance: str | None = None
     scope: int | None = None
     code: ReceiptCode | None = None
+    expected_digest: Digest | None = None
 
     @property
     def is_retryable(self) -> bool:
@@ -346,6 +377,7 @@ class OperationResult:
                 RelativePath(self.src.raw),
                 RelativePath(self.dst.raw),
                 self.kind,
+                expected_digest=self.expected_digest,
             )
         except ValueError:
             return None
@@ -522,4 +554,9 @@ def _mapping_json(entry: MappingEntry) -> dict[str, Any]:
         record["size"] = entry.size
     if entry.mtime is not None:
         record["mtime"] = entry.mtime
+    if entry.expected_digest is not None:
+        record["expected_digest"] = {
+            "algorithm": entry.expected_digest.algorithm.value,
+            "value": entry.expected_digest.value,
+        }
     return record

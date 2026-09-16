@@ -488,6 +488,9 @@
         },
         "code": {
           "$ref": "#/$defs/receiptCode"
+        },
+        "expected_digest": {
+          "$ref": "#/$defs/expectedDigest"
         }
       },
       "required": [
@@ -1836,6 +1839,55 @@
         "summary"
       ],
       "additionalProperties": false
+    },
+    "expectedDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "enum": [
+            "blake3",
+            "sha256",
+            "md5",
+            "xxh3-128"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "value"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "algorithm": {
+                "enum": [
+                  "blake3",
+                  "sha256"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "pattern": "^[0-9a-f]{32}$"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }
