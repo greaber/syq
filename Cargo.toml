@@ -45,7 +45,7 @@ rayon = "1.12"
 ignore = "0.4"
 blake3 = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zstd = "0.13"
+zstd = "0.14"
 libc = "0.2"
 shell-words = "1"
 serde_bytes = "0.11"
