@@ -18,7 +18,9 @@
         let
           pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
           lib = pkgs.lib;
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          # Use the SDK's libiconv stub on macOS, not a Nix-store runtime dylib.
+          toolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).overrideAttrs
+            (_: lib.optionalAttrs pkgs.stdenv.isDarwin { depsTargetTargetPropagated = [ ]; });
           rustPlatform = pkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
           manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           release = rustPlatform.buildRustPackage {
