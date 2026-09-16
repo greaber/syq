@@ -5,7 +5,7 @@ on:
   workflow_call:
   workflow_dispatch:
   push:
-    branches: [master, reproducible-builds]
+    branches: [master]
     paths:
       - 'flake.nix'
       - 'flake.lock'
