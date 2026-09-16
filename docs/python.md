@@ -9,7 +9,7 @@ events. Synchronous and asyncio clients are available.
 
 ## Install
 
-The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.10+
+The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.13.4+
 on Linux and macOS:
 
 ```sh
