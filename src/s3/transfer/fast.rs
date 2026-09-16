@@ -1,9 +1,9 @@
 //! Automatic request scheduling and bounded writers, independent of hash policy.
 use super::*;
-use crate::s3::writer;
+use crate::s3::{admission::Concurrency, writer};
 
 impl Engine {
-    pub(super) fn object_workers(&self, sizes: impl Iterator<Item = u64>) -> Result<usize> {
+    pub(super) fn object_workers(&self, sizes: impl Iterator<Item = u64>) -> Result<Concurrency> {
         let mut count = 0u64;
         let mut bytes = 0u64;
         let mut largest = 0u64;
@@ -13,7 +13,10 @@ impl Engine {
             bytes = bytes.saturating_add(size);
         }
         if count == 0 {
-            return Ok(1);
+            return Ok(Concurrency {
+                initial: 1,
+                maximum: None,
+            });
         }
         let tiny = bytes / count < 1024 * 1024;
         let small_upload = self.options.upload && largest <= 1024 * 1024;
@@ -51,8 +54,43 @@ impl Engine {
             workers
         };
         self.tuning
-            .configure(tiny, workers, if small_upload { workers } else { 256 });
-        Ok(workers)
+            .configure(tiny, if small_upload { workers } else { 256 });
+        let starting_requests = self.tuning.request_limit();
+        let maximum = if count > workers as u64
+            && self
+                .args
+                .tuning_options
+                .and_then(|t| t.s3_object_workers)
+                .is_none()
+            && !self.args.dry_run
+            && !self.args.verify_only
+            && largest <= self.part_size(largest)
+        {
+            let capacity = if self.options.upload {
+                let buffer_size = if self.tuning.tigris() {
+                    8 * 1024 * 1024
+                } else {
+                    1024 * 1024
+                };
+                super::super::tuning::small_upload_capacity(largest.min(buffer_size))?
+            } else {
+                256
+            };
+            let maximum = capacity.min(count as usize);
+            self.tuning.adapt_objects(maximum);
+            Some(maximum)
+        } else {
+            None
+        };
+        let initial = if let Some(maximum) = maximum {
+            // Preserve the effective starting data concurrency when replacing
+            // the request controller with object admission.
+            workers.min(maximum).min(starting_requests)
+        } else {
+            workers
+        };
+        self.tuning.report(initial);
+        Ok(Concurrency { initial, maximum })
     }
 
     pub(super) fn part_size(&self, size: u64) -> u64 {

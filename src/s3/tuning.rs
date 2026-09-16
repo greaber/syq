@@ -58,9 +58,8 @@ impl Tuning {
         // provider; short copies cannot recover time spent ramping from 64.
         (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
     }
-    pub fn configure(&self, tiny: bool, workers: usize, request_cap: usize) {
+    pub fn configure(&self, tiny: bool, request_cap: usize) {
         let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
-        let ns = self.control_ns.load(Relaxed);
         let mut s = self.requests.state.lock().unwrap();
         s.max = request_cap;
         s.limit = s.limit.min(request_cap);
@@ -69,14 +68,31 @@ impl Tuning {
             // leaves short queues waiting through an extra response cycle.
             s.limit = request_cap;
         }
-        super::diagnostics::planning(
-            (ns != u64::MAX).then(|| Duration::from_nanos(ns)),
-            workers,
-            s.limit,
-        );
     }
     pub fn tigris(&self) -> bool {
         self.tigris
+    }
+    pub fn request_limit(&self) -> usize {
+        self.requests.state.lock().unwrap().limit
+    }
+    pub fn report(&self, workers: usize) {
+        let ns = self.control_ns.load(Relaxed);
+        super::diagnostics::planning(
+            (ns != u64::MAX).then(|| Duration::from_nanos(ns)),
+            workers,
+            self.request_limit(),
+        );
+    }
+    pub fn adapt_objects(&self, maximum: usize) {
+        // For single-request batches, one controller owns concurrency. An
+        // explicit request cap remains authoritative; otherwise object
+        // admission provides the changing limit under this fixed ceiling.
+        let mut s = self.requests.state.lock().unwrap();
+        s.adaptive = false;
+        if self.fixed_requests.is_none() {
+            s.limit = maximum;
+            s.max = maximum;
+        }
     }
     pub fn local_latency(&self) -> bool {
         self.control_ns.load(Relaxed) < 3_000_000
@@ -302,12 +318,15 @@ mod tests {
             if let Some(ms) = latency_ms {
                 tuning.observe_control(Duration::from_millis(ms));
             }
-            tuning.configure(tiny, 256, 256);
+            tuning.configure(tiny, 256);
             assert_eq!(
                 tuning.requests.state.lock().unwrap().limit,
                 expected,
                 "upload={upload}, tigris={tigris}, latency={latency_ms:?}, tiny={tiny}, fixed={fixed:?}",
             );
+            tuning.adapt_objects(128);
+            assert_eq!(tuning.request_limit(), fixed.unwrap_or(128));
+            assert!(!tuning.requests.state.lock().unwrap().adaptive);
         }
     }
 

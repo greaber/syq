@@ -97,3 +97,11 @@ pub(super) fn finish() {
         );
     }
 }
+
+pub(super) fn object_concurrency(before: usize, after: usize, activity_per_second: f64) {
+    if trace().is_some() {
+        record(
+            json!({"phase":"object_concurrency","before":before,"after":after,"activity_per_second":activity_per_second}),
+        );
+    }
+}
