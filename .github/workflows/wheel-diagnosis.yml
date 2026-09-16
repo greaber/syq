@@ -49,11 +49,28 @@ jobs:
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
             # Restored Cargo caches can contain distributions from an older SDK.
             rm -rf -- "$output"
-            MATURIN_PEP517_ARGS="--profile dev" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
+            MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
             sleep 2
           done
+          for artifact in target/sdk-python-dist-a/*; do
+            name=${artifact##*/}
+            cmp "$artifact" "target/sdk-python-dist-b/$name"
+          done
+          set -- target/sdk-python-dist-a/syq-*-py3-none-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
+            --with "$1" \
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          rm -rf -- target/sdk-python-from-sdist
+          MATURIN_PEP517_ARGS="--profile dev --strip" uv build --wheel \
+            target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
+          set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
+            --with "$1" \
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - name: Preserve both builds
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

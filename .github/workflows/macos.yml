@@ -158,7 +158,7 @@ jobs:
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
             # Restored Cargo caches can contain distributions from an older SDK.
             rm -rf -- "$output"
-            MATURIN_PEP517_ARGS="--profile dev" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
+            MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
             sleep 2
@@ -173,7 +173,7 @@ jobs:
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
           rm -rf -- target/sdk-python-from-sdist
-          MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
+          MATURIN_PEP517_ARGS="--profile dev --strip" uv build --wheel \
             target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
           set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
