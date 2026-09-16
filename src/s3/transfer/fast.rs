@@ -17,6 +17,7 @@ impl Engine {
                 initial: 1,
                 maximum: None,
                 initial_probe_up: false,
+                requests: None,
             });
         }
         let tiny = bytes / count < 1024 * 1024;
@@ -56,7 +57,6 @@ impl Engine {
         };
         self.tuning
             .configure(tiny, if small_upload { workers } else { 256 });
-        let starting_requests = self.tuning.request_limit();
         let maximum = if count > workers as u64
             && self
                 .args
@@ -78,22 +78,16 @@ impl Engine {
                 256
             };
             let maximum = capacity.min(count as usize);
-            self.tuning.adapt_objects(maximum);
             Some(maximum)
         } else {
             None
         };
-        let initial = if let Some(maximum) = maximum {
-            // Preserve the effective starting data concurrency when replacing
-            // the request controller with object admission.
-            workers.min(maximum).min(starting_requests)
-        } else {
-            workers
-        };
+        let initial = workers.min(maximum.unwrap_or(workers));
         self.tuning.report(initial);
         Ok(Concurrency {
             initial,
             maximum,
+            requests: maximum.map(|_| self.tuning.requests.clone()),
             initial_probe_up: self
                 .tuning
                 .control_latency()

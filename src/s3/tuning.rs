@@ -82,17 +82,6 @@ impl Tuning {
     pub fn report(&self, workers: usize) {
         super::diagnostics::planning(self.control_latency(), workers, self.request_limit());
     }
-    pub fn adapt_objects(&self, maximum: usize) {
-        // For single-request batches, one controller owns concurrency. An
-        // explicit request cap remains authoritative; otherwise object
-        // admission provides the changing limit under this fixed ceiling.
-        let mut s = self.requests.state.lock().unwrap();
-        s.adaptive = false;
-        if self.fixed_requests.is_none() {
-            s.limit = maximum;
-            s.max = maximum;
-        }
-    }
     pub fn local_latency(&self) -> bool {
         self.control_ns.load(Relaxed) < 3_000_000
     }
@@ -151,6 +140,19 @@ impl Budget {
             }
             ready.await;
         }
+    }
+    pub fn begin_objects(&self, workers: usize, maximum: usize) -> Option<usize> {
+        let mut s = self.state.lock().unwrap();
+        if s.adaptive && !s.settled && s.limit < workers {
+            return None;
+        }
+        let initial = workers.min(s.limit);
+        if s.adaptive {
+            s.limit = maximum;
+            s.max = maximum;
+        }
+        s.adaptive = false;
+        Some(initial)
     }
     pub fn completed(&self, bytes: u64) {
         let mut s = self.state.lock().unwrap();
@@ -211,6 +213,34 @@ pub(super) fn small_upload_capacity(largest: u64) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
     use std::{future::Future, task::Context};
+
+    #[test]
+    fn object_controller_waits_for_request_ramp_or_plateau() {
+        let budget = Budget::new(64, true);
+        assert_eq!(budget.begin_objects(256, 512), None);
+        for (bytes, expected) in [(1024, 128), (2048, 256)] {
+            {
+                let mut s = budget.state.lock().unwrap();
+                s.since = Instant::now() - Duration::from_secs(1);
+                s.saturated = true;
+            }
+            for _ in 0..16 {
+                budget.completed(bytes);
+            }
+            assert_eq!(budget.state.lock().unwrap().limit, expected);
+            if expected < 256 {
+                assert_eq!(budget.begin_objects(256, 512), None);
+            }
+        }
+        assert_eq!(budget.begin_objects(256, 512), Some(256));
+        assert_eq!(budget.state.lock().unwrap().limit, 512);
+        assert!(!budget.state.lock().unwrap().adaptive);
+
+        let budget = Budget::new(64, true);
+        budget.state.lock().unwrap().settled = true;
+        assert_eq!(budget.begin_objects(256, 512), Some(64));
+        assert!(!budget.state.lock().unwrap().adaptive);
+    }
 
     #[test]
     fn releasing_one_slot_wakes_only_one_queued_request() {
@@ -323,9 +353,15 @@ mod tests {
                 expected,
                 "upload={upload}, tigris={tigris}, latency={latency_ms:?}, tiny={tiny}, fixed={fixed:?}",
             );
-            tuning.adapt_objects(128);
-            assert_eq!(tuning.request_limit(), fixed.unwrap_or(128));
-            assert!(!tuning.requests.state.lock().unwrap().adaptive);
+            let ready = fixed.is_some() || expected >= 256;
+            assert_eq!(
+                tuning.requests.begin_objects(256, 512),
+                ready.then_some(256.min(expected))
+            );
+            if ready {
+                assert_eq!(tuning.request_limit(), fixed.unwrap_or(512));
+                assert!(!tuning.requests.state.lock().unwrap().adaptive);
+            }
         }
     }
 

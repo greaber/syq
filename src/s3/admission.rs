@@ -1,7 +1,7 @@
 //! Adjust whole-object admission without interrupting requests already in flight.
 use crate::tune::{Sampler, FILE_CREDIT};
 use anyhow::Result;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 const SAMPLE: Duration = Duration::from_millis(250);
 
@@ -9,6 +9,7 @@ pub(super) struct Concurrency {
     pub initial: usize,
     pub maximum: Option<usize>,
     pub initial_probe_up: bool,
+    pub requests: Option<Arc<super::tuning::Budget>>,
 }
 
 struct Probe {
@@ -147,10 +148,20 @@ where
     F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = Result<Option<u64>>> + Send + 'static,
 {
-    let mut controller = concurrency
-        .maximum
-        .map(|maximum| Controller::new(concurrency.initial, maximum, concurrency.initial_probe_up));
-    let mut limit = concurrency.initial;
+    let begin = || {
+        let maximum = concurrency.maximum?;
+        let initial = match &concurrency.requests {
+            Some(requests) => requests.begin_objects(concurrency.initial, maximum)?,
+            None => concurrency.initial,
+        };
+        Some(Controller::new(
+            initial,
+            maximum,
+            concurrency.initial_probe_up,
+        ))
+    };
+    let mut controller = begin();
+    let mut limit = controller.as_ref().map_or(concurrency.initial, |c| c.limit);
     let mut tasks = tokio::task::JoinSet::new();
     let mut jobs = jobs.into_iter();
     let mut interval = tokio::time::interval(SAMPLE);
@@ -178,7 +189,17 @@ where
                     Err(e) => { if error.is_none() { error = Some(e); } },
                 }
             }
-            _ = interval.tick(), if controller.is_some() && error.is_none() => {
+            _ = interval.tick(), if concurrency.maximum.is_some() && error.is_none() => {
+                if controller.is_none() {
+                    // Preserve the existing request ramp before taking over.
+                    // Only one controller changes concurrency at a time.
+                    controller = begin();
+                    if let Some(controller) = &controller { limit = controller.limit; }
+                    activity = 0;
+                    completed = 0;
+                    since = tokio::time::Instant::now();
+                    continue;
+                }
                 let elapsed = since.elapsed();
                 // Sparse completions need a longer window; one straggler must
                 // not be treated as a reliable measurement of a setting.
@@ -260,6 +281,7 @@ mod tests {
                 initial: 4,
                 maximum: Some(16),
                 initial_probe_up: false,
+                requests: None,
             },
             |n| {
                 let active = active.clone();
@@ -295,6 +317,7 @@ mod tests {
                 initial: 2,
                 maximum: None,
                 initial_probe_up: false,
+                requests: None,
             },
             |n| {
                 let started = started.clone();
