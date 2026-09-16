@@ -42,7 +42,6 @@ python-source = "src"
 python-packages = ["syq"]
 locked = true
 editable-profile = "dev"
-strip = true
 include = [
     { path = "NATIVE_API.md", format = "sdist" },
     { path = "native-api.json", format = "sdist" },

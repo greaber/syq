@@ -2,8 +2,9 @@
 
 use anyhow::{bail, Result};
 
-/// Official builds use the immutable release tag. Development builds include
-/// their Git revision so two source builds do not claim release compatibility.
+/// Peer compatibility identity. Official builds and source builds explicitly
+/// choosing release helpers use the release tag. Other source builds include
+/// their revision. This is a compatibility claim, not proof of artifact origin.
 pub const fn build() -> &'static str {
     env!("SYQ_BUILD_IDENTITY")
 }
@@ -29,14 +30,26 @@ pub fn supports_confined_socket_nodes() -> bool {
     !cfg!(target_os = "macos")
 }
 
-pub fn require_release_build() -> Result<()> {
-    if is_release_build() {
+pub fn require_release_helpers() -> Result<()> {
+    if uses_release_helpers() {
         return Ok(());
     }
     bail!(
-        "managed remote bootstrap is only available from an official syq release build (this build is {}); use an official release",
-        build()
+        "official helper downloads require a release-compatible build (this build is {}); rebuild with SYQ_HELPER_RELEASE=v{}",
+        build(), env!("CARGO_PKG_VERSION")
     )
+}
+
+/// Helper origin is independent of whether this executable is a published build.
+pub(crate) fn uses_release_helpers() -> bool {
+    if env!("SYQ_RELEASE_HELPERS") == "1" || is_release_build() {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_RELEASE_HELPERS").is_some_and(|value| value == "1") {
+        return true;
+    }
+    false
 }
 
 pub(crate) fn is_release_build() -> bool {
@@ -56,7 +69,7 @@ mod tests {
 
     #[test]
     fn development_builds_do_not_claim_the_release_identity() {
-        if env!("SYQ_IS_RELEASE_BUILD") == "0" {
+        if env!("SYQ_RELEASE_HELPERS") == "0" {
             let release = format!("v{}", env!("CARGO_PKG_VERSION"));
             assert!(build().starts_with(&format!("{release}+dev.")));
             assert_ne!(build(), release);

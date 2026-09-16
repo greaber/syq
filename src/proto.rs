@@ -2128,6 +2128,20 @@ mod tests {
     }
 
     #[test]
+    fn released_v060_preamble_preserves_explicit_compatibility() {
+        // v0.6.0 preamble, kept independent of the current encoder. Selecting
+        // release helpers must accept it; ordinary source builds must reject it.
+        const V060: &[u8] = b"SYQWIRE\0\0\x06v0.6.0";
+        let result = FrameReader::new(V060).read_preamble();
+        if crate::identity::build() == "v0.6.0" {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("build identity mismatch"), "{error}");
+        }
+    }
+
+    #[test]
     fn every_malformed_build_identity_is_a_preamble_protocol_error() {
         let preamble = |length: u16, identity: &[u8]| {
             let mut input = Vec::new();

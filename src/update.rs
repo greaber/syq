@@ -131,6 +131,9 @@ pub fn register_standalone_install() -> Result<()> {
 }
 
 pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
+    if !crate::identity::is_release_build() {
+        bail!("source builds must be rebuilt or replaced with a standalone install");
+    }
     embedded_public_key()?;
     let target = Target::local().ok_or_else(|| {
         anyhow!(
@@ -218,7 +221,7 @@ fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: boo
 /// signed manifest. Remote bootstrap never trusts metadata downloaded by the
 /// remote host itself.
 pub(crate) fn trusted_current_helper(target: Target) -> Result<TrustedCurrentHelper> {
-    crate::identity::require_release_build()?;
+    crate::identity::require_release_helpers()?;
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let release = fetch_verified(
         &format!("{}/{tag}", release_downloads()),
@@ -234,7 +237,7 @@ pub(crate) fn trusted_current_helper_from_manifest(
     target: Target,
     manifest_bytes: &[u8],
 ) -> Result<TrustedCurrentHelper> {
-    crate::identity::require_release_build()?;
+    crate::identity::require_release_helpers()?;
     let key = embedded_public_key()?;
     let manifest = verified_manifest(manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
@@ -358,6 +361,13 @@ fn embedded_public_key() -> Result<Cow<'static, str>> {
         return Ok(Cow::Owned(key.to_string_lossy().into_owned()));
     }
     RELEASE_PUBLIC_KEY
+        .or_else(|| {
+            // Public upstream trust anchor, also used by the release installer.
+            // Source builds opting into official helpers need no private key.
+            (env!("SYQ_RELEASE_HELPERS") == "1" && !crate::identity::is_release_build()).then_some(
+                "5eh0FvhNFutyQ9BLYCHZ3W8Ad2caKg2cIP+QYrnjQjo="
+            )
+        })
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(Cow::Borrowed)
@@ -742,6 +752,11 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
 }
 
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
+    // Replacing an installed release with a custom build must not let a stale
+    // receipt turn that custom executable back into an upstream release.
+    if !crate::identity::is_release_build() {
+        bail!("source builds must be rebuilt or replaced with a standalone install");
+    }
     let current = canonical_current_exe()?;
     let path = receipt_read_path(receipt_path_for(&current)?)?;
     let receipt = read_receipt(&path)?;

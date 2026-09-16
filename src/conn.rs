@@ -2889,7 +2889,7 @@ impl RemoteSpec {
         let (os, arch) = value
             .split_once(':')
             .ok_or_else(|| anyhow!("{}: malformed platform response {value:?}", self.label()))?;
-        let target = Target::from_uname(os, arch).ok_or_else(|| {
+        let target = Target::for_bootstrap(os, arch).ok_or_else(|| {
             anyhow!(
                 "{}: automatic remote helpers do not support {os} {arch}",
                 self.label()
@@ -2912,8 +2912,8 @@ impl RemoteSpec {
     }
 
     fn bootstrap_helper(&self, bootstrap: RemoteBootstrap) -> Result<()> {
-        if !crate::identity::is_release_build() {
-            if Some(bootstrap.target) != Target::local() {
+        if !crate::identity::uses_release_helpers() {
+            if !bootstrap.target.can_upload_self() {
                 bail!(
                     "cannot automatically install a source-built helper for {} from {}; \
                      run syq from a compatible host, use an official release, or install a matching \

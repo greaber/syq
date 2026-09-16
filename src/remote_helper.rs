@@ -51,6 +51,21 @@ impl Target {
         }
     }
 
+    /// Unknown platforms have no upstream asset. A self-upload can still be
+    /// tried: executing the temporary binary is the final compatibility check.
+    pub fn for_bootstrap(os: &str, arch: &str) -> Option<Self> {
+        Self::from_uname(os, arch).or_else(|| {
+            (!crate::identity::uses_release_helpers()).then_some(Self {
+                key: "self",
+                asset: "",
+            })
+        })
+    }
+
+    pub fn can_upload_self(self) -> bool {
+        self.key == "self" || Some(self) == Self::local()
+    }
+
     pub fn local() -> Option<Self> {
         Self::from_uname(
             match std::env::consts::OS {
@@ -99,12 +114,17 @@ Linux:x86_64) target=linux-x86_64 ;;
 Linux:aarch64|Linux:arm64) target=linux-aarch64 ;;
 Darwin:x86_64) target=macos-x86_64 ;;
 Darwin:arm64|Darwin:aarch64) target=macos-arm64 ;;
-*) exit {HELPER_MISSING_EXIT} ;;
+*) {unknown_target} ;;
 esac
 program="$HOME/.cache/syq/helpers/{release}/$target/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
         release = cache_key(),
+        unknown_target = if crate::identity::uses_release_helpers() {
+            format!("exit {HELPER_MISSING_EXIT}")
+        } else {
+            "target=self".into()
+        },
     );
     format!(
         "sh -c {} syq {}",

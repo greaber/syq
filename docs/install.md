@@ -35,6 +35,11 @@ the command.
 brew install greaber/tap/syq
 ```
 
+## Build from source
+
+See [source builds](development.md) for Cargo builds, custom compilation options,
+and choosing between your own executable and compatible official SSH helpers.
+
 ## Try a benchmark
 
 Compare syq with rsync on your own machines, or with rsync and cp locally:

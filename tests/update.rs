@@ -140,6 +140,7 @@ impl UpdateFixture {
             .args(arguments)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &self.public_key)
+            .env("SYQ_TEST_RELEASE_BUILD", "1")
             .env(
                 "SYQ_TEST_LATEST_DOWNLOADS",
                 "https://release.invalid/latest",
@@ -481,6 +482,7 @@ fn registration_needs_no_config_and_does_not_change_bin_permissions() {
         .arg("--register-standalone-install")
         .env_remove("HOME")
         .env_remove("XDG_CONFIG_HOME")
+        .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
         .output()
         .unwrap();
@@ -589,5 +591,32 @@ fn legacy_receipt_preserves_deleted_command_and_is_bound_to_its_path() {
         assert_eq!(fs::read(&binary).unwrap(), fixture.original);
         assert!(adjacent.is_file());
         assert_eq!(fs::read(&legacy).unwrap(), foreign);
+    }
+}
+
+#[test]
+fn custom_build_does_not_inherit_upstream_update_ownership() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    assert!(fixture
+        .command("--register-standalone-install")
+        .status
+        .success());
+    let receipt_path = fixture.installed.with_file_name(".syq-install.json");
+    let receipt = fs::read(&receipt_path).unwrap();
+    for helpers in ["0", "1"] {
+        for argument in ["--self-update", "--register-standalone-install"] {
+            let output = Command::new(&fixture.installed)
+                .arg(argument)
+                .env("SYQ_TEST_RELEASE_BUILD", "0")
+                .env("SYQ_TEST_RELEASE_HELPERS", helpers)
+                .env("SYQ_TEST_RELEASE_PUBLIC_KEY", &fixture.public_key)
+                .env("XDG_CONFIG_HOME", &fixture.config)
+                .output()
+                .unwrap();
+            assert_failure_contains(&output, "source builds must be rebuilt");
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+            fixture.assert_original_unchanged();
+        }
     }
 }
