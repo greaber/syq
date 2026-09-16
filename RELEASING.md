@@ -46,8 +46,10 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
 ## Encrypted release inventory
 
 The committed `.env.release` file is the canonical release-credential
-inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64` and
-`HOMEBREW_TAP_DEPLOY_KEY`, plus the corresponding public
+inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64`,
+`HOMEBREW_TAP_DEPLOY_KEY`, and the `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` that deploy the download host in
+[`infra/syq-dl/`](infra/syq-dl/README.md), plus the corresponding public
 `SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
 gitignored `.env.keys`. Forks receive the ciphertext but neither the
 decryption key nor official publishing authority.
