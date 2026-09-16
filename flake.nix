@@ -52,7 +52,8 @@
               export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE-} -ffile-prefix-map=$NIX_BUILD_TOP=/build"
             '' + lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET=${if system == "x86_64-darwin" then "10.12" else "11.0"}
-              export RUSTFLAGS="$RUSTFLAGS -L native=${systemLibiconv}/lib"
+              # Linker debug-map paths also feed the Mach-O UUID before stripping.
+              export RUSTFLAGS="$RUSTFLAGS -L native=${systemLibiconv}/lib -C link-arg=-Wl,-oso_prefix,$NIX_BUILD_TOP/"
             '';
             # buildRustPackage delegates stripping to Nix's pinned tools.
             # Compress only after final stripping and Darwin signing fixups.
