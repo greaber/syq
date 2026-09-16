@@ -65,26 +65,35 @@ parallelism rather than bounding the process's total resource use:
 
 | Key | Meaning |
 |---|---|
-| `s3-requests=N` | Shared data-request slots across objects; 1–65536 |
-| `s3-object-workers=N` | Objects processed concurrently; 1–65536 |
-| `s3-part-workers=N` | Concurrent parts or ranges per object; 1–1024 |
+| `s3-max-concurrent-requests=N` | Maximum simultaneous data requests across all objects; 1–65536 |
+| `s3-max-concurrent-objects=N` | Maximum objects in progress; 1–65536 |
+| `s3-max-concurrent-parts-per-object=N` | Maximum simultaneous parts or ranges for each object; 1–1024 |
 | `s3-part-size=SIZE` | Part/range size; 5M–5G |
 | `s3-retries=N` | Transient retry budget; 0–100, default 10 |
 
-Object workers include hashing, metadata and recovery work. Part workers divide
-one object's data transfer; each part also needs a shared `s3-requests` slot.
-For example, `s3-object-workers=4,s3-part-workers=8,s3-requests=16` processes
-up to four objects and up to eight parts per object, with at most sixteen data
-requests active across them. Single-request objects use one slot each.
+These are nested concurrency limits, not counts of worker threads. An object
+stays in progress through preparation, hashing, data transfer and finalization.
+A large object's transfer can use several parts at once; a small object needs
+fewer parts. Every data request also needs a shared request slot.
 
-A fixed count disables automatic adjustment of that count; slots can remain idle
-when there is insufficient ready work. Metadata requests and idle SDK sockets
-are separate, so none of these settings caps total open sockets. The payload
-buffer budget still applies; an explicit object-worker count beyond the available
-small-upload capacity is rejected. Requests include uploads, range downloads and
-content-verification GETs.
-An object no larger than the part size uses one data request. Upload part size
-increases when necessary to stay within 10,000 parts.
+For example:
+
+```sh
+--performance-tuning s3-max-concurrent-objects=4,s3-max-concurrent-parts-per-object=8,s3-max-concurrent-requests=16
+```
+
+This allows up to four objects in progress and up to eight parts per object,
+with at most sixteen simultaneous data requests across them. It does not reserve
+eight slots for every object. An object no larger than the part size uses one
+data request. Upload part size increases when necessary to stay within 10,000
+parts.
+
+An explicit maximum disables automatic adjustment of that setting; actual
+concurrency can be lower when there is insufficient ready work. The shared
+request limit covers uploads, range downloads and content-verification GETs.
+Metadata requests and idle SDK sockets are separate, so these settings do not
+cap total open sockets. The payload buffer budget still applies; an explicit
+object maximum beyond the available small-upload capacity is rejected.
 
 Small uploads share a 256 MiB payload-buffer budget. TLS and request bookkeeping
 use additional memory. Large objects stream through bounded buffers. Discovery

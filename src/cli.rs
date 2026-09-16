@@ -2757,13 +2757,22 @@ mod tests {
                 "--as",
                 "object",
                 "--resource-limits=bandwidth=1M",
-                "--performance-tuning=s3-requests=4,s3-part-workers=2,s3-part-size=8M",
+                "--performance-tuning=s3-max-concurrent-objects=3,s3-max-concurrent-requests=4,s3-max-concurrent-parts-per-object=2,s3-part-size=8M",
                 "--integrity-checking=compare=blake3,transfer=sha256",
             ]
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(args.tuning_options.unwrap().s3_requests, Some(4));
+        let tuning = args.tuning_options.unwrap();
+        assert_eq!(tuning.s3_requests, Some(4));
+        assert_eq!(tuning.s3_object_workers, Some(3));
+        assert_eq!(
+            tuning
+                .to_string()
+                .parse::<crate::transfer_tuning::TransferTuning>()
+                .unwrap(),
+            tuning
+        );
         assert_eq!(args.bwlimit_bytes, 1 << 20);
         assert!(args.checksum);
         assert!(args.transfer_integrity);

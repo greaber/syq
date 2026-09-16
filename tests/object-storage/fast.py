@@ -57,12 +57,12 @@ try:
     with tempfile.TemporaryDirectory(prefix="syq-s3-fast-") as temp:
         root=pathlib.Path(temp); source=root/"source"; source.write_bytes(os.urandom(11*2**20))
         env={**os.environ,"AWS_ACCESS_KEY_ID":"fixture","AWS_SECRET_ACCESS_KEY":"fixture","AWS_REGION":"us-east-1","AWS_EC2_METADATA_DISABLED":"true","AWS_ENDPOINT_URL_S3":"http://127.0.0.1:"+str(server.server_address[1]),"XDG_CACHE_HOME":str(root/"cache")}
-        base=[binary,"cp","--no-progress","--performance-tuning", "s3-retries=0,s3-part-size=5M,s3-part-workers=2"]
+        base=[binary,"cp","--no-progress","--performance-tuning", "s3-retries=0,s3-part-size=5M,s3-max-concurrent-parts-per-object=2"]
         for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated"]:
             shutil.rmtree(root/"cache",ignore_errors=True)
             events.clear(); destination=root/"download"; destination.unlink(missing_ok=True)
             command=base+([str(source),"--to","s3://fixture","--as","object"] if scenario.startswith("upload") else ["--from","s3://fixture","object","--as",str(destination)])
-            if scenario.startswith("upload-single"): command[command.index("--performance-tuning")+1]="s3-retries=0,s3-part-size=16M,s3-part-workers=2"
+            if scenario.startswith("upload-single"): command[command.index("--performance-tuning")+1]="s3-retries=0,s3-part-size=16M,s3-max-concurrent-parts-per-object=2"
             if scenario=="upload-interrupted":
                 child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 deadline=time.monotonic()+10

@@ -73,7 +73,7 @@ impl Server {
                 "--performance-tuning",
                 "s3-part-size=5M",
                 "--performance-tuning",
-                "s3-part-workers=3",
+                "s3-max-concurrent-parts-per-object=3",
             ])
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
@@ -590,7 +590,7 @@ fn s3_one_request_slot_supports_multipart_and_content_verification() {
             "data",
             "--as",
             "result",
-            "--performance-tuning=s3-requests=1",
+            "--performance-tuning=s3-max-concurrent-requests=1",
         ];
         if let Some(flag) = extra {
             args.push(flag);
