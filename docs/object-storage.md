@@ -172,6 +172,23 @@ objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
 
+Use `--prune` to mirror selected directories or prefixes in either direction:
+
+```sh
+syq cp --srcs-in build --to s3://my-bucket --into site --prune --max-delete 100
+```
+
+This copies `build` into `site/`, then removes destination-only objects there.
+Use `--dry-run -v` to preview removals. Named directory selections prune only
+their corresponding destination directories; individual files do not open a
+pruning scope. Ignored and size-excluded paths stay protected, and scan or copy
+errors prevent deletion. `--max-delete` refuses all removals and exits 25 if the
+limit is exceeded. S3 directory-marker objects count as individual removals.
+An S3 source prefix with no objects is rejected, so it cannot empty a local
+destination. Deleting from a versioned bucket uses normal S3 deletion semantics;
+it does not remove historical versions. See [mirroring](reference.md#mirror-a-directory)
+for the shared pruning rules.
+
 Rerun an interrupted copy with the same endpoint, keys,
 destination and options to resume completed multipart uploads or download ranges. Recovery records live
 in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside
@@ -187,5 +204,5 @@ not remove uploaded parts. Syq does not delete unrelated objects.
 
 S3 copies support `--results` and the Python `cp` API. Automation endpoints use
 `kind: "s3"` and `host: "s3://BUCKET"`, requiring an SDK that understands S3
-endpoints. SSH delegation, `--prune`, `--inplace`, `rm`, and S3-to-S3 copies are
+endpoints. SSH delegation, `--inplace`, `rm`, and S3-to-S3 copies are
 not supported for object storage.

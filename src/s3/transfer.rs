@@ -1,4 +1,5 @@
 mod fast;
+mod pruning;
 
 use super::{
     checksum::Algorithm,
@@ -141,7 +142,8 @@ impl Engine {
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
-            let plan = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            let (plan, prune) =
+                tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
             let planning = std::time::Instant::now();
             if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
@@ -193,10 +195,13 @@ impl Engine {
                 }
             })
             .await?;
+            if self.args.delete && self.progress.errors.load(Relaxed) == 0 {
+                self.prune(prune, None).await?;
+            }
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let planning = std::time::Instant::now();
-            let plan = self.download_plan(&destination).await?;
+            let (plan, prune) = self.download_plan(&destination).await?;
             self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
@@ -231,18 +236,34 @@ impl Engine {
                 }
             })
             .await?;
-            if !self.args.dry_run && !self.args.verify_only {
-                let mut directories = directories.lock().await;
-                directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
-                for (path, meta, mode) in directories.iter() {
-                    local::apply_metadata(
-                        &destination.root,
-                        &RelativePath::new(path.as_bytes())?,
-                        meta,
-                        &self.args,
-                        *mode,
-                    )?;
+            // Finish copying metadata before authorizing removals. Restore it
+            // again after pruning, which can change directory modification times.
+            self.finish_directories(&destination, &directories).await?;
+            if self.args.delete && self.progress.errors.load(Relaxed) == 0 {
+                self.prune(prune, Some(&destination)).await?;
+                if self.progress.deletions_completed.load(Relaxed) != 0 {
+                    self.finish_directories(&destination, &directories).await?;
                 }
+            }
+        }
+        Ok(())
+    }
+    async fn finish_directories(
+        &self,
+        destination: &Destination,
+        directories: &DirectoryMetadata,
+    ) -> Result<()> {
+        if !self.args.dry_run && !self.args.verify_only {
+            let mut directories = directories.lock().await;
+            directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+            for (path, meta, mode) in directories.iter() {
+                local::apply_metadata(
+                    &destination.root,
+                    &RelativePath::new(path.as_bytes())?,
+                    meta,
+                    &self.args,
+                    *mode,
+                )?;
             }
         }
         Ok(())
@@ -1047,7 +1068,11 @@ impl Engine {
         }
         Ok(())
     }
-    async fn download_plan(&self, destination: &Destination) -> Result<Vec<Download>> {
+    async fn download_plan(
+        &self,
+        destination: &Destination,
+    ) -> Result<(Vec<Download>, super::prune::Plan)> {
+        let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
         let base = local::key_path(
             self.args
@@ -1188,6 +1213,9 @@ impl Engine {
                 if listed.is_empty() {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
+                if self.args.delete {
+                    prune.scope(path.as_bytes(), key.as_bytes());
+                }
                 let mut objects = Vec::new();
                 for (object, size) in listed {
                     let suffix = object
@@ -1210,6 +1238,7 @@ impl Engine {
                 let directory = key.ends_with('/') && size == 0;
                 if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
                     continue;
                 }
                 if matcher
@@ -1217,12 +1246,20 @@ impl Engine {
                     .is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
                 {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
                     continue;
                 }
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
                 }
                 local::claim(&mut claims, &path, directory)?;
+                if self.args.delete {
+                    if directory {
+                        prune.claim(path.as_bytes());
+                    } else {
+                        prune.protect(path.as_bytes());
+                    }
+                }
                 out.push(Download {
                     key,
                     path,
@@ -1231,7 +1268,7 @@ impl Engine {
                 });
             }
         }
-        Ok(out)
+        Ok((out, prune))
     }
     async fn download(
         self: &Arc<Self>,

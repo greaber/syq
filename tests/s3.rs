@@ -146,6 +146,27 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("prune-") {
+        if method == "GET" {
+            let key = if fault == "prune-outside" {
+                "elsewhere/extra"
+            } else {
+                "mirror/extra"
+            };
+            let body = format!("<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>{key}</Key><Size>0</Size></Contents></ListBucketResult>");
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else {
+            assert_eq!(method, "DELETE");
+            reply(
+                &mut socket,
+                403,
+                &[],
+                b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                false,
+            );
+        }
+        return;
+    }
     if fault.starts_with("upload-") {
         if method == "HEAD" {
             reply(&mut socket, 404, &[], b"", true);
@@ -1198,4 +1219,77 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
         std::fs::read(temp.path().join("result")).unwrap(),
         vec![b'x'; 65536]
     );
+}
+
+#[test]
+fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
+    for (fault, code, requests, planned) in [("prune-denied", 23, 2, 1), ("prune-outside", 1, 1, 0)]
+    {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("empty")).unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--srcs-in",
+                "empty",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "mirror",
+                "--prune",
+                "--results",
+                "results.ndjson",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(result["deletions_planned"], planned);
+        assert_eq!(result["deletions_completed"], 0);
+    }
+}
+
+#[test]
+fn s3_prune_limit_refuses_without_sending_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("empty")).unwrap();
+    let server = Server::start("prune-denied");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "empty",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--max-delete",
+            "0",
+            "--results",
+            "results.ndjson",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(25),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+    let result: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(result["status"], "refused");
+    assert_eq!(result["errors"], 0);
+    assert_eq!(result["deletions_planned"], 1);
+    assert_eq!(result["deletions_blocked"], 1);
+    assert_eq!(result["deletions_completed"], 0);
 }
