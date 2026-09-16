@@ -68,8 +68,10 @@ which provides more extensive benchmarks. Your results will depend on your machi
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
-Standalone installs may print update reminders in a terminal; nothing updates
-automatically. Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
+Standalone and Homebrew installs may print an update reminder in a terminal,
+at most once a day after a successful command, naming the upgrade command for
+that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` to
+disable reminders.
 
 ## Shell completion
 
