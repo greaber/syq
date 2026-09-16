@@ -39,11 +39,16 @@
               SYQ_RELEASE_PUBLIC_KEY = lib.strings.trim (builtins.readFile ./src/release-public-key.txt);
               RUSTFLAGS = lib.optionalString pkgs.stdenv.isLinux "-C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib";
             };
+            # Keep the deployment targets of the published v0.6.0 binaries.
+            # Build tools may require a newer macOS than the produced executable.
+            preBuild = lib.optionalString pkgs.stdenv.isDarwin ''
+              export MACOSX_DEPLOYMENT_TARGET=${if system == "x86_64-darwin" then "10.12" else "11.0"}
+            '';
             # Cargo strips once. Avoid host-specific postprocessing of Mach-O
             # files and preserve the compiler's deterministic ad-hoc signature.
             dontStrip = true;
             dontPatchELF = true;
-            postInstall = ''
+            postFixup = ''
               test "$("$out/bin/syq" --version)" = "syq ${manifest.package.version}"
               test "$("$out/bin/syq" --build-identity)" = "v${manifest.package.version}"
               ${pkgs.gzip}/bin/gzip -9 -n -c "$out/bin/syq" > "$out/bin/syq.gz"

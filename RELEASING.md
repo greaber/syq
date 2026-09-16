@@ -249,9 +249,12 @@ release request does not require another preparation PR or another test run.
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
    and `conformance` checks all succeeded on that exact commit, and that all three
-   full-suite workflow certifications succeeded. It then builds
-   static GNU Linux x86-64/ARM64
-   binaries and native macOS Apple Silicon/Intel binaries. In parallel it
+   full-suite workflow certifications succeeded. It then uses `flake.lock` and
+   the pinned Nix recipe to build static GNU Linux x86-64/ARM64 binaries and
+   native macOS Apple Silicon/Intel binaries twice on separate runners. Both
+   the raw executable and its deterministic gzip archive must match byte for
+   byte before they reach the publishing job. The embedded public key must
+   match the repository variable. In parallel it
    compiles the source crate once. The protected publishing job repackages it
    without compiling and requires byte-for-byte equality with that validated
    artifact before any permanent publication. `cargo publish --no-verify`

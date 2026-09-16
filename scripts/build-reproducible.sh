@@ -19,19 +19,22 @@ case "$(uname -s):$(uname -m)" in
 esac
 output=$(nix --extra-experimental-features 'nix-command flakes' build \
   .#release --no-update-lock-file --no-link --print-out-paths -L)
-cp "$output/bin/syq" "$dist/$asset"
-cp "$output/bin/syq.gz" "$dist/$asset.gz"
-chmod 755 "$dist/$asset"
+install -m 755 "$output/bin/syq" "$dist/$asset"
+install -m 644 "$output/bin/syq.gz" "$dist/$asset.gz"
 
 # Execute the copied artifact outside the Nix output and exercise a real copy.
 work=$(mktemp -d)
+work=$(CDPATH='' cd -- "$work" && pwd -P)
 trap 'rm -rf "$work"' EXIT
 printf 'reproducible syq smoke test\n' > "$work/source"
 "$dist/$asset" cp "$work/source" --into "$work/destination"
 cmp "$work/source" "$work/destination/source"
+gzip -d -c "$dist/$asset.gz" > "$work/uncompressed"
+cmp "$dist/$asset" "$work/uncompressed"
 if [ "$(uname -s)" = Linux ]; then
   # A release must run without a Nix installation or a dynamic ELF loader.
-  if readelf -l "$dist/$asset" | grep 'INTERP'; then
+  readelf -l "$dist/$asset" > "$work/elf-headers"
+  if grep 'INTERP' "$work/elf-headers"; then
     echo 'Release executable unexpectedly requires a dynamic loader.' >&2
     exit 1
   fi
@@ -41,5 +44,11 @@ else
     echo 'Release executable unexpectedly links to the Nix store.' >&2
     exit 1
   fi
-  codesign --verify "$dist/$asset"
+  minimum=$(otool -l "$dist/$asset" | awk '$1 == "minos" || ($1 == "version" && NF == 2) { print $2 }')
+  if [ "$(uname -m)" = arm64 ]; then
+    test "$minimum" = 11.0
+    codesign --verify "$dist/$asset"
+  else
+    test "$minimum" = 10.12
+  fi
 fi

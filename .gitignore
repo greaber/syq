@@ -11,3 +11,7 @@ __pycache__/
 
 # Agent working notes / handoff plans (not committed).
 /current-plans
+
+# Nix build output links.
+/result
+/result-*
