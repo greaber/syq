@@ -748,3 +748,10 @@ Use `Client(cache_dir=...)` to change the cache root, or
 and verification, so you are responsible for compatibility and origin. Typed
 calls still validate automation output. A failed executable selection does not
 fall back to another binary.
+
+S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
+`s3_region`, `s3_profile`, and `s3_header`. `s3_all_versions=True` permanently
+removes all selected versions and delete markers; `s3_version_id="ID"` selects
+one version of one exact key. These options are mutually exclusive.
+`RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
+`s3_delete_marker` fields. The same arguments work with `AsyncClient.rm`.

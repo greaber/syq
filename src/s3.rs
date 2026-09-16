@@ -5,6 +5,8 @@ mod client;
 mod diagnostics;
 mod dns;
 mod local;
+mod remove;
+pub(crate) use remove::RemoveFlags;
 mod state;
 mod transfer;
 mod tuning;
@@ -108,7 +110,10 @@ impl Options {
             })
             .transpose()?
             .unwrap_or_default();
-        let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        let explicit = |id: &str| {
+            matches.try_contains_id(id).unwrap_or(false)
+                && matches.value_source(id) == Some(ValueSource::CommandLine)
+        };
         if from.is_none() && to.is_none() {
             if tuning.has_s3_controls() {
                 bail!("S3 performance tuning requires --from s3://BUCKET or --to s3://BUCKET");
@@ -211,6 +216,9 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    if args.rm {
+        return remove::run(args);
+    }
     let writer = crate::results::start(
         &args,
         crate::results::RunMode::Cp {

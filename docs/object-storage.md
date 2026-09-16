@@ -188,5 +188,45 @@ not remove uploaded parts. Syq does not delete unrelated objects.
 
 S3 copies support `--results` and the Python `cp` API. Automation endpoints use
 `kind: "s3"` and `host: "s3://BUCKET"`, requiring an SDK that understands S3
-endpoints. SSH delegation, `--prune`, `--inplace`, `rm`, and S3-to-S3 copies are
+endpoints. SSH delegation, `--prune`, `--inplace`, and S3-to-S3 copies are
 not supported for object storage.
+
+## Remove objects and versions
+
+`syq rm --on s3://BUCKET` removes selected keys or prefix trees. A named
+selector chooses an exact object if it exists, otherwise its `name/` prefix.
+`--src-dir name` selects a prefix tree and rejects a conflicting exact object;
+`--srcs-in name` keeps the prefix's own directory-marker object. Use
+`--srcs-in .` for bucket contents. Removal never deletes the bucket itself.
+Selectors are literal paths, not wildcard patterns; `-C` and `--root` set a
+key prefix. Missing selections succeed without removing anything.
+
+```sh
+# Preview ordinary removal. Versioned buckets retain historical contents.
+syq rm --on s3://my-bucket --src-dir old-backup --dry-run -v
+
+# Permanently remove the tree's versions, including hidden keys and delete markers.
+syq rm --on s3://my-bucket --src-dir old-backup --s3-all-versions
+
+# Permanently remove one version of one exact key.
+syq rm --on s3://my-bucket report.txt --s3-version-id VERSION_ID
+```
+
+`--s3-all-versions` and `--s3-version-id` are mutually exclusive and apply only
+to S3 removal. A version ID requires one named or non-directory selector;
+a named key ending in `/` can identify a directory marker's version. Removing
+a delete marker alone can reveal an older version. `--dry-run -v` previews
+version IDs and identifies delete markers without sending deletion requests.
+The same endpoint, region, profile, and custom-header options work as for copies.
+
+All selectors and listings are checked before deletion begins. Overlapping
+selections remove each key/version once. Removal stops at the first deletion
+error and reports partial failure; it cannot undo earlier removals. For
+`--s3-all-versions`, delete markers are removed after the selected data versions.
+Stop concurrent writers when clearing a prefix: versions created after listing
+are not part of the removal plan. Version operations require permission to list
+and delete versions; retention rules may prevent permanent deletion.
+
+The Python `rm` and `AsyncClient.rm` APIs accept `s3_all_versions=True` or
+`s3_version_id="..."`, along with `on="s3://BUCKET"` and the S3 connection options.
+Removal results count each version or delete marker as one entry.

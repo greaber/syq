@@ -59,9 +59,21 @@ impl Server {
         }
     }
     fn command(&self, temp: &Path) -> Command {
+        self.command_for(temp, "cp")
+    }
+    fn command_for(&self, temp: &Path, mode: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-        command
-            .args([
+        if mode == "rm" {
+            command.args([
+                "rm",
+                "--s3-region",
+                "us-east-1",
+                "--s3-header",
+                "X-Tigris-Consistent: true",
+                "--no-progress",
+            ]);
+        } else {
+            command.args([
                 "cp",
                 "--s3-region",
                 "us-east-1",
@@ -74,7 +86,9 @@ impl Server {
                 "s3-part-size=5M",
                 "--performance-tuning",
                 "s3-max-concurrent-parts-per-object=3",
-            ])
+            ]);
+        }
+        command
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
             .env_remove("AWS_SESSION_TOKEN")
@@ -146,6 +160,42 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("remove-") {
+        if method == "GET" {
+            assert!(first.contains("versions"));
+            let body = if fault == "remove-outside" {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>outside/key</Key><VersionId>v</VersionId></Version></ListVersionsResult>"
+            } else if fault == "remove-no-id" {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>tree/key</Key></Version></ListVersionsResult>"
+            } else if fault == "remove-no-cursor" {
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><Version><Key>tree/key</Key><VersionId>v</VersionId></Version></ListVersionsResult>"
+            } else if first.contains("version-id-marker=v1") {
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>tree/key</Key><VersionId>v2</VersionId></Version></ListVersionsResult>"
+            } else {
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>tree/key</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><DeleteMarker><Key>tree/key</Key><VersionId>marker</VersionId></DeleteMarker><Version><Key>tree/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
+            };
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else {
+            assert_eq!(method, "DELETE");
+            if fault == "remove-denied" {
+                assert!(
+                    !first.contains("versionId=marker"),
+                    "must preserve marker after a failed data deletion"
+                );
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                    false,
+                );
+            } else {
+                assert!(first.contains("versionId="));
+                reply(&mut socket, 204, &[], b"", false);
+            }
+        }
+        return;
+    }
     if fault.starts_with("upload-") {
         if method == "HEAD" {
             reply(&mut socket, 404, &[], b"", true);
@@ -1198,4 +1248,113 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
         std::fs::read(temp.path().join("result")).unwrap(),
         vec![b'x'; 65536]
     );
+}
+
+#[test]
+fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
+    for (fault, exit, requests) in [
+        ("remove-outside", 1, 1),
+        ("remove-no-id", 1, 1),
+        ("remove-no-cursor", 1, 1),
+        ("remove-denied", 23, 3),
+        ("remove-ok", 0, 5),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/automation.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for line in records.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value), "{value}");
+        }
+        let result: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            result["entries_removed"],
+            if fault == "remove-ok" { 3 } else { 0 }
+        );
+        assert_eq!(
+            result["entries_failed"],
+            u64::from(fault == "remove-denied")
+        );
+    }
+}
+
+#[test]
+fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-ok");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-dir",
+            "tree",
+            "--s3-all-versions",
+            "--dry-run",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+    for options in [
+        vec![
+            "--on",
+            "s3://bucket",
+            "--s3-all-versions",
+            "--s3-version-id",
+            "v",
+            "key",
+        ],
+        vec![
+            "--on",
+            "s3://bucket",
+            "--s3-version-id",
+            "v",
+            "--src-dir",
+            "tree",
+        ],
+        vec!["--s3-all-versions", "local"],
+        vec!["--on", "s3://bucket", "--s3-version-id", "v", "a", "b"],
+        vec!["--on", "s3://bucket", "--pscope", "/missing", "key"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
 }

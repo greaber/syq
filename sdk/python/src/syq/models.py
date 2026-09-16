@@ -399,6 +399,8 @@ class RemovalTrace:
     path: PathValue
     kind: EntryKind
     disposition: RemovalDisposition
+    s3_version_id: str | None = None
+    s3_delete_marker: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +415,8 @@ class RemovalResult:
     class_: ErrorClass | None
     os_kind: OsKind | None
     message: str | None
+    s3_version_id: str | None = None
+    s3_delete_marker: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
