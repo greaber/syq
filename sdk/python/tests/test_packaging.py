@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
+from types import SimpleNamespace
+from unittest.mock import patch
 import unittest
 
 
@@ -52,3 +55,14 @@ class PackagingTests(unittest.TestCase):
             metadata = json.loads((output / "sdk/python/.cargo_vcs_info.json").read_text())
             self.assertEqual(metadata["git"]["sha1"], revision)
             self.assertFalse((output / "sdk/python/.venv").exists())
+
+    def test_stage_on_python_without_tar_extraction_filters(self):
+        extract = tarfile.TarFile.extractall
+
+        def old_extract(archive, path):
+            # The pre-3.10.12 signature rejects a filter keyword.
+            return extract(archive, path)
+
+        with patch.object(staging, "tarfile", SimpleNamespace(open=tarfile.open)), \
+                patch.object(tarfile.TarFile, "extractall", old_extract):
+            self.test_stage_uses_release_native_source_and_current_python()

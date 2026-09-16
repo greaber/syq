@@ -95,7 +95,7 @@ jobs:
           SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
           SYQ_RELEASE_BUILD: "1"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-          MATURIN_PEP517_ARGS: "--compatibility pypi"
+          MATURIN_PEP517_ARGS: "--compatibility pypi --strip"
         shell: bash
         run: |
           set -euo pipefail

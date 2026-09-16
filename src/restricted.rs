@@ -3757,7 +3757,7 @@ fn run_management_over_route(
     let arch = lines
         .next()
         .context("receiver platform probe returned no architecture")?;
-    let platform = crate::remote_helper::Target::from_uname(os, arch)
+    let platform = crate::remote_helper::Target::for_bootstrap(os, arch)
         .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
     let bytes = management_executable(platform)?;
     let mut nonce = [0u8; 8];
@@ -3772,8 +3772,12 @@ fn run_management_over_route(
 }
 
 fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
-    if Some(target) != crate::remote_helper::Target::local() {
-        if crate::identity::is_release_build() {
+    // A source build opting into release helpers must use the verified upstream
+    // helper even on its own platform. Official releases keep their offline path.
+    if (crate::identity::uses_release_helpers() && !crate::identity::is_release_build())
+        || !target.can_upload_self()
+    {
+        if crate::identity::uses_release_helpers() {
             let helper = crate::update::trusted_current_helper(target)?;
             return crate::update::verified_current_helper(&helper);
         }
@@ -4772,7 +4776,10 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(case.as_str(), "valid" | "local-release"),
+                matches!(
+                    case.as_str(),
+                    "valid" | "local-release" | "source-helpers" | "local-source-helpers"
+                ),
                 "{result:?}"
             );
             return;
@@ -4800,8 +4807,10 @@ pub(crate) mod tests {
             "manifest-tampered",
             "archive-tampered",
             "source-build",
+            "source-helpers",
+            "local-source-helpers",
         ] {
-            let (os, arch) = if case == "local-release" {
+            let (os, arch) = if matches!(case, "local-release" | "local-source-helpers") {
                 (
                     if cfg!(target_os = "linux") {
                         "Linux"
@@ -4812,6 +4821,11 @@ pub(crate) mod tests {
                 )
             } else {
                 (os, arch)
+            };
+            let target = if case == "local-source-helpers" {
+                crate::remote_helper::Target::local().unwrap().key
+            } else {
+                target
             };
             let temporary = crate::test_support::tempdir().unwrap();
             let root = temporary.path();
@@ -4873,7 +4887,22 @@ esac
                 .env("SYQ_ENROLLMENT_TEST_CHILD", case)
                 .env(
                     "SYQ_TEST_RELEASE_BUILD",
-                    if case == "source-build" { "0" } else { "1" },
+                    if matches!(
+                        case,
+                        "source-build" | "source-helpers" | "local-source-helpers"
+                    ) {
+                        "0"
+                    } else {
+                        "1"
+                    },
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_HELPERS",
+                    if case.ends_with("source-helpers") {
+                        "1"
+                    } else {
+                        "0"
+                    },
                 )
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4896,7 +4925,7 @@ esac
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            if case == "valid" {
+            if matches!(case, "valid" | "source-helpers" | "local-source-helpers") {
                 assert_eq!(fs::read(root.join("uploaded")).unwrap(), binary);
             } else if case == "local-release" {
                 assert_eq!(

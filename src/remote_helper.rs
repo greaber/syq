@@ -51,6 +51,21 @@ impl Target {
         }
     }
 
+    /// Unknown platforms have no upstream asset. A self-upload can still be
+    /// tried: executing the temporary binary is the final compatibility check.
+    pub fn for_bootstrap(os: &str, arch: &str) -> Option<Self> {
+        Self::from_uname(os, arch).or_else(|| {
+            (!crate::identity::uses_release_helpers()).then_some(Self {
+                key: "self",
+                asset: "",
+            })
+        })
+    }
+
+    pub fn can_upload_self(self) -> bool {
+        self.key == "self" || Some(self) == Self::local()
+    }
+
     pub fn local() -> Option<Self> {
         Self::from_uname(
             match std::env::consts::OS {
@@ -99,12 +114,17 @@ Linux:x86_64) target=linux-x86_64 ;;
 Linux:aarch64|Linux:arm64) target=linux-aarch64 ;;
 Darwin:x86_64) target=macos-x86_64 ;;
 Darwin:arm64|Darwin:aarch64) target=macos-arm64 ;;
-*) exit {HELPER_MISSING_EXIT} ;;
+*) {unknown_target} ;;
 esac
 program="$HOME/.cache/syq/helpers/{release}/$target/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
         release = cache_key(),
+        unknown_target = if crate::identity::uses_release_helpers() {
+            format!("exit {HELPER_MISSING_EXIT}")
+        } else {
+            "target=self".into()
+        },
     );
     format!(
         "sh -c {} syq {}",
@@ -302,7 +322,7 @@ if ! chmod 700 "$tmp"; then
     exit {install_failed_exit}
 fi
 got=$("$tmp" --version 2>/dev/null) || {{
-    echo "syq: uploaded helper cannot run on this host; use a build compatible with its system libraries and CPU" >&2
+    echo "syq: uploaded helper cannot run on this host ($(uname -s) $(uname -m)); use a build compatible with its system libraries and CPU" >&2
     exit {install_failed_exit}
 }}
 [ "$got" = {expected_version} ] || {{
@@ -310,7 +330,7 @@ got=$("$tmp" --version 2>/dev/null) || {{
     exit {install_failed_exit}
 }}
 got_id=$("$tmp" --build-identity 2>/dev/null) || {{
-    echo "syq: uploaded helper does not report a build identity" >&2
+    echo "syq: uploaded helper does not report a build identity on $(uname -s) $(uname -m); check that the binary runs there and supports --build-identity" >&2
     exit {install_failed_exit}
 }}
 [ "$got_id" = {expected_identity} ] || {{
@@ -430,6 +450,62 @@ mod tests {
         assert!(command.contains("openssl"));
         assert!(command.contains("gzip"));
         assert!(command.contains("syq-helper-tools:"));
+    }
+
+    #[test]
+    fn upload_identity_failure_reports_remote_platform() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let root = crate::test_support::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let uname = bin.join("uname");
+        std::fs::write(
+            &uname,
+            b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                &upload_script(Target {
+                    key: "self",
+                    asset: "",
+                }),
+            ])
+            .env("HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let binary = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'syq {}'; else exit 1; fi\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(binary.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert_eq!(result.status.code(), Some(INSTALL_FAILED_EXIT));
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("does not report a build identity on Linux riscv64"),
+            "{error}"
+        );
+        let cache = root
+            .path()
+            .join(".cache/syq/helpers")
+            .join(cache_key())
+            .join("self");
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
     }
 
     #[test]

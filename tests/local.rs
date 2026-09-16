@@ -4672,6 +4672,54 @@ fn development_build_uploads_itself_and_reuses_cached_helper() {
 }
 
 #[test]
+fn source_build_can_download_helpers_without_installing_a_command() {
+    for upload in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        setup_release_bootstrap(&t);
+        if upload {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        write(&t.path("src"), b"source client with release helpers");
+        let remote = format!("fake:{}", t.s("dst"));
+        let out = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+            .env("SYQ_TEST_RELEASE_BUILD", "0")
+            .env("SYQ_TEST_RELEASE_HELPERS", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        assert!(cached_remote_helper(&t).exists());
+        assert!(!t.path("remote-home/.local/bin/syq").exists());
+        if upload {
+            // Falling back must download a verified release locally, not send
+            // the source executable merely because it is the same platform.
+            assert!(cached_local_helper(&t).exists());
+        } else {
+            assert!(!read(&t.path("curl.log")).is_empty());
+        }
+    }
+}
+
+#[test]
+fn development_build_attempts_upload_for_an_unlisted_platform() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(
+        &t.path("remote-bin/uname"),
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+    );
+    write(&t.path("src"), b"custom target");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+    assert!(!t.path("remote-home/.local/bin/syq").exists());
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+}
+
+#[test]
 fn development_build_rejects_cross_platform_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
@@ -4703,7 +4751,11 @@ fn development_build_rejects_cross_platform_upload() {
 fn development_build_does_not_install_an_unrunnable_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Model a host on which the uploaded binary cannot execute.
+    // Model an unlisted host on which the uploaded binary cannot execute.
+    executable(
+        &t.path("remote-bin/uname"),
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+    );
     executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
     write(&t.path("src"), b"must not copy");
     let remote = format!("fake:{}", t.s("dst"));
@@ -4714,8 +4766,14 @@ fn development_build_does_not_install_an_unrunnable_upload() {
         stderr.contains("uploaded helper cannot run on this host"),
         "{stderr}"
     );
+    assert!(stderr.contains("Linux riscv64"), "{stderr}");
     assert!(!t.path("dst").exists());
-    let helper = cached_remote_helper(&t);
+    let helper = cached_remote_helper(&t)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("self/syq");
     assert!(!helper.exists());
     assert_eq!(fs::read_dir(helper.parent().unwrap()).unwrap().count(), 0);
 }
