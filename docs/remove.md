@@ -13,7 +13,7 @@ syq rm --srcs-in cache
 ```
 
 Add `--dry-run -v` to either command to see what would be removed first.
-Missing paths succeed. Removal is permanent; completed deletions cannot be
+Missing paths succeed. Filesystem removal is permanent; completed deletions cannot be
 rolled back.
 
 ## On another machine
@@ -26,6 +26,10 @@ This removes `/scratch/old-output` on `server`. Remote removal runs while your
 connection stays open; there is no detached mode. With `--dry-run`, nothing is
 removed, but remote setup may still cache the helper or
 [install syq](install.md#automatic-installation-on-ssh-servers).
+
+For object storage, use `--on s3://BUCKET`. Ordinary removal respects bucket
+versioning; explicit version deletion is available with `--s3-all-versions` or
+`--s3-version-id`. See [S3 removal](object-storage.md#remove-objects-and-versions).
 
 ## Limit the selection
 
@@ -57,8 +61,8 @@ With `--root`, traversal must still stay inside that root.
 
 ## Results
 
-The command continues with independent entries after per-entry failures and
-exits 23. Fatal setup or connection failures exit 1. Use
+Filesystem removal continues with independent entries after per-entry failures
+and exits 23. S3 removal stops at the first deletion failure and also exits 23. Fatal setup or connection failures exit 1. Use
 [`--results`](automation.md) for per-path outcomes in scripts.
 
 For the full option list, run `syq rm --help-all`.

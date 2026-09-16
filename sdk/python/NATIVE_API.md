@@ -143,8 +143,15 @@ enabled.
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
 arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
-It supports local and ordinary SSH endpoints. Command-restricted receivers
+It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
+
+S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
+`s3_region`, `s3_profile`, and `s3_header`. `s3_all_versions=True` permanently
+removes all selected versions and delete markers; `s3_version_id="ID"` selects
+one version of one exact key. These options are mutually exclusive.
+`RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
+`s3_delete_marker` fields. The same arguments work with `AsyncClient.rm`.
 
 <a id="complete-input-guarantee"></a>
 
@@ -529,6 +536,8 @@ selector: int
 path: PathValue
 kind: EntryKind
 disposition: RemovalDisposition
+s3_version_id: str | None
+s3_delete_marker: bool | None
 ```
 
 ### RemovalResult
@@ -549,6 +558,8 @@ retryable: Retryability | None
 class_: ErrorClass | None
 os_kind: OsKind | None
 message: str | None
+s3_version_id: str | None
+s3_delete_marker: bool | None
 ```
 
 ### ErrorEvent
@@ -748,10 +759,3 @@ Use `Client(cache_dir=...)` to change the cache root, or
 and verification, so you are responsible for compatibility and origin. Typed
 calls still validate automation output. A failed executable selection does not
 fall back to another binary.
-
-S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
-`s3_region`, `s3_profile`, and `s3_header`. `s3_all_versions=True` permanently
-removes all selected versions and delete markers; `s3_version_id="ID"` selects
-one version of one exact key. These options are mutually exclusive.
-`RemovalTrace` and `RemovalResult` expose optional `s3_version_id` and
-`s3_delete_marker` fields. The same arguments work with `AsyncClient.rm`.
