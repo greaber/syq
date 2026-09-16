@@ -5494,7 +5494,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         .unwrap()
         .as_bytes(),
     );
-    let run = |destination: &str, fixed: Option<usize>| {
+    let run = |destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
             .arg("-e")
@@ -5502,6 +5502,9 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
             .arg("--rsync-path")
             .arg(env!("CARGO_BIN_EXE_syq"))
             .args(["--syq-no-tcp", "--stats", "-avv"]);
+        if limited {
+            command.arg("--resource-limits=bandwidth=1M");
+        }
         if let Some(fixed) = fixed {
             command.args(["--performance-tuning", &format!("workers={fixed}")]);
         }
@@ -5518,7 +5521,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     };
     write(&t.path("src"), b"remembered start");
 
-    let automatic = run("auto", None);
+    let automatic = run("auto", None, false);
     assert_output_ok(&automatic);
     assert!(
         String::from_utf8_lossy(&automatic.stderr)
@@ -5533,7 +5536,17 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         String::from_utf8_lossy(&automatic.stdout)
     );
 
-    let fixed = run("fixed", Some(3));
+    let limited = run("limited", None, true);
+    assert_output_ok(&limited);
+    assert!(
+        String::from_utf8_lossy(&limited.stderr)
+            .contains("starting with 1 connections remembered for this path"),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    assert_eq!(read(&t.path("limited")), read(&t.path("src")));
+
+    let fixed = run("fixed", Some(3), true);
     assert_output_ok(&fixed);
     let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
     assert_eq!(cached["paths"]["local>fake|ssh"], 1);

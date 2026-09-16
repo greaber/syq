@@ -2807,10 +2807,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_TCP;
             gate.set_active(args.connections);
         }
-        let tuning_key =
-            (autotune && args.tuning_options.is_none() && args.resource_limits.is_none())
-                .then(|| tune::path_key(&src_ep, &dst_ep))
-                .flatten();
+        let tuning_key = (autotune && args.tuning_options.is_none())
+            .then(|| tune::path_key(&src_ep, &dst_ep))
+            .flatten();
         let remembered_start = tuning_key.as_deref().and_then(tune::cached);
         if let Some(remembered) = remembered_start {
             args.connections = remembered;
