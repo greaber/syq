@@ -533,6 +533,22 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
+    def test_s3_options_and_literal_headers(self) -> None:
+        self.client.cp("source", to="s3://bucket", into="prefix",
+                       s3_endpoint="https://storage.example", s3_region="auto",
+                       s3_profile="archive", s3_header=["X-Policy: a:b", "X-Other: yes"],
+                       s3_concurrency=7, s3_part_size=64, s3_retries=2, s3_integrity="none")
+        argv = self.argv()
+        for expected in ["--s3-endpoint=https://storage.example", "--s3-region=auto",
+                         "--s3-profile=archive", "--s3-header=X-Policy: a:b",
+                         "--s3-header=X-Other: yes", "--s3-concurrency=7",
+                         "--s3-part-size=64", "--s3-retries=2", "--s3-integrity=none"]:
+            self.assertIn(expected, argv)
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.cp("source", to="s3://bucket", into="prefix", s3_header="X: value")
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.cp("source", to="s3://bucket", into="prefix", s3_concurrency=True)
+
     def test_cp_selects_an_authorizer_and_rejects_conflicting_selectors(self) -> None:
         self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()

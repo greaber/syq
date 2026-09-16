@@ -554,6 +554,29 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
     return value
 
 
+def _s3_arguments(
+    argv: list[Argument], endpoint: str | None, region: str | None,
+    profile: str | None, headers: Iterable[str] | None, concurrency: int | None,
+    part_size: int | None, retries: int | None, integrity: str | None,
+) -> None:
+    if integrity is not None:
+        if integrity not in ("full", "none"):
+            raise SyqInvocationError("s3_integrity must be full or none")
+        argv.append("--s3-integrity=" + integrity)
+    for option, value in (("s3_endpoint", endpoint), ("s3_region", region), ("s3_profile", profile)):
+        if value is not None:
+            argv.append("--" + option.replace("_", "-") + "=" + _text_arg(value, label=option))
+    for option, value in (("s3_concurrency", concurrency), ("s3_part_size", part_size), ("s3_retries", retries)):
+        if value is not None:
+            _nonnegative_integer(value, option=option)
+            argv.append("--" + option.replace("_", "-") + "=" + str(value))
+    if headers is not None:
+        if isinstance(headers, (str, bytes)):
+            raise SyqInvocationError("s3_header must be an iterable of header strings")
+        for header in headers:
+            argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
+
+
 def _copy_arguments(
     command: str,
     sources: tuple[PathArgument, ...],
@@ -1026,6 +1049,14 @@ class Client:
         no_compress: bool = False,
         bwlimit: str | int | None = None,
         connections: int | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
+        s3_concurrency: int | None = None,
+        s3_part_size: int | None = None,
+        s3_retries: int | None = None,
+        s3_integrity: str | None = None,
         auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
@@ -1109,6 +1140,8 @@ class Client:
             min_size=min_size,
             max_delete=max_delete,
         )
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header,
+                      s3_concurrency, s3_part_size, s3_retries, s3_integrity)
         if auth_from is not None and via is not None:
             raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:

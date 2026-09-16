@@ -39,6 +39,7 @@ mod resume;
 mod rm;
 #[allow(dead_code)]
 mod rooted;
+mod s3;
 mod scan;
 mod sched;
 mod server;
@@ -314,7 +315,9 @@ fn main() {
         }
     }
     let quiet = args.quiet;
-    let result = if args.interface == cli::Interface::NativeMap {
+    let result = if args.s3.is_some() {
+        s3::run(args)
+    } else if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)
     } else if args.rm {
         rm::run(args)
