@@ -66,9 +66,14 @@ def hashing(root, source, temporary):
                "--hash-algorithm", "xxh3-128", "--transfer-integrity"]
     run(command, data=manifest(selected, expected))
     results = str(Path(temporary) / "hash-repeat-signed.ndjson")
+    inode_query = f"from pathlib import Path; print((Path({destination!r})/'checked').stat().st_ino)"
+    inode = ssh("destination", inode_query).stdout
     run(command + ["--results", results], data=manifest(selected, expected))
     summary = json.loads(Path(results).read_text().splitlines()[-1])
-    assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
+    # Receiver-attested summaries count confirmed mutations, not source skips.
+    assert summary["provenance"] == "receiver_attested" and summary["bytes_transferred"] == 0, summary
+    assert summary["status"] == "success" and summary["receipt_status"] == "clean", summary
+    assert ssh("destination", inode_query).stdout == inode
     wrong = {"algorithm": "sha256", "value": hashlib.sha256(b"different bytes").hexdigest()}
     run(command, data=manifest(selected, wrong), expected=23)
     ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'checked').read_bytes()==b'mapped contents'")
