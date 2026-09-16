@@ -8,6 +8,7 @@ const SAMPLE: Duration = Duration::from_millis(250);
 pub(super) struct Concurrency {
     pub initial: usize,
     pub maximum: Option<usize>,
+    pub initial_probe_up: bool,
 }
 
 struct Probe {
@@ -29,7 +30,7 @@ struct Controller {
 }
 
 impl Controller {
-    fn new(start: usize, maximum: usize) -> Self {
+    fn new(start: usize, maximum: usize, initial_probe_up: bool) -> Self {
         let mut sampler = Sampler::default();
         sampler.reset();
         Self {
@@ -37,7 +38,7 @@ impl Controller {
             maximum,
             sampler,
             probe: None,
-            upward: false,
+            upward: initial_probe_up,
             hold: 0,
             lower: 0,
             upper: maximum + 1,
@@ -148,7 +149,7 @@ where
 {
     let mut controller = concurrency
         .maximum
-        .map(|maximum| Controller::new(concurrency.initial, maximum));
+        .map(|maximum| Controller::new(concurrency.initial, maximum, concurrency.initial_probe_up));
     let mut limit = concurrency.initial;
     let mut tasks = tokio::task::JoinSet::new();
     let mut jobs = jobs.into_iter();
@@ -224,9 +225,11 @@ mod tests {
     #[test]
     fn learns_different_optima_and_revisits_changed_conditions() {
         for optimum in [3, 4, 9, 16, 24, 42, 64, 96, 128] {
-            exercise(&mut Controller::new(32, 256), optimum);
+            for initial_probe_up in [false, true] {
+                exercise(&mut Controller::new(32, 256, initial_probe_up), optimum);
+            }
         }
-        let mut controller = Controller::new(32, 256);
+        let mut controller = Controller::new(32, 256, false);
         for optimum in [16, 64, 4] {
             exercise(&mut controller, optimum);
         }
@@ -234,7 +237,7 @@ mod tests {
 
     #[test]
     fn draining_and_tail_samples_do_not_advance_the_policy() {
-        let mut controller = Controller::new(32, 256);
+        let mut controller = Controller::new(32, 256, false);
         for _ in 0..50 {
             assert_eq!(controller.observe(1000.0, 33, 10000, 16), 32);
             assert_eq!(controller.observe(1000.0, 32, 2, 16), 32);
@@ -256,6 +259,7 @@ mod tests {
             Concurrency {
                 initial: 4,
                 maximum: Some(16),
+                initial_probe_up: false,
             },
             |n| {
                 let active = active.clone();
@@ -290,6 +294,7 @@ mod tests {
             Concurrency {
                 initial: 2,
                 maximum: None,
+                initial_probe_up: false,
             },
             |n| {
                 let started = started.clone();

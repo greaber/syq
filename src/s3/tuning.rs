@@ -75,13 +75,12 @@ impl Tuning {
     pub fn request_limit(&self) -> usize {
         self.requests.state.lock().unwrap().limit
     }
-    pub fn report(&self, workers: usize) {
+    pub fn control_latency(&self) -> Option<Duration> {
         let ns = self.control_ns.load(Relaxed);
-        super::diagnostics::planning(
-            (ns != u64::MAX).then(|| Duration::from_nanos(ns)),
-            workers,
-            self.request_limit(),
-        );
+        (ns != u64::MAX).then(|| Duration::from_nanos(ns))
+    }
+    pub fn report(&self, workers: usize) {
+        super::diagnostics::planning(self.control_latency(), workers, self.request_limit());
     }
     pub fn adapt_objects(&self, maximum: usize) {
         // For single-request batches, one controller owns concurrency. An

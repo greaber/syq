@@ -16,6 +16,7 @@ impl Engine {
             return Ok(Concurrency {
                 initial: 1,
                 maximum: None,
+                initial_probe_up: false,
             });
         }
         let tiny = bytes / count < 1024 * 1024;
@@ -90,7 +91,14 @@ impl Engine {
             workers
         };
         self.tuning.report(initial);
-        Ok(Concurrency { initial, maximum })
+        Ok(Concurrency {
+            initial,
+            maximum,
+            initial_probe_up: self
+                .tuning
+                .control_latency()
+                .is_some_and(|latency| latency >= Duration::from_millis(50)),
+        })
     }
 
     pub(super) fn part_size(&self, size: u64) -> u64 {
