@@ -79,13 +79,14 @@ that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
 `DO_NOT_TRACK=1` to disable reminders.
 
 Downloads and the daily reminder check go through `dl.syq.christmas`, a host
-run by the maintainer that redirects to the GitHub release files. It records
-each request's time, syq version, platform, the connection's IP address, and
-the country, region, and city derived from that address, so the project can see how many installs exist and which
-versions are in use. Nothing identifies an install, and the check sends
-nothing else. Homebrew installs and non-interactive use never make the
-reminder check. Every download is verified against the signed release
-manifest, so the host cannot substitute files.
+run by the maintainer that serves the GitHub release files from a cache. It
+records each request's time, syq version, platform, the connection's IP
+address, and the country, region, and city derived from that address, so the
+project can see how many installs exist and which versions are in use.
+Nothing identifies an install, and the check sends nothing else.
+Non-interactive use never makes the reminder check. Every download is
+verified against the signed release manifest, so the host cannot substitute
+files.
 
 ## Shell completion
 
