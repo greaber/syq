@@ -14,6 +14,7 @@ command -v jq >/dev/null || { echo "generate-installer needs jq" >&2; exit 1; }
 version=$(jq -er '.version' "$manifest")
 tag=$(jq -er '.tag' "$manifest")
 repository=$(jq -er '.repository' "$manifest")
+download_base='https://dl.syq.christmas'
 test "$repository" = 'https://github.com/greaber/syq' || { echo "unexpected repository" >&2; exit 1; }
 
 for target in linux-x86_64 linux-aarch64 macos-arm64 macos-x86_64; do
@@ -29,12 +30,12 @@ done
   cat <<EOF
 #!/bin/sh
 # Generated for syq $version. Inspect this script before running it; the exact
-# version remains at $repository/releases/download/$tag/install.sh.
+# version remains at $download_base/$tag/install.sh.
 set -eu
 
 version='$version'
 tag='$tag'
-base_url=\${SYQ_INSTALL_BASE_URL:-'$repository/releases/download/$tag'}
+base_url=\${SYQ_INSTALL_BASE_URL:-'$download_base/$tag'}
 bin_dir=\${HOME:+\$HOME/.local/bin}
 
 usage() {

@@ -5,7 +5,7 @@ Syq runs on Linux and macOS, on x86-64 and ARM64.
 ## Standalone installer
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh
 ```
 
 Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
@@ -75,8 +75,18 @@ for Homebrew.
 
 Standalone and Homebrew installs may print an update reminder in a terminal,
 at most once a day after a successful command, naming the upgrade command for
-that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` to
-disable reminders.
+that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
+`DO_NOT_TRACK=1` to disable reminders.
+
+Downloads and the daily reminder check go through `dl.syq.christmas`, a host
+run by the maintainer that serves the GitHub release files from a cache. It
+records each request's time, syq version, platform, the connection's IP
+address, and the country, region, and city derived from that address, so the
+project can see how many installs exist and which versions are in use.
+Nothing identifies an install, and the check sends nothing else.
+Non-interactive use never makes the reminder check. Every download is
+verified against the signed release manifest, so the host cannot substitute
+files.
 
 ## Shell completion
 

