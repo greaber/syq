@@ -13,6 +13,7 @@ pub(super) struct Tuning {
     control_ns: AtomicU64,
     fixed_requests: Option<usize>,
     tigris: bool,
+    upload: bool,
     pub requests: Arc<Budget>,
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
@@ -20,6 +21,7 @@ impl Tuning {
     pub fn new(options: &Options, args: &crate::cli::Args) -> Self {
         Self {
             control_ns: AtomicU64::new(u64::MAX),
+            upload: options.upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
@@ -51,7 +53,10 @@ impl Tuning {
     }
     pub fn high_latency(&self) -> bool {
         let ns = self.control_ns.load(Relaxed);
-        !self.tigris && ns != u64::MAX && ns >= 50_000_000
+        // Tigris uploads keep their conservative seed. Downloads still need
+        // enough requests in flight to cover a long round trip, regardless of
+        // provider; short copies cannot recover time spent ramping from 64.
+        (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
     }
     pub fn configure(&self, tiny: bool, workers: usize, request_cap: usize) {
         let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
@@ -271,6 +276,39 @@ mod tests {
             .is_pending());
         drop(held);
         assert_eq!(budget.state.lock().unwrap().active, 0);
+    }
+
+    #[test]
+    fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
+        // (upload, Tigris, observed latency, small objects, explicit maximum, expected)
+        for (upload, tigris, latency_ms, tiny, fixed, expected) in [
+            (false, true, Some(100), true, None, 256),
+            (true, true, Some(100), true, None, 64),
+            (false, false, Some(100), true, None, 256),
+            (true, false, Some(100), true, None, 256),
+            (false, true, Some(1), true, None, 64),
+            (false, true, None, true, None, 64),
+            (false, true, Some(100), false, None, 64),
+            (false, true, Some(100), true, Some(16), 16),
+        ] {
+            let tuning = Tuning {
+                control_ns: AtomicU64::new(u64::MAX),
+                fixed_requests: fixed,
+                tigris,
+                upload,
+                requests: Arc::new(Budget::new(fixed.unwrap_or(64), fixed.is_none())),
+                upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
+            };
+            if let Some(ms) = latency_ms {
+                tuning.observe_control(Duration::from_millis(ms));
+            }
+            tuning.configure(tiny, 256, 256);
+            assert_eq!(
+                tuning.requests.state.lock().unwrap().limit,
+                expected,
+                "upload={upload}, tigris={tigris}, latency={latency_ms:?}, tiny={tiny}, fixed={fixed:?}",
+            );
+        }
     }
 
     #[test]

@@ -56,8 +56,9 @@ uploads. Syq does not change bucket policies or lifecycle rules.
 
 Uploads use multipart requests and downloads use concurrent byte ranges. Syq
 chooses starting settings from file sizes, the backend and observed request
-latency, then adjusts its shared data-request budget during the copy. Short
-copies may finish before enough requests complete to adjust it. These choices
+latency, then adjusts its shared data-request budget during the copy. Downloads
+of small files over high-latency paths start with more simultaneous requests,
+because short copies may finish before the budget can grow. These choices
 apply independently of integrity checking, and S3 tuning writes no cache files.
 
 For deliberate overrides, use `--performance-tuning`. These settings choose
