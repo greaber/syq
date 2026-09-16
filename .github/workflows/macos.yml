@@ -149,12 +149,13 @@ jobs:
           export SYQ_CANDIDATE_VERSION
           scripts/test-python-sdk-release-tools.sh
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
-          export SOURCE_DATE_EPOCH
+          export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
+          RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
             # Restored Cargo caches can contain distributions from an older SDK.
             rm -rf -- "$output"
-            uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
+            MATURIN_PEP517_ARGS="--profile dev" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
             sleep 2
@@ -163,11 +164,19 @@ jobs:
             name=${artifact##*/}
             cmp "$artifact" "target/sdk-python-dist-b/$name"
           done
-          set -- target/sdk-python-dist-a/syq-*-py3-none-any.whl
+          set -- target/sdk-python-dist-a/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
           env -u PYTHONPATH uv run --isolated --python 3.10 \
             --with "$1" \
-            python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          rm -rf -- target/sdk-python-from-sdist
+          MATURIN_PEP517_ARGS="--profile dev" uv build --wheel \
+            target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
+          set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          env -u PYTHONPATH uv run --isolated --python 3.10 \
+            --with "$1" \
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.x"

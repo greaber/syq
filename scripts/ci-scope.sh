@@ -103,7 +103,7 @@ while IFS= read -r path; do
     shellcheck=true
   fi
   case "$path" in
-    sdk/README.md|sdk/RELEASING.md|sdk/python/README.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md|sdk/js/README.md|sdk/go/README.md)
+    sdk/README.md|sdk/RELEASING.md|sdk/python/README-PYTHON.md|sdk/python/NATIVE_API.md|sdk/python/API_DESIGN.md|sdk/js/README.md|sdk/go/README.md)
       # These are prose, not executable SDK test inputs. Keep the exception
       # explicit: native-api.json is compiled into Rust, and files elsewhere
       # in an SDK (including future Markdown fixtures) still select its tests.
@@ -158,7 +158,7 @@ while IFS= read -r path; do
       tooling=true
       python_sdk=true
       ;;
-    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
+    scripts/check-python-api-sync.py|scripts/normalize-python-sdist.py|scripts/check-python-wheel.py|scripts/stage-python-sdk.py|scripts/prepare-python-sdk-release.py|scripts/run-generated-sdk-post-merge-ci.sh|scripts/select-trusted-pr.jq|scripts/test-python-sdk-release-tools.sh)
       tooling=true
       python_sdk=true
       ;;

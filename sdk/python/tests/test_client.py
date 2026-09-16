@@ -153,19 +153,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(result.stdout, argument.encode())
         self.assertEqual(result.stderr, b"diagnostic")
 
-    def test_default_run_uses_the_managed_executable(self) -> None:
+    def test_default_run_uses_the_bundled_executable(self) -> None:
         with mock.patch(
-            "syq.client.managed_executable", return_value=self.executable
-        ) as managed:
-            result = syq.run(["emit", "managed"])
+            "syq.client.bundled_executable", return_value=self.executable
+        ) as bundled:
+            result = syq.run(["emit", "bundled"])
 
-        managed.assert_called_once_with()
-        self.assertEqual(result.stdout, b"managed")
+        bundled.assert_called_once_with()
+        self.assertEqual(result.stdout, b"bundled")
 
-    def test_explicit_executable_bypasses_the_managed_install(self) -> None:
+    def test_explicit_executable_bypasses_the_bundled_selection(self) -> None:
         with mock.patch(
-            "syq.client.managed_executable",
-            side_effect=AssertionError("managed install should not run"),
+            "syq.client.bundled_executable",
+            side_effect=AssertionError("bundled install should not run"),
         ):
             result = syq.run(["emit", "custom"], executable=self.executable)
 

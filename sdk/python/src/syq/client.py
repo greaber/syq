@@ -20,6 +20,7 @@ from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
 from ._mapping import Mapping as FileMapping, _source_options
 from ._paths import PathArgument, _map_stream_cwd
 from .managed import managed_executable
+from .bundled import bundled_executable
 from .errors import (
     SyqInvocationError,
     SyqOperationError,
@@ -91,7 +92,7 @@ def run(
     if isinstance(args, (str, bytes, os.PathLike)):
         raise TypeError("args must be a sequence of individual arguments")
     executable_text = (
-        os.fspath(managed_executable())
+        os.fspath(bundled_executable())
         if executable is None
         else _text_arg(executable, label="executable")
     )
@@ -909,7 +910,7 @@ class Client:
         if self._executable is not None:
             return self._executable
         if self._cache_dir is None:
-            return os.fspath(managed_executable())
+            return os.fspath(bundled_executable())
         return os.fspath(managed_executable(cache_dir=self._cache_dir))
 
     def run(

@@ -6,7 +6,7 @@ on:
     paths:
       - 'docs/**'
       - 'sdk/README.md'
-      - 'sdk/python/README.md'
+      - 'sdk/python/README-PYTHON.md'
       - 'sdk/python/NATIVE_API.md'
       - 'theme/**'
       - 'book.toml'
