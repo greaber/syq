@@ -1,0 +1,36 @@
+name: reproducible builds
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.platform.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-24.04, name: syq-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, name: syq-linux-aarch64 }
+          - { os: macos-26, name: syq-macos-arm64 }
+          - { os: macos-26-intel, name: syq-macos-x86_64 }
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install checksum-pinned Nix
+        run: scripts/install-nix-ci.sh
+      - name: Build from locked inputs and smoke-test the executable
+        run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.platform.name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7

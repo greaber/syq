@@ -138,6 +138,53 @@ The Python build backend must come from the pinned `pyproject.toml`. Published
 wheels are stripped explicitly by release CI. For a standalone debug executable,
 `cargo build --locked` uses Cargo's development profile.
 
+## Reproduce a release binary
+
+The Nix recipe builds the standalone Linux x86-64/ARM64 and macOS Intel/Apple
+Silicon artifacts on a host of the same OS and architecture. The macOS
+executables retain deployment targets of 10.12 on Intel and 11.0 on Apple Silicon.
+Install [Nix](https://nix.dev/install-nix), check out the release tag you want to
+verify, and run:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#release --no-update-lock-file
+./result/bin/syq --build-identity
+```
+
+Use a tag that contains `flake.nix` and `flake.lock`. The lock pins the Rust
+compiler, C compiler, libraries, macOS SDK, and compression tools; `Cargo.lock`
+pins the Rust dependencies. Downloads happen while Nix prepares these inputs.
+Compilation uses the prepared inputs offline. Docker is not required, and the
+resulting executable runs without Nix installed.
+
+Compare `result/bin/syq` with the raw executable for your platform from that
+release; `result/bin/syq.gz` is its compressed asset. For example, after downloading
+`syq-linux-x86_64` into the current directory:
+
+```sh
+cmp result/bin/syq syq-linux-x86_64
+```
+
+A successful comparison means those files have identical bytes. To force another
+local compilation and have Nix compare it with the first output:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' build .#release --rebuild --no-update-lock-file
+```
+
+Release CI builds each target once with this recipe. Rebuilding and comparing
+an older release is a separate, manual check using that tag's locked inputs.
+The recipe uses compiler and dependency substitutes from Nix's cache as trusted
+inputs; it does not independently rebuild them.
+The release signature covers a separate manifest of artifact hashes, so you do
+not need a private signing key to reproduce the executable. See
+[code integrity](security.md#code-and-transport-integrity) for the trust boundary.
+
+This recipe deliberately enables release behavior and embeds the checked-in
+public verification key. Use the ordinary Cargo commands above for custom
+builds. Editing the source or updating either lock file changes the build inputs
+and is not a reproduction of the published release.
+
 ## Before a pull request
 
 For Rust changes, run:
