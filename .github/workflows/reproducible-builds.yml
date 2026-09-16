@@ -48,7 +48,10 @@ jobs:
       - name: Build from locked inputs and smoke-test the executable
         working-directory: source-${{ matrix.replica }}
         run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
+      # Retain candidate bytes if a smoke test fails, for diagnosis. The
+      # comparison and release jobs still require every build to succeed.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ !cancelled() }}
         with:
           name: candidate-${{ matrix.platform.name }}-${{ matrix.replica }}
           path: ${{ runner.temp }}/dist/*

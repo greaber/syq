@@ -48,9 +48,9 @@ else
     (command == "LC_BUILD_VERSION" && $1 == "minos") ||
     (command == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2 }')
   if [ "$(uname -m)" = arm64 ]; then
-    test "$minimum" = 11.0
+    test "$minimum" = 11.0 || { echo "Expected macOS 11.0, got $minimum" >&2; exit 1; }
     codesign --verify "$dist/$asset"
   else
-    test "$minimum" = 10.12
+    test "$minimum" = 10.12 || { echo "Expected macOS 10.12, got $minimum" >&2; exit 1; }
   fi
 fi
