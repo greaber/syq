@@ -165,7 +165,7 @@ jq -e --arg version "$version" 'any(.versions[]?; .num == $version) | not' <<<"$
   || die "syq $version is already published on crates.io"
 formula_json=$(gh api "repos/$HOMEBREW_REPOSITORY/contents/Formula/syq.rb")
 formula=$(jq -er .content <<<"$formula_json" | tr -d '\n' | openssl base64 -d -A)
-if grep -F "/releases/download/$tag/" <<<"$formula" >/dev/null; then
+if grep -F "/$tag/" <<<"$formula" >/dev/null; then
   die "Homebrew tap already references $tag"
 fi
 

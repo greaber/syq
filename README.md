@@ -24,7 +24,7 @@ Quick links to docs for common tasks:
 On Linux or macOS (x86-64 or ARM64):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh
 ```
 
 Installs into `~/.local/bin` without `sudo`; make sure it is on your `PATH`.

@@ -14,6 +14,7 @@ command -v jq >/dev/null || { echo "generate-homebrew-formula needs jq" >&2; exi
 version=$(jq -er '.version' "$manifest")
 tag=$(jq -er '.tag' "$manifest")
 repository=$(jq -er '.repository' "$manifest")
+download_base='https://dl.syq.christmas'
 test "$repository" = 'https://github.com/greaber/syq' || { echo "unexpected repository" >&2; exit 1; }
 
 asset() { jq -er --arg target "$1" '.artifacts[$target].binary.name' "$manifest"; }
@@ -37,20 +38,20 @@ class Syq < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "$repository/releases/download/$tag/$mac_arm_asset", using: :nounzip
+      url "$download_base/$tag/$mac_arm_asset", using: :nounzip
       sha256 "$mac_arm_hash"
     else
-      url "$repository/releases/download/$tag/$mac_x86_asset", using: :nounzip
+      url "$download_base/$tag/$mac_x86_asset", using: :nounzip
       sha256 "$mac_x86_hash"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "$repository/releases/download/$tag/$linux_arm_asset", using: :nounzip
+      url "$download_base/$tag/$linux_arm_asset", using: :nounzip
       sha256 "$linux_arm_hash"
     else
-      url "$repository/releases/download/$tag/$linux_x86_asset", using: :nounzip
+      url "$download_base/$tag/$linux_x86_asset", using: :nounzip
       sha256 "$linux_x86_hash"
     end
   end

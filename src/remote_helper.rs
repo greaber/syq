@@ -6,7 +6,7 @@
 //! the cached binary directly. On a miss, `conn` probes the target and either
 //! authorizes a release download or uploads a matching executable.
 
-pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
+pub const RELEASE_BASE_URL: &str = "https://dl.syq.christmas";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
 /// Direct download could not be used, but installing an uploaded helper may work.

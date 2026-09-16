@@ -46,8 +46,10 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
 ## Encrypted release inventory
 
 The committed `.env.release` file is the canonical release-credential
-inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64` and
-`HOMEBREW_TAP_DEPLOY_KEY`, plus the corresponding public
+inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64`,
+`HOMEBREW_TAP_DEPLOY_KEY`, and the `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` that deploy the download host in
+[`infra/syq-dl/`](infra/syq-dl/README.md), plus the corresponding public
 `SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
 gitignored `.env.keys`. Forks receive the ciphertext but neither the
 decryption key nor official publishing authority.
@@ -288,7 +290,7 @@ release request does not require another preparation PR or another test run.
 
    ```sh
    gh attestation verify syq-linux-x86_64 --repo greaber/syq
-   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh -o install.sh
+   curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh -o install.sh
    less install.sh
    sh install.sh --bin-dir "$(mktemp -d)"
    brew install greaber/tap/syq

@@ -1,8 +1,9 @@
 //! Signed standalone release updates and remote-helper artifact verification.
 //!
 //! Package-manager and source installs deliberately have no install receipt,
-//! so this module will never replace them. Official release builds embed the
-//! Ed25519 public key supplied by the release workflow at compile time.
+//! so this module will never replace them; Homebrew installs still receive
+//! update reminders that point at `brew upgrade`. Official release builds embed
+//! the Ed25519 public key supplied by the release workflow at compile time.
 
 use crate::remote_helper::Target;
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,8 +22,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const REPOSITORY: &str = "https://github.com/greaber/syq";
-const RELEASE_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/download";
-const LATEST_DOWNLOADS: &str = "https://github.com/greaber/syq/releases/latest/download";
+/// Maintainer-run download host. It records each request and redirects to
+/// the GitHub release asset; the signed manifest verified below is what makes
+/// the bytes trustworthy, not the host.
+const RELEASE_DOWNLOADS: &str = "https://dl.syq.christmas";
+const LATEST_DOWNLOADS: &str = "https://dl.syq.christmas/latest";
 const MANIFEST_NAME: &str = "syq-release-manifest.json";
 const RECEIPT_SCHEMA: u32 = 1;
 const MANIFEST_SCHEMA: u32 = 1;
@@ -180,7 +184,7 @@ pub fn after_success(quiet: bool) {
     if !should_check_for_updates(
         quiet,
         std::io::stderr().is_terminal(),
-        std::env::var_os("SYQ_NO_UPDATE_CHECK").is_some(),
+        update_checks_disabled(),
     ) {
         return;
     }
@@ -190,9 +194,9 @@ pub fn after_success(quiet: bool) {
     if !check_is_due(&stamp) {
         return;
     }
-    if managed_receipt().is_err() {
+    let Some(install) = reminded_install() else {
         return;
-    }
+    };
     // Mark before networking so an outage does not delay every invocation.
     if touch_check_stamp(&stamp).is_err() {
         return;
@@ -208,13 +212,61 @@ pub fn after_success(quiet: bool) {
         return;
     }
     crate::output::diagnostic!(
-        "syq: update {} is available; run `syq --self-update`",
-        release.version
+        "syq: update {} is available; run `{}`",
+        release.version,
+        install.upgrade_command()
     );
+}
+
+/// Installations that receive update reminders, each with its own upgrade
+/// command. Source builds have neither a receipt nor a Homebrew path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemindedInstall {
+    Standalone,
+    Homebrew,
+}
+
+impl RemindedInstall {
+    fn upgrade_command(self) -> &'static str {
+        match self {
+            RemindedInstall::Standalone => "syq --self-update",
+            RemindedInstall::Homebrew => "brew upgrade syq",
+        }
+    }
+}
+
+fn reminded_install() -> Option<RemindedInstall> {
+    if managed_receipt().is_ok() {
+        return Some(RemindedInstall::Standalone);
+    }
+    let executable = canonical_current_exe().ok()?;
+    is_homebrew_keg_path(&executable).then_some(RemindedInstall::Homebrew)
+}
+
+/// Homebrew installs the formula's binary as `<prefix>/Cellar/syq/<version>/bin/syq`
+/// and links it from `<prefix>/bin`, so the resolved executable path identifies
+/// a Homebrew install without any receipt.
+fn is_homebrew_keg_path(executable: &Path) -> bool {
+    let components: Vec<&std::ffi::OsStr> = executable
+        .components()
+        .map(|component| component.as_os_str())
+        .collect();
+    matches!(
+        components.as_slice(),
+        [.., cellar, formula, _version, bin, name]
+            if *cellar == "Cellar" && *formula == "syq" && *bin == "bin" && *name == "syq"
+    )
 }
 
 fn should_check_for_updates(quiet: bool, stderr_is_terminal: bool, disabled: bool) -> bool {
     !quiet && stderr_is_terminal && !disabled
+}
+
+/// `SYQ_NO_UPDATE_CHECK` is syq's own switch; `DO_NOT_TRACK` is the shared
+/// console convention, honored because the check reaches a maintainer-run host.
+fn update_checks_disabled() -> bool {
+    std::env::var_os("SYQ_NO_UPDATE_CHECK").is_some()
+        || std::env::var_os("DO_NOT_TRACK").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// Return the artifact metadata for this exact release after verifying its
@@ -716,13 +768,21 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
         .build()
         .new_agent();
 
+    // Lets the download host count requests by platform and tell background
+    // reminder checks from explicit updates, without any identifier.
+    let target = crate::remote_helper::Target::local().map(|target| target.key);
+    let purpose = match mode {
+        FetchMode::BackgroundCheck => "check",
+        FetchMode::Interactive => "interactive",
+    };
     let mut last_error = None;
     for attempt in 0..attempts {
         let result = (|| -> Result<()> {
-            let mut response = agent
-                .get(url)
-                .call()
-                .with_context(|| format!("request {url}"))?;
+            let mut request = agent.get(url).header("x-syq-purpose", purpose);
+            if let Some(target) = target {
+                request = request.header("x-syq-target", target);
+            }
+            let mut response = request.call().with_context(|| format!("request {url}"))?;
             let file = destination.writer()?;
             let mut file = BufWriter::new(file);
             copy_bounded(&mut response.body_mut().as_reader(), &mut file, limit)
@@ -1134,6 +1194,35 @@ mod tests {
         assert!(!was_standalone_install(&binary).unwrap());
         fs::write(&path, b"malformed receipt").unwrap();
         assert!(!was_standalone_install(&binary).unwrap());
+    }
+
+    #[test]
+    fn homebrew_kegs_are_recognized_by_their_cellar_path() {
+        for path in [
+            "/opt/homebrew/Cellar/syq/0.6.0/bin/syq",
+            "/usr/local/Cellar/syq/0.6.0/bin/syq",
+            "/home/linuxbrew/.linuxbrew/Cellar/syq/0.6.0/bin/syq",
+        ] {
+            assert!(is_homebrew_keg_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/opt/homebrew/bin/syq",
+            "/home/user/.local/bin/syq",
+            "/opt/homebrew/Cellar/other/1.0/bin/syq",
+            "/srv/Cellar/syq",
+            "/opt/homebrew/Cellar/syq/0.6.0/syq",
+            "/home/Cellar/syq/tools/bin/rsync",
+        ] {
+            assert!(!is_homebrew_keg_path(Path::new(path)), "{path}");
+        }
+        assert_eq!(
+            RemindedInstall::Homebrew.upgrade_command(),
+            "brew upgrade syq"
+        );
+        assert_eq!(
+            RemindedInstall::Standalone.upgrade_command(),
+            "syq --self-update"
+        );
     }
 
     #[test]
