@@ -5994,6 +5994,98 @@ fn checksum_repairs_silent_corruption() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn hash_policy_verify_only_expected_mismatch_exits() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--verify-only",
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--results",
+            &t.s("results.ndjson"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    let output = wait_for_control_path_output(child);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("expected md5 hash"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read(&t.path("destination")), b"abc");
+    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+    let terminal: serde_json::Value =
+        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "partial");
+}
+
+#[test]
+fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    let copy = |results: &str| {
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--preserve=permissions",
+            "--expected-hash",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+            "--results",
+            &t.s(results),
+        ]);
+        assert_output_ok(&output);
+        let records = fs::read_to_string(t.path(results)).unwrap();
+        serde_json::from_str::<serde_json::Value>(records.lines().last().unwrap()).unwrap()
+    };
+    let summary = copy("match.jsonl");
+    assert_eq!(summary["files_unchanged"], 1);
+    assert_eq!(summary["bytes_transferred"], 0);
+    let metadata = fs::metadata(t.path("destination")).unwrap();
+    assert_eq!(metadata.ino(), inode, "matching destination was replaced");
+    assert_eq!(metadata.mode() & 0o777, 0o640);
+    // Equal size and mtime must not hide differing bytes.
+    write(&t.path("destination"), b"bad");
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    let summary = copy("repair.jsonl");
+    assert_eq!(summary["bytes_transferred"], 3);
+    assert_eq!(read(&t.path("destination")), b"abc");
+    // --hash must still compare source contents even when the expectation
+    // matches the destination and metadata agrees.
+    write(&t.path("source"), b"bad");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    let output = native_syq(&[
+        "cp",
+        "--hash",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        "md5:900150983cd24fb0d6963f7d28e17f72",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("destination")), b"abc");
+}
+
+#[test]
 fn hash_policy_expected_mismatch_preserves_destination() {
     for size in [3, 5 * 1024 * 1024] {
         let t = Tmp::new();

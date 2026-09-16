@@ -185,6 +185,29 @@ pub struct Opts {
 }
 
 impl Opts {
+    fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
+        let mut changes = 0;
+        if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
+            changes |= flags::MODE;
+        }
+        if self.flags & flags::OWNER != 0 && source.uid != destination.uid {
+            changes |= flags::OWNER;
+        }
+        if self.flags & flags::GROUP != 0 && source.gid != destination.gid {
+            changes |= flags::GROUP;
+        }
+        changes
+    }
+
+    fn metadata_matches(&self, source: &Entry, destination: &Entry) -> bool {
+        destination.kind == Kind::File
+            && destination.size == source.size
+            && self.flags & flags::TIMES != 0
+            && destination.mtime == source.mtime
+            && (!self.precise_mtime
+                || destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec))
+    }
+
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
         self.mapping_expected_digests
             .get(path)
@@ -6362,13 +6385,9 @@ impl Planner<'_> {
                     {
                         continue;
                     }
-                    let same = dst_entry.as_ref().is_some_and(|d| {
-                        d.kind == Kind::File
-                            && d.size == e.size
-                            && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
-                            && (!opts.precise_mtime
-                                || destination_fraction_matches(e.mtime_nsec, d.mtime_nsec))
-                    });
+                    let same = dst_entry
+                        .as_ref()
+                        .is_some_and(|d| opts.metadata_matches(&e, d));
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {
                             d.kind == Kind::File
@@ -6396,16 +6415,7 @@ impl Planner<'_> {
                         // (mode/owner/group) the way rsync does — a skipped file
                         // shouldn't keep stale permissions.
                         if let Some(d) = &dst_entry {
-                            let mut ff = 0u8;
-                            if opts.flags & flags::MODE != 0 && d.mode & 0o7777 != e.mode & 0o7777 {
-                                ff |= flags::MODE;
-                            }
-                            if opts.flags & flags::OWNER != 0 && d.uid != e.uid {
-                                ff |= flags::OWNER;
-                            }
-                            if opts.flags & flags::GROUP != 0 && d.gid != e.gid {
-                                ff |= flags::GROUP;
-                            }
+                            let ff = opts.metadata_fix_flags(&e, d);
                             if ff != 0 {
                                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                                 self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
@@ -8184,6 +8194,30 @@ impl Worker {
         let opts = self.opts.clone();
         let _ = &opts;
 
+        match self.try_expected_match(&job) {
+            Ok(true) => {
+                job.done.store(size, Relaxed);
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                self.progress.bytes_total.fetch_sub(size, Relaxed);
+                self.sched.ranges_ready(idx, vec![]);
+                if let Err(error) = self.finish_matched_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, true);
+                    }
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.sched.ranges_ready(idx, vec![]);
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
+                return Err(error);
+            }
+        }
+
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
@@ -9025,6 +9059,57 @@ impl Worker {
         Ok(())
     }
 
+    // Keep digest reads in workers so one large file cannot stall directory
+    // planning. A failed check takes the normal repair path; publication still
+    // validates the expected digest. Explicit --hash continues to compare both
+    // endpoints regardless of matching metadata or an expected digest.
+    fn try_expected_match(&mut self, job: &WorkerJob) -> Result<bool> {
+        let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() else {
+            return Ok(false);
+        };
+        let Some(destination) = job.dst_entry.as_deref() else {
+            return Ok(false);
+        };
+        if self.opts.checksum || !self.opts.metadata_matches(&job.entry, destination) {
+            return Ok(false);
+        }
+        match self.dst.call(Request::ValidateDigest {
+            path: job.dst.clone(),
+            expected,
+            guard: job.container_guard.clone(),
+        })? {
+            Response::Ok => {}
+            Response::Err(_) | Response::EndpointError(_) => return Ok(false),
+            other => bail!("unexpected response validating destination digest: {other:?}"),
+        }
+        // Preserve the ordinary quick check's metadata reconciliation and
+        // require the same destination inode observed by the planner.
+        let response = ok(
+            self.dst.call(Request::Apply {
+                ops: vec![Op::SetFileMetaIfSame {
+                    path: job.dst.clone(),
+                    condition: match job.target_condition {
+                        TargetCondition::Any => target_identity(destination),
+                        condition => condition,
+                    },
+                    meta: job.entry.meta(),
+                    flags: self.opts.metadata_fix_flags(&job.entry, destination),
+                }],
+                guard: job.container_guard.clone(),
+            })?,
+            "update metadata after expected digest match",
+        )?;
+        match response {
+            Response::Applied(results) if results.len() == 1 => {
+                if let Some(error) = &results[0] {
+                    bail!("update metadata after expected digest match: {error}");
+                }
+            }
+            other => bail!("unexpected metadata response: {other:?}"),
+        }
+        Ok(true)
+    }
+
     fn validate_expected_destination(&mut self, job: &WorkerJob) -> Result<()> {
         if let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() {
             ok(
@@ -9041,9 +9126,9 @@ impl Worker {
 
     fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
-        self.validate_expected_destination(&job)?;
 
         let r = (|| -> Result<bool> {
+            self.validate_expected_destination(&job)?;
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
                 source: self.source_reference(&job),

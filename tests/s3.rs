@@ -224,6 +224,28 @@ fn serve(
         ("x-amz-meta-syq-mtime-nsec".into(), "0".into()),
         ("x-amz-meta-syq-blake3".into(), hash),
     ];
+    if fault.starts_with("single-upload-") {
+        if fault == "single-upload-nohash" {
+            fields.retain(|(key, _)| key != "x-amz-meta-syq-blake3");
+        }
+        if method == "PUT" {
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            gate.0.store(true, Ordering::Release);
+            reply(
+                &mut socket,
+                200,
+                &[("ETag".into(), "\"replaced\"".into())],
+                b"",
+                false,
+            );
+            return;
+        }
+        if method == "GET" {
+            gate.1.store(true, Ordering::Release);
+        }
+    }
     if fault.starts_with("prefix-") {
         let target = first.split_whitespace().nth(1).unwrap();
         let path = target.split('?').next().unwrap();
@@ -1051,4 +1073,78 @@ fn s3_dry_run_does_not_validate_expected_hash() {
         output_text(&output)
     );
     assert_eq!(std::fs::read(destination).unwrap(), vec![b'x'; 65536]);
+}
+
+#[test]
+fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
+    for (fault, algorithm, changed) in [
+        ("single-upload-nohash", "blake3", false),
+        ("single-upload-otherhash", "sha256", false),
+        ("single-upload-nohash", "blake3", true),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::write(&source, vec![if changed { b'y' } else { b'x' }; 65536]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+            .unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--hash",
+                "--hash-algorithm",
+                algorithm,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert!(
+            server.gate.1.load(Ordering::Acquire),
+            "{fault}: --hash did not compare object contents"
+        );
+        assert_eq!(
+            server.gate.0.load(Ordering::Acquire),
+            changed,
+            "{fault}: unchanged object was uploaded again"
+        );
+    }
+}
+
+#[test]
+fn s3_review_verify_only_reports_expected_hash_mismatch() {
+    let server = Server::start("single-ok");
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("result"), vec![b'x'; 65536]).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--verify-only",
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "result",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    let message = output_text(&output);
+    assert!(message.contains("expected md5 hash"), "{message}");
+    assert!(
+        !message.contains("file missing, type differs, or size differs"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("result")).unwrap(),
+        vec![b'x'; 65536]
+    );
 }

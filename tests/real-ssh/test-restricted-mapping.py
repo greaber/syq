@@ -44,6 +44,10 @@ def hashing(root, source, temporary):
         command = ["syq", "cp", "--no-progress", "-j", "1", str(local), "--to", "destination", "--as", destination,
                    "--hash-algorithm", "xxh3-128", "--transfer-integrity", "--tuning-options", "copy-path=ranges"] + flags
         run(command + ["--expected-hash", "sha256:" + sha256])
+        results = str(Path(temporary) / ("hash-repeat-" + name + ".ndjson"))
+        run(command + ["--expected-hash", "sha256:" + sha256, "--results", results])
+        summary = json.loads(Path(results).read_text().splitlines()[-1])
+        assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
         # --hash forces selected-algorithm comparison on the existing file.
         run(command + ["--hash", "--expected-hash", "md5:" + md5])
         run(command + ["--expected-hash", "md5:" + wrong_md5], expected=23)
@@ -61,6 +65,10 @@ def hashing(root, source, temporary):
                "--mapping", "-", "--to", "destination", "--into", destination,
                "--hash-algorithm", "xxh3-128", "--transfer-integrity"]
     run(command, data=manifest(selected, expected))
+    results = str(Path(temporary) / "hash-repeat-signed.ndjson")
+    run(command + ["--results", results], data=manifest(selected, expected))
+    summary = json.loads(Path(results).read_text().splitlines()[-1])
+    assert summary["files_unchanged"] == 1 and summary["bytes_transferred"] == 0, summary
     wrong = {"algorithm": "sha256", "value": hashlib.sha256(b"different bytes").hexdigest()}
     run(command, data=manifest(selected, wrong), expected=23)
     ssh("destination", f"from pathlib import Path; assert (Path({destination!r})/'checked').read_bytes()==b'mapped contents'")

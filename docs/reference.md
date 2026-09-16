@@ -340,6 +340,8 @@ cryptographic collision resistance.
 Syq's extra payload checksums are opt-in with `--transfer-integrity`. This is
 independent of encryption: SSH and encrypted TCP retain their transport
 protection, and `--tcp-plain` does not enable payload checksums automatically.
+Enabling it also sends same-host copies through checked userspace blocks,
+disabling kernel copy offload and whole-file copy shortcuts.
 Comparisons for `--hash`, verification, and reuse of existing data still hash
 contents when needed, even without `--transfer-integrity`.
 
@@ -351,7 +353,9 @@ syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e1
 ```
 
 This checks all resulting bytes, including reused data, before reporting success;
-a metadata match alone is insufficient. A mismatch fails that file. With normal
+a metadata match alone is insufficient. When size and modification time match,
+syq validates the existing destination and skips copying if its digest matches.
+Otherwise it copies and validates the result; a mismatch fails that file. With normal
 staging, validation happens before replacing the destination. With `--inplace`,
 the file has already been modified when validation finishes. Use
 [per-file mapping expectations](mappings.md#the-format) for a batch. Selection

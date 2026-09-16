@@ -519,7 +519,8 @@ impl Engine {
             o.kind() == source.kind()
                 && o.size == size
                 && o.metadata.as_ref().is_some_and(|m| {
-                    (whole_digest.is_none()
+                    (self.args.checksum
+                        || whole_digest.is_none()
                         || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm))
                         && m.mtime == metadata.mtime
                         && m.nsec == metadata.nsec
@@ -1253,17 +1254,22 @@ impl Engine {
                 unchanged = m.mtime == metadata.mtime && m.mtime_nsec == metadata.nsec;
             }
         }
+        if self.args.verify_only {
+            if !unchanged {
+                if existing.is_some_and(|m| m.is_file() && m.len == object.size) {
+                    bail!("verification failed: contents differ");
+                }
+                bail!("verification failed: file missing, type differs, or size differs");
+            }
+            self.verify_expected_local(root, &path, expected_digest)
+                .await?;
+            return Ok(None);
+        }
         if unchanged && expected_digest.is_some() {
             unchanged = self
                 .verify_expected_local(root, &path, expected_digest)
                 .await
                 .is_ok();
-        }
-        if self.args.verify_only {
-            if !unchanged {
-                bail!("verification failed: file missing, type differs, or size differs");
-            }
-            return Ok(None);
         }
         if unchanged {
             if !self.args.dry_run {

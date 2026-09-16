@@ -1921,13 +1921,7 @@ impl FsOps {
                 if bytes.len() != file.data.len() {
                     return Ok(None);
                 }
-                let source_hash = if self.hash_policy.transfer_integrity {
-                    // Already validated against the incoming bytes above.
-                    file.hash
-                } else {
-                    self.observed_content_hash(&file.data)
-                };
-                Ok((self.observed_content_hash(&bytes) == source_hash).then_some((target, opened)))
+                Ok((bytes == file.data).then_some((target, opened)))
             })();
             match check {
                 Ok(Some(held)) => {
