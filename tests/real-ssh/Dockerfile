@@ -8,9 +8,12 @@ COPY schemas ./schemas
 COPY src ./src
 # The second PATH fixture has a real distinct identity and return wire version.
 # It must hand off before making anything beyond a stable readiness probe.
+# Reused build caches can contain newer timestamps from another checkout.
+# Rebuild this package, including its identity build script; keep dependency artifacts.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --bin syq \
+    cargo clean -p syq \
+    && cargo build --locked --bin syq \
     && cp target/debug/syq /tmp/syq \
     && printf '%s\n' '{"git":{"sha1":"1234567890abcdef1234567890abcdef12345678"}}' > .cargo_vcs_info.json \
     && sed -i 's/^const VERSION: u16 = 2;/const VERSION: u16 = 65500;/' src/destination.rs \
