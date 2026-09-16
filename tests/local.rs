@@ -4691,6 +4691,13 @@ fn source_build_can_download_helpers_without_installing_a_command() {
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
         assert!(cached_remote_helper(&t).exists());
         assert!(!t.path("remote-home/.local/bin/syq").exists());
+        if upload {
+            // Falling back must download a verified release locally, not send
+            // the source executable merely because it is the same platform.
+            assert!(cached_local_helper(&t).exists());
+        } else {
+            assert!(!read(&t.path("curl.log")).is_empty());
+        }
     }
 }
 
