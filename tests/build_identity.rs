@@ -44,6 +44,21 @@ fn packaged_provenance_and_helper_selection() {
                 .status()
                 .unwrap()
                 .success());
+            assert!(Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=SDK test",
+                    "-c",
+                    "user.email=sdk-test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "enclosing checkout"
+                ])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success());
             fs::write(root.path().join("unrelated"), "unrelated edits").unwrap();
         }
         let output = run(None, false);
