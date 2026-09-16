@@ -216,7 +216,8 @@ impl Opts {
     fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
         crate::copy_policy::CopyPolicy {
             same_host: self.same_host,
-            checksum: self.checksum || self.hash_policy.transfer_integrity,
+            // Payload checks do not disable same-host copy shortcuts.
+            checksum: self.checksum,
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
         }

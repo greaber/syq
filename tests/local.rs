@@ -6085,6 +6085,55 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     assert_eq!(read(&t.path("destination")), b"abc");
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
+    let t = Tmp::new();
+    let contents = prng(5 << 20, 993);
+    write(&t.path("source"), &contents);
+    let correct = format!("blake3:{}", blake3::hash(&contents).to_hex());
+    let wrong = format!("blake3:{}", "0".repeat(64));
+    for (name, expected, succeeds) in [
+        ("plain", None, true),
+        ("expected", Some(correct.as_str()), true),
+        ("mismatch", Some(wrong.as_str()), false),
+    ] {
+        write(&t.path(name), b"previous contents");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s(name),
+            "--transfer-integrity",
+            "--hash-algorithm=xxh3-128",
+        ]);
+        if let Some(expected) = expected {
+            command.args(["--expected-hash", expected]);
+        }
+        let output = command
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+            .run()
+            .unwrap();
+        if succeeds {
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path(name)), contents);
+            let observed = tuning_observed(&output);
+            assert_eq!(observed["local_whole_files"], 1);
+            assert_eq!(observed["range_requests"], 0);
+        } else {
+            assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+            assert!(
+                stderr_of(&output).contains("expected blake3 hash"),
+                "{}",
+                stderr_of(&output)
+            );
+            assert_eq!(read(&t.path(name)), b"previous contents");
+        }
+    }
+}
+
 #[test]
 fn hash_policy_expected_mismatch_preserves_destination() {
     for size in [3, 5 * 1024 * 1024] {

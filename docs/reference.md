@@ -340,8 +340,8 @@ cryptographic collision resistance.
 Syq's extra payload checksums are opt-in with `--transfer-integrity`. This is
 independent of encryption: SSH and encrypted TCP retain their transport
 protection, and `--tcp-plain` does not enable payload checksums automatically.
-Enabling it also sends same-host copies through checked userspace blocks,
-disabling kernel copy offload and whole-file copy shortcuts.
+Same-host copies keep their kernel-copy and whole-file shortcuts. Use
+`--expected-hash` when you need to validate the complete local result.
 Comparisons for `--hash`, verification, and reuse of existing data still hash
 contents when needed, even without `--transfer-integrity`.
 
