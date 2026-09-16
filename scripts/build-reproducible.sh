@@ -27,8 +27,8 @@ chmod 755 "$dist/$asset"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 printf 'reproducible syq smoke test\n' > "$work/source"
-"$dist/$asset" "$work/source" "$work/destination"
-cmp "$work/source" "$work/destination"
+"$dist/$asset" cp "$work/source" --into "$work/destination"
+cmp "$work/source" "$work/destination/source"
 if [ "$(uname -s)" = Linux ]; then
   # A release must run without a Nix installation or a dynamic ELF loader.
   if readelf -l "$dist/$asset" | grep 'INTERP'; then

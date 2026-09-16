@@ -15,6 +15,7 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'scripts/build-reproducible.sh'
+      - 'scripts/install-nix-ci.sh'
       - '.github/workflows/reproducible-builds.yml'
       - '.github/workflows/release.yml'
 
@@ -41,12 +42,9 @@ jobs:
           persist-credentials: false
           # Deliberately vary the checkout location between independent jobs.
           path: source-${{ matrix.replica }}
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-        with:
-          enable_kvm: false
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            always-allow-substitutes = false
+      - name: Install checksum-pinned Nix
+        working-directory: source-${{ matrix.replica }}
+        run: scripts/install-nix-ci.sh
       - name: Build from locked inputs and smoke-test the executable
         working-directory: source-${{ matrix.replica }}
         run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
