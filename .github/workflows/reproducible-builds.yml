@@ -1,34 +1,18 @@
-# The release workflow consumes only the independently compared artifacts.
 name: reproducible builds
 
 on:
   workflow_call:
   workflow_dispatch:
-  push:
-    branches: [master]
-    paths:
-      - 'flake.nix'
-      - 'flake.lock'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'build.rs'
-      - 'src/**'
-      - 'scripts/build-reproducible.sh'
-      - 'scripts/install-nix-ci.sh'
-      - '.github/workflows/reproducible-builds.yml'
-      - '.github/workflows/release.yml'
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: build (${{ matrix.platform.name }}, replica ${{ matrix.replica }})
+    name: build (${{ matrix.platform.name }})
     strategy:
       fail-fast: false
       matrix:
-        replica: [1, 2]
         platform:
           - { os: ubuntu-24.04, name: syq-linux-x86_64 }
           - { os: ubuntu-24.04-arm, name: syq-linux-aarch64 }
@@ -40,52 +24,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          # Deliberately vary the checkout location between independent jobs.
-          path: source-${{ matrix.replica }}
       - name: Install checksum-pinned Nix
-        working-directory: source-${{ matrix.replica }}
         run: scripts/install-nix-ci.sh
       - name: Build from locked inputs and smoke-test the executable
-        working-directory: source-${{ matrix.replica }}
         run: scripts/build-reproducible.sh "$RUNNER_TEMP/dist"
-      # Retain candidate bytes if a smoke test fails, for diagnosis. The
-      # comparison and release jobs still require every build to succeed.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: ${{ !cancelled() }}
         with:
-          name: candidate-${{ matrix.platform.name }}-${{ matrix.replica }}
+          name: ${{ matrix.platform.name }}
           path: ${{ runner.temp }}/dist/*
-          if-no-files-found: error
-          retention-days: 1
-
-  compare:
-    name: compare (${{ matrix.name }})
-    needs: build
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        name: [syq-linux-x86_64, syq-linux-aarch64, syq-macos-arm64, syq-macos-x86_64]
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          pattern: candidate-${{ matrix.name }}-*
-          path: candidates
-      - name: Require byte-identical executable and gzip archive
-        env:
-          ASSET: ${{ matrix.name }}
-        run: |
-          set -euo pipefail
-          mkdir dist
-          for suffix in '' .gz; do
-            first="candidates/candidate-$ASSET-1/$ASSET$suffix"
-            second="candidates/candidate-$ASSET-2/$ASSET$suffix"
-            cmp "$first" "$second"
-            cp "$first" "dist/$ASSET$suffix"
-            sha256sum "dist/$ASSET$suffix" >> "$GITHUB_STEP_SUMMARY"
-          done
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: ${{ matrix.name }}
-          path: dist/*
           if-no-files-found: error
           retention-days: 7

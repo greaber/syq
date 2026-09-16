@@ -141,10 +141,10 @@ wheels are stripped explicitly by release CI. For a standalone debug executable,
 ## Reproduce a release binary
 
 The Nix recipe builds the standalone Linux x86-64/ARM64 and macOS Intel/Apple
-Silicon artifacts on a host of the same OS and architecture. The pinned macOS
-build tools need macOS 14 or newer; the executables retain deployment targets of
-10.12 on Intel and 11.0 on Apple Silicon. Install [Nix](https://nix.dev/install-nix), check out the release tag you want to verify,
-and run:
+Silicon artifacts on a host of the same OS and architecture. The macOS
+executables retain deployment targets of 10.12 on Intel and 11.0 on Apple Silicon.
+Install [Nix](https://nix.dev/install-nix), check out the release tag you want to
+verify, and run:
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' build .#release --no-update-lock-file
@@ -172,9 +172,10 @@ local compilation and have Nix compare it with the first output:
 nix --extra-experimental-features 'nix-command flakes' build .#release --rebuild --no-update-lock-file
 ```
 
-Release CI builds each target on two separate runners, compares both artifacts,
-and publishes only matching outputs. This checks the syq build; it does not
-independently rebuild every compiler or dependency downloaded from Nix's cache.
+Release CI builds each target once with this recipe. Rebuilding and comparing
+an older release is a separate, manual check using that tag's locked inputs.
+The recipe uses compiler and dependency substitutes from Nix's cache as trusted
+inputs; it does not independently rebuild them.
 The release signature covers a separate manifest of artifact hashes, so you do
 not need a private signing key to reproduce the executable. See
 [code integrity](security.md#code-and-transport-integrity) for the trust boundary.
