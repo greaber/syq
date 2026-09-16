@@ -26,6 +26,9 @@ from .errors import SyqError
 _DOWNLOAD_TIMEOUT_SECONDS = 30
 _CHUNK_SIZE = 1024 * 1024
 _EXPECTED_REPOSITORY = "https://github.com/greaber/syq"
+# Maintainer-run download host; it records each request and serves the GitHub
+# release asset. The packaged manifest hashes are what make the bytes trusted.
+_DOWNLOAD_HOST = "https://dl.syq.christmas"
 
 
 class SyqInstallError(SyqError, RuntimeError):
@@ -182,7 +185,13 @@ def _copy_bounded(
 
 
 def _download_archive(url: str, destination: Path, artifact: _Artifact) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "syq-python-sdk"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"syq-python-sdk/{PINNED_SYQ_VERSION}",
+            "X-Syq-Target": artifact.target,
+        },
+    )
     try:
         with urllib.request.urlopen(
             request, timeout=_DOWNLOAD_TIMEOUT_SECONDS
@@ -298,7 +307,7 @@ def managed_executable(
             ) from error
         return executable
 
-    base_url = f"{manifest['repository']}/releases/download/{manifest['tag']}"
+    base_url = f"{_DOWNLOAD_HOST}/{manifest['tag']}"
     url = f"{base_url}/{artifact.archive_name}"
     archive_path: Path | None = None
     binary_path: Path | None = None

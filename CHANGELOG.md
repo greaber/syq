@@ -7,7 +7,8 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
 ## Unreleased
 
 - Release downloads, the installer, the Homebrew formula, the remote helper
-  bootstrap, and the daily update reminder check now use `dl.syq.christmas`,
+  bootstrap, the Python SDK's managed install, and the daily update reminder
+  check now use `dl.syq.christmas`,
   a maintainer-run host that counts requests by version, platform, and
   country before redirecting to the GitHub release files. The reminder check
   also honors `DO_NOT_TRACK=1`. See the install guide for what is recorded.

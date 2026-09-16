@@ -768,12 +768,17 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
         .build()
         .new_agent();
 
-    // Lets the download host count checks by platform without an identifier.
+    // Lets the download host count requests by platform and tell background
+    // reminder checks from explicit updates, without any identifier.
     let target = crate::remote_helper::Target::local().map(|target| target.key);
+    let purpose = match mode {
+        FetchMode::BackgroundCheck => "check",
+        FetchMode::Interactive => "interactive",
+    };
     let mut last_error = None;
     for attempt in 0..attempts {
         let result = (|| -> Result<()> {
-            let mut request = agent.get(url);
+            let mut request = agent.get(url).header("x-syq-purpose", purpose);
             if let Some(target) = target {
                 request = request.header("x-syq-target", target);
             }

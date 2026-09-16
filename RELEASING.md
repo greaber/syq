@@ -290,7 +290,7 @@ release request does not require another preparation PR or another test run.
 
    ```sh
    gh attestation verify syq-linux-x86_64 --repo greaber/syq
-   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh -o install.sh
+   curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh -o install.sh
    less install.sh
    sh install.sh --bin-dir "$(mktemp -d)"
    brew install greaber/tap/syq
