@@ -33,10 +33,10 @@ libraries. Syq reports the failure instead of substituting a released helper.
 
 To use official helpers instead of uploading your executable, set
 `SYQ_HELPER_RELEASE` when compiling. It must equal `v` followed by the version in
-`Cargo.toml`; for example, for source version 0.6.0:
+`Cargo.toml`. Replace `vX.Y.Z` below with that release version:
 
 ```sh
-SYQ_HELPER_RELEASE=v0.6.0 cargo build --locked --release
+SYQ_HELPER_RELEASE=vX.Y.Z cargo build --locked --release
 ```
 
 This is a build-time choice. It lets a source-built client use verified official
@@ -48,7 +48,8 @@ Choosing it asserts that your source is compatible with that release, including
 its wire protocol and shared state. Use it for unchanged release source or changes
 you know preserve compatibility. A fork with protocol or state changes should
 use its own helpers. Matching the package version alone does not establish
-compatibility.
+compatibility: an unreleased checkout can have protocol changes before its
+version number changes.
 
 `--build-identity` then reports the selected release identity. This identifies
 compatibility; it does not certify that your executable is an official artifact
