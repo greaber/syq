@@ -246,6 +246,27 @@ another agent, and the reviewer's job is to find possible issues with the work. 
 issues raised by the reviewer might actually best be addressed by doing nothing even
 though the reviewer was not wrong about how the code works.
 
+## Reviewing scope the user did not request
+
+A pull request description and its commit messages are the implementing
+agent's own account of the work. They show what the agent intended; they are
+not evidence that the user asked for or agreed to it. The user often has not
+seen the change before the review.
+
+When reviewing, separate what the task called for from what the PR adds
+beyond it: new workflows or triggers, recurring CI or hosting cost, new
+policy or defaults, broadened guarantees, or behavior in unrelated areas.
+Report each such addition at the top of the review as a decision for the
+user, stating its cost or consequence, even when the PR explains it and even
+when the implementation is sound. Do not file it as a deliberate choice that
+needs no action. The user decides whether the expansion stays; "the PR says
+it is intentional" is not that decision.
+
+The rationale in 2026-09: a review noted that a release-tooling PR had added
+eight uncached builds on every source push to `master`, but treated it as
+deliberate because the PR body described it. The user had never authorized or
+known about it.
+
 ## PR review freshness
 
 - For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName`, `headRefOid`, and head-repository identity (owner and repository) first. Treat the GitHub `headRefOid` as authoritative unless a fresher local commit is verified as described below.
