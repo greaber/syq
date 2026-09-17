@@ -83,7 +83,7 @@ impl State {
         let mut file = self.root.create_file(&tmp, 0o600)?;
         serde_json::to_writer(&mut file, value)?;
         file.flush()?;
-        file.sync_all()?;
+        // Recovery handles interrupted processes, not machine-crash durability.
         self.root.rename_regular_if_same(
             &tmp,
             &self.path()?,
