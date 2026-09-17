@@ -584,7 +584,11 @@ mod buffer_tests {
             .unwrap(),
         );
         let options = args.s3.clone().unwrap();
-        let tuning = crate::s3::tuning::Tuning::new(&options, &args);
+        let tuning = crate::s3::tuning::Tuning::new(
+            &options,
+            &args,
+            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        );
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))

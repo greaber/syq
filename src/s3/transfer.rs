@@ -104,13 +104,14 @@ impl Engine {
             .endpoint
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let (client, note) = client::connect(&mut options).await?;
+        let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (client, note) = client::connect(&mut options, control.clone()).await?;
         if let Some(note) = note.filter(|_| args.verbose > 0) {
             progress.println(&note);
         }
         super::diagnostics::elapsed(setup, "client_setup", 0);
         Ok(Arc::new(Self {
-            tuning: super::tuning::Tuning::new(&options, &args),
+            tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_wake: tokio::sync::Notify::new(),
             args,
@@ -149,7 +150,6 @@ impl Engine {
             let (plan, prune) =
                 tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
-            let planning = std::time::Instant::now();
             if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
             {
                 bail!("an expected digest requires exactly one regular file");
@@ -198,7 +198,6 @@ impl Engine {
                 }
             }
 
-            self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -230,9 +229,7 @@ impl Engine {
             self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
-            let planning = std::time::Instant::now();
             let (plan, prune) = self.download_plan(&destination).await?;
-            self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
                 bail!("an expected digest requires exactly one regular file");
@@ -484,9 +481,7 @@ impl Engine {
         {
             None
         } else {
-            let started = std::time::Instant::now();
             let object = client::head(&self.client, &self.options.bucket, &source.key).await?;
-            self.tuning.observe_control(started.elapsed());
             object
         };
         if (self.args.ignore_existing && existing.is_some())
