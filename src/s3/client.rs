@@ -59,7 +59,7 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
 #[derive(Debug)]
 struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
 #[derive(Debug)]
-struct ControlStart(std::time::Instant);
+struct ControlStart(tokio::time::Instant);
 impl aws_smithy_types::config_bag::Storable for ControlStart {
     type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
 }
@@ -78,7 +78,7 @@ impl Intercept for ControlLatency {
             || (request.method() == "GET" && request.uri().contains("list-type="))
         {
             cfg.interceptor_state()
-                .store_put(ControlStart(std::time::Instant::now()));
+                .store_put(ControlStart(tokio::time::Instant::now()));
         }
         Ok(())
     }
@@ -110,7 +110,7 @@ impl Intercept for Headers {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
-        if let Some(attempt) = super::diagnostics::request(context.request()) {
+        if let Some(attempt) = super::diagnostics::request(context.request_mut()) {
             cfg.interceptor_state().store_put(attempt);
         }
         Ok(())
@@ -954,3 +954,6 @@ mod tests {
         assert!(!reason.is_empty());
     }
 }
+
+#[cfg(test)]
+mod control_latency_tests;

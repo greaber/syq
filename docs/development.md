@@ -214,6 +214,12 @@ is a JSON object of headers. The test creates a unique `syq-tests/` prefix and
 removes only its own objects and multipart uploads. To compare an optimized
 build with s5cmd under the same environment, run
 `python3 tests/object-storage/benchmark.py --syq target/release/syq --s5cmd /path/to/s5cmd --output target/s3-benchmark`.
+Transfer trials use each tool's built-in defaults unless you request overrides.
+Use `--syq-tuning` for syq and its baseline, and `--s5cmd-workers`,
+`--s5cmd-concurrency`, or `--s5cmd-part-size` (MiB) to tune s5cmd independently.
+The shared `--workers`, `--concurrency`, and `--part-size` options still set
+both tools when explicitly supplied; use either shared or separate overrides.
+The results record the exact commands as well as the binary hashes.
 By default it runs the transfer workloads (`large`, `medium`, `small`) and
 reports throughput. The pruning workloads (`delete`, `noop`, `mixed`) mirror
 100,000 small objects with `--prune` in both directions, take much longer, and

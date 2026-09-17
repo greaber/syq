@@ -559,6 +559,7 @@ impl Engine {
             }
             if let Some(reservation) = reservation {
                 let mut file = source_clone.open()?;
+                let buffer_trace = super::diagnostics::upload_buffer(size);
                 let mut bytes = vec![0; size as usize];
                 file.read_exact(&mut bytes)?;
                 source_clone.check(&file)?;
@@ -582,6 +583,7 @@ impl Engine {
                     Some(bytes::Bytes::from_owner(fast::UploadBuffer {
                         bytes,
                         _reservation: reservation,
+                        _trace: buffer_trace,
                     })),
                 ));
             }
