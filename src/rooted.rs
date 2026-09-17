@@ -1096,41 +1096,25 @@ impl Root {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return fallback(error.into()),
         }
-        // A descendant mount can differ from the root device. Resolve and
-        // inspect the actual parent even for cached unsupported pairs; a root
-        // device shortcut would incorrectly reject eligible mounted volumes.
+        // Inspect the actual destination parent: a descendant mount can differ
+        // from the root, and a device number can be reused after a remount.
         let parent_metadata = match parent.directory.metadata() {
             Ok(metadata) => metadata,
             Err(error) => return fallback(error.into()),
         };
-        let pair = (source_metadata.dev(), parent_metadata.dev());
-        // Process-local capability cache: file metadata and directory ACL failures
-        // are not properties of a filesystem pair and must never enter it.
-        let pairs = clone_volume_pairs();
-        let cached = pairs.lock().unwrap().get(&pair).copied();
-        let supported = if let Some(supported) = cached {
-            supported
-        } else {
-            // This optimization targets APFS. Reject exFAT/SMB and other
-            // destinations before probing ACLs or creating staging directories.
-            let supported = if pair.0 != pair.1 {
-                false
-            } else {
-                match filesystem_is(&parent.directory, b"apfs") {
-                    Ok(supported) => supported,
-                    Err(error) => {
-                        return fallback(
-                            anyhow::Error::new(error).context("inspect clone filesystem"),
-                        );
-                    }
-                }
-            };
-            #[cfg(debug_assertions)]
-            let supported =
-                supported && std::env::var_os("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME").is_none();
-            pairs.lock().unwrap().insert(pair, supported);
-            supported
+        if source_metadata.dev() != parent_metadata.dev() {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
+        // Reject non-APFS destinations before inspecting ACLs or staging data.
+        let supported = match filesystem_is(&parent.directory, b"apfs") {
+            Ok(supported) => supported,
+            Err(error) => {
+                return fallback(anyhow::Error::new(error).context("inspect clone filesystem"));
+            }
         };
+        #[cfg(debug_assertions)]
+        let supported =
+            supported && std::env::var_os("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME").is_none();
         if !supported {
             return Ok(CopyLocalOutcome::Unsupported);
         }
@@ -1175,9 +1159,6 @@ impl Root {
             if directory.metadata()?.mode() & 0o7777 != u32::from(private_mode) {
                 // Some filesystems synthesize permissions. Fall back without
                 // putting source data into a directory we cannot keep private.
-                return Ok(CopyLocalOutcome::Unsupported);
-            }
-            if !clone_directory_has_no_inheritable_acl(&directory)? {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
             trusted_directory = Some(directory);
@@ -2089,15 +2070,6 @@ fn record_clone_attempt_for_test() -> io::Result<()> {
         return fail_clone_for_test("SYQ_TEST_CLONE_ERROR");
     }
     Ok(())
-}
-
-// APFS eligibility uses device pairs, whereas Linux offload distinguishes
-// mounts and their NFS/synchronous traits. Keep this clone-specific cache here:
-// file metadata and ACL refusals must not disable other files on the volume.
-#[cfg(target_os = "macos")]
-fn clone_volume_pairs() -> &'static Mutex<HashMap<(u64, u64), bool>> {
-    static PAIRS: OnceLock<Mutex<HashMap<(u64, u64), bool>>> = OnceLock::new();
-    PAIRS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Darwin's ACL functions and constants from <sys/acl.h> are not exposed by

@@ -5988,7 +5988,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        policy: CopyLocalPolicy,
+        _policy: CopyLocalPolicy,
         copy_id: &CopyId,
         size: u64,
         _mode: u32,
@@ -5998,9 +5998,6 @@ impl FsOps {
             .span(crate::transfer_observations::Stage::FilesystemCopy);
         #[cfg(debug_assertions)]
         record_copy_local_request_for_test()?;
-        if policy.inplace {
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         let (source, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let root = target.root.clone();
         let (partial, _) = rooted_partial_target(&target, copy_id)?;

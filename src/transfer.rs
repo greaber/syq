@@ -141,8 +141,8 @@ pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
-    /// Settled before worker startup; optional clone claims must fit preflight.
-    local_copy_fd_budget: AtomicBool,
+    /// Settled before sharing these options; clone claims must fit preflight.
+    local_copy_fd_budget: bool,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -223,7 +223,7 @@ impl Opts {
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
-                || !self.local_copy_fd_budget.load(Relaxed)
+                || !self.local_copy_fd_budget
                 || self.verify_only
                 || self.dry_run
                 || self.restricted_receiver
@@ -1739,8 +1739,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let opts = Arc::new(Opts {
-        local_copy_fd_budget: AtomicBool::new(true),
+    let mut opts = Opts {
+        local_copy_fd_budget: true,
         hash_policy: crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
@@ -1796,7 +1796,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
         max_size,
         min_size,
-    });
+    };
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
             "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}, job-storage={}",
@@ -1810,6 +1810,97 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     let mapping_contents = args.mapping_contents.clone();
+    let t0 = std::time::Instant::now();
+    // Pooled sessions are received as descriptors; take them on this thread
+    // before the parallel connect can spawn a child beside the receipt.
+    for endpoint in [&src_ep, &dst_ep] {
+        if let Endpoint::Remote(spec) = endpoint {
+            spec.prime_pooled_control(args.compress);
+        }
+    }
+    let (mut src_ctl, mut dst_ctl) = {
+        let (a, b) = (src_ep.clone(), args.clone());
+        let t = std::thread::spawn(move || connect_ctl(&a, &b));
+        let dst_ctl = connect_ctl(&dst_ep, &args);
+        let src_ctl = t
+            .join()
+            .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
+        match (src_ctl, dst_ctl) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                progress.stop();
+                return Err(e);
+            }
+        }
+    };
+    if debug() {
+        crate::output::diagnostic!(
+            "syq: control connections up in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    if args.restricted_grant.is_some() {
+        if let Some(contents) = &mapping_contents {
+            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
+        }
+    }
+    let destination_supports_confined_socket_nodes = match &dst_ep {
+        Endpoint::Remote(spec) => {
+            spec.diagnostics()
+                .peer
+                .context("destination handshake did not report receiver capabilities")?
+                .supports_confined_socket_nodes
+        }
+        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
+    };
+    let maximum_workers = if autotune {
+        tune::MAX
+    } else {
+        args.connections
+    };
+    let source_shared_workers = match &src_ep {
+        Endpoint::Local { .. } => maximum_workers,
+        Endpoint::Remote(_) if use_tcp => maximum_workers,
+        Endpoint::Remote(_) => 0,
+    };
+    // Only workers that can attempt local offload need foreign source claims.
+    // Actual local destinations live in a separate receiver process.
+    let mut copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
+    {
+        maximum_workers
+    } else {
+        0
+    };
+    // macOS cloning is optional. Its source is in this process, so use the
+    // same admission check as registration before reserving foreign claims.
+    // If those claims do not fit, keep the normal worker budget and byte-copy
+    // path on every filesystem, including APFS. Registration still rejects
+    // a budget that cannot accommodate the ordinary copy itself.
+    if cfg!(target_os = "macos")
+        && copy_local_claim_workers > 0
+        && crate::fsops::require_source_descriptor_capacity(
+            srcs.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        )
+        .is_err()
+    {
+        opts.local_copy_fd_budget = false;
+        copy_local_claim_workers = 0;
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
+            );
+        }
+    }
+    let source_independent_handoff_workers = copy_local_claim_workers
+        .checked_add(match &src_ep {
+            Endpoint::Local { .. } => 0,
+            Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
+        })
+        .context("source worker count overflow")?;
+    // Admission is complete before worker closures receive shared options.
+    let opts = Arc::new(opts);
     let sched = Arc::new(Sched::with_job_storage(
         block,
         opts.tuning.split_min_size(block),
@@ -1921,7 +2012,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
                             let copy_sources =
-                                if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
+                                if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
                                     initial_sources.clone()
                                 } else {
                                     Vec::new()
@@ -2053,98 +2144,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }));
         }
     };
-    let t0 = std::time::Instant::now();
-    // Pooled sessions are received as descriptors; take them on this thread
-    // before the parallel connect can spawn a child beside the receipt.
-    for endpoint in [&src_ep, &dst_ep] {
-        if let Endpoint::Remote(spec) = endpoint {
-            spec.prime_pooled_control(args.compress);
-        }
-    }
-    let (mut src_ctl, mut dst_ctl) = {
-        let (a, b) = (src_ep.clone(), args.clone());
-        let t = std::thread::spawn(move || connect_ctl(&a, &b));
-        let dst_ctl = connect_ctl(&dst_ep, &args);
-        let src_ctl = t
-            .join()
-            .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
-        match (src_ctl, dst_ctl) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) => {
-                sched.abort();
-                progress.stop();
-                return Err(e);
-            }
-        }
-    };
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: control connections up in {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-    }
-    if args.restricted_grant.is_some() {
-        if let Some(contents) = &mapping_contents {
-            crate::mapping::send(&contents.contents, &mut *dst_ctl)?;
-        }
-    }
-    let destination_supports_confined_socket_nodes = match &dst_ep {
-        Endpoint::Remote(spec) => {
-            spec.diagnostics()
-                .peer
-                .context("destination handshake did not report receiver capabilities")?
-                .supports_confined_socket_nodes
-        }
-        Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
-    };
-    let maximum_workers = if autotune {
-        tune::MAX
-    } else {
-        args.connections
-    };
-    let source_shared_workers = match &src_ep {
-        Endpoint::Local { .. } => maximum_workers,
-        Endpoint::Remote(_) if use_tcp => maximum_workers,
-        Endpoint::Remote(_) => 0,
-    };
-    let source_independent_handoff_workers = match &src_ep {
-        Endpoint::Local { .. } => 0,
-        Endpoint::Remote(_) => maximum_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
-    };
-    // Only workers that can attempt local offload need foreign source claims.
-    // Actual local destinations live in a separate receiver process.
-    let copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
-        maximum_workers
-    } else {
-        0
-    };
-    // macOS cloning is optional. Its source is in this process, so use the
-    // same admission check as registration before reserving foreign claims.
-    // If those claims do not fit, keep the normal worker budget and byte-copy
-    // path on every filesystem, including APFS. Registration still rejects
-    // a budget that cannot accommodate the ordinary copy itself.
-    let copy_local_claim_workers = if cfg!(target_os = "macos")
-        && copy_local_claim_workers > 0
-        && crate::fsops::require_source_descriptor_capacity(
-            srcs.len(),
-            source_shared_workers,
-            copy_local_claim_workers,
-        )
-        .is_err()
-    {
-        opts.local_copy_fd_budget.store(false, Relaxed);
-        if debug() {
-            crate::output::diagnostic!(
-                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
-            );
-        }
-        0
-    } else {
-        copy_local_claim_workers
-    };
-    let source_independent_handoff_workers = source_independent_handoff_workers
-        .checked_add(copy_local_claim_workers)
-        .context("source worker count overflow")?;
     let registered_sources = register_source_roots(
         &mut *src_ctl,
         srcs,
@@ -9359,7 +9358,7 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
-            local_copy_fd_budget: AtomicBool::new(true),
+            local_copy_fd_budget: true,
             hash_policy: Default::default(),
             expected_digest: None,
             mapping_expected_digests: Default::default(),

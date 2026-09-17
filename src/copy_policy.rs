@@ -17,17 +17,12 @@ pub(crate) enum FileOperation {
 }
 
 impl CopyPolicy {
-    /// Claim source capabilities only when a receiver can attempt direct copy.
-    /// This is about descriptor authority, not transport.
-    pub(crate) fn receiver_source_claims(self) -> bool {
-        self.allows_receiver_copy()
-    }
-
     pub(crate) fn prefer_whole_files(self) -> bool {
         // Keep macOS batching unchanged when cloning is unavailable.
         cfg!(target_os = "linux") && self.allows_receiver_copy()
     }
 
+    /// Also determines whether workers need receiver-side source claims.
     pub(crate) fn allows_receiver_copy(self) -> bool {
         self.same_host
             && !self.receiver_copy_disabled
