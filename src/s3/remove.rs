@@ -331,7 +331,10 @@ fn finished(
         .err()
         .map(|e| format!("S3 remove {:?}: {}", entry.key, e.message));
     if let Some(message) = &message {
-        progress.error(message);
+        // Unattempted markers share one explanation printed by the caller.
+        if !entry.marker || failure.is_none_or(|f| f.attempts != 0) {
+            progress.error(message);
+        }
         summary.entries_failed += 1;
         summary.errors += 1;
     } else if args.dry_run {
@@ -414,6 +417,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
     let ticker = progress.spawn_ticker();
     let result = runtime.block_on(async {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let deleting = std::cell::Cell::new(false);
         let work = async {
             let mut options = args.s3.clone().unwrap();
             let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
@@ -448,6 +452,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
                     finished(&args, &progress, &mut summary, entry, Ok(()));
                 }
             } else {
+                // Planning is read-only and can be dropped on cancellation.
+                // Once deletion starts, drain requests already sent so their
+                // outcomes are recorded before exiting.
+                deleting.set(true);
                 let split = entries.partition_point(|e| !e.marker);
                 let (data, markers) = entries.split_at(split);
                 deleter
@@ -462,6 +470,12 @@ pub(super) fn run(args: Args) -> Result<i32> {
                         })
                         .await?;
                 } else {
+                    if !markers.is_empty() {
+                        progress.error(&format!(
+                            "S3 removal preserved {} delete markers because selected data versions could not all be removed; resolve those failures before retrying the purge",
+                            markers.len()
+                        ));
+                    }
                     for entry in markers {
                         finished(
                             &args,
@@ -482,12 +496,16 @@ pub(super) fn run(args: Args) -> Result<i32> {
             result = &mut work => result,
             _ = tokio::signal::ctrl_c() => {
                 cancelled.store(true, Relaxed);
-                let _ = work.await;
+                if deleting.get() {
+                    let _ = work.await;
+                }
                 bail!("S3 removal interrupted");
             },
             _ = terminate.recv() => {
                 cancelled.store(true, Relaxed);
-                let _ = work.await;
+                if deleting.get() {
+                    let _ = work.await;
+                }
                 bail!("S3 removal terminated");
             },
         }

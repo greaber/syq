@@ -268,9 +268,11 @@ to 1,000 entries and continues after individual or batch failures, reporting
 partial failure with exit 23. It cannot undo earlier removals. With
 `--s3-all-versions`, all selected data versions are attempted before any delete
 markers. If any data version fails, all selected markers are preserved and
-reported as failed removals with zero attempts. This keeps hidden contents from
-being exposed by removing their markers after an incomplete purge. Interrupting
-a run stops new batches and waits for requests already sent to finish.
+reported as failed removals with zero attempts and unknown retryability. Resolve
+the data-version failures before retrying the purge. Preserving markers keeps
+hidden contents from being exposed after an incomplete purge. Interrupting
+planning cancels it without deleting anything. Once deletion starts, interruption
+stops new batches and waits for deletion requests already sent to finish.
 Stop concurrent writers when clearing a prefix: versions created after listing
 are not part of the removal plan. Version operations require permission to list
 and delete versions; retention rules may prevent permanent deletion.

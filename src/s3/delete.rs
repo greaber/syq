@@ -41,7 +41,8 @@ impl Failure {
                 "delete marker preserved because selected data versions could not all be removed"
                     .into(),
             class: "conflict",
-            retryable: "no",
+            // Retrying depends on resolving the preceding data-version failure.
+            retryable: "unknown",
             os_kind: None,
             attempts: 0,
         }

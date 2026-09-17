@@ -170,6 +170,16 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "remove-planning-interrupt" {
+        assert_eq!(method, "GET");
+        gate.0.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !gate.1.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The client must exit before this response is released.
+        return;
+    }
     if fault == "remove-exact-bounded" {
         assert_eq!(method, "GET");
         assert!(first.contains("delimiter="));
@@ -2253,6 +2263,10 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
                 .find(|r| r["s3_delete_marker"] == true)
                 .unwrap();
             assert_eq!(marker["attempts"], 0);
+            assert_eq!(marker["retryable"], "unknown");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("S3 removal preserved 1 delete markers"));
+            assert!(!stderr.contains("delete marker preserved because"));
             assert_eq!(marker["disposition"], "failed");
             assert!(marker["message"].as_str().unwrap().contains("preserved"));
         }
@@ -2713,7 +2727,80 @@ fn s3_remove_batches_are_concurrent_and_preserve_markers_after_late_failure() {
             .unwrap();
         if failed != 0 {
             assert_eq!(marker["attempts"], 0);
+            assert_eq!(marker["retryable"], "unknown");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("S3 removal preserved 1 delete markers"));
+            assert!(!stderr.contains("delete marker preserved because"));
         }
+    }
+}
+
+#[test]
+fn s3_remove_interrupt_cancels_stalled_planning_without_deleting() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("remove-planning-interrupt");
+        let mut child = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--src-dir",
+                "tree",
+                "--s3-all-versions",
+                "--results",
+                "results.ndjson",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !server.gate.0.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "rm exited before listing"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !server.gate.0.load(Ordering::SeqCst) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("planning request was not received before deadline");
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        server.gate.1.store(true, Ordering::SeqCst);
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(
+            status
+                .expect("rm waited for read-only planning after interruption")
+                .code(),
+            Some(1)
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!records.iter().any(|r| r["type"] == "removal_result"));
+        assert_eq!(records.last().unwrap()["entries_removed"], 0);
+        assert_eq!(records.last().unwrap()["exit_code"], 1);
     }
 }
 

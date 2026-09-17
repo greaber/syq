@@ -31,7 +31,10 @@ def versions(prefix=''):
 
 
 def run(args, ok=True):
-    completed = subprocess.run([c.SYQ, 'rm', '--on', 's3://' + c.BUCKET, '--no-progress', *map(str, args)], capture_output=True, text=True, timeout=120)
+    command = [c.SYQ, 'rm', '--on', 's3://' + c.BUCKET, '--no-progress']
+    for name, value in c.HEADERS.items():
+        command += ['--s3-header', name + ': ' + value]
+    completed = subprocess.run([*command, *map(str, args)], capture_output=True, text=True, timeout=120)
     assert (completed.returncode == 0) == ok, completed.stderr
     return completed
 
