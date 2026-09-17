@@ -1184,6 +1184,49 @@ fn s3_service_profile_endpoints_keep_recovery_separate() {
 }
 
 #[test]
+fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("corrupt");
+    let download = |server: &Server| {
+        server.cp(
+            temp.path(),
+            &[
+                "--integrity-checking=transfer=blake3",
+                "--from",
+                "s3://bucket",
+                "data",
+                "--as",
+                "download",
+            ],
+        )
+    };
+    let output = download(&server);
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    let cache = temp.path().join("cache/syq/s3");
+    let record = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("failed multipart download keeps its recovery record");
+    // A machine crash can persist the rename without the record's contents.
+    std::fs::write(&record, b"").unwrap();
+    let stale = record.with_extension("tmp");
+    std::fs::write(&stale, b"{").unwrap();
+    let unrelated = cache.join("unrelated.tmp");
+    std::fs::write(&unrelated, b"{").unwrap();
+
+    let output = download(&server);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains(record.to_str().unwrap()),
+        "{}",
+        output_text(&output)
+    );
+    assert!(!stale.exists());
+    assert!(unrelated.exists());
+}
+
+#[test]
 fn s3_expected_hash_checks_single_and_multipart_before_publication() {
     use sha2::Digest as _;
     for (fault, size) in [("single-ok", 65536), ("ok", SIZE)] {
