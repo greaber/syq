@@ -162,6 +162,7 @@ impl Engine {
         let mut hash = algorithm.map(HashAlgorithm::hasher);
         let mut batch = Vec::new();
         let mut batch_size = 0;
+        let mut fragments = bytes::BytesMut::new();
         loop {
             self.check_cancelled()?;
             let started = crate::s3::diagnostics::start();
@@ -251,10 +252,23 @@ impl Engine {
                                 continue;
                             }
                             let n = bytes.len().min(128 * 1024 - batch_size);
-                            batch.push(bytes.split_to(n));
+                            let chunk = bytes.split_to(n);
+                            // Tiny slices can pin much larger SDK buffers and
+                            // exhaust the scatter limit with only a few bytes.
+                            // Pack consecutive small fragments; keep large ones
+                            // in the scatter batch without copying them.
+                            if n < 4096 {
+                                fragments.extend_from_slice(&chunk);
+                            } else {
+                                flush_fragments(&mut batch, &mut fragments);
+                                batch.push(chunk);
+                            }
                             batch_size += n;
                             done += n as u64;
-                            if batch_size == 128 * 1024 || batch.len() == 16 {
+                            if batch_size == 128 * 1024
+                                || batch.len() + usize::from(!fragments.is_empty()) >= 16
+                            {
+                                flush_fragments(&mut batch, &mut fragments);
                                 self.pace(batch_size as u64).await?;
                                 output
                                     .write_batch(
@@ -269,7 +283,8 @@ impl Engine {
                         anyhow::ensure!(!recover(done, waited), SlowRead);
                     }
                     anyhow::ensure!(done == length, "S3 body truncated");
-                    if !batch.is_empty() {
+                    if batch_size != 0 {
+                        flush_fragments(&mut batch, &mut fragments);
                         self.pace(batch_size as u64).await?;
                         output
                             .write_batch(
@@ -343,6 +358,7 @@ impl Engine {
                         done = 0;
                         hash = algorithm.map(HashAlgorithm::hasher);
                         batch.clear();
+                        fragments.clear();
                         batch_size = 0;
                     }
                     crate::s3::backoff(attempt).await;
@@ -351,6 +367,12 @@ impl Engine {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+fn flush_fragments(batch: &mut Vec<bytes::Bytes>, fragments: &mut bytes::BytesMut) {
+    if !fragments.is_empty() {
+        batch.push(std::mem::take(fragments).freeze());
     }
 }
 
@@ -403,6 +425,116 @@ impl AsRef<[u8]> for UploadBuffer {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ReceiveBuffer(Vec<u8>, Arc<AtomicUsize>);
+        impl AsRef<[u8]> for ReceiveBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for ReceiveBuffer {
+            fn drop(&mut self) {
+                self.1.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        struct FragmentBody {
+            tiny: u8,
+            live: Arc<AtomicUsize>,
+            chunks: std::collections::VecDeque<bytes::Bytes>,
+        }
+        impl http_body::Body for FragmentBody {
+            type Data = bytes::Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+            {
+                if self.live.load(Ordering::Relaxed) != 0 {
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                        "previous tiny fragment still owns its receive buffer",
+                    ))));
+                }
+                let bytes = if self.tiny < 32 {
+                    let value = self.tiny;
+                    self.tiny += 1;
+                    let mut allocation = vec![0; 32 * 1024];
+                    allocation[..3].copy_from_slice(&[value, value + 1, value + 2]);
+                    self.live.fetch_add(1, Ordering::Relaxed);
+                    Some(
+                        bytes::Bytes::from_owner(ReceiveBuffer(allocation, self.live.clone()))
+                            .slice(..3),
+                    )
+                } else {
+                    self.chunks.pop_front()
+                };
+                std::task::Poll::Ready(bytes.map(|b| Ok(http_body::Frame::data(b))))
+            }
+        }
+        let mut expected: Vec<u8> = (0..32u8).flat_map(|v| [v, v + 1, v + 2]).collect();
+        let mut chunks = std::collections::VecDeque::new();
+        // Mix compacted and scatter batches, empty frames, the full-batch
+        // boundary, scatter limit, large-chunk bypass, and all-tiny final tail.
+        for (i, length) in [0, 4095, 4096, 8192, 3, 130_000, 300_000]
+            .into_iter()
+            .chain(std::iter::repeat_n(4096, 17))
+            .chain([1, 2, 3])
+            .enumerate()
+        {
+            let bytes: Vec<u8> = (0..length)
+                .map(|n| (n as u8).wrapping_add(i as u8))
+                .collect();
+            expected.extend_from_slice(&bytes);
+            chunks.push_back(bytes::Bytes::from(bytes));
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let body = ByteStream::new(aws_smithy_types::body::SdkBody::from_body_1_x(
+            FragmentBody {
+                tiny: 0,
+                live: live.clone(),
+                chunks,
+            },
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        std::fs::write(&path, b"prefix!").unwrap();
+        let size = 7 + expected.len() as u64;
+        let file = Arc::new(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+        let writer = writer::Writer::with_readback(file, size, true).unwrap();
+        let object = Object {
+            key: "fragmented".into(),
+            size,
+            etag: "fixture".into(),
+            version: None,
+            metadata: None,
+            mtime: 0,
+        };
+        let engine = planning_engine(&["--performance-tuning", "s3-retries=0"]);
+        let hash = engine
+            .download_fast_range(
+                &object,
+                &writer,
+                7,
+                expected.len() as u64,
+                Some(body),
+                None,
+                Some(HashAlgorithm::Blake3),
+            )
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        assert_eq!(
+            hash,
+            Digest::hash_bytes(HashAlgorithm::Blake3, &expected).value
+        );
+        let actual = std::fs::read(path).unwrap();
+        assert_eq!(&actual[..7], b"prefix!");
+        assert_eq!(&actual[7..], expected);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
