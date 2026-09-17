@@ -91,7 +91,7 @@ struct Window {
     limit: usize,
     max: usize,
     adaptive: bool,
-    since: Instant,
+    since: Option<Instant>,
     bytes: u64,
     completed: usize,
     saturated: bool,
@@ -113,7 +113,7 @@ impl Budget {
                 limit,
                 max: 256,
                 adaptive,
-                since: Instant::now(),
+                since: None,
                 bytes: 0,
                 completed: 0,
                 saturated: false,
@@ -131,6 +131,9 @@ impl Budget {
             {
                 let mut s = self.state.lock().unwrap();
                 if s.active < s.limit {
+                    // Planning and source preparation precede request admission;
+                    // they must not depress the ramp's first throughput score.
+                    s.since.get_or_insert_with(Instant::now);
                     s.active += 1;
                     return Permit {
                         budget: self.clone(),
@@ -166,13 +169,15 @@ impl Budget {
         let mut s = self.state.lock().unwrap();
         s.bytes += bytes;
         s.completed += 1;
-        let elapsed = s.since.elapsed();
+        let Some(since) = s.since else { return };
+        let elapsed = since.elapsed();
         if !s.adaptive || s.settled || elapsed < Duration::from_millis(250) || s.completed < 16 {
             return;
         }
         // A throughput plateau is a reason to stop adding competing requests.
         // The first window includes startup and is deliberately only a baseline.
         let rate = s.bytes as f64 / elapsed.as_secs_f64();
+        let before = s.limit;
         if s.saturated {
             if let Some((old_limit, old_rate)) = s.previous {
                 if rate < old_rate * 1.05 {
@@ -185,7 +190,16 @@ impl Budget {
                 s.limit = (s.limit * 2).min(s.max);
             }
         }
-        s.since = Instant::now();
+        super::diagnostics::request_window(
+            before,
+            s.limit,
+            rate,
+            elapsed,
+            s.completed,
+            s.saturated,
+            s.settled,
+        );
+        s.since = Some(Instant::now());
         s.bytes = 0;
         s.completed = 0;
         s.saturated = false;
@@ -222,6 +236,28 @@ mod tests {
     use super::*;
     use std::{future::Future, task::Context};
 
+    #[tokio::test]
+    async fn planning_time_does_not_advance_the_first_request_window() {
+        let budget = Arc::new(Budget::new(64, true));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let held = budget.acquire().await;
+        // A full request queue is waiting, but the transfer has only just begun.
+        budget.state.lock().unwrap().saturated = true;
+        for _ in 0..16 {
+            budget.completed(1024);
+        }
+        let (limit, previous, since) = {
+            let state = budget.state.lock().unwrap();
+            (state.limit, state.previous, state.since)
+        };
+        assert_eq!(limit, 64);
+        assert!(previous.is_none());
+        drop(held);
+        let _next = budget.acquire().await;
+        let next_since = budget.state.lock().unwrap().since;
+        assert_eq!(next_since, since);
+    }
+
     #[test]
     fn object_controller_waits_for_request_ramp_or_plateau() {
         let budget = Budget::new(64, true);
@@ -229,7 +265,7 @@ mod tests {
         for (bytes, expected) in [(1024, 128), (2048, 256)] {
             {
                 let mut s = budget.state.lock().unwrap();
-                s.since = Instant::now() - Duration::from_secs(1);
+                s.since = Some(Instant::now() - Duration::from_secs(1));
                 s.saturated = true;
             }
             for _ in 0..16 {
@@ -392,7 +428,7 @@ mod tests {
         for request in &mut waiting {
             assert!(request.as_mut().poll(&mut cx).is_pending());
         }
-        budget.state.lock().unwrap().since = Instant::now() - Duration::from_secs(1);
+        budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
         for _ in 0..16 {
             budget.completed(1024);
         }

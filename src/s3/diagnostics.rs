@@ -105,3 +105,28 @@ pub(super) fn object_concurrency(before: usize, after: usize, activity_per_secon
         );
     }
 }
+
+/// Rates actually used by the request ramp, before counters are reset.
+pub(super) fn request_window(
+    before: usize,
+    after: usize,
+    bytes_per_second: f64,
+    elapsed: Duration,
+    completed: usize,
+    saturated: bool,
+    settled: bool,
+) {
+    if let Some(trace) = trace() {
+        record(json!({
+            "phase": "request_window",
+            "at_s": trace.start.elapsed().as_secs_f64(),
+            "before": before,
+            "after": after,
+            "bytes_per_second": bytes_per_second,
+            "elapsed_s": elapsed.as_secs_f64(),
+            "completed": completed,
+            "saturated": saturated,
+            "settled": settled,
+        }));
+    }
+}
