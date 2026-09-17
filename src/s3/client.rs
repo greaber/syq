@@ -96,7 +96,56 @@ impl Intercept for Headers {
     }
 }
 
-pub(super) async fn connect(options: &mut Options) -> Result<Client> {
+/// S3 names a bucket's region on every response, including the redirect or
+/// denial that a request sent to the wrong region receives.
+fn response_region(
+    response: Option<&aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
+) -> Option<String> {
+    response?
+        .headers()
+        .get("x-amz-bucket-region")
+        .map(str::to_owned)
+}
+
+/// Describe a failed request. A bodyless redirect otherwise reads as an
+/// "unhandled error", although S3 says where the bucket is.
+fn failure<E>(
+    operation: &str,
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> String {
+    let response = error.raw_response();
+    match (
+        response.map(|r| r.status().as_u16()),
+        response_region(response),
+    ) {
+        (Some(301), Some(region)) => format!(
+            "{operation} failed (HTTP 301): the bucket is in region {region}; \
+             pass --s3-region {region} or set AWS_REGION"
+        ),
+        (Some(status), _) => format!("{operation} failed (HTTP {status})"),
+        (None, _) => format!("{operation} failed"),
+    }
+}
+
+/// Ask S3 where a bucket is. Any response carries the answer, so this needs
+/// no permission on the bucket. The error says why there was no answer.
+async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(output) => output
+            .bucket_region()
+            .map(str::to_owned)
+            .ok_or_else(|| "the response did not name a region".to_owned()),
+        Err(error) => response_region(error.raw_response()).ok_or_else(|| {
+            aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        }),
+    }
+}
+
+/// Also returns a note for verbose output when the region lookup got no answer.
+pub(super) async fn connect(options: &mut Options) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -155,11 +204,26 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         })
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
+    let mut note = None;
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
+    } else if shared.region().is_none() {
+        // AWS serves each bucket from one region and redirects requests sent
+        // elsewhere. With no region configured, ask instead of assuming
+        // us-east-1. A configured region is used as given, and a custom
+        // endpoint already identifies its provider's storage.
+        let probe = Client::from_conf(config.clone().build());
+        match bucket_region(&probe, &options.bucket).await {
+            Ok(region) => config = config.region(Region::new(region)),
+            Err(reason) => {
+                note = Some(format!(
+                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                ))
+            }
+        }
     }
-    Ok(Client::from_conf(config.build()))
+    Ok((Client::from_conf(config.build()), note))
 }
 
 /// Version 1 is an ordinary object body plus this small metadata record.
@@ -297,11 +361,8 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
             return Ok(None)
         }
         Err(error) => {
-            let status = error.raw_response().map(|r| r.status().as_u16());
-            return Err(error.into_service_error()).with_context(|| match status {
-                Some(status) => format!("S3 HEAD failed (HTTP {status})"),
-                None => "S3 HEAD failed".to_owned(),
-            });
+            let message = failure("S3 HEAD", &error);
+            return Err(error.into_service_error()).context(message);
         }
     };
     Ok(Some(from_head(key, &output)?))
@@ -369,8 +430,10 @@ pub(super) async fn upload_listing(
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| e.into_service_error())
-            .context("S3 listing failed")?;
+            .map_err(|e| {
+                let message = failure("S3 listing", &e);
+                anyhow::Error::new(e.into_service_error()).context(message)
+            })?;
         for object in output.contents() {
             let key = object.key().context("S3 listing omitted key")?;
             anyhow::ensure!(
@@ -790,5 +853,61 @@ mod tests {
         assert_eq!(values["syq-hash-algorithm"], "md5");
         assert!(!values.contains_key("syq-blake3"));
         assert_eq!(Metadata::decode(Some(&values)).unwrap(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn bucket_region_comes_from_redirects_and_denials() {
+        use std::io::{Read, Write};
+        for status in ["301 Moved Permanently", "403 Forbidden"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") && socket.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"HEAD /bucket"));
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nx-amz-bucket-region: eu-central-1\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            let config = aws_sdk_s3::config::Builder::new()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "key", "secret", None, None, "test",
+                ))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .build();
+            let region = bucket_region(&Client::from_conf(config), "bucket").await;
+            server.join().unwrap();
+            assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_region_reports_why_there_was_no_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "key", "secret", None, None, "test",
+            ))
+            .retry_config(RetryConfig::disabled())
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        let reason = bucket_region(&Client::from_conf(config), "bucket")
+            .await
+            .unwrap_err();
+        assert!(!reason.is_empty());
     }
 }
