@@ -29,16 +29,17 @@ impl Tuning {
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // These measured seeds describe provider request behavior; they do
             // not change the data route, integrity policy, or explicit overrides.
-            tigris: options
-                .endpoint
-                .as_deref()
-                .and_then(|s| url::Url::parse(s).ok())
-                .and_then(|u| u.host_str().map(str::to_owned))
-                .is_some_and(|host| {
-                    host == "t3.storage.dev"
-                        || host == "fly.storage.tigris.dev"
-                        || host.ends_with(".tigris.dev")
-                }),
+            tigris: options.source_bucket.is_none()
+                && options
+                    .endpoint
+                    .as_deref()
+                    .and_then(|s| url::Url::parse(s).ok())
+                    .and_then(|u| u.host_str().map(str::to_owned))
+                    .is_some_and(|host| {
+                        host == "t3.storage.dev"
+                            || host == "fly.storage.tigris.dev"
+                            || host.ends_with(".tigris.dev")
+                    }),
             requests: Arc::new(Budget::new(
                 args.tuning_options
                     .and_then(|t| t.s3_requests)
@@ -75,6 +76,10 @@ impl Tuning {
     }
     pub fn tigris(&self) -> bool {
         self.tigris
+    }
+    pub fn request_capacity(&self) -> usize {
+        self.fixed_requests
+            .unwrap_or_else(|| self.requests.state.lock().unwrap().max)
     }
     pub fn request_limit(&self) -> usize {
         self.requests.state.lock().unwrap().limit

@@ -140,7 +140,9 @@ impl Engine {
         if !self.options.automatic_concurrency {
             self.options.concurrency
         } else if self.options.source_bucket.is_some() {
-            64
+            // Queue enough parts for the shared tuner to explore its full range.
+            // Every part still acquires a permit from that shared budget.
+            self.tuning.request_capacity()
         } else if !self.options.upload && self.tuning.local_latency() {
             4
         } else if self.tuning.tigris() {
@@ -452,7 +454,7 @@ mod buffer_tests {
         assert_eq!(engine.copy_request_limit(32 << 20), limit);
         assert_eq!(engine.copy_request_limit(limit + 1), limit);
         assert_eq!((6u64 << 30).div_ceil(engine.part_size(6u64 << 30)), 24);
-        assert_eq!(engine.part_workers(), 64);
+        assert_eq!(engine.part_workers(), engine.tuning.request_capacity());
         assert!(engine
             .object_workers([256 << 20; 100].into_iter())
             .unwrap()
@@ -471,6 +473,53 @@ mod buffer_tests {
             .unwrap()
             .maximum
             .is_none());
+    }
+
+    #[test]
+    fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
+        let mut observed = Vec::new();
+        for endpoint in ["https://t3.storage.dev", "https://storage.example"] {
+            for extra in [
+                "",
+                "s3-max-concurrent-requests=1",
+                "s3-max-concurrent-requests=128",
+                "s3-max-concurrent-parts-per-object=7",
+            ] {
+                let mut flags = vec!["--to", "s3://destination", "--s3-endpoint", endpoint];
+                if !extra.is_empty() {
+                    flags.extend(["--performance-tuning", extra]);
+                }
+                let engine = planning_engine(&flags);
+                assert!(!engine.tuning.tigris());
+                engine.tuning.observe_control(Duration::from_millis(100));
+                let workers = engine.object_workers([32u64 << 30].into_iter()).unwrap();
+                let expected = match extra {
+                    "s3-max-concurrent-requests=1" => 1,
+                    "s3-max-concurrent-requests=128" => 128,
+                    "s3-max-concurrent-parts-per-object=7" => 7,
+                    _ => 256,
+                };
+                // A per-object queue follows the global exploration range,
+                // not the initial 64 permits; explicit limits remain binding.
+                assert_eq!(engine.part_workers(), expected);
+                observed.push((
+                    workers.initial,
+                    engine.part_size(32u64 << 30),
+                    engine.part_workers(),
+                    engine.tuning.request_limit(),
+                ));
+                engine.object_workers([1024u64; 512].into_iter()).unwrap();
+                assert_eq!(
+                    engine.tuning.request_limit(),
+                    match extra {
+                        "s3-max-concurrent-requests=1" => 1,
+                        "s3-max-concurrent-requests=128" => 128,
+                        _ => 256,
+                    }
+                );
+            }
+        }
+        assert_eq!(observed[..4], observed[4..]);
     }
 
     #[tokio::test]

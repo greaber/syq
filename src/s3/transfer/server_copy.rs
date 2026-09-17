@@ -222,13 +222,13 @@ impl Engine {
             .bytes_total
             .store(plan.iter().map(|p| p.size).sum(), Relaxed);
         self.progress.scan_done.store(true, Relaxed);
-        parallel(plan, workers, |job| {
+        parallel(plan, workers, |mut job| {
             let engine = self.clone();
             async move {
                 engine.check_cancelled()?;
                 let mut kind = "file";
                 let result = engine
-                    .copy_object(&job, &mut kind)
+                    .copy_object(&mut job, &mut kind)
                     .await
                     .map_err(|error| engine.copy_error(error));
                 engine.settle(job.key.as_bytes(), &job.path, kind, &result, None);
@@ -240,7 +240,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn copy_object(&self, job: &Download, kind: &mut &'static str) -> Result<Option<u64>> {
+    async fn copy_object(
+        &self,
+        job: &mut Download,
+        kind: &mut &'static str,
+    ) -> Result<Option<u64>> {
         let source_bucket = self.options.source_bucket.as_deref().unwrap();
         let key = copy_destination_key(job);
         if job.path.is_empty() && job.key.ends_with('/') {
@@ -261,8 +265,8 @@ impl Engine {
             }
         };
         let source = async {
-            match job.copy_source.as_deref() {
-                Some(source) => Ok(Some(source.clone())),
+            match job.copy_source.take() {
+                Some(source) => Ok(Some(*source)),
                 None => self.copy_head(source_bucket, &job.key, 0).await,
             }
         };
@@ -403,9 +407,11 @@ impl Engine {
         let failed = std::sync::atomic::AtomicBool::new(false);
         let result: Result<()> = async {
             let mut parts = stream::iter(0..source.size.div_ceil(part_size))
+                .take_while(|_| std::future::ready(!failed.load(Relaxed)))
                 .map(|index| {
                     let failed = &failed;
                     async move {
+                        anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
                         let _slot = self.tuning.requests.acquire().await;
                         self.check_cancelled()?;
                         anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");

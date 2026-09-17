@@ -72,7 +72,11 @@ metadata/tagging directives.
 Header values are omitted from results and recovery records. Command-line
 arguments may still be visible to other processes on the machine.
 
-The account needs object read/write and bucket listing permissions. Multipart
+The account needs object read/write and bucket listing permissions. Downloads
+and server-side copies pin the source version when the service supplies a
+version ID. On AWS, reading that version also requires `s3:GetObjectVersion`;
+reading its tags requires `s3:GetObjectVersionTagging`.
+Multipart
 recovery also needs permission to list uploaded parts and abort obsolete
 uploads. Server-side copies preserve tags. Multipart copies read source tags
 unless HEAD explicitly reports zero tags, so they can require tag-reading
@@ -187,7 +191,9 @@ copies do not reject an existing destination solely for that reason.
 By default, server-side copies use one copy request up to the 5 GiB limit.
 An explicit `s3-part-size` also sets the multipart threshold, capped at that
 limit. Larger objects use concurrent multipart server-side copying, with the shared
-request budget and per-object part limit described above. Failed or cancelled
+request budget described above. Server-copy tuning uses the same rules for
+every provider. Unless you set `s3-max-concurrent-parts-per-object`, parts
+can use the shared request budget's full tuning range. Failed or cancelled
 multipart copies attempt to abort their unfinished upload; retries restart that object.
 If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
 objects remain available.
