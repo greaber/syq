@@ -24,8 +24,8 @@ def check():
         root = Path(temp)
         for name, rules, archive in [
             ('pruned', ['--ignore', 'archive/'], False),
-            ('reincluded', ['--ignore', 'archive/*', '--ignore', '!archive/0000.tmp'], True),
-            ('last-rule', ['--ignore', '!archive/0000.tmp', '--ignore', 'archive/'], False),
+            ('reincluded', ['--ignore', '**/archive/*', '--ignore', '!**/archive/0000.tmp'], True),
+            ('last-rule', ['--ignore', '!**/archive/0000.tmp', '--ignore', 'archive/'], False),
         ]:
             destination = root / name
             checks.run(['--from', remote, '--srcs-in', prefix, '--into', destination, *rules])
@@ -34,7 +34,7 @@ def check():
                 expected['archive/0000.tmp'] = b'ignored'
             actual = {str(p.relative_to(destination)): p.read_bytes()
                       for p in destination.rglob('*') if p.is_file()}
-            assert actual == expected, (name, actual)
+            assert actual == expected, (name, sorted(actual), sorted(expected))
             assert (destination / 'keep/empty').is_dir()
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', root / 'excluded',
                     '--ignore', '*'])
