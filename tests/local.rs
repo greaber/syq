@@ -153,8 +153,23 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
 
 #[cfg(debug_assertions)]
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
+    wait_for_confinement_marker_with_timeout(
+        child,
+        marker,
+        stage,
+        std::time::Duration::from_secs(5),
+    );
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_confinement_marker_with_timeout(
+    child: &mut std::process::Child,
+    marker: &Path,
+    stage: &str,
+    timeout: std::time::Duration,
+) {
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(5);
+    let deadline = started + timeout;
     let mut next_progress = started + std::time::Duration::from_secs(1);
     loop {
         let status = child.try_wait().unwrap();
@@ -4075,6 +4090,7 @@ fn background_bootstrap_installs_the_command_quietly() {
                     t.path("release-manifest.json"),
                 )
                 .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_COMPLETION_DEBUG", "1")
                 .env("SYQ_TEST_RELEASE_BUILD", "1")
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4103,7 +4119,8 @@ fn background_bootstrap_installs_the_command_quietly() {
                             .as_os_str()
                             .as_encoded_bytes()
                             .to_vec()
-                    )]
+                    )],
+                    "completion={completion}, upload={upload}: {output:?}"
                 );
             }
             assert!(
@@ -21692,7 +21709,16 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            // Preparing the retained basis hashes the multi-block fixture.
+            // This bounds a deadlock, not hashing speed on a loaded runner.
+            wait_for_confinement_marker_with_timeout(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
+                std::time::Duration::from_secs(60),
+            );
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
