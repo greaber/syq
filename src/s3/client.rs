@@ -326,14 +326,37 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
     }))
 }
 
-pub(super) async fn list(
+/// Existence needs only one object, regardless of the size of the prefix.
+pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
+    let output = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1)
+        .send()
+        .await
+        .map_err(|e| e.into_service_error())
+        .context("S3 listing failed")?;
+    anyhow::ensure!(
+        !output.contents().is_empty() || output.is_truncated() != Some(true),
+        "S3 existence listing was truncated without an object"
+    );
+    Ok(!output.contents().is_empty())
+}
+
+/// Bound destination discovery by the size of the upload. An incomplete listing
+/// cannot prove that an upload key is absent, so leave those decisions to HEAD.
+pub(super) async fn upload_listing(
     client: &Client,
     bucket: &str,
     prefix: &str,
-) -> Result<Vec<(String, u64)>> {
-    let mut objects = Vec::new();
+    source_keys: &std::collections::HashSet<&str>,
+) -> Result<Option<std::collections::HashMap<String, u64>>> {
+    let mut keys = std::collections::HashMap::new();
     let mut token = None;
-    loop {
+    // Never spend as many LIST requests as checking each source with HEAD.
+    // Retain only relevant keys so a large destination cannot grow the cache.
+    for _ in 0..source_keys.len().saturating_sub(1) {
         let output = client
             .list_objects_v2()
             .bucket(bucket)
@@ -344,13 +367,18 @@ pub(super) async fn list(
             .map_err(|e| e.into_service_error())
             .context("S3 listing failed")?;
         for object in output.contents() {
-            objects.push((
-                object.key().context("S3 listing omitted key")?.to_owned(),
-                u64::try_from(object.size().context("S3 listing omitted size")?)?,
-            ));
+            let key = object.key().context("S3 listing omitted key")?;
+            anyhow::ensure!(
+                key.starts_with(prefix),
+                "S3 listing returned a key outside the requested prefix"
+            );
+            if source_keys.contains(key) {
+                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
+                keys.insert(key.to_owned(), size);
+            }
         }
-        if output.is_truncated() != Some(true) {
-            break;
+        if output.is_truncated() != Some(true) || keys.len() == source_keys.len() {
+            return Ok(Some(keys));
         }
         let next = output
             .next_continuation_token()
@@ -361,7 +389,256 @@ pub(super) async fn list(
         }
         token = Some(next);
     }
-    Ok(objects)
+    Ok(None)
+}
+
+/// The first excluded ancestor is the boundary a filesystem walk would prune.
+/// Keep that boundary rather than counting every descendant in a flat S3 page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Exclusion<'a> {
+    File,
+    Subtree(&'a str),
+}
+
+impl Exclusion<'_> {
+    pub(super) fn count(self, subtrees: &mut std::collections::HashSet<String>) -> u64 {
+        match self {
+            Self::File => 1,
+            Self::Subtree(path) if subtrees.contains(path) => 0,
+            Self::Subtree(path) => {
+                subtrees.insert(path.to_owned());
+                1
+            }
+        }
+    }
+}
+
+pub(super) fn exclusion<'a>(
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    key: &'a str,
+    directory: bool,
+    known_subtrees: &std::collections::HashSet<String>,
+) -> Option<Exclusion<'a>> {
+    let matcher = matcher?;
+    let key = if directory {
+        key.trim_end_matches('/')
+    } else {
+        key
+    };
+    // These boundaries were already classified under the same rules. Reuse
+    // them for adjacent objects rather than rematching a deep parent chain.
+    if directory && known_subtrees.contains(key) {
+        return Some(Exclusion::Subtree(key));
+    }
+    if let Some((parent, _)) = key.rsplit_once('/') {
+        if known_subtrees.contains(parent) {
+            return Some(Exclusion::Subtree(parent));
+        }
+    }
+    for (separator, _) in key.match_indices('/') {
+        let ancestor = &key[..separator];
+        if !ancestor.is_empty() && matcher.matched(ancestor, true).is_ignore() {
+            return Some(Exclusion::Subtree(ancestor));
+        }
+    }
+    if !key.is_empty() && matcher.matched(key, directory).is_ignore() {
+        Some(if directory {
+            Exclusion::Subtree(key)
+        } else {
+            Exclusion::File
+        })
+    } else {
+        None
+    }
+}
+
+pub(super) struct Listing {
+    pub objects: Vec<(String, u64)>,
+    pub found: bool,
+    pub excluded: u64,
+}
+
+/// Keep flat listings for small trees and filename filters. Only switch to
+/// directory discovery when the first full page contains only excluded descendants.
+/// A complete directory probe can prune children or descend through a single
+/// included child toward excluded descendants. Limit probes to four per source
+/// selector: deep chains must not turn a flat listing into an unbounded walk.
+/// Wide or truncated probes reuse the flat sample instead of fanning out.
+pub(super) async fn list(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    excluded_subtrees: &mut std::collections::HashSet<String>,
+) -> Result<Listing> {
+    let mut result = Listing {
+        objects: Vec::new(),
+        found: false,
+        excluded: 0,
+    };
+    if let Some(excluded) = exclusion(matcher, prefix, true, excluded_subtrees) {
+        result.found = prefix_exists(client, bucket, prefix).await?;
+        if result.found {
+            result.excluded += excluded.count(excluded_subtrees);
+        }
+        return Ok(result);
+    }
+    let mut probes_remaining = 4;
+    let mut pending = vec![prefix.to_owned()];
+    while let Some(current) = pending.pop() {
+        let mut token = None;
+        loop {
+            let mut directories = false;
+            let mut output = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&current)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())
+                .context("S3 listing failed")?;
+            result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
+            let mut reachable_exclusion = false;
+            if probes_remaining > 0
+                && token.is_none()
+                && output.is_truncated() == Some(true)
+                && !output.contents().is_empty()
+                && output.contents().iter().all(|object| {
+                    object.key().is_some_and(|key| {
+                        if let Some(Exclusion::Subtree(boundary)) = exclusion(
+                            matcher,
+                            key,
+                            key.ends_with('/') && object.size() == Some(0),
+                            excluded_subtrees,
+                        ) {
+                            reachable_exclusion |=
+                                boundary.strip_prefix(&current).is_some_and(|relative| {
+                                    relative.bytes().filter(|byte| *byte == b'/').count()
+                                        < probes_remaining
+                                });
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                && reachable_exclusion
+            {
+                let mut probe_prefix = current.clone();
+                let mut parent_objects = Vec::new();
+                while probes_remaining > 0 {
+                    probes_remaining -= 1;
+                    let mut directory_page = client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix(&probe_prefix)
+                        .delimiter("/")
+                        .send()
+                        .await
+                        .map_err(|e| e.into_service_error())
+                        .context("S3 listing failed")?;
+                    let mut included = 0;
+                    let mut excluded = 0;
+                    for child in directory_page.common_prefixes() {
+                        let child = child.prefix().context("S3 listing omitted common prefix")?;
+                        anyhow::ensure!(
+                            child.starts_with(&probe_prefix)
+                                && child.len() > probe_prefix.len()
+                                && child.ends_with('/'),
+                            "S3 listing returned an invalid common prefix"
+                        );
+                        if exclusion(matcher, child, true, excluded_subtrees).is_some() {
+                            excluded += 1;
+                        } else {
+                            included += 1;
+                        }
+                    }
+                    if directory_page.is_truncated() == Some(true) || included > 1 {
+                        break;
+                    }
+                    for object in directory_page.contents() {
+                        anyhow::ensure!(
+                            object
+                                .key()
+                                .context("S3 listing omitted key")?
+                                .starts_with(&probe_prefix),
+                            "S3 listing returned a key outside the requested prefix"
+                        );
+                    }
+                    if excluded > 0 {
+                        // Commit the lookahead only once it actually prunes.
+                        // Ancestor objects and this page replace the sample;
+                        // intermediate prefixes have already been visited.
+                        parent_objects.extend(directory_page.contents.take().unwrap_or_default());
+                        directory_page.contents = Some(parent_objects);
+                        output = directory_page;
+                        directories = true;
+                        break;
+                    }
+                    if included == 0 {
+                        break;
+                    }
+                    // Every sampled object was under an excluded ancestor and
+                    // this page has just one child. Follow that child without
+                    // refetching the same flat sample at each directory level.
+                    probe_prefix = directory_page.common_prefixes()[0]
+                        .prefix()
+                        .context("S3 listing omitted common prefix")?
+                        .to_owned();
+                    parent_objects.extend(directory_page.contents.take().unwrap_or_default());
+                }
+                // If the budget or a wide page stopped lookahead, the original
+                // flat sample and its continuation token are still usable.
+            }
+            for object in output.contents() {
+                let key = object.key().context("S3 listing omitted key")?;
+                anyhow::ensure!(
+                    key.starts_with(&current),
+                    "S3 listing returned a key outside the requested prefix"
+                );
+                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
+                let directory = key.ends_with('/') && size == 0;
+                if let Some(excluded) = exclusion(matcher, key, directory, excluded_subtrees) {
+                    // A filename-only exclusion still encounters the key and
+                    // preserves its path validation. Pruned descendants do not.
+                    if excluded == Exclusion::File {
+                        super::local::key_path(key.as_bytes())?;
+                    }
+                    result.excluded += excluded.count(excluded_subtrees);
+                } else {
+                    result.objects.push((key.to_owned(), size));
+                }
+            }
+            for child in output.common_prefixes() {
+                let child = child.prefix().context("S3 listing omitted common prefix")?;
+                anyhow::ensure!(
+                    directories
+                        && child.starts_with(&current)
+                        && child.len() > current.len()
+                        && child.ends_with('/'),
+                    "S3 listing returned an invalid common prefix"
+                );
+                if let Some(excluded) = exclusion(matcher, child, true, excluded_subtrees) {
+                    result.excluded += excluded.count(excluded_subtrees);
+                } else {
+                    pending.push(child.to_owned());
+                }
+            }
+            if output.is_truncated() != Some(true) {
+                break;
+            }
+            let next = output
+                .next_continuation_token()
+                .context("truncated S3 listing omitted continuation token")?
+                .to_owned();
+            if token.as_ref() == Some(&next) {
+                bail!("S3 listing repeated its continuation token");
+            }
+            token = Some(next);
+        }
+    }
+    Ok(result)
 }
 
 // GET metadata is authoritative for the body returned by that same request.
@@ -394,6 +671,73 @@ pub(super) fn from_get(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exclusion_identifies_first_pruned_ancestor_and_preserves_negations() {
+        use super::{exclusion, Exclusion};
+        for (rules, key, directory, expected) in [
+            (
+                vec!["archive/"],
+                "root/archive/nested/file",
+                false,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (
+                vec!["archive/"],
+                "root/archive/",
+                true,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (vec!["archive/"], "root/archive", false, None),
+            (
+                vec!["archive/", "!**/archive/keep"],
+                "root/archive/keep",
+                false,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (vec!["*.tmp"], "root/file.tmp", false, Some(Exclusion::File)),
+            (
+                vec!["**/archive/*", "!**/archive/keep/"],
+                "root/archive/keep/file",
+                false,
+                None,
+            ),
+            (
+                vec!["root/", "archive/"],
+                "root/archive/file",
+                false,
+                Some(Exclusion::Subtree("root")),
+            ),
+        ] {
+            let matcher =
+                crate::scan::build_ignore(&rules.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                    .unwrap()
+                    .unwrap();
+            let mut known_subtrees = std::collections::HashSet::new();
+            let actual = exclusion(Some(&matcher), key, directory, &known_subtrees);
+            assert_eq!(actual, expected, "{rules:?} {key}");
+            if let Some(excluded) = actual {
+                excluded.count(&mut known_subtrees);
+                assert_eq!(
+                    exclusion(Some(&matcher), key, directory, &known_subtrees),
+                    expected
+                );
+            }
+            assert_eq!(
+                actual.is_some(),
+                crate::scan::path_is_ignored(
+                    &matcher,
+                    if directory {
+                        key.trim_end_matches('/').as_bytes()
+                    } else {
+                        key.as_bytes()
+                    },
+                    directory
+                ),
+                "{rules:?} {key} directory={directory}"
+            );
+        }
+    }
+
     use super::*;
     use crate::hashing::{Digest, HashAlgorithm};
 

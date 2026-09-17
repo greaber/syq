@@ -28,17 +28,6 @@ impl Engine {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
         let (plan, prune) = self.download_plan(&target).await?;
         self.check_upload_placement(&[]).await?;
-        if self.args.placement == Placement::As
-            && plan.len() == 1
-            && plan[0].path == target
-            && !plan[0].key.ends_with('/')
-            && !target.is_empty()
-            && !client::list(&self.client, &self.options.bucket, &format!("{target}/"))
-                .await?
-                .is_empty()
-        {
-            bail!("S3 destination is a prefix, not an object");
-        }
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
         self.progress
