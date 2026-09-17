@@ -20168,7 +20168,11 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut socket = loop {
             match listener.accept() {
-                Ok((socket, _)) => break socket,
+                Ok((socket, _)) => {
+                    // BSD accepted sockets inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
+                    break socket;
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -20498,7 +20502,11 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         for response in [serde_json::json!({"Error":"copy denied by test policy"})] {
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && std::time::Instant::now() < deadline =>
@@ -20809,7 +20817,11 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             Instant::now() < deadline,
