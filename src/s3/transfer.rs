@@ -2,6 +2,7 @@ mod fast;
 mod pruning;
 
 use super::{
+    admission::parallel,
     checksum::Algorithm,
     client::{self, Metadata, Object},
     local::{self, Destination, Source},
@@ -204,7 +205,7 @@ impl Engine {
                         .cloned();
                     let result = engine.upload(source).await;
                     engine.settle(&label, &key, kind, &result, expected.as_ref());
-                    Ok(())
+                    Ok(result.ok().flatten())
                 }
             })
             .await?;
@@ -243,7 +244,7 @@ impl Engine {
                             .as_ref()
                             .or(engine.args.expected_digest.as_ref()),
                     );
-                    Ok(())
+                    Ok(result.ok().flatten())
                 }
             })
             .await?;
@@ -1978,35 +1979,6 @@ fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
         root.unlink(&path)?;
     }
     Ok(())
-}
-
-// Each object gets a runtime task so hashing and filesystem work can use more
-// than one executor thread. JoinSet bounds live tasks and aborts them together
-// when the copy is cancelled; detached uploads must never outlive the command.
-async fn parallel<T, F, Fut>(jobs: Vec<T>, workers: usize, mut work: F) -> Result<()>
-where
-    F: FnMut(T) -> Fut,
-    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
-{
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut jobs = jobs.into_iter();
-    for job in jobs.by_ref().take(workers) {
-        tasks.spawn(work(job));
-    }
-    let mut error = None;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(e) = result.map_err(anyhow::Error::from).and_then(|r| r) {
-            if error.is_none() {
-                error = Some(e);
-            }
-        }
-        if error.is_none() {
-            if let Some(job) = jobs.next() {
-                tasks.spawn(work(job));
-            }
-        }
-    }
-    error.map_or(Ok(()), Err)
 }
 
 // Single-request downloads have no reusable completed ranges. Remove their

@@ -80,6 +80,7 @@ debug = 1
 strip = "symbols"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 libc = "0.2"
 serde_json = "1"
 jsonschema = { version = "0.56", default-features = false }

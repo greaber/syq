@@ -56,8 +56,13 @@ uploads. Syq does not change bucket policies or lifecycle rules.
 
 Uploads use multipart requests and downloads use concurrent byte ranges. Syq
 chooses starting settings from file sizes, the backend and observed request
-latency, then adjusts its shared data-request budget during the copy. Downloads
-of small files over high-latency paths start with more simultaneous requests,
+latency. For batches where each object fits in one request, syq tests higher and
+lower object concurrency when there is enough work to measure a change. After
+finding a good setting, syq probes less often, while continuing to check for
+changed conditions. For batches of small downloads, the search range also
+accounts for object sizes and available file descriptors.
+Multipart batches adjust their shared data-request budget instead. Downloads of
+small files over high-latency paths start with more simultaneous requests,
 because short copies may finish before the budget can grow. These choices
 apply independently of integrity checking, and S3 tuning writes no cache files.
 
@@ -172,6 +177,11 @@ storage, including mappings, ignore rules, size filters, `--dry-run`,
 objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
+
+Within the retry budget, syq can restart a download range that is much slower
+than comparable reads in the same copy. The retry checks the object's identity
+and reuses the portion already processed. Other read failures can still restart
+the entire range. Setting `s3-retries=0` disables this recovery.
 
 Use `--prune` to mirror selected directories or prefixes in either direction:
 
