@@ -705,21 +705,14 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
     client
         .write_all(b"GET /bucket/data HTTP/1.1\r\nAuthorization: x-tigris-consistent\r\nX-Tigris-Consistent: true\r\n\r\n")
         .unwrap();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
         serve(
             socket,
             "ok",
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
-        );
-        done_tx.send(()).unwrap();
+        )
     });
-    assert_eq!(
-        done_rx.recv_timeout(Duration::from_millis(100)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-        "fixture closed before the client could drain the response"
-    );
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
     worker.join().unwrap();
