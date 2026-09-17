@@ -121,15 +121,21 @@ fn failure<E>(
 }
 
 /// Ask S3 where a bucket is. Any response carries the answer, so this needs
-/// no permission on the bucket; without a response the caller keeps its region.
-async fn bucket_region(client: &Client, bucket: &str) -> Option<String> {
+/// no permission on the bucket. The error says why there was no answer.
+async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
     match client.head_bucket().bucket(bucket).send().await {
-        Ok(output) => output.bucket_region().map(str::to_owned),
-        Err(error) => response_region(error.raw_response()),
+        Ok(output) => output
+            .bucket_region()
+            .map(str::to_owned)
+            .ok_or_else(|| "the response did not name a region".to_owned()),
+        Err(error) => response_region(error.raw_response()).ok_or_else(|| {
+            aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        }),
     }
 }
 
-pub(super) async fn connect(options: &mut Options) -> Result<Client> {
+/// Also returns a note for verbose output when the region lookup got no answer.
+pub(super) async fn connect(options: &mut Options) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -187,6 +193,7 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         })
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
+    let mut note = None;
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
@@ -196,11 +203,16 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         // us-east-1. A configured region is used as given, and a custom
         // endpoint already identifies its provider's storage.
         let probe = Client::from_conf(config.clone().build());
-        if let Some(region) = bucket_region(&probe, &options.bucket).await {
-            config = config.region(Region::new(region));
+        match bucket_region(&probe, &options.bucket).await {
+            Ok(region) => config = config.region(Region::new(region)),
+            Err(reason) => {
+                note = Some(format!(
+                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                ))
+            }
         }
     }
-    Ok(Client::from_conf(config.build()))
+    Ok((Client::from_conf(config.build()), note))
 }
 
 /// Version 1 is an ordinary object body plus this small metadata record.
@@ -520,7 +532,28 @@ mod tests {
                 .build();
             let region = bucket_region(&Client::from_conf(config), "bucket").await;
             server.join().unwrap();
-            assert_eq!(region.as_deref(), Some("eu-central-1"), "{status}");
+            assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn bucket_region_reports_why_there_was_no_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "key", "secret", None, None, "test",
+            ))
+            .retry_config(RetryConfig::disabled())
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        let reason = bucket_region(&Client::from_conf(config), "bucket")
+            .await
+            .unwrap_err();
+        assert!(!reason.is_empty());
     }
 }
