@@ -52,7 +52,7 @@ impl Engine {
                 let mut kind = "file";
                 let result = engine.copy_object(&job, &mut kind).await;
                 engine.settle(job.key.as_bytes(), &job.path, kind, &result, None);
-                Ok(())
+                Ok(result.ok().flatten())
             }
         })
         .await?;

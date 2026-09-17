@@ -58,8 +58,14 @@ bucket policies or lifecycle rules.
 
 Uploads use multipart requests and downloads use concurrent byte ranges. Syq
 chooses starting settings from file sizes, the backend and observed request
-latency, then adjusts its shared data-request budget during the copy. Short
-copies may finish before enough requests complete to adjust it. These choices
+latency. For batches where each object fits in one request, syq tests higher and
+lower object concurrency when there is enough work to measure a change. After
+finding a good setting, syq probes less often, while continuing to check for
+changed conditions. For batches of small downloads, the search range also
+accounts for object sizes and available file descriptors.
+Multipart batches adjust their shared data-request budget instead. Downloads of
+small files over high-latency paths start with more simultaneous requests,
+because short copies may finish before the budget can grow. These choices
 apply independently of integrity checking, and S3 tuning writes no cache files.
 
 For deliberate overrides, use `--performance-tuning`. These settings choose
@@ -71,7 +77,7 @@ parallelism rather than bounding the process's total resource use:
 | `s3-max-concurrent-objects=N` | Maximum objects in progress; 1–65536 |
 | `s3-max-concurrent-parts-per-object=N` | Maximum simultaneous parts or ranges for each object; 1–1024 |
 | `s3-part-size=SIZE` | Part/range size; 5M–5G |
-| `s3-retries=N` | Transient retry budget; 0–100, default 10 |
+| `s3-retries=N` | Transient failure and throttling retry budget; 0–100, default 10 |
 
 These are nested concurrency limits, not counts of worker threads. An object
 stays in progress through preparation, hashing, data transfer and finalization.
@@ -202,6 +208,11 @@ storage, including mappings, ignore rules, size filters, `--dry-run`,
 objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
+
+Within the retry budget, syq can restart a download range that is much slower
+than comparable reads in the same copy. The retry checks the object's identity
+and reuses the portion already processed. Other read failures can still restart
+the entire range. Setting `s3-retries=0` disables this recovery.
 
 Use `--prune` to mirror selected directories or prefixes in either direction:
 

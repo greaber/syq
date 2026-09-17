@@ -4075,6 +4075,7 @@ fn background_bootstrap_installs_the_command_quietly() {
                     t.path("release-manifest.json"),
                 )
                 .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_COMPLETION_DEBUG", "1")
                 .env("SYQ_TEST_RELEASE_BUILD", "1")
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4103,7 +4104,8 @@ fn background_bootstrap_installs_the_command_quietly() {
                             .as_os_str()
                             .as_encoded_bytes()
                             .to_vec()
-                    )]
+                    )],
+                    "completion={completion}, upload={upload}: {output:?}"
                 );
             }
             assert!(
@@ -6171,6 +6173,37 @@ fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
             assert_output_ok(&output);
             assert!(read(&t.path(&destination)) == data);
         }
+    }
+}
+
+#[test]
+fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
+    let t = Tmp::new();
+    // Three default 4 MiB hash blocks; only the last block differs.
+    let contents = prng(12 << 20, 1000);
+    write(&t.path("source"), &contents);
+    for (compare, transfer) in [("blake3", "sha256"), ("xxh3-128", "blake3")] {
+        let results = t.s(&format!("results-{compare}-{transfer}.ndjson"));
+        let mut previous = contents.clone();
+        *previous.last_mut().unwrap() ^= 1;
+        write(&t.path("destination"), &previous);
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--performance-tuning=workers=1,copy-path=ranges",
+            &format!("--integrity-checking=compare={compare},transfer={transfer}"),
+            "--results",
+            &results,
+        ]);
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("destination")), contents);
+        let records = fs::read_to_string(results).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["bytes_transferred"], 4 << 20, "{summary}");
+        assert_eq!(summary["bytes_unchanged"], 8 << 20, "{summary}");
     }
 }
 
@@ -21661,7 +21694,13 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            wait_for_confinement_marker(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
+            );
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([

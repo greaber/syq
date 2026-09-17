@@ -1,11 +1,13 @@
 //! Native local/S3 and server-side S3 copies. The S3 client and its durable formats are independent
 //! of the filesystem helper protocol: credentials never enter an SSH request.
+mod admission;
 mod checksum;
 mod client;
 mod diagnostics;
 mod dns;
 mod local;
 mod prune;
+mod read_recovery;
 mod state;
 mod transfer;
 mod tuning;

@@ -59,6 +59,10 @@ impl Server {
         }
     }
     fn command(&self, temp: &Path) -> Command {
+        self.command_with_retries(temp, 0)
+    }
+    fn command_with_retries(&self, temp: &Path, retries: u32) -> Command {
+        let retry_option = format!("s3-retries={retries}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args([
@@ -66,7 +70,7 @@ impl Server {
                 "--s3-region",
                 "us-east-1",
                 "--performance-tuning",
-                "s3-retries=0",
+                &retry_option,
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",
@@ -110,6 +114,9 @@ fn serve(
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
 ) {
+    // BSD can inherit the listener's nonblocking mode; this handler uses
+    // blocking I/O with timeouts on every platform.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -312,6 +319,35 @@ fn serve(
         let length: usize = headers["content-length"].parse().unwrap();
         let mut body = vec![0; length];
         socket.read_exact(&mut body).unwrap();
+        if let Some(status) = match fault {
+            "upload-throttle-always" => Some(429),
+            "upload-transient-always" => Some(503),
+            _ => None,
+        } {
+            reply(&mut socket, status, &[], b"", false);
+            return;
+        }
+        if fault == "upload-timeout-code-once" {
+            if !gate.0.swap(true, Ordering::SeqCst) {
+                // S3 reports a slow request body as RequestTimeout with HTTP 400.
+                reply(
+                    &mut socket,
+                    400,
+                    &[],
+                    b"<Error><Code>RequestTimeout</Code><Message>slow</Message></Error>",
+                    false,
+                );
+            } else {
+                reply(
+                    &mut socket,
+                    200,
+                    &[("ETag".into(), "\"stored\"".into())],
+                    b"",
+                    false,
+                );
+            }
+            return;
+        }
         use base64::Engine as _;
         use sha2::Digest as _;
         assert_eq!(
@@ -353,6 +389,40 @@ fn serve(
             b"",
             false,
         );
+        return;
+    }
+    if (method == "HEAD"
+        && (fault == "single-throttle-always"
+            || (matches!(fault, "single-throttle-once" | "single-transient-once")
+                && !gate.0.swap(true, Ordering::SeqCst))))
+        || (method == "GET"
+            && fault == "single-get-throttle-once"
+            && !gate.0.swap(true, Ordering::SeqCst))
+    {
+        let status = if fault == "single-transient-once" {
+            503
+        } else {
+            429
+        };
+        reply(&mut socket, status, &[], b"", false);
+        return;
+    }
+    if method == "GET" {
+        if let Some((status, body)) = match fault {
+            "single-get-throttle-always" => Some((429, &b""[..])),
+            "single-get-transient-always" => Some((503, &b""[..])),
+            "single-get-timeout-code-always" => Some((
+                400,
+                &b"<Error><Code>RequestTimeout</Code><Message>slow</Message></Error>"[..],
+            )),
+            _ => None,
+        } {
+            reply(&mut socket, status, &[], body, false);
+            return;
+        }
+    }
+    if fault == "head-denied" && method == "HEAD" {
+        reply(&mut socket, 403, &[], b"", false);
         return;
     }
     if fault == "missing" {
@@ -573,6 +643,50 @@ fn reply(
         let _ = socket.write_all(body);
     }
 }
+#[test]
+fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    // Reproduce BSD's accepted-socket mode on every platform and force the
+    // response to exceed the available send buffer before the client reads.
+    socket.set_nonblocking(true).unwrap();
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    client
+        .write_all(b"GET /bucket/data HTTP/1.1\r\nAuthorization: x-tigris-consistent\r\nX-Tigris-Consistent: true\r\n\r\n")
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        serve(
+            socket,
+            "ok",
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
+        );
+        done_tx.send(()).unwrap();
+    });
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "fixture closed before the client could drain the response"
+    );
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    worker.join().unwrap();
+    let body = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .map(|end| &response[end + 4..])
+        .expect("HTTP response headers");
+    assert_eq!(body.len(), SIZE);
+    assert!(body.iter().all(|&byte| byte == b'x'));
+}
+
 fn output_text(output: &Output) -> String {
     format!(
         "{}\n{}",
@@ -1627,5 +1741,206 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 5
             }
         );
+    }
+}
+
+#[test]
+fn s3_head_failure_reports_http_status_without_a_response_body() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"source").unwrap();
+    let server = Server::start("head-denied");
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("S3 HEAD failed (HTTP 403)"),
+        "{}",
+        output_text(&output)
+    );
+}
+
+#[test]
+fn s3_get_throttling_without_a_body_is_retried() {
+    for (retries, expected_exit, requests) in [(2, 0, 3), (0, 23, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("single-get-throttle-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the throttled GET and its retry.
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        assert_eq!(
+            temp.path().join("result").exists(),
+            expected_exit == 0,
+            "retries {retries}"
+        );
+    }
+}
+
+#[test]
+fn s3_download_retries_share_one_budget_across_statuses_and_error_codes() {
+    for fault in [
+        "single-get-throttle-always",
+        "single-get-transient-always",
+        "single-get-timeout-code-always",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        // An existing, different file takes the HEAD-then-download-loop path;
+        // a fresh file would fetch its metadata with an SDK-only initial GET.
+        std::fs::write(temp.path().join("result"), b"stale").unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), 1)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // A HEAD to plan the named object, a HEAD to compare the existing
+        // file, then the GET and exactly one retry from the download loop:
+        // the SDK must not retry inside it (six requests when it does).
+        assert_eq!(server.requests.load(Ordering::Relaxed), 4, "{fault}");
+        assert_eq!(
+            std::fs::read(temp.path().join("result")).unwrap(),
+            b"stale",
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
+    for fault in ["upload-throttle-always", "upload-transient-always"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), 1)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the PUT and exactly one retry: the in-memory body
+        // must not also be retried inside the SDK.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 3, "{fault}");
+    }
+}
+
+#[test]
+fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
+    for (retries, expected_exit, requests) in [(1, 0, 3), (0, 23, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start("upload-timeout-code-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, the PUT answered with HTTP 400 RequestTimeout, and one retry.
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            requests,
+            "retries {retries}"
+        );
+    }
+}
+
+#[test]
+fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
+    for (fault, retries, expected_exit, requests) in [
+        ("single-throttle-once", 2, 0, 2),
+        ("single-transient-once", 2, 0, 2),
+        ("single-throttle-once", 0, 23, 1),
+        ("single-throttle-always", 2, 23, 3),
+        ("head-denied", 2, 23, 1),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+            .unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
     }
 }
