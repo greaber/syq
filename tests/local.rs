@@ -21699,6 +21699,50 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
             let stage = format!(
                 "overlapping copy preparation (identical={identical}, existing={existing})"
             );
+            #[cfg(target_os = "macos")]
+            let sampler = {
+                static SAMPLED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let group_id = first.id();
+                let ready = ready.clone();
+                let directory = t.0.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if ready.exists() || SAMPLED.swap(true, Ordering::Relaxed) {
+                        return;
+                    }
+                    let group = Command::new("/usr/bin/pgrep")
+                        .args(["-g", &group_id.to_string()])
+                        .run()
+                        .unwrap();
+                    let members = String::from_utf8_lossy(&group.stdout);
+                    eprintln!("early copy process group: {members}");
+                    let samples: Vec<_> = members
+                        .split_whitespace()
+                        .map(|pid| {
+                            let path = directory.join(format!("early-{pid}.sample"));
+                            let child = Command::new("/usr/bin/sample")
+                                .arg(pid)
+                                .args(["1", "-file"])
+                                .arg(&path)
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .start()
+                                .unwrap();
+                            (path, child)
+                        })
+                        .collect();
+                    for (path, child) in samples {
+                        eprintln!("early sampler: {:?}", child.wait_with_output());
+                        writeln!(
+                            std::io::stderr(),
+                            "{}",
+                            fs::read_to_string(path).unwrap_or_default()
+                        )
+                        .unwrap();
+                    }
+                })
+            };
             let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 wait_for_confinement_marker(&mut first, &ready, &stage);
             }));
@@ -21707,26 +21751,9 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 preparing.elapsed(),
                 ready.exists()
             );
+            #[cfg(target_os = "macos")]
+            sampler.join().unwrap();
             if let Err(panic) = waited {
-                #[cfg(target_os = "macos")]
-                {
-                    let group = Command::new("/usr/bin/pgrep")
-                        .args(["-g", &first.id().to_string()])
-                        .run()
-                        .unwrap();
-                    let members = String::from_utf8_lossy(&group.stdout);
-                    eprintln!("copy process group: {members}");
-                    for pid in members.split_whitespace() {
-                        let sample_path = t.path(&format!("preparation-{pid}.sample"));
-                        let sample = Command::new("/usr/bin/sample")
-                            .arg(pid)
-                            .args(["1", "-file"])
-                            .arg(&sample_path)
-                            .run();
-                        eprintln!("stack sampler for {pid}: {sample:?}");
-                        eprintln!("{}", fs::read_to_string(sample_path).unwrap_or_default());
-                    }
-                }
                 eprintln!(
                     "after diagnostics: elapsed={:?}, ready={}",
                     preparing.elapsed(),
@@ -22474,7 +22501,7 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
 #[test]
 #[ignore = "temporary macOS CI reproduction for PR 383"]
 fn debug_concurrent_publication_with_neighboring_tests() {
-    for round in 0..10 {
+    for round in 0..2 {
         writeln!(
             std::io::stderr(),
             "concurrent publication reproduction round {round}"
