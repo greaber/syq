@@ -99,6 +99,7 @@ struct Window {
     previous: Option<(usize, f64)>,
     slower_limit: usize,
     probe_preserved_rate: bool,
+    object_rate: Option<(usize, f64)>,
     settled: bool,
 }
 pub(super) struct Budget {
@@ -124,6 +125,7 @@ impl Budget {
                 previous: None,
                 slower_limit: 0,
                 probe_preserved_rate: false,
+                object_rate: None,
                 settled: false,
             }),
             changed: Notify::new(),
@@ -160,6 +162,12 @@ impl Budget {
     // first object probe; it does not accept the higher request setting.
     pub fn probe_preserved_rate(&self) -> bool {
         self.state.lock().unwrap().probe_preserved_rate
+    }
+    pub fn object_rate(&self, workers: usize) -> Option<f64> {
+        let s = self.state.lock().unwrap();
+        s.object_rate
+            .filter(|(limit, _)| *limit == workers)
+            .map(|(_, rate)| rate)
     }
     pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
@@ -258,6 +266,17 @@ impl Budget {
                 s.previous = Some((s.limit, rate));
                 s.limit = (s.limit * 2).min(s.max);
             }
+        }
+        // Only single-request object batches reuse this score. Match object
+        // activity units, including the fixed credit for each completed file.
+        // A changed limit or rejected probe cannot supply its new baseline.
+        s.object_rate = None;
+        if !s.settled && s.limit == before && s.completed >= before {
+            s.object_rate = Some((
+                before,
+                (s.bytes as f64 + s.completed as f64 * crate::tune::FILE_CREDIT as f64)
+                    / elapsed.as_secs_f64(),
+            ));
         }
         super::diagnostics::request_window(
             before,
@@ -576,6 +595,26 @@ mod tests {
         assert_eq!(jobs, (0..8).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn handoff_rate_matches_a_completed_probe_at_the_same_limit() {
+        let budget = Budget::new(64, true);
+        budget.state.lock().unwrap().max = 128;
+        for (completions, saturated) in [(64, true), (128, false)] {
+            {
+                let mut state = budget.state.lock().unwrap();
+                state.since = Some(Instant::now() - Duration::from_secs(1));
+                state.saturated = saturated;
+            }
+            for _ in 0..completions {
+                budget.completed(2048);
+            }
+            assert!(budget.object_rate(64).is_none());
+        }
+        let rate = budget.object_rate(128).unwrap();
+        let expected = 128.0 * (2048 + crate::tune::FILE_CREDIT) as f64;
+        assert!((rate / expected - 1.0).abs() < 0.01);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn object_handoff_tries_downward_after_a_rejected_request_increase() {
         check_handoff_direction(256, 64, 32).await;
@@ -610,6 +649,7 @@ mod tests {
             assert_eq!(limit, expected);
         }
         assert!(budget.rejected_limit().is_some());
+        assert!(budget.object_rate(64).is_none());
         let peak = Arc::new(AtomicUsize::new(0));
         let copy_budget = budget.clone();
         let copy_peak = peak.clone();

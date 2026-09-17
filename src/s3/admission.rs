@@ -329,6 +329,9 @@ where
                     .is_some_and(|r| r.probe_preserved_rate()),
         );
         if let Some(requests) = &concurrency.requests {
+            // Keep warmup exclusion, but reuse one full-count request score
+            // instead of collecting the entire baseline again after handoff.
+            controller.sampler.previous = requests.object_rate(initial);
             // The ramp may also have demonstrated that fewer requests lose
             // throughput. Revisit that bound normally if conditions change.
             controller.lower = requests.slower_limit().min(initial.saturating_sub(1));
@@ -495,6 +498,15 @@ mod tests {
         assert!(window.push(20000.0).is_none());
         assert!(window.push(10.0).is_none());
         assert_eq!(window.push(20.0), Some(15.0));
+    }
+
+    #[test]
+    fn inherited_request_score_still_excludes_the_handoff_warmup() {
+        let mut controller = Controller::new(32, 256, true);
+        controller.sampler.previous = Some(1000.0);
+        assert_eq!(controller.observe(100000.0, 32, 10000, 16), 32);
+        assert_eq!(controller.observe(1000.0, 32, 10000, 16), 64);
+        assert_eq!(controller.probe.as_ref().unwrap().baseline, 1000.0);
     }
 
     #[test]
