@@ -2,6 +2,7 @@
 """Exercise filtered, paginated S3 downloads against the configured test service."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import json
 import tempfile
 
 import check as checks
@@ -13,6 +14,8 @@ def check():
     objects = {f'{prefix}/archive/{i:04}.tmp': b'ignored' for i in range(1001)}
     objects.update({
         f'{prefix}/root-file': b'root',
+        f'{checks.PREFIX}/zz-outside': b'outside',
+        f'{prefix}/archive/': b'',
         f'{prefix}/keep/': b'',
         f'{prefix}/keep/file': b'kept',
         f'{prefix}/keep/sub/file': b'nested',
@@ -22,20 +25,39 @@ def check():
         list(workers.map(lambda item: checks.request('PUT', item[0], item[1]), objects.items()))
     with tempfile.TemporaryDirectory(prefix='syq-s3-selection-') as temp:
         root = Path(temp)
-        for name, rules, archive in [
-            ('pruned', ['--ignore', 'archive/'], False),
-            ('reincluded', ['--ignore', '**/archive/*', '--ignore', '!**/archive/0000.tmp'], True),
-            ('last-rule', ['--ignore', '!**/archive/0000.tmp', '--ignore', 'archive/'], False),
+        for name, rules, archive, selected, excluded in [
+            ('pruned', ['--ignore', 'archive/'], False, prefix, 1),
+            ('flat', ['--ignore', 'archive/'], False, prefix, 1),
+            ('nested', ['--ignore', 'archive/'], False, checks.PREFIX, 1),
+            ('reincluded', ['--ignore', '**/archive/*', '--ignore', '!**/archive/0000.tmp'], True, prefix, 1000),
+            ('last-rule', ['--ignore', '!**/archive/0000.tmp', '--ignore', 'archive/'], False, prefix, 1),
         ]:
             destination = root / name
-            checks.run(['--from', remote, '--srcs-in', prefix, '--into', destination, *rules])
+            if name == 'flat':
+                request_key = prefix + '/000-leading'
+                checks.request('PUT', request_key, b'leading')
+            results = root / (name + '.jsonl')
+            checks.run(['--from', remote, '--srcs-in', selected, '--into', destination, *rules, '--results', results])
+            terminal = json.loads(results.read_text().splitlines()[-1])
+            assert terminal['files_excluded'] == excluded, (name, terminal)
             expected = {'root-file': b'root', 'keep/file': b'kept', 'keep/sub/file': b'nested'}
             if archive:
                 expected['archive/0000.tmp'] = b'ignored'
+            if name == 'flat':
+                expected['000-leading'] = b'leading'
+            selected_tree = destination
+            if selected == checks.PREFIX:
+                expected = {'selection/' + path: data for path, data in expected.items()}
+                expected['zz-outside'] = b'outside'
+                selected_tree = destination / 'selection'
             actual = {str(p.relative_to(destination)): p.read_bytes()
                       for p in destination.rglob('*') if p.is_file()}
             assert actual == expected, (name, sorted(actual), sorted(expected))
-            assert (destination / 'keep/empty').is_dir()
+            assert (selected_tree / 'keep/empty').is_dir()
+            if not archive:
+                assert not (selected_tree / 'archive').exists()
+            if name == 'flat':
+                checks.request('DELETE', request_key)
         checks.run(['--from', remote, '--srcs-in', prefix, '--into', root / 'excluded',
                     '--ignore', '*'])
         assert not list((root / 'excluded').rglob('*'))

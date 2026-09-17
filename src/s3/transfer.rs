@@ -1128,6 +1128,7 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
+        let mut excluded_subtrees = HashSet::new();
         for (key, path, selection, declared_kind, expected_digest) in selectors {
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
@@ -1160,13 +1161,15 @@ impl Engine {
                         &self.client,
                         &self.options.bucket,
                         &prefix,
-                        matcher.as_ref()
+                        matcher.as_ref(),
+                        &mut excluded_subtrees
                     )
                 )?;
                 (exact, Some(listed))
             } else {
                 (exact.await?, None)
             };
+            let already_filtered = self.args.native_mapping.is_none() && exact.is_none();
             let objects = if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -1197,6 +1200,7 @@ impl Engine {
                             &self.options.bucket,
                             &prefix,
                             matcher.as_ref(),
+                            &mut excluded_subtrees,
                         )
                         .await?
                     }
@@ -1227,14 +1231,15 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
-                if !directory && (size < min || size > max) {
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
-                    continue;
+                if !already_filtered {
+                    if let Some(excluded) = client::exclusion(matcher.as_ref(), &key, directory) {
+                        self.progress
+                            .files_excluded
+                            .fetch_add(excluded.count(&mut excluded_subtrees), Relaxed);
+                        continue;
+                    }
                 }
-                if matcher
-                    .as_ref()
-                    .is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
-                {
+                if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }

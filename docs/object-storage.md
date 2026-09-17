@@ -18,9 +18,9 @@ beneath a prefix. A named selector selects an exact object when it exists,
 otherwise the objects beneath `NAME/`.
 
 Ignore patterns containing `/` match bucket-relative object keys. Ignore
-rules can let syq skip entire object subtrees. As with filesystem
-copies, excluded totals cover entries inspected, not unseen descendants of
-skipped directories. Keys inside skipped subtrees are not validated.
+rules can let syq skip entire object subtrees. Download exclusion totals count
+individual excluded files and count each ignored subtree once, without counting
+its descendants. Keys inside ignored subtrees are not validated.
 
 ## Credentials and providers
 

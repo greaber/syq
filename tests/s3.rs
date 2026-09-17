@@ -162,10 +162,51 @@ fn serve(
         }
         if query.contains_key("list-type") {
             assert_eq!(method, "GET");
-            assert_eq!(query.get("prefix").map(|s| s.as_ref()), Some("data/"));
+            let prefix = query.get("prefix").unwrap().as_ref();
+            if !matches!(
+                fault,
+                "listing-nested" | "listing-deep" | "listing-nested-wide"
+            ) {
+                assert_eq!(prefix, "data/");
+            }
             let object =
                 |key: &str| format!("<Contents><Key>{key}</Key><Size>{SIZE}</Size></Contents>");
             let (body, truncated) = match fault {
+                "listing-nested" | "listing-deep" | "listing-nested-wide" => {
+                    let depth = if fault == "listing-deep" { 12 } else { 1 };
+                    let parent = format!("data/{}", "level/".repeat(depth));
+                    let excluded = format!("{parent}archive/");
+                    if query.contains_key("delimiter") {
+                        if prefix == parent {
+                            let mut body = format!(
+                                "<CommonPrefixes><Prefix>{excluded}</Prefix></CommonPrefixes>"
+                            );
+                            if fault == "listing-nested-wide" {
+                                body.push_str(&format!("<CommonPrefixes><Prefix>{parent}a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>{parent}b/</Prefix></CommonPrefixes>"));
+                            }
+                            (body, false)
+                        } else {
+                            assert!(parent.starts_with(prefix));
+                            (format!("<CommonPrefixes><Prefix>{prefix}level/</Prefix></CommonPrefixes>"), false)
+                        }
+                    } else {
+                        (
+                            object(&format!("{excluded}file")),
+                            !query.contains_key("continuation-token"),
+                        )
+                    }
+                }
+                "listing-ignored-root" | "listing-empty" => {
+                    assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
+                    (
+                        if fault == "listing-empty" {
+                            String::new()
+                        } else {
+                            object("data/archive/file")
+                        },
+                        false,
+                    )
+                }
                 "listing-exists" => {
                     assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
                     (object("data/other"), true)
@@ -1292,6 +1333,9 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
         ("listing-all-ignored", vec!["--ignore", "archive/"], 3),
         ("listing-flat", vec!["--ignore", "*.tmp"], 3),
         ("listing-wide", vec!["--ignore", "archive/"], 4),
+        ("listing-nested", vec!["--ignore", "archive/"], 4),
+        ("listing-deep", vec!["--ignore", "archive/"], 7),
+        ("listing-nested-wide", vec!["--ignore", "archive/"], 5),
         (
             "listing-mixed",
             vec!["--ignore", "archive/", "--ignore", "*.tmp"],
@@ -1339,10 +1383,10 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
             terminal["files_excluded"],
             if fault == "listing-mixed" {
                 3
-            } else if fault == "listing-flat" || fault == "listing-wide" {
+            } else if fault == "listing-flat" {
                 2
             } else {
-                0
+                1
             }
         );
         if fault == "listing-adaptive" {
@@ -1392,5 +1436,62 @@ fn s3_upload_destination_discovery_is_bounded() {
             expected_requests,
             "{fault}"
         );
+    }
+}
+
+#[test]
+fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
+    for (fault, sources, rule, success, excluded, requests) in [
+        (
+            "listing-ignored-root",
+            vec!["--srcs-in", "data", "--srcs-in", "data"],
+            "data/",
+            true,
+            1,
+            4,
+        ),
+        (
+            "listing-exact",
+            vec!["data/archive/a", "data/archive/b"],
+            "archive/",
+            true,
+            1,
+            2,
+        ),
+        (
+            "listing-empty",
+            vec!["--srcs-in", "data"],
+            "data/",
+            false,
+            0,
+            2,
+        ),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "--ignore",
+            rule,
+            "--dry-run",
+            "--results",
+            "results.jsonl",
+        ];
+        args.extend(sources);
+        args.extend(["--into", "out"]);
+        let output = server.cp(temp.path(), &args);
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+        let records = std::fs::read_to_string(temp.path().join("results.jsonl")).unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(terminal["files_excluded"], excluded, "{fault}: {terminal}");
+        assert_eq!(terminal["files_transferred"], 0, "{fault}: {terminal}");
     }
 }
