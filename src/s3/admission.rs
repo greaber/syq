@@ -17,6 +17,7 @@ struct Probe {
     baseline: f64,
     upward: bool,
     revisit: bool,
+    confirming: bool,
 }
 
 struct Controller {
@@ -31,8 +32,10 @@ struct Controller {
     scores: usize,
     failures: [u32; 2],
     revisit_at: [usize; 2],
+    nearby: [bool; 2],
     reference: Option<f64>,
     changed_scores: usize,
+    rate_variation: f64,
 }
 
 impl Controller {
@@ -51,8 +54,10 @@ impl Controller {
             scores: 0,
             failures: [0; 2],
             revisit_at: [0; 2],
+            nearby: [false; 2],
             reference: None,
             changed_scores: 0,
+            rate_variation: 0.0,
         }
     }
 
@@ -73,13 +78,24 @@ impl Controller {
         if let Some(score) = self.sampler.push(rate) {
             let before = self.limit;
             self.scores += 1;
-            if let Some(probe) = self.probe.take() {
+            if let Some(mut probe) = self.probe.take() {
                 // Pay for more concurrency only when it improves throughput.
                 // Prefer fewer objects only when measured speed holds: a
                 // tolerated loss per step can accumulate into a large loss.
                 let floor = if probe.upward { 1.02 } else { 1.0 };
                 let direction = usize::from(probe.upward);
                 if score > 0.0 && score >= probe.baseline * floor {
+                    // A small apparent improvement can be ordinary variation.
+                    // Require another successful score before accepting it;
+                    // clearly better settings need no extra confirmation.
+                    if probe.revisit
+                        && !probe.confirming
+                        && score < probe.baseline * (1.0 + 2.0 * self.rate_variation)
+                    {
+                        probe.confirming = true;
+                        self.probe = Some(probe);
+                        return self.limit;
+                    }
                     if probe.revisit {
                         // A nearby probe found a change outside the old bounds.
                         // Resume the coarse search only in that direction.
@@ -135,12 +151,30 @@ impl Controller {
                     for upward in [self.upward, !self.upward] {
                         if self.scores >= self.revisit_at[usize::from(upward)] {
                             let step = self.limit.div_ceil(if upward { 2 } else { 4 });
+                            let direction = usize::from(upward);
+                            let nearby = self.nearby[direction];
+                            // Alternate nearby and broader revisits. A broad
+                            // step can jump over a newly improved optimum;
+                            // tiny steps can be lost in normal rate variation.
+                            let step = if nearby {
+                                let boundary = if upward {
+                                    self.upper.saturating_sub(self.limit)
+                                } else {
+                                    self.limit.saturating_sub(self.lower)
+                                };
+                                let variation_step =
+                                    (self.limit as f64 * 2.0 * self.rate_variation).ceil() as usize;
+                                step.min(boundary.max(variation_step))
+                            } else {
+                                step
+                            };
                             let next = if upward {
                                 (self.limit + step).min(self.maximum)
                             } else {
                                 self.limit.saturating_sub(step).max(1)
                             };
                             if next != self.limit {
+                                self.nearby[direction] = !nearby;
                                 self.upward = upward;
                                 candidate = next;
                                 revisit = true;
@@ -152,9 +186,14 @@ impl Controller {
                 if candidate != self.limit {
                     self.probe = Some(Probe {
                         from: self.limit,
-                        baseline: score,
+                        baseline: if revisit {
+                            self.reference.unwrap_or(score)
+                        } else {
+                            score
+                        },
                         upward: self.upward,
                         revisit,
+                        confirming: false,
                     });
                     self.limit = candidate;
                 }
@@ -181,6 +220,10 @@ impl Controller {
                 self.failures = [0; 2];
                 self.revisit_at = [0; 2];
             } else {
+                if reference > 0.0 {
+                    self.rate_variation =
+                        self.rate_variation * 0.9 + ((score - reference) / reference).abs() * 0.1;
+                }
                 self.reference = Some(reference * 0.9 + score * 0.1);
                 self.changed_scores = 0;
                 return;
@@ -403,6 +446,57 @@ mod tests {
             .sum::<f64>()
             / 1000.0;
         assert!(fraction > 0.95, "must sustain the improvement: {fraction}");
+    }
+
+    #[test]
+    fn an_ambiguous_revisit_can_fail_its_confirmation() {
+        let mut controller = Controller::new(32, 256, false);
+        controller.limit = 36;
+        controller.rate_variation = 0.1;
+        controller.probe = Some(Probe {
+            from: 32,
+            baseline: 1000.0,
+            upward: true,
+            revisit: true,
+            confirming: false,
+        });
+        // The first stable score looks 3% better, within the observed variation.
+        for _ in 0..3 {
+            assert_eq!(controller.observe(1030.0, 36, 10000, 16), 36);
+        }
+        assert!(controller.probe.as_ref().unwrap().confirming);
+        // A subsequent score reverses that finding. Restore the accepted limit.
+        controller.observe(990.0, 36, 10000, 16);
+        assert_eq!(controller.observe(990.0, 36, 10000, 16), 32);
+        assert!(controller.probe.is_none());
+    }
+
+    #[test]
+    fn probes_discover_modest_capacity_changes() {
+        for (before, after) in [(7, 8), (8, 9), (9, 8), (32, 36)] {
+            let mut controller = Controller::new(32, 256, false);
+            let mut model = PathModel {
+                active: 32,
+                completions: 0.0,
+                random: 17,
+            };
+            for _ in 0..1000 {
+                model.sample(&mut controller, before, 0.0);
+            }
+            // A modest change can put the optimum between the settled limit
+            // and a broad probe. Repeatedly jumping over it must not strand us.
+            for _ in 0..1000 {
+                model.sample(&mut controller, after, 0.0);
+            }
+            let fraction = (0..1000)
+                .map(|_| model.sample(&mut controller, after, 0.0))
+                .sum::<f64>()
+                / 1000.0;
+            assert!(
+                fraction > 0.97,
+                "capacity {before}->{after}: useful fraction {fraction}"
+            );
+        }
     }
 
     #[test]
