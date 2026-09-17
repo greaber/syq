@@ -4075,6 +4075,7 @@ fn background_bootstrap_installs_the_command_quietly() {
                     t.path("release-manifest.json"),
                 )
                 .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_COMPLETION_DEBUG", "1")
                 .env("SYQ_TEST_RELEASE_BUILD", "1")
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4103,7 +4104,8 @@ fn background_bootstrap_installs_the_command_quietly() {
                             .as_os_str()
                             .as_encoded_bytes()
                             .to_vec()
-                    )]
+                    )],
+                    "completion={completion}, upload={upload}: {output:?}"
                 );
             }
             assert!(
@@ -20219,7 +20221,11 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut socket = loop {
             match listener.accept() {
-                Ok((socket, _)) => break socket,
+                Ok((socket, _)) => {
+                    // BSD accepted sockets inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
+                    break socket;
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -20549,7 +20555,11 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         for response in [serde_json::json!({"Error":"copy denied by test policy"})] {
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && std::time::Instant::now() < deadline =>
@@ -20860,7 +20870,11 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             Instant::now() < deadline,
@@ -21745,7 +21759,13 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            wait_for_confinement_marker(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
+            );
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([

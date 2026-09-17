@@ -10,15 +10,93 @@ use aws_smithy_runtime_api::{
         interceptors::{
             context::{
                 BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+                InterceptorContext,
             },
             Intercept,
         },
+        retries::classifiers::{ClassifyRetry, RetryAction},
         runtime_components::RuntimeComponents,
     },
 };
 use aws_smithy_types::config_bag::ConfigBag;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
+
+// The SDK retries throttling only by known error codes in an XML body. HEAD
+// responses have no body, and some providers send HTTP 429 with other codes,
+// so classify the status itself for every operation. A 429 response means the
+// request was not processed, so a retry within the bounded budget is safe.
+#[derive(Debug)]
+struct Throttling;
+impl ClassifyRetry for Throttling {
+    fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
+        if context
+            .response()
+            .is_some_and(|r| r.status().as_u16() == 429)
+        {
+            RetryAction::throttling_error()
+        } else {
+            RetryAction::NoActionIndicated
+        }
+    }
+    fn name(&self) -> &'static str {
+        "S3 HTTP 429 throttling"
+    }
+}
+
+/// Requests wrapped by their own retry loop run without SDK retries, so
+/// `s3-retries` is one budget per request. Uploads need the loop because the
+/// SDK cannot rewind a file body; downloads need it because a response body
+/// can fail after the headers arrive. Every other request keeps SDK retries.
+pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
+}
+
+/// Time HEAD and LIST responses to their headers. Each is one small exchange,
+/// unlike data requests, whose duration follows their bodies. Only an answer
+/// about the object or listing counts: errors and throttling describe the
+/// service, and a redirect comes from a region that does not hold the bucket.
+#[derive(Debug)]
+struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
+#[derive(Debug)]
+struct ControlStart(std::time::Instant);
+impl aws_smithy_types::config_bag::Storable for ControlStart {
+    type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
+}
+impl Intercept for ControlLatency {
+    fn name(&self) -> &'static str {
+        "SyqS3ControlLatency"
+    }
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let request = context.request();
+        if request.method() == "HEAD"
+            || (request.method() == "GET" && request.uri().contains("list-type="))
+        {
+            cfg.interceptor_state()
+                .store_put(ControlStart(std::time::Instant::now()));
+        }
+        Ok(())
+    }
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let status = context.response().status().as_u16();
+        if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
+            if (200..300).contains(&status) || status == 404 {
+                super::tuning::observe_control(&self.0, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct Headers(Vec<Header>);
@@ -64,7 +142,59 @@ impl Intercept for Headers {
     }
 }
 
-pub(super) async fn connect(options: &mut Options) -> Result<Client> {
+/// S3 names a bucket's region on every response, including the redirect or
+/// denial that a request sent to the wrong region receives.
+fn response_region(
+    response: Option<&aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
+) -> Option<String> {
+    response?
+        .headers()
+        .get("x-amz-bucket-region")
+        .map(str::to_owned)
+}
+
+/// Describe a failed request. A bodyless redirect otherwise reads as an
+/// "unhandled error", although S3 says where the bucket is.
+fn failure<E>(
+    operation: &str,
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> String {
+    let response = error.raw_response();
+    match (
+        response.map(|r| r.status().as_u16()),
+        response_region(response),
+    ) {
+        (Some(301), Some(region)) => format!(
+            "{operation} failed (HTTP 301): the bucket is in region {region}; \
+             pass --s3-region {region} or set AWS_REGION"
+        ),
+        (Some(status), _) => format!("{operation} failed (HTTP {status})"),
+        (None, _) => format!("{operation} failed"),
+    }
+}
+
+/// Ask S3 where a bucket is. Any response carries the answer, so this needs
+/// no permission on the bucket. The error says why there was no answer.
+async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(output) => output
+            .bucket_region()
+            .map(str::to_owned)
+            .ok_or_else(|| "the response did not name a region".to_owned()),
+        Err(error) => response_region(error.raw_response()).ok_or_else(|| {
+            aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        }),
+    }
+}
+
+/// Also returns a note for verbose output when the region lookup got no answer.
+pub(super) async fn connect(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -88,6 +218,7 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
                 .unwrap_or_else(|| Region::new("us-east-1")),
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
+        .retry_classifier(Throttling)
         .timeout_config(
             TimeoutConfig::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -97,7 +228,8 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .interceptor(Headers(options.headers.clone()));
+        .interceptor(Headers(options.headers.clone()))
+        .interceptor(ControlLatency(control));
 
     let endpoint = options
         .endpoint
@@ -122,11 +254,26 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         })
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
+    let mut note = None;
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
+    } else if shared.region().is_none() {
+        // AWS serves each bucket from one region and redirects requests sent
+        // elsewhere. With no region configured, ask instead of assuming
+        // us-east-1. A configured region is used as given, and a custom
+        // endpoint already identifies its provider's storage.
+        let probe = Client::from_conf(config.clone().build());
+        match bucket_region(&probe, &options.bucket).await {
+            Ok(region) => config = config.region(Region::new(region)),
+            Err(reason) => {
+                note = Some(format!(
+                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                ))
+            }
+        }
     }
-    Ok(Client::from_conf(config.build()))
+    Ok((Client::from_conf(config.build()), note))
 }
 
 /// Version 1 is an ordinary object body plus this small metadata record.
@@ -263,7 +410,10 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
         {
             return Ok(None)
         }
-        Err(error) => return Err(error.into_service_error()).context("S3 HEAD failed"),
+        Err(error) => {
+            let message = failure("S3 HEAD", &error);
+            return Err(error.into_service_error()).context(message);
+        }
     };
     let size = u64::try_from(
         output
@@ -285,14 +435,37 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
     }))
 }
 
-pub(super) async fn list(
+/// Existence needs only one object, regardless of the size of the prefix.
+pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
+    let output = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1)
+        .send()
+        .await
+        .map_err(|e| e.into_service_error())
+        .context("S3 listing failed")?;
+    anyhow::ensure!(
+        !output.contents().is_empty() || output.is_truncated() != Some(true),
+        "S3 existence listing was truncated without an object"
+    );
+    Ok(!output.contents().is_empty())
+}
+
+/// Bound destination discovery by the size of the upload. An incomplete listing
+/// cannot prove that an upload key is absent, so leave those decisions to HEAD.
+pub(super) async fn upload_listing(
     client: &Client,
     bucket: &str,
     prefix: &str,
-) -> Result<Vec<(String, u64)>> {
-    let mut objects = Vec::new();
+    source_keys: &std::collections::HashSet<&str>,
+) -> Result<Option<std::collections::HashMap<String, u64>>> {
+    let mut keys = std::collections::HashMap::new();
     let mut token = None;
-    loop {
+    // Never spend as many LIST requests as checking each source with HEAD.
+    // Retain only relevant keys so a large destination cannot grow the cache.
+    for _ in 0..source_keys.len().saturating_sub(1) {
         let output = client
             .list_objects_v2()
             .bucket(bucket)
@@ -300,16 +473,23 @@ pub(super) async fn list(
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| e.into_service_error())
-            .context("S3 listing failed")?;
+            .map_err(|e| {
+                let message = failure("S3 listing", &e);
+                anyhow::Error::new(e.into_service_error()).context(message)
+            })?;
         for object in output.contents() {
-            objects.push((
-                object.key().context("S3 listing omitted key")?.to_owned(),
-                u64::try_from(object.size().context("S3 listing omitted size")?)?,
-            ));
+            let key = object.key().context("S3 listing omitted key")?;
+            anyhow::ensure!(
+                key.starts_with(prefix),
+                "S3 listing returned a key outside the requested prefix"
+            );
+            if source_keys.contains(key) {
+                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
+                keys.insert(key.to_owned(), size);
+            }
         }
-        if output.is_truncated() != Some(true) {
-            break;
+        if output.is_truncated() != Some(true) || keys.len() == source_keys.len() {
+            return Ok(Some(keys));
         }
         let next = output
             .next_continuation_token()
@@ -320,7 +500,256 @@ pub(super) async fn list(
         }
         token = Some(next);
     }
-    Ok(objects)
+    Ok(None)
+}
+
+/// The first excluded ancestor is the boundary a filesystem walk would prune.
+/// Keep that boundary rather than counting every descendant in a flat S3 page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Exclusion<'a> {
+    File,
+    Subtree(&'a str),
+}
+
+impl Exclusion<'_> {
+    pub(super) fn count(self, subtrees: &mut std::collections::HashSet<String>) -> u64 {
+        match self {
+            Self::File => 1,
+            Self::Subtree(path) if subtrees.contains(path) => 0,
+            Self::Subtree(path) => {
+                subtrees.insert(path.to_owned());
+                1
+            }
+        }
+    }
+}
+
+pub(super) fn exclusion<'a>(
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    key: &'a str,
+    directory: bool,
+    known_subtrees: &std::collections::HashSet<String>,
+) -> Option<Exclusion<'a>> {
+    let matcher = matcher?;
+    let key = if directory {
+        key.trim_end_matches('/')
+    } else {
+        key
+    };
+    // These boundaries were already classified under the same rules. Reuse
+    // them for adjacent objects rather than rematching a deep parent chain.
+    if directory && known_subtrees.contains(key) {
+        return Some(Exclusion::Subtree(key));
+    }
+    if let Some((parent, _)) = key.rsplit_once('/') {
+        if known_subtrees.contains(parent) {
+            return Some(Exclusion::Subtree(parent));
+        }
+    }
+    for (separator, _) in key.match_indices('/') {
+        let ancestor = &key[..separator];
+        if !ancestor.is_empty() && matcher.matched(ancestor, true).is_ignore() {
+            return Some(Exclusion::Subtree(ancestor));
+        }
+    }
+    if !key.is_empty() && matcher.matched(key, directory).is_ignore() {
+        Some(if directory {
+            Exclusion::Subtree(key)
+        } else {
+            Exclusion::File
+        })
+    } else {
+        None
+    }
+}
+
+pub(super) struct Listing {
+    pub objects: Vec<(String, u64)>,
+    pub found: bool,
+    pub excluded: u64,
+}
+
+/// Keep flat listings for small trees and filename filters. Only switch to
+/// directory discovery when the first full page contains only excluded descendants.
+/// A complete directory probe can prune children or descend through a single
+/// included child toward excluded descendants. Limit probes to four per source
+/// selector: deep chains must not turn a flat listing into an unbounded walk.
+/// Wide or truncated probes reuse the flat sample instead of fanning out.
+pub(super) async fn list(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    excluded_subtrees: &mut std::collections::HashSet<String>,
+) -> Result<Listing> {
+    let mut result = Listing {
+        objects: Vec::new(),
+        found: false,
+        excluded: 0,
+    };
+    if let Some(excluded) = exclusion(matcher, prefix, true, excluded_subtrees) {
+        result.found = prefix_exists(client, bucket, prefix).await?;
+        if result.found {
+            result.excluded += excluded.count(excluded_subtrees);
+        }
+        return Ok(result);
+    }
+    let mut probes_remaining = 4;
+    let mut pending = vec![prefix.to_owned()];
+    while let Some(current) = pending.pop() {
+        let mut token = None;
+        loop {
+            let mut directories = false;
+            let mut output = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&current)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())
+                .context("S3 listing failed")?;
+            result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
+            let mut reachable_exclusion = false;
+            if probes_remaining > 0
+                && token.is_none()
+                && output.is_truncated() == Some(true)
+                && !output.contents().is_empty()
+                && output.contents().iter().all(|object| {
+                    object.key().is_some_and(|key| {
+                        if let Some(Exclusion::Subtree(boundary)) = exclusion(
+                            matcher,
+                            key,
+                            key.ends_with('/') && object.size() == Some(0),
+                            excluded_subtrees,
+                        ) {
+                            reachable_exclusion |=
+                                boundary.strip_prefix(&current).is_some_and(|relative| {
+                                    relative.bytes().filter(|byte| *byte == b'/').count()
+                                        < probes_remaining
+                                });
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                && reachable_exclusion
+            {
+                let mut probe_prefix = current.clone();
+                let mut parent_objects = Vec::new();
+                while probes_remaining > 0 {
+                    probes_remaining -= 1;
+                    let mut directory_page = client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix(&probe_prefix)
+                        .delimiter("/")
+                        .send()
+                        .await
+                        .map_err(|e| e.into_service_error())
+                        .context("S3 listing failed")?;
+                    let mut included = 0;
+                    let mut excluded = 0;
+                    for child in directory_page.common_prefixes() {
+                        let child = child.prefix().context("S3 listing omitted common prefix")?;
+                        anyhow::ensure!(
+                            child.starts_with(&probe_prefix)
+                                && child.len() > probe_prefix.len()
+                                && child.ends_with('/'),
+                            "S3 listing returned an invalid common prefix"
+                        );
+                        if exclusion(matcher, child, true, excluded_subtrees).is_some() {
+                            excluded += 1;
+                        } else {
+                            included += 1;
+                        }
+                    }
+                    if directory_page.is_truncated() == Some(true) || included > 1 {
+                        break;
+                    }
+                    for object in directory_page.contents() {
+                        anyhow::ensure!(
+                            object
+                                .key()
+                                .context("S3 listing omitted key")?
+                                .starts_with(&probe_prefix),
+                            "S3 listing returned a key outside the requested prefix"
+                        );
+                    }
+                    if excluded > 0 {
+                        // Commit the lookahead only once it actually prunes.
+                        // Ancestor objects and this page replace the sample;
+                        // intermediate prefixes have already been visited.
+                        parent_objects.extend(directory_page.contents.take().unwrap_or_default());
+                        directory_page.contents = Some(parent_objects);
+                        output = directory_page;
+                        directories = true;
+                        break;
+                    }
+                    if included == 0 {
+                        break;
+                    }
+                    // Every sampled object was under an excluded ancestor and
+                    // this page has just one child. Follow that child without
+                    // refetching the same flat sample at each directory level.
+                    probe_prefix = directory_page.common_prefixes()[0]
+                        .prefix()
+                        .context("S3 listing omitted common prefix")?
+                        .to_owned();
+                    parent_objects.extend(directory_page.contents.take().unwrap_or_default());
+                }
+                // If the budget or a wide page stopped lookahead, the original
+                // flat sample and its continuation token are still usable.
+            }
+            for object in output.contents() {
+                let key = object.key().context("S3 listing omitted key")?;
+                anyhow::ensure!(
+                    key.starts_with(&current),
+                    "S3 listing returned a key outside the requested prefix"
+                );
+                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
+                let directory = key.ends_with('/') && size == 0;
+                if let Some(excluded) = exclusion(matcher, key, directory, excluded_subtrees) {
+                    // A filename-only exclusion still encounters the key and
+                    // preserves its path validation. Pruned descendants do not.
+                    if excluded == Exclusion::File {
+                        super::local::key_path(key.as_bytes())?;
+                    }
+                    result.excluded += excluded.count(excluded_subtrees);
+                } else {
+                    result.objects.push((key.to_owned(), size));
+                }
+            }
+            for child in output.common_prefixes() {
+                let child = child.prefix().context("S3 listing omitted common prefix")?;
+                anyhow::ensure!(
+                    directories
+                        && child.starts_with(&current)
+                        && child.len() > current.len()
+                        && child.ends_with('/'),
+                    "S3 listing returned an invalid common prefix"
+                );
+                if let Some(excluded) = exclusion(matcher, child, true, excluded_subtrees) {
+                    result.excluded += excluded.count(excluded_subtrees);
+                } else {
+                    pending.push(child.to_owned());
+                }
+            }
+            if output.is_truncated() != Some(true) {
+                break;
+            }
+            let next = output
+                .next_continuation_token()
+                .context("truncated S3 listing omitted continuation token")?
+                .to_owned();
+            if token.as_ref() == Some(&next) {
+                bail!("S3 listing repeated its continuation token");
+            }
+            token = Some(next);
+        }
+    }
+    Ok(result)
 }
 
 // GET metadata is authoritative for the body returned by that same request.
@@ -352,6 +781,73 @@ pub(super) fn from_get(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exclusion_identifies_first_pruned_ancestor_and_preserves_negations() {
+        use super::{exclusion, Exclusion};
+        for (rules, key, directory, expected) in [
+            (
+                vec!["archive/"],
+                "root/archive/nested/file",
+                false,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (
+                vec!["archive/"],
+                "root/archive/",
+                true,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (vec!["archive/"], "root/archive", false, None),
+            (
+                vec!["archive/", "!**/archive/keep"],
+                "root/archive/keep",
+                false,
+                Some(Exclusion::Subtree("root/archive")),
+            ),
+            (vec!["*.tmp"], "root/file.tmp", false, Some(Exclusion::File)),
+            (
+                vec!["**/archive/*", "!**/archive/keep/"],
+                "root/archive/keep/file",
+                false,
+                None,
+            ),
+            (
+                vec!["root/", "archive/"],
+                "root/archive/file",
+                false,
+                Some(Exclusion::Subtree("root")),
+            ),
+        ] {
+            let matcher =
+                crate::scan::build_ignore(&rules.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                    .unwrap()
+                    .unwrap();
+            let mut known_subtrees = std::collections::HashSet::new();
+            let actual = exclusion(Some(&matcher), key, directory, &known_subtrees);
+            assert_eq!(actual, expected, "{rules:?} {key}");
+            if let Some(excluded) = actual {
+                excluded.count(&mut known_subtrees);
+                assert_eq!(
+                    exclusion(Some(&matcher), key, directory, &known_subtrees),
+                    expected
+                );
+            }
+            assert_eq!(
+                actual.is_some(),
+                crate::scan::path_is_ignored(
+                    &matcher,
+                    if directory {
+                        key.trim_end_matches('/').as_bytes()
+                    } else {
+                        key.as_bytes()
+                    },
+                    directory
+                ),
+                "{rules:?} {key} directory={directory}"
+            );
+        }
+    }
+
     use super::*;
     use crate::hashing::{Digest, HashAlgorithm};
 
@@ -400,5 +896,61 @@ mod tests {
         assert_eq!(values["syq-hash-algorithm"], "md5");
         assert!(!values.contains_key("syq-blake3"));
         assert_eq!(Metadata::decode(Some(&values)).unwrap(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn bucket_region_comes_from_redirects_and_denials() {
+        use std::io::{Read, Write};
+        for status in ["301 Moved Permanently", "403 Forbidden"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") && socket.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                assert!(request.starts_with(b"HEAD /bucket"));
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nx-amz-bucket-region: eu-central-1\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            let config = aws_sdk_s3::config::Builder::new()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "key", "secret", None, None, "test",
+                ))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .build();
+            let region = bucket_region(&Client::from_conf(config), "bucket").await;
+            server.join().unwrap();
+            assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_region_reports_why_there_was_no_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "key", "secret", None, None, "test",
+            ))
+            .retry_config(RetryConfig::disabled())
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        let reason = bucket_region(&Client::from_conf(config), "bucket")
+            .await
+            .unwrap_err();
+        assert!(!reason.is_empty());
     }
 }

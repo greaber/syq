@@ -1,6 +1,8 @@
 mod fast;
+mod pruning;
 
 use super::{
+    admission::parallel,
     checksum::Algorithm,
     client::{self, Metadata, Object},
     local::{self, Destination, Source},
@@ -42,7 +44,7 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
-    upload_keys: OnceLock<HashSet<String>>,
+    upload_keys: OnceLock<HashMap<String, u64>>,
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -102,10 +104,14 @@ impl Engine {
             .endpoint
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let client = client::connect(&mut options).await?;
+        let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (client, note) = client::connect(&mut options, control.clone()).await?;
+        if let Some(note) = note.filter(|_| args.verbose > 0) {
+            progress.println(&note);
+        }
         super::diagnostics::elapsed(setup, "client_setup", 0);
         Ok(Arc::new(Self {
-            tuning: super::tuning::Tuning::new(&options, &args),
+            tuning: super::tuning::Tuning::new(&options, &args, control),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             cancel_wake: tokio::sync::Notify::new(),
             args,
@@ -141,9 +147,9 @@ impl Engine {
         if self.options.upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
-            let plan = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            let (plan, prune) =
+                tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
-            let planning = std::time::Instant::now();
             if self.args.expected_digest.is_some() && (plan.len() != 1 || plan[0].kind() != "file")
             {
                 bail!("an expected digest requires exactly one regular file");
@@ -156,15 +162,42 @@ impl Engine {
                 } else {
                     format!("{target}/")
                 };
-                let keys = client::list(&self.client, &self.options.bucket, &prefix)
-                    .await?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
-                let _ = self.upload_keys.set(keys);
+                let listing = if self.args.delete {
+                    // Pruning needs every destination key, including keys absent
+                    // from the upload plan. Only this complete cache is reusable
+                    // by the deletion planner.
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        None,
+                        &mut HashSet::new(),
+                    )
+                    .await
+                    .map(|listing| Some(listing.objects.into_iter().collect()))
+                } else {
+                    let source_keys = plan.iter().map(|source| source.key.as_str()).collect();
+                    client::upload_listing(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        &source_keys,
+                    )
+                    .await
+                };
+                match listing {
+                    Ok(Some(keys)) => {
+                        let _ = self.upload_keys.set(keys);
+                    }
+                    Ok(None) => {}
+                    Err(error) if self.args.delete => {
+                        self.progress
+                            .error(&format!("list S3 destination: {error:#}"));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
-            self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -189,15 +222,14 @@ impl Engine {
                         .cloned();
                     let result = engine.upload(source).await;
                     engine.settle(&label, &key, kind, &result, expected.as_ref());
-                    Ok(())
+                    Ok(result.ok().flatten())
                 }
             })
             .await?;
+            self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
-            let planning = std::time::Instant::now();
-            let plan = self.download_plan(&destination).await?;
-            self.tuning.observe_control(planning.elapsed());
+            let (plan, prune) = self.download_plan(&destination).await?;
             let workers = self.object_workers(plan.iter().map(|s| s.size))?;
             if self.args.expected_digest.is_some() && plan.len() != 1 {
                 bail!("an expected digest requires exactly one regular file");
@@ -227,22 +259,34 @@ impl Engine {
                             .as_ref()
                             .or(engine.args.expected_digest.as_ref()),
                     );
-                    Ok(())
+                    Ok(result.ok().flatten())
                 }
             })
             .await?;
-            if !self.args.dry_run && !self.args.verify_only {
-                let mut directories = directories.lock().await;
-                directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
-                for (path, meta, mode) in directories.iter() {
-                    local::apply_metadata(
-                        &destination.root,
-                        &RelativePath::new(path.as_bytes())?,
-                        meta,
-                        &self.args,
-                        *mode,
-                    )?;
-                }
+            // Prune while directories are writable, then restore their modes and times.
+            // Apply metadata even when the deletion budget refuses pruning.
+            let pruned = self.prune(prune, Some(&destination)).await;
+            self.finish_directories(&destination, &directories).await?;
+            pruned?;
+        }
+        Ok(())
+    }
+    async fn finish_directories(
+        &self,
+        destination: &Destination,
+        directories: &DirectoryMetadata,
+    ) -> Result<()> {
+        if !self.args.dry_run && !self.args.verify_only {
+            let mut directories = directories.lock().await;
+            directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+            for (path, meta, mode) in directories.iter() {
+                local::apply_metadata(
+                    &destination.root,
+                    &RelativePath::new(path.as_bytes())?,
+                    meta,
+                    &self.args,
+                    *mode,
+                )?;
             }
         }
         Ok(())
@@ -396,10 +440,8 @@ impl Engine {
         } else {
             format!("{target}/")
         };
-        let present = exact
-            || !client::list(&self.client, &self.options.bucket, &prefix)
-                .await?
-                .is_empty();
+        let present =
+            exact || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
             || (self.args.target_existence == Existence::Existing && !present)
         {
@@ -414,6 +456,18 @@ impl Engine {
         }
         Ok(())
     }
+    fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
+        object.kind() == source.kind()
+            && object.size == size
+            && object.metadata.as_ref().is_some_and(|m| {
+                m.mtime == source.meta.mtime
+                    && m.nsec == source.meta.mtime_nsec
+                    && (!self.args.perms || m.mode == source.meta.mode & 0o7777)
+                    && (!(self.args.owner || self.args.group)
+                        || (m.uid == source.meta.uid && m.gid == source.meta.gid))
+            })
+    }
+
     async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
         let expected_digest = source
             .expected_digest
@@ -423,13 +477,11 @@ impl Engine {
         let existing = if self
             .upload_keys
             .get()
-            .is_some_and(|keys| !keys.contains(&source.key))
+            .is_some_and(|keys| !keys.contains_key(&source.key))
         {
             None
         } else {
-            let started = std::time::Instant::now();
             let object = client::head(&self.client, &self.options.bucket, &source.key).await?;
-            self.tuning.observe_control(started.elapsed());
             object
         };
         if (self.args.ignore_existing && existing.is_some())
@@ -449,6 +501,30 @@ impl Engine {
         } else {
             source.meta.len
         };
+        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
+            if self.args.transfer_integrity {
+                Some(self.args.transfer_hash_type.unwrap_or_default())
+            } else if self.args.checksum || self.args.verify_only {
+                Some(self.args.hash_algorithm)
+            } else {
+                None
+            }
+        });
+        if whole_algorithm.is_none()
+            && existing
+                .as_ref()
+                .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
+        {
+            if source.kind() == "file" {
+                // Opening validates the pinned scan identity without reading the
+                // body. Explicit content checks still take the hashing path.
+                source.open()?;
+            } else {
+                source.bytes()?;
+            }
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            return Ok(None);
+        }
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
@@ -472,15 +548,6 @@ impl Engine {
         self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
-            if self.args.transfer_integrity {
-                Some(self.args.transfer_hash_type.unwrap_or_default())
-            } else if self.args.checksum || self.args.verify_only {
-                Some(self.args.hash_algorithm)
-            } else {
-                None
-            }
-        });
         let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
                 let bytes = source_clone.bytes()?;
@@ -610,17 +677,11 @@ impl Engine {
         metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut unchanged = existing.as_ref().is_some_and(|o| {
-            o.kind() == source.kind()
-                && o.size == size
+            self.upload_metadata_matches(&source, size, o)
                 && o.metadata.as_ref().is_some_and(|m| {
-                    (self.args.checksum
+                    self.args.checksum
                         || whole_digest.is_none()
-                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm))
-                        && m.mtime == metadata.mtime
-                        && m.nsec == metadata.nsec
-                        && (!self.args.perms || m.mode == metadata.mode)
-                        && (!(self.args.owner || self.args.group)
-                            || (m.uid == metadata.uid && m.gid == metadata.gid))
+                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
         let comparison_digest = if self.args.checksum || self.args.verify_only {
@@ -703,6 +764,7 @@ impl Engine {
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
+                    .config_override(super::client::without_sdk_retries())
                     .disable_payload_signing();
                 let request = if let Some(file) = &sync_file {
                     request.interceptor(file.clone())
@@ -715,10 +777,7 @@ impl Engine {
                 }
                 match result {
                     Ok(_) => break,
-                    Err(e)
-                        if retryable_status(e.raw_response().map(|r| r.status().as_u16()))
-                            && attempt < self.options.retries =>
-                    {
+                    Err(e) if retryable(&e) && attempt < self.options.retries => {
                         super::backoff(attempt).await;
                         attempt += 1;
                     }
@@ -919,6 +978,7 @@ impl Engine {
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
                                 .customize()
+                                .config_override(super::client::without_sdk_retries())
                                 .disable_payload_signing();
                             let request = if let Some(file) = &sync_file {
                                 request.interceptor(file.clone())
@@ -956,11 +1016,7 @@ impl Engine {
                                         )
                                         .build());
                                 }
-                                Err(e)
-                                    if retryable_status(
-                                        e.raw_response().map(|r| r.status().as_u16()),
-                                    ) && attempt < self.options.retries =>
-                                {
+                                Err(e) if retryable(&e) && attempt < self.options.retries => {
                                     super::backoff(attempt).await;
                                     attempt += 1;
                                 }
@@ -1047,7 +1103,11 @@ impl Engine {
         }
         Ok(())
     }
-    async fn download_plan(&self, destination: &Destination) -> Result<Vec<Download>> {
+    async fn download_plan(
+        &self,
+        destination: &Destination,
+    ) -> Result<(Vec<Download>, super::prune::Plan)> {
+        let mut prune = super::prune::Plan::default();
         let count = self.args.locations.len() - 1;
         let base = local::key_path(
             self.args
@@ -1125,6 +1185,7 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
+        let mut excluded_subtrees = HashSet::new();
         for (key, path, selection, declared_kind, expected_digest) in selectors {
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
@@ -1153,12 +1214,19 @@ impl Engine {
             let (exact, listed) = if directory && self.args.native_mapping.is_none() {
                 let (exact, listed) = tokio::try_join!(
                     exact,
-                    client::list(&self.client, &self.options.bucket, &prefix)
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        matcher.as_ref(),
+                        &mut excluded_subtrees
+                    )
                 )?;
                 (exact, Some(listed))
             } else {
                 (exact.await?, None)
             };
+            let already_filtered = self.args.native_mapping.is_none() && exact.is_none();
             let objects = if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -1183,13 +1251,28 @@ impl Engine {
                 }
                 let listed = match listed {
                     Some(listed) => listed,
-                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                    None => {
+                        client::list(
+                            &self.client,
+                            &self.options.bucket,
+                            &prefix,
+                            matcher.as_ref(),
+                            &mut excluded_subtrees,
+                        )
+                        .await?
+                    }
                 };
-                if listed.is_empty() {
+                if !listed.found {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
+                self.progress
+                    .files_excluded
+                    .fetch_add(listed.excluded, Relaxed);
+                if self.args.delete {
+                    prune.scope(path.as_bytes(), key.as_bytes());
+                }
                 let mut objects = Vec::new();
-                for (object, size) in listed {
+                for (object, size) in listed.objects {
                     let suffix = object
                         .strip_prefix(&prefix)
                         .context("S3 listing returned a key outside the requested prefix")?;
@@ -1208,21 +1291,32 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
+                if !already_filtered {
+                    if let Some(excluded) =
+                        client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
+                    {
+                        self.progress
+                            .files_excluded
+                            .fetch_add(excluded.count(&mut excluded_subtrees), Relaxed);
+                        continue;
+                    }
+                }
                 if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
-                    continue;
-                }
-                if matcher
-                    .as_ref()
-                    .is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
-                {
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
                     continue;
                 }
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
                 }
                 local::claim(&mut claims, &path, directory)?;
+                if self.args.delete {
+                    if directory {
+                        prune.claim(path.as_bytes());
+                    } else {
+                        prune.protect(path.as_bytes());
+                    }
+                }
                 out.push(Download {
                     key,
                     path,
@@ -1231,7 +1325,7 @@ impl Engine {
                 });
             }
         }
-        Ok(out)
+        Ok((out, prune))
     }
     async fn download(
         self: &Arc<Self>,
@@ -1669,11 +1763,7 @@ impl Engine {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
         let partial = RelativePath::new(
-            local::join(
-                parent,
-                &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-            )
-            .as_bytes(),
+            local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
         let file = Arc::new(root.create_file(&partial, 0o600)?);
         let _cleanup = PartialCleanup {
@@ -1742,10 +1832,7 @@ impl Engine {
         let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)?;
-        let partial = local::join(
-            parent,
-            &format!(".syq-s3-{}.partial", blake3::hash(&random).to_hex()),
-        );
+        let partial = local::join(parent, &super::prune::partial_name(&random));
         let file = root.create_file(&RelativePath::new(partial.as_bytes())?, 0o600)?;
         file.set_len(object.size)?;
         let m = file.metadata()?;
@@ -1856,8 +1943,27 @@ impl std::fmt::Display for Permanent {
     }
 }
 impl std::error::Error for Permanent {}
-fn retryable_status(status: Option<u16>) -> bool {
-    status.is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+/// The upload loops replace SDK retries, so they must recognize the same
+/// throttling and transient conditions: dispatch failures without a response,
+/// retryable statuses, and the error codes S3 can send with other statuses,
+/// such as `RequestTimeout` with HTTP 400.
+fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
+    error
+        .raw_response()
+        .map(|r| r.status().as_u16())
+        .is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+        || error
+            .as_service_error()
+            .and_then(|e| e.code())
+            .is_some_and(|code| {
+                THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
+            })
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();
@@ -1920,35 +2026,6 @@ fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
         root.unlink(&path)?;
     }
     Ok(())
-}
-
-// Each object gets a runtime task so hashing and filesystem work can use more
-// than one executor thread. JoinSet bounds live tasks and aborts them together
-// when the copy is cancelled; detached uploads must never outlive the command.
-async fn parallel<T, F, Fut>(jobs: Vec<T>, workers: usize, mut work: F) -> Result<()>
-where
-    F: FnMut(T) -> Fut,
-    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
-{
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut jobs = jobs.into_iter();
-    for job in jobs.by_ref().take(workers) {
-        tasks.spawn(work(job));
-    }
-    let mut error = None;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(e) = result.map_err(anyhow::Error::from).and_then(|r| r) {
-            if error.is_none() {
-                error = Some(e);
-            }
-        }
-        if error.is_none() {
-            if let Some(job) = jobs.next() {
-                tasks.spawn(work(job));
-            }
-        }
-    }
-    error.map_or(Ok(()), Err)
 }
 
 // Single-request downloads have no reusable completed ranges. Remove their
