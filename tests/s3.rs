@@ -155,34 +155,86 @@ fn serve(
     );
     if fault.starts_with("server-copy") {
         let path = first.split_whitespace().nth(1).unwrap();
+        let multipart = fault.contains("multipart");
+        let comparison = fault.contains("compare");
         if method == "HEAD" {
-            if path.starts_with("/source/") {
-                reply(
-                    &mut socket,
-                    200,
-                    &[
-                        (
-                            "Content-Length".into(),
-                            if fault == "server-copy-multipart-fails" {
-                                (6 * 1024 * 1024).to_string()
-                            } else {
-                                "4".into()
-                            },
-                        ),
-                        ("ETag".into(), "\"source-etag\"".into()),
-                        ("Expires".into(), "0".into()),
-                        (
-                            "x-amz-website-redirect-location".into(),
-                            "/new-location".into(),
-                        ),
-                    ],
-                    b"",
-                    true,
+            if fault == "server-copy-compare-unavailable"
+                && headers.contains_key("x-amz-checksum-mode")
+            {
+                reply(&mut socket, 403, &[], b"", true);
+                return;
+            }
+            let source = path.starts_with("/source/");
+            if source || comparison {
+                let same_etag = !matches!(
+                    fault,
+                    "server-copy-compare-checksum" | "server-copy-compare-composite"
                 );
+                let mut fields = vec![
+                    (
+                        "Content-Length".into(),
+                        if multipart {
+                            (6 * 1024 * 1024).to_string()
+                        } else {
+                            "4".into()
+                        },
+                    ),
+                    (
+                        "ETag".into(),
+                        if source || same_etag {
+                            "\"source-etag\"".into()
+                        } else {
+                            "\"different-etag\"".into()
+                        },
+                    ),
+                    ("Expires".into(), "0".into()),
+                    (
+                        "x-amz-website-redirect-location".into(),
+                        "/new-location".into(),
+                    ),
+                    (
+                        "Last-Modified".into(),
+                        if source {
+                            "Wed, 01 Jan 2020 00:00:00 GMT".into()
+                        } else {
+                            "Thu, 02 Jan 2020 00:00:00 GMT".into()
+                        },
+                    ),
+                ];
+                if matches!(
+                    fault,
+                    "server-copy-compare-checksum"
+                        | "server-copy-compare-composite"
+                        | "server-copy-compare-conflict"
+                ) {
+                    fields.push((
+                        "x-amz-checksum-type".into(),
+                        if fault.ends_with("composite") {
+                            "COMPOSITE".into()
+                        } else {
+                            "FULL_OBJECT".into()
+                        },
+                    ));
+                    fields.push((
+                        "x-amz-checksum-sha256".into(),
+                        if !source && fault.ends_with("conflict") {
+                            "BBBB".into()
+                        } else {
+                            "AAAA".into()
+                        },
+                    ));
+                }
+                if fault == "server-copy-compare-metadata" {
+                    fields.push((
+                        "x-amz-meta-project".into(),
+                        if source { "new".into() } else { "old".into() },
+                    ));
+                }
+                reply(&mut socket, 200, &fields, b"", true);
             } else {
                 reply(&mut socket, 404, &[], b"", true);
             }
-        } else if fault == "server-copy-multipart-fails" && path.contains("tagging") {
+        } else if multipart && path.contains("tagging") {
             assert_eq!(method, "GET");
             reply(
                 &mut socket,
@@ -191,48 +243,139 @@ fn serve(
                 b"<Tagging><TagSet/></Tagging>",
                 false,
             );
-        } else if fault == "server-copy-multipart-fails" && method == "POST" {
-            assert!(path.contains("uploads"));
+        } else if multipart && method == "POST" && path.contains("uploads") {
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
-        } else if fault == "server-copy-multipart-fails" && method == "DELETE" {
-            assert!(path.contains("uploadId=owned"));
-            reply(&mut socket, 204, &[], b"", false);
-        } else if method == "GET" && path.contains("list-type=2") {
-            reply(
-                &mut socket,
-                200,
-                &[],
-                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-                false,
+        } else if multipart && method == "POST" {
+            let length: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            assert!(
+                body.find("<PartNumber>1</PartNumber>").unwrap()
+                    < body.find("<PartNumber>2</PartNumber>").unwrap()
             );
+            assert!(!fault.ends_with("fails"));
+            reply(&mut socket, 200, &[], b"<CompleteMultipartUploadResult><ETag>&quot;complete&quot;</ETag></CompleteMultipartUploadResult>", false);
+        } else if multipart && method == "DELETE" {
+            assert!(path.contains("uploadId=owned"));
+            if fault == "server-copy-multipart-drain-fails" {
+                assert!(
+                    gate.1.load(Ordering::Acquire),
+                    "abort raced unfinished second part"
+                );
+            }
+            reply(&mut socket, 204, &[], b"", false);
         } else if method == "PUT" {
             assert_eq!(path.split('?').next().unwrap(), "/destination/copied");
             assert_eq!(headers["x-amz-copy-source"], "source/original");
             assert_eq!(headers["x-amz-copy-source-if-match"], "\"source-etag\"");
-            if fault == "server-copy-multipart-fails" {
+            if multipart {
                 assert!(path.contains("uploadId=owned"));
-                assert_eq!(headers["x-amz-copy-source-range"], "bytes=0-5242879");
+                let first = headers["x-amz-copy-source-range"] == "bytes=0-5242879";
+                if !first {
+                    assert_eq!(headers["x-amz-copy-source-range"], "bytes=5242880-6291455");
+                }
+                if matches!(
+                    fault,
+                    "server-copy-multipart-parallel" | "server-copy-multipart-drain-fails"
+                ) {
+                    if first {
+                        gate.0.store(true, Ordering::Release);
+                        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                        while !gate.1.load(Ordering::Acquire)
+                            && std::time::Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        assert!(gate.1.load(Ordering::Acquire), "parts did not overlap");
+                        if fault.ends_with("fails") {
+                            gate.0.store(false, Ordering::Release);
+                            while gate.1.load(Ordering::Acquire)
+                                && std::time::Instant::now() < deadline
+                            {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            assert!(
+                                !gate.1.load(Ordering::Acquire),
+                                "second part did not acknowledge failure"
+                            );
+                        }
+                    } else {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                        while !gate.0.load(Ordering::Acquire)
+                            && std::time::Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        assert!(gate.0.load(Ordering::Acquire), "first part did not start");
+                        gate.1.store(true, Ordering::Release);
+                        if fault.ends_with("fails") {
+                            while gate.0.load(Ordering::Acquire)
+                                && std::time::Instant::now() < deadline
+                            {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            assert!(
+                                !gate.0.load(Ordering::Acquire),
+                                "first part did not acknowledge overlap"
+                            );
+                            gate.1.store(false, Ordering::Release);
+                            thread::sleep(Duration::from_millis(100));
+                            gate.1.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                if fault.ends_with("fails") && first {
+                    reply(
+                        &mut socket,
+                        412,
+                        &[],
+                        b"<Error><Code>PreconditionFailed</Code></Error>",
+                        false,
+                    );
+                } else {
+                    reply(
+                        &mut socket,
+                        200,
+                        &[],
+                        b"<CopyPartResult><ETag>&quot;part&quot;</ETag></CopyPartResult>",
+                        false,
+                    );
+                }
             } else {
-                assert_eq!(headers["if-none-match"], "*");
+                if comparison {
+                    assert!(!headers.contains_key("if-none-match"));
+                } else {
+                    assert_eq!(headers["if-none-match"], "*");
+                }
                 assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
-            }
-            if fault.ends_with("fails") {
-                reply(
-                    &mut socket,
-                    412,
-                    &[],
-                    b"<Error><Code>PreconditionFailed</Code></Error>",
-                    false,
+                assert!(
+                    !matches!(
+                        fault,
+                        "server-copy-compare-etag"
+                            | "server-copy-compare-checksum"
+                            | "server-copy-compare-unavailable"
+                    ),
+                    "unchanged object was copied"
                 );
-            } else {
-                reply(
-                    &mut socket,
-                    200,
-                    &[],
-                    b"<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>",
-                    false,
-                );
+                if fault.ends_with("fails") {
+                    reply(
+                        &mut socket,
+                        412,
+                        &[],
+                        b"<Error><Code>PreconditionFailed</Code></Error>",
+                        false,
+                    );
+                } else {
+                    reply(
+                        &mut socket,
+                        200,
+                        &[],
+                        b"<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>",
+                        false,
+                    );
+                }
             }
         } else {
             panic!("server-side copy must not read or relay contents: {first}");
@@ -1845,7 +1988,7 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 "--from",
                 "s3://source",
                 "original",
-                "--performance-tuning=s3-max-concurrent-objects=4096",
+                "--performance-tuning=s3-max-concurrent-objects=4096,s3-max-concurrent-requests=1",
                 "--to",
                 "s3://destination",
                 "--as",
@@ -1862,9 +2005,9 @@ fn server_copy_never_reads_or_relays_object_contents() {
         assert_eq!(
             server.requests.load(Ordering::Relaxed),
             if fault == "server-copy-multipart-fails" {
-                9
+                7
             } else {
-                5
+                4
             }
         );
     }
@@ -2238,5 +2381,67 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(terminal["files_excluded"], excluded, "{fault}: {terminal}");
         assert_eq!(terminal["files_transferred"], 0, "{fault}: {terminal}");
+    }
+}
+
+#[test]
+fn server_copy_compares_remote_checksums_etags_and_metadata_without_body_reads() {
+    for (fault, requests) in [
+        ("server-copy-compare-etag", 3),
+        ("server-copy-compare-checksum", 3),
+        ("server-copy-compare-composite", 4),
+        ("server-copy-compare-conflict", 4),
+        ("server-copy-compare-metadata", 4),
+        ("server-copy-compare-unavailable", 5),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "original",
+                "--to",
+                "s3://destination",
+                "--as",
+                "copied",
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
+}
+
+#[test]
+fn server_copy_parts_overlap_and_respect_one_request_limit() {
+    for (fault, limit, success) in [
+        ("server-copy-multipart-parallel", "2", true),
+        ("server-copy-multipart-serial", "1", true),
+        ("server-copy-multipart-drain-fails", "2", false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start(fault);
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "original",
+                "--to",
+                "s3://destination",
+                "--as",
+                "copied",
+                "--performance-tuning",
+                &format!("s3-max-concurrent-requests={limit}"),
+            ],
+        );
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), 8, "{fault}");
     }
 }

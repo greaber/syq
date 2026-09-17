@@ -80,6 +80,25 @@ def check():
             assert headers.get('x-amz-website-redirect-location') == source_headers.get('x-amz-website-redirect-location')
             _, tags = c.request('GET', name + '-copy', query={'tagging': ''})
             assert b'server-copy' in tags
+        # Metadata-only changes must propagate even with matching body ETags.
+        name = c.PREFIX + '/metadata-change'
+        args = ['--from', remote, name, '--to', remote, '--as', name + '-copy']
+        c.request('PUT', name, b'same body', headers={'x-amz-meta-owner': 'before'})
+        c.run(args)
+        c.request('PUT', name, b'same body', headers={'x-amz-meta-owner': 'after'})
+        c.run(args)
+        headers, _ = c.request('HEAD', name + '-copy')
+        assert {k.lower(): v for k, v in headers.items()}['x-amz-meta-owner'] == 'after'
+        # An existing destination prefix does not prohibit its exact object key.
+        target = c.PREFIX + '/coexisting'
+        c.request('PUT', target + '/child', b'keep')
+        c.run(['--from', remote, name, '--to', remote, '--as', target])
+        assert c.request('GET', target)[1] == b'same body'
+        assert c.request('GET', target + '/child')[1] == b'keep'
+        # Remove these exact keys before listing-based teardown: this MinIO
+        # fixture can hide a child in LIST while its parent key exists.
+        c.request('DELETE', target)
+        c.request('DELETE', target + '/child')
         assert not c.listing(uploads=True), 'unfinished server copies remain'
         print('S3 server-copy checks passed', flush=True)
 

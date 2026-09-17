@@ -305,6 +305,13 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
             });
         }
     };
+    Ok(Some(from_head(key, &output)?))
+}
+
+pub(super) fn from_head(
+    key: &str,
+    output: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> Result<Object> {
     let size = u64::try_from(
         output
             .content_length()
@@ -315,7 +322,7 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
     if metadata.as_ref().is_some_and(|m| m.kind == "dir") && (!key.ends_with('/') || size != 0) {
         bail!("invalid syq directory marker");
     }
-    Ok(Some(Object {
+    Ok(Object {
         key: key.to_owned(),
         size,
         etag,
@@ -323,7 +330,7 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
         website_redirect: output.website_redirect_location().map(str::to_owned),
         metadata,
         mtime: output.last_modified().map_or(0, |t| t.secs()),
-    }))
+    })
 }
 
 /// Existence needs only one object, regardless of the size of the prefix.

@@ -10,9 +10,11 @@ syq cp --srcs-in build --to s3://artifacts --into releases/current
 syq cp --from s3://artifacts releases/current/app.tar --as app.tar
 ```
 
-Exactly one endpoint must be local. Run syq on the machine holding the files.
+For local/S3 copies, run syq on the machine holding the files. Two S3 endpoints
+can also copy within one service, as described below. SSH/S3 copies are not supported.
 A bucket must already exist. Keys are relative UTF-8 paths; syq rejects empty
-components, `.` and `..`, absolute paths, and file/directory collisions.
+components, `.` and `..`, absolute paths, and file/directory collisions in
+the selected source tree.
 Shell wildcards expand locally; use `--srcs-in PREFIX` to select object keys
 beneath a prefix. A named selector selects an exact object when it exists,
 otherwise the objects beneath `NAME/`.
@@ -48,7 +50,9 @@ syq cp --from s3://my-bucket backup/data --into restored
 `--s3-header 'NAME: VALUE'` is repeatable. Headers are added before signing to
 every request, including listing, multipart operations, and retries. Use
 provider headers that are valid on all these operations. Repeating the same
-name uses the last value. Syq refuses overrides of authentication, request
+name uses the last value. Headers are passed through, not interpreted as a
+metadata-editing operation: the service may apply a header differently to
+CopyObject and multipart creation. Syq refuses overrides of authentication, request
 framing, ranges, conditional writes, checksums, and its own metadata headers.
 Header values are omitted from results and recovery records. Command-line
 arguments may still be visible to other processes on the machine.
@@ -103,7 +107,8 @@ parts.
 
 An explicit maximum disables automatic adjustment of that setting; actual
 concurrency can be lower when there is insufficient ready work. The shared
-request limit covers uploads, range downloads and content-verification GETs.
+request limit covers uploads, range downloads, server-side copies and
+content-verification GETs.
 Metadata requests and idle SDK sockets are separate, so these settings do not
 cap total open sockets. The payload buffer budget still applies; an explicit
 object maximum beyond the available small-upload capacity is rejected.
@@ -137,12 +142,25 @@ Placement, selection filters, overwrite choices, `--dry-run`, `--results`, and
 `--prune` work as for local/S3 copies. Object metadata and tags are copied,
 including syq metadata and stored digests. Preserving a digest does not verify
 the object's contents. `--hash`, `--verify-only`, `--expected-hash`, mapping
-expected digests, and transfer hashing are rejected because they require
-reading object contents. The destination uses its bucket's default encryption
+expected digests, and transfer hashing are not supported for server-side copies.
+The destination uses its bucket's default encryption
 unless request headers specify otherwise; source ACLs are not copied.
 
-Large objects use multipart server-side copying. Failed or cancelled multipart
-copies attempt to abort their unfinished upload; retries restart that object.
+Before copying, syq compares object type, size, user metadata and content headers.
+It skips objects when these match and a common provider-reported whole-object
+checksum matches; otherwise it uses matching ETags or syq file metadata when no
+comparable checksum is available. This needs no local ETag cache or body reads.
+Composite checksums are not compared because they depend on part boundaries.
+ETags can also change with multipart layout or encryption, so unchanged objects
+may still be copied. Tags, ACLs, storage class and encryption settings are not
+part of this quick check; tag-only changes do not trigger a copy.
+
+S3 permits a key and keys beneath its corresponding prefix to coexist. Server-side
+copies do not reject an existing destination solely for that reason.
+
+Large objects use concurrent multipart server-side copying, with the shared
+request budget and per-object part limit described above. Failed or cancelled
+multipart copies attempt to abort their unfinished upload; retries restart that object.
 If cleanup fails, syq reports the upload ID for manual cleanup. Already completed
 objects remain available. Existing upload and download resume behavior is unchanged.
 

@@ -1,6 +1,65 @@
 //! Same-service copies never read object bodies through the invoking machine.
 use super::*;
-use aws_sdk_s3::types::{MetadataDirective, TaggingDirective};
+use aws_sdk_s3::{
+    operation::head_object::HeadObjectOutput,
+    types::{ChecksumMode, ChecksumType, MetadataDirective, TaggingDirective},
+};
+
+// Compare only fields whose meaning survives a copy. LastModified, encryption,
+// storage class, version IDs and ETags are not user metadata.
+fn same_metadata(a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
+    a.metadata()
+        .into_iter()
+        .flat_map(|m| m.iter())
+        .collect::<BTreeMap<_, _>>()
+        == b.metadata()
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .collect::<BTreeMap<_, _>>()
+        && a.content_type() == b.content_type()
+        && a.content_encoding() == b.content_encoding()
+        && a.content_language() == b.content_language()
+        && a.content_disposition() == b.content_disposition()
+        && a.cache_control() == b.cache_control()
+        && a.expires_string() == b.expires_string()
+        && a.website_redirect_location() == b.website_redirect_location()
+}
+
+fn full_checksum_match(a: &HeadObjectOutput, b: &HeadObjectOutput) -> Option<bool> {
+    // Composite checksums depend on part boundaries. A different value cannot
+    // establish a content difference, so leave those to the ordinary quick check.
+    if a.checksum_type() != Some(&ChecksumType::FullObject)
+        || b.checksum_type() != Some(&ChecksumType::FullObject)
+    {
+        return None;
+    }
+    let mut found = false;
+    for (left, right) in [
+        (a.checksum_sha256(), b.checksum_sha256()),
+        (a.checksum_sha1(), b.checksum_sha1()),
+        (a.checksum_crc64_nvme(), b.checksum_crc64_nvme()),
+        (a.checksum_crc32_c(), b.checksum_crc32_c()),
+        (a.checksum_crc32(), b.checksum_crc32()),
+    ] {
+        if let (Some(left), Some(right)) = (left, right) {
+            found = true;
+            if left != right {
+                return Some(false);
+            }
+        }
+    }
+    found.then_some(true)
+}
+
+fn unchanged(source: &Object, old: &Object, a: &HeadObjectOutput, b: &HeadObjectOutput) -> bool {
+    source.kind() == old.kind()
+        && source.size == old.size
+        && same_metadata(a, b)
+        && full_checksum_match(a, b).unwrap_or_else(|| {
+            source.etag == old.etag
+                || (source.metadata.is_some() && source.metadata == old.metadata)
+        })
+}
 
 fn encoded_source(bucket: &str, object: &Object) -> String {
     fn encode(value: &str) -> String {
@@ -24,10 +83,45 @@ fn encoded_source(bucket: &str, object: &Object) -> String {
 }
 
 impl Engine {
+    async fn copy_head(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(Object, HeadObjectOutput)>> {
+        let request = self.client.head_object().bucket(bucket).key(key);
+        let result = request
+            .clone()
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await;
+        // Checksums are an optional quick-check aid. Compatible providers may not
+        // support this mode; AWS KMS may deny checksum access while allowing HEAD.
+        // Retrying ordinary HEAD preserves that existing access, without body GETs.
+        let result = match result {
+            Err(e)
+                if e.raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
+            {
+                request.send().await
+            }
+            result => result,
+        };
+        let output = match result {
+            Ok(output) => output,
+            Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e.into_service_error()).context("S3 copy HEAD failed"),
+        };
+        Ok(Some((client::from_head(key, &output)?, output)))
+    }
+
     pub(super) async fn server_copy(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
+        let planning = std::time::Instant::now();
         let (plan, prune) = self.download_plan(&target).await?;
         self.check_upload_placement(&[]).await?;
+        self.tuning.observe_control(planning.elapsed());
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
         self.progress
@@ -45,16 +139,15 @@ impl Engine {
             }
         })
         .await?;
-        if self.args.delete && self.progress.errors.load(Relaxed) == 0 {
-            self.prune(prune, None).await?;
-        }
+        self.prune(prune, None).await?;
         Ok(())
     }
 
     async fn copy_object(&self, job: &Download, kind: &mut &'static str) -> Result<Option<u64>> {
         let source_bucket = self.options.source_bucket.as_deref().unwrap();
-        let _slot = self.tuning.requests.acquire().await;
-        let source = client::head(&self.client, source_bucket, &job.key)
+        let slot = self.tuning.requests.acquire().await;
+        let (source, source_head) = self
+            .copy_head(source_bucket, &job.key)
             .await?
             .context("S3 copy source disappeared")?;
         anyhow::ensure!(
@@ -76,23 +169,19 @@ impl Engine {
         };
         local::key_path(key.trim_end_matches('/').as_bytes())?;
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
-        let existing = client::head(&self.client, &self.options.bucket, &key).await?;
+        let existing = self.copy_head(&self.options.bucket, &key).await?;
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
             return Ok(None);
         }
         let source_time = source.metadata.as_ref().map_or(source.mtime, |m| m.mtime);
-        if let Some(old) = &existing {
+        if let Some((old, old_head)) = &existing {
             let old_time = old.metadata.as_ref().map_or(old.mtime, |m| m.mtime);
             if self.args.update && old_time > source_time {
                 return Ok(None);
             }
-            if old.kind() == source.kind()
-                && old.size == source.size
-                && old_time == source_time
-                && old.metadata == source.metadata
-            {
+            if unchanged(&source, old, &source_head, old_head) {
                 self.progress
                     .bytes_unchanged
                     .fetch_add(source.size, Relaxed);
@@ -105,6 +194,7 @@ impl Engine {
         }
         self.check_cancelled()?;
 
+        let _interval = self.progress.copying_interval();
         let copy_source = encoded_source(source_bucket, &source);
         // Respect explicit part sizing for both performance control and exercising
         // multipart copying with small disposable fixtures.
@@ -123,17 +213,20 @@ impl Engine {
                 .await
                 .map_err(|e| e.into_service_error())
                 .context("S3 server-side copy failed")?;
+            self.tuning.requests.completed(source.size);
+            self.progress.add_bytes(source.size);
         } else {
-            self.multipart_copy(&source, &key, &copy_source, existing.is_none())
+            drop(slot);
+            self.multipart_copy(&source, source_head, &key, &copy_source, existing.is_none())
                 .await?;
         }
-        self.progress.bytes_done.fetch_add(source.size, Relaxed);
         Ok(Some(source.size))
     }
 
     async fn multipart_copy(
         &self,
         source: &Object,
+        metadata: HeadObjectOutput,
         key: &str,
         copy_source: &str,
         new: bool,
@@ -144,16 +237,8 @@ impl Engine {
             part_size <= 5 * 1024 * 1024 * 1024,
             "object exceeds the S3 multipart size limit"
         );
-        let metadata = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(&source.key)
-            .if_match(&source.etag)
-            .set_version_id(source.version.clone())
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())?;
+        let setup_slot = self.tuning.requests.acquire().await;
+        self.check_cancelled()?;
         let tags = self
             .client
             .get_object_tagging()
@@ -200,35 +285,57 @@ impl Engine {
         let id = created
             .upload_id()
             .context("S3 omitted multipart upload ID")?;
+        drop(setup_slot);
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let result: Result<()> = async {
-            let mut parts = Vec::new();
-            for index in 0..source.size.div_ceil(part_size) {
-                self.check_cancelled()?;
-                let start = index * part_size;
-                let end = (start + part_size).min(source.size) - 1;
-                let output = self
-                    .client
-                    .upload_part_copy()
-                    .bucket(&self.options.bucket)
-                    .key(key)
-                    .upload_id(id)
-                    .part_number((index + 1) as i32)
-                    .copy_source(copy_source)
-                    .copy_source_if_match(&source.etag)
-                    .copy_source_range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(|e| e.into_service_error())?;
-                let part = output
-                    .copy_part_result()
-                    .context("S3 omitted copy part result")?;
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number((index + 1) as i32)
-                        .e_tag(part.e_tag().context("S3 omitted copied part ETag")?)
-                        .build(),
-                );
-            }
+            let mut parts = stream::iter(0..source.size.div_ceil(part_size))
+                .map(|index| {
+                    let failed = &failed;
+                    async move {
+                        let _slot = self.tuning.requests.acquire().await;
+                        self.check_cancelled()?;
+                        anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
+                        let start = index * part_size;
+                        let end = (start + part_size).min(source.size) - 1;
+                        let output = self
+                            .client
+                            .upload_part_copy()
+                            .bucket(&self.options.bucket)
+                            .key(key)
+                            .upload_id(id)
+                            .part_number((index + 1) as i32)
+                            .copy_source(copy_source)
+                            .copy_source_if_match(&source.etag)
+                            .copy_source_range(format!("bytes={start}-{end}"))
+                            .send()
+                            .await
+                            .map_err(|e| e.into_service_error())?;
+                        let part = output
+                            .copy_part_result()
+                            .context("S3 omitted copy part result")?;
+                        let part = CompletedPart::builder()
+                            .part_number((index + 1) as i32)
+                            .e_tag(part.e_tag().context("S3 omitted copied part ETag")?)
+                            .build();
+                        self.tuning.requests.completed(end - start + 1);
+                        self.progress.add_bytes(end - start + 1);
+                        Ok(part)
+                    }
+                })
+                .buffer_unordered(self.part_workers())
+                .inspect(|result: &Result<CompletedPart>| {
+                    if result.is_err() {
+                        failed.store(true, Relaxed);
+                    }
+                })
+                // Drain started requests before aborting: dropping their futures
+                // could leave provider-side parts racing cleanup.
+                .collect::<Vec<Result<_>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            parts.sort_by_key(|part| part.part_number());
+            let _slot = self.tuning.requests.acquire().await;
             self.check_cancelled()?;
             self.client
                 .complete_multipart_upload()
@@ -248,6 +355,7 @@ impl Engine {
         }
         .await;
         if result.is_err() {
+            let _slot = self.tuning.requests.acquire().await;
             if let Err(error) = self
                 .client
                 .abort_multipart_upload()
