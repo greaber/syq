@@ -6175,6 +6175,37 @@ fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
 }
 
 #[test]
+fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
+    let t = Tmp::new();
+    // Three default 4 MiB hash blocks; only the last block differs.
+    let contents = prng(12 << 20, 1000);
+    write(&t.path("source"), &contents);
+    for (compare, transfer) in [("blake3", "sha256"), ("xxh3-128", "blake3")] {
+        let results = t.s(&format!("results-{compare}-{transfer}.ndjson"));
+        let mut previous = contents.clone();
+        *previous.last_mut().unwrap() ^= 1;
+        write(&t.path("destination"), &previous);
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--performance-tuning=workers=1,copy-path=ranges",
+            &format!("--integrity-checking=compare={compare},transfer={transfer}"),
+            "--results",
+            &results,
+        ]);
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("destination")), contents);
+        let records = fs::read_to_string(results).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["bytes_transferred"], 4 << 20, "{summary}");
+        assert_eq!(summary["bytes_unchanged"], 8 << 20, "{summary}");
+    }
+}
+
+#[test]
 fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     let t = Tmp::new();
     write(&t.path("source"), b"abc");
