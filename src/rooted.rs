@@ -1132,10 +1132,7 @@ impl Root {
             supported
         };
         if !supported {
-            return Ok(CopyLocalOutcome::UnsupportedVolume {
-                source_dev: pair.0,
-                destination_dev: pair.1,
-            });
+            return Ok(CopyLocalOutcome::Unsupported);
         }
         if !clone_flags_can_be_removed(source_metadata) {
             return Ok(CopyLocalOutcome::Unsupported);

@@ -1146,13 +1146,6 @@ pub enum Response {
     ReadStreamDone,
     WriteStreamDone,
     Prepared(Preparation),
-    /// This source/destination device pair cannot clone files. Only
-    /// same-executable local macOS receivers emit this hint; existing response
-    /// discriminants and remote helper exchanges stay unchanged.
-    CopyLocalUnsupportedVolume {
-        source_dev: u64,
-        destination_dev: u64,
-    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -2251,17 +2244,6 @@ mod tests {
             postcard::to_stdvec(&Response::CopyLocalUnsupported).unwrap(),
             V052_UNSUPPORTED
         );
-        let hint = Response::CopyLocalUnsupportedVolume {
-            source_dev: 123,
-            destination_dev: 456,
-        };
-        assert!(matches!(
-            postcard::from_bytes::<Response>(&postcard::to_stdvec(&hint).unwrap()).unwrap(),
-            Response::CopyLocalUnsupportedVolume {
-                source_dev: 123,
-                destination_dev: 456
-            }
-        ));
         let mut frame = Vec::new();
         FrameWriter::new(&mut frame, false)
             .write_msg(&Response::CopyLocalUnsupported)

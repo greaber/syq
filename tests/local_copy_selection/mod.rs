@@ -641,7 +641,7 @@ fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
-fn macos_clone_memoizes_unsupported_volume_pairs() {
+fn macos_clone_volume_refusal_falls_back_across_directories() {
     if !macos_clone_support::available() {
         return;
     }
@@ -666,7 +666,6 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
         ])
         .env("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME", "1")
         .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
-        .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"))
         .env("SYQ_DEBUG", "1")
         .run()
         .unwrap();
@@ -674,14 +673,6 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
     assert_same_tree(&t.path("src"), &t.path("dst"));
     assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
     assert!(!t.path("attempts").exists());
-    assert_eq!(
-        fs::read_to_string(t.path("requests"))
-            .unwrap()
-            .lines()
-            .count(),
-        1,
-        "one volume refusal suppresses CopyLocal in every directory on that device"
-    );
     assert!(partial_files(&t.path("dst")).is_empty());
 }
 

@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -141,9 +141,6 @@ pub struct Opts {
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
-    /// Process-local negative hints keyed by source and destination devices.
-    /// A current local parent stat keeps descendant mounts independent.
-    local_copy_unavailable: Mutex<std::collections::HashSet<(u64, u64)>>,
     /// Settled before worker startup; optional clone claims must fit preflight.
     local_copy_fd_budget: AtomicBool,
     pub flags: u8,
@@ -1743,7 +1740,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let opts = Arc::new(Opts {
-        local_copy_unavailable: Mutex::new(Default::default()),
         local_copy_fd_budget: AtomicBool::new(true),
         hash_policy: crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
@@ -8441,24 +8437,6 @@ impl Worker {
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     fn try_copy_local(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
-        // Only same-host macOS receivers emit these hints. After a refusal,
-        // stat the local parent instead of paying another receiver RPC for
-        // each directory. Never infer a descendant's device from an ancestor:
-        // it may be a mountpoint. A failed stat leaves the receiver in charge.
-        let has_volume_refusal = !self.opts.local_copy_unavailable.lock().unwrap().is_empty();
-        if has_volume_refusal {
-            if let Ok(parent) = std::fs::metadata(OsStr::from_bytes(&parent_path(&job.dst))) {
-                if self
-                    .opts
-                    .local_copy_unavailable
-                    .lock()
-                    .unwrap()
-                    .contains(&(job.entry.dev, parent.dev()))
-                {
-                    return Ok(false);
-                }
-            }
-        }
         // Write to a partial and let finish_file rename it, so an interrupted
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
@@ -8492,17 +8470,6 @@ impl Worker {
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
-            Response::CopyLocalUnsupportedVolume {
-                source_dev,
-                destination_dev,
-            } => {
-                // Only the opened source device describes the refused pair.
-                // A mount change after scanning must not disable the original
-                // device's otherwise eligible copies.
-                let mut unavailable = self.opts.local_copy_unavailable.lock().unwrap();
-                unavailable.insert((source_dev, destination_dev));
-                Ok(false)
-            }
             Response::EndpointError(error) => Err(endpoint_error(error)),
             Response::Err(e) => bail!("{e}"),
             other => bail!("unexpected response {other:?}"),
@@ -9392,7 +9359,6 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
-            local_copy_unavailable: Mutex::new(Default::default()),
             local_copy_fd_budget: AtomicBool::new(true),
             hash_policy: Default::default(),
             expected_digest: None,
@@ -9693,92 +9659,6 @@ mod tests {
             .iter()
             .all(|r| matches!(r, Request::WriteRange { .. })));
         assert_eq!(worker.progress.errors.load(Relaxed), 0);
-    }
-
-    #[test]
-    fn local_copy_volume_refusal_only_caches_the_opened_device_pair() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source");
-        std::fs::write(&path, b"data").unwrap();
-        let mut entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
-        entry.dev = 11;
-        let destination_dev = directory.path().metadata().unwrap().dev();
-        let destination = |name: &str| directory.path().join(name).as_os_str().as_bytes().to_vec();
-        std::fs::create_dir(directory.path().join("subdir")).unwrap();
-        let sched = Arc::new(Sched::new(512, 8192));
-        let mut job = FileJob {
-            dst_entry: None,
-            data: FileJobData {
-                src: b"source".to_vec(),
-                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
-                    .unwrap(),
-                dst: destination("first"),
-                rel: "first".into(),
-                entry,
-                target_condition: TargetCondition::Any,
-                container_guard: None,
-                attempt: 0,
-                done: Arc::new(AtomicU64::new(0)),
-                inplace: false,
-                rel_bytes: b"first".to_vec(),
-                src_rel: None,
-            },
-        };
-        let snapshot = |job: &FileJob| WorkerJob {
-            dst_entry: None,
-            data: crate::sched::SnapshotData::Owned(job.data.clone()),
-        };
-        sched.push_file(job.clone());
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        let src = Arc::new(Mutex::new(PipelineState::default()));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        dst.lock().unwrap().replies.extend([
-            Response::CopyLocalUnsupportedVolume {
-                source_dev: 22,
-                destination_dev,
-            },
-            Response::CopyLocalUnsupported,
-            Response::CopyLocalUnsupported,
-            // A refusal on a different destination device must not affect this
-            // directory, even with the same source device and pathname.
-            Response::CopyLocalUnsupportedVolume {
-                source_dev: 33,
-                destination_dev: destination_dev + 1,
-            },
-            Response::CopyLocalUnsupported,
-            Response::CopyLocalUnsupported,
-            Response::CopyLocalUnsupported,
-        ]);
-        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        // Files still on the planning-time device remain eligible for a probe.
-        for name in ["sibling", "subdir/child"] {
-            job.dst = destination(name);
-            assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        }
-        assert_eq!(dst.lock().unwrap().requests.len(), 3);
-        // The reported device is skipped across destination directories.
-        job.entry.dev = 22;
-        for name in ["sibling", "subdir/child"] {
-            job.dst = destination(name);
-            assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        }
-        assert_eq!(dst.lock().unwrap().requests.len(), 3);
-        job.entry.dev = 33;
-        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        // A file-specific refusal must not suppress the next attempt either.
-        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        assert_eq!(dst.lock().unwrap().requests.len(), 6);
-        // Unknown parent devices cannot match a negative volume hint.
-        job.entry.dev = 11;
-        job.dst = destination("missing/child");
-        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
-        assert_eq!(dst.lock().unwrap().requests.len(), 7);
-        let unavailable = worker.opts.local_copy_unavailable.lock().unwrap();
-        assert_eq!(unavailable.len(), 2);
-        assert!(!unavailable.contains(&(11, destination_dev)));
-        assert!(unavailable.contains(&(22, destination_dev)));
-        assert!(unavailable.contains(&(33, destination_dev + 1)));
     }
 
     #[test]

@@ -152,11 +152,6 @@ struct CopyLocalPolicy {
 pub(crate) enum CopyLocalOutcome {
     Copied,
     Unsupported,
-    #[cfg(target_os = "macos")]
-    UnsupportedVolume {
-        source_dev: u64,
-        destination_dev: u64,
-    },
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -7019,14 +7014,6 @@ impl FsOps {
                 .map(|outcome| match outcome {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
-                    #[cfg(target_os = "macos")]
-                    CopyLocalOutcome::UnsupportedVolume {
-                        source_dev,
-                        destination_dev,
-                    } => Response::CopyLocalUnsupportedVolume {
-                        source_dev,
-                        destination_dev,
-                    },
                 }),
             Request::PutSmallBatch(puts) => Ok(Response::Applied(
                 puts.iter()
