@@ -10,7 +10,7 @@
 use crate::descriptor_broker::{DescriptorTicket, RegisteredRootId};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 // 64 MiB data/batch tuning remains supported, with room for its metadata.
 pub const MAX_FRAME: usize = 65 * 1024 * 1024;
@@ -1620,30 +1620,6 @@ impl<R: Read> FrameReader<R> {
         &mut self,
     ) -> io::Result<crate::wire_budget::Budgeted<T>> {
         self.read_preamble()?;
-        self.read_frame()
-    }
-
-    /// Local timing only: wait for the first frame bytes before reading its
-    /// remaining payload. Buffered replies start immediately. An encrypted
-    /// reader first authenticates its initial record before exposing bytes.
-    pub(crate) fn read_budgeted_with_start<T: for<'de> Deserialize<'de> + SizeHint>(
-        &mut self,
-    ) -> io::Result<(crate::wire_budget::Budgeted<T>, std::time::Instant)> {
-        self.read_preamble()?;
-        // Match read_exact's interrupted-read handling: a signal before the
-        // first byte must not turn a live connection into a transport failure.
-        while let Err(error) = self.r.fill_buf() {
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        let started_at = std::time::Instant::now();
-        self.read_frame().map(|message| (message, started_at))
-    }
-
-    fn read_frame<T: for<'de> Deserialize<'de> + SizeHint>(
-        &mut self,
-    ) -> io::Result<crate::wire_budget::Budgeted<T>> {
         let mut hdr = [0u8; 4];
         self.r.read_exact(&mut hdr)?;
         let len = u32::from_le_bytes(hdr) as usize;

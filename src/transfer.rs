@@ -58,7 +58,6 @@ fn fast_batch_file_limit(
 
 // Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
-const FAST_BATCH_TINY_BYTES: u64 = 64 << 10;
 
 /// Upper bound: each file needs one worker, and each simultaneous range must
 /// contain at least min_split bytes. Balanced/aligned splitting can use fewer.
@@ -1973,7 +1972,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         observation: None,
                         benchmark: Default::default(),
                         fast_batch_files,
-                        setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]
                     record_worker_event_for_test("connected", id, 0)?;
@@ -7704,7 +7702,6 @@ struct Worker {
     observation: Option<Arc<crate::transfer_observations::Actor>>,
     benchmark: crate::transfer_tuning::BenchmarkStats,
     fast_batch_files: usize,
-    setup_elapsed: std::time::Duration,
 }
 
 struct BlockDiff {
@@ -7964,7 +7961,7 @@ impl Worker {
         results: &mut [Option<Result<()>>],
     ) -> Result<()> {
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
-        let mut read_window = if self.src.supports_request_pipelining() {
+        let read_window = if self.src.supports_request_pipelining() {
             window
         } else {
             1
@@ -7974,18 +7971,6 @@ impl Worker {
         } else {
             1
         };
-        // Connection setup supplies a conservative latency allowance even
-        // for SSH, which has no kernel RTT observation. Do not mistake an
-        // ordinary WAN response for a stalled source read. Keep the conservative
-        // sixteen-RTT allowance; the measured wait now ends when the reply starts,
-        // before receiving its remaining payload.
-        let source_rtt_us = self.src.tcp_rtt_us().unwrap_or(0);
-        let read_stall_budget = self
-            .setup_elapsed
-            .max(std::time::Duration::from_millis(100))
-            .max(std::time::Duration::from_micros(
-                source_rtt_us.saturating_mul(16),
-            ));
         let mut reads = std::collections::VecDeque::new();
         let mut writes = std::collections::VecDeque::new();
         let flags = publication_metadata_flags(self.opts.flags);
@@ -8018,37 +8003,23 @@ impl Worker {
                 let Some((group, count)) = reads.pop_front() else {
                     break;
                 };
-                let (blocks, waited) = if count == 0 {
-                    (Vec::new(), std::time::Duration::ZERO)
+                let blocks = if count == 0 {
+                    Vec::new()
                 } else {
-                    let (response, waited) = self.src.recv_with_wait()?;
+                    let response = self.src.recv()?;
                     let blocks =
                         ok(response, "read small batch").and_then(|response| match response {
                             Response::SmallBlocks(blocks) if blocks.len() == count => Ok(blocks),
                             other => bail!("unexpected response {other:?}"),
                         });
                     match blocks {
-                        Ok(blocks) => (blocks, waited),
+                        Ok(blocks) => blocks,
                         Err(error) => {
                             Self::fail_small_batch(results, group, &error);
                             break 'issuing;
                         }
                     }
                 };
-                if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
-                    if debug() {
-                        crate::output::diagnostic!(
-                            "syq: worker {}: source reply wait {:.3}s exceeded {:.3}s allowance (RTT {}us, setup {:.3}s); draining read-ahead",
-                            self.id, waited.as_secs_f64(), read_stall_budget.as_secs_f64(),
-                            source_rtt_us, self.setup_elapsed.as_secs_f64()
-                        );
-                    }
-                    // Drain existing read-ahead before claiming more. Unissued
-                    // groups stay stealable, so one slow source file cannot
-                    // keep a window of further work away from idle peers.
-                    // The next logical batch starts with the full window again.
-                    read_window = 1;
-                }
                 let mut blocks = blocks.into_iter();
                 let mut puts = Vec::new();
                 let mut sent = Vec::new();
@@ -9439,8 +9410,6 @@ mod tests {
         gate_changes: Vec<(usize, Arc<Gate>, usize)>,
         steal_on_receive: Option<Arc<Sched>>,
         stolen_file: Option<usize>,
-        reply_start_wait: Option<std::time::Duration>,
-        rtt_us: Option<u64>,
         dead: bool,
         max_pending: usize,
         local: bool,
@@ -9457,9 +9426,6 @@ mod tests {
                 let state = self.0.lock().unwrap();
                 !state.synchronous && !state.local
             }
-        }
-        fn tcp_rtt_us(&self) -> Option<u64> {
-            self.0.lock().unwrap().rtt_us
         }
         fn is_dead(&self) -> bool {
             self.0.lock().unwrap().dead
@@ -9478,17 +9444,6 @@ mod tests {
             }
             state.max_pending = state.max_pending.max(state.requests.len() - state.received);
             Ok(())
-        }
-        fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
-            let start = std::time::Instant::now();
-            let response = self.recv()?;
-            let waited = self
-                .0
-                .lock()
-                .unwrap()
-                .reply_start_wait
-                .unwrap_or_else(|| start.elapsed());
-            Ok((response, waited))
         }
         fn recv(&mut self) -> Result<Response> {
             let mut state = self.0.lock().unwrap();
@@ -9642,7 +9597,6 @@ mod tests {
             observation: None,
             benchmark: Default::default(),
             fast_batch_files: 1,
-            setup_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -10299,58 +10253,6 @@ mod tests {
                 assert!(sched.ranges_ready(idx, vec![]).is_none());
             }
             assert!(sched.finished());
-        }
-    }
-
-    #[test]
-    fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
-        // Inject reply-start waits so scheduling delays cannot change which
-        // side of the stall allowance a case exercises.
-        for (rtt_us, setup_ms, reply_wait_ms, expected) in [
-            (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
-            (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-            (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-            // Payload time does not contribute to the reported reply-start wait.
-            (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
-        ] {
-            let jobs: Vec<_> = (0..8)
-                .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
-                .collect();
-            let src = Arc::new(Mutex::new(PipelineState {
-                rtt_us,
-                reply_start_wait: Some(std::time::Duration::from_millis(reply_wait_ms)),
-                ..Default::default()
-            }));
-            let dst = Arc::new(Mutex::new(PipelineState::default()));
-            for _ in &jobs {
-                let data = vec![0; 512];
-                src.lock()
-                    .unwrap()
-                    .replies
-                    .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
-                        hash: content_digest(&data),
-                        data,
-                    })]));
-                dst.lock()
-                    .unwrap()
-                    .replies
-                    .push_back(Response::Applied(vec![None]));
-            }
-            let mut worker = pipeline_worker(
-                Arc::new(Sched::new(512, 8192)),
-                src.clone(),
-                dst,
-                512,
-                false,
-            );
-            worker.gate.set_active(2);
-            worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
-            let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-            worker
-                .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
-                .unwrap();
-            assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
-            assert_eq!(src.lock().unwrap().sent_at_receive, expected);
         }
     }
 
