@@ -27,7 +27,7 @@ impl Engine {
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload = self.options.upload && largest <= 1024 * 1024;
         let capacity = if small_upload {
-            super::super::tuning::small_upload_capacity(largest)?
+            super::super::tuning::small_object_capacity(largest)?
         } else {
             256
         };
@@ -81,7 +81,11 @@ impl Engine {
                 } else {
                     1024 * 1024
                 };
-                super::super::tuning::small_upload_capacity(largest.min(buffer_size))?
+                super::super::tuning::small_object_capacity(largest.min(buffer_size))?
+            } else if largest < 1024 * 1024 {
+                // Keep the starting load unchanged, but allow measured gains
+                // beyond 256 when small objects fit the payload/FD budget.
+                super::super::tuning::small_object_capacity(largest)?
             } else {
                 256
             };
@@ -460,6 +464,38 @@ mod buffer_tests {
             cancelled: Default::default(),
             cancel_wake: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
+        let engine = planning_engine(&[]);
+        engine.tuning.observe_control(Duration::from_millis(100));
+        let concurrency = engine
+            .object_workers(std::iter::repeat_n(64 * 1024, 8192))
+            .unwrap();
+        let maximum = concurrency.maximum.unwrap();
+        assert!((1..=4096).contains(&maximum));
+        assert_eq!(concurrency.initial, maximum.min(256));
+        assert_eq!(engine.tuning.request_limit(), 256);
+
+        // An average below 1 MiB does not make every object small. Keep the
+        // existing target when even one larger object needs streaming buffers.
+        let mixed = planning_engine(&[])
+            .object_workers(std::iter::repeat_n(64 * 1024, 8192).chain([1024 * 1024]))
+            .unwrap();
+        assert_eq!(mixed.initial, 256);
+        assert_eq!(mixed.maximum, Some(256));
+
+        let fixed = planning_engine(&[
+            "--performance-tuning",
+            "s3-max-concurrent-objects=1024,s3-max-concurrent-requests=128",
+        ]);
+        let concurrency = fixed
+            .object_workers(std::iter::repeat_n(64 * 1024, 8192))
+            .unwrap();
+        assert_eq!(concurrency.initial, 1024);
+        assert!(concurrency.maximum.is_none());
+        assert_eq!(fixed.tuning.request_limit(), 128);
     }
 
     #[tokio::test]

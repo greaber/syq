@@ -59,7 +59,8 @@ chooses starting settings from file sizes, the backend and observed request
 latency. For batches where each object fits in one request, syq tests higher and
 lower object concurrency when there is enough work to measure a change. After
 finding a good setting, syq probes less often, while continuing to check for
-changed conditions.
+changed conditions. For batches of small downloads, the search range also
+accounts for object sizes and available file descriptors.
 Multipart batches adjust their shared data-request budget instead. Downloads of
 small files over high-latency paths start with more simultaneous requests,
 because short copies may finish before the budget can grow. These choices

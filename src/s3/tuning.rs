@@ -361,19 +361,20 @@ impl Drop for Permit {
     }
 }
 
-// A bounded payload budget, plus room for the socket and transient source opens.
-// TLS/SDK allocations are additional; the measured request ceiling bounds those.
+// Estimate concurrency from payload size and descriptor headroom, leaving room
+// for sockets and transient source opens. TLS/SDK allocations are additional;
+// this is not a total process-memory bound. Upload buffers have a separate budget.
 fn small_capacity(soft: u64, open: usize, largest: u64) -> usize {
     let descriptors = soft.saturating_sub(open as u64).saturating_sub(64) / 4;
     let payloads = (256 * 1024 * 1024u64) / largest.max(1);
     descriptors.min(payloads).min(4096) as usize
 }
-pub(super) fn small_upload_capacity(largest: u64) -> anyhow::Result<usize> {
+pub(super) fn small_object_capacity(largest: u64) -> anyhow::Result<usize> {
     use anyhow::Context;
     let limits = crate::fsops::nofile_limits().context("read S3 descriptor limit")?;
     let open = crate::fsops::current_open_descriptor_count(limits.rlim_cur)?;
     let capacity = small_capacity(limits.rlim_cur as u64, open, largest);
-    anyhow::ensure!(capacity > 0, "insufficient file descriptors for S3 uploads; raise the open-file limit or reduce source selectors");
+    anyhow::ensure!(capacity > 0, "insufficient file descriptors for S3 objects; raise the open-file limit or reduce source selectors");
     Ok(capacity)
 }
 #[cfg(test)]
@@ -1097,15 +1098,17 @@ mod tests {
     }
 
     #[test]
-    fn tiny_upload_budget_leaves_room_for_existing_descriptors() {
+    fn small_object_budget_leaves_room_for_existing_descriptors() {
         assert_eq!(small_capacity(1024, 900, 1024), 15);
         assert_eq!(small_capacity(64, 10, 1024), 0);
         assert_eq!(small_capacity(8192, 8, 1024), 2030);
         assert_eq!(small_capacity(524288, 8, 1024), 4096);
     }
     #[test]
-    fn tiny_upload_budget_bounds_payload_memory_and_empty_objects() {
+    fn small_object_budget_bounds_payload_memory_and_empty_objects() {
         assert_eq!(small_capacity(524288, 8, 1024 * 1024), 256);
         assert_eq!(small_capacity(524288, 8, 0), 4096);
+        assert_eq!(small_capacity(524288, 8, 64 * 1024), 4096);
+        assert_eq!(small_capacity(524288, 8, 512 * 1024), 512);
     }
 }
