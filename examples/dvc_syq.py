@@ -153,7 +153,8 @@ def parse_remote(root: Path, config: configparser.ConfigParser, name: str | None
 def parse_outs(root: Path, file: Path) -> list[Out]:
     """Tracked outputs of one `.dvc` file or `dvc.lock`."""
     try:
-        data = yaml.safe_load(file.read_text()) or {}
+        # BaseLoader keeps every scalar as text; an all-digit MD5 must not become a number.
+        data = yaml.load(file.read_text(), Loader=yaml.BaseLoader) or {}
     except (OSError, yaml.YAMLError) as error:
         sys.exit(f"error: cannot read {file}: {error}")
     stages = data.get("stages", {}).values() if file.name == "dvc.lock" else [data]
