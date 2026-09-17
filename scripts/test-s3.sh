@@ -39,6 +39,7 @@ spec.loader.exec_module(checks)
 checks.request('PUT')
 PY
 python3 tests/object-storage/check.py "$_syq_s3_binary"
+python3 tests/object-storage/selection.py "$_syq_s3_binary"
 
 python3 tests/object-storage/prune.py "$_syq_s3_binary"
 

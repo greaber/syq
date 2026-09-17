@@ -149,7 +149,17 @@ impl Engine {
                         .filter(|(key, _)| key.starts_with(&prefix))
                         .map(|(key, size)| (key.clone(), *size))
                         .collect(),
-                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                    None => {
+                        client::list(
+                            &self.client,
+                            &self.options.bucket,
+                            &prefix,
+                            None,
+                            &mut HashSet::new(),
+                        )
+                        .await?
+                        .objects
+                    }
                 };
                 for (key, size) in listed {
                     self.check_cancelled()?;
