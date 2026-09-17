@@ -442,6 +442,18 @@ impl Engine {
         }
         Ok(())
     }
+    fn upload_metadata_matches(&self, source: &Source, size: u64, object: &Object) -> bool {
+        object.kind() == source.kind()
+            && object.size == size
+            && object.metadata.as_ref().is_some_and(|m| {
+                m.mtime == source.meta.mtime
+                    && m.nsec == source.meta.mtime_nsec
+                    && (!self.args.perms || m.mode == source.meta.mode & 0o7777)
+                    && (!(self.args.owner || self.args.group)
+                        || (m.uid == source.meta.uid && m.gid == source.meta.gid))
+            })
+    }
+
     async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
         let expected_digest = source
             .expected_digest
@@ -477,6 +489,30 @@ impl Engine {
         } else {
             source.meta.len
         };
+        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
+            if self.args.transfer_integrity {
+                Some(self.args.transfer_hash_type.unwrap_or_default())
+            } else if self.args.checksum || self.args.verify_only {
+                Some(self.args.hash_algorithm)
+            } else {
+                None
+            }
+        });
+        if whole_algorithm.is_none()
+            && existing
+                .as_ref()
+                .is_some_and(|o| self.upload_metadata_matches(&source, size, o))
+        {
+            if source.kind() == "file" {
+                // Opening validates the pinned scan identity without reading the
+                // body. Explicit content checks still take the hashing path.
+                source.open()?;
+            } else {
+                source.bytes()?;
+            }
+            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+            return Ok(None);
+        }
         let part_size = self.part_size(size);
         if part_size > 5 * 1024 * 1024 * 1024 {
             bail!("file exceeds the S3 multipart size limit");
@@ -500,15 +536,6 @@ impl Engine {
         self.check_cancelled()?;
         let source_clone = source.clone();
         let algorithm = Algorithm::for_endpoint(self.options.endpoint.as_deref());
-        let whole_algorithm = expected_digest.map(|d| d.algorithm).or_else(|| {
-            if self.args.transfer_integrity {
-                Some(self.args.transfer_hash_type.unwrap_or_default())
-            } else if self.args.checksum || self.args.verify_only {
-                Some(self.args.hash_algorithm)
-            } else {
-                None
-            }
-        });
         let (whole_digest, checksums, small) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != "file" {
                 let bytes = source_clone.bytes()?;
@@ -638,17 +665,11 @@ impl Engine {
         metadata.hash_algorithm = whole_algorithm.unwrap_or(HashAlgorithm::Blake3);
         let digest = upload_identity(algorithm, size, part_size, &checksums);
         let mut unchanged = existing.as_ref().is_some_and(|o| {
-            o.kind() == source.kind()
-                && o.size == size
+            self.upload_metadata_matches(&source, size, o)
                 && o.metadata.as_ref().is_some_and(|m| {
-                    (self.args.checksum
+                    self.args.checksum
                         || whole_digest.is_none()
-                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm))
-                        && m.mtime == metadata.mtime
-                        && m.nsec == metadata.nsec
-                        && (!self.args.perms || m.mode == metadata.mode)
-                        && (!(self.args.owner || self.args.group)
-                            || (m.uid == metadata.uid && m.gid == metadata.gid))
+                        || (m.hash == whole_digest && m.hash_algorithm == metadata.hash_algorithm)
                 })
         });
         let comparison_digest = if self.args.checksum || self.args.verify_only {

@@ -1438,3 +1438,51 @@ fn s3_prune_can_ignore_unrepresentable_destination_keys() {
     );
     assert_eq!(server.requests.load(Ordering::Relaxed), 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+        .unwrap();
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(fd >= 0);
+    let mut watch = unsafe { std::fs::File::from_raw_fd(fd) };
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe { libc::inotify_add_watch(watch.as_raw_fd(), name.as_ptr(), libc::IN_ACCESS) } >= 0
+    );
+    for flag in [None, Some("--hash")] {
+        let server = Server::start("single-upload-nohash");
+        let mut args = vec!["source", "--to", "s3://bucket", "--as", "object"];
+        if let Some(flag) = flag {
+            args.push(flag);
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            !server.gate.0.load(Ordering::Acquire),
+            "unchanged body uploaded"
+        );
+        let mut events = [0; 4096];
+        match flag {
+            None => assert_eq!(
+                watch.read(&mut events).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            ),
+            Some(_) => assert!(
+                watch.read(&mut events).unwrap() > 0,
+                "checksum did not read source"
+            ),
+        }
+    }
+}

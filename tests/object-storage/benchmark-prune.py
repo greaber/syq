@@ -182,7 +182,18 @@ def main():
                                 if new:
                                     remove(c.listing(prefix + '/new'))
                                 if extra:
-                                    run(command('s5cmd', 'upload', extras, prefix, False), 'restore-extras')
+                                    # A failed untimed restore can be retried safely;
+                                    # preserve each attempt's log. Timed commands
+                                    # are never retried or discarded.
+                                    for attempt in range(3):
+                                        try:
+                                            run(command('s5cmd', 'upload', extras, prefix, False), 'restore-extras')
+                                            break
+                                        except RuntimeError:
+                                            if attempt == 2:
+                                                raise
+                                            print('Untimed restore failed; retrying (see attempt log)', flush=True)
+                                    assert len(c.listing(prefix + '/extra')) == extra
                             else:
                                 local = root / 'download'
                                 shutil.copytree(seeds[tool], local)
