@@ -27,13 +27,6 @@ pub trait Conn: Send {
     }
     fn send(&mut self, req: Request) -> Result<()>;
     fn recv(&mut self) -> Result<Response>;
-    /// Wait before the reply starts, excluding its remaining payload transfer
-    /// when the connection can observe arrival separately from decoding.
-    fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
-        let start = std::time::Instant::now();
-        let response = self.recv()?;
-        Ok((response, start.elapsed()))
-    }
     /// The experimental writer must not retain one reply per sent block.
     fn begin_streaming_writes(&mut self) -> Result<()> {
         bail!("this connection does not support experimental streaming writes")
@@ -841,36 +834,6 @@ impl Conn for LocalConn {
     }
 }
 
-/// A decoded reply keeps its memory reservation and local arrival timestamp
-/// together while queued, including through the streaming reply collector.
-#[derive(Debug)]
-pub(crate) struct ReceivedResponse {
-    pub(crate) value: Response,
-    hold: crate::wire_budget::Hold,
-    started_at: std::time::Instant,
-}
-
-impl ReceivedResponse {
-    pub(crate) fn from_frame(
-        (message, started_at): (crate::wire_budget::Budgeted<Response>, std::time::Instant),
-    ) -> Self {
-        let (value, hold) = message.into_parts();
-        Self {
-            value,
-            hold,
-            started_at,
-        }
-    }
-
-    fn into_inner(self) -> Response {
-        self.value
-    }
-
-    pub(crate) fn into_parts(self) -> (Response, crate::wire_budget::Hold) {
-        (self.value, self.hold)
-    }
-}
-
 pub struct RemoteConn {
     rpc_observation: Option<RpcObservation>,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
@@ -878,7 +841,7 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: Option<std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>>,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
@@ -910,7 +873,7 @@ fn spawn_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
 ) -> (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
 ) {
     spawn_observed_reader(input, read_ahead, Default::default())
@@ -920,7 +883,7 @@ fn spawn_observed_reader(
     read_ahead: usize,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
 ) -> (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     std::thread::JoinHandle<()>,
 ) {
     // Control requests also pipeline up to the default depth. Keeping that
@@ -932,9 +895,7 @@ fn spawn_observed_reader(
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         r.set_limit(MAX_HANDSHAKE_FRAME);
-        let hello = r
-            .read_budgeted_with_start::<Response>()
-            .map(ReceivedResponse::from_frame);
+        let hello = r.read_budgeted::<Response>();
         // Make the same acceptance check as receive_hello before allowing the
         // background reader to allocate any ordinary data frame. This also
         // covers pooled sessions, whose Hello was sent by another process.
@@ -946,9 +907,7 @@ fn spawn_observed_reader(
         }
         r.set_limit(MAX_FRAME);
         loop {
-            let msg = r
-                .read_budgeted_with_start::<Response>()
-                .map(ReceivedResponse::from_frame);
+            let msg = r.read_budgeted::<Response>();
             if let Ok(message) = &msg {
                 if let Response::TransportStats(stats) = &message.value {
                     if let Some(value) = &stats.observation {
@@ -971,12 +930,12 @@ fn spawn_observed_reader(
 }
 
 fn receive_transport_stats(
-    rx: &std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    rx: &std::sync::mpsc::Receiver<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     timeout: std::time::Duration,
 ) -> Option<TcpSocketStats> {
     match rx
         .recv_timeout(timeout)
-        .map(|result| result.map(ReceivedResponse::into_inner))
+        .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
     {
         Ok(Ok(Response::TransportStats(stats))) => stats.tcp,
         _ => None,
@@ -1141,22 +1100,6 @@ impl RemoteConn {
         };
         anyhow!("{}: {msg}", self.label)
     }
-
-    fn receive_response(&mut self) -> Result<ReceivedResponse> {
-        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
-        match self
-            .rx
-            .as_ref()
-            .context("response reader is collecting streaming writes")?
-            .recv()
-        {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(e)) => Err(self.io_err(e.into())),
-            Err(_) => Err(self.io_err(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
-            )),
-        }
-    }
 }
 
 impl Conn for RemoteConn {
@@ -1228,13 +1171,20 @@ impl Conn for RemoteConn {
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))
     }
     fn recv(&mut self) -> Result<Response> {
-        self.receive_response().map(ReceivedResponse::into_inner)
-    }
-    fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
-        let start = std::time::Instant::now();
-        let response = self.receive_response()?;
-        let waited = response.started_at.saturating_duration_since(start);
-        Ok((response.into_inner(), waited))
+        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
+        match self
+            .rx
+            .as_ref()
+            .context("response reader is collecting streaming writes")?
+            .recv()
+            .map(|result| result.map(crate::wire_budget::Budgeted::into_inner))
+        {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(self.io_err(e.into())),
+            Err(_) => Err(self.io_err(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
+            )),
+        }
     }
     fn is_dead(&self) -> bool {
         self.dead
@@ -3742,114 +3692,6 @@ mod tests {
             supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
             ssh_worker_ticket: None,
         }
-    }
-
-    #[test]
-    fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
-        // Feed the real reader in separately released chunks. No clock sleeps:
-        // the reader announces each blocking input read, so arrival ordering is
-        // checked independently of how fast the test machine runs.
-        struct Chunks {
-            current: std::io::Cursor<Vec<u8>>,
-            input: std::sync::mpsc::Receiver<Vec<u8>>,
-            waiting: std::sync::mpsc::Sender<()>,
-        }
-        impl Read for Chunks {
-            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                if out.is_empty() {
-                    return Ok(0);
-                }
-                loop {
-                    let n = self.current.read(out)?;
-                    if n > 0 {
-                        return Ok(n);
-                    }
-                    self.waiting.send(()).map_err(std::io::Error::other)?;
-                    match self.input.recv_timeout(std::time::Duration::from_secs(2)) {
-                        Ok(chunk) if chunk.is_empty() => {
-                            return Err(std::io::ErrorKind::Interrupted.into());
-                        }
-                        Ok(chunk) => self.current = std::io::Cursor::new(chunk),
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
-                        Err(error) => return Err(std::io::Error::other(error)),
-                    }
-                }
-            }
-        }
-        let (send, input) = std::sync::mpsc::channel();
-        let (waiting, blocked) = std::sync::mpsc::channel();
-        let next_read = || {
-            blocked
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        };
-        let (rx, reader) = spawn_reader(
-            Box::new(Chunks {
-                current: std::io::Cursor::new(Vec::new()),
-                input,
-                waiting,
-            }),
-            4,
-        );
-        let mut wire = Vec::new();
-        FrameWriter::new(&mut wire, false)
-            .write_msg(&hello_ok())
-            .unwrap();
-        next_read();
-        send.send(wire).unwrap();
-        assert!(matches!(
-            rx.recv().unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
-        let mut wire = Vec::new();
-        let mut writer = FrameWriter::with_preamble_written(&mut wire, false);
-        let data = vec![42; 1 << 20];
-        writer
-            .write_msg(&Response::SmallBlocks(vec![Ok(SmallBlock {
-                hash: crate::fsops::content_digest(&data),
-                data,
-            })]))
-            .unwrap();
-        writer.write_msg(&Response::Ok).unwrap();
-        drop(writer);
-        next_read();
-        send.send(Vec::new()).unwrap(); // Interrupted before the next frame.
-        next_read(); // The live reader retries, preserving its next reply.
-        let before_header = std::time::Instant::now();
-        send.send(wire[..5].to_vec()).unwrap();
-        next_read(); // The frame header arrived; the payload is still withheld.
-        let before_payload = std::time::Instant::now();
-        send.send(wire[5..].to_vec()).unwrap();
-        drop(send);
-        let reply = rx.recv().unwrap().unwrap();
-        assert!(reply.started_at >= before_header);
-        assert!(reply.started_at <= before_payload);
-        assert!(matches!(reply.value, Response::SmallBlocks(_)));
-        reader.join().unwrap(); // The following reply and EOF are already queued.
-        let mut conn = RemoteConn {
-            observation: Default::default(),
-            child: None,
-            w: FrameWriter::new(Box::new(std::io::sink()), false),
-            rx: Some(rx),
-            reader: None,
-            label: "reply timing test".into(),
-            dead: false,
-            rpc_observation: None,
-            write_stream: None,
-            peer: None,
-            tcp_socket: None,
-            named_socket: None,
-            multiplexed_ssh: false,
-            detached: false,
-        };
-        let (reply, waited) = conn.recv_with_wait().unwrap();
-        assert!(matches!(reply, Response::Ok));
-        assert_eq!(waited, std::time::Duration::ZERO);
-        assert!(
-            conn.recv_with_wait().is_err(),
-            "EOF remains a transport error"
-        );
-        assert!(conn.is_dead());
     }
 
     #[test]

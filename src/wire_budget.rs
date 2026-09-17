@@ -94,7 +94,6 @@ pub(crate) struct Budgeted<T> {
     pub(crate) hold: Hold,
 }
 impl<T> Budgeted<T> {
-    #[cfg(test)]
     pub(crate) fn into_inner(self) -> T {
         self.value
     }

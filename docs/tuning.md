@@ -90,8 +90,7 @@ The default comparison block is 4 MiB; one changed byte makes that whole block
 need copying. Smaller blocks can reduce the data sent, but require more hashes
 and requests. Keep `request-size=4M`: request size otherwise defaults to the
 comparison block, so `-B 64K` alone also shrinks requests and lowers the automatic
-streaming threshold to 256 KiB. New-file batching follows the request and batch
-limits, independently of the comparison block.
+streaming threshold to 256 KiB.
 
 Syq fills available request windows with changed ranges from the same file,
 leaving queued work for other workers. This can help on high-latency links,
@@ -171,13 +170,6 @@ File and byte limits are ceilings; syq may choose smaller batches. Files larger
 than the byte limit use another copy method. With `--resource-limits bandwidth=RATE`, each batch
 contains at most one file. Batch controls cannot combine with `copy-path=ranges`
 or `copy-path=streaming`; `auto-streaming` accepts them.
-
-Remote new-file copies keep files batched to reduce network round trips.
-Workers overlap reads and writes in bounded groups of whole files inside each
-batch. Idle workers can take groups whose reads have not started; after a source
-read stalls, its worker drains read-ahead before claiming more groups. Larger
-files can use up to one worker per file within the selected worker count; tiny
-files share workers to avoid unnecessary connection setup.
 
 `split-min-size` sets the smallest file region an idle worker can take from
 another worker. Lower values allow finer sharing; higher values avoid small
