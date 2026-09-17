@@ -574,6 +574,24 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_fresh_window_can_be_part_of_a_useful_probe() {
+        let mut controller = Controller::new(256, 1024, true);
+        for _ in 0..3 {
+            controller.observe(280.0, 256, 10000, 16, 0.0);
+        }
+        assert_eq!(controller.limit, 512);
+        // A healthy HTTP fixture returned 32 fresh responses in one window,
+        // then 224 in the next. Rejecting its first window below half the
+        // baseline cut useful concurrency and increased the copy time.
+        controller.observe(300.0, 512, 10000, 16, 300.0);
+        assert_eq!(controller.observe(75.5, 512, 10000, 16, 0.0), 512);
+        assert!(controller.probe.is_some());
+        assert_eq!(controller.observe(527.0, 512, 10000, 16, 0.0), 512);
+        assert!(controller.probe.is_none());
+        assert_eq!(controller.lower, 256);
+    }
+
+    #[test]
     fn old_only_windows_cannot_reject_an_unmeasured_probe() {
         let mut controller = Controller::new(256, 512, true);
         controller.upper = 512;
