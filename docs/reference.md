@@ -478,8 +478,10 @@ in names and peer diagnostics. JSON status output keeps the original values.
 
 ## Environment variables and local files
 
-Syq reads no configuration file. A command's behavior comes from its
-arguments, plus these environment variables:
+Syq reads no configuration file. Besides the usual system variables such as
+`HOME`, `TMPDIR`, and `SSH_AUTH_SOCK`, and the AWS credential, region, and
+endpoint variables described under
+[object storage](object-storage.md#credentials-and-providers), syq honors:
 
 - `SYQ_CP_OPTIONS`, `SYQ_RSYNC_OPTIONS`, and `SYQ_RM_OPTIONS` hold extra
   arguments for `syq cp`, `syq rsync`, and `syq rm`. Use them to adjust a
@@ -497,8 +499,9 @@ arguments, plus these environment variables:
 - `SYQ_TUNING_CACHE` names the
   [remembered connection count](tuning.md#remembered-connection-counts) file;
   an empty value turns that cache off.
-- `SYQ_DEBUG` adds internal diagnostics to stderr. Their content changes
-  between versions.
+- `SYQ_DEBUG` adds internal diagnostics to stderr, and `SYQ_S3_DIAGNOSTICS=1`
+  does the same for object storage requests. Their content changes between
+  versions.
 - `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, and `XDG_RUNTIME_DIR` relocate the
   files below; `HOME` supplies the defaults.
 
@@ -513,6 +516,7 @@ Syq keeps these files on the machine where you run it:
 | `~/.config/syq/receive.json` | receiving profiles from `syq persist receive on` |
 | `~/.config/syq/install.json`, `last-update-check` | standalone install receipt and reminder timing |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | live persistent connection sockets |
+| `~/.syq-destinations-v3/` | return destinations (`@NAME`) registered by connected receivers |
 | `~/.local/share/syq/restricted/` | receiver enrollment state on a receiving server |
 
 None of the caches or the update stamp are required. When they cannot be
