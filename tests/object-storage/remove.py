@@ -69,6 +69,8 @@ def check():
         for key in ['tree/', 'tree/child', 'tree/nested/child', 'tree-other/child']:
             c.request('PUT', key, b'')
         c.request('DELETE', 'tree/child')
+        for flags in [[], ['--s3-all-versions']]:
+            run(['tree', *flags], ok=False)
         run(['--src-non-dir', 'tree', '--s3-all-versions'], ok=False)
         run(['--srcs-in', 'tree', '--s3-all-versions'])
         assert {e[0] for e in versions()} == {'tree/', 'tree-other/child'}
@@ -76,8 +78,8 @@ def check():
         assert {e[0] for e in versions()} == {'tree-other/child'}
         # Validate all selectors before deleting any selected key.
         c.request('PUT', 'conflict', b'data')
-        run(['tree-other/child', '--src-dir', 'conflict', '--s3-all-versions'], ok=False)
-        assert versions('tree-other/child')
+        run(['conflict', 'tree-other', '--s3-all-versions'], ok=False)
+        assert versions('conflict') and versions('tree-other/child')
         run(['--root', 'tree-other', '--srcs-in', '.', '--s3-all-versions'])
         assert not versions('tree-other/')
 
@@ -85,12 +87,18 @@ def check():
         c.request('PUT', 'overlap/a + & %.txt', b'one')
         c.request('PUT', 'overlap/a + & %.txt', b'two')
         results = root / 'removed.ndjson'
-        run(['overlap', 'overlap/a + & %.txt', '--s3-all-versions', '--results', results])
+        run(['--src-dir', 'overlap', '--src-non-dir', 'overlap/a + & %.txt', '--s3-all-versions', '--results', results])
         records = [json.loads(line) for line in results.read_text().splitlines()]
         assert records[-1]['entries_removed'] == 2
         removals = [r for r in records if r['type'] == 'removal_result']
         assert len(removals) == 2 and all(r['s3_version_id'] and r['s3_delete_marker'] is False for r in removals)
         assert not versions('overlap/')
+
+        # A trailing slash remains part of an explicitly selected marker version.
+        c.request('PUT', 'marker/', b'')
+        marker_version = versions('marker/')[0][1]
+        run(['marker/', '--s3-version-id', marker_version])
+        assert not versions('marker/')
 
         # Multiple pages for a single key require both continuation markers.
         with ThreadPoolExecutor(max_workers=16) as workers:

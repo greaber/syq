@@ -47,7 +47,6 @@ struct Entry {
     key: String,
     version: Option<String>,
     marker: bool,
-    latest: bool,
     selector: u64,
 }
 impl Entry {
@@ -80,15 +79,15 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
                 anyhow::Error::new(e.into_service_error()).context(message)
             })?;
         let mut past_exact = false;
-        for (key, version, marker, latest) in output
+        for (key, version, marker) in output
             .versions()
             .iter()
-            .map(|v| (v.key(), v.version_id(), false, v.is_latest() == Some(true)))
+            .map(|v| (v.key(), v.version_id(), false))
             .chain(
                 output
                     .delete_markers()
                     .iter()
-                    .map(|v| (v.key(), v.version_id(), true, v.is_latest() == Some(true))),
+                    .map(|v| (v.key(), v.version_id(), true)),
             )
         {
             let key = key.context("S3 version listing omitted key")?;
@@ -107,7 +106,6 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
                 key: key.into(),
                 version: Some(version.into()),
                 marker,
-                latest,
                 selector: 0,
             });
         }
@@ -187,8 +185,12 @@ async fn plan(
             SourceSelection::Directory | SourceSelection::Contents
         );
         anyhow::ensure!(!key.is_empty() || location.selection == SourceSelection::Contents, "select bucket contents explicitly with --srcs-in .; S3 removal does not remove buckets");
+        anyhow::ensure!(
+            directory || exact_version.is_some() || !raw.ends_with('/'),
+            "S3 tree removal requires --src-dir or --srcs-in: {raw:?}"
+        );
         let use_versions = args.s3_remove.s3_all_versions || exact_version.is_some();
-        let mut listed = if use_versions && !key.is_empty() {
+        let mut listed = if use_versions && !key.is_empty() && !directory {
             versions(client, bucket, &key, true).await?
         } else {
             Vec::new()
@@ -198,46 +200,19 @@ async fn plan(
         } else {
             format!("{key}/")
         };
-        let live_exact = !key.is_empty()
+        let exact = !directory
             && if use_versions {
-                listed.iter().any(|e| e.key == key && e.latest && !e.marker)
+                listed.iter().any(|e| {
+                    e.key == key && exact_version.is_none_or(|id| e.version.as_deref() == Some(id))
+                })
             } else {
                 present(client, bucket, &key).await?
             };
-        anyhow::ensure!(
-            !(directory && live_exact),
-            "S3 directory selector conflicts with exact object {key:?}"
-        );
-        if use_versions
-            && exact_version.is_none()
-            && !live_exact
-            && (location.selection != SourceSelection::File || listed.is_empty())
-        {
+        if use_versions && exact_version.is_none() && !exact {
             listed.extend(versions(client, bucket, &prefix, false).await?);
         }
-        let exact = if use_versions && !key.is_empty() {
-            if let Some(id) = exact_version {
-                listed
-                    .iter()
-                    .any(|e| e.key == key && e.version.as_deref() == Some(id))
-            } else {
-                // Resolve the current view first. Historical exact keys remain
-                // addressable when nothing live wins, or when explicitly typed.
-                let historical_exact = listed.iter().any(|e| e.key == key);
-                let live_tree = listed
-                    .iter()
-                    .any(|e| e.key.starts_with(&prefix) && e.latest && !e.marker);
-                live_exact
-                    || (!directory
-                        && historical_exact
-                        && (location.selection == SourceSelection::File || !live_tree))
-            }
-        } else {
-            live_exact
-        };
-        let is_tree =
-            exact_version.is_none() && !exact && location.selection != SourceSelection::File;
-        if !exact && exact_version.is_none() && location.selection == SourceSelection::File {
+        let is_tree = directory;
+        if !directory && !exact && exact_version.is_none() {
             let has_children = if use_versions {
                 listed.iter().any(|e| e.key.starts_with(&prefix))
             } else {
@@ -245,7 +220,7 @@ async fn plan(
             };
             anyhow::ensure!(
                 !has_children,
-                "S3 non-directory selector names a prefix: {key:?}"
+                "S3 non-directory selector names a prefix: {key:?}; use --src-dir to remove a tree or --srcs-in to remove its contents"
             );
         }
         let exists;
@@ -259,7 +234,6 @@ async fn plan(
                         key,
                         version: None,
                         marker: false,
-                        latest: true,
                         selector: 0,
                     })
                     .collect();
@@ -284,7 +258,6 @@ async fn plan(
                     key: key.clone(),
                     version: None,
                     marker: false,
-                    latest: true,
                     selector: 0,
                 });
             }

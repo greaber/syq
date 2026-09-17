@@ -951,10 +951,10 @@ struct NativeRmSelectionArgs {
     /// Follow symlinks in --cwd, --root, and selector parent directories; always unlink a final selected symlink
     #[arg(long)]
     follow_src: bool,
-    /// Select an object without constraining its type; attach =PATH when it begins with `-` (repeatable)
+    /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
     #[arg(long, value_name = "PATH")]
     src: Vec<OsString>,
-    /// Select a directory's contents; attach =DIR when it begins with `-` (repeatable)
+    /// Recursively select a directory's contents, keeping the directory; attach =DIR when it begins with `-` (repeatable)
     #[arg(long, value_name = "DIR")]
     srcs_in: Vec<OsString>,
     /// Select a non-directory object; attach =PATH when it begins with `-` (repeatable)
@@ -969,7 +969,7 @@ struct NativeRmSelectionArgs {
     /// Select several directory trees
     #[arg(long, value_name = "DIR", num_args = 1..)]
     src_dirs: Vec<OsString>,
-    /// Select several objects without constraining their selected types
+    /// Select several non-directory objects
     #[arg(long, value_name = "PATH", num_args = 1..)]
     srcs: Vec<OsString>,
     /// Selected objects (shorthand for --src)
@@ -1365,9 +1365,9 @@ struct NativeMapCommand {
 #[command(
     name = "syq rm",
     version,
-    about = "Remove selected files, directory trees, or S3 objects and prefixes.\n\nDirectories are removed recursively. --srcs-in removes their contents instead.\nSelected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.",
-    before_help = "Examples:\n  syq rm --dry-run old-backup\n  syq rm old-backup\n  syq rm --on nas --srcs-in /backup/old\n  syq rm --on s3://bucket --src-dir old --s3-all-versions --dry-run",
-    long_about = "Remove selected files, directory trees, or S3 objects and prefixes. Use --on s3://BUCKET for S3; ordinary removal respects bucket versioning. Directories are removed recursively; --srcs-in removes their contents instead. Selected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
+    about = "Remove selected files, directory trees, or S3 objects and prefixes.\n\nNamed paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory.\nSelected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.",
+    before_help = "Examples:\n  syq rm --dry-run --src-dir old-backup\n  syq rm --src-dir old-backup\n  syq rm --on nas --srcs-in /backup/old\n  syq rm --on s3://bucket --src-dir old --s3-all-versions --dry-run",
+    long_about = "Remove selected files, directory trees, or S3 objects and prefixes. Use --on s3://BUCKET for S3; ordinary removal respects bucket versioning. Named paths must be non-directories. --src-dir recursively removes a tree; --srcs-in recursively removes its contents, keeping the directory. Selected symlinks are always removed as links. --follow-src permits parent-directory symlink traversal; directory and contents selectors reject final symlinks.\n\nAttach path option values beginning with `-` by using `=`, for example --src-dir=-.",
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
@@ -1885,17 +1885,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
-        (
-            "sources",
-            SourceSelection::NamedNoFollow,
-            &parsed.selection.sources,
-        ),
-        ("src", SourceSelection::NamedNoFollow, &parsed.selection.src),
-        (
-            "srcs",
-            SourceSelection::NamedNoFollow,
-            &parsed.selection.srcs,
-        ),
+        ("sources", SourceSelection::File, &parsed.selection.sources),
+        ("src", SourceSelection::File, &parsed.selection.src),
+        ("srcs", SourceSelection::File, &parsed.selection.srcs),
         (
             "srcs_in",
             SourceSelection::Contents,
@@ -1965,13 +1957,19 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let locations = ordered
         .into_iter()
         .map(|(_, selection, path)| {
-            let path = if parsed.s3_remove.s3_version_id.is_some() {
+            let path = if s3.is_some() {
                 path.into_vec()
             } else {
                 trim_native_trailing_slashes(path.into_vec())
             };
             validate_native_source_selector(&path, parsed.selection.root.is_some())?;
-            Ok(Location::native(endpoint.clone(), path, selection))
+            let mut location = Location::native(endpoint.clone(), path.clone(), selection);
+            if s3.is_some() {
+                // An S3 marker key ends in a slash; retain its identity for
+                // explicit version deletion and non-directory validation.
+                location.path = path;
+            }
+            Ok(location)
         })
         .collect::<Result<Vec<_>>>()?;
     let mut args = native_removal_args(
@@ -3211,6 +3209,21 @@ mod tests {
         assert!(args.no_tcp);
         assert_eq!(args.tcp_ports, "49000-49010");
         assert!(args.detach);
+    }
+
+    #[test]
+    fn native_rm_named_paths_use_existing_file_selector_and_preserve_s3_marker_keys() {
+        let argv = ["one", "--src=two", "--srcs", "three", "four"].map(std::ffi::OsString::from);
+        let args = parse_native_rm(&argv).unwrap();
+        assert_eq!(args.locations.len(), 4);
+        assert!(args
+            .locations
+            .iter()
+            .all(|l| l.selection == SourceSelection::File));
+        let argv =
+            ["--on=s3://bucket", "foo/", "--s3-version-id=version"].map(std::ffi::OsString::from);
+        let args = parse_native_rm(&argv).unwrap();
+        assert_eq!(args.locations[0].path, b"foo/");
     }
 
     #[test]

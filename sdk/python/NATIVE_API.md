@@ -134,6 +134,9 @@ for interactions with other copy options.
 
 ## rm
 
+Positional sources, `src`, and `srcs` refuse directories. `src_dir` removes a
+tree recursively; `srcs_in` removes its contents recursively and keeps the root.
+
 `on="server"` selects the removal endpoint. A final selected symlink is
 always unlinked. Both `follow_src=True` and `follow=True` permit symlinks in
 `cwd`, `root`, and selector parent directories.

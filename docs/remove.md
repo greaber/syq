@@ -1,12 +1,19 @@
 # Remove files
 
-Remove a file or a directory tree:
+Remove a file or symlink:
 
 ```sh
-syq rm old-output
+syq rm old-file
 ```
 
-Remove a directory's contents, leaving the directory itself:
+Named paths, `--src`, and `--srcs` refuse directories. Select a tree explicitly
+to remove it recursively:
+
+```sh
+syq rm --src-dir old-output
+```
+
+Remove a directory's contents recursively, leaving the directory itself:
 
 ```sh
 syq rm --srcs-in cache
@@ -19,7 +26,7 @@ rolled back.
 ## On another machine
 
 ```sh
-syq rm --on server /scratch/old-output
+syq rm --on server --src-dir /scratch/old-output
 ```
 
 This removes `/scratch/old-output` on `server`. Remote removal runs while your
@@ -34,7 +41,7 @@ versioning; explicit version deletion is available with `--s3-all-versions` or
 ## Limit the selection
 
 ```sh
-syq rm --root /srv cache old-output
+syq rm --root /srv --src-dir cache --src-dir old-output
 ```
 
 This removes `/srv/cache` and `/srv/old-output`, with selection confined to

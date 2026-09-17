@@ -745,6 +745,17 @@ ssh source 'test -f /tmp/syq-real-ssh/rm-policy/real/file'
 syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src link/file
 ssh source 'test -L /tmp/syq-real-ssh/rm-policy/link; test ! -e /tmp/syq-real-ssh/rm-policy/real/file'
 
+printf 'case: native remote removal requires explicit tree selection\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/rm-policy/tree/nested; printf keep > /tmp/syq-real-ssh/rm-policy/tree/nested/child; printf keep > /tmp/syq-real-ssh/rm-policy/victim'
+policy_status=0
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy victim tree || policy_status=$?
+test "$policy_status" -ne 0
+ssh source 'test -f /tmp/syq-real-ssh/rm-policy/victim; test -f /tmp/syq-real-ssh/rm-policy/tree/nested/child'
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy --srcs-in tree
+ssh source 'test -d /tmp/syq-real-ssh/rm-policy/tree; test ! -e /tmp/syq-real-ssh/rm-policy/tree/nested'
+syq rm --on source --root /tmp/syq-real-ssh/rm-policy --src-dir tree
+ssh source 'test ! -e /tmp/syq-real-ssh/rm-policy/tree'
+
 printf 'case: native verification and overwrite policies through the restricted receiver\n'
 syq cp --verify-only --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
