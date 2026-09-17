@@ -1210,9 +1210,9 @@ fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
         .expect("failed multipart download keeps its recovery record");
     // A machine crash can persist the rename without the record's contents.
     std::fs::write(&record, b"").unwrap();
-    let stale = record.with_extension("7.tmp");
+    let stale = record.with_extension("tmp");
     std::fs::write(&stale, b"{").unwrap();
-    let unrelated = cache.join("unrelated.7.tmp");
+    let unrelated = cache.join("unrelated.tmp");
     std::fs::write(&unrelated, b"{").unwrap();
 
     let output = download(&server);

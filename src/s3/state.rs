@@ -50,23 +50,22 @@ impl State {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             bail!("another S3 copy is using this recovery record; retry after it finishes");
         }
-        // Only the lock holder saves under this name, so a temporary file
-        // found now was left by an interrupted save.
-        let prefix = format!("{name}.");
-        for entry in root
-            .read_directory(&RelativePath::new(b"")?)
-            .unwrap_or_default()
-        {
-            if entry.starts_with(prefix.as_bytes()) && entry.ends_with(b".tmp") {
-                let _ = RelativePath::new(&entry).and_then(|stale| root.unlink(&stale));
-            }
-        }
-        Ok(Self {
+        let state = Self {
             directory: path,
             root,
             name,
             _lock: lock,
-        })
+        };
+        // Only the lock holder writes this file, so one found now was left by
+        // an interrupted save.
+        let temporary = state.temporary()?;
+        if state.root.metadata_optional(&temporary)?.is_some() {
+            state.root.unlink(&temporary)?;
+        }
+        Ok(state)
+    }
+    fn temporary(&self) -> Result<RelativePath> {
+        RelativePath::new(format!("{}.tmp", self.name).as_bytes())
     }
     fn path(&self) -> Result<RelativePath> {
         RelativePath::new(format!("{}.json", self.name).as_bytes())
@@ -91,11 +90,7 @@ impl State {
         })?))
     }
     pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
-        let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes)?;
-        let tmp = RelativePath::new(
-            format!("{}.{}.tmp", self.name, u64::from_le_bytes(bytes)).as_bytes(),
-        )?;
+        let tmp = self.temporary()?;
         let mut file = self.root.create_file(&tmp, 0o600)?;
         // One write: serializing straight to the file costs a syscall per token.
         file.write_all(&serde_json::to_vec(value)?)?;
