@@ -22209,7 +22209,13 @@ fn delete_many_roots_keeps_claims_in_their_own_scope() {
     }
     let destination = t.s("dst");
     for dry in [true, false] {
-        let mut args = vec![if dry { "-an" } else { "-a" }, "--delete"];
+        // This checks selector scope, not automatic worker scaling. Keep the
+        // 40-root fixture within ordinary per-process descriptor limits.
+        let mut args = vec![
+            if dry { "-an" } else { "-a" },
+            "--delete",
+            "--performance-tuning=workers=2",
+        ];
         args.extend(sources.iter().map(String::as_str));
         args.push(&destination);
         run_ok(&args);
