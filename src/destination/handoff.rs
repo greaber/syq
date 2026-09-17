@@ -128,6 +128,19 @@ pub(super) fn check_selection(selection: &Selection) -> Result<()> {
     Ok(())
 }
 
+/// The public command line after `enter` and environment options, recorded
+/// by main. A re-executed helper receives exactly this, so arguments taken
+/// from the environment reach it even when it predates that feature, and the
+/// variables themselves, already removed from the environment, are not
+/// applied a second time.
+static COMMAND_LINE: OnceLock<Vec<OsString>> = OnceLock::new();
+
+pub(crate) fn record_command_line(argv: &[OsString]) {
+    COMMAND_LINE
+        .set(argv.to_vec())
+        .expect("command line recorded once");
+}
+
 pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     check_selection(selection)?;
     if selection.registration.identity == crate::identity::build() {
@@ -135,10 +148,11 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     }
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
     let guard = serde_json::to_string(&selection.guard()?)?;
+    let argv = COMMAND_LINE.get().context("command line not recorded")?;
     let error = Command::new(program)
         .arg(HANDOFF)
         .arg(guard)
-        .args(std::env::args_os().skip(1))
+        .args(argv.iter().skip(1))
         .exec();
     Err(error).with_context(|| format!(
         "start matching return helper {} for @{}; reconnect from the receiving machine to refresh it",

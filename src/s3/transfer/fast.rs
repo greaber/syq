@@ -433,6 +433,7 @@ async fn read_body<F: std::future::Future>(
 pub(super) struct UploadBuffer {
     pub(super) bytes: Vec<u8>,
     pub(super) _reservation: tokio::sync::OwnedSemaphorePermit,
+    pub(super) _trace: Option<crate::s3::diagnostics::UploadBufferTrace>,
 }
 impl AsRef<[u8]> for UploadBuffer {
     fn as_ref(&self) -> &[u8] {
@@ -782,6 +783,7 @@ mod buffer_tests {
         let body = aws_smithy_types::body::SdkBody::from(bytes::Bytes::from_owner(UploadBuffer {
             bytes: vec![42; 8],
             _reservation: reservation,
+            _trace: None,
         }));
         let retry = body.try_clone().unwrap();
         drop(body);

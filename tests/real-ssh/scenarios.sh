@@ -988,12 +988,13 @@ echo 'interactive benchmark push/pull passed'
 
 # Interrupt a real copy after the remote partial file appears, then require all
 # temporary data to be gone. An unrelated file in the scratch parent must stay.
+# Keep the copy alive long enough for the one-second partial-file poll to see it.
 cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
     --workload large --size quick --warmup off --rounds 1 --source-dir "$cancel_parent" \
-    --dest-dir /tmp/benchmark-cancel &
+    --dest-dir /tmp/benchmark-cancel -- --resource-limits bandwidth=1M &
 benchmark_pid=$!
 attempt=0
 copy_started=false

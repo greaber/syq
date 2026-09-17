@@ -42,6 +42,32 @@ PRUNE = ['delete', 'noop', 'mixed']
 STAMP = (1700000000, 1700000000)
 
 
+def transfer_tuning_mode(args):
+    if any(value is not None for value in (args.workers, args.concurrency, args.part_size)):
+        return "shared-overrides"
+    if args.syq_tuning or any(value is not None for value in
+                              (args.s5cmd_workers, args.s5cmd_concurrency, args.s5cmd_part_size)):
+        return "per-tool-overrides"
+    return "tool-defaults"
+
+
+def transfer_tuning(args):
+    """No explicit settings means the binary's automatic defaults."""
+    shared = [("s3-max-concurrent-objects", args.workers),
+              ("s3-max-concurrent-parts-per-object", args.concurrency),
+              ("s3-part-size", f"{args.part_size}M" if args.part_size else None)]
+    return args.syq_tuning or ','.join(f'{key}={value}' for key, value in shared if value is not None)
+
+
+def s5cmd_transfer_flags(args):
+    workers = args.s5cmd_workers if args.s5cmd_workers is not None else args.workers
+    concurrency = args.s5cmd_concurrency if args.s5cmd_concurrency is not None else args.concurrency
+    part_size = args.s5cmd_part_size if args.s5cmd_part_size is not None else args.part_size
+    return ([*(['--numworkers', str(workers)] if workers is not None else []), 'cp']
+            + (['-c', str(concurrency)] if concurrency is not None else [])
+            + (['-p', str(part_size)] if part_size is not None else []))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--syq', required=True, type=Path, help='optimized syq executable')
@@ -55,9 +81,13 @@ def main():
     parser.add_argument('--minimum-seconds', type=float, default=10)
     parser.add_argument('--timeout', type=float, default=1800)
     transfer = parser.add_argument_group('transfer workloads')
-    transfer.add_argument('--workers', type=int, default=32, help='concurrent objects')
-    transfer.add_argument('--concurrency', type=int, default=32, help='concurrent parts per object')
-    transfer.add_argument('--part-size', type=int, default=64, help='MiB')
+    transfer.add_argument('--workers', type=int, help='explicit shared object concurrency for syq and s5cmd')
+    transfer.add_argument('--concurrency', type=int, help='explicit shared part concurrency for syq and s5cmd')
+    transfer.add_argument('--part-size', type=int, help='explicit shared part size in MiB for syq and s5cmd')
+    transfer.add_argument('--s5cmd-workers', type=int, help='s5cmd object workers only')
+    transfer.add_argument('--s5cmd-concurrency', type=int, help='s5cmd concurrent parts only')
+    transfer.add_argument('--s5cmd-part-size', type=int, help='s5cmd part size in MiB only')
+    parser.add_argument('--syq-tuning', help='Explicit performance-tuning override for syq and baseline; otherwise automatic')
     transfer.add_argument('--large-mib', type=int, default=512)
     transfer.add_argument('--medium-count', type=int, default=64)
     transfer.add_argument('--small-count', type=int, default=1024)
@@ -65,11 +95,13 @@ def main():
     prune.add_argument('--count', type=int, default=100000, help='objects per tree')
     prune.add_argument('--size', type=int, default=1024, help='bytes per object')
     prune.add_argument('--directions', nargs='+', choices=['upload', 'download'], default=['upload', 'download'])
-    prune.add_argument('--syq-tuning', help='Optional performance-tuning override for the syq binaries')
     args = parser.parse_args()
-    if min(args.repeats, args.timeout, args.workers, args.concurrency, args.part_size, args.large_mib,
-           args.medium_count, args.small_count, args.count, args.size) <= 0:
+    overrides = [args.workers, args.concurrency, args.part_size, args.s5cmd_workers, args.s5cmd_concurrency, args.s5cmd_part_size]
+    if min(args.repeats, args.timeout, args.large_mib, args.medium_count, args.small_count, args.count, args.size,
+           *(v for v in overrides if v is not None)) <= 0:
         parser.error('counts, sizes, repeats and timeout must be positive')
+    if any(v is not None for v in overrides[:3]) and (args.syq_tuning or any(v is not None for v in overrides[3:])):
+        parser.error('use shared overrides or separate --syq-tuning/--s5cmd-* overrides, not both')
     binaries = {'syq': args.syq.resolve()}
     if args.s5cmd:
         binaries['s5cmd'] = args.s5cmd.resolve()
@@ -97,7 +129,7 @@ def main():
     rows = []
     report = dict(prefix=c.PREFIX, endpoint=c.ENDPOINT, bucket=c.BUCKET, region=c.REGION,
                   harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                  binary_sha256=hashes, settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                  binary_sha256=hashes, transfer_tuning_mode=transfer_tuning_mode(args), settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   host=os.uname().nodename, cpus=len(os.sched_getaffinity(0)), load=os.getloadavg(),
                   records=rows, complete=False, cleaned=False)
     header_flags = [flag for name, value in c.HEADERS.items() for flag in ['--s3-header', name + ': ' + value]]
@@ -170,9 +202,9 @@ def main():
     def transfer_command(tool, direction, local, prefix):
         remote = f's3://{c.BUCKET}/{prefix}/'
         if tool == 's5cmd':
-            base = s5cmd('--numworkers', str(args.workers), 'cp', '-c', str(args.concurrency), '-p', str(args.part_size))
+            base = s5cmd(*s5cmd_transfer_flags(args))
             return base + ([str(local / '*'), remote] if direction == 'upload' else [remote + '*', str(local) + '/'])
-        tuning = f's3-max-concurrent-objects={args.workers},s3-max-concurrent-parts-per-object={args.concurrency},s3-part-size={args.part_size}M'
+        tuning = transfer_tuning(args)
         return syq(tool, tuning, *(['--srcs-in', local, '--to', f's3://{c.BUCKET}', '--into', prefix] if direction == 'upload'
                                    else ['--from', f's3://{c.BUCKET}', '--srcs-in', prefix, '--into', local]))
 

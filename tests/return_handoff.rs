@@ -189,6 +189,31 @@ sys.exit(23)
     assert_eq!(output.stdout, input);
 }
 
+#[test]
+fn handoff_passes_environment_options_as_arguments_and_drops_the_variable() {
+    let fixture = Fixture::new();
+    let helper = fixture.script(
+        r#"
+import os, sys
+assert sys.argv[1] == '--return-handoff-v1', sys.argv
+assert sys.argv[3:] == ['cp', '--dry-run', '--quiet', 'source', '--to', '@laptop', '--into', 'dst'], sys.argv
+assert 'SYQ_CP_OPTIONS' not in os.environ and 'SYQ_RM_OPTIONS' not in os.environ
+sys.exit(23)
+"#,
+    );
+    fixture.registration(&helper, "another-build");
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "source", "--to", "@laptop", "--into", "dst"])
+        .current_dir(fixture.temp.path())
+        .env("HOME", fixture.temp.path())
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .env("SYQ_CP_OPTIONS", "--dry-run --quiet")
+        .env("SYQ_RM_OPTIONS", "--dry-run")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn handoff_does_not_read_ignore_sources_in_the_invoking_build() {

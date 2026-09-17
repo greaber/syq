@@ -89,6 +89,14 @@ fn configure_at(mut command: Command, path: &str) -> Command {
             }
         }
     }
+    if let Some((_, variable)) = crate::cli::EnvironmentOptions::VARIABLES
+        .iter()
+        .find(|(command, _)| format!("syq {command}") == path)
+    {
+        details.push_str(&format!(
+            "Environment: {variable} holds extra arguments, inserted before those on the command line.\n\n"
+        ));
+    }
     details.push_str("Documentation: https://greaber.github.io/syq/");
     let rsync = path == "syq rsync";
     command = command.disable_help_flag(true);
