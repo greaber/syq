@@ -144,6 +144,11 @@ than the byte limit use another copy method. With `--resource-limits bandwidth=R
 contains at most one file. Batch controls cannot combine with `copy-path=ranges`
 or `copy-path=streaming`; `auto-streaming` accepts them.
 
+Remote new-file copies can batch files up to the smaller of `request-size` and
+`batch-bytes`; by default, `request-size` equals the comparison block size.
+Increasing these limits can make larger files use whole-file copies held in
+memory, which restart from the beginning if interrupted.
+
 `split-min-size` sets the smallest file region an idle worker can take from
 another worker. Lower values allow finer sharing; higher values avoid small
 assignments. Splits align to hash blocks and need at least twice the minimum
