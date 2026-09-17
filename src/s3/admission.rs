@@ -292,7 +292,7 @@ where
     let begin = || {
         let maximum = concurrency.maximum?;
         let initial = match &concurrency.requests {
-            Some(requests) => requests.begin_objects(concurrency.initial, maximum)?,
+            Some(requests) => requests.begin_objects(concurrency.initial)?,
             None => concurrency.initial,
         };
         Some(Controller::new(
@@ -302,6 +302,7 @@ where
         ))
     };
     let mut controller = begin();
+    let mut handoff_pending = controller.is_some() && concurrency.requests.is_some();
     let mut limit = controller.as_ref().map_or(concurrency.initial, |c| c.limit);
     let mut tasks = tokio::task::JoinSet::new();
     let mut jobs = jobs.into_iter();
@@ -312,6 +313,16 @@ where
     let mut completed = 0usize;
     let mut error = None;
     loop {
+        if handoff_pending && tasks.len() <= limit {
+            // The old request cap stays in force until queued requests belong
+            // to no more than the new number of live object tasks.
+            concurrency
+                .requests
+                .as_ref()
+                .unwrap()
+                .finish_objects(concurrency.maximum.unwrap());
+            handoff_pending = false;
+        }
         while error.is_none() && tasks.len() < limit {
             let Some(job) = jobs.next() else { break };
             tasks.spawn(work(job));
@@ -335,7 +346,10 @@ where
                     // Preserve the existing request ramp before taking over.
                     // Only one controller changes concurrency at a time.
                     controller = begin();
-                    if let Some(controller) = &controller { limit = controller.limit; }
+                    if let Some(controller) = &controller {
+                        limit = controller.limit;
+                        handoff_pending = concurrency.requests.is_some();
+                    }
                     activity = 0;
                     completed = 0;
                     since = tokio::time::Instant::now();

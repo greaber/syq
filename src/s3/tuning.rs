@@ -141,12 +141,19 @@ impl Budget {
             ready.await;
         }
     }
-    pub fn begin_objects(&self, workers: usize, maximum: usize) -> Option<usize> {
+    pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
         if s.adaptive && !s.settled && s.limit < workers {
             return None;
         }
-        let initial = workers.min(s.limit);
+        // Freeze the request ramp while the scheduler drains its existing jobs.
+        // Some jobs may still be waiting in acquire(); increasing the request
+        // limit here would let them bypass the newly chosen object concurrency.
+        s.settled = true;
+        Some(workers.min(s.limit))
+    }
+    pub fn finish_objects(&self, maximum: usize) {
+        let mut s = self.state.lock().unwrap();
         if s.adaptive {
             s.limit = maximum;
             s.max = maximum;
@@ -154,7 +161,6 @@ impl Budget {
         s.adaptive = false;
         drop(s);
         self.changed.notify_waiters();
-        Some(initial)
     }
     pub fn completed(&self, bytes: u64) {
         let mut s = self.state.lock().unwrap();
@@ -219,7 +225,7 @@ mod tests {
     #[test]
     fn object_controller_waits_for_request_ramp_or_plateau() {
         let budget = Budget::new(64, true);
-        assert_eq!(budget.begin_objects(256, 512), None);
+        assert_eq!(budget.begin_objects(256), None);
         for (bytes, expected) in [(1024, 128), (2048, 256)] {
             {
                 let mut s = budget.state.lock().unwrap();
@@ -231,17 +237,71 @@ mod tests {
             }
             assert_eq!(budget.state.lock().unwrap().limit, expected);
             if expected < 256 {
-                assert_eq!(budget.begin_objects(256, 512), None);
+                assert_eq!(budget.begin_objects(256), None);
             }
         }
-        assert_eq!(budget.begin_objects(256, 512), Some(256));
+        assert_eq!(budget.begin_objects(256), Some(256));
+        assert_eq!(budget.state.lock().unwrap().limit, 256);
+        budget.finish_objects(512);
         assert_eq!(budget.state.lock().unwrap().limit, 512);
         assert!(!budget.state.lock().unwrap().adaptive);
 
         let budget = Budget::new(64, true);
         budget.state.lock().unwrap().settled = true;
-        assert_eq!(budget.begin_objects(256, 512), Some(64));
+        assert_eq!(budget.begin_objects(256), Some(64));
+        assert_eq!(budget.state.lock().unwrap().limit, 64);
+        budget.finish_objects(512);
         assert!(!budget.state.lock().unwrap().adaptive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_handoff_drains_waiting_jobs_before_opening_request_capacity() {
+        let budget = Arc::new(Budget::new(2, true));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let copy_budget = budget.clone();
+        let copy_gate = gate.clone();
+        let copy = tokio::spawn(async move {
+            crate::s3::admission::parallel(
+                (0..8).collect(),
+                crate::s3::admission::Concurrency {
+                    initial: 8,
+                    maximum: Some(16),
+                    initial_probe_up: true,
+                    requests: Some(copy_budget.clone()),
+                },
+                move |job| {
+                    let budget = copy_budget.clone();
+                    let gate = copy_gate.clone();
+                    let started = started.clone();
+                    async move {
+                        let _request = budget.acquire().await;
+                        started.send(job).unwrap();
+                        gate.acquire().await.unwrap().forget();
+                        Ok(Some(1024))
+                    }
+                },
+            )
+            .await
+        });
+        // Two requests are running; the other six live jobs wait for a permit.
+        observed.recv().await.unwrap();
+        observed.recv().await.unwrap();
+        budget.state.lock().unwrap().settled = true;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        let unexpected = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
+        gate.add_permits(8);
+        copy.await.unwrap().unwrap();
+        assert!(
+            unexpected.is_err(),
+            "handoff started another request before draining old jobs"
+        );
+        let mut remaining = 0;
+        while observed.recv().await.is_some() {
+            remaining += 1;
+        }
+        assert_eq!(remaining, 6);
+        assert_eq!(budget.state.lock().unwrap().active, 0);
     }
 
     #[test]
@@ -261,7 +321,10 @@ mod tests {
         };
         let mut waiting = Box::pin(budget.acquire());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(budget.begin_objects(1, 2), Some(1));
+        assert_eq!(budget.begin_objects(1), Some(1));
+        assert_eq!(wakes.0.load(Relaxed), 0);
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        budget.finish_objects(2);
         assert_eq!(wakes.0.load(Relaxed), 1);
         assert!(waiting.as_mut().poll(&mut cx).is_ready());
         drop(held);
@@ -380,10 +443,12 @@ mod tests {
             );
             let ready = fixed.is_some() || expected >= 256;
             assert_eq!(
-                tuning.requests.begin_objects(256, 512),
+                tuning.requests.begin_objects(256),
                 ready.then_some(256.min(expected))
             );
             if ready {
+                assert_eq!(tuning.request_limit(), expected);
+                tuning.requests.finish_objects(512);
                 assert_eq!(tuning.request_limit(), fixed.unwrap_or(512));
                 assert!(!tuning.requests.state.lock().unwrap().adaptive);
             }
