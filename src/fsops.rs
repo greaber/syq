@@ -5552,7 +5552,8 @@ impl FsOps {
                     // The controller treats an absent hash as a block to transfer.
                     break;
                 }
-                let hash = self.hash_policy.payload_algorithm().hash(bytes);
+                // Reuse compares these with the source's comparison hashes.
+                let hash = self.hash_policy.algorithm.hash(bytes);
                 if input.is_some() {
                     #[cfg(debug_assertions)]
                     test_race_barrier(
@@ -10207,6 +10208,13 @@ mod tests {
             .unwrap();
         let before = fs::metadata(&partial).unwrap();
         let mut ops = FsOps::new();
+        // Retried bytes are compared with source block hashes, independently
+        // of the hash used to check transported payloads.
+        ops.set_hash_policy(crate::hashing::HashPolicy {
+            algorithm: crate::hashing::HashAlgorithm::Blake3,
+            transfer_integrity: true,
+            transfer_hash_type: Some(crate::hashing::HashAlgorithm::Sha256),
+        });
         let hashes = ops
             .seed_basis(
                 &path_bytes(&target),
