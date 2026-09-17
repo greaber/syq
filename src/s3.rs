@@ -6,6 +6,7 @@ mod client;
 mod diagnostics;
 mod dns;
 mod local;
+mod read_recovery;
 mod state;
 mod transfer;
 mod tuning;

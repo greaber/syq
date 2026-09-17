@@ -185,6 +185,10 @@ objects beneath it; it is not an independent directory in S3. New-object
 uploads use conditional writes to avoid replacing an object created concurrently.
 A prefix existence check is not a transaction over the bucket.
 
+Within the retry budget, syq can restart a download range that is much slower
+than comparable reads in the same copy. The retry checks the object's identity
+and may download some bytes again. Setting `s3-retries=0` disables this recovery.
+
 Rerun an interrupted copy with the same endpoint, keys,
 destination and options to resume completed multipart uploads or download ranges. Recovery records live
 in `$XDG_CACHE_HOME/syq/s3`, or `~/.cache/syq/s3`. Download partials live beside

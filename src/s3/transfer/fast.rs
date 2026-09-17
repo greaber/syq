@@ -152,9 +152,14 @@ impl Engine {
             None => self.tuning.requests.acquire().await,
         };
         let mut attempt = 0;
+        // Hold the process-local recovery slot until the retried range finishes.
+        let mut recovery = None;
         loop {
             self.check_cancelled()?;
             let started = crate::s3::diagnostics::start();
+            let body_started = std::time::Instant::now();
+            let mut waited = Duration::ZERO;
+            let mut next_check = Duration::from_secs(1);
             let result = async {
                 let mut hash = algorithm.map(HashAlgorithm::hasher);
                 let body = if let Some(body) = initial.take() {
@@ -191,20 +196,44 @@ impl Engine {
                     }
                     response.body
                 };
+                let mut recover = |done: u64, waited: Duration| {
+                    if attempt != 0
+                        || self.options.retries == 0
+                        || done >= length
+                        || waited < next_check
+                    {
+                        return false;
+                    }
+                    next_check = waited + Duration::from_millis(250);
+                    recovery = self.tuning.reads.retry(length, body_started, waited);
+                    if recovery.is_some() {
+                        crate::s3::diagnostics::record(serde_json::json!({
+                            "phase": "download_slow_retry", "bytes": length,
+                            "received": done, "network_wait_s": waited.as_secs_f64(),
+                        }));
+                    }
+                    recovery.is_some()
+                };
                 if !output.direct() {
                     let mut body = body;
                     let mut done = 0;
                     let mut batch = Vec::new();
                     let mut batch_size = 0;
-                    while let Some(bytes) =
-                        tokio::time::timeout(Duration::from_secs(60), body.next()).await?
-                    {
+                    loop {
+                        let bytes =
+                            read_body(body.next(), &mut waited, |elapsed| recover(done, elapsed))
+                                .await?;
+                        let Some(bytes) = bytes else { break };
                         let mut bytes = bytes?;
-                        if let Some(h) = &mut hash {
-                            h.update(&bytes);
-                        }
                         if bytes.len() as u64 > length - done {
                             return Err(Permanent("S3 body exceeded length".into()).into());
+                        }
+                        anyhow::ensure!(
+                            !recover(done + bytes.len() as u64, waited),
+                            "S3 body progressing much more slowly than completed peers"
+                        );
+                        if let Some(h) = &mut hash {
+                            h.update(&bytes);
                         }
                         while !bytes.is_empty() {
                             if batch_size == 0 && bytes.len() >= 128 * 1024 {
@@ -245,11 +274,16 @@ impl Engine {
                 let mut buffer = writer::Aligned::new(1024 * 1024)?;
                 while done < length {
                     let want = (length - done).min(1024 * 1024) as usize;
-                    tokio::time::timeout(
-                        Duration::from_secs(60),
+                    read_body(
                         body.read_exact(&mut buffer.bytes_mut()[..want]),
+                        &mut waited,
+                        |elapsed| recover(done, elapsed),
                     )
                     .await??;
+                    anyhow::ensure!(
+                        !recover(done + want as u64, waited),
+                        "S3 body progressing much more slowly than completed peers"
+                    );
                     anyhow::ensure!(
                         (offset + done).is_multiple_of(4096)
                             && (want.is_multiple_of(4096)
@@ -278,6 +312,9 @@ impl Engine {
             .await;
             match result {
                 Ok(hash) => {
+                    self.tuning
+                        .reads
+                        .completed(length, waited, std::time::Instant::now());
                     crate::s3::diagnostics::elapsed(started, "download_range", length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
@@ -297,6 +334,36 @@ impl Engine {
     }
 }
 
+// Keep a pending read alive across observations. In particular, cancelling
+// read_exact at each tick would lose track of bytes already consumed into its
+// buffer. A recovery abandons the entire attempt and uses its normal barrier.
+async fn read_body<F: std::future::Future>(
+    read: F,
+    waited: &mut Duration,
+    mut recover: impl FnMut(Duration) -> bool,
+) -> Result<F::Output> {
+    let started = std::time::Instant::now();
+    tokio::pin!(read);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), &mut read).await {
+            Ok(result) => {
+                *waited += started.elapsed();
+                return Ok(result);
+            }
+            Err(_) => {
+                anyhow::ensure!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "S3 body read timed out"
+                );
+                anyhow::ensure!(
+                    !recover(*waited + started.elapsed()),
+                    "S3 body progressing much more slowly than completed peers"
+                );
+            }
+        }
+    }
+}
+
 pub(super) struct UploadBuffer {
     pub(super) bytes: Vec<u8>,
     pub(super) _reservation: tokio::sync::OwnedSemaphorePermit,
@@ -309,6 +376,30 @@ impl AsRef<[u8]> for UploadBuffer {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
+        use tokio::io::AsyncWriteExt;
+        let (mut send, mut recv) = tokio::io::duplex(4);
+        let writer = tokio::spawn(async move {
+            send.write_all(b"ab").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            send.write_all(b"cd").await.unwrap();
+        });
+        let mut bytes = [0; 4];
+        let mut waited = Duration::ZERO;
+        let mut observations = 0;
+        read_body(recv.read_exact(&mut bytes), &mut waited, |_| {
+            observations += 1;
+            false
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        writer.await.unwrap();
+        assert!(observations >= 1);
+        assert_eq!(&bytes, b"abcd");
+    }
 
     fn planning_engine(extra: &[&str]) -> Engine {
         let argv = [

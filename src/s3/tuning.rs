@@ -15,12 +15,14 @@ pub(super) struct Tuning {
     tigris: bool,
     upload: bool,
     pub requests: Arc<Budget>,
+    pub reads: crate::s3::read_recovery::Recovery,
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
     pub fn new(options: &Options, args: &crate::cli::Args) -> Self {
         Self {
             control_ns: AtomicU64::new(u64::MAX),
+            reads: crate::s3::read_recovery::Recovery::default(),
             upload: options.upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
@@ -858,6 +860,7 @@ mod tests {
         ] {
             let tuning = Tuning {
                 control_ns: AtomicU64::new(u64::MAX),
+                reads: crate::s3::read_recovery::Recovery::default(),
                 fixed_requests: fixed,
                 tigris,
                 upload,
