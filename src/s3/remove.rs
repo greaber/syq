@@ -75,8 +75,10 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
             .set_version_id_marker(version_marker)
             .send()
             .await
-            .map_err(|e| e.into_service_error())
-            .context("list S3 versions")?;
+            .map_err(|e| {
+                let message = client::failure("list S3 versions", &e);
+                anyhow::Error::new(e.into_service_error()).context(message)
+            })?;
         let mut past_exact = false;
         for (key, version, marker, latest) in output
             .versions()
@@ -150,7 +152,10 @@ async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
         {
             Ok(false)
         }
-        Err(error) => Err(error.into_service_error()).context("resolve S3 removal key"),
+        Err(error) => {
+            let message = client::failure("resolve S3 removal key", &error);
+            Err(error.into_service_error()).context(message)
+        }
     }
 }
 
@@ -370,7 +375,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
     let result = runtime.block_on(async {
         let work = async {
             let mut options = args.s3.clone().unwrap();
-            let client = client::connect(&mut options).await?;
+            let (client, note) = client::connect(&mut options).await?;
+            if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
+                progress.println(&note);
+            }
             let entries = plan(&args, &client, &progress, &mut summary).await?;
             progress.files_total.store(entries.len() as u64, Relaxed);
             progress.scan_done.store(true, Relaxed);
@@ -395,7 +403,8 @@ pub(super) fn run(args: Args) -> Result<i32> {
                                 e.as_service_error().and_then(|e| e.code()),
                                 e.raw_response().map(|r| r.status().as_u16()),
                             );
-                            anyhow::anyhow!(e.into_service_error())
+                            let message = client::failure("S3 removal", &e);
+                            anyhow::Error::new(e.into_service_error()).context(message)
                         })
                 };
                 let message = result

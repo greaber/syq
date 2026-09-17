@@ -1089,6 +1089,26 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
             "{text}"
         );
     }
+    for flags in [vec![], vec!["--s3-all-versions"]] {
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "object",
+            ])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains("--s3-region eu-central-1"),
+            "{}",
+            output_text(&output)
+        );
+    }
 }
 
 #[test]

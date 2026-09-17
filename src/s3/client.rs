@@ -109,7 +109,7 @@ fn response_region(
 
 /// Describe a failed request. A bodyless redirect otherwise reads as an
 /// "unhandled error", although S3 says where the bucket is.
-fn failure<E>(
+pub(super) fn failure<E>(
     operation: &str,
     error: &aws_sdk_s3::error::SdkError<
         E,
@@ -394,8 +394,10 @@ pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -
         .max_keys(1)
         .send()
         .await
-        .map_err(|e| e.into_service_error())
-        .context("S3 listing failed")?;
+        .map_err(|e| {
+            let message = failure("S3 listing", &e);
+            anyhow::Error::new(e.into_service_error()).context(message)
+        })?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
@@ -557,8 +559,10 @@ pub(super) async fn list(
                 .set_continuation_token(token.clone())
                 .send()
                 .await
-                .map_err(|e| e.into_service_error())
-                .context("S3 listing failed")?;
+                .map_err(|e| {
+                    let message = failure("S3 listing", &e);
+                    anyhow::Error::new(e.into_service_error()).context(message)
+                })?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             let mut reachable_exclusion = false;
             if probes_remaining > 0
@@ -597,8 +601,10 @@ pub(super) async fn list(
                         .delimiter("/")
                         .send()
                         .await
-                        .map_err(|e| e.into_service_error())
-                        .context("S3 listing failed")?;
+                        .map_err(|e| {
+                            let message = failure("S3 listing", &e);
+                            anyhow::Error::new(e.into_service_error()).context(message)
+                        })?;
                     let mut included = 0;
                     let mut excluded = 0;
                     for child in directory_page.common_prefixes() {
