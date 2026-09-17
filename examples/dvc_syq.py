@@ -27,7 +27,6 @@ import argparse
 import configparser
 import json
 import os
-import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -315,8 +314,8 @@ def setup(args: argparse.Namespace) -> tuple[Path, Path, list[Out], Transfer]:
     cache = cache_dir(root, config)
     remote = parse_remote(root, config, args.remote)
     outs = collect_outs(root, args.targets)
-    executable = args.syq or os.environ.get("SYQ_EXECUTABLE") or shutil.which("syq")
-    client = syq.Client(executable=executable)
+    # Default to the executable bundled with the syq package, not one on PATH.
+    client = syq.Client(executable=args.syq or os.environ.get("SYQ_EXECUTABLE"))
     print(f"remote {remote.kind}: {remote.endpoint or ''}{'/' if remote.endpoint else ''}{remote.base}")
     return root, cache, outs, Transfer(client, remote, cache, args.dry_run)
 
@@ -327,7 +326,7 @@ def main() -> None:
     parser.add_argument("targets", nargs="*", help=".dvc files, dvc.lock, or tracked paths (default: all)")
     parser.add_argument("--remote", help="DVC remote name (default: core.remote)")
     parser.add_argument("--dry-run", action="store_true", help="plan without copying")
-    parser.add_argument("--syq", help="syq executable (default: $SYQ_EXECUTABLE, then PATH)")
+    parser.add_argument("--syq", help="syq executable (default: $SYQ_EXECUTABLE, then the syq package's own)")
     args = parser.parse_args()
     if args.command == "push":
         push(args)
