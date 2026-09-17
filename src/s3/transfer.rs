@@ -104,7 +104,10 @@ impl Engine {
             .endpoint
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let client = client::connect(&mut options).await?;
+        let (client, note) = client::connect(&mut options).await?;
+        if let Some(note) = note.filter(|_| args.verbose > 0) {
+            progress.println(&note);
+        }
         super::diagnostics::elapsed(setup, "client_setup", 0);
         Ok(Arc::new(Self {
             tuning: super::tuning::Tuning::new(&options, &args),

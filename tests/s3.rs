@@ -268,6 +268,11 @@ fn serve(
         }
         return;
     }
+    if fault == "wrong-region" {
+        let region = ("x-amz-bucket-region".to_owned(), "eu-central-1".to_owned());
+        reply(&mut socket, 301, &[region], b"", method == "HEAD");
+        return;
+    }
     if fault.starts_with("prune-") {
         if method == "GET" {
             let keys: Vec<String> = match fault {
@@ -1066,6 +1071,26 @@ fn s3_bad_responses_preserve_existing_destination() {
         validate_results(temp.path());
     }
 }
+#[test]
+fn s3_wrong_region_redirects_name_the_bucket_region() {
+    let server = Server::start("wrong-region");
+    let temp = tempfile::tempdir().unwrap();
+    // A named object is found with HEAD, a prefix with a listing.
+    for selector in [&["object"][..], &["--srcs-in", "prefix"][..]] {
+        let mut args = vec!["--from", "s3://bucket"];
+        args.extend_from_slice(selector);
+        args.extend_from_slice(&["--into", "output"]);
+        let output = server.cp(temp.path(), &args);
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            text.contains("(HTTP 301): the bucket is in region eu-central-1")
+                && text.contains("--s3-region eu-central-1"),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn s3_dry_run_never_creates_destination_or_recovery() {
     let server = Server::start("ok");
