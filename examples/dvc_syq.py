@@ -5,9 +5,11 @@
 # ///
 """Pull and push DVC-tracked data with syq.
 
-    dvc_syq.py pull  [targets]   # download missing objects, then write the workspace
-    dvc_syq.py fetch [targets]   # download into DVC's cache only
-    dvc_syq.py push  [targets]   # upload objects the remote lacks
+    dvc_syq.py pull  TARGET...   # download missing objects, then write the workspace
+    dvc_syq.py fetch TARGET...   # download into DVC's cache only
+    dvc_syq.py push  TARGET...   # upload objects the remote lacks
+
+A target is a `.dvc` file, a tracked path, or with -R a directory to search.
 
 How DVC stores data, which is all this script relies on:
 
@@ -27,12 +29,14 @@ from __future__ import annotations
 import argparse
 import configparser
 import filecmp
+import hashlib
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -68,14 +72,16 @@ class CacheObject:
         return tail if self.legacy else f"files/md5/{tail}"
 
     @property
-    def expected_digest(self) -> Digest | None:
-        """The MD5 the object's bytes must have, when that is knowable.
+    def named_after_its_bytes(self) -> bool:
+        """Whether the name is the plain MD5 of the contents, which syq can check.
 
-        DVC 2 hashed text files after normalizing their line endings, so the
-        name of a DVC 2 file object is not reliably the MD5 of its bytes.
+        DVC 2 hashed text files after turning CRLF line endings into LF, so a
+        DVC 2 file needs the more forgiving check in `matches_dvc2_md5`.
         """
-        if self.legacy and not self.is_listing:
-            return None
+        return self.is_listing or not self.legacy
+
+    @property
+    def digest(self) -> Digest:
         return Digest("md5", self.md5.removesuffix(".dir"))
 
 
@@ -111,8 +117,8 @@ def read_outputs(root: Path, dvc_file: Path) -> list[Output]:
     return outputs
 
 
-def find_outputs(root: Path, targets: list[str]) -> list[Output]:
-    """Outputs of the named targets, or of every DVC file in the repository."""
+def find_outputs(root: Path, targets: list[str], recursive: bool) -> list[Output]:
+    """Outputs of the named targets."""
     dvc_files = []
     for target in targets:
         for candidate in (Path(target), Path(f"{target}.dvc")):
@@ -120,12 +126,14 @@ def find_outputs(root: Path, targets: list[str]) -> list[Output]:
                 dvc_files.append(candidate.resolve())
                 break
         else:
-            sys.exit(f"error: {target} is not a .dvc file, dvc.lock, or tracked path")
-    if not targets:
-        for directory, subdirectories, names in os.walk(root):
-            subdirectories[:] = [d for d in subdirectories if d not in (".git", ".dvc")]
-            dvc_files += [Path(directory) / n for n in names if n.endswith(".dvc") or n == "dvc.lock"]
-    outputs = [output for dvc_file in sorted(dvc_files) for output in read_outputs(root, dvc_file)]
+            if not Path(target).is_dir():
+                sys.exit(f"error: {target} is not a .dvc file, dvc.lock, or tracked path")
+            if not recursive:
+                sys.exit(f"error: {target} is a directory; use -R to include every .dvc file under it")
+            for directory, subdirectories, names in os.walk(Path(target).resolve()):
+                subdirectories[:] = [d for d in subdirectories if d not in (".git", ".dvc")]
+                dvc_files += [Path(directory) / n for n in names if n.endswith(".dvc") or n == "dvc.lock"]
+    outputs = [output for dvc_file in sorted(set(dvc_files)) for output in read_outputs(root, dvc_file)]
     if not outputs:
         sys.exit("error: no tracked outputs found")
     return outputs
@@ -252,7 +260,6 @@ class ProgressLine:
 def copy(client: syq.Client, label: str, entries: list[MappingEntry], **options: object) -> None:
     """Give syq one list of copies, show progress, and report the outcome."""
     if not entries:
-        print(f"{label}: nothing to do")
         return
     progress = ProgressLine(label)
     started = time.monotonic()
@@ -271,17 +278,48 @@ def copy(client: syq.Client, label: str, entries: list[MappingEntry], **options:
     )
 
 
-def download(client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject], dry_run: bool) -> None:
+def download(
+    client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject],
+    *, verify: bool, dry_run: bool,
+) -> None:
     """Remote to cache. The path is the same on both sides; S3 keys also carry the prefix."""
     prefix = f"{remote.base}/" if remote.is_s3 and remote.base else ""
     entries = [
-        MappingEntry(src=prefix + obj.path, dst=obj.path, kind="file", expected_digest=obj.expected_digest)
+        MappingEntry(
+            src=prefix + obj.path, dst=obj.path, kind="file",
+            # syq checks the digest as the bytes arrive and keeps a mismatched file out of the cache.
+            expected_digest=obj.digest if verify and obj.named_after_its_bytes else None,
+        )
         for obj in objects
     ]
     source = {"from_": remote.endpoint} if remote.endpoint else {}
     if not remote.is_s3:
         source["cwd"] = remote.base
     copy(client, label, entries, into=cache, only_new=True, dry_run=dry_run, **source, **remote.s3_options)
+
+    if verify and not dry_run:
+        dvc2_files = [obj for obj in objects if not obj.named_after_its_bytes]
+        with ThreadPoolExecutor() as pool:
+            results = pool.map(lambda obj: matches_dvc2_md5(cache / obj.path, obj.md5), dvc2_files)
+        corrupt = [obj for obj, matches in zip(dvc2_files, results) if not matches]
+        for obj in corrupt:
+            (cache / obj.path).unlink()
+        if corrupt:
+            sys.exit(f"error: {len(corrupt)} downloads did not match their MD5, for example {corrupt[0].path}")
+
+
+def matches_dvc2_md5(path: Path, md5: str) -> bool:
+    """Whether a file's MD5 is `md5`, either as it is or with CRLF turned into LF as DVC 2 did for text."""
+    plain, normalized, held_back = hashlib.md5(), hashlib.md5(), b""
+    with open(path, "rb") as file:
+        while chunk := file.read(1 << 20):
+            plain.update(chunk)
+            chunk = held_back + chunk
+            # A CR ending this chunk may be half of a CRLF; decide when the next chunk arrives.
+            held_back = b"\r" if chunk.endswith(b"\r") else b""
+            normalized.update(chunk[: len(chunk) - len(held_back)].replace(b"\r\n", b"\n"))
+    normalized.update(held_back)
+    return md5 in (plain.hexdigest(), normalized.hexdigest())
 
 
 def upload(client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject], dry_run: bool) -> None:
@@ -297,6 +335,13 @@ def upload(client: syq.Client, remote: Remote, cache: Path, label: str, objects:
 def checkout(client: syq.Client, root: Path, cache: Path, outputs: list[Output], dry_run: bool, force: bool) -> None:
     """Cache to workspace. This is where objects get their real names."""
     entries = [MappingEntry(src=obj.path, dst=path, kind="file") for path, obj in files_of(cache, outputs)]
+    tracked = {str(entry.dst) for entry in entries}
+    untracked = [
+        file
+        for output in outputs if output.object.is_listing
+        for file in (root / output.path).rglob("*")
+        if not file.is_dir() and file.relative_to(root).as_posix() not in tracked
+    ]
     if not force and not dry_run:
         # Like DVC, refuse to replace a file whose contents differ from the tracked version.
         # Matching size and modification time settle most files without reading them.
@@ -307,9 +352,16 @@ def checkout(client: syq.Client, root: Path, cache: Path, outputs: list[Output],
             and not filecmp.cmp(root / str(entry.dst), cache / str(entry.src), shallow=True)
             and not filecmp.cmp(root / str(entry.dst), cache / str(entry.src), shallow=False)
         ]
-        if modified:
-            shown = "\n  ".join(modified[:10])
-            sys.exit(f"error: {len(modified)} files have local changes; use --force to replace them\n  {shown}")
+        unsaved = modified + [file.relative_to(root).as_posix() for file in untracked]
+        if unsaved:
+            shown = "\n  ".join(unsaved[:10])
+            sys.exit(
+                f"error: {len(unsaved)} files are changed or not tracked; "
+                f"use --force to replace and remove them\n  {shown}"
+            )
+    if force and not dry_run:
+        for file in untracked:  # as `dvc pull --force` does, make tracked directories match exactly
+            file.unlink()
     copy(client, "checkout", entries, cwd=cache, into=root, dry_run=dry_run)
 
 
@@ -319,7 +371,8 @@ def checkout(client: syq.Client, root: Path, cache: Path, outputs: list[Output],
 def pull(client: syq.Client, root: Path, cache: Path, remote: Remote, outputs: list[Output], args: argparse.Namespace) -> None:
     # Directory listings first: the files inside a directory are unknown until its listing is here.
     listings = {o.object for o in outputs if o.object.is_listing and not (cache / o.object.path).exists()}
-    download(client, remote, cache, "directory listings", sorted(listings, key=lambda o: o.md5), args.dry_run)
+    listings = sorted(listings, key=lambda o: o.md5)
+    download(client, remote, cache, "directory listings", listings, verify=args.verify, dry_run=args.dry_run)
     if listings and args.dry_run:
         print("dry run: the files inside those directories are unknown until their listings are downloaded")
         return
@@ -327,7 +380,7 @@ def pull(client: syq.Client, root: Path, cache: Path, remote: Remote, outputs: l
     wanted = {obj for _, obj in files_of(cache, outputs)}
     missing = sorted((obj for obj in wanted if not (cache / obj.path).exists()), key=lambda o: o.md5)
     print(f"{len(wanted)} tracked files, {len(missing)} not in the cache")
-    download(client, remote, cache, "files", missing, args.dry_run)
+    download(client, remote, cache, "files", missing, verify=args.verify, dry_run=args.dry_run)
 
     if args.command == "pull":
         checkout(client, root, cache, outputs, args.dry_run, args.force)
@@ -347,10 +400,12 @@ def push(client: syq.Client, cache: Path, remote: Remote, outputs: list[Output],
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pull and push DVC data with syq.")
     parser.add_argument("command", choices=["pull", "fetch", "push"])
-    parser.add_argument("targets", nargs="*", help=".dvc files, dvc.lock, or tracked paths (default: all)")
-    parser.add_argument("--remote", help="DVC remote name (default: the repository's default remote)")
+    parser.add_argument("targets", nargs="+", metavar="TARGET", help=".dvc file, dvc.lock, or tracked path")
+    parser.add_argument("-R", "--recursive", action="store_true", help="include every .dvc file under a directory target")
+    parser.add_argument("-r", "--remote", help="DVC remote name (default: the repository's default remote)")
+    parser.add_argument("--verify", action="store_true", help="check each download against its MD5")
+    parser.add_argument("-f", "--force", action="store_true", help="let pull replace changed files and remove untracked ones")
     parser.add_argument("--dry-run", action="store_true", help="show what would be copied")
-    parser.add_argument("--force", action="store_true", help="let pull replace files that have local changes")
     parser.add_argument("--syq", help="syq executable (default: the one installed with the syq package)")
     args = parser.parse_args()
 
@@ -361,7 +416,7 @@ def main() -> None:
     config.read([root / ".dvc" / "config", root / ".dvc" / "config.local"])
     cache = (root / ".dvc" / config.get("cache", "dir", fallback="cache")).resolve()
     remote = read_remote(root, config, args.remote)
-    outputs = find_outputs(root, args.targets)
+    outputs = find_outputs(root, args.targets, args.recursive)
     client = syq.Client(executable=args.syq or os.environ.get("SYQ_EXECUTABLE"))
 
     if args.command == "push":

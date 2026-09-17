@@ -1,10 +1,11 @@
 # Pull and push DVC data
 
 [`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc_syq.py)
-does the work of `dvc pull` and `dvc push` with syq, and can be much faster.
-DVC transfers objects one at a time from Python. The script works out every
-copy in advance and gives syq the whole list in a single run. Repositories
-with many files gain the most.
+does the work of `dvc pull` and `dvc push` with syq, and can be faster. DVC
+coordinates its transfers from a single Python process, which keeps it to
+about one CPU core however many jobs it runs. The script works out every copy
+in advance and hands the whole list to syq, which spreads the work over
+several cores.
 
 It is a short program written with the [Python SDK](python.md), meant to be
 used, read, and adapted. DVC keeps working alongside it: both use the same
@@ -14,21 +15,39 @@ the script's results as their own.
 ## Run it
 
 You need [uv](https://docs.astral.sh/uv/), which installs the script's
-dependencies for you. Inside a DVC repository:
+dependencies for you. Download the script once, then run it inside a DVC
+repository:
 
 ```sh
-uv run https://raw.githubusercontent.com/greaber/syq/master/examples/dvc_syq.py pull
+curl -LO https://raw.githubusercontent.com/greaber/syq/master/examples/dvc_syq.py
+
+# Pull one tracked path, or the .dvc file that describes it.
+uv run dvc_syq.py pull models/speech.dvc
+
+# Pull everything tracked under a directory; "-R ." covers the repository.
+uv run dvc_syq.py pull -R datasets
+
+# Download into DVC's cache without touching the workspace.
+uv run dvc_syq.py fetch -R datasets
+
+# Upload what the remote does not have yet.
+uv run dvc_syq.py push models/speech.dvc
 ```
 
-| Argument | Meaning |
+These options have the same meaning as in DVC:
+
+| Option | Meaning |
 |---|---|
-| `pull` | Download missing objects into DVC's cache, then write the tracked files into the workspace |
-| `fetch` | Download into the cache only |
-| `push` | Upload cache objects that the remote does not have |
-| `TARGET...` | After the command: `.dvc` files or tracked paths to limit it to. The default is everything tracked in the repository |
-| `--remote NAME` | Use this DVC remote instead of the default one |
+| `-R`, `--recursive` | Include every `.dvc` file under a directory target |
+| `-r NAME`, `--remote NAME` | Use this DVC remote instead of the default one |
+| `-f`, `--force` | Let `pull` replace files you have changed and remove untracked files from tracked directories. Without it, `pull` stops and lists them |
+
+And two are the script's own:
+
+| Option | Meaning |
+|---|---|
+| `--verify` | Check every download against its MD5. A file that does not match is kept out of the cache |
 | `--dry-run` | Show what would be copied |
-| `--force` | Let `pull` replace workspace files that have local changes |
 
 ## How it works
 
@@ -40,40 +59,29 @@ and only the last step, writing the workspace, gives files their real names.
 def object_path(md5):
     return f"files/md5/{md5[:2]}/{md5[2:]}"
 
-# Remote to cache: the same path on both sides, plus the MD5 each file must have.
-downloads = [
-    MappingEntry(src=object_path(md5), dst=object_path(md5), expected_digest=Digest("md5", md5))
-    for md5 in missing_from_cache
-]
+# Remote to cache: the same path on both sides.
+downloads = [MappingEntry(src=object_path(md5), dst=object_path(md5)) for md5 in missing_from_cache]
 client.cp(mapping=downloads, from_="s3://my-bucket", into=".dvc/cache", only_new=True)
 
-# Cache to workspace: each object gets the name recorded in the .dvc file.
+# Cache to workspace: each object gets the name recorded in its .dvc file.
 checkout = [MappingEntry(src=object_path(md5), dst=path) for path, md5 in tracked_files]
 client.cp(mapping=checkout, cwd=".dvc/cache", into=".")
 ```
 
 Each list is a [mapping](mappings.md): pairs of source and destination paths
-that syq copies in one run. Syq checks every download against its expected
-MD5 before putting it in place. A file that does not match fails on its own
-while the rest continue, and running the command again fetches only what is
-still missing. A push is the first copy in reverse, and `only_new` makes it
-skip objects the remote already has.
+that syq copies in one run. A push is the first copy in reverse, and
+`only_new` makes it skip objects the remote already has. With `--verify`,
+each download entry also carries the MD5 the file must have, and syq checks
+it as the bytes arrive.
 
 ## Differences from DVC
 
-- **Remotes.** Local directories, `ssh://host/path` without an explicit port,
-  and `s3://bucket/prefix` are supported. For S3, the script reads
-  `endpointurl`, `profile`, and `region` from the DVC remote and otherwise
-  uses your usual AWS credentials. Other remote types, and remotes using
-  DVC's cloud versioning, are refused.
-- **Imported data.** `dvc pull` fetches `dvc import` data from the repository
-  it came from. The script skips those files and says so; use `dvc pull` for
-  them.
-- **Untracked files in a tracked directory.** DVC refuses to pull until they
-  are removed, and removes them with `--force`. The script leaves them alone.
-- **Verification.** DVC does not check downloaded contents by default. The
-  script checks the MD5 of every directory listing and of every file tracked
-  by DVC 3. Files tracked by DVC 2 are not checked, because DVC 2 computed
-  the MD5 of text files after changing their line endings.
-- **Options.** `dvc pull` and `dvc push` options not in the table above, such
-  as `--all-branches`, are not available.
+- A target is required. DVC pulls or pushes the whole repository when you
+  name none; here that is `-R .`.
+- Remotes can be local directories, `ssh://host/path` without an explicit
+  port, or `s3://bucket/prefix`. For S3 the script reads `endpointurl`,
+  `profile`, and `region` from the DVC remote and otherwise uses your usual
+  AWS credentials. Remotes that use DVC's cloud versioning are refused.
+- Data brought in with `dvc import` is skipped with a message, because it
+  lives in another repository's remote. Use `dvc pull` for it.
+- DVC options not listed above, such as `--all-branches`, are not available.

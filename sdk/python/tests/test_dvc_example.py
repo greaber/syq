@@ -64,8 +64,10 @@ class DvcExample(unittest.TestCase):
             f"outs:\n- md5: {md5(FILES['model.bin'])}\n  hash: md5\n  path: model.bin\n"
         )
         for name, data in LEGACY.items():
-            store(self.remote, md5(data), data, legacy=True)
-            (self.repo / f"{name}.dvc").write_text(f"outs:\n- md5: {md5(data)}\n  path: {name}\n")
+            # DVC 2 named a text file after the MD5 of its contents with CRLF turned into LF.
+            self.legacy_md5 = md5(data.replace(b"\r\n", b"\n"))
+            store(self.remote, self.legacy_md5, data, legacy=True)
+            (self.repo / f"{name}.dvc").write_text(f"outs:\n- md5: {self.legacy_md5}\n  path: {name}\n")
 
     def run_example(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -74,26 +76,30 @@ class DvcExample(unittest.TestCase):
         )
 
     def test_pull_then_push_round_trips_both_layouts(self) -> None:
-        pulled = self.run_example("pull")
+        self.assertNotEqual(self.run_example("pull", ".").returncode, 0, "a directory needs -R")
+        pulled = self.run_example("pull", "--verify", "-R", ".")
         self.assertEqual(pulled.returncode, 0, pulled.stderr)
         for name, data in {**FILES, **LEGACY}.items():
             self.assertEqual((self.repo / name).read_bytes(), data, name)
         self.assertEqual(tree(self.repo / ".dvc" / "cache"), tree(self.remote))
 
-        again = self.run_example("pull")
+        again = self.run_example("pull", "-R", ".")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("0 not in the cache", again.stdout)
 
         (self.repo / "data" / "a.txt").write_bytes(b"edited locally\n")
-        refused = self.run_example("pull")
+        (self.repo / "data" / "stray.txt").write_bytes(b"not tracked\n")
+        refused = self.run_example("pull", "data")
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("data/a.txt", refused.stderr)
+        self.assertIn("data/stray.txt", refused.stderr)
         self.assertEqual((self.repo / "data" / "a.txt").read_bytes(), b"edited locally\n")
-        forced = self.run_example("pull", "--force")
+        forced = self.run_example("pull", "--force", "data")
         self.assertEqual(forced.returncode, 0, forced.stderr)
         self.assertEqual((self.repo / "data" / "a.txt").read_bytes(), FILES["data/a.txt"])
+        self.assertFalse((self.repo / "data" / "stray.txt").exists())
 
-        pushed = self.run_example("push", "--remote", "second")
+        pushed = self.run_example("push", "-r", "second", "-R", ".")
         self.assertEqual(pushed.returncode, 0, pushed.stderr)
         self.assertEqual(tree(self.second), tree(self.remote))
 
@@ -102,7 +108,7 @@ class DvcExample(unittest.TestCase):
             "deps:\n- path: x\n  repo:\n    url: https://example.invalid/registry\n"
             "outs:\n- md5: 00000000000000000000000000000000\n  hash: md5\n  path: imported\n"
         )
-        pulled = self.run_example("pull")
+        pulled = self.run_example("pull", "-R", ".")
         self.assertEqual(pulled.returncode, 0, pulled.stderr)
         self.assertIn("skipping imported.dvc", pulled.stdout)
         self.assertFalse((self.repo / "imported").exists())
@@ -110,12 +116,22 @@ class DvcExample(unittest.TestCase):
     def test_a_corrupt_directory_listing_is_rejected(self) -> None:
         listing = next(self.remote.rglob("*.dir"))
         listing.write_bytes(b"[]")
-        pulled = self.run_example("fetch")
+        pulled = self.run_example("fetch", "--verify", "data")
         self.assertEqual(pulled.returncode, 23, pulled.stdout + pulled.stderr)
+
+    def test_verify_covers_dvc2_files_and_is_off_by_default(self) -> None:
+        store(self.remote, self.legacy_md5, b"not what DVC 2 stored", legacy=True)
+        cached = self.repo / ".dvc" / "cache" / self.legacy_md5[:2] / self.legacy_md5[2:]
+        checked = self.run_example("fetch", "--verify", "old.txt")
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertFalse(cached.exists())
+        unchecked = self.run_example("fetch", "old.txt")
+        self.assertEqual(unchecked.returncode, 0, unchecked.stderr)
+        self.assertTrue(cached.exists())
 
     def test_a_corrupt_object_fails_only_its_own_file(self) -> None:
         store(self.remote, md5(FILES["model.bin"]), b"not the model")
-        pulled = self.run_example("fetch")
+        pulled = self.run_example("fetch", "--verify", "-R", ".")
         self.assertEqual(pulled.returncode, 23, pulled.stdout + pulled.stderr)
         cache = tree(self.repo / ".dvc" / "cache")
         self.assertNotIn(f"files/md5/{md5(FILES['model.bin'])[:2]}/{md5(FILES['model.bin'])[2:]}", cache)
