@@ -6029,7 +6029,7 @@ impl FsOps {
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
         match root.clone_file(&source, &source_metadata, &partial, size)? {
-            crate::rooted::CloneOutcome::Copied(_file) => {}
+            crate::rooted::CloneOutcome::Copied => {}
             crate::rooted::CloneOutcome::Unsupported => return Ok(CopyLocalOutcome::Unsupported),
             crate::rooted::CloneOutcome::UnsupportedVolume {
                 source_dev,

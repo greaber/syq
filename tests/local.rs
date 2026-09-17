@@ -6296,9 +6296,13 @@ fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
     assert_eq!(read(&t.path("destination")), b"abc");
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
+    #[cfg(target_os = "macos")]
+    if !macos_clone_support::available() {
+        return;
+    }
     let t = Tmp::new();
     let contents = prng(5 << 20, 993);
     write(&t.path("source"), &contents);

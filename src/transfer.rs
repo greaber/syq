@@ -8468,11 +8468,11 @@ impl Worker {
                 source_dev,
                 destination_dev,
             } => {
-                // Queued siblings still use the planning-time source device,
-                // even if the receiver opened a replacement on another volume.
+                // Only the opened source device describes the refused pair.
+                // A mount change after scanning must not disable the original
+                // device's otherwise eligible copies.
                 let mut unavailable = self.opts.local_copy_unavailable.lock().unwrap();
                 unavailable.insert((source_dev, destination_dev));
-                unavailable.insert((job.entry.dev, destination_dev));
                 Ok(false)
             }
             Response::EndpointError(error) => Err(endpoint_error(error)),
@@ -9667,7 +9667,7 @@ mod tests {
     }
 
     #[test]
-    fn local_copy_volume_refusal_covers_both_source_devices_across_directories() {
+    fn local_copy_volume_refusal_only_caches_the_opened_device_pair() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         std::fs::write(&path, b"data").unwrap();
@@ -9695,6 +9695,10 @@ mod tests {
                 src_rel: None,
             },
         };
+        let snapshot = |job: &FileJob| WorkerJob {
+            dst_entry: None,
+            data: crate::sched::SnapshotData::Owned(job.data.clone()),
+        };
         sched.push_file(job.clone());
         let dst = Arc::new(Mutex::new(PipelineState::default()));
         let src = Arc::new(Mutex::new(PipelineState::default()));
@@ -9704,6 +9708,8 @@ mod tests {
                 source_dev: 22,
                 destination_dev,
             },
+            Response::CopyLocalUnsupported,
+            Response::CopyLocalUnsupported,
             // A refusal on a different destination device must not affect this
             // directory, even with the same source device and pathname.
             Response::CopyLocalUnsupportedVolume {
@@ -9714,78 +9720,34 @@ mod tests {
             Response::CopyLocalUnsupported,
             Response::CopyLocalUnsupported,
         ]);
-        assert!(!worker
-            .try_copy_local(
-                0,
-                &WorkerJob {
-                    dst_entry: None,
-                    data: crate::sched::SnapshotData::Owned(job.data.clone())
-                }
-            )
-            .unwrap());
-        // Both queued and newly scanned siblings skip the RPC, across parents.
-        for device in [11, 22] {
-            for name in ["sibling", "subdir/child"] {
-                job.dst = destination(name);
-                job.entry.dev = device;
-                assert!(!worker
-                    .try_copy_local(
-                        0,
-                        &WorkerJob {
-                            dst_entry: None,
-                            data: crate::sched::SnapshotData::Owned(job.data.clone())
-                        }
-                    )
-                    .unwrap());
-            }
+        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
+        // Files still on the planning-time device remain eligible for a probe.
+        for name in ["sibling", "subdir/child"] {
+            job.dst = destination(name);
+            assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
         }
-        assert_eq!(dst.lock().unwrap().requests.len(), 1);
+        assert_eq!(dst.lock().unwrap().requests.len(), 3);
+        // The reported device is skipped across destination directories.
+        job.entry.dev = 22;
+        for name in ["sibling", "subdir/child"] {
+            job.dst = destination(name);
+            assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
+        }
+        assert_eq!(dst.lock().unwrap().requests.len(), 3);
         job.entry.dev = 33;
-        assert!(!worker
-            .try_copy_local(
-                0,
-                &WorkerJob {
-                    dst_entry: None,
-                    data: crate::sched::SnapshotData::Owned(job.data.clone())
-                }
-            )
-            .unwrap());
-        assert!(!worker
-            .try_copy_local(
-                0,
-                &WorkerJob {
-                    dst_entry: None,
-                    data: crate::sched::SnapshotData::Owned(job.data.clone())
-                }
-            )
-            .unwrap());
+        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
+        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
         // A file-specific refusal must not suppress the next attempt either.
-        assert!(!worker
-            .try_copy_local(
-                0,
-                &WorkerJob {
-                    dst_entry: None,
-                    data: crate::sched::SnapshotData::Owned(job.data.clone())
-                }
-            )
-            .unwrap());
-        assert_eq!(dst.lock().unwrap().requests.len(), 4);
+        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
+        assert_eq!(dst.lock().unwrap().requests.len(), 6);
         // Unknown parent devices cannot match a negative volume hint.
         job.entry.dev = 11;
         job.dst = destination("missing/child");
-        assert!(!worker
-            .try_copy_local(
-                0,
-                &WorkerJob {
-                    dst_entry: None,
-                    data: crate::sched::SnapshotData::Owned(job.data.clone())
-                }
-            )
-            .unwrap());
-        assert_eq!(dst.lock().unwrap().requests.len(), 5);
+        assert!(!worker.try_copy_local(0, &snapshot(&job)).unwrap());
+        assert_eq!(dst.lock().unwrap().requests.len(), 7);
         let unavailable = worker.opts.local_copy_unavailable.lock().unwrap();
-        assert_eq!(unavailable.len(), 3);
-        assert!(unavailable.contains(&(11, destination_dev)));
+        assert_eq!(unavailable.len(), 2);
+        assert!(!unavailable.contains(&(11, destination_dev)));
         assert!(unavailable.contains(&(22, destination_dev)));
         assert!(unavailable.contains(&(33, destination_dev + 1)));
     }

@@ -877,26 +877,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
 }
 
 fn is_virtual_iface(name: &str) -> bool {
-    if name == "lo"
+    name == "lo"
         || [
             "docker", "veth", "br-", "virbr", "vmnet", "cni", "flannel", "cali", "kube", "ib",
         ]
         .iter()
         .any(|p| name.starts_with(p))
-    {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+        || std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists()
 }
 
-#[cfg(target_os = "linux")]
 fn iface_speed(name: &str) -> u32 {
     std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
         .ok()
@@ -934,21 +923,16 @@ fn local_addrs(families: BoundFamilies) -> Vec<(String, u32)> {
             .nth(2)
             .and_then(|ip| ip.parse::<IpAddr>().ok())
     });
-    // Only Linux has this iproute2/sysfs probe. The Darwin receiver must not
-    // spawn children: its workers receive SCM_RIGHTS before setting CLOEXEC.
+    // The Darwin receiver must not spawn children while receiving SCM_RIGHTS.
     #[cfg(target_os = "linux")]
-    {
-        let text = std::process::Command::new("ip")
-            .args(["-o", "addr", "show"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        advertised_addrs(&text, ssh_ip, families, iface_speed)
-    }
+    let text = std::process::Command::new("ip")
+        .args(["-o", "addr", "show"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
     #[cfg(not(target_os = "linux"))]
-    {
-        advertised_addrs("", ssh_ip, families, |_| 0)
-    }
+    let text = String::new();
+    advertised_addrs(&text, ssh_ip, families, iface_speed)
 }
 
 /// Priority bucket for an advertised address: lower sorts first. The address

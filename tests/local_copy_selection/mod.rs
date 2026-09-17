@@ -437,9 +437,9 @@ fn macos_clone_prepublication_failures_clean_up_and_fall_back() {
     if !macos_clone_support::available() {
         return;
     }
-    for hook in [
-        "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
-        "SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS",
+    for (hook, errno) in [
+        ("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "ENOSPC"),
+        ("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS", "EPERM"),
     ] {
         let t = Tmp::new();
         let data = prng(5 << 20, 993);
@@ -447,7 +447,7 @@ fn macos_clone_prepublication_failures_clean_up_and_fall_back() {
         write(&t.path("dst"), b"old destination");
         let out = compat_command()
             .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-            .env(hook, "1")
+            .env(hook, errno)
             .env("SYQ_DEBUG", "1")
             .run()
             .unwrap();
@@ -476,7 +476,7 @@ fn macos_immutable_clone_open_failure_cleans_up_and_streams() {
         assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), flags) }, 0);
         let result = compat_command()
             .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-            .env("SYQ_TEST_CLONE_OPEN_EMFILE", "1")
+            .env("SYQ_TEST_CLONE_OPEN_EMFILE", "EMFILE")
             .env("SYQ_TEST_CLONE_ATTEMPTS", t.path("attempts"))
             .env("SYQ_DEBUG", "1")
             .run();
@@ -527,9 +527,9 @@ fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
     if !macos_clone_support::available() {
         return;
     }
-    for hook in [
-        "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
-        "SYQ_TEST_CLONE_PUBLIC_DIRECTORY",
+    for (hook, value) in [
+        ("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR", "EIO"),
+        ("SYQ_TEST_CLONE_PUBLIC_DIRECTORY", "1"),
     ] {
         let t = Tmp::new();
         let data = prng(5 << 20, 995);
@@ -537,7 +537,7 @@ fn macos_clone_directory_setup_failure_cleans_up_and_unsafe_mode_falls_back() {
         write(&t.path("dst"), b"old destination");
         let out = compat_command()
             .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-            .env(hook, "1")
+            .env(hook, value)
             .env("SYQ_DEBUG", "1")
             .run()
             .unwrap();
@@ -811,8 +811,8 @@ fn macos_clone_reports_copy_and_cleanup_errors() {
     write(&t.path("dst"), b"old destination");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-        .env("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "1")
-        .env("SYQ_TEST_FAIL_CLONE_CLEANUP", "1")
+        .env("SYQ_TEST_FAIL_CLONE_AFTER_CREATE", "ENOSPC")
+        .env("SYQ_TEST_FAIL_CLONE_CLEANUP", "EACCES")
         .run()
         .unwrap();
     assert!(!out.status.success());
@@ -839,7 +839,7 @@ fn macos_clone_rmdir_failure_keeps_complete_partial_for_resume() {
     write(&t.path("dst"), b"old destination");
     let out = compat_command()
         .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-        .env("SYQ_TEST_FAIL_CLONE_RMDIR", "1")
+        .env("SYQ_TEST_FAIL_CLONE_RMDIR", "EACCES")
         .run()
         .unwrap();
     assert!(!out.status.success());
@@ -998,7 +998,7 @@ fn macos_unremovable_clone_is_a_visible_cleanup_failure() {
     // Model an unprivileged receiver being unable to clear a raced system flag.
     let result = compat_command()
         .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-        .env("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS", "1")
+        .env("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS", "EPERM")
         .run();
     assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
     let swaps: Vec<_> = fs::read_dir(&t.0)

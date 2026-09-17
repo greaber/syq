@@ -1147,7 +1147,7 @@ impl Root {
         }
         let temporary = match create_temporary(&parent, |fd, name| {
             #[cfg(debug_assertions)]
-            fail_clone_mkdir_for_test()?;
+            fail_clone_for_test("SYQ_TEST_CLONE_MKDIR_ERROR")?;
             retry_zero(|| unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) })
         }) {
             Ok(temporary) => temporary,
@@ -1157,11 +1157,8 @@ impl Root {
         let mut trusted_directory = None;
         let result = (|| -> Result<CloneOutcome> {
             #[cfg(debug_assertions)]
-            fail_clone_for_test(
-                "SYQ_TEST_FAIL_CLONE_AFTER_MKDIR",
-                libc::EIO,
-                "test clone directory failure",
-            )?;
+            fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR")
+                .context("test clone directory failure")?;
             // Open with search access, then restore owner permissions on the
             // empty directory. If umask also removed search access, opening can
             // fail; cleanup below still removes it before byte copying begins.
@@ -1229,11 +1226,8 @@ impl Root {
                 return Ok(CloneOutcome::Unsupported);
             }
             #[cfg(debug_assertions)]
-            fail_clone_for_test(
-                "SYQ_TEST_FAIL_CLONE_AFTER_CREATE",
-                libc::ENOSPC,
-                "test clone failure",
-            )?;
+            fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_CREATE")
+                .context("test clone failure")?;
             retry_zero(|| unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) })?;
             // Do not replace an existing resumable partial, including one that
             // appeared after the caller checked. Both directory fds stay pinned.
@@ -1253,11 +1247,11 @@ impl Root {
                 }
                 return Err(error).context("stage cloned local file");
             }
-            Ok(CloneOutcome::Copied(file))
+            Ok(CloneOutcome::Copied)
         })();
         let cleanup = (|| -> Result<()> {
             if let Some(directory) =
-                trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied(_))))
+                trusted_directory.filter(|_| !matches!(result, Ok(CloneOutcome::Copied)))
             {
                 match unlink_at(directory.as_raw_fd(), leaf, 0) {
                     Ok(()) => {}
@@ -1268,21 +1262,14 @@ impl Root {
             // Also runs when opening or checking the new directory failed.
             // rmdir cannot traverse a replacement or delete its contents.
             #[cfg(debug_assertions)]
-            fail_clone_for_test(
-                "SYQ_TEST_FAIL_CLONE_RMDIR",
-                libc::EACCES,
-                "test clone staging rmdir failure",
-            )?;
+            fail_clone_for_test("SYQ_TEST_FAIL_CLONE_RMDIR")
+                .context("test clone staging rmdir failure")?;
             unlink_at(parent.directory.as_raw_fd(), &temporary, libc::AT_REMOVEDIR)
                 .context("remove private clone directory")
         })();
         #[cfg(debug_assertions)]
         let cleanup = cleanup.and_then(|()| {
-            fail_clone_for_test(
-                "SYQ_TEST_FAIL_CLONE_CLEANUP",
-                libc::EACCES,
-                "test clone cleanup failure",
-            )
+            fail_clone_for_test("SYQ_TEST_FAIL_CLONE_CLEANUP").context("test clone cleanup failure")
         });
         match (result, cleanup) {
             (Err(copy_error), Err(cleanup_error)) => {
@@ -2034,25 +2021,14 @@ impl Root {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CloneOutcome {
-    // Keep the normalized inode open through staging cleanup. Tests also use
-    // this handle to inspect metadata and write without reopening the path.
-    Copied(File),
+    Copied,
     Unsupported,
     UnsupportedVolume {
         source_dev: u64,
         destination_dev: u64,
     },
-}
-
-#[cfg(all(target_os = "macos", test))]
-impl CloneOutcome {
-    fn copied(self) -> Option<File> {
-        match self {
-            Self::Copied(file) => Some(file),
-            Self::Unsupported | Self::UnsupportedVolume { .. } => None,
-        }
-    }
 }
 
 // A leaf directly under the retained root needs no new descriptor. Borrowing
@@ -2079,24 +2055,23 @@ struct ResolvedParent<'a> {
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
-fn fail_clone_for_test(variable: &str, code: libc::c_int, context: &str) -> Result<()> {
-    if std::env::var_os(variable).is_some() {
-        return Err(io::Error::from_raw_os_error(code)).context(context.to_owned());
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-fn fail_clone_mkdir_for_test() -> io::Result<()> {
-    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_MKDIR_ERROR") {
-        return Err(io::Error::from_raw_os_error(match error.as_str() {
-            "EACCES" => libc::EACCES,
-            "EPERM" => libc::EPERM,
-            "EMLINK" => libc::EMLINK,
-            _ => libc::EIO,
-        }));
-    }
-    Ok(())
+fn fail_clone_for_test(variable: &str) -> io::Result<()> {
+    let Some(name) = std::env::var_os(variable) else {
+        return Ok(());
+    };
+    let code = match name.to_str() {
+        Some("EACCES") => libc::EACCES,
+        Some("EIO") => libc::EIO,
+        Some("EMFILE") => libc::EMFILE,
+        Some("EMLINK") => libc::EMLINK,
+        Some("ENOSPC") => libc::ENOSPC,
+        Some("ENOSYS") => libc::ENOSYS,
+        Some("ENOTSUP") => libc::ENOTSUP,
+        Some("EPERM") => libc::EPERM,
+        Some("EXDEV") => libc::EXDEV,
+        _ => panic!("unknown clone test errno {name:?} in {variable}"),
+    };
+    Err(io::Error::from_raw_os_error(code))
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -2116,7 +2091,7 @@ fn record_clone_attempt_for_test() -> io::Result<()> {
             "clone"
         )?;
     }
-    if let Ok(error) = std::env::var("SYQ_TEST_CLONE_ERROR") {
+    if std::env::var_os("SYQ_TEST_CLONE_ERROR").is_some() {
         if let Some(once) = std::env::var_os("SYQ_TEST_CLONE_ERROR_ONCE") {
             match OpenOptions::new().write(true).create_new(true).open(once) {
                 Ok(_) => {}
@@ -2124,13 +2099,7 @@ fn record_clone_attempt_for_test() -> io::Result<()> {
                 Err(error) => return Err(error),
             }
         }
-        return Err(io::Error::from_raw_os_error(match error.as_str() {
-            "EPERM" => libc::EPERM,
-            "EXDEV" => libc::EXDEV,
-            "ENOTSUP" => libc::ENOTSUP,
-            "ENOSYS" => libc::ENOSYS,
-            _ => libc::EIO,
-        }));
+        return fail_clone_for_test("SYQ_TEST_CLONE_ERROR");
     }
     Ok(())
 }
@@ -2215,11 +2184,8 @@ fn clone_directory_has_no_inheritable_acl(directory: &File) -> Result<bool> {
 #[cfg(target_os = "macos")]
 fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
     #[cfg(debug_assertions)]
-    fail_clone_for_test(
-        "SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS",
-        libc::EPERM,
-        "test clear clone flags failure",
-    )?;
+    fail_clone_for_test("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS")
+        .context("test clear clone flags failure")?;
     let mut attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -2246,9 +2212,7 @@ fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn open_clone_for_copy(directory: &File, leaf: &CString) -> io::Result<File> {
     #[cfg(debug_assertions)]
-    if std::env::var_os("SYQ_TEST_CLONE_OPEN_EMFILE").is_some() {
-        return Err(io::Error::from_raw_os_error(libc::EMFILE));
-    }
+    fail_clone_for_test("SYQ_TEST_CLONE_OPEN_EMFILE")?;
     open_at(
         directory.as_raw_fd(),
         leaf,
@@ -3176,45 +3140,50 @@ mod tests {
         fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
         let source = File::open(&source_path).unwrap();
         let root = Root::open(t.path()).unwrap();
-        let clone = root
-            .clone_file(
+        assert_eq!(
+            root.clone_file(
                 &source,
                 &source.metadata().unwrap(),
                 &relative(b"partial"),
                 13,
             )
-            .unwrap()
-            .copied()
-            .expect("macOS clone tests require a clone-capable filesystem (APFS)");
+            .unwrap(),
+            CloneOutcome::Copied
+        );
+        let clone = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path().join("partial"))
+            .unwrap();
         assert_eq!(clone.metadata().unwrap().mode() & 0o7777, 0o600);
         assert_ne!(
             source.metadata().unwrap().ino(),
             clone.metadata().unwrap().ino()
         );
-        assert!(root
-            .clone_file(
+        assert_eq!(
+            root.clone_file(
                 &source,
                 &source.metadata().unwrap(),
                 &relative(b"partial"),
                 13
             )
-            .unwrap()
-            .copied()
-            .is_none());
+            .unwrap(),
+            CloneOutcome::Unsupported
+        );
         (&clone).write_all(b"changed clone").unwrap();
         assert_eq!(fs::read(&source_path).unwrap(), b"original data");
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
         for planned_size in [12, 14] {
-            assert!(root
-                .clone_file(
+            assert_eq!(
+                root.clone_file(
                     &source,
                     &source.metadata().unwrap(),
                     &relative(b"wrong-size"),
                     planned_size
                 )
-                .unwrap()
-                .copied()
-                .is_none());
+                .unwrap(),
+                CloneOutcome::Unsupported
+            );
         }
         assert!(!t.path().join("wrong-size").exists());
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
@@ -3264,10 +3233,12 @@ mod tests {
             let source_flags = source.metadata().unwrap().st_flags();
             // Restore fixture mutability even if cloning failed.
             assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
-            let clone = result
-                .unwrap()
-                .copied()
-                .expect("ordinary xattrs and user flags must allow cloning");
+            assert_eq!(result.unwrap(), CloneOutcome::Copied);
+            let clone = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(t.path().join("partial"))
+                .unwrap();
             assert_eq!(source_flags, flags);
             assert_eq!(clone.metadata().unwrap().st_flags(), 0);
             // macOS can add its own provenance attribute after publication,
@@ -3316,11 +3287,11 @@ mod tests {
         );
         // Model a source compressed between the prelude stat and cloning.
         let root = Root::open(t.path()).unwrap();
-        assert!(root
-            .clone_file(&source, &snapshot, &relative(b"partial"), data.len() as u64)
-            .unwrap()
-            .copied()
-            .is_none());
+        assert_eq!(
+            root.clone_file(&source, &snapshot, &relative(b"partial"), data.len() as u64)
+                .unwrap(),
+            CloneOutcome::Unsupported
+        );
         assert_eq!(fs::read(&compressed).unwrap(), data);
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
     }
@@ -3345,16 +3316,16 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            assert!(root
-                .clone_file(
+            assert_eq!(
+                root.clone_file(
                     &source,
                     &source.metadata().unwrap(),
                     &relative(b"noninherited"),
                     4
                 )
-                .unwrap()
-                .copied()
-                .is_some());
+                .unwrap(),
+                CloneOutcome::Copied
+            );
             fs::remove_file(t.path().join("noninherited")).unwrap();
             assert!(Command::new("/bin/chmod")
                 .args(["+a", rule])
@@ -3362,16 +3333,16 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            assert!(root
-                .clone_file(
+            assert_eq!(
+                root.clone_file(
                     &source,
                     &source.metadata().unwrap(),
                     &relative(b"partial"),
                     4
                 )
-                .unwrap()
-                .copied()
-                .is_none());
+                .unwrap(),
+                CloneOutcome::Unsupported
+            );
             assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
             assert!(Command::new("/bin/chmod")
                 .arg("-N")
@@ -3380,16 +3351,16 @@ mod tests {
                 .unwrap()
                 .success());
             // Ineligibility is per-directory, never cached for the volume.
-            assert!(root
-                .clone_file(
+            assert_eq!(
+                root.clone_file(
                     &source,
                     &source.metadata().unwrap(),
                     &relative(b"after-acl"),
                     4
                 )
-                .unwrap()
-                .copied()
-                .is_some());
+                .unwrap(),
+                CloneOutcome::Copied
+            );
             fs::remove_file(t.path().join("after-acl")).unwrap();
         }
     }
@@ -3440,21 +3411,28 @@ mod tests {
             4,
         );
         assert_eq!(unsafe { libc::fchflags(source.as_raw_fd(), 0) }, 0);
-        let locked = locked
-            .unwrap()
-            .copied()
-            .expect("flags are cleared before owner access");
+        assert_eq!(locked.unwrap(), CloneOutcome::Copied);
+        let locked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path().join("locked"))
+            .unwrap();
         assert_eq!(locked.metadata().unwrap().mode() & 0o777, 0o600);
         fs::remove_file(t.path().join("locked")).unwrap();
-        let clone = root
-            .clone_file(
+        assert_eq!(
+            root.clone_file(
                 &source,
                 &source.metadata().unwrap(),
                 &relative(b"partial"),
                 4,
             )
-            .unwrap()
-            .copied()
+            .unwrap(),
+            CloneOutcome::Copied
+        );
+        let clone = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path().join("partial"))
             .unwrap();
         assert_eq!(clone.metadata().unwrap().mode() & 0o777, 0o600);
         (&clone).write_all(b"copy").unwrap();
@@ -3519,15 +3497,20 @@ mod tests {
             .open(t.path().join("raw-clone"))
             .unwrap();
         let root = Root::open(t.path()).unwrap();
-        let clone = root
-            .clone_file(
+        assert_eq!(
+            root.clone_file(
                 &source,
                 &source.metadata().unwrap(),
                 &relative(b"normalized"),
                 4,
             )
-            .unwrap()
-            .copied()
+            .unwrap(),
+            CloneOutcome::Copied
+        );
+        let clone = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path().join("normalized"))
             .unwrap();
         (&clone).write_all(b"copy").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"data");
