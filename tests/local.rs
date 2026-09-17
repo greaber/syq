@@ -4075,6 +4075,7 @@ fn background_bootstrap_installs_the_command_quietly() {
                     t.path("release-manifest.json"),
                 )
                 .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_COMPLETION_DEBUG", "1")
                 .env("SYQ_TEST_RELEASE_BUILD", "1")
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4103,7 +4104,8 @@ fn background_bootstrap_installs_the_command_quietly() {
                             .as_os_str()
                             .as_encoded_bytes()
                             .to_vec()
-                    )]
+                    )],
+                    "completion={completion}, upload={upload}: {output:?}"
                 );
             }
             assert!(
@@ -21692,7 +21694,13 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            wait_for_confinement_marker(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
+            );
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
