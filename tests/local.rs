@@ -21710,14 +21710,22 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
             if let Err(panic) = waited {
                 #[cfg(target_os = "macos")]
                 {
-                    let sample_path = t.path("preparation.sample");
-                    let sample = Command::new("/usr/bin/sample")
-                        .arg(first.id().to_string())
-                        .args(["1", "-file"])
-                        .arg(&sample_path)
-                        .run();
-                    eprintln!("stack sampler: {sample:?}");
-                    eprintln!("{}", fs::read_to_string(sample_path).unwrap_or_default());
+                    let group = Command::new("/usr/bin/pgrep")
+                        .args(["-g", &first.id().to_string()])
+                        .run()
+                        .unwrap();
+                    let members = String::from_utf8_lossy(&group.stdout);
+                    eprintln!("copy process group: {members}");
+                    for pid in members.split_whitespace() {
+                        let sample_path = t.path(&format!("preparation-{pid}.sample"));
+                        let sample = Command::new("/usr/bin/sample")
+                            .arg(pid)
+                            .args(["1", "-file"])
+                            .arg(&sample_path)
+                            .run();
+                        eprintln!("stack sampler for {pid}: {sample:?}");
+                        eprintln!("{}", fs::read_to_string(sample_path).unwrap_or_default());
+                    }
                 }
                 eprintln!(
                     "after diagnostics: elapsed={:?}, ready={}",
@@ -22459,5 +22467,24 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
             stats || debug,
             "{out:?}"
         );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[ignore = "temporary macOS CI reproduction for PR 383"]
+fn debug_concurrent_publication_with_neighboring_tests() {
+    for round in 0..10 {
+        writeln!(
+            std::io::stderr(),
+            "concurrent publication reproduction round {round}"
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(concurrent_copies_union);
+            scope.spawn(concurrent_default_tree_copies_keep_every_file_whole);
+            scope.spawn(concurrent_small_pushes_publish_independent_files);
+            concurrent_identical_and_different_copies_publish_complete_files();
+        });
     }
 }
