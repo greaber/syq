@@ -61,8 +61,8 @@ impl Engine {
             tiny,
             if small_upload { workers } else { 256 },
             if ramp_whole_objects {
-                // Leave room for a measured increase within the object target,
-                // while retaining the existing floor for larger objects.
+                // Half the size-based estimate performed well in medium-object
+                // measurements; retain the existing floor for larger objects.
                 workers.div_ceil(2).max(32)
             } else {
                 64
@@ -73,8 +73,8 @@ impl Engine {
         } else {
             workers
         };
-        // A short batch may fit the object target while exceeding the initial
-        // request budget. It still needs bounded preparation during the ramp.
+        // Batches larger than the starting concurrency can use the object
+        // controller, with preparation bounded by its current request limit.
         let maximum = if count > starting as u64
             && fixed_workers.is_none()
             && !self.args.dry_run
@@ -733,6 +733,18 @@ mod buffer_tests {
                 assert_eq!(requests.preparation_limit(), 129);
                 assert_eq!(requests.begin_objects(concurrency.initial), Some(128));
             }
+        }
+        for (size_mib, expected) in [(2, 64), (8, 32)] {
+            let engine = planning_engine(&[]);
+            let concurrency = engine
+                .object_workers(std::iter::repeat_n(size_mib * 1024 * 1024, 512))
+                .unwrap();
+            assert_eq!(concurrency.initial, expected);
+            assert_eq!(engine.tuning.request_limit(), expected);
+            assert_eq!(concurrency.maximum, Some(256));
+            let requests = concurrency.requests.unwrap();
+            assert_eq!(requests.preparation_limit(), expected + 1);
+            assert_eq!(requests.begin_objects(concurrency.initial), Some(expected));
         }
         let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=8"]);
         let concurrency = engine
