@@ -9,10 +9,11 @@ Example, from the repository root:
   python3 tests/object-storage/benchmark.py --syq target/release/syq \\
     --s5cmd /path/to/s5cmd --output target/s3-benchmark
 Omit --s5cmd to measure syq alone; use --baseline to include an older syq.
-Transfer workloads (large, medium, small) report throughput. Pruning workloads
-(delete, noop, mixed) mirror many small objects with --prune in both
-directions. Increase --count or --size until individual trials last at least
---minimum-seconds; short trials are flagged, not silently combined or discarded.
+The default transfer workloads (large, medium, small) report throughput. The
+opt-in pruning workloads (delete, noop, mixed) mirror many small objects with
+--prune in both directions; select them with --workloads. Increase --count or
+--size until individual trials last at least --minimum-seconds; short trials
+are flagged, not silently combined or discarded.
 Logs and raw measurements stay in --output.
 """
 import argparse
@@ -48,7 +49,8 @@ def main():
     parser.add_argument('--s5cmd-quiet', action='store_true', help='Use s5cmd --log error to measure without per-object logging')
     parser.add_argument('--baseline', type=Path, help='older syq executable to include')
     parser.add_argument('--output', required=True, type=Path, help='new directory for logs and results.json')
-    parser.add_argument('--workloads', nargs='+', choices=TRANSFER + PRUNE, default=TRANSFER + PRUNE)
+    parser.add_argument('--workloads', nargs='+', choices=TRANSFER + PRUNE, default=TRANSFER,
+                        help='transfer workloads by default; pruning workloads are opt-in')
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--minimum-seconds', type=float, default=10)
     parser.add_argument('--timeout', type=float, default=1800)

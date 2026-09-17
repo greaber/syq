@@ -121,6 +121,8 @@ impl Engine {
                         .set_range((length > 0).then(|| format!("bytes={offset}-{end}")))
                         .if_match(&object.etag)
                         .set_version_id(object.version.clone())
+                        .customize()
+                        .config_override(crate::s3::client::without_sdk_retries())
                         .send()
                         .await
                         .map_err(|e| {

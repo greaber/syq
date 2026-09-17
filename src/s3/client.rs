@@ -44,9 +44,10 @@ impl ClassifyRetry for Throttling {
     }
 }
 
-/// Body-carrying uploads retry in their own loop, which rebuilds a body the
-/// SDK cannot rewind. Disabling SDK retries there keeps `s3-retries` a single
-/// budget for every body size instead of compounding for small in-memory ones.
+/// Requests wrapped by their own retry loop run without SDK retries, so
+/// `s3-retries` is one budget per request. Uploads need the loop because the
+/// SDK cannot rewind a file body; downloads need it because a response body
+/// can fail after the headers arrive. Every other request keeps SDK retries.
 pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
