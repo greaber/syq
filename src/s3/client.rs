@@ -25,7 +25,7 @@ use std::{collections::HashMap, time::Duration};
 // HEAD errors have no XML body, so the SDK cannot recover a provider's
 // TooManyRequests error code. Keep throttling inside its bounded retry policy.
 #[derive(Debug)]
-struct HeadThrottling;
+pub(super) struct HeadThrottling;
 impl ClassifyRetry for HeadThrottling {
     fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
         if context

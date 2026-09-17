@@ -121,7 +121,17 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Ent
 }
 
 async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
-    match client.head_object().bucket(bucket).key(key).send().await {
+    match client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .customize()
+        .config_override(
+            aws_sdk_s3::config::Builder::new().retry_classifier(client::HeadThrottling),
+        )
+        .send()
+        .await
+    {
         Ok(_) => Ok(true),
         Err(error)
             if error

@@ -170,6 +170,22 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "remove-head-throttle" {
+        assert_eq!(method, "HEAD");
+        if requests.load(Ordering::Relaxed) == 1 {
+            reply(&mut socket, 429, &[], b"", true);
+        } else {
+            // rm only needs existence; even metadata from a future format is removable.
+            reply(
+                &mut socket,
+                200,
+                &[("x-amz-meta-syq-format".into(), "999".into())],
+                b"",
+                true,
+            );
+        }
+        return;
+    }
     if fault.starts_with("remove-") {
         if method == "GET" {
             assert!(first.contains("versions"));
@@ -1774,4 +1790,18 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
             .unwrap();
         assert!(!output.status.success());
     }
+}
+
+#[test]
+fn s3_remove_retries_bodyless_head_throttling_without_decoding_copy_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-head-throttle");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args(["--s3-endpoint", &server.address])
+        .args(["--on", "s3://bucket", "key", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
 }
