@@ -188,6 +188,12 @@ fn listing_failure(
     anyhow::Error::new(error.into_service_error()).context(message)
 }
 
+/// Whether to ask S3 for the bucket's region before copying. A custom
+/// endpoint already identifies its provider's storage and is never probed.
+fn looks_up_region(explicit_region: Option<&str>, custom_endpoint: Option<&str>) -> bool {
+    explicit_region.is_none() && custom_endpoint.is_none()
+}
+
 /// Ask S3 where a bucket is. Any response carries the answer, so this needs
 /// no permission on the bucket. The error says why there was no answer.
 async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
@@ -267,20 +273,27 @@ pub(super) async fn connect(
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
     let mut note = None;
+    let lookup = looks_up_region(options.region.as_deref(), endpoint.as_deref());
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
-    } else if shared.region().is_none() {
+    }
+    if lookup {
         // AWS serves each bucket from one region and redirects requests sent
-        // elsewhere. With no region configured, ask instead of assuming
-        // us-east-1. A configured region is used as given, and a custom
-        // endpoint already identifies its provider's storage.
+        // elsewhere. A region from the environment or a profile is the
+        // account's default, not a fact about this bucket, so it only chooses
+        // where to ask. `--s3-region` is a statement about the bucket and is
+        // used as given.
+        let hint = shared
+            .region()
+            .map_or("us-east-1", |r| r.as_ref())
+            .to_owned();
         let probe = Client::from_conf(config.clone().build());
         match bucket_region(&probe, &options.bucket).await {
             Ok(region) => config = config.region(Region::new(region)),
             Err(reason) => {
                 note = Some(format!(
-                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                    "could not look up the bucket's region, signing for {hint}: {reason}"
                 ))
             }
         }
@@ -937,6 +950,15 @@ mod tests {
             server.join().unwrap();
             assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
         }
+    }
+
+    #[test]
+    fn only_an_explicit_region_or_a_custom_endpoint_skips_the_lookup() {
+        // Regions from the environment or a profile never reach this decision:
+        // they are hints for where to ask, not reasons to skip asking.
+        assert!(looks_up_region(None, None));
+        assert!(!looks_up_region(Some("eu-central-1"), None));
+        assert!(!looks_up_region(None, Some("https://storage.example")));
     }
 
     #[tokio::test]

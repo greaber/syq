@@ -144,6 +144,9 @@ finish successfully before copying starts; a failed transform leaves the
 destination untouched. See
 [Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
 
+For a complete program built on mappings, see
+[Pull and push DVC data](https://greaber.github.io/syq/dvc.html).
+
 ## Use asyncio
 
 Await operations on `AsyncClient`. Its arguments and results match `Client`:

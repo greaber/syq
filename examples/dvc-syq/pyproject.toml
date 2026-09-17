@@ -1,0 +1,18 @@
+# Lets uv install the script as a `dvc-syq` command straight from this
+# repository. It is not published to PyPI.
+[project]
+name = "dvc-syq"
+version = "0.1.0"
+description = "Pull and push DVC data with syq"
+requires-python = ">=3.10"
+dependencies = ["syq>0.6.0", "pyyaml"]
+
+[project.scripts]
+dvc-syq = "dvc_syq:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["dvc_syq"]
