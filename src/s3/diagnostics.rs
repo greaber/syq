@@ -130,3 +130,114 @@ pub(super) fn request_window(
         }));
     }
 }
+
+// Track preparation generations only while diagnostics are enabled. This is
+// attribution evidence, not an assertion about the concurrency at socket admission.
+#[derive(Default)]
+pub(super) struct ObjectWindows {
+    jobs: std::collections::HashMap<tokio::task::Id, u64>,
+    generation: u64,
+    fresh_completed: usize,
+    fresh_activity: u64,
+}
+
+pub(super) struct ObjectWindow {
+    pub limit: usize,
+    pub active: usize,
+    pub queued: usize,
+    pub completed: usize,
+    pub activity: u64,
+    pub elapsed: Duration,
+    pub warmup: bool,
+    pub previous_rate: Option<f64>,
+    pub probe_from: Option<usize>,
+    pub probe_baseline: Option<f64>,
+}
+
+impl ObjectWindows {
+    pub fn new() -> Option<Self> {
+        trace()?;
+        Some(Self::default())
+    }
+    pub fn spawned(&mut self, id: tokio::task::Id) {
+        self.jobs.insert(id, self.generation);
+    }
+    pub fn completed(&mut self, id: tokio::task::Id, activity: Option<u64>) {
+        let generation = self.jobs.remove(&id);
+        if generation == Some(self.generation) {
+            if let Some(activity) = activity {
+                self.fresh_completed += 1;
+                self.fresh_activity = self.fresh_activity.saturating_add(activity);
+            }
+        }
+    }
+    pub fn changed(&mut self) {
+        self.generation += 1;
+        self.reset();
+    }
+    pub fn reset(&mut self) {
+        self.fresh_completed = 0;
+        self.fresh_activity = 0;
+    }
+    pub fn sample(&mut self, window: ObjectWindow) {
+        if let Some(trace) = trace() {
+            record(json!({
+                "phase": "object_window",
+                "at_s": trace.start.elapsed().as_secs_f64(),
+                "generation": self.generation,
+                "limit": window.limit,
+                "active": window.active,
+                "queued": window.queued,
+                "elapsed_s": window.elapsed.as_secs_f64(),
+                "completed": window.completed,
+                "activity": window.activity,
+                "fresh_completed": self.fresh_completed,
+                "fresh_activity": self.fresh_activity,
+                "warmup": window.warmup,
+                "previous_rate": window.previous_rate,
+                "probe_from": window.probe_from,
+                "probe_baseline": window.probe_baseline,
+            }));
+        }
+        self.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn object_windows_distinguish_old_work_without_retaining_finished_tasks() {
+        let mut windows = ObjectWindows::default();
+        let old = tokio::spawn(async {});
+        let old_id = old.id();
+        windows.spawned(old_id);
+        windows.changed();
+        let current = tokio::spawn(async {});
+        let current_id = current.id();
+        windows.spawned(current_id);
+        old.await.unwrap();
+        windows.completed(old_id, Some(100));
+        current.await.unwrap();
+        windows.completed(current_id, Some(200));
+        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 200));
+        assert!(windows.jobs.is_empty());
+
+        let spanning = tokio::spawn(async {});
+        let spanning_id = spanning.id();
+        windows.spawned(spanning_id);
+        windows.reset(); // A new measurement window, but the same setting.
+        spanning.await.unwrap();
+        windows.completed(spanning_id, Some(300));
+        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 300));
+
+        let skipped = tokio::spawn(async {});
+        let skipped_id = skipped.id();
+        windows.spawned(skipped_id);
+        skipped.await.unwrap();
+        windows.completed(skipped_id, None);
+        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 300));
+        assert!(windows.jobs.is_empty());
+    }
+}

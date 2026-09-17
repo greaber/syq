@@ -319,6 +319,9 @@ where
     let mut activity = 0u64;
     let mut completed = 0usize;
     let mut error = None;
+    let mut observations = concurrency
+        .maximum
+        .and_then(|_| super::diagnostics::ObjectWindows::new());
     loop {
         if handoff_pending && tasks.len() <= limit {
             // The old request cap stays in force until queued requests belong
@@ -343,14 +346,26 @@ where
         };
         while error.is_none() && tasks.len() < preparation_limit {
             let Some(job) = jobs.next() else { break };
-            tasks.spawn(work(job));
+            let task = tasks.spawn(work(job));
+            if let Some(observations) = &mut observations {
+                observations.spawned(task.id());
+            }
         }
         if tasks.is_empty() {
             break;
         }
         tokio::select! {
-            result = tasks.join_next() => {
-                match result.unwrap().map_err(anyhow::Error::from).and_then(|r| r) {
+            result = tasks.join_next_with_id() => {
+                let result = result.unwrap();
+                if let Some(observations) = &mut observations {
+                    match &result {
+                        Ok((id, result)) => observations.completed(*id,
+                            result.as_ref().ok().and_then(|bytes| *bytes)
+                                .map(|bytes| bytes.saturating_add(FILE_CREDIT))),
+                        Err(error) => observations.completed(error.id(), None),
+                    }
+                }
+                match result.map_err(anyhow::Error::from).and_then(|(_, r)| r) {
                     Ok(Some(bytes)) => {
                         activity = activity.saturating_add(bytes.saturating_add(FILE_CREDIT));
                         completed += 1;
@@ -365,6 +380,9 @@ where
                     // Only one controller changes concurrency at a time.
                     controller = begin();
                     if let Some(controller) = &controller {
+                        if let Some(observations) = &mut observations {
+                            observations.changed();
+                        }
                         limit = controller.limit;
                         handoff_pending = concurrency.requests.is_some();
                     }
@@ -380,10 +398,27 @@ where
                 // consecutive ticks slightly less than SAMPLE apart; rejecting
                 // those ticks needlessly doubles some measurement windows.
                 if !elapsed.is_zero() && completed >= 16 {
+                    if let Some(observations) = &mut observations {
+                        let controller = controller.as_ref().unwrap();
+                        observations.sample(super::diagnostics::ObjectWindow {
+                            limit, active: tasks.len(), queued: jobs.len(),
+                            completed, activity, elapsed,
+                            warmup: controller.sampler.discard,
+                            previous_rate: controller.sampler.previous,
+                            probe_from: controller.probe.as_ref().map(|probe| probe.from),
+                            probe_baseline: controller.probe.as_ref().map(|probe| probe.baseline),
+                        });
+                    }
+                    let before = limit;
                     limit = controller.as_mut().unwrap().observe(
                         activity as f64 / elapsed.as_secs_f64(), tasks.len(), jobs.len(),
                         (completed as f64 * 4.0 * SAMPLE.as_secs_f64() / elapsed.as_secs_f64()).ceil() as usize,
                     );
+                    if limit != before {
+                        if let Some(observations) = &mut observations {
+                            observations.changed();
+                        }
+                    }
                     activity = 0;
                     completed = 0;
                     since = tokio::time::Instant::now();

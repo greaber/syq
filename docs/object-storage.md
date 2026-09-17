@@ -109,6 +109,14 @@ with the number of selected objects.
 with bursts up to a part on upload. `--no-compress` has no effect because object
 bodies are transferred without compression.
 
+For performance investigations, `SYQ_S3_DIAGNOSTICS=1` adds an experimental
+`S3_DIAGNOSTICS` JSON record on stderr. It includes request timings and object
+concurrency measurements, capped at 16,384 events. Object measurements distinguish
+jobs started before and after a concurrency change. This describes job preparation;
+socket admission can happen later. The trace omits paths,
+endpoints, header values and credentials. Use the same diagnostic setting in both
+runs when comparing performance.
+
 ## Metadata and integrity
 
 A regular file remains an ordinary object body, readable with other S3 tools.
