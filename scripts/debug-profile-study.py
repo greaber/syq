@@ -75,45 +75,50 @@ def run(label, args, timeout=1800, extra_env=None, required=True):
 
 run('toolchain', ['rustc', '-Vv'])
 run('fetch', ['cargo', 'fetch', '--locked'])  # Network downloads excluded from compilation timing.
-artifacts = {}
-for trial in range(2):
-    builddir = pathlib.Path(env['CARGO_TARGET_DIR'])
-    assert builddir == root / 'target/profile-build'
-    if builddir.exists():
-        shutil.rmtree(builddir)
-    output = run(f'fresh_test_build_{trial}', cargo + ['test', '--locked', '--all-targets', '--no-run', '--message-format=json'])
+if os.environ.get('PROFILE_OPERATIONS_ONLY') != '1':
     artifacts = {}
-    for line in output.splitlines():
-        if not line.startswith('{'):
+    for trial in range(2):
+        builddir = pathlib.Path(env['CARGO_TARGET_DIR'])
+        assert builddir == root / 'target/profile-build'
+        if builddir.exists():
+            shutil.rmtree(builddir)
+        output = run(f'fresh_test_build_{trial}', cargo + ['test', '--locked', '--all-targets', '--no-run', '--message-format=json'])
+        artifacts = {}
+        for line in output.splitlines():
+            if not line.startswith('{'):
+                continue
+            item = json.loads(line)
+            if item.get('reason') == 'compiler-artifact' and item.get('executable') and item['profile']['test']:
+                artifacts[item['target']['name']] = item['executable']
+        assert 'syq' in artifacts and 'local' in artifacts, artifacts
+        # Invoke precisely the compiled test executables, preserving libtest's default
+        # parallelism, so suite timing excludes Cargo/build-script work.
+        for name, executable in sorted(artifacts.items()):
+            if name == 'profile-probe':
+                continue
+            run(f'suite_{name}_{trial}', [executable], required=False)
+        if trial == 0:
             continue
-        item = json.loads(line)
-        if item.get('reason') == 'compiler-artifact' and item.get('executable') and item['profile']['test']:
-            artifacts[item['target']['name']] = item['executable']
-    assert 'syq' in artifacts and 'local' in artifacts, artifacts
-    # Invoke precisely the compiled test executables, preserving libtest's default
-    # parallelism, so suite timing excludes Cargo/build-script work.
-    for name, executable in sorted(artifacts.items()):
-        if name == 'profile-probe':
-            continue
-        run(f'suite_{name}_{trial}', [executable], required=False)
-    if trial == 0:
-        continue
 
-local_tests = [
-    'hash_policy_independent_compare_and_payload_hashes_cross_transports',
-    'hash_policy_independent_hashes_reuse_unchanged_blocks',
-    'large_file_parallel_chunks',
-    'resume_from_partial',
-    'concurrent_identical_and_different_copies_publish_complete_files',
-    'concurrent_default_tree_copies_keep_every_file_whole',
-    'source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams',
-]
-listing = run('local_test_inventory', [artifacts['local'], '--list'])
-for name in local_tests:
-    assert name + ': test' in listing, name
-    for trial in range(3):
-        output = run(f'test_{name}_{trial}', [artifacts['local'], name, '--exact'], required=False)
-        assert 'running 1 test' in output and '0 ignored' in output, name
+    local_tests = [
+        'hash_policy_independent_compare_and_payload_hashes_cross_transports',
+        'hash_policy_independent_hashes_reuse_unchanged_blocks',
+        'large_file_parallel_chunks',
+        'resume_from_partial',
+        'concurrent_identical_and_different_copies_publish_complete_files',
+        'concurrent_default_tree_copies_keep_every_file_whole',
+    ]
+    if sys.platform.startswith('linux'):
+        local_tests.append('source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams')
+    listing = run('local_test_inventory', [artifacts['local'], '--list'])
+    for name in local_tests:
+        assert name + ': test' in listing, name
+        for trial in range(3):
+            output = run(f'test_{name}_{trial}', [artifacts['local'], name, '--exact'], required=False)
+            assert 'running 1 test' in output and '0 ignored' in output, name
+
+else:
+    run('supplement_build', cargo + ['build', '--locked', '--bin', 'syq'])
 
 bindir = pathlib.Path(env['CARGO_TARGET_DIR']) / 'debug'
 run('build_probe', cargo + ['build', '--locked', '--bin', 'profile-probe'])

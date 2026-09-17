@@ -34,12 +34,12 @@ permissions:
 
 jobs:
   focused-test:
-    if: github.event_name == 'workflow_dispatch' && inputs.test_name == 'debug_profile_study'
+    if: github.event_name == 'workflow_dispatch' && (inputs.test_name == 'debug_profile_study' || inputs.test_name == 'debug_profile_operations')
     strategy:
       fail-fast: false
       matrix:
         variant: [0, 1, 2, 3]
-        os: [ubuntu-latest, macos-26]
+        os: ${{ fromJSON(inputs.test_name == 'debug_profile_operations' && '["macos-26"]' || '["ubuntu-latest","macos-26"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -57,6 +57,7 @@ jobs:
       - name: Measure build and runtime tradeoffs
         env:
           PROFILE_VARIANT: ${{ matrix.variant }}
+          PROFILE_OPERATIONS_ONLY: ${{ inputs.test_name == 'debug_profile_operations' && '1' || '0' }}
         run: python3 scripts/debug-profile-study.py "$PROFILE_VARIANT"
       - name: Save measurements and logs
         if: always()
