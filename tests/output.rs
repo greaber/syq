@@ -201,10 +201,10 @@ fn broken_stdout_warning_does_not_append_to_live_progress() {
             "dst",
             "--progress",
             "-v",
-            "--bwlimit",
-            "1M",
-            "--connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1M",
+            "--performance-tuning",
+            "workers=1",
         ])
         .stdout(broken_output())
         .stderr(Stdio::piped())
@@ -247,10 +247,10 @@ fn fatal_deferred_metadata_error_leaves_final_incomplete_counts() {
             "--preserve",
             "permissions",
             "--progress",
-            "--bwlimit",
-            "1M",
-            "--connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1M",
+            "--performance-tuning",
+            "workers=1",
             "--results",
             "result.json",
         ])

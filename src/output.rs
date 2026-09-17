@@ -57,7 +57,10 @@ impl Terminal {
     fn write_line(&mut self, out: &mut impl Write, args: Arguments<'_>) -> io::Result<()> {
         let line = self.line.clone();
         self.clear(out)?;
-        writeln!(out, "{args}")?;
+        // Helpers can inherit the same stderr pipe but have their own locks.
+        // Keep the newline in the same write as the message so lines within
+        // PIPE_BUF cannot be interleaved by those other processes.
+        out.write_all(format!("{args}\n").as_bytes())?;
         if let Some(line) = line {
             self.draw(out, line)?;
         }
@@ -140,6 +143,41 @@ pub(crate) use human_stdout;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_process_diagnostics_do_not_split_lines() {
+        // Model another process writing to the same stderr pipe after each
+        // write. The in-process terminal lock cannot exclude that writer.
+        #[derive(Default)]
+        struct SharedPipe(Vec<u8>);
+        impl Write for SharedPipe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                self.0.extend_from_slice(b"syq: helper closed\n");
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = SharedPipe::default();
+        let mut terminal = Terminal::default();
+        let counters = serde_json::json!({"range_requests": 0});
+        terminal
+            .diagnostic(
+                &mut output,
+                format_args!("syq: tuning observed: {counters}"),
+            )
+            .unwrap();
+        terminal
+            .write_line(&mut output, format_args!("{counters}"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.0).unwrap(),
+            format!("syq: tuning observed: {counters}\nsyq: helper closed\n{counters}\nsyq: helper closed\n")
+        );
+    }
 
     #[test]
     fn json_output_preserves_unicode_and_json_escapes() {

@@ -71,14 +71,14 @@ def main():
             outputs.append(output)
             process = subprocess.Popen([
                 "syq", "cp", "--from", "source", source, "--to", "destination",
-                "--as", f"{root}/{name}", "--connections", "1", "--bwlimit", "1M", "--no-progress", *transport,
+                "--as", f"{root}/{name}", "--performance-tuning", "workers=1", "--resource-limits", "bandwidth=1M", "--no-progress", *transport,
             ], stdout=output, stderr=output, start_new_session=True)
             processes.append(process)
         probe = "python3 -c " + shlex.quote(f"""
 import json
 from pathlib import Path
 root = Path({root!r})
-print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in root.glob('.' + name + '.syq-part.*')) for name in ('one', 'two')]))
+print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in root.glob('.' + name + '.syq-tmp.*')) for name in ('one', 'two')]))
 """)
         def started():
             assert all(process.poll() is None for process in processes), "copy exited before revocation"
@@ -103,7 +103,7 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
             with tempfile.TemporaryDirectory(prefix="revoke-resume-results-") as temporary:
                 results = Path(temporary) / "results.ndjson"
                 run("syq", "cp", "--from", "source", source, "--to", "destination",
-                    "--as", f"{root}/{name}", "--connections", "2", "--no-progress", "--results", str(results), *transport)
+                    "--as", f"{root}/{name}", "--performance-tuning", "workers=2", "--no-progress", "--results", str(results), *transport)
                 terminal = [json.loads(line) for line in results.read_text().splitlines()][-1]
                 assert terminal["type"] == "result" and terminal["status"] == "success", terminal
                 assert 0 < terminal["bytes_transferred"] <= 28 << 20, terminal

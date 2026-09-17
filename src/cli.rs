@@ -1,5 +1,5 @@
 use crate::proto::OperatorSymlinkPolicy;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -65,6 +65,9 @@ pub enum CoordinateAt {
     override_usage = "syq rsync [OPTIONS] SRC... DEST\n       syq rsync [OPTIONS] [USER@]HOST:SRC... DEST\n       syq rsync [OPTIONS] SRC... [USER@]HOST:DEST"
 )]
 pub struct Args {
+    /// Process-local S3 transfer settings; never serialized into helper requests.
+    #[arg(skip)]
+    pub(crate) s3: Option<crate::s3::Options>,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
     #[arg(skip)]
@@ -90,6 +93,8 @@ pub struct Args {
     /// Endpoint-side containment boundary for native removal.
     #[arg(skip)]
     pub native_rm_root: Option<Vec<u8>>,
+    #[arg(skip)]
+    pub clean_partials: bool,
     /// Endpoint-side base for native copy source selectors. Unlike `--root`,
     /// this is not a containment boundary.
     #[arg(skip)]
@@ -205,7 +210,7 @@ pub struct Args {
     #[arg(long, overrides_with = "compress")]
     pub no_compress: bool,
     /// Resolve mappings and transport, then estimate transfers, exclusions, and deletions;
-    /// leave source and destination data unchanged (remote helper setup may write cache files)
+    /// leave source and destination data unchanged (remote setup may still cache the helper or install syq)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
     /// No-op accepted for rsync compatibility (sizes are always human-readable)
@@ -215,12 +220,8 @@ pub struct Args {
     #[arg(long)]
     pub numeric_ids: bool,
 
-    /// Parallel connections/workers. Default for copies: auto-tuned — starts at
-    /// the last settled count remembered for this host path and transport, or 16
-    /// over TCP, 8 over ssh, or 16 when local with at most two available CPUs
-    /// (otherwise 32). It probes from 1 to 64 while the copy has enough work to
-    /// measure. Give a number to fix it.
-    #[arg(long = "syq-connections", value_name = "N")]
+    /// Normalized fixed parallelism override; omitted means automatic tuning.
+    #[arg(skip)]
     pub connections_opt: Option<usize>,
     #[arg(skip)]
     pub connections: usize,
@@ -230,8 +231,30 @@ pub struct Args {
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
     /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    pub performance_tuning: Vec<String>,
+    #[arg(skip)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
+    /// Limit aggregate logical file-data bandwidth
+    #[arg(
+        long = "resource-limits",
+        long_help = crate::advanced::RESOURCE_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    pub resource_limits_arg: Vec<String>,
+    #[arg(skip)]
+    pub resource_limits: Option<crate::advanced::ResourceLimits>,
+    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    #[arg(
+        long = "integrity-checking",
+        long_help = crate::advanced::INTEGRITY_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    pub integrity_checking_arg: Vec<String>,
+    #[arg(skip)]
+    pub integrity_checking: Option<crate::advanced::IntegrityChecking>,
     /// Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables)
     #[arg(long, value_name = "RATE")]
     pub bwlimit: Option<String>,
@@ -253,13 +276,24 @@ pub struct Args {
     /// Syq extension: emit machine-readable progress lines (JSON) on stderr
     #[arg(long = "syq-progress-json")]
     pub progress_json: bool,
-    /// Print transfer statistics at the end
+    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     pub stats: bool,
 
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
+    /// Algorithm for file content comparisons and optional transfer checks
+    #[arg(skip)]
+    pub hash_algorithm: crate::hashing::HashAlgorithm,
+    /// Add payload checksums independently of transport encryption
+    #[arg(skip)]
+    pub transfer_integrity: bool,
+    #[arg(skip)]
+    pub transfer_hash_type: Option<crate::hashing::HashAlgorithm>,
+    /// Require one regular file to match ALGORITHM:HEX
+    #[arg(long = "syq-expected-hash", value_name = "ALGORITHM:HEX")]
+    pub expected_digest: Option<crate::hashing::Digest>,
     /// Syq extension: only compare source and destination contents; transfer nothing
     #[arg(long = "syq-verify-only")]
     pub verify_only: bool,
@@ -442,6 +476,7 @@ impl Args {
             "rsync" => Self::parse_rsync(&argv[1..]),
             "cp" => parse_native(&argv[1..], Interface::NativeCp),
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
+            "clean-partials" => parse_clean_partials(&argv[1..]),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
             "--help" | "-h" | "--help-all" => {
                 print_root_help(command == "--help-all");
@@ -483,6 +518,7 @@ impl Args {
             .try_get_matches_from(full_argv)
             .unwrap_or_else(|error| error.exit());
         let args = Args::from_arg_matches(&matches)?;
+        validate_expected_hash_selection(&args)?;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
     }
@@ -521,7 +557,78 @@ impl Args {
             self.partial = true;
         }
         self.connections_default = self.connections_opt.is_none();
-        self.connections = self.connections_opt.unwrap_or(8).max(1);
+        self.connections = self.connections_opt.unwrap_or(8);
+    }
+
+    fn apply_advanced(&mut self) -> Result<()> {
+        if !self.performance_tuning.is_empty() {
+            self.tuning_options = Some(
+                self.performance_tuning
+                    .join(",")
+                    .parse()
+                    .context("invalid --performance-tuning")?,
+            );
+        }
+        if !self.resource_limits_arg.is_empty() {
+            self.resource_limits = Some(
+                self.resource_limits_arg
+                    .join(",")
+                    .parse()
+                    .context("invalid --resource-limits")?,
+            );
+        }
+        if !self.integrity_checking_arg.is_empty() {
+            self.integrity_checking = Some(
+                self.integrity_checking_arg
+                    .join(",")
+                    .parse()
+                    .context("invalid --integrity-checking")?,
+            );
+        }
+
+        if let Some(tuning) = self.tuning_options {
+            if self.s3.is_none() && tuning.has_s3_controls() {
+                bail!("S3 performance tuning requires an S3 endpoint");
+            }
+            if self.rm
+                && tuning
+                    != (crate::transfer_tuning::TransferTuning {
+                        workers: tuning.workers,
+                        ..Default::default()
+                    })
+            {
+                bail!("removal supports only performance-tuning workers");
+            }
+            self.connections_opt = tuning.workers;
+        }
+        if let Some(limits) = &self.resource_limits {
+            if limits.bandwidth.is_some() && self.bwlimit.is_some() {
+                bail!("--bwlimit conflicts with --resource-limits bandwidth");
+            }
+            self.bwlimit = limits.bandwidth.clone().or(self.bwlimit.clone());
+            self.bwlimit_bytes = self
+                .bwlimit
+                .as_deref()
+                .map(crate::bwlimit::parse_rate)
+                .transpose()?
+                .unwrap_or(0);
+        }
+        if let Some(checks) = self.integrity_checking {
+            if let Some(compare) = checks.compare {
+                if self.checksum && compare != Some(crate::hashing::HashAlgorithm::Blake3) {
+                    bail!("--hash/--checksum conflicts with integrity-checking compare");
+                }
+                self.checksum = compare.is_some();
+                self.hash_algorithm = compare.unwrap_or_default();
+            }
+            if let Some(transfer) = checks.transfer {
+                self.transfer_integrity = transfer.is_some();
+                self.transfer_hash_type = transfer;
+            }
+        }
+        self.connections_default = self.connections_opt.is_none();
+        self.connections = self.connections_opt.unwrap_or(8);
+        Ok(())
     }
 
     pub fn meta_flags(&self) -> u8 {
@@ -543,7 +650,36 @@ impl Args {
     }
 }
 
+fn validate_expected_hash_selection(args: &Args) -> Result<()> {
+    if args.expected_digest.is_none() {
+        return Ok(());
+    }
+    let one_file = if args.interface == Interface::Rsync {
+        // Reject selection lists before finish_parse reads files or stdin.
+        args.paths.len() == 2
+            && args.files_from.is_none()
+            && !Location::parse(&args.paths[0])?.copies_contents()
+    } else {
+        args.locations.len() == 2
+            && matches!(
+                args.locations[0].selection,
+                SourceSelection::Named | SourceSelection::NamedNoFollow | SourceSelection::File
+            )
+    };
+    if !one_file {
+        let option = if args.interface == Interface::Rsync {
+            "--syq-expected-hash"
+        } else {
+            "--expected-hash"
+        };
+        bail!("{option} requires one named regular file; use per-file expected_digest values in a mapping for batches");
+    }
+    // The source endpoint checks the actual object kind before copying.
+    Ok(())
+}
+
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
+    args.apply_advanced()?;
     args.bwlimit_bytes = args
         .bwlimit
         .as_deref()
@@ -685,6 +821,7 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
         "rsync" => Some(crate::help::filesystem(Args::command())),
         "cp" => Some(crate::help::filesystem(NativeCopyCommand::command())),
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
+        "clean-partials" => Some(crate::help::filesystem(CleanPartialsCommand::command())),
         "map" => Some(crate::help::filesystem(NativeMapCommand::command())),
         _ => None,
     }
@@ -732,7 +869,7 @@ struct NativeSourceArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeSelectionArgs {
-    /// Source endpoint ([USER@]HOST[:PORT]); omitted means local
+    /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
     #[command(flatten)]
@@ -784,7 +921,7 @@ struct NativeRmSelectionArgs {
 
 #[derive(clap::Args, Debug)]
 struct NativeOperationalArgs {
-    /// Preview without changing copy/removal data; requested results files are still written
+    /// Preview without changing copy/removal data; remote setup may still cache the helper or install syq; requested results files are still written
     #[arg(short = 'n', long)]
     dry_run: bool,
     /// Increase verbosity
@@ -793,9 +930,9 @@ struct NativeOperationalArgs {
     /// Suppress non-error messages
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Fix parallel connections/workers (copies otherwise tune automatically)
-    #[arg(short = 'j', long = "connections", value_name = "N")]
-    connections: Option<usize>,
+    /// Override performance settings (normally automatic)
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    performance_tuning: Vec<String>,
     /// Show progress even when stderr is not a terminal
     #[arg(long, overrides_with = "no_progress")]
     progress: bool,
@@ -826,6 +963,13 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Require one regular file to match ALGORITHM:HEX
+    #[arg(
+        long = "expected-hash",
+        value_name = "ALGORITHM:HEX",
+        conflicts_with = "mapping"
+    )]
+    expected_digest: Option<crate::hashing::Digest>,
     /// Compare selected contents without writing; fail on differences or inspection errors
     #[arg(long, conflicts_with_all = ["dry_run", "prune", "inplace", "update", "ignore_existing", "existing"])]
     verify_only: bool,
@@ -835,19 +979,29 @@ struct NativeCopyOperationalArgs {
     /// Update only entries already present; create no missing entries or directories
     #[arg(long = "only-existing", conflicts_with_all = ["ignore_existing", "into_new", "as_new"])]
     existing: bool,
-    /// Skip regular files newer at the destination; type replacements still occur
+    /// Skip regular files newer at the destination; non-directory type replacements still occur
     #[arg(long = "skip-newer", conflicts_with_all = ["ignore_existing", "inplace"])]
     update: bool,
     /// Disable transport compression
     #[arg(long)]
     no_compress: bool,
-    /// Limit aggregate file-data throughput (default unit: KiB/s; 0 disables)
-    #[arg(long, value_name = "RATE")]
-    bwlimit: Option<String>,
-    /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long, value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP)]
-    tuning_options: Option<crate::transfer_tuning::TransferTuning>,
-    /// Print transfer statistics at the end
+    /// Limit aggregate logical file-data bandwidth
+    #[arg(
+        long = "resource-limits",
+        long_help = crate::advanced::RESOURCE_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    resource_limits_arg: Vec<String>,
+    /// compare=size-mtime|blake3|sha256|md5|xxh3-128; transfer=off|HASH
+    #[arg(
+        long = "integrity-checking",
+        long_help = crate::advanced::INTEGRITY_HELP,
+        value_name = "KEY=VALUE,...",
+        help_heading = "Advanced controls"
+    )]
+    integrity_checking_arg: Vec<String>,
+    /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     stats: bool,
     /// Skip paths matching a gitignore-style pattern (repeatable)
@@ -920,7 +1074,9 @@ pub(crate) enum AuthFrom {
 
 impl AuthFrom {
     fn receiving(value: &str) -> Result<Self> {
-        let name = value.strip_prefix('@').unwrap_or(value);
+        let name = value
+            .strip_prefix('@')
+            .ok_or_else(|| anyhow::anyhow!("receiver references require @NAME"))?;
         crate::destination::validate_name(name)?;
         Ok(Self::Return(name.to_owned()))
     }
@@ -939,7 +1095,7 @@ struct NativeRemoteArgs {
     /// Authorize with a live receiving machine, or use SSH from this machine (default: auto)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, conflicts_with = "via")]
     auth_from: Option<AuthFrom>,
-    /// Alias for --auth-from @NAME; every bare value remains a receiving name
+    /// Alias for --auth-from @NAME
     #[arg(long, value_name = "@NAME")]
     via: Option<String>,
     /// Choose the endpoint that runs the coordinator
@@ -1004,7 +1160,7 @@ struct NativeCopyFields {
     suppress_summary: bool,
     #[command(flatten)]
     selection: NativeSelectionArgs,
-    /// Destination SSH endpoint or live receiving name; @NAME requires a return connection; placement defaults to --into .
+    /// Destination SSH endpoint, @NAME, or s3://BUCKET; placement defaults to --into .
     #[arg(long, value_name = "ENDPOINT")]
     to: Option<String>,
     /// Follow symlinks in directly supplied destination paths
@@ -1053,12 +1209,14 @@ struct NativeSizeSelectionArgs {
 #[command(
     name = "syq cp",
     version,
-    about = "Copy files and directories locally or over SSH.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
-    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt",
-    long_about = "Copy files and directories locally or over SSH.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
+    about = "Copy files and directories locally, over SSH, or to/from S3.\n\nDirectories are copied recursively, symlinks as symlinks, and modification times\nare preserved. Add --preserve=permissions to preserve modes, including executable\npermissions. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Matching destination files may be overwritten.\nSource arguments must precede destination arguments.",
+    before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --preserve=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
+    long_about = "Copy files and directories locally, over SSH, or to/from S3.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Matching destination files may be overwritten.\n\nNative copies recurse, copy symlinks as symlinks, and preserve modification times by default. Use --preserve to add permissions, ownership, or special files. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored and size-excluded paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]"
 )]
 struct NativeCopyCommand {
+    #[command(flatten)]
+    s3: crate::s3::Flags,
     #[command(flatten)]
     copy: NativeCopyFields,
     #[command(flatten)]
@@ -1166,6 +1324,73 @@ struct NativeRmCommand {
     /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "syq clean-partials",
+    version,
+    about = "Delete syq partial files below the selected directories.",
+    long_about = "Delete new-format syq partial files recursively, leaving other files and directories intact. Stop copies writing into these trees first. Older partial formats are not selected. Symlinks are not followed.",
+    before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
+)]
+struct CleanPartialsCommand {
+    /// Directory trees to search
+    #[arg(value_name = "TREE", required = true)]
+    trees: Vec<OsString>,
+    /// Removal endpoint ([USER@]HOST[:PORT]); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    on: Option<String>,
+    /// Resolve relative trees from DIR at the removal endpoint
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
+    cwd: Option<OsString>,
+    /// Confine traversal beneath DIR
+    #[arg(long, value_name = "DIR")]
+    root: Option<OsString>,
+    #[command(flatten)]
+    operational: NativeOperationalArgs,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
+    #[command(flatten)]
+    results_output: NativeResultsArgs,
+}
+
+fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
+    reject_detached_dash_native_values(argv)?;
+    let mut full = vec![OsString::from("syq clean-partials")];
+    full.extend_from_slice(argv);
+    let matches = crate::help::filesystem(CleanPartialsCommand::command())
+        .try_get_matches_from(full)
+        .unwrap_or_else(|error| error.exit());
+    let parsed = CleanPartialsCommand::from_arg_matches(&matches)?;
+    let endpoint = parse_native_endpoint(parsed.on.as_deref())?;
+    if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
+        bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
+    }
+    validate_native_results_fd(parsed.results_output.results_fd)?;
+    let confined = parsed.root.is_some();
+    let mut args = native_removal_args(
+        parsed.cwd,
+        parsed.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    )?;
+    args.clean_partials = true;
+    args.locations = parsed
+        .trees
+        .into_iter()
+        .map(|tree| {
+            let path = trim_native_trailing_slashes(tree.into_vec());
+            validate_native_source_selector(&path, confined)?;
+            Ok(Location::native(
+                endpoint.clone(),
+                path,
+                SourceSelection::Directory,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(args)
 }
 
 fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
@@ -1305,6 +1530,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     validate_native_copy_argument_order(&matches)?;
     let parsed = NativeCopyCommand::from_arg_matches(&matches)?;
     let NativeCopyCommand {
+        s3,
         mut copy,
         size_selection,
         remote,
@@ -1317,6 +1543,31 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     }
     if copy.delegated_operands_b64 {
         decode_delegated_operands(&mut copy)?;
+    }
+    let s3_from = copy
+        .selection
+        .from
+        .as_deref()
+        .filter(|s| s.starts_with("s3://"))
+        .map(str::to_owned);
+    let s3_to = copy
+        .to
+        .as_deref()
+        .filter(|s| s.starts_with("s3://"))
+        .map(str::to_owned);
+    let s3_options = crate::s3::Options::parse(s3, s3_from.as_deref(), s3_to.as_deref(), &matches)?;
+    if s3_options.is_some() {
+        if (s3_from.is_none() && copy.selection.from.is_some())
+            || (s3_to.is_none() && copy.to.is_some())
+        {
+            bail!("S3 copies require one local endpoint; run syq on the machine holding the files");
+        }
+        if s3_from.is_some() {
+            copy.selection.from = None;
+        }
+        if s3_to.is_some() {
+            copy.to = None;
+        }
     }
     let mapping = copy.mapping.take();
     let results = copy.results_output.results.take();
@@ -1360,7 +1611,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
         None if prune => bail!("--prune requires an explicit placement, such as --into DIR"),
-        None if copy.to.is_some() || copy.selection.from.is_some() => {
+        None if copy.to.is_some() || copy.selection.from.is_some() || s3_options.is_some() => {
             (Some(OsString::from(".")), Placement::Into, Existence::Any)
         }
         None => bail!(
@@ -1402,6 +1653,7 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
     ));
 
     let mut args = native_engine_defaults();
+    args.s3 = s3_options;
     args.interface = Interface::NativeCp;
     args.placement = placement;
     args.target_existence = existence;
@@ -1468,6 +1720,23 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
             bail!(
                 "--dry-run with --results needs a local coordinator for a remote-to-remote copy; pass --coordinate-at local to preview with the full trace stream"
             );
+        }
+    }
+    if let Some(options) = &args.s3 {
+        if args.devices {
+            bail!("--preserve=specials is not supported for S3 copies");
+        }
+        let index = if options.upload {
+            args.locations.len() - 1
+        } else {
+            0
+        };
+        args.locations[index].host = Some(format!("s3://{}", options.bucket));
+        if !options.upload {
+            let count = args.locations.len() - 1;
+            for location in &mut args.locations[..count] {
+                location.host = Some(format!("s3://{}", options.bucket));
+            }
         }
     }
     Ok(args)
@@ -1550,10 +1819,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let matches = crate::help::filesystem(NativeRmCommand::command())
         .try_get_matches_from(full_argv)
         .unwrap_or_else(|error| error.exit());
-    let mut parsed = NativeRmCommand::from_arg_matches(&matches)?;
-    let results = parsed.results_output.results.take();
-    let results_fd = parsed.results_output.results_fd.take();
-    validate_native_results_fd(results_fd)?;
+    let parsed = NativeRmCommand::from_arg_matches(&matches)?;
+    validate_native_results_fd(parsed.results_output.results_fd)?;
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
     for (id, selection, paths) in [
         (
@@ -1617,20 +1884,40 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
             Ok(Location::native(endpoint.clone(), path, selection))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut args = native_engine_defaults();
-    args.interface = Interface::NativeRm;
+    let mut args = native_removal_args(
+        parsed.selection.cwd,
+        parsed.selection.root,
+        parsed.operational,
+        parsed.helper,
+        parsed.results_output,
+    )?;
     args.locations = locations;
-    args.native_rm_cwd = parsed.selection.cwd.map(OsStringExt::into_vec);
-    args.native_rm_root = parsed.selection.root.map(OsStringExt::into_vec);
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
-    args.native_results = results.map(OsStringExt::into_vec);
-    args.native_results_fd = results_fd;
     args.pscope = parsed.pscope;
-    args.syq_path = parsed.helper.syq_path;
-    args.no_bootstrap = parsed.helper.no_bootstrap;
+    Ok(args)
+}
+
+// Keep common engine settings shared while each command retains its own
+// selection syntax and validation order.
+fn native_removal_args(
+    cwd: Option<OsString>,
+    root: Option<OsString>,
+    operational: NativeOperationalArgs,
+    helper: NativeRemoteHelperArgs,
+    results: NativeResultsArgs,
+) -> Result<Args> {
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeRm;
     args.rm = true;
-    apply_native_operational(&mut args, parsed.operational);
+    args.native_rm_cwd = cwd.map(OsStringExt::into_vec);
+    args.native_rm_root = root.map(OsStringExt::into_vec);
+    args.native_results = results.results.map(OsStringExt::into_vec);
+    args.native_results_fd = results.results_fd;
+    args.syq_path = helper.syq_path;
+    args.no_bootstrap = helper.no_bootstrap;
+    apply_native_operational(&mut args, operational);
+    args.apply_advanced()?;
     Ok(args)
 }
 
@@ -1705,7 +1992,7 @@ fn apply_native_operational(args: &mut Args, operational: NativeOperationalArgs)
     args.dry_run = operational.dry_run;
     args.verbose = operational.verbose;
     args.quiet = operational.quiet;
-    args.connections_opt = operational.connections;
+    args.performance_tuning = operational.performance_tuning;
     args.progress = operational.progress;
     args.no_progress = operational.no_progress;
     args.progress_json = operational.progress_json;
@@ -1748,6 +2035,7 @@ mod native_sdk_inventory_tests {
         let commands = [
             ("cp", NativeCopyCommand::command()),
             ("rm", NativeRmCommand::command()),
+            ("clean-partials", CleanPartialsCommand::command()),
             ("map", NativeMapCommand::command()),
         ];
         assert_eq!(
@@ -1795,13 +2083,14 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        expected_digest,
         verify_only,
         ignore_existing,
         existing,
         update,
         no_compress,
-        bwlimit,
-        tuning_options,
+        integrity_checking_arg,
+        resource_limits_arg,
         stats,
         ignore,
         ignore_from,
@@ -1815,6 +2104,8 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.expected_digest = expected_digest;
+    validate_expected_hash_selection(args)?;
     args.verify_only = verify_only;
     args.ignore_existing = ignore_existing;
     args.existing = existing;
@@ -1823,13 +2114,8 @@ fn apply_native_copy_operational(
     if no_compress {
         args.compress = false;
     }
-    args.bwlimit_bytes = bwlimit
-        .as_deref()
-        .map(crate::bwlimit::parse_rate)
-        .transpose()?
-        .unwrap_or(0);
-    args.bwlimit = bwlimit;
-    args.tuning_options = tuning_options;
+    args.integrity_checking_arg = integrity_checking_arg;
+    args.resource_limits_arg = resource_limits_arg;
     args.stats = stats;
     args.pending_ignore_inputs = ordered_ignore_inputs(&ignore, &ignore_from, matches);
     args.ignore = ignore;
@@ -1846,6 +2132,7 @@ fn apply_native_copy_operational(
         }
     }
     apply_native_operational(args, common);
+    args.apply_advanced()?;
     Ok(())
 }
 
@@ -2122,10 +2409,10 @@ fn reject_unsupported_rsync_flags(argv: &[OsString]) -> Result<()> {
         "--rsh",
         "--syq-ignore",
         "--syq-ignore-from",
-        "--syq-connections",
+        "--resource-limits",
         "--block-size",
-        "--tuning-options",
-        "--bwlimit",
+        "--performance-tuning",
+        "--integrity-checking",
         "--max-size",
         "--min-size",
         "--files-from",
@@ -2196,7 +2483,7 @@ const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq exten
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. --syq-verify-only can compare contents without mutation, but it does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";
-const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq replaces destination symlink conflicts instead.";
+const DESTINATION_LINK_TRAVERSAL_MSG: &str = "syq does not implement -K/--keep-dirlinks because it follows existing destination directory symlinks; syq refuses to copy a directory onto an in-tree symlink.";
 
 fn message_for_long(base: &str) -> Option<&'static str> {
     Some(match base {
@@ -2296,12 +2583,13 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
-        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, Placement,
-        SourceSelection,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, NativeCopyCommand,
+        Placement, SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
     use clap::Parser;
+    use std::ffi::OsString;
 
     fn read_files_from_buffered_reference(raw: &[u8], nul: bool) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
@@ -2460,10 +2748,218 @@ mod tests {
     }
 
     #[test]
+    fn advanced_groups_separate_limits_tuning_and_integrity() {
+        let args = parse_native_copy(
+            &[
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+                "--resource-limits=bandwidth=1M",
+                "--performance-tuning=s3-max-concurrent-objects=3,s3-max-concurrent-requests=4,s3-max-concurrent-parts-per-object=2,s3-part-size=8M",
+                "--integrity-checking=compare=blake3,transfer=sha256",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        let tuning = args.tuning_options.unwrap();
+        assert_eq!(tuning.s3_requests, Some(4));
+        assert_eq!(tuning.s3_object_workers, Some(3));
+        assert_eq!(
+            tuning
+                .to_string()
+                .parse::<crate::transfer_tuning::TransferTuning>()
+                .unwrap(),
+            tuning
+        );
+        assert_eq!(args.bwlimit_bytes, 1 << 20);
+        assert!(args.checksum);
+        assert!(args.transfer_integrity);
+        assert_eq!(
+            args.transfer_hash_type,
+            Some(crate::hashing::HashAlgorithm::Sha256)
+        );
+        let options = args.s3.unwrap();
+        assert_eq!(options.concurrency, 2);
+        assert_eq!(options.part_size, 8 << 20);
+        for flags in [
+            vec!["--resource-limits=connections=2"],
+            vec!["--hash", "--integrity-checking=compare=sha256"],
+            vec![
+                "--performance-tuning=workers=2",
+                "--performance-tuning=workers=3",
+            ],
+        ] {
+            let mut argv = vec!["source", "--as", "target"];
+            argv.extend(flags);
+            assert!(
+                parse_native_copy(&argv.into_iter().map(OsString::from).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        for old in [
+            "--connections=2",
+            "--bwlimit=1M",
+            "--tuning-options=workers=2",
+            "--s3-concurrency=2",
+            "--s3-part-size=8",
+            "--s3-integrity=none",
+            "--hash-algorithm=sha256",
+            "--transfer-integrity",
+        ] {
+            assert!(
+                NativeCopyCommand::try_parse_from(["cp", "source", "--as", "target", old]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn expected_hash_accepts_native_named_and_file_selectors() {
+        for selectors in [
+            vec!["source"],
+            vec!["--src", "source"],
+            vec!["--src-non-dir", "source"],
+        ] {
+            let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
+            argv.extend(selectors);
+            argv.extend(["--into", "destination"]);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert!(parse_native_copy(&argv).unwrap().expected_digest.is_some());
+        }
+    }
+
+    #[test]
+    fn expected_hash_rejects_native_batch_and_directory_selectors() {
+        for selectors in [
+            vec!["first", "second"],
+            vec!["--srcs-in", "source"],
+            vec!["--src-dir", "source"],
+        ] {
+            let mut argv = vec!["--expected-hash", "md5:900150983cd24fb0d6963f7d28e17f72"];
+            argv.extend(selectors);
+            argv.extend(["--into", "destination"]);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let error = parse_native_copy(&argv).unwrap_err().to_string();
+            assert!(
+                error.contains("--expected-hash requires one named regular file"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_hash_rejects_rsync_batch_and_contents_before_reading_inputs() {
+        for operands in [
+            vec!["first", "second", "destination"],
+            vec!["source/", "destination"],
+            vec!["host:source/", "destination"],
+            vec![".", "destination"],
+            vec!["source/..", "destination"],
+            vec!["--files-from", "-", "source", "destination"],
+            vec!["--files-from", "/missing/list", "source", "destination"],
+        ] {
+            let mut argv = vec![
+                "--syq-expected-hash",
+                "md5:900150983cd24fb0d6963f7d28e17f72",
+            ];
+            argv.extend(operands);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let error = Args::parse_rsync(&argv).unwrap_err().to_string();
+            assert!(
+                error.contains("--syq-expected-hash requires one named regular file"),
+                "{error}"
+            );
+        }
+        for operands in [
+            ["source", "destination"],
+            ["host:source", "destination"],
+            ["source", "host:destination"],
+        ] {
+            let mut argv = vec![
+                "--syq-expected-hash",
+                "md5:900150983cd24fb0d6963f7d28e17f72",
+            ];
+            argv.extend(operands);
+            let argv = argv
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            assert!(Args::parse_rsync(&argv).unwrap().expected_digest.is_some());
+        }
+    }
+
+    #[test]
+    fn rsync_hash_controls_use_syq_prefix() {
+        let mut parsed = Args::try_parse_from([
+            "syq",
+            "--integrity-checking",
+            "compare=xxh3-128",
+            "--integrity-checking=transfer=blake3",
+            "--syq-expected-hash",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+            "source",
+            "destination",
+        ])
+        .unwrap();
+        parsed.apply_advanced().unwrap();
+        assert_eq!(parsed.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
+        assert!(parsed.transfer_integrity);
+        assert!(parsed.expected_digest.is_some());
+        for option in [
+            "--hash-algorithm=md5",
+            "--transfer-integrity",
+            "--expected-hash=md5:900150983cd24fb0d6963f7d28e17f72",
+        ] {
+            assert!(Args::try_parse_from(["syq", option, "source", "destination"]).is_err());
+        }
+    }
+
+    #[test]
     fn native_hash_selects_content_comparison() {
         let argv = ["--hash", "source", "--into", "destination"].map(std::ffi::OsString::from);
         let args = parse_native_copy(&argv).unwrap();
         assert!(args.checksum);
+    }
+
+    #[test]
+    fn payload_checks_and_encryption_are_independent() {
+        for plain in [false, true] {
+            for integrity in [false, true] {
+                let mut argv = vec![
+                    "source",
+                    "--into",
+                    "destination",
+                    "--integrity-checking=compare=xxh3-128",
+                ];
+                if plain {
+                    argv.push("--tcp-plain");
+                }
+                if integrity {
+                    argv.push("--integrity-checking=transfer=blake3");
+                }
+                let args = parse_native_copy(
+                    &argv
+                        .iter()
+                        .map(std::ffi::OsString::from)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(args.tcp_plain, plain);
+                assert_eq!(args.transfer_integrity, integrity);
+                assert_eq!(args.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
+                assert!(args.checksum);
+            }
+        }
     }
 
     #[test]

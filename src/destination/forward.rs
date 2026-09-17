@@ -98,9 +98,8 @@ pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selectio
         (name, registration)
     } else {
         let Some(found) = registered_names().into_iter().find_map(|name| {
-            let registration = load_registration(&name).ok()?;
-            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(2)).ok()?;
-            matches!(reply, Reply::Ready).then_some((name, registration))
+            let registration = available(&name, Duration::from_secs(2)).ok()?;
+            Some((name, registration))
         }) else {
             return Ok(None);
         };
@@ -292,20 +291,22 @@ impl ForwardChild {
                     &mut DeadlineIo {
                         inner: child.child.stdin.as_mut().unwrap(),
                         deadline,
-                        cancelled,
+                        cancelled: Some(cancelled),
                     },
                     request,
                 )?;
                 read_message::<Reply>(&mut DeadlineIo {
                     inner: child.child.stdout.as_mut().unwrap(),
                     deadline,
-                    cancelled,
+                    cancelled: Some(cancelled),
                 })
             })();
             match reply {
                 Ok(Reply::Approved(approved)) => return Ok((child, approved)),
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
-                Ok(Reply::Ready) => bail!("invalid destination setup response"),
+                Ok(Reply::Ready | Reply::Identity(_)) => {
+                    bail!("invalid destination setup response")
+                }
                 Err(error) => {
                     // Match ordinary bootstrap: a missing helper or an exec
                     // failure may retry setup once, before a copy is approved.
@@ -489,49 +490,12 @@ fn relay(
     result
 }
 
-fn wait_fd(
-    fd: std::os::fd::RawFd,
-    events: i16,
-    deadline: Instant,
-    cancelled: &impl Fn() -> bool,
-) -> std::io::Result<()> {
-    loop {
-        if cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "return request cancelled",
-            ));
-        }
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "return helper deadline expired",
-                )
-            })?;
-        let mut descriptor = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        let result =
-            unsafe { libc::poll(&mut descriptor, 1, left.as_millis().clamp(1, 100) as i32) };
-        if result > 0 {
-            return Ok(());
-        }
-        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-}
-struct DeadlineIo<'a, T, F> {
+struct DeadlineIo<'a, T> {
     inner: &'a mut T,
     deadline: Instant,
-    cancelled: &'a F,
+    cancelled: Option<&'a dyn Fn() -> bool>,
 }
-impl<T: Read + AsRawFd, F: Fn() -> bool> Read for DeadlineIo<'_, T, F> {
+impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         wait_fd(
             self.inner.as_raw_fd(),
@@ -542,7 +506,7 @@ impl<T: Read + AsRawFd, F: Fn() -> bool> Read for DeadlineIo<'_, T, F> {
         self.inner.read(bytes)
     }
 }
-impl<T: Write + AsRawFd, F: Fn() -> bool> Write for DeadlineIo<'_, T, F> {
+impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         wait_fd(
             self.inner.as_raw_fd(),
@@ -586,9 +550,7 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
             return Ok(0);
         }
         if self.pending.load(Ordering::Acquire) {
-            wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, &|| {
-                false
-            })?;
+            wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, None)?;
         }
         let count = self.inner.read(bytes)?;
         if count > 0 && !self.started {
@@ -627,7 +589,7 @@ fn receive() -> Result<i32> {
         let request: HelperRequest = read_message(&mut DeadlineIo {
             inner: &mut input,
             deadline: Instant::now() + Duration::from_secs(10),
-            cancelled: &|| false,
+            cancelled: None,
         })?;
         if request.version != HELPER_VERSION || request.identity != crate::identity::build() {
             bail!("return helper build mismatch");
@@ -962,7 +924,7 @@ mod tests {
         let error = read_message::<Reply>(&mut DeadlineIo {
             inner: &mut reader,
             deadline: Instant::now() + Duration::from_millis(20),
-            cancelled: &|| false,
+            cancelled: None,
         })
         .err()
         .unwrap();
@@ -973,7 +935,7 @@ mod tests {
         let error = read_message::<Reply>(&mut DeadlineIo {
             inner: &mut reader,
             deadline: Instant::now() + Duration::from_secs(60),
-            cancelled: &|| true,
+            cancelled: Some(&|| true),
         })
         .err()
         .unwrap();

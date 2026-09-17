@@ -1,0 +1,1 @@
+{ "name": "syq-dl", "private": true, "devDependencies": { "wrangler": "^4" } }

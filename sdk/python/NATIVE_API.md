@@ -21,8 +21,8 @@ and `AsyncClient(...)` accept:
 
 | Argument | Meaning |
 |---|---|
-| `executable` | Custom executable path, or name to find on `PATH`; default: managed syq |
-| `cache_dir` | Managed executable cache root |
+| `executable` | Custom executable path, or name to find on `PATH`; default: bundled syq |
+| `cache_dir` | Opt into a separately downloaded executable at this cache root |
 | `process_cwd` | Local subprocess working directory; default: inherit |
 | `env` | Subprocess environment mapping; default: inherit |
 | `timeout` | Operation timeout in seconds; default: no limit |
@@ -69,20 +69,25 @@ In addition to the shared arguments above, it accepts:
 
 | Options | Values / purpose |
 |---|---|
-| `from_`, `to` | SSH endpoint strings; omitted endpoints are local |
+| `from_`, `to` | SSH endpoint strings or `s3://BUCKET`; omitted endpoints are local |
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash`, `verify_only` | Boolean: mirror, preview, compare content, or verify without copying |
+| `integrity_checking` | Comma-separated string, e.g. `"compare=blake3,transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
+| `expected_digest` | `Digest` for one regular-file source; with mappings, set it on each `MappingEntry` instead |
 | `only_new`, `only_existing`, `skip_newer` | Boolean: copy missing entries, copy existing entries, or skip newer destination files |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |
 | `ignore_from` | Rule file path or iterable of paths; applied after `ignore` |
 | `preserve` | Preservation string or iterable of strings |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
-| `bwlimit`, `min_size`, `max_size` | Native rate/size strings or integers |
+| `min_size`, `max_size` | Native size strings or integer bytes |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
-| `connections` | Positive integer connection count |
+| `resource_limits` | Comma-separated ceilings, e.g. `"bandwidth=10M"` |
+| `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-max-concurrent-objects=32,s3-max-concurrent-parts-per-object=8,s3-part-size=16M"`; omitted means automatic |
+| `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
+| `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
 | `auth_from`, `via` | Credential source string; aliases, so use only one |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
@@ -94,16 +99,19 @@ In addition to the shared arguments above, it accepts:
 | `on_event`, `results`, `check` | See events and failures below |
 
 Option behavior is covered in [Copy files](https://greaber.github.io/syq/reference.html)
-and [Remote copy details](https://greaber.github.io/syq/remote-reference.html).
+[Remote copy details](https://greaber.github.io/syq/remote-reference.html),
+and [Object storage](https://greaber.github.io/syq/object-storage.html).
 
-The SDK passes `pscope` unchanged to the selected syq executable, which controls
-the scope and its background receivers. Ephemeral scopes in the current
-CLI reuse forward SSH connections only. For return copies or commands, establish
-durable persistence with `syq persist connect server` and omit `pscope`. This
-also applies to `AsyncClient` and to `rm`. If the SDK selects an older executable,
-its scope behavior still applies: syq 0.4.1 also enabled receiving in ephemeral
-scopes. See [connection persistence](https://greaber.github.io/syq/install.html#keep-connections-open)
-for lifetime, cleanup, and upgrade behavior, and
+For example, `client.cp("data", to="s3://bucket", into="backup",
+s3_header=["X-Tigris-Consistent: true"])` uploads local data using credentials
+from the subprocess environment or AWS configuration. S3 copies require one
+local endpoint. S3 results use `EndpointKind.S3`; older SDKs reject this new
+endpoint kind instead of interpreting it as SSH.
+
+`pscope` selects an isolated scope for reusing SSH connections. For return
+copies or commands, use `syq persist connect server` and omit `pscope`. See
+[persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes)
+for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility)
 for executable selection.
 
@@ -115,15 +123,12 @@ Typed remote-to-remote copies require an enrolled receiver or
 `bytes`, or `os.PathLike`). To interleave rule files and inline patterns:
 `ignore=[syq.IgnoreFrom("rules"), "!keep.tmp"]`. The last matching rule wins.
 
-With `only_new=True`, directories already present when syq first checks them
-keep their metadata. Missing children are still added.
-Adding children may naturally change directory timestamps. Directories copied
-as new receive normal copy metadata. When several sources supply the same new
-directory, the last source supplies its metadata, just as without
-`only_new=True`. Adding children to those existing
-directories requires write access; permissions are not temporarily widened.
-Permission failures are reported in the result and raise `SyqOperationError`
-unless `check=False`. A dry run does not test write permission.
+With `only_new=True`, existing directories keep their metadata while receiving
+missing children. They must be writable; syq does not change their permissions
+to add files. Adding children can change directory timestamps, and a dry run
+does not test write access. See the
+[overwrite policies](https://greaber.github.io/syq/reference.html#choose-which-existing-files-to-update)
+for interactions with other copy options.
 
 <a id="removal"></a>
 
@@ -136,7 +141,7 @@ Directory and contents selectors reject a final symlink even with following
 enabled.
 
 `rm(*sources, **options)` → [RmResult](https://greaber.github.io/syq/python-reference.html#rmresult) removes selected entries. Besides the shared
-arguments, it accepts `on`, `dry_run`, `connections`, `syq_path`,
+arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local and ordinary SSH endpoints. Command-restricted receivers
 reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
@@ -188,6 +193,33 @@ remain independent. `map(root=..., srcs_in=...)` carries the selected directory
 as the consuming copy's root. The copy resolves that root again; it does not
 inherit an open directory handle or a snapshot of the source tree.
 
+### Digest and HashAlgorithm
+
+`Digest(algorithm, value)` describes the expected digest of all bytes in one
+regular file. `algorithm` accepts a `HashAlgorithm` value or its string:
+`"blake3"`, `"sha256"`, `"md5"`, or `"xxh3-128"`. `value` is hexadecimal:
+64 digits for BLAKE3 and SHA-256, 32 for MD5 and XXH3-128. The immutable object
+validates the length and characters and stores lowercase hex.
+
+```python
+client.cp(
+    "data.bin", as_="verified.bin",
+    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+)
+```
+
+The expectation covers the complete resulting file, including reused bytes.
+A mismatch fails the file rather than reporting a successful copy. Files excluded
+by selection rules are not digest-verified. `hash=True` still controls whether
+existing contents are compared instead of trusting size and modification time;
+`integrity_checking="compare=HASH"` selects and enables content comparison;
+`hash=True` is a shorthand for `compare=blake3`.
+Dry runs preview changes without validating the expectation. An expected
+whole-file digest is independent of the algorithm used for block comparison or
+transport checks. MD5 and XXH3-128 are useful for compatibility
+and accidental-error detection, but do not provide cryptographic collision
+resistance. Receiver receipt digests continue to use BLAKE3.
+
 ### MappingEntry
 
 Frozen dataclass describing one source-to-destination mapping. Pass an iterable
@@ -200,10 +232,24 @@ of these to `cp(mapping=...)`; use `dataclasses.replace` to change an entry.
 | `kind` | `EntryKind` or `None` | Object kind, when known; default `None` |
 | `size` | `int` or `None` | Informational size in bytes; default `None` |
 | `mtime` | `int` or `None` | Informational modification time in Unix seconds; default `None` |
+| `expected_digest` | `Digest` or `None` | Expected whole-file digest; requires a regular file; default `None` |
 
-`MappingEntry(src, dst, kind=None, size=None, mtime=None)` also accepts text or
+`MappingEntry(src, dst, kind=None, size=None, mtime=None, expected_digest=None)` also accepts text or
 byte paths for `src` and `dst` and converts them to `RelativePath`. `size` and
-`mtime` do not impose preconditions on the copy.
+`mtime` do not impose preconditions on the copy. `expected_digest` does: a file
+cannot succeed unless its contents match. For example, an adapter can supply
+an MD5 from a DVC manifest without changing syq's ordinary comparison algorithm:
+
+```python
+entry = syq.MappingEntry(
+    "cache/object", "data.bin", kind="file",
+    expected_digest=syq.Digest("md5", "900150983cd24fb0d6963f7d28e17f72"),
+)
+client.cp(mapping=[entry], cwd="source", into="download")
+```
+
+Mapping files encode it as `"expected_digest": {"algorithm": "md5", "value": "..."}`.
+Older syq versions that do not support this field reject the mapping.
 
 ### RelativePath and PathValue
 
@@ -364,8 +410,8 @@ It withholds the terminal record if stream validation, process completion, or
 a callback fails. Sink failures raise and abort the operation.
 
 `OperationResult.is_retryable` identifies retryable failures; `retry_entry()`
-returns a `MappingEntry` when a complete mapping identity is available, otherwise
-`None`. Only use collected entries after the call returns a validated `success`
+preserves `expected_digest` and returns a `MappingEntry` when a complete mapping
+identity is available, otherwise `None`. Only use collected entries after the call returns a validated `success`
 or `partial` result. A terminal callback alone does not establish completion.
 The client does not retry automatically.
 
@@ -451,6 +497,7 @@ retryable: Retryability | None
 class_: ErrorClass | None
 os_kind: OsKind | None
 message: str | None
+expected_digest: Digest | None
 provenance: str | None
 scope: int | None
 code: ReceiptCode | None
@@ -590,7 +637,7 @@ operation from a broken results stream.
 
 | Exception | Meaning / useful attributes |
 |---|---|
-| `SyqInstallError` | Managed executable installation or verification failed |
+| `SyqInstallError` | Bundled executable is missing, or managed installation or verification failed |
 | `SyqInvocationError` | Invalid Python arguments |
 | `SyqOperationError` | Typed operation was unsuccessful; `.result` and `.stderr` (last 8 KiB) |
 | `SyqProtocolError` | Invalid, unsupported, inconsistent, or incomplete results; `.returncode`, `.stderr` |
@@ -604,11 +651,9 @@ Python exceptions. Exceptions from application callbacks or mapping iterators
 are re-raised unchanged. Async cancellation remains `asyncio.CancelledError`.
 These exceptions are not wrapped in `SyqError`.
 
-Timeout, cancellation, early mapping exit, and streaming failures terminate and
-reap the local process group, including SSH children. Closing a mapping whose
-producer has already exited still cleans up its children; the exited producer
-alone does not cause a cleanup permission error on macOS. Filesystem changes
-already completed are not rolled back.
+Timeout, cancellation, early mapping exit, and streaming failures stop the
+local process group, including SSH children. Filesystem changes already
+completed are not rolled back.
 
 <a id="deliberate-exclusions"></a>
 
@@ -671,17 +716,25 @@ Frozen dataclass returned by `run()` and held in `SyqProcessError.result`:
 
 ## Compatibility
 
-Python 3.10+ on Linux and macOS; no runtime Python dependencies. Each Python
+Python 3.13.4+ on Linux and macOS; no runtime Python dependencies. Each Python
 package uses the matching syq release. `syq.__version__` and
 `syq.PINNED_SYQ_VERSION` report those versions. Pin the package in your dependency
 file to keep the pairing.
 
+### Bundled executable
+
+By default, the SDK runs the executable installed with its Python wheel. It
+locates that executable through the package's installation record, without
+searching `PATH`, downloading files, or creating an executable cache. Each
+Python environment has its own installation. Removing the package also removes
+its executable.
+
 ### Managed executable
 
-The default client downloads the matching executable on first use and verifies
+For callers using a separate cache, `Client(cache_dir=...)` downloads the matching executable on first use and verifies
 it against the package's embedded release manifest. It checks the cached binary
 before every use and replaces missing or corrupt entries. It does not search
-`PATH`.
+`PATH`. The existing `syq.managed_executable()` API also keeps this behavior.
 
 The default cache is `$XDG_CACHE_HOME/syq/sdk/python/v<version>/` when
 `XDG_CACHE_HOME` is absolute, or `~/.cache/syq/sdk/python/v<version>/` otherwise.
@@ -691,7 +744,7 @@ Use `Client(cache_dir=...)` to change the cache root, or
 ### Custom executable
 
 `Client(executable="/opt/bin/syq")` uses that binary;
-`Client(executable="syq")` searches `PATH`. Overrides bypass managed download
+`Client(executable="syq")` searches `PATH`. Overrides bypass bundled selection and managed download
 and verification, so you are responsible for compatibility and origin. Typed
 calls still validate automation output. A failed executable selection does not
 fall back to another binary.

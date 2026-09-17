@@ -17,10 +17,10 @@ fn local_batch_boundary_and_scheduler_agree() {
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections",
-                connections,
+                "--performance-tuning",
+                &format!("workers={connections}"),
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 "--no-progress",
                 &t.s("src/"),
                 &t.s("dst/"),
@@ -61,9 +61,9 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=2",
+            "--performance-tuning=workers=2",
             "--block-size=4M",
-            "--tuning-options=request-size=4M",
+            "--performance-tuning=request-size=4M",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -84,14 +84,14 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
 
 #[test]
 fn checksum_and_paced_medium_files_keep_batches() {
-    for control in ["--checksum", "--bwlimit=1G"] {
+    for control in ["--checksum", "--resource-limits=bandwidth=1G"] {
         let t = Tmp::new();
         write(&t.path("src/file"), &prng(1 << 20, 80));
         let out = compat_command()
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections=1",
+                "--performance-tuning=workers=1",
                 "--no-progress",
                 control,
                 &t.s("src/"),
@@ -134,7 +134,7 @@ fn remote_medium_files_keep_batches() {
                 env!("CARGO_BIN_EXE_syq"),
                 "--syq-no-bootstrap",
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 &src,
                 &dst,
             ],
@@ -182,8 +182,20 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let mut changed = original;
     changed[..1 << 20].fill(b'c');
     write(&t.path("src/file"), &changed);
+    // ENOSPC can stop the companion before it completes. Reproduce that state
+    // deterministically and select ranges so the retry exercises partial reuse
+    // instead of the direct-copy fast path for multiple pending files.
+    if t.path("dst/small").exists() {
+        fs::remove_file(t.path("dst/small")).unwrap();
+    }
     let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .args([
+            "-a",
+            "--performance-tuning=copy-path=ranges",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "local")
@@ -194,7 +206,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let observed = tuning_observed(&out);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);
-    assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(partial_files(&t.path("dst")), partials);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -259,10 +271,32 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
 
     contents[..1 << 20].fill(b'x');
     write(&t.path("src/file"), &contents);
-    let resumed = run().run().unwrap();
+    // Keep the companion pending as it may be after ENOSPC, and explicitly
+    // select ranges to test reuse rather than the multi-file direct-copy path.
+    if t.path("dst/tiny").exists() {
+        fs::remove_file(t.path("dst/tiny")).unwrap();
+    }
+    let resumed = run()
+        .arg("--performance-tuning=copy-path=ranges")
+        .run()
+        .unwrap();
     assert_output_ok(&resumed);
-    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert_eq!(partial_files(&t.path("dst")), partials);
+    // Cleanup changes the containing directory's mtime. Check copied directory
+    // metadata before cleanup, and compare each payload independently of donors.
+    let source_dir = fs::metadata(t.path("src")).unwrap();
+    let destination_dir = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!(source_dir.mtime(), destination_dir.mtime());
+    assert_eq!(source_dir.mode() & 0o7777, destination_dir.mode() & 0o7777);
+    for name in ["file", "tiny"] {
+        assert_same_tree(
+            &t.path(&format!("src/{name}")),
+            &t.path(&format!("dst/{name}")),
+        );
+    }
+    run_native_ok(&["clean-partials", &t.s("dst")]);
     assert!(partial_files(&t.path("dst")).is_empty());
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 2);
     let observed = tuning_observed(&resumed);
     assert_eq!(observed["local_whole_files"], 0);
     assert!(observed["range_requests"].as_u64().unwrap() > 0);

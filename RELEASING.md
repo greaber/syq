@@ -46,8 +46,10 @@ registry setup and release procedure live in [`sdk/RELEASING.md`](sdk/RELEASING.
 ## Encrypted release inventory
 
 The committed `.env.release` file is the canonical release-credential
-inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64` and
-`HOMEBREW_TAP_DEPLOY_KEY`, plus the corresponding public
+inventory. It contains ciphertext for `SYQ_RELEASE_SIGNING_KEY_PEM_B64`,
+`HOMEBREW_TAP_DEPLOY_KEY`, and the `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` that deploy the download host in
+[`infra/syq-dl/`](infra/syq-dl/README.md), plus the corresponding public
 `SYQ_RELEASE_PUBLIC_KEY`. Its decryption authority lives only in the
 gitignored `.env.keys`. Forks receive the ciphertext but neither the
 decryption key nor official publishing authority.
@@ -149,6 +151,16 @@ activate publication. Validation and repository protections still apply.
 
 ## Cutting a release
 
+**Review before the next release**
+
+- [ ] Review the S3 concurrency controls introduced in PR #367 with the maintainer
+  before publishing them. The current names make the maximum and scope explicit
+  (`s3-max-concurrent-objects`, `s3-max-concurrent-parts-per-object`, and
+  `s3-max-concurrent-requests`), but their relationship to filesystem `workers`
+  still needs a usability review. Confirm or revise the names, per-object versus
+  shared scope, and help examples together with the Python SDK documentation.
+  This question was deliberately left open to allow the implementation to merge.
+
 Start with `scripts/release-readiness.py v<version>` (add `--json` for automation).
 Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
 2 means inspection failed. The report includes the candidate SHA, remote master,
@@ -161,8 +173,10 @@ For an already-prepared version with matching evidence, start at step 2. A new
 release request does not require another preparation PR or another test run.
 
 1. Update the package version in `Cargo.toml`, run `cargo check` to refresh
-   `Cargo.lock`, then run the normal locked checks to validate it. Write the
-   curated introduction and breaking-change notes in
+   `Cargo.lock`, then run the normal locked checks to validate it. Finalize the
+   `Unreleased` entry in `CHANGELOG.md` with the version and release date,
+   checking it against the changes since the previous release. Use that entry
+   to write the curated introduction and breaking-change notes in
    `.github/release-notes/v<version>.md`; the release workflow prepends that
    file to GitHub's generated contributor and change list. Merge the version
    and release notes through the protected branch. Peer compatibility is
@@ -247,9 +261,11 @@ release request does not require another preparation PR or another test run.
    directly targets the workflow commit, that this commit is reachable
    from protected `master`, that the `rust`, `sdks`, `macos`, `linux-arm64`,
    and `conformance` checks all succeeded on that exact commit, and that all three
-   full-suite workflow certifications succeeded. It then builds
-   static GNU Linux x86-64/ARM64
-   binaries and native macOS Apple Silicon/Intel binaries. In parallel it
+   full-suite workflow certifications succeeded. It then uses `flake.lock` and
+   the pinned Nix recipe to build static GNU Linux x86-64/ARM64 binaries and
+   native macOS Apple Silicon/Intel binaries once per target, with deterministic
+   gzip archives. The embedded public key must
+   match the repository variable. In parallel it
    compiles the source crate once. The protected publishing job repackages it
    without compiling and requires byte-for-byte equality with that validated
    artifact before any permanent publication. `cargo publish --no-verify`
@@ -286,7 +302,7 @@ release request does not require another preparation PR or another test run.
 
    ```sh
    gh attestation verify syq-linux-x86_64 --repo greaber/syq
-   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh -o install.sh
+   curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh -o install.sh
    less install.sh
    sh install.sh --bin-dir "$(mktemp -d)"
    brew install greaber/tap/syq

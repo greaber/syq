@@ -20,8 +20,8 @@ run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 run("ssh", "source", "syq-other-build persist destinations wait laptop --timeout 5")
 root = Path("/tmp/syq-real-ssh-receive")
 expected = run("ssh", "source", "cat /tmp/syq-real-ssh/return-source/message.txt")
-for name in ("laptop", "@laptop"):
-    target = "skew-explicit" if name.startswith("@") else "skew-bare"
+for name in ("@laptop",):
+    target = "skew-explicit"
     run("ssh", "source", shlex.join([
         "syq-other-build", "cp", "/tmp/syq-real-ssh/return-source/message.txt",
         "--to", name, "--as", target,
@@ -115,7 +115,7 @@ try:
     args = [binary, 'cp', '--srcs-in', base + '/ignore-source', '--ignore', '*.log',
             '--ignore', '!drop.tmp', '--ignore-from', path, '--ignore', '!allow.tmp',
             '--ignore-from', base + '/extra-rules', '--ignore', '!keep.cache',
-            '--to', 'laptop' if kind == 'stdin' else '@laptop', '--into', target,
+            '--to', '@laptop', '--into', target,
             '--prune', '--max-delete', '1']
     if kind == 'stdin':
         args.append('--follow')  # /dev/stdin is a symlink on Linux.

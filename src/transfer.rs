@@ -9,13 +9,15 @@ use crate::conn::{
     endpoint_error, ok, Conn, DataAddressSource, DataTransport, Endpoint, RemoteSpec,
     SshMultiplexer, TcpCandidate, TcpPairStats,
 };
-use crate::fsops::{content_digest, is_partial_name, join};
+#[cfg(test)]
+use crate::fsops::content_digest;
+use crate::fsops::{destination_fraction_matches, is_partial_name, is_recovery_name, join};
 pub(crate) use crate::mapping::validate_manifest_path;
 use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
-use crate::sched::{FileJob, Item, RangeHandle, Sched};
+use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched, WorkerJob};
 use crate::tune::{self, Gate};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -134,7 +136,7 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
         .tuning
         .request_size(opts.block, bwlimit, opts.restricted_receiver);
     let limit = opts.tuning.batch_bytes().min(request);
-    if cfg!(target_os = "linux") && opts.same_host && !opts.checksum && bwlimit.is_none() {
+    if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
     } else {
         limit
@@ -142,6 +144,9 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
 }
 
 pub struct Opts {
+    pub hash_policy: crate::hashing::HashPolicy,
+    pub expected_digest: Option<crate::hashing::Digest>,
+    pub mapping_expected_digests: std::collections::HashMap<PathBytes, crate::hashing::Digest>,
     pub block: u64,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
@@ -151,6 +156,7 @@ pub struct Opts {
     pub perms: bool,
     pub devices: bool,
     pub checksum: bool,
+    pub precise_mtime: bool,
     pub verify_only: bool,
     pub inplace: bool,
     pub same_host: bool,
@@ -163,7 +169,7 @@ pub struct Opts {
     pub quiet: bool,
     pub verbose: u8,
     pub umask: u32,
-    pub copy_id: std::sync::OnceLock<CopyId>,
+    pub copy_id: CopyId,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
     /// --delete: remove destination paths the source doesn't have (see Planner::plan_deletes).
@@ -180,13 +186,51 @@ pub struct Opts {
     pub preserve_existing_directory_metadata: bool,
     /// --existing: never create a destination path that doesn't exist.
     pub existing: bool,
-    /// Record the local rsync operator-path opt-out in the resume identity.
-    pub insecure_links: bool,
     /// Symlink policy for the operator-selected destination path.
     pub operator_symlink_policy: OperatorSymlinkPolicy,
     /// --max-size / --min-size: regular files outside the range are not transferred.
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+}
+
+impl Opts {
+    fn metadata_fix_flags(&self, source: &Entry, destination: &Entry) -> u8 {
+        let mut changes = 0;
+        if self.flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777 {
+            changes |= flags::MODE;
+        }
+        if self.flags & flags::OWNER != 0 && source.uid != destination.uid {
+            changes |= flags::OWNER;
+        }
+        if self.flags & flags::GROUP != 0 && source.gid != destination.gid {
+            changes |= flags::GROUP;
+        }
+        changes
+    }
+
+    fn metadata_matches(&self, source: &Entry, destination: &Entry) -> bool {
+        destination.kind == Kind::File
+            && destination.size == source.size
+            && self.flags & flags::TIMES != 0
+            && destination.mtime == source.mtime
+            && (!self.precise_mtime
+                || destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec))
+    }
+
+    fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
+        self.mapping_expected_digests
+            .get(path)
+            .or(self.expected_digest.as_ref())
+    }
+    fn copy_policy(&self, bandwidth_limited: bool) -> crate::copy_policy::CopyPolicy {
+        crate::copy_policy::CopyPolicy {
+            same_host: self.same_host,
+            // Payload checks do not disable same-host copy shortcuts.
+            checksum: self.checksum,
+            force_ranges: self.tuning.force_ranges(),
+            bandwidth_limited,
+        }
+    }
 }
 
 fn print_benchmark_observations(opts: &Opts) {
@@ -296,12 +340,29 @@ fn control_operator_symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
 /// Open a control connection. It bypasses the data-connection connect
 /// limiter: the scan, and therefore every worker, waits on it.
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
-    match ep {
+    let mut connection = match ep {
         Endpoint::Local { .. } => ep.connect_control(args.compress),
         Endpoint::Remote(spec) => spec
             .connect_with(args.compress, false)
             .map(|c| Box::new(c) as Box<dyn Conn>),
-    }
+    }?;
+    configure_hashing(
+        &mut *connection,
+        crate::hashing::HashPolicy {
+            algorithm: args.hash_algorithm,
+            transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
+        },
+    )?;
+    Ok(connection)
+}
+
+fn configure_hashing(connection: &mut dyn Conn, policy: crate::hashing::HashPolicy) -> Result<()> {
+    ok(
+        connection.call(Request::ConfigureHashing(policy))?,
+        "configure hashing",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn parse_ports(s: &str) -> Result<(u16, u16)> {
@@ -666,148 +727,6 @@ fn format_tcp_stats(pairs: &[TcpPairStats], has_ssh_data: bool) -> String {
     output
 }
 
-/// The canonical form of a path (symlinks and `..` resolved the way the kernel
-/// does), normalized by the endpoint that holds it. Used for the copy identity —
-/// so `host:dir`, `host:./dir` and `host:/home/u/dir` name one job.
-fn canonical_path(ctl: &mut dyn Conn, path: &[u8], remote: bool) -> Result<std::path::PathBuf> {
-    if !remote {
-        return Ok(crate::fsops::normalize(&crate::fsops::resolve(path)));
-    }
-    match ok(
-        ctl.call(Request::Canonicalize {
-            path: path.to_vec(),
-            guard: None,
-        })?,
-        "canonicalize",
-    )? {
-        Response::Path(p) => Ok(crate::fsops::resolve(&p)),
-        other => bail!("unexpected response {other:?}"),
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum DestinationIdentityPlan {
-    /// The command-restricted enrollment already supplied the canonical
-    /// parent plus literal placement leaf. No receiver observation is needed.
-    Enrolled(std::path::PathBuf),
-    /// Canonicalize the complete destination spelling.
-    Canonicalize(PathBytes),
-    /// Canonicalize only the parent, then restore the literal placement leaf.
-    CanonicalizeParent {
-        parent: PathBytes,
-        exact_path: PathBytes,
-    },
-}
-
-fn destination_identity_plan(
-    exact_native_destination: bool,
-    restricted_receiver: bool,
-    operator_dst_root: &[u8],
-    destination_path: &[u8],
-) -> DestinationIdentityPlan {
-    if exact_native_destination && restricted_receiver {
-        // Direct setup replaces the public operand with the enrolled
-        // destination: a canonical parent plus its literal leaf. The signed
-        // grant binds these same absolute bytes. Asking the receiver to
-        // canonicalize the parent would both be unnecessary and exceed the
-        // exact destination's observation scope.
-        DestinationIdentityPlan::Enrolled(crate::fsops::resolve(destination_path))
-    } else if exact_native_destination && operator_dst_root == b"~" {
-        // Bare `~` names HOME rather than a literal leaf named `~`. Resolve the
-        // complete spelling so that expansion happens, while ordinary exact
-        // destinations continue to preserve their final symlink as a leaf.
-        DestinationIdentityPlan::Canonicalize(operator_dst_root.to_vec())
-    } else if exact_native_destination {
-        DestinationIdentityPlan::CanonicalizeParent {
-            parent: parent_path(operator_dst_root),
-            exact_path: operator_dst_root.to_vec(),
-        }
-    } else {
-        DestinationIdentityPlan::Canonicalize(destination_path.to_vec())
-    }
-}
-
-/// Encode the content/metadata-affecting options into the copy identity.
-fn semantic_flags(opts: &Opts, args: &Args, srcs: &[Location]) -> String {
-    let source_modes: Vec<&str> = srcs
-        .iter()
-        .map(|source| match source.selection {
-            crate::cli::SourceSelection::Rsync => "rsync",
-            crate::cli::SourceSelection::Named => "named-follow",
-            crate::cli::SourceSelection::Contents => "contents-follow",
-            crate::cli::SourceSelection::NamedNoFollow => "named-no-follow",
-            crate::cli::SourceSelection::File => "file",
-            crate::cli::SourceSelection::Directory => "directory",
-        })
-        .collect();
-    let mut flags = serde_json::json!({
-        "partial_format": 1,
-        "recursive": opts.recursive,
-        "links": opts.links,
-        "perms": opts.flags & flags::MODE != 0,
-        "times": opts.flags & flags::TIMES != 0,
-        "group": opts.flags & flags::GROUP != 0,
-        "owner": opts.flags & flags::OWNER != 0,
-        "devices": opts.devices,
-        "inplace": args.inplace,
-        "block_size": opts.block,
-        "ignore": opts.ignore,
-    });
-    // Keep the established compatibility identity byte-for-byte stable so an
-    // upgrade does not orphan resumable sidecars.
-    if srcs
-        .iter()
-        .any(|source| source.selection != crate::cli::SourceSelection::Rsync)
-    {
-        flags["source_modes"] = serde_json::json!(source_modes);
-    }
-    if opts.insecure_links {
-        flags["insecure_links"] = serde_json::json!(true);
-    }
-    flags.to_string()
-}
-
-/// The endpoint half of a copy identity: `user@host[:port]` (the user and an
-/// explicit port matter — they may select different filesystems), or `local`.
-fn endpoint_identity(l: &Location) -> String {
-    match (&l.user, &l.host) {
-        (_, None) => "local".into(),
-        (user, Some(host)) => {
-            // Preserve the established portless identity byte-for-byte. A
-            // port-qualified native endpoint gets a distinct, unambiguous
-            // spelling; IPv6 needs brackets before the port separator.
-            let host = match l.port {
-                Some(port) if host.contains(':') => format!("[{host}]:{port}"),
-                Some(port) => format!("{host}:{port}"),
-                None => host.clone(),
-            };
-            match user {
-                Some(user) => format!("{user}@{host}"),
-                None => host,
-            }
-        }
-    }
-}
-
-/// Keep existing partial identities unchanged for UTF-8 paths, while giving
-/// native raw-byte paths a lossless and unambiguous spelling.
-pub(crate) fn path_identity(path: &std::path::Path) -> String {
-    if let Some(path) = path.to_str() {
-        return path.to_string();
-    }
-    use std::fmt::Write as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    let bytes = path.as_os_str().as_bytes();
-    let mut encoded = String::with_capacity(15 + bytes.len() * 2);
-    // NUL cannot occur in a Unix pathname, so no valid UTF-8 path can collide
-    // with this encoded namespace.
-    encoded.push_str("\0unix-path-hex:");
-    for byte in bytes {
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
-}
-
 struct DestinationRoot<'a> {
     path: &'a [u8],
     existed: bool,
@@ -849,63 +768,6 @@ pub(crate) fn validate_native_source_type(
         | SourceSelection::Directory
         | SourceSelection::Contents => Ok(()),
     }
-}
-
-fn resolve_copy_identity(
-    args: &Args,
-    srcs: &[Location],
-    dst: &Location,
-    src_ctl: &mut dyn Conn,
-    dst_ctl: &mut dyn Conn,
-    dst_canonical: Option<std::path::PathBuf>,
-    opts: &Opts,
-) -> Result<String> {
-    // Relative native bases and selectors get their meaning from the source
-    // endpoint's process cwd. Identify that already-held cwd separately;
-    // never canonicalize the registered selection after it has been pinned.
-    let src_roots: Vec<(String, bool)> = if args.interface == Interface::NativeCp {
-        source_identity_parts(args, srcs, src_ctl)?
-    } else {
-        srcs.iter()
-            .map(|source| {
-                let path = canonical_path(src_ctl, &source.path, source.is_remote())?;
-                Ok((path_identity(&path), source.copies_contents()))
-            })
-            .collect::<Result<_>>()?
-    };
-    let dst_root = match dst_canonical {
-        Some(path) => path,
-        None => canonical_path(dst_ctl, &dst.path, dst.is_remote())?,
-    };
-    let dst_root = path_identity(&dst_root);
-    Ok(crate::resume::copy_identity(
-        &endpoint_identity(&srcs[0]),
-        &src_roots,
-        &endpoint_identity(dst),
-        &dst_root,
-        &semantic_flags(opts, args, srcs),
-    ))
-}
-
-/// The job-identity inputs that do not depend on the destination endpoint:
-/// what a small push sends so the receiver can finish the identity with the
-/// canonical destination it resolves.
-fn source_identity_parts(
-    args: &Args,
-    srcs: &[Location],
-    src_ctl: &mut dyn Conn,
-) -> Result<Vec<(String, bool)>> {
-    let native_endpoint_cwd =
-        canonical_path(src_ctl, b".", srcs[0].is_remote()).map(|path| path_identity(&path))?;
-    Ok(srcs
-        .iter()
-        .map(|source| {
-            (
-                native_source_identity(args, source, &native_endpoint_cwd),
-                source.copies_contents(),
-            )
-        })
-        .collect())
 }
 
 /// Mode a fresh destination file is created with: the source mode under -p,
@@ -963,6 +825,7 @@ fn small_copy_eligible(
         && !args.delete
         && !args.update
         && !args.checksum
+        && args.expected_digest.is_none()
         && !args.ignore_existing
         && !args.existing
         && !args.stats
@@ -1086,6 +949,31 @@ fn attempt_small_copy(
             len: entry.size as u32,
         })
         .collect();
+    configure_hashing(&mut *reader, opts.hash_policy)?;
+    let native_actor = progress
+        .observations
+        .enabled
+        .load(Relaxed)
+        .then(|| progress.observations.workers.actor("worker"));
+    if let Some(actor) = &native_actor {
+        if reader
+            .observe(&progress.observations, actor, true, 0)
+            .is_err()
+        {
+            return Ok(SmallCopy::Declined);
+        }
+        if dst_ctl
+            .observe(&progress.observations, actor, false, 0)
+            .is_err()
+        {
+            // Nothing has been copied yet. Reopen the control connection before
+            // entering the ordinary transfer path; never use lost framing.
+            return Ok(SmallCopy::Reconnect);
+        }
+    }
+    let _native_work = native_actor
+        .as_ref()
+        .map(|a| a.span(crate::transfer_observations::Stage::Work));
     let copying = progress.copying_interval();
     let mut blocks = if reads.is_empty() {
         Vec::new()
@@ -1102,7 +990,7 @@ fn attempt_small_copy(
     let mut files = Vec::with_capacity(srcs.len());
     for (entry, (dst_path, _, _)) in entries.iter().zip(&targets) {
         let (data, hash) = if entry.size == 0 {
-            (Vec::new(), content_digest(&[]))
+            (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
         } else {
             match blocks.next() {
                 Some(Ok(block)) if block.data.len() as u64 == entry.size => {
@@ -1128,11 +1016,8 @@ fn attempt_small_copy(
         symlink_policy: opts.operator_symlink_policy,
         request_prefix,
         identity: SmallCopyIdentity {
-            src_endpoint: endpoint_identity(&srcs[0]),
-            src_roots: source_identity_parts(args, srcs, src_ctl)?,
-            dst_endpoint: endpoint_identity(dst),
+            copy_id: opts.copy_id,
             dst_leaf,
-            semantic_flags: semantic_flags(opts, args, srcs),
         },
         flags,
         files,
@@ -1344,6 +1229,11 @@ fn attempt_small_copy(
         deletions_completed: None,
         deletions_blocked: None,
     };
+    if progress.observations.enabled.load(Relaxed) {
+        reader.transport_stats();
+        dst_ctl.transport_stats();
+    }
+    drop(_native_work);
     progress.finish(exit_code == 0);
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
@@ -1352,6 +1242,13 @@ fn attempt_small_copy(
         results.emit_result(&terminal);
     }
     Ok(SmallCopy::Done(exit_code))
+}
+
+fn show_statistics(args: &Args) -> bool {
+    // Restricted coordinators suppress their outcome summary because the
+    // invoking machine prints the verified receipt. That receipt does not
+    // contain diagnostics, so requested statistics still come from here.
+    !args.suppress_summary || args.restricted_grant.is_some()
 }
 
 /// The one summary line a completed copy prints, rendered from the same
@@ -1376,32 +1273,6 @@ fn print_transfer_summary(terminal: &crate::results::ResultRecord, elapsed: f64,
             String::new()
         }
     );
-}
-
-/// Native source authority is the pinned endpoint-side base plus the raw
-/// operator selector. Do not canonicalize the selector again after source
-/// registration: doing so could observe a different namespace identity from
-/// the descriptor-backed one the transfer actually uses.
-fn native_source_identity(args: &Args, source: &Location, endpoint_cwd: &str) -> String {
-    let (base_kind, base) = if let Some(path) = args.native_source_root.as_deref() {
-        ("root", Some(path))
-    } else if let Some(path) = args.native_source_cwd.as_deref() {
-        ("cwd", Some(path))
-    } else {
-        ("endpoint-cwd", None)
-    };
-    serde_json::json!({
-        "native_source_identity": 1,
-        "endpoint_cwd": endpoint_cwd,
-        "base_kind": base_kind,
-        "base": base.map(path_bytes_identity),
-        "selector": path_bytes_identity(&source.path),
-    })
-    .to_string()
-}
-
-fn path_bytes_identity(path: &[u8]) -> String {
-    path_identity(std::path::Path::new(OsStr::from_bytes(path)))
 }
 
 #[derive(Clone, Debug)]
@@ -1507,6 +1378,13 @@ pub fn run(mut args: Args) -> Result<i32> {
         args.width,
         !args.quiet && args.progress_json,
     );
+    if args.stats || debug() {
+        progress
+            .observations
+            .human_summary
+            .store(show_statistics(&args), Relaxed);
+        progress.observations.enable();
+    }
     // The detach and remote-coordinator combinations were refused at
     // argument parsing (exit 2, no stream); every request that reaches this
     // point settles with a terminal record.
@@ -1860,6 +1738,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let opts = Arc::new(Opts {
+        hash_policy: crate::hashing::HashPolicy {
+            algorithm: args.hash_algorithm,
+            transfer_integrity: args.transfer_integrity,
+            transfer_hash_type: args.transfer_hash_type,
+        },
+        expected_digest: args.expected_digest.clone(),
+        mapping_expected_digests: mapping_entries
+            .as_ref()
+            .map(|(entries, _)| {
+                entries
+                    .iter()
+                    .filter_map(|(_, entry)| {
+                        entry
+                            .expected_digest
+                            .clone()
+                            .map(|digest| (entry.dst.clone(), digest))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         block,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
@@ -1872,6 +1770,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         perms: args.perms,
         devices: args.devices,
         checksum: args.checksum,
+        precise_mtime: !matches!(args.placement, Placement::Rsync),
         verify_only: args.verify_only,
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
@@ -1882,7 +1781,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
         umask: crate::fsops::process_umask(),
-        copy_id: std::sync::OnceLock::new(),
+        copy_id: crate::resume::fresh_copy_id()?,
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
         delete_excluded: args.delete_excluded,
@@ -1891,25 +1790,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         ignore_existing: args.ignore_existing,
         preserve_existing_directory_metadata: args.only_new_native_entries(),
         existing: args.existing,
-        insecure_links: rsync_insecure_links(&args, !src_ep.is_remote()),
         operator_symlink_policy: destination_operator_symlink_policy(&args, !dst_ep.is_remote()),
         max_size,
         min_size,
     });
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning: request-size={} bytes (ordinary, after pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}, job-storage={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.tuning.batch_files.map(|n| n.to_string()).unwrap_or_else(|| "adaptive(128/512)".into()),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
-            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
+            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }, opts.tuning.job_storage()
         );
     }
     let mapping_contents = args.mapping_contents.clone();
-    let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
+    let sched = Arc::new(Sched::with_job_storage(
+        block,
+        opts.tuning.split_min_size(block),
+        opts.tuning.job_storage(),
+    ));
 
     // Workers connect on their own threads once the control connections are
     // up: everything waits on those, so they must never compete with worker
@@ -1952,7 +1854,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             connect_after_file_plan.clone(),
         );
         let compress = args.compress;
-        let collect_tcp_stats = args.stats;
+        let collect_tcp_stats = progress.observations.enabled.load(Relaxed);
         Arc::new(move |id: usize| {
             let (
                 src_ep,
@@ -2015,11 +1917,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let conns = src_ep
                         .connect_with_sources(compress, initial_sources.clone(), reuse_control)
                         .and_then(|src| {
-                            let copy_sources = if cfg!(target_os = "linux") && opts.same_host {
-                                initial_sources.clone()
-                            } else {
-                                Vec::new()
-                            };
+                            let copy_sources =
+                                if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
+                                    initial_sources.clone()
+                                } else {
+                                    Vec::new()
+                                };
                             Ok((
                                 src,
                                 dst_ep.connect_with_copy_capabilities(
@@ -2073,8 +1976,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         opts: opts.clone(),
                         bwlimit: bwlimit.clone(),
                         gate: gate.clone(),
-                        t: [0.0; 4],
-                        fast: FastTiming::default(),
+                        observation: None,
                         benchmark: Default::default(),
                         fast_batch_files,
                         setup_elapsed: t0.elapsed(),
@@ -2211,7 +2113,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // source capabilities from the source endpoint's broker before reporting
     // ready. These are foreign-session claims even when both logical endpoints
     // are local to the coordinator process.
-    let copy_local_claim_workers = if cfg!(target_os = "linux") && opts.same_host {
+    let copy_local_claim_workers = if opts.copy_policy(bwlimit.is_some()).receiver_source_claims() {
         maximum_workers
     } else {
         0
@@ -2226,6 +2128,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         source_shared_workers,
         source_independent_handoff_workers,
     )?;
+    if args.expected_digest.is_some() {
+        let entry = stat_one_registered(
+            &mut *src_ctl,
+            &srcs[0].path,
+            &registered_sources[0].selection,
+            false,
+        )?;
+        if !entry.is_some_and(|entry| entry.kind == Kind::File) {
+            bail!("--expected-hash requires one regular source file");
+        }
+    }
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
@@ -2291,57 +2204,33 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // (lexically only; symlinks stay the self-copy guard's business) keeps
     // `dst`, `dst/`, `dst/.` and `dst//` from producing keys that disagree.
     let operator_dst_root = clean_root(&dst.path);
-    // Exact native placement names a directory entry, so its identity is the
-    // canonical parent plus the operator-supplied leaf. Ordinary endpoints
-    // compute that form here; restricted setup already supplied and signed
-    // it. Canonicalizing the whole path would dereference an existing leaf
-    // symlink and give the self-copy guard and resumable-copy identity the
-    // wrong destination.
-    let exact_native_destination =
-        args.interface != Interface::Rsync && args.placement == Placement::As;
-    let expand_exact_home =
-        exact_native_destination && args.restricted_grant.is_none() && operator_dst_root == b"~";
-    let identity_plan = destination_identity_plan(
-        exact_native_destination,
-        args.restricted_grant.is_some(),
-        &operator_dst_root,
-        &dst.path,
-    );
-    let (dst_root_entry, dst_canonical) = match identity_plan {
-        DestinationIdentityPlan::Enrolled(canonical) => (
-            stat_one(&mut *dst_ctl, &operator_dst_root, false)?,
-            canonical,
-        ),
-        DestinationIdentityPlan::Canonicalize(path) => {
-            stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &path, dst.is_remote())?
-        }
-        DestinationIdentityPlan::CanonicalizeParent { parent, exact_path } => {
-            let (entry, mut canonical) =
-                stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root, &parent, dst.is_remote())?;
-            append_final_component(&mut canonical, &exact_path);
-            (entry, canonical)
-        }
-    };
-    // Rsync retains its destination-directory compatibility rule. Native
-    // container placement keeps the named symlink by default or resolves its
-    // complete chain under the destination follow policy. Exact native
-    // placement always selects the final directory entry; destination
-    // following applies only to its parent path.
-    let (dst_root, mut dst_root_entry) = match args.interface {
-        Interface::Rsync => follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, dst_root_entry)?,
-        _ if expand_exact_home => (
-            dst_canonical.as_os_str().as_bytes().to_vec(),
-            dst_root_entry,
-        ),
-        _ if args.follows_native_destination_paths() && args.placement == Placement::Into => {
+    // Only exact placement onto bare `~` needs the receiver's canonical
+    // spelling: it names HOME rather than a literal leaf. Other placements
+    // keep the operator's spelling; registration handles their path policy.
+    let expand_exact_home = args.interface != Interface::Rsync
+        && args.placement == Placement::As
+        && args.restricted_grant.is_none()
+        && operator_dst_root == b"~";
+    let (dst_root, mut dst_root_entry) = if expand_exact_home {
+        let (entry, canonical) = stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root)?;
+        (canonical.as_os_str().as_bytes().to_vec(), entry)
+    } else {
+        let entry = stat_one(&mut *dst_ctl, &operator_dst_root, false)?;
+        // Rsync retains its destination-directory compatibility rule. Native
+        // container placement follows links only under the destination policy;
+        // exact placement preserves the final directory entry.
+        if args.interface == Interface::Rsync {
+            follow_dir_symlink(&mut *dst_ctl, &operator_dst_root, entry)?
+        } else if args.follows_native_destination_paths() && args.placement == Placement::Into {
             follow_container_symlink(
                 &mut *dst_ctl,
                 &operator_dst_root,
-                dst_root_entry,
+                entry,
                 args.target_existence != Existence::Existing,
             )?
+        } else {
+            (operator_dst_root.clone(), entry)
         }
-        _ => (operator_dst_root.clone(), dst_root_entry),
     };
     if debug() {
         crate::output::diagnostic!(
@@ -2615,39 +2504,79 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // (or is beneath) a source directory, the scanner would discover the
     // freshly-created destination and recurse. Compare the exact source and
     // retained destination descriptors; never re-resolve either operator
-    // pathname for this decision.
+    // pathname for this decision. The descriptor handoff requires one kernel,
+    // so attempt it only for local paths or matching SSH endpoints.
     let same_machine = (!srcs[0].is_remote() && !dst.is_remote())
         || (srcs[0].is_remote() && dst.is_remote() && srcs[0].same_host(dst));
+    let mut prune_overlap_unsearchable = false;
     if same_machine {
         let roots = source_roots.get().expect("source roots registered");
         let mut source_checks = Vec::new();
         let mut ancestry_checks = Vec::new();
+        let may_prune = opts.delete
+            && roots
+                .iter()
+                .any(|root| root.selection.relative().is_empty());
+        let primary_suffix = if expand_exact_home || dst_is_dir {
+            Vec::new()
+        } else {
+            operator_dst_root
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default()
+                .to_vec()
+        };
+        let prune_suffixes: Vec<_> = if may_prune {
+            srcs.iter()
+                .zip(roots)
+                .filter(|(_, root)| root.selection.relative().is_empty())
+                .map(|(candidate, _)| {
+                    if candidate.copies_contents()
+                        || args.files_from.is_some()
+                        || args.placement == Placement::As
+                    {
+                        primary_suffix.clone()
+                    } else {
+                        join(&primary_suffix, &candidate.basename())
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (source_index, (source, root)) in srcs.iter().zip(roots).enumerate() {
             // Registration represents every selected directory as an empty
             // path beneath that directory descriptor. Exact files and
-            // symlinks retain a non-empty leaf and cannot recurse.
-            if !root.selection.relative.is_empty() {
+            // symlinks cannot recurse, but pruning another source's copied
+            // directory must not remove an exact source selected beneath it.
+            let source_is_directory = root.selection.relative().is_empty();
+            if !source_is_directory && !may_prune {
                 continue;
             }
-            let primary_suffix = if expand_exact_home || dst_is_dir {
-                Vec::new()
-            } else {
-                operator_dst_root
-                    .rsplit(|byte| *byte == b'/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_vec()
-            };
-            let mut suffixes = vec![primary_suffix];
+            let mut suffixes = vec![primary_suffix.clone()];
             if dst_is_dir && !source.copies_contents() && args.files_from.is_none() {
                 let basename = source.basename();
                 if !basename.is_empty() {
                     suffixes.push(basename);
                 }
             }
-            source_checks.push((source_index, suffixes.len()));
+            // Recursion checks include the destination container, but prune
+            // overlap checks apply only to copied directory roots. Compare
+            // every selected source with every such root: one source's prune
+            // must not remove another selected source.
+            for suffix in &prune_suffixes {
+                if !suffixes.contains(suffix) {
+                    suffixes.push(suffix.clone());
+                }
+            }
+            let checked_for_prune = suffixes
+                .iter()
+                .map(|suffix| prune_suffixes.contains(suffix))
+                .collect::<Vec<_>>();
+            source_checks.push((source_index, checked_for_prune));
             ancestry_checks.push(DirectoryAncestryCheck {
                 source_root: root.ticket.clone(),
+                source_is_directory,
                 suffixes,
             });
         }
@@ -2664,20 +2593,34 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source_checks.len()
             );
         }
-        for ((source_index, expected_relations), relations) in
+        for ((source_index, checked_for_prune), relations) in
             source_checks.into_iter().zip(relations)
         {
-            if relations.len() != expected_relations {
+            if relations.len() != checked_for_prune.len() {
                 bail!(
                     "destination returned {} ancestry results for {} effective paths",
                     relations.len(),
-                    expected_relations
+                    checked_for_prune.len()
                 );
             }
             let source = &srcs[source_index];
-            for relation in relations {
+            for (relation, checks_prune) in relations.into_iter().zip(checked_for_prune) {
                 match relation {
                     DirectoryRelation::Separate => {}
+                    DirectoryRelation::SourceUnsearchable => {
+                        if checks_prune {
+                            prune_overlap_unsearchable = true;
+                            progress.error(&format!(
+                                "syq: cannot check pruning overlap for source {}: a source ancestor cannot be searched",
+                                display(&source.path)
+                            ));
+                        }
+                    }
+                    DirectoryRelation::Ancestor if !checks_prune => {}
+                    DirectoryRelation::Ancestor => bail!(
+                        "cannot prune destination {:?}: it contains source {:?}",
+                        display(&dst.path), display(&source.path)
+                    ),
                     DirectoryRelation::Same => bail!(
                         "source and destination are the same directory {:?}",
                         display(&source.path)
@@ -2691,21 +2634,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    let identity = resolve_copy_identity(
-        &args,
-        srcs,
-        dst,
-        &mut *src_ctl,
-        &mut *dst_ctl,
-        Some(dst_canonical),
-        &opts,
-    )?;
-    opts.copy_id
-        .set(crate::resume::copy_id(&identity))
-        .expect("partial identity set once");
     if debug() {
         crate::output::diagnostic!(
-            "syq: copy identity complete at {:.2}s",
+            "syq: source/destination ancestry checked at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -2937,10 +2868,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         destination_tree_known_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
-        dry_run_replaced_dirs: std::collections::HashSet::new(),
+        blocked_directory_paths: std::collections::HashSet::new(),
         payload_paths: std::collections::HashMap::new(),
         sidecar_paths: std::collections::HashMap::new(),
-        live_sidecars: Vec::new(),
         unusable_files: std::collections::HashSet::new(),
         deferred_payloads: Vec::new(),
         source_partials: 0,
@@ -3216,13 +3146,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 let (multiplex_small_files, file_jobs, file_bytes, all_tiny) = {
                     let jobs = sched.jobs.lock().unwrap();
-                    (
+                    let summary = (
                         !opts.verify_only
                             && !opts.tuning.force_ranges()
                             && bwlimit.is_none()
-                            && jobs.iter().all(|job| {
+                            && jobs.iter().enumerate().all(|(idx, job)| {
                                 job.entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref())
-                                    && job.dst_entry.is_none()
+                                    && jobs.destination(idx).is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any
                                             && job.container_guard.is_none()))
@@ -3232,7 +3162,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             .fold(0u64, |sum, job| sum.saturating_add(job.entry.size)),
                         jobs.iter()
                             .all(|job| job.entry.size <= FAST_BATCH_TINY_BYTES),
-                    )
+                    );
+                    summary
                 };
                 if multiplex_small_files {
                     for spec in [&src_ep, &dst_ep]
@@ -3252,14 +3183,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the first worker wakes the tuner to restore the ordinary
                     // local starting count immediately.
                     let single_direct_candidate = autotune
-                        && !opts.tuning.force_ranges()
-                        && opts.same_host
-                        && !opts.checksum
+                        && opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
                         && !opts.verify_only
-                        && bwlimit.is_none()
                         && {
                             let jobs = sched.jobs.lock().unwrap();
-                            matches!(jobs.as_slice(), [job] if job.container_guard.is_none())
+                            jobs.len() == 1 && jobs[0].container_guard.is_none()
                         };
                     let mut initial = if multiplex_small_files {
                         initial_fast_workers(
@@ -3376,6 +3304,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if st.scan_warned {
             delete_plan = DeletePlan::Skipped("source scan errors");
             progress.eprintln("syq: source scan reported errors; skipping deletions");
+        } else if prune_overlap_unsearchable {
+            delete_plan = DeletePlan::Skipped("source ancestry could not be checked");
+            progress.eprintln("syq: source ancestry could not be checked; skipping deletions");
+        } else if progress.errors.load(Relaxed) != 0 {
+            delete_plan = DeletePlan::Skipped("copy errors");
+            progress.eprintln("syq: copy reported errors; skipping deletions");
         } else {
             match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
                 Ok(()) if st.delete_walk_failed => {
@@ -3614,7 +3548,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && !args.quiet && !opts.verify_only && !opts.dry_run {
+    if args.stats && show_statistics(&args) && !args.quiet && !opts.verify_only && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -3764,20 +3698,11 @@ fn hold_after_target_precondition_for_test(args: &Args) -> Result<()> {
     if args.interface != Interface::Rsync || args.target_existence == Existence::Any {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_TARGET_PRECONDITION_READY_FILE") {
-        std::fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write target-precondition-ready signal {}",
-                std::path::Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_TARGET_PRECONDITION_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    crate::fsops::test_race_barrier(
+        "SYQ_TEST_TARGET_PRECONDITION_READY_FILE",
+        "SYQ_TEST_TARGET_PRECONDITION_CONTINUE_FILE",
+        "target precondition",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -4111,6 +4036,12 @@ fn prepare_existing_destination(
     Ok((selection, filesystem, anchor))
 }
 
+fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'/').then_some(&path[..index]))
+}
+
 fn parent_path(path: &[u8]) -> PathBytes {
     match path.iter().rposition(|byte| *byte == b'/') {
         Some(0) => b"/".to_vec(),
@@ -4119,42 +4050,21 @@ fn parent_path(path: &[u8]) -> PathBytes {
     }
 }
 
-/// Append the final raw component of `path` to an already-canonicalized
-/// parent. Native exact placement deliberately treats this component as a
-/// directory entry rather than resolving through it.
-fn append_final_component(parent: &mut std::path::PathBuf, path: &[u8]) {
-    let component = path
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .filter(|component| !component.is_empty());
-    if let Some(component) = component {
-        parent.push(OsStr::from_bytes(component));
-    }
-}
-
 /// Fetch the destination root's entry and canonical spelling in one network
 /// turn. They are independent read-only queries; sending both before waiting
-/// avoids an otherwise unnecessary RTT on every remote copy.
+/// avoids an extra RTT when expanding a remote bare-home destination.
 fn stat_and_canonicalize(
     conn: &mut dyn Conn,
-    stat_path: &[u8],
-    canonical_path: &[u8],
-    remote: bool,
+    path: &[u8],
 ) -> Result<(Option<Entry>, std::path::PathBuf)> {
-    if !remote {
-        return Ok((
-            stat_one(conn, stat_path, false)?,
-            crate::fsops::normalize(&crate::fsops::resolve(canonical_path)),
-        ));
-    }
     conn.send(Request::StatMany {
-        paths: vec![stat_path.to_vec()],
+        paths: vec![path.to_vec()],
         sources: None,
         follow: false,
         guard: None,
     })?;
     conn.send(Request::Canonicalize {
-        path: canonical_path.to_vec(),
+        path: path.to_vec(),
         guard: None,
     })?;
     // Consume both replies before interpreting either endpoint error so the
@@ -4333,7 +4243,8 @@ fn metadata_differs(source: &Entry, destination: &Entry, flags: u8) -> bool {
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
-            && (source.mtime, source.mtime_nsec) != (destination.mtime, destination.mtime_nsec))
+            && (source.mtime != destination.mtime
+                || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
 }
 
 fn publication_metadata_flags(requested: u8) -> u8 {
@@ -4710,10 +4621,9 @@ struct Planner<'a> {
     /// (or aren't directories); --ignore-existing: an existing non-directory
     /// sits at their path. Nothing under them is touched.
     missing_dirs: std::collections::HashSet<PathBytes>,
-    /// Directories that a dry run would create over destination leaves. Until
-    /// that virtual replacement exists, lstat would follow an old in-tree
-    /// symlink in an intermediate component and inspect the wrong subtree.
-    dry_run_replaced_dirs: std::collections::HashSet<PathBytes>,
+    /// Directory copies blocked by a destination file or symlink. The conflict
+    /// is reported at the parent; its descendants must not be copied.
+    blocked_directory_paths: std::collections::HashSet<PathBytes>,
     /// Once syq has observed a missing remote destination root, every mapped
     /// path is missing too. Avoid WAN round trips for impossible descendants;
     /// local stats stay cheap and warm filesystem metadata for the writers.
@@ -4723,10 +4633,6 @@ struct Planner<'a> {
     /// Ordinary payload names cannot collide and do not need to stay in RAM.
     payload_paths: std::collections::HashMap<PathBytes, String>,
     sidecar_paths: std::collections::HashMap<PathBytes, String>,
-    /// The keys of sidecar_paths, kept past finish_planning only for --delete
-    /// (sorted, binary-searched: one path per regular file is the dominant
-    /// resident cost of --delete on huge trees, so keep it lean).
-    live_sidecars: Vec<PathBytes>,
     /// Files whose destination cannot accommodate a safe sidecar name. They
     /// fail individually while the rest of the scan and transfer continue.
     unusable_files: std::collections::HashSet<PathBytes>,
@@ -4818,6 +4724,179 @@ enum Claim {
     /// A symlink or special file syq intends to create.
     Leaf,
     Weak,
+}
+
+/// A failed entry's result identity, with a source path only in mapping mode.
+struct FailedEntry<'a> {
+    dst: &'a [u8],
+    src: Option<&'a [u8]>,
+    kind: Option<DeclaredKind>,
+}
+
+/// Keep destination-only candidates, borrowing source claim paths instead of
+/// copying every destination spelling. Exact matches are discarded as scanned.
+struct PruneWalk<'a> {
+    seen: &'a std::collections::HashMap<PathBytes, Claim>,
+    unmatched: std::collections::HashSet<&'a PathBytes>,
+    entries: Vec<Entry>,
+    shielded: std::collections::HashSet<PathBytes>,
+    recovery_parents: std::collections::HashSet<PathBytes>,
+}
+
+impl<'a> PruneWalk<'a> {
+    fn new(
+        seen: &'a std::collections::HashMap<PathBytes, Claim>,
+        root: &[u8],
+        sorted: Option<&[&'a PathBytes]>,
+    ) -> Self {
+        Self {
+            seen,
+            unmatched: match sorted {
+                Some(paths) => {
+                    let mut prefix = root.to_vec();
+                    if !prefix.ends_with(b"/") {
+                        prefix.push(b'/');
+                    }
+                    let start = paths.partition_point(|path| path.as_slice() < prefix.as_slice());
+                    paths[start..]
+                        .iter()
+                        .copied()
+                        .take_while(|path| path.starts_with(&prefix))
+                        .collect()
+                }
+                None => seen
+                    .keys()
+                    .filter(|path| path_is_inside(path, root))
+                    .collect(),
+            },
+            entries: Vec::new(),
+            shielded: Default::default(),
+            recovery_parents: Default::default(),
+        }
+    }
+
+    fn push(&mut self, mut entry: Entry, root: &[u8], nested: &[PathBytes]) {
+        if entry.path.is_empty() {
+            return;
+        }
+        let full = join(root, &entry.path);
+        if entry
+            .path
+            .split(|byte| *byte == b'/')
+            .any(|name| is_recovery_name(OsStr::from_bytes(name)))
+        {
+            self.recovery_parents
+                .extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
+            return;
+        }
+        self.unmatched.remove(&full);
+        if nested
+            .iter()
+            .any(|n| *n == full || path_is_inside(&full, n))
+        {
+            return;
+        }
+        if let Some(claim) = self.seen.get(&full) {
+            if *claim != Claim::Dir && entry.kind == Kind::Dir {
+                self.shielded.insert(full);
+            }
+            return;
+        }
+        entry.path = full;
+        self.entries.push(entry);
+    }
+
+    fn finish_scan(&mut self, root: &[u8]) {
+        // Apply exact directory shields after all batches, independently of
+        // scan order. Alias directory shields are applied after lookup.
+        self.entries
+            .retain(|entry| !Planner::under_any(&self.shielded, &entry.path, root));
+    }
+}
+
+fn lookup_prune_aliases(
+    conn: &mut dyn Conn,
+    walk: &PruneWalk<'_>,
+    guard: Option<&ContainerGuard>,
+) -> Result<std::collections::HashMap<(u64, u64), Claim>> {
+    let mut aliases = std::collections::HashMap::new();
+    if walk.entries.is_empty() {
+        return Ok(aliases);
+    }
+    let candidates: std::collections::HashSet<_> = walk
+        .entries
+        .iter()
+        .map(|entry| (entry.dev, entry.ino))
+        .collect();
+    let mut unmatched = walk.unmatched.iter();
+    // Remote response queues hold at least this many replies, even when the
+    // file-data pipeline is configured smaller. Local calls execute in send.
+    let depth = if conn.supports_request_pipelining() {
+        crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH
+    } else {
+        1
+    };
+    let mut pending = std::collections::VecDeque::new();
+    let mut exhausted = false;
+    loop {
+        while !exhausted && pending.len() < depth {
+            let paths: Vec<_> = unmatched
+                .by_ref()
+                .take(512)
+                .map(|path| (**path).clone())
+                .collect();
+            if paths.is_empty() {
+                exhausted = true;
+                break;
+            }
+            if let Err(error) = conn.send(Request::PruneLookup {
+                paths: paths.clone(),
+                guard: guard.cloned(),
+            }) {
+                if !conn.is_dead() {
+                    crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                }
+                return Err(error);
+            }
+            pending.push_back(paths);
+        }
+        let Some(paths) = pending.pop_front() else {
+            break;
+        };
+        let response = conn.recv()?;
+        let stats = (|| -> Result<_> {
+            match ok(response, "inspect prune aliases")? {
+                Response::Stats(stats) if stats.len() == paths.len() => Ok(stats),
+                Response::Stats(stats) => bail!(
+                    "stat reply count {} does not match request count {}",
+                    stats.len(),
+                    paths.len()
+                ),
+                other => bail!("unexpected prune lookup response {other:?}"),
+            }
+        })();
+        let stats = match stats {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Keep the shared control connection at a request boundary.
+                crate::conn::drain_range_replies(conn, pending.len(), "inspect prune aliases")?;
+                return Err(error);
+            }
+        };
+        for (path, entry) in paths.iter().zip(stats) {
+            if let Some(entry) = entry {
+                let identity = (entry.dev, entry.ino);
+                if candidates.contains(&identity) {
+                    aliases.insert(identity, walk.seen[path]);
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+fn path_is_inside(path: &[u8], root: &[u8]) -> bool {
+    path.starts_with(root) && (root.ends_with(b"/") || path.get(root.len()) == Some(&b'/'))
 }
 
 /// Everything the planner decided about one source entry, made once in the
@@ -5543,9 +5622,17 @@ impl Planner<'_> {
 
     /// All sources scanned and the sidecar namespace preflight passed: add
     /// deferred payloads to the buffer. The caller runs the fresh-target
-    /// capacity check before replaying that buffer. Planning maps remain live
-    /// until replay because applying buffered entries still consults them.
+    /// capacity check before replaying that buffer. The directory and mapping
+    /// sets released by retire_planning_state remain live through replay,
+    /// because applying buffered entries still consults them.
     fn finish_planning(&mut self) -> Result<()> {
+        // Every source has passed the sidecar collision preflight. Applying
+        // buffered entries does not consult these indexes; release them before
+        // the scheduler grows so their allocations can be reused for jobs.
+        if self.opts.tuning.job_storage() != crate::transfer_tuning::JobStorage::Inline {
+            self.payload_paths = std::collections::HashMap::new();
+            self.sidecar_paths = std::collections::HashMap::new();
+        }
         let deferred = std::mem::take(&mut self.deferred_payloads);
         if let Some(buf) = &mut self.buffer {
             buf.extend(deferred);
@@ -5567,25 +5654,17 @@ impl Planner<'_> {
                 .into_iter()
                 .filter(|(path, ..)| self.implicit_dirs.contains(path)),
         );
-        // The preflight maps are dead now — except the sidecar set, which
-        // --delete needs (only its keys) to tell a live sidecar from an
-        // orphan. On multi-million-file trees these are the difference
-        // between transient and resident gigabytes.
+        // Inline mode preserves the previous collision-index lifetime.
         self.payload_paths = std::collections::HashMap::new();
-        let sidecars = std::mem::take(&mut self.sidecar_paths);
-        if self.opts.delete {
-            let mut keys: Vec<PathBytes> = sidecars.into_keys().collect();
-            keys.sort_unstable();
-            self.live_sidecars = keys;
-        }
+        self.sidecar_paths = std::collections::HashMap::new();
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
-        // alone still needs the destination claims and live sidecar names.
+        // alone still needs the destination claims.
         self.created_dirs = std::collections::HashSet::new();
         self.missing_dirs = std::collections::HashSet::new();
         self.mapping_explicit_parents = std::collections::HashSet::new();
         self.blocked_mapping_parents = std::collections::HashSet::new();
-        self.dry_run_replaced_dirs = std::collections::HashSet::new();
+        self.blocked_directory_paths = std::collections::HashSet::new();
         self.unusable_files = std::collections::HashSet::new();
         // Dry-run directory traces are intentionally deferred until after
         // planning, when a later explicit directory can have upgraded an
@@ -5596,7 +5675,6 @@ impl Planner<'_> {
         }
         if !self.opts.delete {
             self.dst_seen = std::collections::HashMap::new();
-            self.live_sidecars = Vec::new();
             self.delete_roots = Vec::new();
         }
     }
@@ -5617,6 +5695,26 @@ impl Planner<'_> {
                 continue;
             }
             let dst_rel = join(sub, &e.path);
+            if opts.expected_for(&dst_rel).is_some()
+                && e.kind != Kind::File
+                && !self.implicit_dirs.contains(&join(dst_root, &dst_rel))
+            {
+                let message = "expected digest requires a regular file";
+                self.progress.error(message);
+                let source = self.mapping_source_rel(&dst_rel);
+                self.emit_entry_failed(
+                    FailedEntry {
+                        dst: &dst_rel,
+                        src: source.as_deref(),
+                        kind: Some(DeclaredKind::File),
+                    },
+                    "no",
+                    "conflict",
+                    None,
+                    message,
+                );
+                continue;
+            }
             let dst = join(dst_root, &dst_rel);
             let rel = self.rel_name(src_root, sub, &e.path);
             // Every source entry claims its destination here, before any
@@ -5850,15 +5948,9 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let mut planned: Vec<(PathBytes, PathBytes, Entry, Option<Entry>)> = Vec::new();
-            for ((p, dst_rel, e), mut st) in dirs.into_iter().zip(stats) {
+            for ((p, dst_rel, e), st) in dirs.into_iter().zip(stats) {
                 if self.fail_blocked_mapping_entry(&p, &dst_rel, e.kind) {
                     continue;
-                }
-                // Keep the parent-first overlay invariant explicit here too:
-                // a directory below a replacement is missing in the virtual
-                // destination tree.
-                if opts.dry_run && Self::under_any(&self.dry_run_replaced_dirs, &p, dst_root) {
-                    st = None;
                 }
                 let is_dir = matches!(st, Some(ref d) if d.kind == Kind::Dir);
                 if opts.verify_only {
@@ -5873,7 +5965,7 @@ impl Planner<'_> {
                 }
                 // --existing creates nothing. A non-directory at the path (a
                 // file, a symlink even to a directory — in-tree symlinks are
-                // replaced, never traversed) counts as missing: we won't
+                // never traversed) counts as missing: we won't
                 // replace it and won't write through it, and since entries
                 // come parent-first, everything below is skipped too.
                 // --ignore-existing never touches what exists either: an
@@ -5907,8 +5999,10 @@ impl Planner<'_> {
                     self.blocked_mapping_parents.insert(p);
                     continue;
                 }
-                if opts.dry_run && st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
-                    self.dry_run_replaced_dirs.insert(p.clone());
+                if st.as_ref().is_some_and(|d| d.kind != Kind::Dir) {
+                    self.fail_directory_type_change(&p, &dst_rel, Kind::Dir);
+                    self.blocked_directory_paths.insert(p);
+                    continue;
                 }
                 planned.push((p, dst_rel, e, st));
             }
@@ -5935,21 +6029,6 @@ impl Planner<'_> {
                                     self.progress.println(&format!(
                                         "create directory {} (destination missing)",
                                         display_directory(p)
-                                    ));
-                                }
-                            }
-                        }
-                        Some(d) if d.kind != Kind::Dir => {
-                            if self.dry_run_changes.directories.insert(p.clone()) {
-                                self.dry_run_changes.type_replacements += 1;
-                                self.dry_run_changes
-                                    .directory_creates
-                                    .push((p.clone(), "type_differs"));
-                                if opts.verbose > 0 {
-                                    self.progress.println(&format!(
-                                        "replace with directory {} (destination is {})",
-                                        display_directory(p),
-                                        kind_label(d.kind)
                                     ));
                                 }
                             }
@@ -6200,7 +6279,7 @@ impl Planner<'_> {
             }
         }
 
-        if !self.blocked_mapping_parents.is_empty() {
+        if !self.blocked_mapping_parents.is_empty() || !self.blocked_directory_paths.is_empty() {
             others.retain(|p| !self.fail_blocked_mapping_entry(&p.dst, &p.dst_rel, p.e.kind));
         }
         if others.is_empty() {
@@ -6320,11 +6399,13 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
-                    let same = dst_entry.as_ref().is_some_and(|d| {
-                        d.kind == Kind::File
-                            && d.size == e.size
-                            && (opts.flags & flags::TIMES != 0 && d.mtime == e.mtime)
-                    });
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
+                    {
+                        continue;
+                    }
+                    let same = dst_entry
+                        .as_ref()
+                        .is_some_and(|d| opts.metadata_matches(&e, d));
                     let dst_newer = opts.update
                         && dst_entry.as_ref().is_some_and(|d| {
                             d.kind == Kind::File
@@ -6347,21 +6428,12 @@ impl Planner<'_> {
                         } else {
                             self.progress.error(&format!("MISSING {rel}"));
                         }
-                    } else if same && !opts.checksum {
+                    } else if same && !opts.checksum && opts.expected_for(&dst_rel).is_none() {
                         // Content is up to date, but still reconcile metadata
                         // (mode/owner/group) the way rsync does — a skipped file
                         // shouldn't keep stale permissions.
                         if let Some(d) = &dst_entry {
-                            let mut ff = 0u8;
-                            if opts.flags & flags::MODE != 0 && d.mode & 0o7777 != e.mode & 0o7777 {
-                                ff |= flags::MODE;
-                            }
-                            if opts.flags & flags::OWNER != 0 && d.uid != e.uid {
-                                ff |= flags::OWNER;
-                            }
-                            if opts.flags & flags::GROUP != 0 && d.gid != e.gid {
-                                ff |= flags::GROUP;
-                            }
+                            let ff = opts.metadata_fix_flags(&e, d);
                             if ff != 0 {
                                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                                 self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
@@ -6461,6 +6533,10 @@ impl Planner<'_> {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
                         continue;
                     }
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
+                    {
+                        continue;
+                    }
                     let target = e.link.clone().unwrap_or_default();
                     let same = dst_entry.as_ref().is_some_and(|d| {
                         d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..])
@@ -6535,6 +6611,10 @@ impl Planner<'_> {
                 Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
                     if self.skip_existing(&dst_entry) {
                         self.progress.files_excluded.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref())
+                    {
                         continue;
                     }
                     let same = dst_entry
@@ -6778,11 +6858,7 @@ impl Planner<'_> {
         let (sidecars, dir_stats, other_stats) = if pre_stat {
             let response = self.dst.call(Request::PlanBatch {
                 partial_paths,
-                copy_id: *self
-                    .opts
-                    .copy_id
-                    .get()
-                    .expect("partial identity initialized before planning"),
+                copy_id: self.opts.copy_id,
                 directories: directories.clone(),
                 others: other_paths.clone(),
                 guard: self.container_guard.clone(),
@@ -6870,9 +6946,60 @@ impl Planner<'_> {
         )
     }
 
+    fn refuse_directory_target(
+        &self,
+        dst: &[u8],
+        dst_rel: &[u8],
+        kind: Kind,
+        entry: Option<&Entry>,
+    ) -> bool {
+        if self.opts.verify_only || !entry.is_some_and(|entry| entry.kind == Kind::Dir) {
+            return false;
+        }
+        self.fail_directory_type_change(dst, dst_rel, kind);
+        true
+    }
+
+    fn fail_directory_type_change(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) {
+        let message = if kind == Kind::Dir {
+            format!(
+                "syq: cannot replace non-directory {} with a directory",
+                display(dst)
+            )
+        } else {
+            format!(
+                "syq: cannot replace directory {} with a non-directory",
+                display(dst)
+            )
+        };
+        self.progress
+            .error_classified(&message, Some("conflict"), None);
+        self.emit_entry_failed(
+            FailedEntry {
+                dst: dst_rel,
+                src: self.mapping_source_rel(dst_rel).as_deref(),
+                kind: Some(match kind {
+                    Kind::Dir => DeclaredKind::Dir,
+                    Kind::File => DeclaredKind::File,
+                    Kind::Symlink => DeclaredKind::Symlink,
+                    _ => DeclaredKind::Special,
+                }),
+            },
+            "no",
+            "conflict",
+            None,
+            &message,
+        );
+    }
+
     /// Report only real manifest entries beneath a protected obstruction;
     /// synthesized directories have no source object or retry record.
     fn fail_blocked_mapping_entry(&self, dst: &[u8], dst_rel: &[u8], kind: Kind) -> bool {
+        // The parent conflict has already been reported. Do not schedule its
+        // descendants or report them as separate failed copies.
+        if Self::under_any(&self.blocked_directory_paths, dst, &self.dst_root) {
+            return true;
+        }
         if !Self::under_any(&self.blocked_mapping_parents, dst, &self.dst_root) {
             return false;
         }
@@ -6885,6 +7012,7 @@ impl Planner<'_> {
                 .error_classified(&message, Some("conflict"), None);
             self.emit_mapping_entry_failed(
                 &ManifestEntry {
+                    expected_digest: self.opts.expected_for(dst_rel).cloned(),
                     src: self
                         .mapping_source_rel(dst_rel)
                         .expect("mapping parent failure"),
@@ -6916,6 +7044,27 @@ impl Planner<'_> {
         os_kind: Option<&'static str>,
         message: &str,
     ) {
+        self.emit_entry_failed(
+            FailedEntry {
+                dst: &entry.dst,
+                src: Some(&entry.src),
+                kind: entry.kind,
+            },
+            retryable,
+            class,
+            os_kind,
+            message,
+        );
+    }
+
+    fn emit_entry_failed(
+        &self,
+        entry: FailedEntry<'_>,
+        retryable: &'static str,
+        class: &'static str,
+        os_kind: Option<&'static str>,
+        message: &str,
+    ) {
         // Dry runs are trace-only: the error record and terminal accounting
         // still reflect the failure.
         if self.opts.dry_run {
@@ -6928,19 +7077,22 @@ impl Planner<'_> {
                 Some(DeclaredKind::Special) => ("create_special", "special"),
                 _ => ("transfer_file", "file"),
             };
-            results.emit_operation(&crate::results::OperationRecord {
-                action,
-                dst: &entry.dst,
-                src: Some(&entry.src),
-                kind,
-                disposition: "failed",
-                bytes: None,
-                attempts: None,
-                retryable: Some(retryable),
-                class: Some(class),
-                os_kind,
-                message: Some(message),
-            });
+            results.emit_operation_expected(
+                &crate::results::OperationRecord {
+                    action,
+                    dst: entry.dst,
+                    src: entry.src,
+                    kind,
+                    disposition: "failed",
+                    bytes: None,
+                    attempts: None,
+                    retryable: Some(retryable),
+                    class: Some(class),
+                    os_kind,
+                    message: Some(message),
+                },
+                self.opts.expected_for(entry.dst),
+            );
         }
     }
 
@@ -7063,19 +7215,23 @@ impl Planner<'_> {
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
-            src,
-            source,
-            dst,
-            rel,
-            rel_bytes,
-            entry,
             dst_entry,
-            target_condition,
-            container_guard: self.container_guard.clone(),
-            attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
-            inplace: false,
-            src_rel,
+            data: FileJobData {
+                src,
+                source,
+                dst,
+                rel,
+                rel_bytes,
+                entry,
+                target_condition,
+                container_guard: self.container_guard.clone(),
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: self.opts.inplace
+                    && target_condition == TargetCondition::Any
+                    && self.container_guard.is_none(),
+                src_rel,
+            },
         });
     }
 
@@ -7096,16 +7252,20 @@ impl Planner<'_> {
         let mut roots = std::mem::take(&mut self.delete_roots);
         roots.sort();
         roots.dedup();
-        let inside = |p: &[u8], r: &[u8]| {
-            p.starts_with(r) && (r.ends_with(b"/") || p.get(r.len()) == Some(&b'/'))
-        };
+        // Sorting costs more than a few linear scans. Larger root sets share
+        // one index; focused timings cover this crossover.
+        let sorted_claims = (roots.len() >= 32).then(|| {
+            let mut paths: Vec<_> = self.dst_seen.keys().collect();
+            paths.sort_unstable();
+            paths
+        });
         for (root, sub) in roots.clone() {
             // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
             // its own walk, so its patterns apply and nothing is deleted twice.
             let nested: Vec<PathBytes> = roots
                 .iter()
-                .filter(|(r, _)| *r != root && inside(r, &root))
+                .filter(|(r, _)| *r != root && path_is_inside(r, &root))
                 .map(|(r, _)| r.clone())
                 .collect();
             // Not there yet (a dry run into a new destination): nothing to delete.
@@ -7123,14 +7283,9 @@ impl Planner<'_> {
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
-            let seen = &self.dst_seen;
-            let live_sidecars = &self.live_sidecars;
-            // Destination directories whose path the source claims as a
-            // non-directory (a file we chose not to send, a symlink skipped
-            // without -l, ...). The source has that path, so syq doesn't touch
-            // it — and gutting the directory underneath would be touching it.
-            let mut shielded: std::collections::HashSet<PathBytes> =
-                std::collections::HashSet::new();
+            let mut partial_parents = std::collections::HashMap::new();
+            let mut alias_parents = std::collections::HashSet::new();
+            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
             let res = self.dst.scan(
                 &root,
                 None,
@@ -7138,76 +7293,15 @@ impl Planner<'_> {
                 &ignore,
                 true,
                 &mut |batch: Vec<Entry>| {
-                    for e in batch {
-                        if e.path.is_empty() {
-                            continue;
-                        }
-                        let full = join(&root, &e.path);
-                        if nested.iter().any(|n| *n == full || inside(&full, n))
-                            || Planner::under_any(&shielded, &full, &root)
-                        {
-                            continue;
-                        }
-                        match seen.get(&full) {
-                            Some(Claim::Dir) => continue,
-                            Some(_) => {
-                                if e.kind == Kind::Dir {
-                                    shielded.insert(full);
-                                }
-                                continue;
-                            }
-                            None => {}
-                        }
-                        let dst_rel = join(&sub, &e.path);
-                        let rel = display(&dst_rel);
-                        let name = e.path.rsplit(|&c| c == b'/').next().unwrap_or(&e.path);
-                        // The only sidecar-patterned files that are not extras
-                        // are this job's live ones — exactly those the
-                        // namespace preflight listed. Membership is the whole
-                        // test: a path is only in that set if the receiver
-                        // generated it for this job, and the compact
-                        // (near-PATH_MAX) form doesn't even embed the copy ID,
-                        // so there is nothing valid to compare names against.
-                        // Anything else matching the pattern is an ordinary
-                        // extra: syq itself copies such names as payload now,
-                        // so a foreign-looking name proves nothing, and a
-                        // --delete run concurrent with another job would be
-                        // deleting that job's unclaimed payload anyway.
-                        if e.kind == Kind::File
-                            && crate::fsops::is_partial_name(OsStr::from_bytes(name))
-                            && live_sidecars.binary_search(&full).is_ok()
-                        {
-                            // Live resume state of this very command.
-                        } else {
-                            if e.kind == Kind::Dir {
-                                let depth = full.iter().filter(|&&c| c == b'/').count();
-                                found.dirs.entry(depth).or_default().push((
-                                    full,
-                                    format!("{rel}/"),
-                                    "dir",
-                                ));
-                            } else {
-                                let kind = match e.kind {
-                                    Kind::Symlink => "symlink",
-                                    Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                                        "special"
-                                    }
-                                    _ => "file",
-                                };
-                                found.leaves.push((full, rel, kind));
-                            }
-                        }
+                    for entry in batch {
+                        walk.push(entry, &root, &nested);
                     }
                     Ok(())
                 },
                 &mut |paths: Vec<PathBytes>| {
                     for p in paths {
                         // Every ancestor of an ignored path is protected.
-                        for (i, &c) in p.iter().enumerate() {
-                            if c == b'/' {
-                                protected.insert(join(&root, &p[..i]));
-                            }
-                        }
+                        protected.extend(ancestor_prefixes(&p).map(|prefix| join(&root, prefix)));
                     }
                     Ok(())
                 },
@@ -7217,10 +7311,94 @@ impl Planner<'_> {
                 },
             );
             res?;
+            if self.delete_walk_failed {
+                return Ok(());
+            }
+            walk.finish_scan(&root);
+            // There is nothing for an alias to protect when no candidates
+            // remain, including dry runs whose claimed files do not exist yet.
+            if walk.entries.is_empty() {
+                continue;
+            }
+            let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
+            let mut shielded = walk.shielded;
+            let recovery_parents = walk.recovery_parents;
+            for entry in walk.entries {
+                let full = entry.path;
+                let entry_path =
+                    &full[root.len() + usize::from(!root.is_empty() && !root.ends_with(b"/"))..];
+                let entry_kind = entry.kind;
+                if Planner::under_any(&shielded, &full, &root) {
+                    continue;
+                }
+                let claimed = aliases.get(&(entry.dev, entry.ino));
+                if claimed.is_some() {
+                    // An ambiguous hard link may live in an otherwise extra
+                    // directory. Keep its ancestors as well as the link.
+                    alias_parents.extend(ancestor_prefixes(&full).map(<[u8]>::to_vec));
+                }
+                match claimed {
+                    Some(Claim::Dir) => continue,
+                    Some(_) => {
+                        if entry_kind == Kind::Dir {
+                            shielded.insert(full);
+                        }
+                        continue;
+                    }
+                    None => {}
+                }
+                let dst_rel = join(&sub, entry_path);
+                let rel = display(&dst_rel);
+                let name = entry_path
+                    .rsplit(|&c| c == b'/')
+                    .next()
+                    .unwrap_or(entry_path);
+                if entry_kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                    if self.opts.verbose > 0 {
+                        self.progress.eprintln(&format!(
+                                    "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"
+                                ));
+                    }
+                    for prefix in ancestor_prefixes(&full) {
+                        partial_parents
+                            .entry(prefix.to_vec())
+                            .or_insert_with(|| rel.clone());
+                    }
+                } else {
+                    if entry_kind == Kind::Dir {
+                        let depth = full.iter().filter(|&&c| c == b'/').count();
+                        found
+                            .dirs
+                            .entry(depth)
+                            .or_default()
+                            .push((full, format!("{rel}/"), "dir"));
+                    } else {
+                        let kind = match entry_kind {
+                            Kind::Symlink => "symlink",
+                            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => "special",
+                            _ => "file",
+                        };
+                        found.leaves.push((full, rel, kind));
+                    }
+                }
+            }
+
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
-                    if protected.contains(&path) {
+                    if let Some(partial) = partial_parents.get(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds partial {partial}; use syq clean-partials after copies stop"
+                        ));
+                    } else if recovery_parents.contains(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds replacement recovery data"
+                        ));
+                    } else if alias_parents.contains(&path) {
+                        self.progress.eprintln(&format!(
+                            "syq: not deleting {rel}: it holds a possible filename alias"
+                        ));
+                    } else if protected.contains(&path) {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
@@ -7381,23 +7559,21 @@ impl Planner<'_> {
         stat_many(self.dst, paths, false)
     }
 
-    /// lstat paths that remain reachable after the directory replacements a
-    /// dry run has already planned. Descendants of those replacements are
-    /// virtually missing; querying them would follow the old intermediate
-    /// leaf that the real run removes first.
+    /// Avoid querying descendants of a directory conflict. The planner skips
+    /// these entries; inspecting them could traverse an obstructing symlink.
     fn stat_many_with_dry_run_overlay(
         &mut self,
         paths: Vec<PathBytes>,
         dst_root: &[u8],
     ) -> Result<Vec<Option<Entry>>> {
-        if !self.opts.dry_run || self.dry_run_replaced_dirs.is_empty() {
+        if !self.opts.dry_run || self.blocked_directory_paths.is_empty() {
             return self.stat_many(paths);
         }
         let mut visible = Vec::new();
         let mut indexes = Vec::new();
         let mut results = vec![None; paths.len()];
         for (index, path) in paths.into_iter().enumerate() {
-            if !Self::under_any(&self.dry_run_replaced_dirs, &path, dst_root) {
+            if !Self::under_any(&self.blocked_directory_paths, &path, dst_root) {
                 indexes.push(index);
                 visible.push(path);
             }
@@ -7408,10 +7584,9 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    /// Stat dry-run directories parent-depth first. Discovering a destination
-    /// leaf at one depth makes its whole source-directory subtree virtually
-    /// missing at deeper levels, so no request traverses the leaf that the
-    /// real run would already have replaced.
+    /// Stat dry-run directories parent-depth first, hiding descendants of
+    /// obstructing leaves. The planner reports the parent conflict and skips
+    /// its subtree without following an intermediate symlink.
     fn stat_directories_with_dry_run_overlay(
         &mut self,
         dirs: &[(PathBytes, PathBytes, Entry)],
@@ -7422,7 +7597,7 @@ impl Planner<'_> {
         }
         let existing = self.opts.existing;
         let ignore_existing = self.opts.ignore_existing;
-        let mut replaced = self.dry_run_replaced_dirs.clone();
+        let mut blocked = self.blocked_directory_paths.clone();
         let mut missing = self.missing_dirs.clone();
         let mut by_depth: std::collections::BTreeMap<usize, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -7441,10 +7616,10 @@ impl Planner<'_> {
             let mut visible_indexes = Vec::new();
             for &index in &indexes {
                 let path = &dirs[index].0;
-                let hidden_by_replacement = Self::under_any(&replaced, path, dst_root);
+                let hidden_by_conflict = Self::under_any(&blocked, path, dst_root);
                 let hidden_by_option =
                     (existing || ignore_existing) && Self::under_any(&missing, path, dst_root);
-                if !hidden_by_replacement && !hidden_by_option {
+                if !hidden_by_conflict && !hidden_by_option {
                     visible_indexes.push(index);
                     visible.push(path.clone());
                 }
@@ -7463,7 +7638,7 @@ impl Planner<'_> {
                 {
                     missing.insert(path.clone());
                 } else if entry.as_ref().is_some_and(|item| item.kind != Kind::Dir) {
-                    replaced.insert(path.clone());
+                    blocked.insert(path.clone());
                 }
             }
         }
@@ -7477,11 +7652,7 @@ impl Planner<'_> {
         match ok(
             self.dst.call(Request::PartialPaths {
                 paths,
-                copy_id: *self
-                    .opts
-                    .copy_id
-                    .get()
-                    .expect("partial identity initialized before planning"),
+                copy_id: self.opts.copy_id,
                 guard: None,
             })?,
             "compute sidecar paths",
@@ -7559,39 +7730,43 @@ struct Worker {
     opts: Arc<Opts>,
     bwlimit: Option<Arc<BandwidthLimit>>,
     gate: Arc<Gate>,
-    /// Debug timing: seconds blocked in source recv, dest send, dest ack, idle in scheduler.
-    t: [f64; 4],
-    fast: FastTiming,
+    observation: Option<Arc<crate::transfer_observations::Actor>>,
     benchmark: crate::transfer_tuning::BenchmarkStats,
     fast_batch_files: usize,
     setup_elapsed: std::time::Duration,
 }
 
-#[derive(Default)]
-struct FastTiming {
-    batches: usize,
-    files: usize,
-    source: f64,
-    dest_send: f64,
-    dest_ack: f64,
-    restat: f64,
-    bookkeeping: f64,
-}
-
 struct BlockDiff {
     ranges: Vec<(u64, u64)>,
     held_len: Option<u64>,
+    source_hashes: Vec<ContentDigest>,
 }
 
 impl Worker {
     /// Every content request carries the source capability, including when
     /// the operator allowed a foreign-owned symlink in the typed root path.
-    fn source_reference(&self, job: &FileJob) -> Option<RegisteredPath> {
+    fn source_reference(&self, job: &WorkerJob) -> Option<RegisteredPath> {
         Some(job.source.clone())
     }
 
     fn run(&mut self) -> Result<()> {
-        let r = self.run_inner();
+        let r = (|| {
+            configure_hashing(&mut *self.src, self.opts.hash_policy)?;
+            configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+            if self.progress.observations.enabled.load(Relaxed) {
+                let actor = self.progress.observations.workers.actor("worker");
+                self.src
+                    .observe(&self.progress.observations, &actor, true, self.id)?;
+                self.dst
+                    .observe(&self.progress.observations, &actor, false, self.id)?;
+                self.observation = Some(actor);
+            }
+            let _working = self
+                .observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::Work));
+            self.run_inner()
+        })();
         if r.as_ref()
             .is_err_and(|error| error.is::<RangeReplyMismatch>() || !self.transport_dead())
         {
@@ -7620,6 +7795,10 @@ impl Worker {
     fn run_inner(&mut self) -> Result<()> {
         loop {
             if !self.gate.allowed(self.id) {
+                let _parked = self
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::Parked));
                 // Parked by the tuner: keep the connections, take no work.
                 let sched = self.sched.clone();
                 if !self
@@ -7629,28 +7808,15 @@ impl Worker {
                     return Ok(());
                 }
             }
-            let t0 = std::time::Instant::now();
-            let item = self.sched.next();
-            self.t[3] += t0.elapsed().as_secs_f64();
+            let item = {
+                let _awaiting = self
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
+                self.sched.next()
+            };
             match item {
                 Item::Exit => {
-                    if debug() {
-                        crate::output::diagnostic!(
-                            "syq: worker {} blocked: src recv {:.2}s, dst send {:.2}s, dst ack {:.2}s, idle {:.2}s; small: {} files in {} batches, src {:.2}s, dst send {:.2}s, dst ack {:.2}s, restat {:.2}s, bookkeeping {:.2}s",
-                            self.id,
-                            self.t[0],
-                            self.t[1],
-                            self.t[2],
-                            self.t[3],
-                            self.fast.files,
-                            self.fast.batches,
-                            self.fast.source,
-                            self.fast.dest_send,
-                            self.fast.dest_ack,
-                            self.fast.restat,
-                            self.fast.bookkeeping,
-                        );
-                    }
                     return Ok(());
                 }
                 Item::File(idx) => {
@@ -7727,8 +7893,10 @@ impl Worker {
                             self.retry_credited_range(&h, start, credited);
                             return Err(e);
                         }
-                        self.sched.range_done(&h);
+                        // Keep this range outstanding until failure is visible:
+                        // another worker must not elect itself to publish it.
                         self.file_error(idx, e)?;
+                        self.sched.range_done(&h);
                         continue;
                     }
                     let done = self.sched.range_done(&h);
@@ -7767,17 +7935,15 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.verify_only
+            && self.opts.expected_for(&j.rel_bytes).is_none()
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
-            && j.dst_entry.is_none()
-            && (!self.opts.inplace
-                || (j.target_condition == TargetCondition::Any && j.container_guard.is_none()))
+            && jobs.destination(idx).is_none()
+            && (!self.opts.inplace || j.inplace)
     }
 
     fn receive_small_batch(&mut self, sent: Vec<usize>, results: &mut [Result<()>]) -> Result<()> {
-        let phase = std::time::Instant::now();
         let response = self.dst.recv();
-        self.fast.dest_ack += phase.elapsed().as_secs_f64();
         let applied = match ok(response?, "put small batch")? {
             Response::Applied(applied) if applied.len() == sent.len() => applied,
             other => bail!("unexpected response {other:?}"),
@@ -7790,7 +7956,7 @@ impl Worker {
 
     fn transfer_small_batches(
         &mut self,
-        jobs: &[FileJob],
+        jobs: &[WorkerJob],
         mut groups: impl Iterator<Item = std::ops::Range<usize>>,
     ) -> Result<Vec<Result<()>>> {
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
@@ -7824,7 +7990,6 @@ impl Worker {
             loop {
                 while reads.len() < read_window {
                     let Some(group) = groups.next() else { break };
-                    let phase = std::time::Instant::now();
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
                         // Empty files need no source access, including mode 000.
@@ -7843,7 +8008,6 @@ impl Worker {
                         self.src.send(Request::ReadSmallBatch(requests))?;
                     }
                     reads.push_back((group.clone(), count));
-                    self.fast.source += phase.elapsed().as_secs_f64();
                 }
                 let Some((group, count)) = reads.pop_front() else {
                     break;
@@ -7858,7 +8022,6 @@ impl Worker {
                     }
                 };
                 let waited = phase.elapsed();
-                self.fast.source += waited.as_secs_f64();
                 if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
                     if debug() {
                         crate::output::diagnostic!(
@@ -7874,7 +8037,6 @@ impl Worker {
                     read_window = 1;
                 }
                 let mut blocks = blocks.into_iter();
-                let phase = std::time::Instant::now();
                 let mut puts = Vec::new();
                 let mut sent = Vec::new();
                 for idx in group {
@@ -7882,7 +8044,7 @@ impl Worker {
                     let block = if job.entry.size == 0 {
                         Ok(SmallBlock {
                             data: Vec::new(),
-                            hash: content_digest(&[]),
+                            hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
                         })
                     } else {
                         match blocks.next() {
@@ -7920,7 +8082,6 @@ impl Worker {
                     self.dst.send(Request::PutSmallBatch(puts))?;
                     writes.push_back(sent);
                 }
-                self.fast.dest_send += phase.elapsed().as_secs_f64();
                 if writes.len() >= write_window {
                     self.receive_small_batch(
                         writes.pop_front().expect("pending batch"),
@@ -7935,17 +8096,13 @@ impl Worker {
         })();
         // A normal endpoint error consumes its reply. Drain only requests still
         // outstanding; a receive/transport error stops that drain immediately.
-        let phase = std::time::Instant::now();
         let source_end = crate::conn::drain_range_replies(
             &mut *self.src,
             reads.iter().filter(|(_, count)| *count > 0).count(),
             "read small batch",
         );
-        self.fast.source += phase.elapsed().as_secs_f64();
-        let phase = std::time::Instant::now();
         let destination_end =
             crate::conn::drain_range_replies(&mut *self.dst, writes.len(), "put small batch");
-        self.fast.dest_ack += phase.elapsed().as_secs_f64();
         result.and(source_end).and(destination_end)?;
         Ok(results)
     }
@@ -7953,11 +8110,9 @@ impl Worker {
     fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
         #[cfg(debug_assertions)]
         record_worker_event_for_test("batch", self.id, batch.len())?;
-        self.fast.batches += 1;
-        self.fast.files += batch.len();
-        let mut jobs: Vec<FileJob> = {
+        let mut jobs: Vec<WorkerJob> = {
             let all = self.sched.jobs.lock().unwrap();
-            batch.iter().map(|&i| all[i].clone()).collect()
+            batch.iter().map(|&i| all.snapshot(i)).collect()
         };
         self.benchmark.small_batches += 1;
         self.benchmark.max_batch_files = self.benchmark.max_batch_files.max(jobs.len() as u64);
@@ -8003,10 +8158,8 @@ impl Worker {
         let owned = self.sched.finish_fast_groups(&shared);
         // Fix the caller's ownership even on transport loss, before its retry
         // loop can requeue files that another worker has already taken.
-        let original_len = batch.len();
         let mut keep = owned.iter();
         batch.retain(|_| *keep.next().unwrap());
-        self.fast.files -= original_len - batch.len();
         let mut keep = owned.iter();
         jobs.retain(|_| *keep.next().unwrap());
         let results = result?
@@ -8015,11 +8168,8 @@ impl Worker {
             .filter_map(|(r, own)| own.then_some(r));
         // Did any source change while we were at it?
         let paths: Vec<PathBytes> = jobs.iter().map(|j| j.src.clone()).collect();
-        let phase = std::time::Instant::now();
         let registered = jobs.iter().map(|job| job.source.clone()).collect();
         let now = stat_many_registered(&mut *self.src, paths, Some(registered), false)?;
-        self.fast.restat += phase.elapsed().as_secs_f64();
-        let phase = std::time::Instant::now();
         for ((idx, j), (res, now)) in batch
             .iter()
             .zip(jobs.iter())
@@ -8070,7 +8220,7 @@ impl Worker {
                         ..e
                     };
                     job.attempt += 1;
-                    job.dst_entry = Some(published);
+                    all.set_destination(*idx, published);
                     drop(all);
                     self.sched.requeue(*idx);
                 } else {
@@ -8110,7 +8260,6 @@ impl Worker {
                 self.progress.println(&j.rel);
             }
         }
-        self.fast.bookkeeping += phase.elapsed().as_secs_f64();
         Ok(())
     }
 
@@ -8121,7 +8270,7 @@ impl Worker {
         if e.is::<RangeReplyMismatch>() || self.transport_dead() {
             return Err(e);
         }
-        if !self.sched.is_failed(idx) {
+        if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
             let message = format!("{e:#}");
@@ -8131,7 +8280,6 @@ impl Worker {
                 os_kind,
             );
             self.emit_file_result_failed(&job, "unknown", os_kind, &message);
-            self.sched.fail_file(idx);
             if capacity_os_kind(os_kind) {
                 self.sched.abort();
             }
@@ -8143,7 +8291,7 @@ impl Worker {
     /// counted and printed by the caller.
     fn emit_file_result_failed(
         &self,
-        job: &FileJob,
+        job: &WorkerJob,
         retryable: &'static str,
         os_kind: Option<&'static str>,
         message: &str,
@@ -8154,24 +8302,27 @@ impl Worker {
             return;
         }
         if let Some(results) = self.progress.results_writer() {
-            results.emit_operation(&crate::results::OperationRecord {
-                action: "transfer_file",
-                dst: &job.rel_bytes,
-                src: job.src_rel.as_deref(),
-                kind: "file",
-                disposition: "failed",
-                bytes: None,
-                attempts: Some(u64::from(job.attempt) + 1),
-                retryable: Some(retryable),
-                class: Some("io"),
-                os_kind,
-                message: Some(message),
-            });
+            results.emit_operation_expected(
+                &crate::results::OperationRecord {
+                    action: "transfer_file",
+                    dst: &job.rel_bytes,
+                    src: job.src_rel.as_deref(),
+                    kind: "file",
+                    disposition: "failed",
+                    bytes: None,
+                    attempts: Some(u64::from(job.attempt) + 1),
+                    retryable: Some(retryable),
+                    class: Some("io"),
+                    os_kind,
+                    message: Some(message),
+                },
+                self.opts.expected_for(&job.rel_bytes),
+            );
         }
     }
 
-    fn job(&self, idx: usize) -> FileJob {
-        self.sched.jobs.lock().unwrap()[idx].clone()
+    fn job(&self, idx: usize) -> WorkerJob {
+        self.sched.jobs.lock().unwrap().snapshot(idx)
     }
 
     fn handle_file(&mut self, idx: usize) -> Result<()> {
@@ -8180,23 +8331,44 @@ impl Worker {
         let opts = self.opts.clone();
         let _ = &opts;
 
+        match self.try_expected_match(&job) {
+            Ok(true) => {
+                job.done.store(size, Relaxed);
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                self.progress.bytes_total.fetch_sub(size, Relaxed);
+                self.sched.ranges_ready(idx, vec![]);
+                if let Err(error) = self.finish_matched_file(idx) {
+                    if self.transport_dead() {
+                        self.sched.requeue_finish(idx, true);
+                    }
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.sched.ranges_ready(idx, vec![]);
+                if self.transport_dead() {
+                    self.sched.requeue(idx);
+                }
+                return Err(error);
+            }
+        }
+
         // Placement guards must be enforced by the final mutation. Stage even
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
+        let inplace = job.inplace;
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or an eligible sequential userspace writer) instead of
         // framing, hashing and scheduling them through the transport.
         // copy_file_range cannot be paced, so a limited same-machine transfer
         // uses the regular userspace path (also useful for mounted NFS paths).
-        if self.opts.same_host
-            && !self.opts.tuning.force_ranges()
-            && !self.opts.checksum
-            && self.bwlimit.is_none()
-            && job.entry.size > 0
-            && job.container_guard.is_none()
+        if self
+            .opts
+            .copy_policy(self.bwlimit.is_some())
+            .file_operation(job.entry.size, job.container_guard.is_some())
+            == crate::copy_policy::FileOperation::ReceiverCopy
         {
             match self.try_copy_local(idx, &job) {
                 Ok(true) => {
@@ -8226,7 +8398,7 @@ impl Worker {
         // bool = a staged or in-place file still needs Finalize. A verified
         // content match applies metadata through its retained basis fd instead.
         let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
-            let final_entry = job.dst_entry.clone();
+            let final_entry = job.dst_entry.as_deref();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
                     bail!("destination is a directory");
@@ -8237,12 +8409,11 @@ impl Worker {
             // Unless --inplace was explicit, changed files are published
             // through a sidecar + atomic rename. Small new files normally take
             // the batched small-file path instead of reaching this worker path.
-            self.set_inplace(idx, inplace);
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
-            // absent until SeedBasis proves that bytes actually differ.
-            let partial_size = match ok(
+            // absent until the content comparison shows a difference.
+            let prepared = match ok(
                 self.dst.call(Request::Prepare {
                     path: job.dst.clone(),
                     size,
@@ -8255,11 +8426,11 @@ impl Worker {
                 })?,
                 "prepare",
             )? {
-                Response::PartialSize(size) => size,
+                Response::Prepared(prepared) => prepared,
                 other => bail!("unexpected response {other:?}"),
             };
 
-            if partial_size.is_some() || final_is_file {
+            if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
                 self.sched.request_direct_fallback();
             }
             if inplace {
@@ -8268,19 +8439,22 @@ impl Worker {
                 }
                 return Ok((full(), true));
             }
-            if partial_size.is_some() {
+            // A retry's own output must be finished (and thus consumed), even
+            // if another copy has meanwhile published identical final bytes.
+            if prepared.partial_size.is_some() {
                 if size == 0 {
                     return Ok((vec![], true));
                 }
                 return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             if final_is_file {
-                let (ranges, basis_len) = self.diff_final_and_hold(&job)?;
-                if ranges.is_empty() && basis_len == size {
+                let diff = self.diff_final_and_hold(&job)?;
+                if diff.ranges.is_empty() && diff.held_len == Some(size) {
                     let mut meta = job.entry.meta();
                     meta.mode = self.create_mode(&job);
                     ok(
                         self.dst.call(Request::FinishBasis {
+                            expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
                             path: job.dst.clone(),
                             copy_id: self.copy_id(),
                             meta,
@@ -8292,18 +8466,17 @@ impl Worker {
                     )?;
                     return Ok((vec![], false));
                 }
-                ok(
-                    self.dst.call(Request::SeedBasis {
-                        path: job.dst.clone(),
-                        copy_id: self.copy_id(),
-                        len: size,
-                        reuse: size > 0 && ranges.as_slice() != [(0, size)],
-                        attempt: job.attempt,
-                        guard: job.container_guard.clone(),
-                    })?,
-                    "seed partial from destination basis",
-                )?;
-                return Ok((ranges, true));
+                return Ok((
+                    self.reuse_blocks(
+                        &job,
+                        diff.source_hashes,
+                        prepared.has_candidates || diff.ranges.as_slice() != [(0, size)],
+                    )?,
+                    true,
+                ));
+            }
+            if prepared.has_candidates {
+                return Ok((self.diff_blocks(&job, Which::Partial)?, true));
             }
             Ok((full(), true))
         })();
@@ -8334,8 +8507,9 @@ impl Worker {
                         self.retry_credited_range(&h, start, credited);
                         return Err(e);
                     }
+                    self.file_error(idx, e)?;
                     self.sched.range_done(&h);
-                    return Err(e);
+                    return Ok(());
                 }
                 if self.sched.range_done(&h) {
                     if let Err(e) = self.finish_file(idx) {
@@ -8366,25 +8540,16 @@ impl Worker {
         Ok(())
     }
 
-    /// Record the in-place decision on the job so every range worker and the
-    /// finalize agree.
-    fn set_inplace(&self, idx: usize, v: bool) {
-        self.sched.jobs.lock().unwrap()[idx].inplace = v;
-    }
-
     /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
     /// receiver cannot use its direct path, so the caller should stream;
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
-    fn try_copy_local(&mut self, idx: usize, job: &FileJob) -> Result<bool> {
+    fn try_copy_local(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
         // Write to a partial and let finish_file rename it, so an interrupted
         // A receiver-side copy never leaves a final-named file the quick check
         // could mistake for complete. Only --inplace writes the final path
         // directly.
-        let inplace = self.opts.inplace
-            && job.target_condition == TargetCondition::Any
-            && job.container_guard.is_none();
-        self.set_inplace(idx, inplace);
+        let inplace = job.inplace;
         let mode = self.create_mode(job);
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
@@ -8423,7 +8588,7 @@ impl Worker {
     /// The mode the finished file should have (rsync semantics):
     /// with -p the source mode; without -p an existing file keeps its own mode
     /// and a new file gets the source mode minus the umask.
-    fn create_mode(&self, job: &FileJob) -> u32 {
+    fn create_mode(&self, job: &WorkerJob) -> u32 {
         match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
             Some(d) if !self.opts.perms => d.mode & 0o7777,
             _ => fresh_file_mode(&self.opts, &job.entry),
@@ -8431,17 +8596,13 @@ impl Worker {
     }
 
     fn copy_id(&self) -> CopyId {
-        *self
-            .opts
-            .copy_id
-            .get()
-            .expect("partial identity initialized before planning")
+        self.opts.copy_id
     }
 
     /// Metadata for the whole file just atomically published at the
     /// destination. A retry can use it as a block-diff basis without changing
     /// the no-`-p` mode chosen for the first attempt.
-    fn published_entry(&self, job: &FileJob) -> Entry {
+    fn published_entry(&self, job: &WorkerJob) -> Entry {
         let mut entry = job.entry.clone();
         entry.path = job.dst.clone();
         entry.mode = (entry.mode & !0o7777) | self.create_mode(job);
@@ -8449,7 +8610,12 @@ impl Worker {
     }
 
     /// Hash blocks on both sides (in parallel) and return the ranges that differ.
-    fn diff_blocks(&mut self, job: &FileJob, which: Which) -> Result<Vec<(u64, u64)>> {
+    fn diff_blocks(&mut self, job: &WorkerJob, which: Which) -> Result<Vec<(u64, u64)>> {
+        if which == Which::Partial {
+            return self
+                .diff_with(job, self.seed_request(job), "seed and hash destination")
+                .map(|diff| diff.ranges);
+        }
         self.diff_with(
             job,
             Request::HashBlocks {
@@ -8467,9 +8633,44 @@ impl Worker {
         .map(|diff| diff.ranges)
     }
 
+    fn reuse_blocks(
+        &mut self,
+        job: &WorkerJob,
+        hashes: Vec<ContentDigest>,
+        reuse: bool,
+    ) -> Result<Vec<(u64, u64)>> {
+        let mut request = self.seed_request(job);
+        if let Request::SeedBasis {
+            reuse: allow_reuse, ..
+        } = &mut request
+        {
+            *allow_reuse = reuse;
+        }
+        let response = self.dst.call(request)?;
+        let reused = Self::hashes(ok(response, "reuse destination blocks")?)?;
+        Ok(Self::different_ranges(
+            &hashes,
+            &reused,
+            self.opts.block,
+            job.entry.size,
+        ))
+    }
+
+    fn seed_request(&self, job: &WorkerJob) -> Request {
+        Request::SeedBasis {
+            path: job.dst.clone(),
+            copy_id: self.copy_id(),
+            len: job.entry.size,
+            block: self.opts.block,
+            reuse: true,
+            attempt: job.attempt,
+            guard: job.container_guard.clone(),
+        }
+    }
+
     /// Compare the source with one opened final-file inode retained by the
     /// receiver for either metadata-only completion or sidecar seeding.
-    fn diff_final_and_hold(&mut self, job: &FileJob) -> Result<(Vec<(u64, u64)>, u64)> {
+    fn diff_final_and_hold(&mut self, job: &WorkerJob) -> Result<BlockDiff> {
         let diff = self.diff_with(
             job,
             Request::HashAndHold {
@@ -8482,16 +8683,14 @@ impl Worker {
             },
             "hash and retain destination basis",
         )?;
-        Ok((
-            diff.ranges,
-            diff.held_len
-                .context("destination did not report its retained basis length")?,
-        ))
+        diff.held_len
+            .context("destination did not report its retained basis length")?;
+        Ok(diff)
     }
 
     fn diff_with(
         &mut self,
-        job: &FileJob,
+        job: &WorkerJob,
         destination_request: Request,
         destination_label: &str,
     ) -> Result<BlockDiff> {
@@ -8518,6 +8717,7 @@ impl Worker {
             Self::destination_hashes(ok(destination_response?, destination_label)?)?;
         Ok(BlockDiff {
             ranges: Self::different_ranges(&source, &destination, block, size),
+            source_hashes: source,
             held_len,
         })
     }
@@ -8598,7 +8798,7 @@ impl Worker {
     fn acknowledge_range_write(
         sched: &Sched,
         progress: &Progress,
-        job: &FileJob,
+        job: &WorkerJob,
         flights: &mut [Option<RangeFlight>],
         slot: usize,
         n: u64,
@@ -8623,7 +8823,7 @@ impl Worker {
 
     fn transfer_range_pipeline(
         &mut self,
-        job: &FileJob,
+        job: &WorkerJob,
         primary: &RangeHandle,
         credited: &mut u64,
         block: u64,
@@ -8642,9 +8842,12 @@ impl Worker {
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
-                released |= self.sched.is_failed(idx)
-                    || self.sched.is_aborted()
-                    || !self.gate.allowed(self.id);
+                if self.sched.is_failed(idx) || self.sched.is_aborted() {
+                    // Drain issued requests without sending further writes for
+                    // work cancelled by another worker.
+                    break;
+                }
+                released |= !self.gate.allowed(self.id);
                 if released {
                     // Only the current range can have an unread suffix. Never
                     // reserve a batch of unread ranges from a synchronous source.
@@ -8716,16 +8919,14 @@ impl Worker {
                 let Some((slot, expected_off, expected_len)) = pending_reads.pop_front() else {
                     break;
                 };
-                let t0 = std::time::Instant::now();
+
                 let response = self.src.recv();
-                self.t[0] += t0.elapsed().as_secs_f64();
                 let (off, hash, data) = match ok(response?, "read")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     other => bail!("unexpected response {other:?}"),
                 };
                 validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
-                let t0 = std::time::Instant::now();
                 self.dst.send(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
@@ -8736,13 +8937,11 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
                 pending_writes.push_back((slot, n));
                 if pending_writes.len() >= write_window {
                     let (slot, n) = pending_writes.pop_front().expect("pending write");
-                    let t0 = std::time::Instant::now();
+
                     let response = self.dst.recv();
-                    self.t[2] += t0.elapsed().as_secs_f64();
                     ok(response?, "write")?;
                     Self::acknowledge_range_write(
                         &self.sched,
@@ -8763,11 +8962,9 @@ impl Worker {
             // Fail closed: never drain or reuse a malformed source's connection.
             result
         } else {
-            let t0 = std::time::Instant::now();
             let source_end =
                 crate::conn::drain_range_replies(&mut *self.src, pending_reads.len(), "read");
-            self.t[0] += t0.elapsed().as_secs_f64();
-            let t0 = std::time::Instant::now();
+
             let destination_end = crate::conn::drain_range_replies_with(
                 &mut *self.dst,
                 pending_writes.len(),
@@ -8784,7 +8981,6 @@ impl Worker {
                     );
                 },
             );
-            self.t[2] += t0.elapsed().as_secs_f64();
             result.and(source_end).and(destination_end)
         };
         *credited += flights[0].as_ref().expect("primary share").credited;
@@ -8862,22 +9058,35 @@ impl Worker {
                     self.benchmark.stream_shrink_requests += 1;
                 }
                 self.dst.check_streaming_writes()?;
-                let t0 = std::time::Instant::now();
                 let (off, mut hash, mut data) = match ok(self.src.recv()?, "read stream")? {
                     Response::Block { off, hash, data } => (off, hash, data),
                     _ => bail!("unexpected response in read stream"),
                 };
-                self.t[0] += t0.elapsed().as_secs_f64();
                 let requested = (end - expected).min(block);
                 validate_range_reply(expected, requested, off, data.len())?;
                 expected += requested;
-                let claimed = crate::streaming::claim_block(h, off, &mut hash, &mut data)?;
+                let policy = self.opts.hash_policy;
+                if !policy.transfer_integrity {
+                    hash = [0; 32];
+                }
+                let claimed = crate::streaming::claim_block_with_digest(
+                    h,
+                    off,
+                    &mut hash,
+                    &mut data,
+                    |data| {
+                        if policy.transfer_integrity {
+                            policy.payload_algorithm().hash(data)
+                        } else {
+                            [0; 32]
+                        }
+                    },
+                )?;
                 self.benchmark.stream_discarded_bytes += requested - claimed;
                 if claimed == 0 {
                     break;
                 }
                 self.limit(claimed);
-                let t0 = std::time::Instant::now();
                 self.dst.send(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
@@ -8888,7 +9097,6 @@ impl Worker {
                     data,
                     guard: job.container_guard.clone(),
                 })?;
-                self.t[1] += t0.elapsed().as_secs_f64();
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
@@ -8909,12 +9117,11 @@ impl Worker {
         }
         // Always restore both protocol boundaries, even after a local write
         // error. No following file can consume this one's data or late errors.
-        let (source_end, destination_end, destination_wait) =
+        let (source_end, destination_end, _destination_wait) =
             crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
         let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });
-        self.t[2] += destination_wait.as_secs_f64();
         result.and(source_end).and(destination_end)
     }
 
@@ -8945,6 +9152,10 @@ impl Worker {
 
     fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
+            let _pacing = self
+                .observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
             if self.opts.tuning.bw_pacing == Some(crate::transfer_tuning::BwPacing::Average) {
                 limit.wait_prepaid(bytes);
             } else {
@@ -8954,15 +9165,19 @@ impl Worker {
     }
 
     fn finish_file(&mut self, idx: usize) -> Result<()> {
-        if self.sched.is_failed(idx) {
+        if self.sched.is_failed(idx) || self.sched.is_aborted() {
             return Ok(());
         }
         let job = self.job(idx);
+        if job.done.load(Relaxed) != job.entry.size {
+            bail!("refusing to publish an incomplete file");
+        }
         let mut meta = job.entry.meta();
         meta.mode = self.create_mode(&job);
         let flags = publication_metadata_flags(self.opts.flags);
         let finalized = ok(
             self.dst.call(Request::Finalize {
+                expected_digest: self.opts.expected_for(&job.rel_bytes).cloned(),
                 path: job.dst.clone(),
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
@@ -8995,18 +9210,18 @@ impl Worker {
             if !partial_missing || !self.contents_match(&job)? {
                 return Err(error);
             }
+            self.validate_expected_destination(&job)?;
         }
         #[cfg(debug_assertions)]
         crate::fsops::test_race_barrier(
             "SYQ_TEST_FINALIZE_READY_FILE",
             "SYQ_TEST_FINALIZE_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_AFTER_FINALIZE_MS",
             "finalize-ready",
         )?;
         self.complete_file(idx, job, false)
     }
 
-    fn contents_match(&mut self, job: &FileJob) -> Result<bool> {
+    fn contents_match(&mut self, job: &WorkerJob) -> Result<bool> {
         self.src.send(Request::FileHash {
             path: job.src.clone(),
             source: self.source_reference(job),
@@ -9048,7 +9263,7 @@ impl Worker {
     /// Recheck the source after either an atomic publication or a verified
     /// metadata-only completion, and retry from the completed destination when
     /// the source changed during that work.
-    fn complete_file(&mut self, idx: usize, job: FileJob, matched: bool) -> Result<()> {
+    fn complete_file(&mut self, idx: usize, job: WorkerJob, matched: bool) -> Result<()> {
         // Did the source change under us?
         let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
         let changed = match &now {
@@ -9078,8 +9293,8 @@ impl Worker {
                         ..e
                     };
                     j.attempt += 1;
-                    j.dst_entry = Some(published);
                     j.done.store(0, Relaxed);
+                    jobs.set_destination(idx, published);
                     drop(jobs);
                     self.sched.requeue(idx);
                     return Ok(());
@@ -9093,19 +9308,22 @@ impl Worker {
         } else {
             self.progress.files_done.fetch_add(1, Relaxed);
             if let Some(results) = self.progress.results_writer() {
-                results.emit_operation(&crate::results::OperationRecord {
-                    action: "transfer_file",
-                    dst: &job.rel_bytes,
-                    src: job.src_rel.as_deref(),
-                    kind: "file",
-                    disposition: "succeeded",
-                    bytes: Some(job.entry.size),
-                    attempts: Some(u64::from(job.attempt) + 1),
-                    retryable: None,
-                    class: None,
-                    os_kind: None,
-                    message: None,
-                });
+                results.emit_operation_expected(
+                    &crate::results::OperationRecord {
+                        action: "transfer_file",
+                        dst: &job.rel_bytes,
+                        src: job.src_rel.as_deref(),
+                        kind: "file",
+                        disposition: "succeeded",
+                        bytes: Some(job.entry.size),
+                        attempts: Some(u64::from(job.attempt) + 1),
+                        retryable: None,
+                        class: None,
+                        os_kind: None,
+                        message: None,
+                    },
+                    self.opts.expected_for(&job.rel_bytes),
+                );
             }
         }
         if !matched && self.opts.verbose > 0 {
@@ -9114,10 +9332,76 @@ impl Worker {
         Ok(())
     }
 
+    // Keep digest reads in workers so one large file cannot stall directory
+    // planning. A failed check takes the normal repair path; publication still
+    // validates the expected digest. Explicit --hash continues to compare both
+    // endpoints regardless of matching metadata or an expected digest.
+    fn try_expected_match(&mut self, job: &WorkerJob) -> Result<bool> {
+        let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() else {
+            return Ok(false);
+        };
+        let Some(destination) = job.dst_entry.as_deref() else {
+            return Ok(false);
+        };
+        if self.opts.checksum || !self.opts.metadata_matches(&job.entry, destination) {
+            return Ok(false);
+        }
+        match self.dst.call(Request::ValidateDigest {
+            path: job.dst.clone(),
+            expected,
+            guard: job.container_guard.clone(),
+        })? {
+            Response::Ok => {}
+            Response::Err(_) | Response::EndpointError(_) => return Ok(false),
+            other => bail!("unexpected response validating destination digest: {other:?}"),
+        }
+        // Preserve the ordinary quick check's metadata reconciliation and
+        // require the same destination inode observed by the planner.
+        let response = ok(
+            self.dst.call(Request::Apply {
+                ops: vec![Op::SetFileMetaIfSame {
+                    path: job.dst.clone(),
+                    condition: match job.target_condition {
+                        TargetCondition::Any => target_identity(destination),
+                        condition => condition,
+                    },
+                    meta: job.entry.meta(),
+                    flags: self.opts.metadata_fix_flags(&job.entry, destination),
+                }],
+                guard: job.container_guard.clone(),
+            })?,
+            "update metadata after expected digest match",
+        )?;
+        match response {
+            Response::Applied(results) if results.len() == 1 => {
+                if let Some(error) = &results[0] {
+                    bail!("update metadata after expected digest match: {error}");
+                }
+            }
+            other => bail!("unexpected metadata response: {other:?}"),
+        }
+        Ok(true)
+    }
+
+    fn validate_expected_destination(&mut self, job: &WorkerJob) -> Result<()> {
+        if let Some(expected) = self.opts.expected_for(&job.rel_bytes).cloned() {
+            ok(
+                self.dst.call(Request::ValidateDigest {
+                    path: job.dst.clone(),
+                    expected,
+                    guard: job.container_guard.clone(),
+                })?,
+                "validate expected digest",
+            )?;
+        }
+        Ok(())
+    }
+
     fn verify_file(&mut self, idx: usize) -> Result<()> {
         let job = self.job(idx);
 
         let r = (|| -> Result<bool> {
+            self.validate_expected_destination(&job)?;
             self.src.send(Request::FileHash {
                 path: job.src.clone(),
                 source: self.source_reference(&job),
@@ -9250,13 +9534,21 @@ mod tests {
         receive_pause: Option<std::time::Duration>,
         rtt_us: Option<u64>,
         dead: bool,
+        max_pending: usize,
+        local: bool,
+        latency: Option<std::time::Duration>,
+        ready: std::collections::VecDeque<std::time::Instant>,
+        abort_on_receive: Option<Arc<Sched>>,
     }
 
     struct PipelineConn(Arc<Mutex<PipelineState>>);
 
     impl Conn for PipelineConn {
         fn supports_request_pipelining(&self) -> bool {
-            !self.0.lock().unwrap().synchronous
+            {
+                let state = self.0.lock().unwrap();
+                !state.synchronous && !state.local
+            }
         }
         fn tcp_rtt_us(&self) -> Option<u64> {
             self.0.lock().unwrap().rtt_us
@@ -9271,7 +9563,12 @@ mod tests {
             Ok(())
         }
         fn send(&mut self, request: Request) -> Result<()> {
-            self.0.lock().unwrap().requests.push(request);
+            let mut state = self.0.lock().unwrap();
+            state.requests.push(request);
+            if let Some(latency) = state.latency {
+                state.ready.push_back(std::time::Instant::now() + latency);
+            }
+            state.max_pending = state.max_pending.max(state.requests.len() - state.received);
             Ok(())
         }
         fn recv(&mut self) -> Result<Response> {
@@ -9301,6 +9598,12 @@ mod tests {
             if state.fail_receive == Some(state.received) {
                 state.dead = true;
                 bail!("injected connection loss");
+            }
+            if let Some(ready) = state.ready.pop_front() {
+                std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
+            }
+            if let Some(sched) = state.abort_on_receive.take() {
+                sched.abort();
             }
             Ok(state.replies.pop_front().expect("unexpected receive"))
         }
@@ -9337,22 +9640,29 @@ mod tests {
         let path = directory.path().join("source");
         std::fs::write(&path, vec![0; size]).unwrap();
         FileJob {
-            src: name.to_vec(),
-            source: RegisteredPath {
-                root: serde_json::from_str("0").unwrap(),
-                relative: name.to_vec(),
-            },
-            dst: [name, b"-dst"].concat(),
-            rel: String::from_utf8(name.to_vec()).unwrap(),
-            entry: crate::fsops::lstat_entry(Vec::new(), &path).unwrap(),
             dst_entry: None,
-            target_condition: TargetCondition::Any,
-            container_guard: None,
-            attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
-            inplace: false,
-            rel_bytes: name.to_vec(),
-            src_rel: None,
+            data: FileJobData {
+                src: name.to_vec(),
+                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), name.to_vec())
+                    .unwrap(),
+                dst: [name, b"-dst"].concat(),
+                rel: String::from_utf8(name.to_vec()).unwrap(),
+                entry: crate::fsops::lstat_entry(Vec::new(), &path).unwrap(),
+                target_condition: TargetCondition::Any,
+                container_guard: None,
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: false,
+                rel_bytes: name.to_vec(),
+                src_rel: None,
+            },
+        }
+    }
+
+    fn pipeline_snapshot(job: FileJob) -> WorkerJob {
+        WorkerJob {
+            data: crate::sched::SnapshotData::Owned(job.data),
+            dst_entry: job.dst_entry.map(crate::sched::SnapshotEntry::Owned),
         }
     }
 
@@ -9374,6 +9684,9 @@ mod tests {
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
+            hash_policy: Default::default(),
+            expected_digest: None,
+            mapping_expected_digests: Default::default(),
             block,
             tuning: crate::transfer_tuning::TransferTuning {
                 copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
@@ -9387,6 +9700,7 @@ mod tests {
             perms: false,
             devices: false,
             checksum: false,
+            precise_mtime: true,
             verify_only: false,
             inplace: false,
             same_host: false,
@@ -9397,7 +9711,7 @@ mod tests {
             quiet: true,
             verbose: 0,
             umask: 0,
-            copy_id: std::sync::OnceLock::from([0; 16]),
+            copy_id: [0; 16],
             ignore: Vec::new(),
             delete: false,
             delete_excluded: false,
@@ -9406,7 +9720,6 @@ mod tests {
             ignore_existing: false,
             preserve_existing_directory_metadata: false,
             existing: false,
-            insecure_links: false,
             operator_symlink_policy: OperatorSymlinkPolicy::Refuse,
             max_size: None,
             min_size: None,
@@ -9420,12 +9733,257 @@ mod tests {
             opts,
             bwlimit: None,
             gate: Gate::new(1),
-            t: [0.0; 4],
-            fast: FastTiming::default(),
+            observation: None,
             benchmark: Default::default(),
             fast_batch_files: 1,
             setup_elapsed: std::time::Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn prune_index_preserves_root_boundaries() {
+        let seen: std::collections::HashMap<_, _> = [
+            "dst",
+            "dst/file",
+            "dst/sub",
+            "dst/sub/file",
+            "dst/submarine/file",
+            "dst2/file",
+            "/file",
+        ]
+        .into_iter()
+        .map(|p| (p.as_bytes().to_vec(), Claim::Leaf))
+        .collect();
+        let mut sorted: Vec<_> = seen.keys().collect();
+        sorted.sort_unstable();
+        for root in [
+            b"dst".as_slice(),
+            b"dst/",
+            b"dst/sub",
+            b"dst/sub/",
+            b"missing",
+            b"/",
+            b"",
+        ] {
+            assert_eq!(
+                PruneWalk::new(&seen, root, None).unmatched,
+                PruneWalk::new(&seen, root, Some(&sorted)).unmatched
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual planner timing; run with --release --ignored --nocapture"]
+    fn prune_index_timing() {
+        use std::time::Instant;
+        let count = 200_000;
+        for roots in [1, 2, 10, 16, 32, 100] {
+            let seen: std::collections::HashMap<_, _> = (0..count)
+                .map(|i| {
+                    (
+                        format!("destination/root-{:03}/directory/file-{i:08}", i % roots)
+                            .into_bytes(),
+                        Claim::Leaf,
+                    )
+                })
+                .collect();
+            let root_paths: Vec<_> = (0..roots)
+                .map(|i| format!("destination/root-{i:03}").into_bytes())
+                .collect();
+            let start = Instant::now();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, None));
+            }
+            let original = start.elapsed();
+            let start = Instant::now();
+            let mut sorted: Vec<_> = seen.keys().collect();
+            sorted.sort_unstable();
+            let sorting = start.elapsed();
+            for root in &root_paths {
+                std::hint::black_box(PruneWalk::new(&seen, root, Some(&sorted)));
+            }
+            eprintln!("claims={count} roots={roots} scan={original:?} index_total={:?} sorting={sorting:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual simulated-latency timing; run with --ignored --nocapture"]
+    fn prune_pipeline_timing() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = crate::fsops::lstat_entry(b"extra".to_vec(), directory.path()).unwrap();
+        let seen = (0..4096)
+            .map(|i| (format!("dst/file-{i}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        walk.push(candidate, b"dst", &[]);
+        for local in [true, false] {
+            let state = Arc::new(Mutex::new(PipelineState {
+                local,
+                latency: Some(std::time::Duration::from_millis(20)),
+                ..Default::default()
+            }));
+            state
+                .lock()
+                .unwrap()
+                .replies
+                .extend((0..8).map(|_| Response::Stats(vec![None; 512])));
+            let start = std::time::Instant::now();
+            lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+            eprintln!(
+                "simulated RTT=20ms paths=4096 sequential={local} elapsed={:?}",
+                start.elapsed()
+            );
+            assert_eq!(state.lock().unwrap().max_pending, if local { 1 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn prune_walk_drops_synced_entries_and_skips_empty_candidate_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let template = crate::fsops::lstat_entry(Vec::new(), &file).unwrap();
+        let seen: std::collections::HashMap<_, _> = (0..10_000)
+            .map(|index| (format!("dst/file-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        for index in 0..9_000 {
+            let mut entry = template.clone();
+            entry.path = format!("file-{index}").into_bytes();
+            walk.push(entry, b"dst", &[]);
+            assert!(walk.entries.is_empty(), "exact matches must not accumulate");
+        }
+        walk.finish_scan(b"dst");
+        assert_eq!(walk.unmatched.len(), 1_000);
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert!(aliases.is_empty());
+        assert!(state.lock().unwrap().requests.is_empty());
+    }
+
+    #[test]
+    fn prune_walk_keeps_shields_recovery_and_nested_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut entry = crate::fsops::lstat_entry(Vec::new(), directory.path()).unwrap();
+        let seen = [(b"dst/blocked".to_vec(), Claim::Weak)]
+            .into_iter()
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        // The child deliberately arrives before its claimed directory.
+        for path in [
+            "blocked/child",
+            "blocked",
+            "nested/extra",
+            "old/.syq-swap-123-4/data",
+            "extra",
+        ] {
+            entry.path = path.as_bytes().to_vec();
+            walk.push(entry.clone(), b"dst", &[b"dst/nested".to_vec()]);
+        }
+        walk.finish_scan(b"dst");
+        assert!(walk.unmatched.is_empty());
+        assert_eq!(walk.entries.len(), 1);
+        assert_eq!(walk.entries[0].path, b"dst/extra");
+        assert!(walk.recovery_parents.contains(b"dst/old".as_slice()));
+    }
+
+    #[test]
+    fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        let mut candidate = crate::fsops::lstat_entry(b"stored-name".to_vec(), &file).unwrap();
+        candidate.ino = 42;
+        let seen: std::collections::HashMap<_, _> = (0..3_073)
+            .map(|index| (format!("dst/claim-{index}").into_bytes(), Claim::Leaf))
+            .collect();
+        let mut walk = PruneWalk::new(&seen, b"dst", None);
+        walk.push(candidate.clone(), b"dst", &[]);
+        let mut unrelated = candidate.clone();
+        unrelated.ino = 43;
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        state.lock().unwrap().replies.extend([
+            Response::Stats(vec![Some(unrelated); 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![Some(candidate.clone())]),
+        ]);
+        let aliases = lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[&(candidate.dev, candidate.ino)], Claim::Leaf);
+        assert_eq!(state.lock().unwrap().requests.len(), 7);
+        assert_eq!(state.lock().unwrap().max_pending, 4);
+        assert!(state.lock().unwrap().replies.is_empty());
+
+        let malformed = Arc::new(Mutex::new(PipelineState::default()));
+        malformed.lock().unwrap().replies.extend([
+            Response::Stats(vec![]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+            Response::Stats(vec![None; 512]),
+        ]);
+        assert!(lookup_prune_aliases(&mut PipelineConn(malformed.clone()), &walk, None).is_err());
+        assert!(malformed.lock().unwrap().replies.is_empty());
+    }
+
+    #[test]
+    fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(FileJob {
+            dst_entry: None,
+            data: FileJobData {
+                src: b"source".to_vec(),
+                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
+                    .unwrap(),
+                dst: b"destination".to_vec(),
+                rel: "innocent-file".into(),
+                entry,
+                target_condition: TargetCondition::Any,
+                container_guard: None,
+                attempt: 0,
+                done: Arc::new(AtomicU64::new(0)),
+                inplace: false,
+                rel_bytes: b"innocent-file".to_vec(),
+                src_rel: None,
+            },
+        });
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+        let src = Arc::new(Mutex::new(PipelineState {
+            abort_on_receive: Some(sched.clone()),
+            ..Default::default()
+        }));
+        for i in 0..4 {
+            let data = vec![0; 512];
+            src.lock().unwrap().replies.push_back(Response::Block {
+                off: i * 512,
+                hash: content_digest(&data),
+                data,
+            });
+        }
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        dst.lock().unwrap().replies.push_back(Response::Ok);
+        let mut worker = pipeline_worker(sched.clone(), src.clone(), dst.clone(), 512, false);
+        worker.transfer_range(&range, &mut 0).unwrap();
+        assert!(!sched.range_done(&range));
+        worker.finish_file(0).unwrap();
+        assert!(!sched.is_failed(0));
+        assert!(src.lock().unwrap().replies.is_empty());
+        let destination = dst.lock().unwrap();
+        assert!(destination.replies.is_empty());
+        assert!(destination
+            .requests
+            .iter()
+            .all(|r| matches!(r, Request::WriteRange { .. })));
+        assert_eq!(worker.progress.errors.load(Relaxed), 0);
     }
 
     #[test]
@@ -9449,6 +10007,7 @@ mod tests {
                         sched.retry_range(&range, 0);
                     }
                     let src = Arc::new(Mutex::new(PipelineState::default()));
+                    src.lock().unwrap().replies.push_back(Response::Ok); // ConfigureHashing
                     if streaming {
                         src.lock().unwrap().replies.push_back(Response::Ok);
                     }
@@ -9465,11 +10024,12 @@ mod tests {
                         });
                     }
                     let dst = Arc::new(Mutex::new(PipelineState::default()));
+                    dst.lock().unwrap().replies.push_back(Response::Ok); // ConfigureHashing
                     if !queued_range {
                         dst.lock()
                             .unwrap()
                             .replies
-                            .push_back(Response::PartialSize(None));
+                            .push_back(Response::Prepared(Preparation::default()));
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                     let mut worker =
@@ -9482,21 +10042,26 @@ mod tests {
                         "protocol failure, not a lost socket"
                     );
                     let source = src.lock().unwrap();
-                    assert_eq!(source.received, 2 + usize::from(streaming));
+                    assert_eq!(source.received, 3 + usize::from(streaming));
+                    assert!(matches!(source.requests[0], Request::ConfigureHashing(_)));
                     assert_eq!(source.replies.len(), 3);
                     if streaming {
-                        assert_eq!(source.requests.len(), 1);
+                        assert_eq!(source.requests.len(), 2);
                         assert!(
-                            matches!(&source.requests[0], Request::ReadStream(stream) if stream.path == b"first")
+                            matches!(&source.requests[1], Request::ReadStream(stream) if stream.path == b"first")
                         );
                     } else {
-                        assert_eq!(source.requests.len(), 5);
-                        assert!(source.requests.iter().all(|request| matches!(
+                        assert_eq!(source.requests.len(), 6);
+                        assert!(source.requests[1..].iter().all(|request| matches!(
                             request, Request::ReadRange { path, .. } if path == b"first"
                         )));
                     }
                     let destination = dst.lock().unwrap();
-                    assert_eq!(destination.received, usize::from(!queued_range));
+                    assert_eq!(destination.received, 1 + usize::from(!queued_range));
+                    assert!(matches!(
+                        destination.requests[0],
+                        Request::ConfigureHashing(_)
+                    ));
                     assert_eq!(
                         destination.replies.len(),
                         1,
@@ -9511,7 +10076,7 @@ mod tests {
                     assert!(
                         matches!(writes[0], Request::WriteRange { off: 0, path, .. } if path == b"first-dst")
                     );
-                    assert_eq!(destination.requests.len(), 1 + usize::from(!queued_range));
+                    assert_eq!(destination.requests.len(), 2 + usize::from(!queued_range));
                 }
             }
         }
@@ -9717,7 +10282,7 @@ mod tests {
                 "destination-drop",
             ] {
                 let jobs: Vec<_> = (0..8)
-                    .map(|i| pipeline_job(format!("file{i}").as_bytes(), 512))
+                    .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
                     .collect();
                 let groups = [0..2, 2..4, 4..6, 6..8];
                 let dst = Arc::new(Mutex::new(PipelineState {
@@ -9914,7 +10479,7 @@ mod tests {
             (None, 200, [4, 5, 6, 7, 8, 8, 8, 8]),
         ] {
             let jobs: Vec<_> = (0..8)
-                .map(|i| pipeline_job(format!("file{i}").as_bytes(), 512))
+                .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
                 .collect();
             let src = Arc::new(Mutex::new(PipelineState {
                 receive_pause: Some(std::time::Duration::from_millis(125)),
@@ -9956,7 +10521,7 @@ mod tests {
 
     #[test]
     fn empty_file_groups_need_no_source_reads() {
-        let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)];
+        let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)].map(pipeline_snapshot);
         let src = Arc::new(Mutex::new(PipelineState::default()));
         let dst = Arc::new(Mutex::new(PipelineState::default()));
         dst.lock()
@@ -9966,16 +10531,28 @@ mod tests {
         let mut worker = pipeline_worker(
             Arc::new(Sched::new(512, 8192)),
             src.clone(),
-            dst,
+            dst.clone(),
             512,
             false,
         );
+        let algorithm = crate::hashing::HashAlgorithm::Sha256;
+        Arc::get_mut(&mut worker.opts)
+            .unwrap()
+            .hash_policy
+            .algorithm = algorithm;
         assert!(worker
             .transfer_small_batches(&jobs, std::iter::once(0..2))
             .unwrap()
             .iter()
             .all(Result::is_ok));
         assert!(src.lock().unwrap().requests.is_empty());
+        let destination = dst.lock().unwrap();
+        let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {
+            panic!("expected one whole-file write batch")
+        };
+        assert!(puts
+            .iter()
+            .all(|put| put.data.is_empty() && put.hash == algorithm.hash(&[])));
     }
 
     #[test]
@@ -10355,45 +10932,6 @@ mod tests {
     }
 
     #[test]
-    fn raw_path_identity_is_lossless_without_changing_utf8_identity() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        assert_eq!(
-            path_identity(std::path::Path::new("/tmp/name")),
-            "/tmp/name"
-        );
-        let first = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xff"));
-        let second = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/raw-\xfe"));
-        assert_ne!(path_identity(first), path_identity(second));
-        assert!(path_identity(first).starts_with('\0'));
-    }
-
-    #[test]
-    fn explicit_ssh_port_is_part_of_endpoint_identity() {
-        let location = |host: &str, port| Location {
-            user: Some("alice".into()),
-            host: Some(host.into()),
-            port,
-            path: b"/data".to_vec(),
-            selection: SourceSelection::Named,
-        };
-
-        assert_eq!(endpoint_identity(&location("backup", None)), "alice@backup");
-        assert_eq!(
-            endpoint_identity(&location("backup", Some(2200))),
-            "alice@backup:2200"
-        );
-        assert_eq!(
-            endpoint_identity(&location("backup", Some(2222))),
-            "alice@backup:2222"
-        );
-        assert_eq!(
-            endpoint_identity(&location("2001:db8::1", Some(2200))),
-            "alice@[2001:db8::1]:2200"
-        );
-    }
-
-    #[test]
     fn dry_run_location_labels_include_explicit_ssh_port() {
         let location = |host: &str, port| Location {
             user: Some("alice".into()),
@@ -10494,29 +11032,6 @@ mod tests {
     }
 
     #[test]
-    fn restricted_exact_identity_uses_the_enrolled_leaf_without_observing_its_parent() {
-        assert_eq!(
-            destination_identity_plan(true, true, b"/enrolled/root/link", b"/enrolled/root/link",),
-            DestinationIdentityPlan::Enrolled(std::path::PathBuf::from("/enrolled/root/link"))
-        );
-        assert_eq!(
-            destination_identity_plan(false, true, b"/enrolled/root", b"/enrolled/root"),
-            DestinationIdentityPlan::Canonicalize(b"/enrolled/root".to_vec())
-        );
-        assert_eq!(
-            destination_identity_plan(true, false, b"links/exact", b"links/exact"),
-            DestinationIdentityPlan::CanonicalizeParent {
-                parent: b"links".to_vec(),
-                exact_path: b"links/exact".to_vec(),
-            }
-        );
-        assert_eq!(
-            destination_identity_plan(true, false, b"~", b"~"),
-            DestinationIdentityPlan::Canonicalize(b"~".to_vec())
-        );
-    }
-
-    #[test]
     fn restricted_root_creation_uses_only_the_authorized_mode_policy() {
         let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false, false);
         assert_eq!(ordinary.len(), 1);
@@ -10586,6 +11101,23 @@ mod tests {
                 b"/destination/c/d".as_slice()
             ]
         );
+    }
+
+    #[test]
+    fn attested_outcome_summary_does_not_hide_coordinator_statistics() {
+        let mut args = Args::parse_args(&[
+            "cp".into(),
+            "source".into(),
+            "--as".into(),
+            "destination".into(),
+            "--stats".into(),
+        ])
+        .unwrap();
+        assert!(show_statistics(&args));
+        args.suppress_summary = true;
+        assert!(!show_statistics(&args));
+        args.restricted_grant = Some("coordinator grant".into());
+        assert!(show_statistics(&args));
     }
 
     #[test]

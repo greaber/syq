@@ -6,7 +6,7 @@
 //! the cached binary directly. On a miss, `conn` probes the target and either
 //! authorizes a release download or uploads a matching executable.
 
-pub const RELEASE_BASE_URL: &str = "https://github.com/greaber/syq/releases/download";
+pub const RELEASE_BASE_URL: &str = "https://dl.syq.christmas";
 pub const HELPER_MISSING_EXIT: i32 = 125;
 pub const HELPER_NOT_EXECUTABLE_EXIT: i32 = 126;
 /// Direct download could not be used, but installing an uploaded helper may work.
@@ -49,6 +49,21 @@ impl Target {
             }),
             _ => None,
         }
+    }
+
+    /// Unknown platforms have no upstream asset. A self-upload can still be
+    /// tried: executing the temporary binary is the final compatibility check.
+    pub fn for_bootstrap(os: &str, arch: &str) -> Option<Self> {
+        Self::from_uname(os, arch).or_else(|| {
+            (!crate::identity::uses_release_helpers()).then_some(Self {
+                key: "self",
+                asset: "",
+            })
+        })
+    }
+
+    pub fn can_upload_self(self) -> bool {
+        self.key == "self" || Some(self) == Self::local()
     }
 
     pub fn local() -> Option<Self> {
@@ -99,18 +114,35 @@ Linux:x86_64) target=linux-x86_64 ;;
 Linux:aarch64|Linux:arm64) target=linux-aarch64 ;;
 Darwin:x86_64) target=macos-x86_64 ;;
 Darwin:arm64|Darwin:aarch64) target=macos-arm64 ;;
-*) exit {HELPER_MISSING_EXIT} ;;
+*) {unknown_target} ;;
 esac
 program="$HOME/.cache/syq/helpers/{release}/$target/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
         release = cache_key(),
+        unknown_target = if crate::identity::uses_release_helpers() {
+            format!("exit {HELPER_MISSING_EXIT}")
+        } else {
+            "target=self".into()
+        },
     );
     format!(
         "sh -c {} syq {}",
         shell_words::quote(&script),
         shell_words::join(args)
     )
+}
+
+const INSTALL_COMMAND: &str = r#"if [ ! -e "$HOME/.local/bin/syq" ] && [ ! -L "$HOME/.local/bin/syq" ]; then
+    "$program" --install-remote-command </dev/null >/dev/null || :
+fi"#;
+
+fn install_command() -> &'static str {
+    if crate::identity::is_release_build() {
+        INSTALL_COMMAND
+    } else {
+        ""
+    }
 }
 
 pub fn download_script(target: Target) -> String {
@@ -248,7 +280,8 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+{install_command}"#,
         target_key = target.key,
         archive_url = shell_words::quote(&archive_url),
         manifest_url = shell_words::quote(&manifest_url),
@@ -257,6 +290,7 @@ trap - EXIT HUP INT TERM"#,
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
         remote_download_integrity_exit = REMOTE_DOWNLOAD_INTEGRITY_EXIT,
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = install_command(),
     )
 }
 
@@ -268,6 +302,7 @@ pub fn upload_script(target: Target) -> String {
     let expected_identity = helper_identity();
     format!(
         r#"set -u
+install_umask=$(umask)
 umask 077
 dir="$HOME/.cache/syq/helpers/{release}/{target_key}"
 program="$dir/syq"
@@ -287,7 +322,7 @@ if ! chmod 700 "$tmp"; then
     exit {install_failed_exit}
 fi
 got=$("$tmp" --version 2>/dev/null) || {{
-    echo "syq: uploaded helper cannot run on this host; use a build compatible with its system libraries and CPU" >&2
+    echo "syq: uploaded helper cannot run on this host ($(uname -s) $(uname -m)); use a build compatible with its system libraries and CPU" >&2
     exit {install_failed_exit}
 }}
 [ "$got" = {expected_version} ] || {{
@@ -295,7 +330,7 @@ got=$("$tmp" --version 2>/dev/null) || {{
     exit {install_failed_exit}
 }}
 got_id=$("$tmp" --build-identity 2>/dev/null) || {{
-    echo "syq: uploaded helper does not report a build identity" >&2
+    echo "syq: uploaded helper does not report a build identity on $(uname -s) $(uname -m); check that the binary runs there and supports --build-identity" >&2
     exit {install_failed_exit}
 }}
 [ "$got_id" = {expected_identity} ] || {{
@@ -307,17 +342,53 @@ if ! mv "$tmp" "$program"; then
     exit {install_failed_exit}
 fi
 cleanup
-trap - EXIT HUP INT TERM"#,
+trap - EXIT HUP INT TERM
+umask "$install_umask"
+{install_command}"#,
         target_key = target.key,
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         install_failed_exit = INSTALL_FAILED_EXIT,
+        install_command = install_command(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_command_skips_the_installer_process() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        for entry in ["absent", "file", "directory", "symlink", "dangling symlink"] {
+            let home = tempfile::tempdir().unwrap();
+            let bin = home.path().join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("syq");
+            match entry {
+                "absent" => {}
+                "file" => fs::write(&destination, b"existing").unwrap(),
+                "directory" => fs::create_dir(&destination).unwrap(),
+                "symlink" => symlink(&bin, &destination).unwrap(),
+                "dangling symlink" => symlink("missing", &destination).unwrap(),
+                _ => unreachable!(),
+            }
+            // A missing executable makes any attempted launch visible on stderr.
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", INSTALL_COMMAND])
+                .env("HOME", home.path())
+                .env("program", home.path().join("missing-installer"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{entry}: {output:?}");
+            assert_eq!(
+                output.stderr.is_empty(),
+                entry != "absent",
+                "{entry}: {output:?}"
+            );
+        }
+    }
 
     #[test]
     fn maps_supported_uname_pairs() {
@@ -379,6 +450,62 @@ mod tests {
         assert!(command.contains("openssl"));
         assert!(command.contains("gzip"));
         assert!(command.contains("syq-helper-tools:"));
+    }
+
+    #[test]
+    fn upload_identity_failure_reports_remote_platform() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let root = crate::test_support::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let uname = bin.join("uname");
+        std::fs::write(
+            &uname,
+            b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                &upload_script(Target {
+                    key: "self",
+                    asset: "",
+                }),
+            ])
+            .env("HOME", root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let binary = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'syq {}'; else exit 1; fi\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(binary.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert_eq!(result.status.code(), Some(INSTALL_FAILED_EXIT));
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("does not report a build identity on Linux riscv64"),
+            "{error}"
+        );
+        let cache = root
+            .path()
+            .join(".cache/syq/helpers")
+            .join(cache_key())
+            .join("self");
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
     }
 
     #[test]

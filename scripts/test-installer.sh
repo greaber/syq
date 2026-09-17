@@ -171,17 +171,16 @@ test "$(sh "$work/install.sh" --help | head -1)" = 'Install syq 0.1.0 without su
 expect_failure 'unknown option: --bogus' sh "$work/install.sh" --bogus
 expect_failure '--bin-dir needs a value' sh "$work/install.sh" --bin-dir
 expect_failure 'HOME is not set' env -u HOME -u XDG_CONFIG_HOME sh "$work/install.sh"
-no_receipt_config="$work/no-receipt-config"
-expect_failure 'HOME and XDG_CONFIG_HOME are not set' env -u HOME -u XDG_CONFIG_HOME \
-  sh "$work/install.sh" --bin-dir "$no_receipt_config"
-test ! -e "$no_receipt_config/syq"
-invalid_receipt_config="$work/invalid-receipt-config"
-printf 'not a directory\n' > "$invalid_receipt_config"
-invalid_receipt_bin="$work/invalid-receipt-bin"
-expect_failure 'cannot prepare install receipt directory' env \
-  XDG_CONFIG_HOME="$invalid_receipt_config" \
-  sh "$work/install.sh" --bin-dir "$invalid_receipt_bin"
-test ! -e "$invalid_receipt_bin/syq"
+# Explicit bin-dir works without HOME or config, and ignores unusable config.
+env -u HOME -u XDG_CONFIG_HOME SYQ_TEST_UNAME_S=Linux SYQ_TEST_UNAME_M=x86_64 \
+  SYQ_TEST_RELEASE_DIR="$release" PATH="$fakebin:$PATH" \
+  sh "$work/install.sh" --bin-dir "$work/no-config" >/dev/null
+test -x "$work/no-config/syq"
+printf 'not a directory\n' > "$work/blocked-config"
+env XDG_CONFIG_HOME="$work/blocked-config" SYQ_TEST_UNAME_S=Linux SYQ_TEST_UNAME_M=x86_64 \
+  SYQ_TEST_RELEASE_DIR="$release" PATH="$fakebin:$PATH" \
+  sh "$work/install.sh" --bin-dir "$work/invalid-config" >/dev/null
+test -x "$work/invalid-config/syq"
 expect_failure 'unsupported platform: Plan9 mips' env \
   SYQ_TEST_UNAME_S=Plan9 SYQ_TEST_UNAME_M=mips PATH="$fakebin:$PATH" \
   sh "$work/install.sh" --bin-dir "$work/unsupported"

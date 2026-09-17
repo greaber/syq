@@ -191,7 +191,8 @@
               "kind": {
                 "enum": [
                   "local",
-                  "ssh"
+                  "ssh",
+                  "s3"
                 ]
               },
               "host": {
@@ -334,6 +335,9 @@
         },
         "elapsed_ms": {
           "$ref": "#/$defs/u64"
+        },
+        "activity": {
+          "$ref": "#/$defs/activity"
         }
       },
       "required": [
@@ -484,6 +488,9 @@
         },
         "code": {
           "$ref": "#/$defs/receiptCode"
+        },
+        "expected_digest": {
+          "$ref": "#/$defs/expectedDigest"
         }
       },
       "required": [
@@ -1140,6 +1147,747 @@
         "object"
       ],
       "additionalProperties": false
+    },
+    "activityFractions": {
+      "type": "object",
+      "properties": {
+        "other_work": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "awaiting_work": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "parked": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "source_request": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "source_response": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "destination_send": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "destination_ack": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "pacing": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "source_read": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "hashing": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "destination_write": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "filesystem_copy": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "prefetch_advice": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "prefetch_fence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "request_wait": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "handling": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "response_send": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "activityBytes": {
+      "type": "object",
+      "properties": {
+        "other_work": {
+          "$ref": "#/$defs/u64"
+        },
+        "awaiting_work": {
+          "$ref": "#/$defs/u64"
+        },
+        "parked": {
+          "$ref": "#/$defs/u64"
+        },
+        "source_request": {
+          "$ref": "#/$defs/u64"
+        },
+        "source_response": {
+          "$ref": "#/$defs/u64"
+        },
+        "destination_send": {
+          "$ref": "#/$defs/u64"
+        },
+        "destination_ack": {
+          "$ref": "#/$defs/u64"
+        },
+        "pacing": {
+          "$ref": "#/$defs/u64"
+        },
+        "source_read": {
+          "$ref": "#/$defs/u64"
+        },
+        "hashing": {
+          "$ref": "#/$defs/u64"
+        },
+        "destination_write": {
+          "$ref": "#/$defs/u64"
+        },
+        "filesystem_copy": {
+          "$ref": "#/$defs/u64"
+        },
+        "prefetch_advice": {
+          "$ref": "#/$defs/u64"
+        },
+        "prefetch_fence": {
+          "$ref": "#/$defs/u64"
+        },
+        "request_wait": {
+          "$ref": "#/$defs/u64"
+        },
+        "handling": {
+          "$ref": "#/$defs/u64"
+        },
+        "response_send": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "additionalProperties": false
+    },
+    "activityCpu": {
+      "type": "object",
+      "properties": {
+        "user_ns": {
+          "$ref": "#/$defs/u64"
+        },
+        "system_ns": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "user_ns",
+        "system_ns"
+      ],
+      "additionalProperties": false
+    },
+    "activityWorkers": {
+      "type": "object",
+      "properties": {
+        "observed": {
+          "$ref": "#/$defs/u64"
+        },
+        "active": {
+          "$ref": "#/$defs/u64"
+        },
+        "awaiting_work": {
+          "$ref": "#/$defs/u64"
+        },
+        "parked": {
+          "$ref": "#/$defs/u64"
+        },
+        "observed_ns": {
+          "$ref": "#/$defs/u64"
+        },
+        "fractions": {
+          "$ref": "#/$defs/activityFractions"
+        },
+        "cumulative_fractions": {
+          "$ref": "#/$defs/activityFractions"
+        },
+        "parked_ns": {
+          "$ref": "#/$defs/u64"
+        },
+        "cumulative_parked_ns": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "observed",
+        "active",
+        "awaiting_work",
+        "parked",
+        "observed_ns",
+        "fractions",
+        "cumulative_fractions",
+        "parked_ns",
+        "cumulative_parked_ns"
+      ],
+      "additionalProperties": false
+    },
+    "activityProcess": {
+      "type": "object",
+      "properties": {
+        "process": {
+          "type": "string"
+        },
+        "local": {
+          "type": "boolean"
+        },
+        "sample_age_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityCpu"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cumulative_cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityCpu"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "process",
+        "local",
+        "sample_age_ms",
+        "elapsed_ms",
+        "cpu",
+        "cumulative_cpu"
+      ],
+      "additionalProperties": false
+    },
+    "activityOperation": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "state_at_sample": {
+          "enum": [
+            "inactive",
+            "other_work",
+            "awaiting_work",
+            "parked",
+            "source_request",
+            "source_response",
+            "destination_send",
+            "destination_ack",
+            "pacing",
+            "source_read",
+            "hashing",
+            "destination_write",
+            "filesystem_copy",
+            "prefetch_advice",
+            "prefetch_fence",
+            "request_wait",
+            "handling",
+            "response_send"
+          ]
+        },
+        "observed_ns": {
+          "$ref": "#/$defs/u64"
+        },
+        "fractions": {
+          "$ref": "#/$defs/activityFractions"
+        },
+        "bytes": {
+          "$ref": "#/$defs/activityBytes"
+        },
+        "helper_cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityCpu"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "role",
+        "state_at_sample",
+        "observed_ns",
+        "fractions",
+        "bytes",
+        "helper_cpu"
+      ],
+      "additionalProperties": false
+    },
+    "activityTcp": {
+      "type": "object",
+      "properties": {
+        "congestion_control": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bytes_sent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bytes_retransmitted": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "segments_sent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "segments_received": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retransmissions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rtt_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rtt_variance_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_rtt_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "send_cwnd_bytes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delivery_rate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "busy_time_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receive_window_limited_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "send_buffer_limited_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ecn_ce_delivered": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "congestion_control",
+        "bytes_sent",
+        "bytes_retransmitted",
+        "segments_sent",
+        "segments_received",
+        "retransmissions",
+        "rtt_us",
+        "rtt_variance_us",
+        "min_rtt_us",
+        "send_cwnd_bytes",
+        "delivery_rate",
+        "busy_time_us",
+        "receive_window_limited_us",
+        "send_buffer_limited_us",
+        "ecn_ce_delivered"
+      ],
+      "additionalProperties": false
+    },
+    "activityTcpDelta": {
+      "type": "object",
+      "properties": {
+        "bytes_sent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retransmissions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "busy_time_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receive_window_limited_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "send_buffer_limited_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "bytes_sent",
+        "retransmissions",
+        "busy_time_us",
+        "receive_window_limited_us",
+        "send_buffer_limited_us"
+      ],
+      "additionalProperties": false
+    },
+    "activityEndpoint": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "sample_age_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "process": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "actors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activityOperation"
+          }
+        },
+        "tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityTcp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tcp_delta": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityTcpDelta"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "peer_tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityTcp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "peer_tcp_delta": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activityTcpDelta"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cumulative_actors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activityOperation"
+          }
+        }
+      },
+      "required": [
+        "label",
+        "sample_age_ms",
+        "process",
+        "elapsed_ms",
+        "actors",
+        "tcp",
+        "tcp_delta",
+        "peer_tcp",
+        "peer_tcp_delta",
+        "cumulative_actors"
+      ],
+      "additionalProperties": false
+    },
+    "activity": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "workers": {
+          "$ref": "#/$defs/activityWorkers"
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activityProcess"
+          }
+        },
+        "endpoints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activityEndpoint"
+          }
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "elapsed_ms",
+        "workers",
+        "processes",
+        "endpoints",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "expectedDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "enum": [
+            "blake3",
+            "sha256",
+            "md5",
+            "xxh3-128"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "value"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "algorithm": {
+                "enum": [
+                  "blake3",
+                  "sha256"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "pattern": "^[0-9a-f]{32}$"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

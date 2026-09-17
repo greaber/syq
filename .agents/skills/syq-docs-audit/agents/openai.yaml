@@ -1,0 +1,4 @@
+interface:
+  display_name: "Syq docs audit"
+  short_description: "Keep syq guides concise and directed toward users"
+  default_prompt: "Use $syq-docs-audit to audit syq documentation for user focus and excess detail."

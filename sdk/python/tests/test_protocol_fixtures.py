@@ -62,6 +62,32 @@ class AutomationFixtureTests(unittest.TestCase):
                 if mode == "cp" and dry_run:
                     self.assertEqual(result.bytes_transferred, 8)
 
+    def test_optional_activity_is_preserved_without_requiring_it_from_old_producers(self) -> None:
+        records = [json.loads(line) for line in (FIXTURES / "success.ndjson").read_bytes().splitlines()]
+        for activity in [None, {"elapsed_ms": 1, "workers": {"fractions": {"source_response": 1.0}}}]:
+            decoder = AutomationDecoder(dry_run=False, mapping=True)
+            decoder.feed(json.dumps(records[0]).encode())
+            progress = {
+                "schema": "syq.automation", "schema_version": 1, "seq": 1, "type": "progress",
+                **dict.fromkeys(["bytes_done", "bytes_total", "bytes_unchanged", "files_done", "files_total",
+                    "files_unchanged", "files_excluded", "scanned", "elapsed_ms"], 0), "scan_done": False,
+            }
+            if activity is not None:
+                progress["activity"] = activity
+            event = decoder.feed(json.dumps(progress).encode())
+            self.assertEqual(event.activity, activity)
+
+    def test_s3_endpoint_is_explicit_and_validated(self) -> None:
+        records = [json.loads(line) for line in (FIXTURES / "success.ndjson").read_bytes().splitlines()]
+        records[0]["endpoints"][1] = {"role": "destination", "kind": "s3", "host": "s3://bucket"}
+        decoder = AutomationDecoder(prune=False, mapping=True, dry_run=False)
+        events = [decoder.feed(json.dumps(record).encode()) for record in records]
+        self.assertIs(events[0].endpoints[1].kind, syq.EndpointKind.S3)
+        decoder.finish(0)
+        records[0]["endpoints"][1]["host"] = "ssh-host"
+        with self.assertRaises(syq.SyqProtocolError):
+            AutomationDecoder(prune=False, mapping=True, dry_run=False).feed(json.dumps(records[0]).encode())
+
     def test_rm_progress_and_dry_run_failures_are_valid_events(self) -> None:
         decoder = AutomationDecoder(mode="rm", dry_run=True, selectors_total=1)
         events = [

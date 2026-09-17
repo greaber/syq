@@ -17,16 +17,23 @@ syq rsync -av project/ server:backup/project/
 | Positive `--max-delete N` | Deletes nothing if the plan exceeds N; rsync deletes up to N |
 | Destination collisions | Distinct sources claiming the same destination fail before copying |
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
-| `--update` | Checks mtimes only for regular files; type replacements still occur |
+| Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
+| `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
 | Resume | Always keeps syq partial files; cannot reuse rsync partials |
 | Delta transfer | Reuses matching blocks at the same offsets; does not find shifted blocks |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
 
-A failed source or destination scan prevents deletion. A per-file read failure
-during transfer does not by itself prevent deletion: that source entry remains
-present, so its destination counterpart is not an extra. Preview deletion
-scope with `--dry-run -v`; see [deletion rules](reference.md#mirror-a-directory).
+Scan and copy errors prevent deletion. A destination that contains its source
+on the same host cannot be pruned. Preview deletion scope with `--dry-run -v`;
+see [deletion rules](reference.md#mirror-a-directory).
+
+The compatibility command uses rsync's default size-and-whole-second timestamp
+quick check. Native `syq cp` also compares fractional seconds at the precision
+suggested by the destination timestamp; see [timestamp matching](reference.md#check-file-contents).
+Use `-c` to compare contents when size and timestamp match; source timestamps
+are preserved, so ordinary clock skew does not require the source timestamp
+to be newer.
 
 Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
 `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
@@ -75,10 +82,14 @@ created as needed.
 
 ## Syq extensions
 
-Syq-specific options carry a `--syq-` prefix. Common ones are
-`--syq-connections`, `--syq-ignore`, `--syq-ignore-from`, and
+Most syq-specific options carry a `--syq-` prefix. Common ones are
+`--syq-ignore`, `--syq-ignore-from`, and
 `--syq-verify-only`. The last compares selected contents without writing;
 it does not produce rsync's itemized-change format.
+
+The [hashing controls](reference.md#check-file-contents) are
+`--integrity-checking` and `--syq-expected-hash`
+in rsync mode. `-c` still selects content comparison.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
 rules. Check the [gitignore examples](reference.md#ignoring-paths) when
@@ -95,3 +106,7 @@ syq rsync -a --syq-verify-only project/ backup/
 
 Hashes selected contents on both sides, writes nothing, and reports `DIFFERS`
 or `MISSING`. Differences or inspection failures produce a nonzero exit status.
+
+Performance controls use `--performance-tuning`; resource ceilings use
+`--resource-limits`. The standard rsync spelling `--bwlimit` remains available
+in `syq rsync`, as does `--checksum` for BLAKE3 content comparison.

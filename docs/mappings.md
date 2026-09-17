@@ -79,10 +79,18 @@ A manifest contains one JSON object per line (NDJSON):
 | `dst` | Required path relative to the destination container (`--into`) |
 | `kind` | Optional `file`, `dir`, `symlink`, or `special` precondition |
 | `size`, `mtime` | Optional information for transforms; ignored during execution |
+| `expected_digest` | Optional whole-file expectation: `{"algorithm":"md5","value":"900150983cd24fb0d6963f7d28e17f72"}` |
 
 Paths use `encoding: "utf-8"`, or `"base64"` with standard base64 of raw
 filename bytes. Absolute or empty paths, and any `.` or `..` component, are
 refused. Unknown fields are refused too.
+
+`expected_digest` requires a regular file. Algorithms are `blake3`, `sha256`,
+`md5`, and `xxh3-128`; the hex value contains 64 digits for BLAKE3 or SHA-256,
+and 32 for MD5 or XXH3-128. It checks the complete resulting file, including
+reused bytes, and a mismatch fails the entry. See [content checks](reference.md#check-file-contents)
+for staging, in-place writes, and selection filters. Older binaries that do not
+support this field reject the manifest.
 
 Each entry copies one object. **A directory entry is not recursive.**
 `syq map` emits its descendants as separate entries. A missing source or
@@ -107,19 +115,15 @@ syq cp --from hostA -C /data --mapping pairs.ndjson --to hostB --into /archive
 ```
 
 `--mapping -` reads the manifest from stdin. File contents follow the selected
-copy route. The restricted receiver verifies the authorized manifest and permits
-writes only at its listed destinations, plus creation of necessary parent
-directories. New implicit parents use normal directory permissions subject to
-the receiver’s umask. Existing implicit parents keep their permissions, including
-restoration if copying temporarily requires write access. A listed directory
-still selects only that directory, not its unlisted children. If a file or symlink
-blocks an implicit parent, the affected entries fail and unrelated mappings
-continue. Replacing that obstruction requires a directory entry for the parent
-in the manifest.
-Restricted receivers count mapped destinations and their parent directories
-against the copy’s entry limit. Each manifest line can be up to 1 MiB, and each
-destination path up to 4096 bytes. There is no separate limit on the total
-manifest size.
+copy route. The restricted receiver permits writes only at the listed
+destinations and creates missing parent directories as needed. New parents use
+permissions limited by the receiver's umask; existing parents keep theirs.
+If a file or symlink blocks a parent directory, move or remove it before
+retrying. The affected entries fail while unrelated mappings continue.
+
+Mapped destinations and their parent directories count against the receiver's
+entry limit. Each manifest line can be up to 1 MiB, and each destination path
+up to 4096 bytes. There is no separate limit on the total manifest size.
 
 ## Emitting a mapping
 
@@ -166,7 +170,7 @@ Add `--results r.ndjson` to record outcomes in a fresh file outside the copy
 trees. See [Automation results](automation.md) for the stream contract.
 
 Failed mapping entries contain `src`, `dst`, and `kind`, so they can form a
-retry manifest. First require a terminal `result` with `success` or `partial`:
+retry manifest. Preserve `expected_digest` too when present. First require a terminal `result` with `success` or `partial`:
 a missing terminal or an early stop means some entries may have no results.
 In those cases, rerun the original copy instead.
 
@@ -180,7 +184,9 @@ jq -cs 'if (.[-1].type? // "") != "result"
         else .[] | select(.type == "operation_result"
                           and .disposition == "failed"
                           and .retryable != "no")
-             | {src, dst, kind} end' r.ndjson \
+             | {src, dst, kind}
+               + (if has("expected_digest") then {expected_digest} else {} end)
+        end' r.ndjson \
   | syq cp --mapping - -C src --to nas --into /data
 ```
 

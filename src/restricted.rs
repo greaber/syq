@@ -372,9 +372,49 @@ pub(crate) struct RestrictedAuthority {
     settled: std::sync::Condvar,
     tcp_congestion: Option<String>,
     mapping: Option<Mutex<crate::mapping::Admission>>,
+    hashing: Option<crate::hashing::CopyHashing>,
 }
 
 impl RestrictedAuthority {
+    pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
+        self.hashing.as_ref().map_or(
+            crate::hashing::HashPolicy {
+                algorithm: crate::hashing::HashAlgorithm::Blake3,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            },
+            |hashing| hashing.policy,
+        )
+    }
+
+    fn expected_digest(&self, path: &[u8]) -> Result<Option<crate::hashing::Digest>> {
+        if let Some(mapping) = &self.mapping {
+            return Ok(mapping
+                .lock()
+                .unwrap()
+                .expected_digest(self.mapping_relative(path)?)?
+                .cloned());
+        }
+        let selected = match self.copy.policy.placement {
+            DestinationPlacement::ExactPath => path == self.destination,
+            _ => {
+                path != self.destination
+                    && self
+                        .copy
+                        .mutation_scopes
+                        .iter()
+                        .any(|scope| scope.path == path)
+            }
+        };
+        Ok(selected
+            .then(|| {
+                self.hashing
+                    .as_ref()
+                    .and_then(|hashing| hashing.expected_digest.clone())
+            })
+            .flatten())
+    }
+
     fn new(
         config: &ReceiverEnrollment,
         grant: Grant,
@@ -391,6 +431,7 @@ impl RestrictedAuthority {
             receipt_policy,
             tcp_congestion,
             mapping,
+            hashing,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -438,6 +479,7 @@ impl RestrictedAuthority {
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
+            hashing,
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
@@ -1216,8 +1258,10 @@ impl RestrictedAuthority {
                     // Settle only this request's provisional hold: concurrent
                     // preparations for the same partial retain their own
                     // capacity regardless of response ordering.
-                    let absent =
-                        skip_if_absent && matches!(response, proto::Response::PartialSize(None));
+                    let absent = matches!(response,
+                        proto::Response::Prepared(prepared)
+                            if prepared.has_candidates || (skip_if_absent && prepared.partial_size.is_none())
+                    );
                     if let Some(hold) = observation_hold {
                         let key = (path.clone(), copy_id);
                         Self::settle_observation_reservation(&mut state, &key, hold, !absent);
@@ -1959,6 +2003,14 @@ impl RestrictedAuthority {
             _ => false,
         };
         self.check_mutation_path(path, is_dir)?;
+        if self.expected_digest(path)?.is_some()
+            && matches!(
+                operation,
+                Op::Mkdir { .. } | Op::Symlink { .. } | Op::Mknod { .. }
+            )
+        {
+            bail!("expected hash requires a regular file");
+        }
         match operation {
             Op::Mkdir {
                 path,
@@ -2224,6 +2276,25 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         self.check_deadline()?;
         match request {
+            Request::ConfigureHashing(policy) => {
+                if *policy != self.hash_policy() {
+                    bail!("hash policy differs from the authorized copy");
+                }
+            }
+            Request::ValidateDigest {
+                path,
+                expected,
+                guard,
+            } => {
+                self.check_observation_path(path)?;
+                if let Some(authorized) = self.expected_digest(path)? {
+                    if *expected != authorized {
+                        bail!("expected hash differs from the authorized copy");
+                    }
+                }
+                *guard = Some(self.guard.clone());
+            }
+
             Request::MappingChunk {
                 offset,
                 data,
@@ -2322,7 +2393,7 @@ impl RestrictedAuthority {
             Request::DestinationFilesystemInfo { .. } => {
                 bail!("destination filesystem inspection is not authorized by the signed grant")
             }
-            Request::PartialPaths { paths, guard, .. } => {
+            Request::PartialPaths { paths, guard, .. } | Request::PruneLookup { paths, guard } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
@@ -2396,9 +2467,11 @@ impl RestrictedAuthority {
                 path,
                 copy_id,
                 len,
+                block,
                 guard,
                 ..
             } => {
+                self.check_hash_request(*block, *len)?;
                 if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
                     bail!("in-place signed receiver forbids staged basis creation");
                 }
@@ -2406,7 +2479,7 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_update(path, None, pending)?;
+                self.constrain_prepare(path)?;
                 self.reserve_bytes(path, *copy_id, *len, false)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
@@ -2421,6 +2494,7 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::FinishBasis {
+                expected_digest,
                 path,
                 meta,
                 flags,
@@ -2428,6 +2502,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
+                *expected_digest = self.expected_digest(path)?;
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
                 self.constrain_receiver_mode(
@@ -2517,6 +2592,7 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::Finalize {
+                expected_digest,
                 path,
                 inplace,
                 copy_id,
@@ -2526,6 +2602,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
+                *expected_digest = self.expected_digest(path)?;
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
                 }
@@ -2569,6 +2646,9 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
+                    if self.expected_digest(&put.path)?.is_some() {
+                        bail!("expected-hash files require checked finalization");
+                    }
                     self.charge_bytes(&put.path, 0, put.data.len())?;
                     self.constrain_creation(&put.path, &mut put.condition, false, index, pending)?;
                     outcomes.push(PendingOutcome::Logical {
@@ -3753,7 +3833,7 @@ fn run_management_over_route(
     let arch = lines
         .next()
         .context("receiver platform probe returned no architecture")?;
-    let platform = crate::remote_helper::Target::from_uname(os, arch)
+    let platform = crate::remote_helper::Target::for_bootstrap(os, arch)
         .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
     let bytes = management_executable(platform)?;
     let mut nonce = [0u8; 8];
@@ -3768,8 +3848,12 @@ fn run_management_over_route(
 }
 
 fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
-    if Some(target) != crate::remote_helper::Target::local() {
-        if crate::identity::is_release_build() {
+    // A source build opting into release helpers must use the verified upstream
+    // helper even on its own platform. Official releases keep their offline path.
+    if (crate::identity::uses_release_helpers() && !crate::identity::is_release_build())
+        || !target.can_upload_self()
+    {
+        if crate::identity::uses_release_helpers() {
             let helper = crate::update::trusted_current_helper(target)?;
             return crate::update::verified_current_helper(&helper);
         }
@@ -4120,7 +4204,7 @@ fn grant_for(
         DestinationPlacement::ExactPath | DestinationPlacement::DirectoryContents => {
             vec![MutationScope {
                 path: destination_bytes.clone(),
-                descendants: args.recursive,
+                descendants: args.recursive && args.expected_digest.is_none(),
             }]
         }
         DestinationPlacement::DirectoryAsChild => {
@@ -4135,7 +4219,7 @@ fn grant_for(
                 }
                 scopes.push(MutationScope {
                     path: crate::fsops::join(&destination_bytes, &basename),
-                    descendants: args.recursive,
+                    descendants: args.recursive && args.expected_digest.is_none(),
                 });
             }
             scopes
@@ -4341,6 +4425,7 @@ pub(crate) fn prepare_transfer(
         GrantConstraints {
             tcp_congestion: args.tcp_congestion.clone(),
             mapping: mapping_authorization(args)?,
+            hashing: Some(crate::hashing::CopyHashing::from_args(args)),
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -4394,6 +4479,7 @@ pub(crate) fn named_request(
         constraints: GrantConstraints {
             tcp_congestion: args.tcp_congestion.clone(),
             mapping: mapping_authorization(args)?,
+            hashing: Some(crate::hashing::CopyHashing::from_args(args)),
             max_file_data_bytes_per_second: args.bwlimit_bytes,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
@@ -4453,6 +4539,7 @@ pub(crate) fn named_authority(
         });
     }
     for path in [
+        crate::destination::receiver_identity_directory()?,
         crate::receive_service::config_path()?
             .parent()
             .unwrap()
@@ -4767,7 +4854,10 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(case.as_str(), "valid" | "local-release"),
+                matches!(
+                    case.as_str(),
+                    "valid" | "local-release" | "source-helpers" | "local-source-helpers"
+                ),
                 "{result:?}"
             );
             return;
@@ -4795,8 +4885,10 @@ pub(crate) mod tests {
             "manifest-tampered",
             "archive-tampered",
             "source-build",
+            "source-helpers",
+            "local-source-helpers",
         ] {
-            let (os, arch) = if case == "local-release" {
+            let (os, arch) = if matches!(case, "local-release" | "local-source-helpers") {
                 (
                     if cfg!(target_os = "linux") {
                         "Linux"
@@ -4807,6 +4899,11 @@ pub(crate) mod tests {
                 )
             } else {
                 (os, arch)
+            };
+            let target = if case == "local-source-helpers" {
+                crate::remote_helper::Target::local().unwrap().key
+            } else {
+                target
             };
             let temporary = crate::test_support::tempdir().unwrap();
             let root = temporary.path();
@@ -4868,7 +4965,22 @@ esac
                 .env("SYQ_ENROLLMENT_TEST_CHILD", case)
                 .env(
                     "SYQ_TEST_RELEASE_BUILD",
-                    if case == "source-build" { "0" } else { "1" },
+                    if matches!(
+                        case,
+                        "source-build" | "source-helpers" | "local-source-helpers"
+                    ) {
+                        "0"
+                    } else {
+                        "1"
+                    },
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_HELPERS",
+                    if case.ends_with("source-helpers") {
+                        "1"
+                    } else {
+                        "0"
+                    },
                 )
                 .env(
                     "SYQ_TEST_RELEASE_PUBLIC_KEY",
@@ -4891,7 +5003,7 @@ esac
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            if case == "valid" {
+            if matches!(case, "valid" | "source-helpers" | "local-source-helpers") {
                 assert_eq!(fs::read(root.join("uploaded")).unwrap(), binary);
             } else if case == "local-release" {
                 assert_eq!(
@@ -5312,6 +5424,7 @@ esac
             GrantConstraints {
                 tcp_congestion: None,
                 mapping: None,
+                hashing: None,
                 max_file_data_bytes_per_second,
                 filters,
                 root_existence,
@@ -5529,6 +5642,36 @@ esac
         assert!(!directory.join("pending.json").exists());
         assert!(directory.join("metadata.json").is_file());
         assert!(directory.join("enrollment-key").is_file());
+    }
+
+    #[test]
+    fn prune_lookup_is_confined_to_authorized_observation_paths() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let authority = test_authority(&root, DeletionPolicy::Forbid, 4);
+        let target = root.join("target");
+        fs::write(&target, b"data").unwrap();
+        let mut request = Request::PruneLookup {
+            paths: vec![target.as_os_str().as_bytes().to_vec()],
+            guard: None,
+        };
+        authority.authorize(&mut request, false).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&request);
+        let proto::Response::Stats(stats) = response else {
+            panic!("prune lookup failed: {response:?}")
+        };
+        assert_eq!(stats[0].as_ref().unwrap().size, 4);
+        let mut outside = Request::PruneLookup {
+            paths: vec![temporary
+                .path()
+                .join("outside")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()],
+            guard: None,
+        };
+        assert!(authority.authorize(&mut outside, false).is_err());
     }
 
     #[test]
@@ -5884,6 +6027,7 @@ esac
 
     fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
         Request::Finalize {
+            expected_digest: None,
             path: path_bytes(path),
             inplace: false,
             copy_id: [1; 16],
@@ -6533,6 +6677,58 @@ esac
     }
 
     #[test]
+    fn signed_skip_allows_seeding_and_retrying_a_new_file() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let fresh = target.join("fresh");
+        let candidate = target.join(".fresh.syq-tmp.abcdefghijklmnop");
+        fs::write(&candidate, b"new").unwrap();
+        let authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        let mut prepare = prepare_request(&fresh);
+        let settlement = authority.authorize(&mut prepare, false).unwrap();
+        let response = ops.handle(&prepare);
+        assert!(
+            matches!(&response, proto::Response::Prepared(prepared) if prepared.has_candidates)
+        );
+        authority.settle(settlement, &response);
+        assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+        for attempt in 0..2 {
+            let mut seed = Request::SeedBasis {
+                reuse: true,
+                path: path_bytes(&fresh),
+                copy_id: [1; 16],
+                len: 3,
+                block: authority.copy.limits.hash_block_bytes,
+                attempt,
+                guard: None,
+            };
+            let settlement = authority.authorize(&mut seed, false).unwrap();
+            let response = ops.handle(&seed);
+            assert!(matches!(&response, proto::Response::Hashes(hashes)
+                if *hashes == vec![crate::fsops::content_digest(b"new")]));
+            authority.settle(settlement, &response);
+            assert!(!fresh.exists());
+        }
+        let mut publish = finalize_request(&fresh, proto::TargetCondition::Any);
+        let settlement = authority.authorize(&mut publish, false).unwrap();
+        assert_eq!(finalize_condition(&publish), proto::TargetCondition::Absent);
+        let response = ops.handle(&publish);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        authority.settle(settlement, &response);
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        assert_eq!(fs::read(&candidate).unwrap(), b"new");
+    }
+
+    #[test]
     fn signed_skip_policy_retains_preexisting_objects() {
         use proto::TargetCondition::{Absent, Any, Matches};
         let temporary = crate::test_support::tempdir().unwrap();
@@ -6616,6 +6812,7 @@ esac
         // Content repair of a pre-existing file is refused; deletion remains
         // governed by the separately signed deletion policy.
         let mut finish = Request::FinishBasis {
+            expected_digest: None,
             path: path_bytes(&kept),
             copy_id: [1; 16],
             meta: plain_meta(),
@@ -6629,6 +6826,7 @@ esac
             path: path_bytes(&kept),
             copy_id: [1; 16],
             len: 3,
+            block: proto::MIN_HASH_BLOCK_BYTES,
             attempt: 0,
             guard: None,
         };
@@ -6703,6 +6901,7 @@ esac
         assert!(authority.authorize(&mut create_link, false).is_err());
 
         let mut finish = Request::FinishBasis {
+            expected_digest: None,
             path: path_bytes(&present),
             copy_id: [1; 16],
             meta: plain_meta(),
@@ -6899,6 +7098,7 @@ esac
         authority.authorize(&mut same, false).unwrap();
         assert_eq!(op_condition(&same), expected);
         let mut finish = Request::FinishBasis {
+            expected_digest: None,
             path: path_bytes(&present),
             copy_id: [1; 16],
             meta: plain_meta(),
@@ -7266,9 +7466,15 @@ esac
         let first = authority.authorize(&mut absent, false).unwrap();
         let mut same_absent = prepare(&target.join("absent"));
         let second = authority.authorize(&mut same_absent, false).unwrap();
-        authority.settle(first, &proto::Response::PartialSize(None));
+        authority.settle(
+            first,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
         assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
-        authority.settle(second, &proto::Response::PartialSize(None));
+        authority.settle(
+            second,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
         {
             let state = authority.state.lock().unwrap();
             assert!(state.file_lifecycles.is_empty());
@@ -7279,7 +7485,13 @@ esac
         let present_path = target.join("present");
         let mut present = prepare(&present_path);
         let settlement = authority.authorize(&mut present, false).unwrap();
-        authority.settle(settlement, &proto::Response::PartialSize(Some(0)));
+        authority.settle(
+            settlement,
+            &proto::Response::Prepared(proto::Preparation {
+                partial_size: Some(0),
+                has_candidates: false,
+            }),
+        );
         let state = authority.state.lock().unwrap();
         assert!(state
             .file_lifecycles
@@ -7322,7 +7534,10 @@ esac
         let older = authority.authorize(&mut observation, false).unwrap();
         let mut real = prepare_request(&path);
         let newer = authority.authorize(&mut real, false).unwrap();
-        authority.settle(older, &proto::Response::PartialSize(None));
+        authority.settle(
+            older,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
 
         {
             let state = authority.state.lock().unwrap();
@@ -7336,7 +7551,10 @@ esac
         assert!(error
             .to_string()
             .contains("signed grant total-byte limit exceeded"));
-        authority.settle(newer, &proto::Response::PartialSize(None));
+        authority.settle(
+            newer,
+            &proto::Response::Prepared(proto::Preparation::default()),
+        );
     }
 
     #[test]
@@ -7566,6 +7784,7 @@ esac
         let settlement = finished.authorize(&mut prepare, false).unwrap();
         finished.settle(settlement, &proto::Response::Ok);
         let mut finalize = Request::Finalize {
+            expected_digest: None,
             path: path_bytes(&image),
             inplace: true,
             copy_id: [2; 16],
@@ -8418,6 +8637,49 @@ esac
     }
 
     #[test]
+    fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
+        use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        fs::write(&target, b"data").unwrap();
+        let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+        let policy = HashPolicy {
+            algorithm: HashAlgorithm::Xxh3,
+            transfer_integrity: false,
+            transfer_hash_type: None,
+        };
+        let expected = Digest::hash_bytes(HashAlgorithm::Sha256, b"data");
+        authority.hashing = Some(CopyHashing {
+            policy,
+            expected_digest: Some(expected.clone()),
+        });
+        let mut accepted = Request::ConfigureHashing(policy);
+        authority.authorize(&mut accepted, false).unwrap();
+        let mut changed = Request::ConfigureHashing(HashPolicy {
+            transfer_integrity: true,
+            transfer_hash_type: None,
+            ..policy
+        });
+        assert!(authority.authorize(&mut changed, false).is_err());
+        let mut finish = Request::FinishBasis {
+            expected_digest: None,
+            path: path_bytes(&target),
+            copy_id: [1; 16],
+            meta: plain_meta(),
+            flags: 0,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        authority.authorize(&mut finish, false).unwrap();
+        assert!(
+            matches!(finish, Request::FinishBasis { expected_digest: Some(ref value), .. } if *value == expected)
+        );
+        assert!(authority.authorize(&mut small_put(&target), false).is_err());
+    }
+
+    #[test]
     fn signed_read_only_modes_reject_every_destination_mutation() {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -8615,6 +8877,7 @@ esac
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             copy_id: [1; 16],
             len: 3,
+            block: proto::MIN_HASH_BLOCK_BYTES,
             attempt: 0,
             guard: None,
         };
@@ -8625,6 +8888,7 @@ esac
             .authorize(&mut prepare("empty", 0), false)
             .unwrap();
         let mut publish_empty = Request::Finalize {
+            expected_digest: None,
             path: root.join("target/empty").as_os_str().as_bytes().to_vec(),
             inplace: false,
             copy_id: [1; 16],
@@ -8642,6 +8906,7 @@ esac
         authority.authorize(&mut publish_empty, false).unwrap();
         // A file never declared under this grant cannot be published.
         let mut publish_foreign = Request::Finalize {
+            expected_digest: None,
             path: root.join("target/foreign").as_os_str().as_bytes().to_vec(),
             inplace: false,
             copy_id: [9; 16],

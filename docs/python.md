@@ -9,12 +9,20 @@ events. Synchronous and asyncio clients are available.
 
 ## Install
 
-The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.10+
+The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.13.4+
 on Linux and macOS:
 
 ```sh
 python -m pip install syq
 ```
 
-On first use, it downloads and verifies the matching syq executable, then caches
-it for later calls. You do not need to install the command-line tool separately.
+Prebuilt wheels include the matching syq executable. Installation needs no Rust
+compiler, and SDK calls need no executable download or writable home directory
+for installation. The `syq` command is also available in the Python environment.
+
+Installing from a source distribution builds the executable and requires Rust
+and a C compiler. Its remote behavior follows the native source version bundled
+in that distribution: source builds upload themselves to compatible SSH hosts
+by default. See [source builds](development.md) for helper selection and symbols
+when building from a checkout with those options. Older distributions retain
+their bundled native version's build options.

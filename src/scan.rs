@@ -204,14 +204,19 @@ fn inspect_descriptor_children(
         return names.iter().map(inspect).collect();
     }
     let chunk = names.len().div_ceil(DESCRIPTOR_STAT_THREADS).max(1);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = names
-            .chunks(chunk)
-            .map(|names| scope.spawn(|| names.iter().map(inspect).collect::<Vec<_>>()))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("descriptor scan stat thread"))
+    use rayon::prelude::*;
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(DESCRIPTOR_STAT_THREADS)
+            .thread_name(|index| format!("syq-scan-stat-{index}"))
+            .build()
+            .expect("directory stat worker pool")
+    });
+    pool.install(|| {
+        names
+            .par_chunks(chunk)
+            .flat_map_iter(|names| names.iter().map(&inspect))
             .collect()
     })
 }
@@ -232,20 +237,11 @@ fn hold_descriptor_directory_for_test(relative: &[u8]) -> Result<()> {
     if expected.as_os_str().as_bytes() != relative {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE") {
-        std::fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write destination-scan-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    crate::fsops::test_race_barrier(
+        "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE",
+        "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_CONTINUE_FILE",
+        "destination directory scan",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -484,7 +480,7 @@ fn receive_scan(
 }
 
 /// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// Every entry is reported, syq's own `.name.syq-part.<copy-id>` sidecars included (the
+/// Every entry is reported, syq's own `.name.syq-tmp.<random>` sidecars included (the
 /// planner decides what they mean). `warn` receives non-fatal errors
 /// (unreadable directories etc.). `ignore` holds gitignore-style patterns
 /// relative to `root`; a matching directory is pruned with its whole subtree.

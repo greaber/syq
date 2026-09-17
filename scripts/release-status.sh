@@ -115,7 +115,7 @@ fi
 homebrew_state=unknown
 if formula_json=$(gh api "repos/$homebrew_repository/contents/Formula/syq.rb" 2>/dev/null); then
   formula=$(jq -er .content <<<"$formula_json" | tr -d '\n' | openssl base64 -d -A)
-  if grep -F "/releases/download/$tag/" <<<"$formula" >/dev/null; then
+  if grep -F "/$tag/" <<<"$formula" >/dev/null; then
     homebrew_state=published
   else
     homebrew_state=missing

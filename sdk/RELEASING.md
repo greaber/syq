@@ -84,11 +84,23 @@ directly targets the commit on `master`.
 For a Python release, first choose the exact immutable syq release the SDK will
 use. Set `python/pyproject.toml` to that syq version and replace
 `python/src/syq/syq-release-manifest.json` with the release's complete signed
-manifest; do not edit its artifact hashes by hand. The packaged manifest is the
-SDK's immutable executable-version mapping and runtime trust root for downloaded
-bytes. Tests and the release workflow must build the wheel in a clean cache,
-perform its managed first-use download, and require the package version,
-`syq.PINNED_SYQ_VERSION`, and `syq.version()` to agree.
+manifest; do not edit its artifact hashes by hand. It preserves the version
+mapping and the trust root for callers explicitly using managed downloads.
+
+Python wheels are built with pinned maturin tooling for Linux x86-64/AArch64
+and macOS Intel/Apple Silicon. The workflow stages the native source from the
+pinned immutable `v<version>` tag alongside the Python SDK being published;
+it must not compile later native changes from the SDK tag. These are new
+builds of that release source, not copies of the manifest's binary artifacts.
+The wheel builds use the release identity, public verification key, and the
+same target flags as the native release. The source distribution includes the
+Rust source and lockfile; installing it requires Rust and a C compiler.
+
+Each wheel is installed and tested on its target, including synchronous and
+async copies with no executable on `PATH`, no writable home/cache location,
+and Python downloads disabled. Package version, `syq.PINNED_SYQ_VERSION`,
+`syq.version()`, and the CLI release identity must agree. The manual
+`publish-sdks.yml` dispatch builds and tests this matrix without publishing.
 
 Python tags use the version in `python/pyproject.toml`:
 
@@ -112,7 +124,7 @@ git push origin sdk-js-v0.0.1
 
 Those tags run `.github/workflows/publish-sdks.yml`, which verifies that the
 signed tag targets a `master` commit whose `sdks` check passed, then verifies
-the version, tests, package contents, pinned download, and executable identity
+the version, tests, package contents, bundled execution, and executable identity
 before entering the protected publishing environment.
 
 ## Automated Python follow-up to a syq release
@@ -131,7 +143,7 @@ After `.github/workflows/release.yml` completes successfully and the GitHub
 release is immutable, `.github/workflows/prepare-python-sdk.yml` downloads its
 exact signed manifest and prepares the same Python package version. It opens an
 `automation/python-sdk-vX.Y.Z` pull request containing the version, manifest,
-cache-path documentation, and lockfile updates. The workflow has already run
+and lockfile updates. The workflow has already run
 the pinned SDK release-tool and unit-test suites, so it merges that pull request
 immediately without starting pull-request CI.
 
@@ -141,11 +153,13 @@ workflow advances the automation branch to the exact merge commit and
 explicitly dispatches `ci.yml` with that commit as its scope. The CI selector
 then runs the substantive `sdks` job for the generated Python-only change and
 does not repeat the native, rsync, or macOS checks already certified for the
-immutable syq release. The workflow verifies that the returned run targets the
-merge commit, waits for it, and requires its `sdks` job to succeed before
-deleting the automation branch. A failure leaves the generated SDK changes
-merged and the branch available for diagnosis; it does not block unrelated
-merges. The repository keeps the default workflow token read only and grants
+immutable syq release. The workflow tracks the run ID returned by the dispatch
+API and requires its commit to match the merge. If Actions briefly resolves the branch to its old
+commit, it waits for that run to finish and retries, up to three dispatches.
+A failed run on the correct commit stops validation. The exact merge commit
+must pass its `sdks` job before the automation branch is deleted. A failure
+leaves the generated SDK changes merged and the branch available for diagnosis;
+it does not block unrelated merges. The repository keeps the default workflow token read only and grants
 Actions, contents, and pull-request write scopes only inside this preparation
 workflow.
 

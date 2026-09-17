@@ -61,44 +61,22 @@ reads still use its directory handles and refuse descendant symlink traversal.
 
 ## TCP data connections
 
-TCP workers authenticate with a token delivered through the control connection.
-Their ten-second Hello deadline remains active across partial reads, including
-when encryption is off. After Hello succeeds, it does not limit copy duration.
-There is no general coordinator I/O deadline: a stalled peer can leave a copy
-waiting until you cancel it.
+TCP workers authenticate using credentials delivered through the control
+connection. The initial handshake has a ten-second deadline, but there is no
+general copy I/O timeout: a stalled peer can leave a copy waiting until you
+cancel it.
 
-TCP discovery accepts at most 64 advertised addresses plus the SSH target,
-and at most 128 resolved socket addresses in total. Excessive replies fail
-TCP setup visibly; ordinary copies can still fall back to SSH data.
-
-Encrypted TCP rejects reused connection IDs and IDs outside its 24-bit nonce
-space. If a copying process exhausts those IDs, it reports an error; restart the
-copy to continue with a fresh session.
-
-Framed input has a separate memory allowance from the signed transfer's disk
-limits. Hello is limited to 1 MiB, ordinary metadata messages to 8 MiB, and
-bulk-data or hash messages to 65 MiB. Compression cannot bypass these limits;
-zstd windows are limited to 8 MiB. Both endpoints apply the smaller Hello
-limit before reading or decompressing its body.
-
-A shared 512 MiB allowance bounds decoded collection storage, including queued
-collections, because a short frame can advertise a very large collection.
-Exhaustion fails the connection visibly. Flat byte buffers, strings, and
-compression workspace use the frame-size limits and each connection's bounded
-queue instead of competing for that shared allowance. Their aggregate memory
-use grows with the connection count, request size, and pipeline depth; reduce
-those settings to use less memory. The collection allowance is not a limit on
-total process memory or disk usage.
+Syq bounds incoming messages, decompression, and decoded collections to limit
+memory use from malformed peers. These are not a total process memory cap;
+memory also grows with connection count and request size. Invalid replies
+fail the connection visibly. Ordinary copies can fall back to SSH if TCP setup
+fails, keeping the same endpoints.
 
 ## A compromised source server
 
-The coordinator rejects stat, apply, and partial-path replies whose entry
-counts differ from their requests. It also checks each source data block's
-offset and length against the outstanding read before forwarding it to the
-destination. An offset or length mismatch fails the copy and closes that
-worker's connections without reusing them for another file. These checks expose
-malformed replies; they cannot establish that a source's file listing or contents
-are truthful.
+Syq checks peer-supplied paths and data ranges before using them. These checks
+reject malformed replies; they cannot establish that a source's file listing
+or contents are truthful.
 
 For a default direct remote-to-remote copy, the source gets permission for one
 transfer, not your SSH agent or a reusable destination credential. The
@@ -128,8 +106,16 @@ an outbound connection maintained by your laptop. `persist on` enables this
 for syq's SSH connections by default. Each request requires approval on the
 receiving machine through a desktop prompt or `persist receive approve`. Paths and limits
 are validated before prompting; the restricted filesystem executor checks
-every operation after approval. The server receives no SSH agent or
-command-execution interface.
+every operation after approval. The server receives no SSH agent.
+[Commands](exec.md) need separate approval.
+
+Receiving names stay assigned to a persistent receiver public key. Reconnecting
+requires proof of the corresponding private key; knowing the public key does
+not let another receiver claim the name. This prevents accidental reassignment
+and impersonation through registration, but the server account controls the
+assignment files and can replace them. It is not a security boundary against
+someone who controls that account. The receiver private key stays on the
+receiving machine and does not grant SSH login access.
 
 Approval permits that pending copy's destination, overwrite policy, and limits.
 It does not authenticate what you typed on a remote server or attest to source
@@ -146,17 +132,17 @@ request more copies and invent their content. Once approved, it can inspect
 destination entries during copy planning and consume disk space within the
 approved limits. The laptop's receiving account is trusted.
 
-Bare destination names fall back to ordinary SSH while the laptop is offline.
-Use `@name` when you require a return connection and want failure instead of
-host resolution. A copy never switches routes after selecting its destination.
+Receiver destinations require `@name` and fail if that receiver is offline.
+Bare names always identify SSH destinations, resolved through SSH configuration
+or DNS. A copy never switches routes after selecting its destination.
 
 ## Limits to keep in mind
 
-- **Privileged copies need trusted destination directories.** Resume uses
-  predictable partial-file names. Do not copy as root into a directory
-  writable by untrusted users. Syq only reuses partials owned by its effective
-  user; foreign-owned leftovers are replaced without changing their contents
-  or permissions. This does not make a shared writable directory trusted.
+- **Privileged copies need trusted destination directories.** Do not copy as root into a
+  directory writable by untrusted users. Syq writes private partial files.
+  When reusing bytes from another partial, it only reads regular files owned
+  by its effective user. It checks those bytes against source hashes and leaves
+  the other partial unchanged. This does not make a shared writable directory trusted.
 - **Hard links share contents and metadata.** In-place writes and metadata
   changes through a destination hard link affect every name for that file,
   including names outside the selected destination or a restricted grant's
@@ -167,8 +153,6 @@ host resolution. A copy never switches routes after selecting its destination.
   durability guarantee.
 - **Preserving authority is a choice.** Leave `--preserve=ownership` and
   `--preserve=permissions` off when copying from an untrusted source.
-- **Persistent logins stay usable.** Processes running as your local user
-  can reuse them until they close. Use `syq persist off` to end the window.
 - **Protocol assurance is still developing.** Syq's process protocol has
   not been fuzzed as extensively as rsync's.
 
@@ -182,6 +166,12 @@ a network you trust. Downloaded code for remote operations and explicit
 self-updates is verified against a signed release manifest before use.
 That verification cannot protect a machine whose trusted account or programs
 have already been compromised.
+
+Optional `--integrity-checking transfer=blake3` checks detect accidental data corruption; they
+do not authenticate plaintext traffic because an attacker can replace both
+data and checksums. An expected whole-file digest supplied through a trusted
+channel checks the resulting file against that expectation. Use BLAKE3 or
+SHA-256 when resistance to malicious content substitution matters.
 
 A server can also request a copy to another SSH host using a live receiving
 machine's SSH access. Eligible copies discover that machine automatically;
@@ -221,3 +211,17 @@ and interruption behavior.
 
 Human copy listings escape control characters in filenames. Diagnostics also
 escape terminal control sequences from peers; NDJSON keeps its JSON encoding.
+
+## Persistent connections
+
+An open SSH login can be reused by other processes running as your local user
+without another key touch or agent approval. Persistence keeps that access
+available until the connection closes. `syq persist off` ends it; use
+`syq persist receive off` to stop incoming requests while keeping SSH reuse.
+
+Persistence also enables [receiving](#named-receiving-destinations) by default.
+Its approvals and copy limits are separate from the SSH login's authority.
+
+[Isolated script scopes](persistence-reference.md#isolated-script-scopes) reuse
+SSH logins without enabling receiving. Stop background services when upgrading;
+replacing a binary does not change services already running it.

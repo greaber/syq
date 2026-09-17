@@ -55,14 +55,18 @@ pub type PathBytes = Vec<u8>;
 /// the parallel legacy pathname is only a display/compatibility spelling.
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
-    pub(crate) root: RegisteredRootId,
-    pub relative: PathBytes,
+    root: RegisteredRootId,
+    relative: PathBytes,
 }
 
 impl RegisteredPath {
     pub(crate) fn new(root: RegisteredRootId, relative: PathBytes) -> Result<Self> {
         validate_relative_path(&relative)?;
         Ok(Self { root, relative })
+    }
+
+    pub(crate) fn relative(&self) -> &[u8] {
+        &self.relative
     }
 
     pub(crate) fn root(&self) -> RegisteredRootId {
@@ -116,8 +120,7 @@ fn validate_relative_path(path: &[u8]) -> Result<()> {
 /// Full BLAKE3 digest used whenever content equality affects copy behavior.
 pub type ContentDigest = [u8; 32];
 
-/// Stable identifier for one logical copy command. Destination partial names
-/// include this value so unrelated commands never write the same staged inode.
+/// Fresh nonce for one invocation. Workers derive private per-file names from it.
 pub type CopyId = [u8; 16];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -182,6 +185,7 @@ pub enum NativeRemoveKind {
     Contents,
     File,
     Directory,
+    Partials,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -350,6 +354,14 @@ pub struct TcpSocketStats {
     pub receive_window_limited_us: Option<u64>,
     pub send_buffer_limited_us: Option<u64>,
     pub ecn_ce_delivered: Option<u64>,
+}
+
+/// Exact-build helper telemetry; never read before Hello identity acceptance.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TransportStatsReply {
+    pub tcp: Option<TcpSocketStats>,
+    pub(crate) observation: Option<crate::transfer_observations::ServerSnapshot>,
+    pub solicited: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -522,6 +534,8 @@ impl SourceRootBase {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DirectoryAncestryCheck {
     pub source_root: DescriptorTicket,
+    /// False for an exact file or symlink: the ticket then names its parent.
+    pub source_is_directory: bool,
     pub suffixes: Vec<PathBytes>,
 }
 
@@ -531,6 +545,9 @@ pub enum DirectoryRelation {
     Separate,
     Same,
     Descendant,
+    /// The source lies beneath the effective destination directory.
+    Ancestor,
+    SourceUnsearchable,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -557,6 +574,13 @@ pub enum ConnectionRole {
         destination: Option<DestinationRoot>,
         copy_sources: Vec<RegisteredSourceRoot>,
     },
+}
+
+/// An existing private output and an optional donor are separate states.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preparation {
+    pub partial_size: Option<u64>,
+    pub has_candidates: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -694,7 +718,7 @@ pub enum Request {
         others: Vec<PathBytes>,
         guard: Option<ContainerGuard>,
     },
-    /// Return the size of the deterministic sidecar, if it is a regular file.
+    /// Return the size of this invocation's partial, if it is a regular file.
     /// The planner has already statted the final path.
     ProbePartial {
         path: PathBytes,
@@ -702,7 +726,8 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Inspect and, when requested, create/adjust the write target for `path`.
-    /// Returns PartialSize with the size observed before any adjustment. A
+    /// Returns Prepared with the private size observed before adjustment and
+    /// whether donor discovery deferred creation to SeedBasis. A
     /// false `create_if_missing` lets content-identical final files complete
     /// without ever allocating a sidecar.
     /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
@@ -731,6 +756,7 @@ pub enum Request {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -738,14 +764,17 @@ pub enum Request {
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
-    /// Seed this job's sidecar from the retained basis descriptor.
+    /// Copy one optional donor into the private sidecar and return hashes of
+    /// the exact buffers written. The controller must repair differing blocks
+    /// before publication. An existing private sidecar is hashed without copying.
     SeedBasis {
         path: PathBytes,
         copy_id: CopyId,
         len: u64,
-        /// False when no destination blocks match; still consume the held
-        /// inode and create the full-sized private sidecar.
+        /// False when comparison found no matches and no interrupted copy
+        /// offers another basis. Still create the full-sized private sidecar.
         reuse: bool,
+        block: u64,
         attempt: u32,
         guard: Option<ContainerGuard>,
     },
@@ -800,6 +829,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     Finalize {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -818,7 +848,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     /// Absolute, normalized form of a path on this endpoint (symlinks in the
-    /// existing prefix resolved), for a stable copy identity.
+    /// existing prefix resolved).
     Canonicalize {
         path: PathBytes,
         guard: Option<ContainerGuard>,
@@ -873,6 +903,19 @@ pub enum Request {
         data: Vec<u8>,
         finish: bool,
     },
+    /// Destination lookup for pruning. Unlike planning stats, errors other
+    /// than a missing path fail the request rather than looking absent.
+    PruneLookup {
+        paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
+    // Append new variants: released completion payloads retain their indexes.
+    ConfigureHashing(crate::hashing::HashPolicy),
+    ValidateDigest {
+        path: PathBytes,
+        expected: crate::hashing::Digest,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -919,18 +962,11 @@ pub const SMALL_COPY_MAX_FILES: usize = 64;
 pub const SMALL_COPY_MAX_FILE_BYTES: u64 = 1 << 20;
 pub const SMALL_COPY_MAX_TOTAL_BYTES: u64 = 4 << 20;
 
-/// The parts of a job identity only the coordinator knows. The receiver adds
-/// the canonical destination it resolves, so the sidecar names it stages
-/// through are the ones the ordinary engine would use for the same copy.
+/// Fresh invocation identity and optional exact destination leaf for a small push.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyIdentity {
-    pub src_endpoint: String,
-    pub src_roots: Vec<(String, bool)>,
-    pub dst_endpoint: String,
-    /// Exact placement names a directory entry beneath the selected
-    /// directory; its identity is the canonical parent plus this leaf.
+    pub copy_id: CopyId,
     pub dst_leaf: Option<PathBytes>,
-    pub semantic_flags: String,
 }
 
 /// One file of a small push. `path` is spelled as the ordinary engine would
@@ -1005,7 +1041,8 @@ impl Request {
     pub(crate) fn allowed_on_source_worker(&self) -> bool {
         matches!(
             self,
-            Request::Scan { .. }
+            Request::ConfigureHashing(_)
+                | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
                 | Request::ReadRange { .. }
@@ -1088,7 +1125,7 @@ pub enum Response {
         hash: ContentDigest,
     },
     Path(PathBytes),
-    TransportStats(Option<TcpSocketStats>),
+    TransportStats(Box<TransportStatsReply>),
     /// One bounded frame of a signed receipt stream. The final frame is marked
     /// inside the canonical frame encoding.
     Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
@@ -1111,6 +1148,7 @@ pub enum Response {
     /// All data/error frames for the stopped source stream precede this marker.
     ReadStreamDone,
     WriteStreamDone,
+    Prepared(Preparation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1228,7 +1266,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {
@@ -2086,6 +2124,33 @@ mod tests {
             let message = result.unwrap_err().to_string();
             assert!(message.contains("build identity mismatch"), "{message}");
             assert!(message.contains("remote v0.4.0"), "{message}");
+        }
+    }
+
+    #[test]
+    fn released_v052_preamble_rejects_new_transfer_messages_before_decoding() {
+        // Literal v0.5.2 preamble, independent of today's enum encodings.
+        const V052: &[u8] = b"SYQWIRE\0\0\x06v0.5.2";
+        if crate::identity::build() != "v0.5.2" {
+            let error = FrameReader::new(V052).read_msg::<Response>().unwrap_err();
+            assert!(
+                error.to_string().contains("build identity mismatch"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn released_v060_preamble_preserves_explicit_compatibility() {
+        // v0.6.0 preamble, kept independent of the current encoder. Selecting
+        // release helpers must accept it; ordinary source builds must reject it.
+        const V060: &[u8] = b"SYQWIRE\0\0\x06v0.6.0";
+        let result = FrameReader::new(V060).read_preamble();
+        if crate::identity::build() == "v0.6.0" {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("build identity mismatch"), "{error}");
         }
     }
 

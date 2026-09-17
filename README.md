@@ -5,7 +5,8 @@ across machines.
 It aims to perform well across file sizes, directory sizes, and network speeds.
 
 [Documentation](https://greaber.github.io/syq/) ·
-[Benchmarks](https://greaber.github.io/syq-bench/)
+[Benchmarks](https://greaber.github.io/syq-bench/) ·
+[Changelog](https://github.com/greaber/syq/blob/master/CHANGELOG.md)
 
 Quick links to docs for common tasks:
 
@@ -13,6 +14,7 @@ Quick links to docs for common tasks:
   Your laptop needs no SSH server or incoming network port.
 - [Run commands on your laptop from a server](https://greaber.github.io/syq/exec.html)
 - [Copy directly between servers without forwarding your SSH agent](https://greaber.github.io/syq/remote-to-remote.html)
+- [Upload and download with S3-compatible object storage](https://greaber.github.io/syq/object-storage.html)
 - [Rename and reorganize files during a copy](https://greaber.github.io/syq/mappings.html)
 - Script syq using the [JSON API](https://greaber.github.io/syq/automation.html) or
   [Python SDK](https://greaber.github.io/syq/python.html).
@@ -22,7 +24,7 @@ Quick links to docs for common tasks:
 On Linux or macOS (x86-64 or ARM64):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh
 ```
 
 Installs into `~/.local/bin` without `sudo`; make sure it is on your `PATH`.
@@ -51,29 +53,9 @@ examples.
 
 ## Developing syq
 
-Build from source only when developing syq itself. For everyday use, install
-an official release: it can fetch the right remote executable across platforms.
-
-With [rustup](https://rustup.rs/), Git, and a C compiler installed:
-
-```sh
-git clone https://github.com/greaber/syq.git
-cd syq
-cargo build --locked --release
-./target/release/syq cp data --to server
-```
-
-Local edits work without a commit or published branch. A source build uploads
-its running executable to compatible SSH hosts automatically; OS, CPU, and
-required system libraries must match.
-
-Direct server-to-server copies use a separate restricted receiver. The first
-copy can enroll it automatically, but after rebuilding, repeat
-`./target/release/syq receiver enroll hostB:/archive` to update an existing
-receiver. The local executable must run on hostB.
-
-See [Developing syq](docs/development.md) for the rebuild/copy workflow,
-manual setup on another platform, and checks to run before a pull request.
+For source builds, remote testing, and contribution checks, see
+[Developing syq](docs/development.md). For everyday use, install a release
+using the commands above.
 
 ## License
 

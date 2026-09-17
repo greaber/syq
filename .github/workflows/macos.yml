@@ -7,6 +7,24 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      test_name:
+        description: Exact Rust test name (empty runs the full suite)
+        required: false
+        type: string
+      test_target:
+        description: Cargo target for the exact test
+        required: false
+        default: syq
+        type: choice
+        options:
+          - syq
+          - local
+          - help
+          - output
+          - update
+          - return_handoff
+          - macos_exfat
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.run_id }}
@@ -15,7 +33,51 @@ permissions:
   contents: read
 
 jobs:
+  focused-test:
+    if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo dependencies and build output
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Run the exact test
+        shell: bash
+        env:
+          TEST_NAME: ${{ inputs.test_name }}
+          TEST_TARGET: ${{ inputs.test_target || 'syq' }}
+        run: |
+          # Inputs remain data; accept only ordinary Rust test identifiers.
+          [[ "$TEST_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_:]*$ ]] || {
+            echo 'Provide a fully qualified Rust test name.' >&2
+            exit 2
+          }
+          case "$TEST_TARGET" in
+            syq) target=(--bin syq) ;;
+            local|help|output|update|return_handoff|macos_exfat)
+              target=(--test "$TEST_TARGET") ;;
+            *) echo "Unknown test target: $TEST_TARGET" >&2; exit 2 ;;
+          esac
+          # Cargo otherwise succeeds when the exact filter matches no test.
+          listing=$(cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --list)
+          if ! grep -Fx -- "$TEST_NAME: test" <<< "$listing"; then
+            echo "Exact test not found in $TEST_TARGET: $TEST_NAME" >&2
+            exit 1
+          fi
+          # An explicitly selected ignored test must actually run too.
+          cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --include-ignored
+
   scope:
+    if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
     runs-on: ubuntu-latest
     outputs:
       needed: ${{ steps.changes.outputs.needed }}
@@ -30,7 +92,9 @@ jobs:
           scope=$(scripts/ci-scope.sh "$GITHUB_EVENT_PATH")
           # ci-scope output is a machine-readable boolean contract.
           needed=false
-          for key in native sdks tooling shellcheck mapping_docs; do
+          # Mapping examples and shell-lint-only changes have focused Linux
+          # checks. They do not need the complete native/SDK macOS suite.
+          for key in native sdks tooling; do
             if [[ $'\n'"$scope"$'\n' == *$'\n'"$key=true"$'\n'* ]]; then
               needed=true
             fi
@@ -67,15 +131,18 @@ jobs:
         run: cargo test --locked --all-targets --no-fail-fast
       - name: Build the candidate syq executable
         run: cargo build --locked --bin syq
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.10"
+          python-version: ">=3.13.4 <3.14"
+          check-latest: true
       - name: Install pinned Python tooling
         run: python -m pip install --disable-pip-version-check --no-deps uv==0.11.6
       - name: Use Homebrew OpenSSL for Ed25519 signing
         run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Test and reproducibly package Python SDK
         env:
+          UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/syq-sdk-python
@@ -85,12 +152,15 @@ jobs:
           export SYQ_CANDIDATE_VERSION
           scripts/test-python-sdk-release-tools.sh
           uv run --project sdk/python --frozen python -m unittest discover -s sdk/python/tests
-          export SOURCE_DATE_EPOCH
+          export SOURCE_DATE_EPOCH RUSTUP_TOOLCHAIN
+          RUSTUP_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          # macOS debug maps contain temporary Rust object names; strip them
+          # before comparing wheels, as release builds already strip symbols.
           for output in target/sdk-python-dist-a target/sdk-python-dist-b; do
             # Restored Cargo caches can contain distributions from an older SDK.
             rm -rf -- "$output"
-            uv run --project sdk/python --frozen python -m build sdk/python --outdir "$output"
+            MATURIN_PEP517_ARGS="--profile dev --strip" uv run --project sdk/python --frozen python -m build sdk/python --sdist --wheel --outdir "$output"
             python scripts/normalize-python-sdist.py \
               --epoch "$SOURCE_DATE_EPOCH" "$output"/*.tar.gz
             sleep 2
@@ -99,11 +169,19 @@ jobs:
             name=${artifact##*/}
             cmp "$artifact" "target/sdk-python-dist-b/$name"
           done
-          set -- target/sdk-python-dist-a/syq-*-py3-none-any.whl
+          set -- target/sdk-python-dist-a/syq-*-py3-none-*.whl
           test "$#" -eq 1 && test -f "$1"
-          env -u PYTHONPATH uv run --isolated --python 3.10 \
+          env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
-            python -c 'import syq; assert syq.version() == syq.PINNED_SYQ_VERSION'
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          rm -rf -- target/sdk-python-from-sdist
+          MATURIN_PEP517_ARGS="--profile dev --strip" uv build --wheel \
+            target/sdk-python-dist-a/*.tar.gz --out-dir target/sdk-python-from-sdist
+          set -- target/sdk-python-from-sdist/syq-*-py3-none-*.whl
+          test "$#" -eq 1 && test -f "$1"
+          env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
+            --with "$1" \
+            python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.x"

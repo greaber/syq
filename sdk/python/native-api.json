@@ -26,7 +26,6 @@
         "prune",
         "max-delete",
         "dry-run",
-        "connections",
         "auth-from",
         "via",
         "coordinate-at",
@@ -43,18 +42,25 @@
         "receiver-max-bytes",
         "receiver-receipt",
         "hash",
+        "expected-hash",
         "verify-only",
         "only-new",
         "only-existing",
         "skip-newer",
         "no-compress",
-        "bwlimit",
         "ignore",
         "ignore-from",
         "preserve",
         "inplace",
         "max-size",
-        "min-size"
+        "min-size",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header",
+        "performance-tuning",
+        "resource-limits",
+        "integrity-checking"
       ],
       "internal": [
         "delegated-operands-b64",
@@ -73,7 +79,6 @@
         "no-progress",
         "progress-json",
         "stats",
-        "tuning-options",
         "detach"
       ],
       "follow_up": []
@@ -92,10 +97,10 @@
         "src-dir",
         "results",
         "dry-run",
-        "connections",
         "syq-path",
         "no-bootstrap",
-        "pscope"
+        "pscope",
+        "performance-tuning"
       ],
       "internal": [
         "results-fd"
@@ -134,6 +139,30 @@
         "src-dirs": "src-dir"
       },
       "raw_only": [],
+      "follow_up": []
+    },
+    "clean-partials": {
+      "sdk": "raw_only",
+      "python": [],
+      "internal": [
+        "results-fd"
+      ],
+      "aliases": {},
+      "raw_only": [
+        "on",
+        "cwd",
+        "root",
+        "dry-run",
+        "verbose",
+        "quiet",
+        "progress",
+        "no-progress",
+        "progress-json",
+        "syq-path",
+        "no-bootstrap",
+        "results",
+        "performance-tuning"
+      ],
       "follow_up": []
     }
   }

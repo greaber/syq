@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools==80.9.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
 
 [project]
 name = "syq"
-version = "0.5.2"
+version = "0.6.0"
 description = "Official client for the syq file transfer tool"
-readme = "README.md"
-requires-python = ">=3.10"
+readme = "README-PYTHON.md"
+requires-python = ">=3.13.4"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE-PYTHON"]
 authors = [
     { name = "Grant Reaber" },
 ]
@@ -32,13 +32,21 @@ Issues = "https://github.com/greaber/syq/issues"
 [dependency-groups]
 dev = [
     "build==1.3.0",
+    "maturin==1.15.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-syq = ["py.typed", "syq-release-manifest.json"]
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../Cargo.toml"
+python-source = "src"
+python-packages = ["syq"]
+locked = true
+editable-profile = "dev"
+include = [
+    { path = "NATIVE_API.md", format = "sdist" },
+    { path = "native-api.json", format = "sdist" },
+    { path = ".cargo_vcs_info.json", format = "sdist" },
+]
 
 [tool.uv]
 required-version = "==0.11.6"

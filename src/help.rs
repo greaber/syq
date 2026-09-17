@@ -38,7 +38,10 @@ fn configure_at(mut command: Command, path: &str) -> Command {
     }
     // Filesystem commands are classified below. On the management commands,
     // required operands stay visible and only everyday options enter short help.
-    if !matches!(path, "syq cp" | "syq rm" | "syq map" | "syq rsync") {
+    if !matches!(
+        path,
+        "syq cp" | "syq rm" | "syq clean-partials" | "syq map" | "syq rsync"
+    ) {
         command = command.mut_args(|arg| {
             let common = arg.is_positional()
                 || arg.is_required_set()
@@ -133,7 +136,8 @@ fn configure_at(mut command: Command, path: &str) -> Command {
 pub(crate) fn filesystem(command: Command) -> Command {
     let rsync = command.get_name() == "syq rsync";
     let map = command.get_name() == "syq map";
-    let rm = command.get_name() == "syq rm";
+    let clean = command.get_name() == "syq clean-partials";
+    let rm = command.get_name() == "syq rm" || clean;
     let command = command.mut_args(|arg| {
         if arg.is_hide_set() {
             return arg;
@@ -182,20 +186,20 @@ pub(crate) fn filesystem(command: Command) -> Command {
                     | "help"
                     | "version"
             ) || (rm && id == "root")
+                || (clean && matches!(id, "trees" | "on"))
         };
         let heading =
             match id {
-                "sources" | "paths" | "src" | "srcs_in" | "src_non_dir" | "src_dir"
-                | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root" | "follow"
-                | "follow_src" => "Sources and selection",
+                "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
+                | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
+                | "follow" | "follow_src" => "Sources and selection",
                 "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
                 | "follow_dst" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
-                "bwlimit" => "Bandwidth",
-                "connections" | "connections_opt" | "block_size" | "tuning_options" => {
-                    "Performance troubleshooting"
-                }
+                "resource_limits_arg" => "Resource limits",
+                "integrity_checking_arg" | "hash" | "expected_digest" => "Integrity checking",
+                "performance_tuning" | "block_size" => "Performance tuning",
                 "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",
@@ -249,6 +253,7 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
+        .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Manage persistent connections, receiving, and return destinations"))
@@ -261,7 +266,7 @@ pub(crate) fn lifecycle() -> Command {
     configure(Command::new("syq")
         .about("Install the newest signed syq release")
         .override_usage("syq --self-update")
-        .before_help("Standalone (curl installer) installs: syq --self-update\nHomebrew installs: brew upgrade syq\nSource builds: rebuild or reinstall.\n\nStandalone installs show new-version reminders at most daily after successful\nfilesystem commands when stderr is a terminal and quiet mode is off. Set\nSYQ_NO_UPDATE_CHECK to disable reminders; explicit self-update still works.\nUpdates verify signed release metadata and never install as a side effect of copying.")
+        .before_help("Standalone (curl installer) installs: syq --self-update\nHomebrew installs: brew upgrade syq\nSource builds: rebuild or reinstall.\n\nStandalone and Homebrew installs show new-version reminders at most daily after\nsuccessful filesystem commands when stderr is a terminal and quiet mode is off.\nSet SYQ_NO_UPDATE_CHECK or DO_NOT_TRACK to disable reminders; explicit self-update still works.\nUpdates verify signed release metadata and never install as a side effect of copying.")
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue).exclusive(true)
             .help("Update the executable registered by the standalone installer"))
         .arg(Arg::new("register_standalone_install").long("register-standalone-install")

@@ -17,7 +17,7 @@ use crate::rooted::{
     PinnedPath, RootMetadata,
 };
 use anyhow::{bail, Context, Result};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -109,6 +109,7 @@ struct PinnedDirectory {
     name: Option<PinnedName>,
     label: PathBytes,
     remove_selected_directory: bool,
+    partials_only: bool,
 }
 
 enum ResolvedSelection {
@@ -207,7 +208,9 @@ impl Resolver {
             PinnedPath::Directory(directory) => {
                 let identity = identity_from_root(directory.metadata());
                 require_kind(selection.kind, identity, &label)?;
-                let remove_selected_directory = selection.kind != NativeRemoveKind::Contents;
+                let partials_only = selection.kind == NativeRemoveKind::Partials;
+                let remove_selected_directory =
+                    !partials_only && selection.kind != NativeRemoveKind::Contents;
                 let (directory, name) = directory.into_parts();
                 let name = name.map(|name| pinned_name_from_root(name).0);
                 if remove_selected_directory && name.is_none() {
@@ -228,6 +231,7 @@ impl Resolver {
                     name,
                     label,
                     remove_selected_directory,
+                    partials_only,
                 }))
             }
             PinnedPath::OpenFile(_) => {
@@ -286,11 +290,11 @@ fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
 
 fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Result<()> {
     match kind {
-        NativeRemoveKind::Contents | NativeRemoveKind::Directory if identity.is_symlink() => bail!(
+        NativeRemoveKind::Contents | NativeRemoveKind::Directory | NativeRemoveKind::Partials if identity.is_symlink() => bail!(
             "selector {:?} must resolve to a directory; final symlinks are never followed, even with --follow-src or --follow; name the target directory explicitly",
             String::from_utf8_lossy(label)
         ),
-        NativeRemoveKind::Contents | NativeRemoveKind::Directory if !identity.is_dir() => bail!(
+        NativeRemoveKind::Contents | NativeRemoveKind::Directory | NativeRemoveKind::Partials if !identity.is_dir() => bail!(
             "selector {:?} must resolve to a directory",
             String::from_utf8_lossy(label)
         ),
@@ -415,6 +419,7 @@ struct DirectoryJob {
     remaining: AtomicUsize,
     retries: AtomicUsize,
     descendant_failed: AtomicBool,
+    partials_only: bool,
 }
 
 enum Task {
@@ -641,6 +646,7 @@ pub(crate) fn remove(
             ResolvedSelection::Directory(directory) => {
                 pool.submit(Task::Scan(Arc::new(DirectoryJob {
                     selector: directory.selector,
+                    partials_only: directory.partials_only,
                     directory: directory.directory,
                     removal: directory
                         .remove_selected_directory
@@ -832,6 +838,13 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                 continue;
             }
         };
+        if job.partials_only
+            && !identity.is_dir()
+            && (identity.kind() != Kind::File
+                || !crate::fsops::is_partial_name(OsStr::from_bytes(&component)))
+        {
+            continue;
+        }
         let name = match component_cstring(&component) {
             Ok(name) => name,
             Err(error) => {
@@ -877,8 +890,9 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             {
                 Ok(()) => pool.submit(Task::Scan(Arc::new(DirectoryJob {
                     selector: job.selector,
+                    partials_only: job.partials_only,
                     directory,
-                    removal: Some(pinned),
+                    removal: (!job.partials_only).then_some(pinned),
                     label,
                     parent: Some(job.clone()),
                     remaining: AtomicUsize::new(1),

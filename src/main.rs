@@ -1,18 +1,23 @@
+mod advanced;
 mod agent_broker;
 mod bwlimit;
 mod cli;
 mod completion;
 mod completion_details;
 mod conn;
+mod copy_policy;
 mod delegation;
 #[allow(dead_code)]
 mod descriptor_broker;
 mod destination;
 pub mod enrollment;
 mod fsops;
+mod hashing;
 mod help;
 mod identity;
 mod janky_cat;
+#[cfg(target_os = "linux")]
+mod local_copy;
 mod mapping;
 mod native_map;
 mod native_rm;
@@ -22,17 +27,21 @@ mod private_broker;
 mod process_group;
 mod progress;
 mod proto;
+#[cfg(target_os = "linux")]
+mod read_ahead;
 mod receipt;
 mod receive_approval;
 mod receive_service;
 mod remote_helper;
 mod remote_to_remote;
+mod remote_user_install;
 mod restricted;
 mod results;
 mod resume;
 mod rm;
 #[allow(dead_code)]
 mod rooted;
+mod s3;
 mod scan;
 mod sched;
 mod server;
@@ -42,10 +51,12 @@ mod tcp_records;
 #[cfg(test)]
 mod test_support;
 mod transfer;
+mod transfer_observations;
 mod transfer_tuning;
 mod tune;
 mod update;
 mod wire_budget;
+mod write_gate;
 
 /// Keep multi-megabyte block buffers in the heap instead of mmap/munmap-ing
 /// each one: page faults and TLB shootdowns across many threads otherwise
@@ -139,6 +150,10 @@ fn main() {
             crate::output::diagnostic!("syq: {error:#}");
             std::process::exit(2);
         }
+        return;
+    }
+    if argv.len() == 2 && argv[1] == "--install-remote-command" {
+        remote_user_install::install();
         return;
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
@@ -302,7 +317,9 @@ fn main() {
         }
     }
     let quiet = args.quiet;
-    let result = if args.interface == cli::Interface::NativeMap {
+    let result = if args.s3.is_some() {
+        s3::run(args)
+    } else if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)
     } else if args.rm {
         rm::run(args)

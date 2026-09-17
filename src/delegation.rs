@@ -439,6 +439,7 @@ pub(crate) struct SignedGrantEnvelope {
     pub signature: Vec<u8>,
     pub tcp_congestion: Option<String>,
     pub mapping: Option<crate::mapping::Authorization>,
+    pub hashing: Option<crate::hashing::CopyHashing>,
 }
 
 impl SignedGrantEnvelope {
@@ -452,6 +453,7 @@ impl SignedGrantEnvelope {
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
             mapping: None,
+            hashing: None,
             signature,
         }
     }
@@ -467,6 +469,7 @@ impl SignedGrantEnvelope {
             &self.receipt_policy,
             self.tcp_congestion.as_deref(),
             self.mapping.as_ref(),
+            self.hashing.as_ref(),
         )?;
         if body.len() > MAX_GRANT_BYTES {
             bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -509,17 +512,25 @@ impl SignedGrantEnvelope {
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
         let (body, extension): (GrantBody, &[u8]) =
             postcard::take_from_bytes(body_bytes).context("decode signed grant")?;
-        let (tcp_congestion, mapping) = if extension.is_empty() {
-            (None, None)
+        let (tcp_congestion, mapping, hashing) = if extension.is_empty() {
+            (None, None, None)
         } else {
             let (kind, rest): (String, &[u8]) =
                 postcard::take_from_bytes(extension).context("decode signed grant extension")?;
             match kind.as_str() {
-                "tcp-congestion-v1" => (Some(postcard::from_bytes(rest)?), None),
+                "tcp-congestion-v1" => (Some(postcard::from_bytes(rest)?), None, None),
                 "mapping-v1" => {
                     let (tcp, mapping): (Option<String>, crate::mapping::Authorization) =
                         postcard::from_bytes(rest)?;
-                    (tcp, Some(mapping))
+                    (tcp, Some(mapping), None)
+                }
+                "copy-hashing-v2" => {
+                    let (tcp, mapping, hashing): (
+                        Option<String>,
+                        Option<crate::mapping::Authorization>,
+                        crate::hashing::CopyHashing,
+                    ) = postcard::from_bytes(rest)?;
+                    (tcp, mapping, Some(hashing))
                 }
                 _ => bail!("unknown signed grant extension"),
             }
@@ -539,6 +550,7 @@ impl SignedGrantEnvelope {
             &receipt_policy,
             tcp_congestion.as_deref(),
             mapping.as_ref(),
+            hashing.as_ref(),
         )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
@@ -557,6 +569,7 @@ impl SignedGrantEnvelope {
             signature,
             tcp_congestion,
             mapping,
+            hashing,
         })
     }
 
@@ -569,6 +582,7 @@ impl SignedGrantEnvelope {
             &self.receipt_policy,
             self.tcp_congestion.as_deref(),
             self.mapping.as_ref(),
+            self.hashing.as_ref(),
         )
     }
 }
@@ -597,6 +611,7 @@ pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest)
         &policy.receipt_policy,
         policy.tcp_congestion.as_deref(),
         policy.mapping.as_ref(),
+        policy.hashing.as_ref(),
     )?;
     Ok(())
 }
@@ -613,6 +628,7 @@ pub(crate) fn sign_grant(
         receipt_policy,
         tcp_congestion,
         mapping,
+        hashing,
     } = constraints;
     if private_key.is_encrypted() {
         bail!("cannot sign a grant with an encrypted enrollment key");
@@ -627,6 +643,7 @@ pub(crate) fn sign_grant(
         &receipt_policy,
         tcp_congestion.as_deref(),
         mapping.as_ref(),
+        hashing.as_ref(),
     )?;
     let signature = private_key
         .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
@@ -643,6 +660,7 @@ pub(crate) fn sign_grant(
         signature,
         tcp_congestion,
         mapping,
+        hashing,
     }
     .encode()
 }
@@ -657,9 +675,11 @@ fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -
         &test_receipt_policy(),
         None,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signing_payload(
     grant: &Grant,
     max_file_data_bytes_per_second: u64,
@@ -668,6 +688,7 @@ fn signing_payload(
     receipt_policy: &crate::receipt::ReceiptPolicy,
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
+    hashing: Option<&crate::hashing::CopyHashing>,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
@@ -679,6 +700,7 @@ fn signing_payload(
         receipt_policy,
         tcp_congestion,
         mapping,
+        hashing,
     )?;
     if body.len() > MAX_GRANT_BYTES {
         bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -690,6 +712,7 @@ fn signing_payload(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_body_bytes(
     grant: &Grant,
     max_file_data_bytes_per_second: u64,
@@ -698,6 +721,7 @@ fn canonical_body_bytes(
     receipt_policy: &crate::receipt::ReceiptPolicy,
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
+    hashing: Option<&crate::hashing::CopyHashing>,
 ) -> Result<Vec<u8>> {
     receipt_policy.validate()?;
     // Preserve the released v0.4.1 body byte for byte when no override is
@@ -714,7 +738,23 @@ fn canonical_body_bytes(
     if let Some(algorithm) = tcp_congestion {
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
     }
-    if let Some(mapping) = mapping {
+    if let Some(hashing) = hashing {
+        if let Some(expected) = &hashing.expected_digest {
+            expected.validate()?;
+        }
+        if mapping.is_some() {
+            let GrantOperation::Copy(copy) = &grant.operation;
+            if copy.policy.deletion != DeletionPolicy::Forbid {
+                bail!("mapping authorization does not permit pruning");
+            }
+        }
+        bytes.extend(postcard::to_stdvec(&(
+            "copy-hashing-v2",
+            tcp_congestion,
+            mapping,
+            hashing,
+        ))?);
+    } else if let Some(mapping) = mapping {
         let GrantOperation::Copy(copy) = &grant.operation;
         if copy.policy.deletion != DeletionPolicy::Forbid {
             bail!("mapping authorization does not permit pruning");
@@ -1173,6 +1213,7 @@ pub(crate) struct VerifiedGrant {
     execution_deadline: Instant,
     pub tcp_congestion: Option<String>,
     pub mapping: Option<crate::mapping::Authorization>,
+    pub hashing: Option<crate::hashing::CopyHashing>,
 }
 
 /// Signed receiver policy carried alongside the copy grant.
@@ -1185,6 +1226,8 @@ pub(crate) struct GrantConstraints {
     pub tcp_congestion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<crate::mapping::Authorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hashing: Option<crate::hashing::CopyHashing>,
 }
 
 #[cfg(test)]
@@ -1197,6 +1240,7 @@ impl Default for GrantConstraints {
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
             mapping: None,
+            hashing: None,
         }
     }
 }
@@ -1217,6 +1261,7 @@ impl VerifiedGrant {
                 receipt_policy: self.receipt_policy,
                 tcp_congestion: self.tcp_congestion,
                 mapping: self.mapping,
+                hashing: self.hashing,
             },
             self.grant_digest,
             self.execution_deadline,
@@ -1261,6 +1306,7 @@ pub(crate) fn verify_and_redeem(
         receipt_policy: envelope.receipt_policy,
         tcp_congestion: envelope.tcp_congestion,
         mapping: envelope.mapping,
+        hashing: envelope.hashing,
         grant_digest,
         execution_deadline,
     })
@@ -2146,6 +2192,7 @@ mod tests {
             &test_receipt_policy(),
             None,
             None,
+            None,
         )
         .expect("encode test grant");
         let mut out = Vec::new();
@@ -2244,6 +2291,73 @@ mod tests {
             verified.into_parts().1.tcp_congestion.as_deref(),
             Some("cubic")
         );
+    }
+
+    #[test]
+    fn hashing_constraints_are_signed_and_preserve_legacy_encoding() {
+        use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
+        let private = PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
+            "syq-test",
+        )
+        .unwrap();
+        let fixture = Fixture::ordinary();
+        fs::write(
+            &fixture.allowed_signers,
+            format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        let hashing = CopyHashing {
+            policy: HashPolicy {
+                algorithm: HashAlgorithm::Xxh3,
+                transfer_integrity: false,
+                transfer_hash_type: None,
+            },
+            expected_digest: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"expected file")),
+        };
+        let encoded = sign_grant(
+            fixture_grant(45),
+            GrantConstraints {
+                hashing: Some(hashing.clone()),
+                ..Default::default()
+            },
+            &private,
+        )
+        .unwrap();
+        let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
+        assert_eq!(decoded.hashing, Some(hashing.clone()));
+        let replay = fixture.replay("hashing-replay");
+        let mut changed = hashing.clone();
+        changed.policy.transfer_integrity = true;
+        let mut other_payload = hashing.clone();
+        other_payload.policy.transfer_hash_type = Some(HashAlgorithm::Sha256);
+        let mut omitted = hashing.clone();
+        omitted.expected_digest = None;
+        for policy in [None, Some(changed), Some(other_payload), Some(omitted)] {
+            let mut tampered = decoded.clone();
+            tampered.hashing = policy;
+            assert!(verify_and_redeem(
+                &tampered.encode().unwrap(),
+                &context(SIGNER, TARGET, NOW, 0),
+                &fixture.policy(),
+                &replay
+            )
+            .is_err());
+        }
+        let verified = verify_and_redeem(
+            &encoded,
+            &context(SIGNER, TARGET, NOW, 0),
+            &fixture.policy(),
+            &replay,
+        )
+        .unwrap();
+        assert_eq!(verified.into_parts().1.hashing, Some(hashing));
+        // The released body's encoding is unchanged; the new feature is an
+        // extension an old reader rejects instead of silently dropping it.
+        let legacy = fixture.signed(fixture_grant(46));
+        let legacy_decoded = SignedGrantEnvelope::decode(&legacy).unwrap();
+        assert!(legacy_decoded.hashing.is_none());
+        assert_eq!(legacy_decoded.encode().unwrap(), legacy);
     }
 
     #[test]

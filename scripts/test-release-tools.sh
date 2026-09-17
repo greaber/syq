@@ -94,7 +94,7 @@ jq -e \
   ' "$first/syq-release-manifest.json" >/dev/null
 sh -n "$first/install.sh"
 grep -q '^class Syq < Formula$' "$first/syq.rb"
-grep -q '/releases/download/v' "$first/syq.rb"
+grep -q 'https://dl.syq.christmas/v' "$first/syq.rb"
 if command -v ruby >/dev/null 2>&1; then
   ruby -c "$first/syq.rb" >/dev/null
 fi

@@ -123,18 +123,49 @@ done
 # The completion scenario expects to discover only its own endpoint.
 syq completion cache clear >/dev/null
 
+printf 'case: pipelined prune lookup with a one-deep data pipeline\n'
+python3 - <<'PY_PRUNE'
+import pathlib
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory(prefix="syq-prune-") as directory:
+    source = pathlib.Path(directory)
+    for index in range(4096):
+        (source / f"file-{index:04}").write_bytes(b"new content")
+    destination = "/tmp/syq-real-ssh/prune-pipeline"
+    subprocess.run(["ssh", "destination", f"mkdir -p {destination}; printf extra > {destination}/extra"], check=True, timeout=30)
+    command = ["syq", "cp", "--srcs-in", str(source), "--to", "destination", "--into", destination,
+               "--prune", "--no-tcp", "--no-progress", "--performance-tuning", "pipeline-depth=1"]
+    subprocess.run(command + ["--dry-run"], check=True, timeout=90)
+    subprocess.run(["ssh", "destination", f"test -f {destination}/extra && test ! -e {destination}/file-0000"], check=True, timeout=30)
+    subprocess.run(command, check=True, timeout=120)
+    subprocess.run(["ssh", "destination", f"test ! -e {destination}/extra && test $(find {destination} -type f | wc -l) -eq 4096 && test \"$(cat {destination}/file-4095)\" = 'new content'"], check=True, timeout=30)
+PY_PRUNE
+
+printf 'case: ordinary SSH directory push and pull across separate hosts\n'
+mkdir -p /tmp/syq-ordinary-source/sub
+printf 'ordinary cross-host directory copy\n' > /tmp/syq-ordinary-source/sub/file
+syq rsync -a --no-progress --syq-no-tcp /tmp/syq-ordinary-source/ \
+    destination:/tmp/syq-real-ssh/ordinary-push/
+ssh destination 'cat /tmp/syq-real-ssh/ordinary-push/sub/file' | \
+    cmp /tmp/syq-ordinary-source/sub/file -
+syq rsync -a --no-progress --syq-no-tcp \
+    destination:/tmp/syq-real-ssh/ordinary-push/ /tmp/syq-ordinary-pull/
+cmp /tmp/syq-ordinary-source/sub/file /tmp/syq-ordinary-pull/sub/file
+
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 
 printf 'case: long receiver home supports explicit SSH and blocked-TCP fallback\n'
 ssh longhome@destination 'test "${#HOME}" -gt 36; mkdir -p /tmp/syq-long-home'
 make_tree source /tmp/syq-real-ssh/long-home-source long-home
-syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
     --to longhome@destination --into /tmp/syq-long-home/explicit
 assert_same_tree source /tmp/syq-real-ssh/long-home-source \
     longhome@destination /tmp/syq-long-home/explicit long-home-explicit
-syq cp --no-progress -j 2 --preserve=permissions \
+syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
     --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/long-home-source \
     --to longhome@destination --into /tmp/syq-long-home/fallback
@@ -201,7 +232,7 @@ syq persist receive remove "$(hostname)"
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
 printf 'case: return copies await local approval and denial leaves no destination\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as denied' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as denied' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; r=json.load(open("/tmp/syq-pending.json")); assert len(r)==1 and "source" in r[0]["from"] and "denied" in r[0]["destination"],r; print(r[0]["id"])')
@@ -225,7 +256,7 @@ test ! -e "$receive_root/denied"
 if syq persist receive approve "$request_id"; then echo 'denied approval ID was reused' >&2; exit 1; fi
 
 printf 'case: approval allows only the pending copy once\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as approved' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as approved' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -237,7 +268,7 @@ printf 'return\n' | cmp - "$receive_root/approved"
 if syq persist receive approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
 
 printf 'case: disconnected requests cannot be approved later\n'
-ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as disconnected' &
+ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as disconnected' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -256,7 +287,7 @@ if syq persist receive approve "$request_id"; then echo 'disconnected request wa
 test ! -e "$receive_root/disconnected"
 
 printf 'case: changing policy cancels a pending request\n'
-timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as cancelled-policy' &
+timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as cancelled-policy' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
@@ -277,7 +308,7 @@ python3 /usr/local/libexec/syq-test-return-exec.py
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --approve always
 syq persist receive wait source --timeout 30
-ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to laptop --into first'
+ssh source 'test -z "${SSH_AUTH_SOCK:-}"; syq cp --preserve permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
 (
     cd "$receive_root/first"
@@ -304,10 +335,12 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
     exit 1
 fi
 
-printf 'case: duplicate named return cannot displace the existing laptop\n'
+printf 'case: a copied receiver identity cannot displace a responsive laptop\n'
 (
-    export XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
-    mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    original_receiver_identity=$HOME/.syq-receiver-identity
+    export HOME=/tmp/syq-duplicate-home XDG_RUNTIME_DIR=/tmp/syq-duplicate-runtime XDG_CONFIG_HOME=/tmp/syq-duplicate-config
+    mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME"
+    cp -a "$original_receiver_identity" "$HOME/"
     trap 'syq persist off' EXIT
     syq persist on
     syq persist receive on --name laptop --root /tmp/syq-real-ssh-receive-other
@@ -316,21 +349,21 @@ printf 'case: duplicate named return cannot displace the existing laptop\n'
         echo 'duplicate named destination unexpectedly succeeded' >&2
         exit 1
     fi
-    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already registered" in s["connection"]["error"] for s in states), states'
+    syq persist receive status --json | python3 -c 'import json,sys; states=json.load(sys.stdin)["connections"]; assert any(s["connection"]["phase"] == "failed" and "already connected" in s["connection"]["error"] for s in states), states'
 )
 ssh source 'syq persist destinations wait laptop --timeout 5'
 
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
 ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
 source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=4 status=none | sha256sum')
-timeout 45 ssh source 'syq cp --bwlimit 512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+timeout 45 ssh source 'syq cp --resource-limits bandwidth=512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))
 while :; do
-    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)
+    partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)
     if [ "$partial_count" -eq 1 ]; then
-        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*')
+        partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*')
         partial_prefix=$(dd if="$partial" bs=1M count=4 status=none | sha256sum)
         if [ "$partial_prefix" = "$source_prefix" ]; then break; fi
     fi
@@ -361,7 +394,7 @@ test ! -e "$receive_root/interrupted"
 ssh source 'syq persist destinations wait laptop --timeout 30'
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted'
 ssh source 'cat /tmp/syq-real-ssh/return-source/resume.bin' | cmp - "$receive_root/interrupted"
-test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-part.*' | wc -l)" -eq 0
+test "$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)" -eq 1
 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as after-reconnect'
 printf 'return\n' | cmp - "$receive_root/after-reconnect"
 printf 'case: return heartbeat timeout reconnects without toggling persistence\n'
@@ -403,9 +436,9 @@ printf 'return\n' | cmp - "$receive_root/after-heartbeat-timeout"
 printf 'case: cwd permits destinations outside its starting directory\n'
 syq persist receive on --cwd "$receive_root"
 syq persist receive wait source --timeout 30
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as ../syq-return-outside'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as ../syq-return-outside'
 printf 'return\n' | cmp - /tmp/syq-return-outside
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as /tmp/syq-return-absolute'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as /tmp/syq-return-absolute'
 printf 'return\n' | cmp - /tmp/syq-return-absolute
 python3 /usr/local/libexec/syq-test-receive-profiles.py
 printf 'case: persist receive off/on keeps ordinary persistence and restarts receiving\n'
@@ -418,7 +451,7 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 syq persist receive on
 syq persist receive wait source --timeout 30
-ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to laptop --as reenabled'
+ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as reenabled'
 printf 'return\n' | cmp - "$receive_root/reenabled"
 printf 'case: persistence off stops background receiving\n'
 syq persist off
@@ -428,6 +461,8 @@ if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop -
 fi
 test ! -e "$receive_root/after-stop"
 ssh source 'test ! -e ~/.syq-destinations-v3/laptop.json'
+printf 'case: offline names require the original receiver identity or explicit replacement\n'
+python3 /usr/local/libexec/syq-test-receiver-identity.py
 # Unrelated pooling scenarios count SSH commands; explicitly disable receiving.
 syq persist receive off
 syq completion cache clear >/dev/null
@@ -664,7 +699,7 @@ done
 
 printf 'case: restricted enrollment refuses an SSH control-plane destination\n'
 make_tree source /tmp/syq-real-ssh/protected-source protected
-if protected_output=$(syq cp --no-progress -j 2 --preserve=permissions \
+if protected_output=$(syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/protected-source \
     --to destination --into /home/syq/.ssh/sender-controlled 2>&1); then
     echo 'copy into the restricted receiver control plane unexpectedly succeeded' >&2
@@ -691,7 +726,7 @@ python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
-syq cp --no-progress -j 2 --preserve=permissions --tcp-congestion cubic \
+syq cp --no-progress --performance-tuning workers=2 --preserve=permissions --tcp-congestion cubic \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 assert_same_tree \
@@ -711,7 +746,7 @@ syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src link/file
 ssh source 'test -L /tmp/syq-real-ssh/rm-policy/link; test ! -e /tmp/syq-real-ssh/rm-policy/real/file'
 
 printf 'case: native verification and overwrite policies through the restricted receiver\n'
-syq cp --verify-only --no-progress -j 2 \
+syq cp --verify-only --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh source 'printf source > /tmp/syq-real-ssh/direct-source/policy-file; printf new > /tmp/syq-real-ssh/direct-source/policy-new'
@@ -719,32 +754,32 @@ ssh destination 'printf destination > /tmp/syq-real-ssh/direct-destination/polic
 ssh source 'mkdir -p /tmp/syq-real-ssh/direct-source/policy-dir/new; chmod 750 /tmp/syq-real-ssh/direct-source/policy-dir /tmp/syq-real-ssh/direct-source/policy-dir/new'
 ssh destination 'mkdir -p /tmp/syq-real-ssh/direct-destination/policy-dir; chmod 711 /tmp/syq-real-ssh/direct-destination/policy-dir'
 
-syq cp --only-new --preserve=permissions --no-progress -j 2 \
+syq cp --only-new --preserve=permissions --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = destination; test "$(cat /tmp/syq-real-ssh/direct-destination/policy-new)" = new; rm /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh destination 'test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir)" = 711; test "$(stat -c %a /tmp/syq-real-ssh/direct-destination/policy-dir/new)" = 750'
 
-syq cp --only-existing --no-progress -j 2 \
+syq cp --only-existing --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = source; test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 policy_status=0
-syq cp --verify-only --no-progress -j 2 \
+syq cp --verify-only --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination || policy_status=$?
 test "$policy_status" -eq 23
 ssh destination 'test ! -e /tmp/syq-real-ssh/direct-destination/policy-new'
 ssh source 'touch -m -d @1600000000 /tmp/syq-real-ssh/direct-source/policy-file'
 ssh destination 'printf newer > /tmp/syq-real-ssh/direct-destination/policy-file; touch -m -d @1700000000 /tmp/syq-real-ssh/direct-destination/policy-file'
-syq cp --skip-newer --no-progress -j 2 \
+syq cp --skip-newer --no-progress --performance-tuning workers=2 \
     --from source --srcs-in /tmp/syq-real-ssh/direct-source \
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
 printf 'case: destination firewall triggers automatic TCP fallback to SSH\n'
 make_tree source /tmp/syq-real-ssh/firewall-source firewall
-syq cp --no-progress -j 2 --preserve=permissions \
+syq cp --no-progress --performance-tuning workers=2 --preserve=permissions \
     --tcp-ports "$blocked_tcp_port-$blocked_tcp_port" \
     --from source --srcs-in /tmp/syq-real-ssh/firewall-source \
     --to destination --into /tmp/syq-real-ssh/firewall-destination
@@ -755,7 +790,7 @@ assert_same_tree \
 
 printf 'case: source coordinator with constrained agent and SSH data channels\n'
 make_tree source /tmp/syq-real-ssh/ssh-source ssh
-syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
     --from source --srcs-in /tmp/syq-real-ssh/ssh-source \
     --to destination --into /tmp/syq-real-ssh/ssh-destination
 assert_same_tree \
@@ -766,7 +801,7 @@ assert_same_tree \
 printf 'case: an unavailable direct SSH data route fails without relaying through the runner\n'
 ssh source 'dd if=/dev/zero of=/tmp/syq-real-ssh/no-route-source bs=1048576 count=2 status=none; touch /tmp/syq-real-ssh-block-restricted-workers'
 route_status=0
-syq cp --no-progress --no-tcp -j 1 \
+syq cp --no-progress --no-tcp --performance-tuning workers=1 \
     --from source /tmp/syq-real-ssh/no-route-source \
     --to destination --as /tmp/syq-real-ssh/no-route-destination || route_status=$?
 ssh source 'rm /tmp/syq-real-ssh-block-restricted-workers'
@@ -775,7 +810,7 @@ ssh destination 'test ! -e /tmp/syq-real-ssh/no-route-destination'
 
 printf 'case: destination coordinator with the reversed constrained-agent edge\n'
 make_tree source /tmp/syq-real-ssh/pull-source pull
-syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
     --peer-auth broker --coordinate-at dst \
     --from source --srcs-in /tmp/syq-real-ssh/pull-source \
     --to destination --into /tmp/syq-real-ssh/pull-destination
@@ -788,7 +823,7 @@ printf 'case: local coordinator relaying between two SSH endpoints\n'
 make_tree source /tmp/syq-real-ssh/relay-source relay
 trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
-syq cp --no-progress --no-tcp -j 2 --preserve=permissions \
+syq cp --no-progress --no-tcp --performance-tuning workers=2 --preserve=permissions \
     --coordinate-at local \
     --from source --srcs-in /tmp/syq-real-ssh/relay-source \
     --to destination --into /tmp/syq-real-ssh/relay-destination
@@ -830,7 +865,7 @@ assert_same_tree \
     relay
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
-tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average
+tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average,job-storage=inline
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
 for transport in tcp ssh; do
     if [ "$transport" = ssh ]; then
@@ -839,11 +874,11 @@ for transport in tcp ssh; do
         set --
     fi
     syq cp /tmp/syq-real-ssh-tuning.bin --to source \
-        --as "/tmp/syq-real-ssh/tuning-$transport" -j 1 --no-progress \
-        --bwlimit 8M --tuning-options "$tuning" "$@"
+        --as "/tmp/syq-real-ssh/tuning-$transport" --performance-tuning workers=1 --no-progress \
+        --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
     syq cp --from source "/tmp/syq-real-ssh/tuning-$transport" \
-        --as "/tmp/syq-real-ssh-tuning-$transport-download" -j 1 --no-progress \
-        --bwlimit 8M --tuning-options "$tuning" "$@"
+        --as "/tmp/syq-real-ssh-tuning-$transport-download" --performance-tuning workers=1 --no-progress \
+        --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
     cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-tuning-$transport-download"
 done
 for coordinator in src dst local; do
@@ -854,7 +889,7 @@ for coordinator in src dst local; do
     esac
     syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
         --as "/tmp/syq-real-ssh/tuning-$coordinator" --coordinate-at "$coordinator" \
-        -j 1 --no-progress --bwlimit 8M --tuning-options "$tuning" "$@"
+        --performance-tuning workers=1 --no-progress --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
     ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-tuning-check <<'EOF'
 cat "/tmp/syq-real-ssh/tuning-$1"
 EOF
@@ -866,11 +901,11 @@ streaming=copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=aver
 for transport in tcp ssh; do
     if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
     timeout --kill-after=5s 25s syq cp /tmp/syq-real-ssh-tuning.bin --to source \
-        --as "/tmp/syq-real-ssh/streaming-$transport" -j 2 --no-progress \
-        --bwlimit 8M --tuning-options "$streaming" "$@"
+        --as "/tmp/syq-real-ssh/streaming-$transport" --performance-tuning workers=2 --no-progress \
+        --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
     timeout --kill-after=5s 25s syq cp --from source "/tmp/syq-real-ssh/streaming-$transport" \
-        --as "/tmp/syq-real-ssh-streaming-$transport-download" -j 2 --no-progress \
-        --bwlimit 8M --tuning-options "$streaming" "$@"
+        --as "/tmp/syq-real-ssh-streaming-$transport-download" --performance-tuning workers=2 --no-progress \
+        --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
     cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-streaming-$transport-download"
 done
 for coordinator in src dst local; do
@@ -881,7 +916,7 @@ for coordinator in src dst local; do
     esac
     timeout --kill-after=5s 25s syq cp --from source /tmp/syq-real-ssh/streaming-tcp --to destination \
         --as "/tmp/syq-real-ssh/streaming-$coordinator" --coordinate-at "$coordinator" \
-        -j 2 --no-progress --bwlimit 8M --tuning-options "$streaming" "$@"
+        --performance-tuning workers=2 --no-progress --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
     ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-streaming-check <<'EOF'
 cat "/tmp/syq-real-ssh/streaming-$1"
 EOF
@@ -891,8 +926,8 @@ done
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'
 syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
-    --to destination --into /tmp/syq-real-ssh/tuning-batches -j 1 --no-progress \
-    --tuning-options batch-files=3,batch-bytes=1M
+    --to destination --into /tmp/syq-real-ssh/tuning-batches --performance-tuning workers=1 --no-progress \
+    --performance-tuning batch-files=3,batch-bytes=1M
 assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
     destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
@@ -910,14 +945,40 @@ mkdir "$benchmark_parent"
 ssh destination "mkdir -p \"/tmp/benchmark scratch's\""
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload both --size quick \
+        --mode "$benchmark_mode" --host destination --workload both --size quick --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
 done
 # Automatic sizing uses the real terminal timing from each remote direction.
 for benchmark_mode in push pull; do
     bash /usr/local/libexec/syq-try-benchmark --yes \
-        --mode "$benchmark_mode" --host destination --workload small \
+        --mode "$benchmark_mode" --host destination --workload small --size auto --warmup off \
         --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's"
+done
+# One scored syq copy with transport and batch overrides in each direction.
+for benchmark_mode in push pull; do
+    bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --performance-tuning workers=2 --performance-tuning batch-files=256,batch-bytes=2M
+done
+# A new route can learn during warm-up before the first scored copy. Speed up
+# only the debug tuner's sample clock and cap traffic to keep this lab bounded.
+# These are correctness checks, not performance measurements.
+for benchmark_mode in push pull; do
+    benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
+    SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \
+        bash /usr/local/libexec/syq-try-benchmark --yes \
+        --mode "$benchmark_mode" --host destination --workload small --size quick \
+        --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
+        -- --no-tcp --resource-limits bandwidth=2M
+    python3 - "$benchmark_cache" "$benchmark_mode" <<'PY'
+import json, pathlib, sys
+cache = json.loads(pathlib.Path(sys.argv[1]).read_text())
+key = 'local>destination|ssh' if sys.argv[2] == 'push' else 'destination>local|ssh'
+assert 1 <= cache['paths'][key] <= 64, cache
+print('Verified a learned starting count for', key)
+PY
+    rm -f "$benchmark_cache" "$benchmark_cache.lock"
 done
 test -z "$(find "$benchmark_parent" -mindepth 1 -print)"
 ssh destination 'test -z "$(find "/tmp/benchmark scratch'"'"'s" -mindepth 1 -print)"'
@@ -931,13 +992,13 @@ cancel_parent=$home/benchmark-cancel
 mkdir "$cancel_parent"
 ssh destination 'mkdir /tmp/benchmark-cancel; printf keep > /tmp/benchmark-cancel/keep'
 bash /usr/local/libexec/syq-try-benchmark --yes --mode push --host destination \
-    --workload large --size quick --rounds 1 --source-dir "$cancel_parent" \
+    --workload large --size quick --warmup off --rounds 1 --source-dir "$cancel_parent" \
     --dest-dir /tmp/benchmark-cancel &
 benchmark_pid=$!
 attempt=0
 copy_started=false
 while [ "$attempt" -lt 30 ]; do
-    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-part.*; do
+    if ssh destination 'for file in /tmp/benchmark-cancel/syq-bench.*/trial/.data.syq-tmp.*; do
         if [ -f "$file" ]; then exit 0; fi
     done; exit 1'; then
         copy_started=true

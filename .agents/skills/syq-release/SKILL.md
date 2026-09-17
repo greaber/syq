@@ -34,6 +34,14 @@ and release notes in `current-plans/`. Read `sdk/RELEASING.md` for SDK publicati
 Resolve scripts from that checkout, not the installed skill directory. Follow
 task-worktree discipline; fetch current master, tags, and publication state.
 
+Before finalizing release preparation, run the repository's
+[docs audit](../syq-docs-audit/SKILL.md) against changes since the previous
+release. Include needed editorial fixes in preparation before validation and
+tagging. Reuse completed audit evidence for unchanged content. Ask the user
+only when the audit leaves a material editorial or product decision unresolved;
+a clean audit adds no approval gate. Recovery of an already published tag does
+not authorize changing its documentation tree.
+
 Honor a requested version. Otherwise inspect shipped changes and existing tags:
 reuse an appropriate already-prepared unpublished package version, or explain
 and prepare the next version. An existing requested tag calls for

@@ -81,7 +81,8 @@ pub struct EndpointRecord {
     pub user: Option<String>,
 }
 
-pub struct ProgressRecord {
+pub struct ProgressRecord<'a> {
+    pub(crate) activity: Option<&'a crate::transfer_observations::Interval>,
     pub bytes_done: u64,
     pub bytes_total: u64,
     pub bytes_unchanged: u64,
@@ -290,7 +291,11 @@ impl ResultsWriter {
             .map(|endpoint| {
                 let mut value = serde_json::json!({
                     "role": endpoint.role,
-                    "kind": if endpoint.host.is_some() { "ssh" } else { "local" },
+                    "kind": match endpoint.host.as_deref() {
+                        Some(host) if host.starts_with("s3://") => "s3",
+                        Some(_) => "ssh",
+                        None => "local",
+                    },
                 });
                 let object = value.as_object_mut().expect("endpoint is an object");
                 if let Some(host) = &endpoint.host {
@@ -324,8 +329,8 @@ impl ResultsWriter {
         self.write(record);
     }
 
-    pub fn emit_progress(&self, progress: &ProgressRecord) {
-        self.write(serde_json::json!({
+    pub fn emit_progress(&self, progress: &ProgressRecord<'_>) {
+        let mut record = serde_json::json!({
             "type": "progress",
             "bytes_done": progress.bytes_done,
             "bytes_total": progress.bytes_total,
@@ -337,7 +342,12 @@ impl ResultsWriter {
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
             "elapsed_ms": progress.elapsed_ms,
-        }));
+        });
+        if let Some(activity) = progress.activity {
+            record["activity"] =
+                serde_json::to_value(activity).expect("finite observation fractions");
+        }
+        self.write(record);
     }
 
     /// Dry run only: one intended mutation, sharing `operation_result`'s
@@ -450,6 +460,14 @@ impl ResultsWriter {
     }
 
     pub fn emit_operation(&self, op: &OperationRecord) {
+        self.emit_operation_expected(op, None);
+    }
+
+    pub(crate) fn emit_operation_expected(
+        &self,
+        op: &OperationRecord,
+        expected: Option<&crate::hashing::Digest>,
+    ) {
         let mut record = serde_json::json!({
             "type": "operation_result",
             "action": op.action,
@@ -458,6 +476,9 @@ impl ResultsWriter {
             "disposition": op.disposition,
         });
         let object = record.as_object_mut().expect("record is an object");
+        if let Some(expected) = expected {
+            object.insert("expected_digest".into(), serde_json::json!(expected));
+        }
         if let Some(src) = op.src {
             object.insert("src".into(), tagged(src));
         }
@@ -676,6 +697,7 @@ mod tests {
         let after = sink.0.lock().unwrap().len();
         // A straggling ticker render (or a second terminal) must be inert.
         writer.emit_progress(&ProgressRecord {
+            activity: None,
             bytes_done: 1,
             bytes_total: 1,
             bytes_unchanged: 0,

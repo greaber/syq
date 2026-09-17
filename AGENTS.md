@@ -70,8 +70,12 @@ restore `design/`, or add investigation reports, benchmark dumps, or experiment
 diaries to this repository. PR descriptions should explain the actual change
 and relevant checks, without histories of abandoned work.
 
-Keep `current-plans/` limited to brief current task state and next actions;
-remove obsolete notes instead of archiving them. Guidance every session needs
+Keep `current-plans/` limited to brief current task state and next actions.
+At task completion, check the PR's current state and remove obsolete notes;
+first preserve unfinished agreed work in its continuing task's handoff. Do not
+delete notes another conversation is actively updating. Keep generated logs,
+binaries, and benchmark dumps in the task's ignored `target/`, linked from the
+note; do not duplicate PR bodies or CI dumps here. Guidance every session needs
 belongs here in `AGENTS.md`.
 
 When writing any of these, record decisions as current state plus the rationale
@@ -155,6 +159,13 @@ Authorization continues through retries and resumed turns for the same release
 and ends when it completes or is cancelled. Another release requires another
 invocation. Read-only or dry-run invocations stay within their stated scope.
 
+During release preparation, compare `CHANGELOG.md` with all changes since the
+previous published release. Include user-facing fixes, performance improvements,
+and consequential behavior or compatibility changes. Finalize the entry with
+the release version and date, and use it to prepare the GitHub release notes.
+Do not treat an existing changelog entry as evidence that later changes have
+already been covered. See `RELEASING.md` for the release checklist.
+
 The user chose this explicit invocation boundary to prevent accidental
 publication while allowing an invoked release to finish autonomously. Keep
 validation gates, branch protections, tag permanence, and secret boundaries;
@@ -211,6 +222,51 @@ report actual access or decision blockers instead of bypassing them.
 - State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
   the fact the reader needs to route the next step.
 
+## Acting on review feedback
+
+Assess every finding and observation on its merits. "Pre-existing", "out of
+scope", "nonblocking", and "optional" describe context, not importance; none
+is a reason to dismiss a point without consideration. Keep defects, suggestions,
+and observations distinct, and discuss their value rather than treating every
+comment as a change request. A worthwhile observation may belong in this PR,
+in separate work, or need no change; decide that explicitly. Respect an explicit
+user decision to exclude a topic, but do not infer exclusion from reviewer labels.
+
+Reconsider the underlying requirements as part of this assessment, using the
+principles below. Fix directly only independently confirmed, worthwhile problems
+with simple, straightforward fixes, no tradeoffs that would benefit from
+discussion, and no unresolved question about the requirements. For anything else,
+discuss the evidence, value, alternatives, and requirements with the user
+before implementing that finding.
+
+The user may forward review from a reviewer without having understood it or even
+without having read it. Just because a point appears in a review pasted directly by
+the user does not mean that the user agrees with it. Similarly, the reviewer is just
+another agent, and the reviewer's job is to find possible issues with the work. Many
+issues raised by the reviewer might actually best be addressed by doing nothing even
+though the reviewer was not wrong about how the code works.
+
+## Reviewing scope the user did not request
+
+A pull request description and its commit messages are the implementing
+agent's own account of the work. They show what the agent intended; they are
+not evidence that the user asked for or agreed to it. The user often has not
+seen the change before the review.
+
+When reviewing, separate what the task called for from what the PR adds
+beyond it: new workflows or triggers, recurring CI or hosting cost, new
+policy or defaults, broadened guarantees, or behavior in unrelated areas.
+Report each such addition at the top of the review as a decision for the
+user, stating its cost or consequence, even when the PR explains it and even
+when the implementation is sound. Do not file it as a deliberate choice that
+needs no action. The user decides whether the expansion stays; "the PR says
+it is intentional" is not that decision.
+
+The rationale in 2026-09: a review noted that a release-tooling PR had added
+eight uncached builds on every source push to `master`, but treated it as
+deliberate because the PR body described it. The user had never authorized or
+known about it.
+
 ## PR review freshness
 
 - For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName`, `headRefOid`, and head-repository identity (owner and repository) first. Treat the GitHub `headRefOid` as authoritative unless a fresher local commit is verified as described below.
@@ -218,7 +274,17 @@ report actual access or decision blockers instead of bypassing them.
 - A matching branch name is not proof that a local ref belongs to the PR, especially for fork PRs. Treat a local ref as PR code only when its worktree ownership is explicit and its repository identity and ancestry relative to `headRefOid` have been verified.
 - If the local ref is missing, behind the GitHub head, divergent from it, or cannot be tied unambiguously to the PR's head repository, review the GitHub `headRefOid`. Fetch that exact head into a dedicated review ref or worktree when necessary, without overwriting an unrelated local branch, and report the discrepancy.
 - If local and GitHub refs match, review that SHA. If the local ref is ahead, use it only when the worktree belongs to the task and the GitHub `headRefOid` is its ancestor; tell the user that GitHub is stale and either review the unpushed local tip explicitly or wait for it to be pushed.
-- If the chosen review target SHA matches the last SHA already reviewed, stop immediately and report that the PR is unchanged instead of producing another review.
+- Skip a repeated review only when the chosen target SHA matches the last SHA
+  that this same agent reviewed for this PR in its own conversation history
+  (including preserved context when resuming that conversation). Report that
+  the PR is unchanged since this agent's review and name the SHA. An explicit
+  user request to review it again overrides this shortcut.
+- Use only that agent's own conversation history to establish its previous
+  review. Do not use GitHub reviews, comments, review decisions, shared review
+  notes, or another agent's review history to decide to skip. Agents may share
+  a GitHub account, and multiple agents must be able to review the same commit
+  independently. If this agent has no record of its own prior review, proceed
+  with the review.
 - Always state the exact reviewed SHA and whether it came from the local branch tip or the GitHub PR head.
 
 ## Working on syq
@@ -232,10 +298,19 @@ report actual access or decision blockers instead of bypassing them.
   plain words; a reader should not need project jargon such as "retained" or
   "the ordinary engine" to follow them. The code is authoritative for
   everything else.
-- Distinguish explicit requirements from assumptions and design choices. If a
-  supposed requirement creates substantial complexity, question the premise
-  and look for a simpler interpretation. Ask the user when the answer would
-  materially change the product.
+- Routinely reconsider whether requirements are actually required and how much
+  they matter; no special reason or failure is needed to ask. Distinguish the
+  user's goals from assumptions, design choices, and incidental safeguards.
+  A casual request or a check intended to catch common user mistakes must not
+  silently become a guarantee covering every possible case.
+- Weigh a scenario's likelihood and consequences against the complexity,
+  maintenance cost, and disadvantages of preventing it. The fact that a case
+  can occur does not by itself establish that it needs prevention; a rare case
+  can still matter greatly when its consequences are serious. When a small
+  safeguard starts requiring substantial machinery, discuss whether to narrow
+  it, accept a limitation, change the requirement, or choose another design.
+  Bring consequential choices to the user before implementing them; do not
+  silently expand the scope or drop agreed behavior.
 - Prefer one clear implementation. Add fallbacks or compatibility paths only
   for a concrete scenario or consumer that needs them.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
@@ -247,6 +322,19 @@ report actual access or decision blockers instead of bypassing them.
   belong there. Keep only brief `current-plans/` notes needed to continue
   active work. State a limitation as a fact about today's behavior, not as
   an intention.
+- Match documentation detail to the page's job. Setup and task guides should
+  give a useful example, explain consequential choices, and link to reference
+  material. Reference pages hold option interactions and scripting contracts;
+  security pages explain trust boundaries. Algorithm mechanics and regression
+  histories usually belong in code, tests, or the PR description.
+- When adding behavior, revise the paragraph that owns it rather than appending
+  a new explanation everywhere it is mentioned. Read the surrounding section
+  as a new user: keep details that help them act or interpret a result. A fixed
+  bug does not automatically need a new paragraph. Avoid release-number history
+  and unmeasured tuning advice in guides; benchmark claims need linked evidence.
+- Use [the docs audit skill](.agents/skills/syq-docs-audit/SKILL.md) for requested
+  editorial audits and during release preparation. An audit can identify a
+  product question without changing runtime behavior to simplify its explanation.
 - Keep the selected data route fixed. TCP may fall back to SSH between the
   same endpoints, but failure must never silently relay file data through the
   invoking or authorizing machine. Relaying requires an explicit route choice.
@@ -311,8 +399,16 @@ every actual update. See `RELEASING.md` for provisioning, backup, and rotation.
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
-Run checks proportionate to the change. For a Rust change, the normal
-pre-merge baseline is:
+Choose checks from the behavior changed, not every workflow available. For a
+narrow change confined to one test or its private fixture, run formatting and
+that exact test on the affected platform. The full Rust baseline below is not
+required for that case. Broaden only when shared fixtures, runtime code, or a
+concrete unresolved risk makes other tests relevant. Do not dispatch a full
+workflow merely to reach one test, or wait for unrelated checks once the
+needed result is available. State the selected checks and why before running
+expensive validation.
+
+For a Rust runtime change, the normal pre-merge baseline is:
 
 ```bash
 cargo fmt --all -- --check
@@ -327,9 +423,26 @@ handoff when a change is broad, crosses subsystem boundaries, changes shared
 test infrastructure, or leaves meaningful uncertainty about the affected
 surface. Do not run unrelated suites merely because they exist.
 
-Changes to SSH, remote helpers, enrollment, restricted receivers, transports,
-or remote coordinator placement should also run the local-only three-container
-OpenSSH suite:
+For one exact Rust unit test, use
+`cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
+integration test, replace `--bin syq` with its target, such as `--test local`.
+Confirm the named test ran; a zero-test or ignored result is not validation.
+For macOS, dispatch the focused job on the pushed task branch:
+
+```bash
+gh workflow run macos.yml --ref <task-branch> \
+  -f test_target=syq -f test_name='module::tests::name'
+```
+
+`test_target` also accepts the integration target names. This runs only the
+exact test, including it if marked ignored, and rejects a name absent on that
+platform. It does not produce full-suite release certification. Monitor the
+returned run with `gh run watch <run-id> --exit-status`. Leaving `test_name`
+empty selects the full workflow; use that only when broad validation is needed.
+
+Run the local-only three-container OpenSSH suite when changes materially affect
+connection setup, helper bootstrap, authentication or authorization, remote
+process lifecycle, transport behavior, or remote coordinator placement:
 
 ```bash
 scripts/test-real-ssh.sh
@@ -338,8 +451,19 @@ scripts/test-real-ssh.sh
 It is intentionally not part of ordinary CI or `cargo test`; see
 `tests/real-ssh/README.md` for its isolation and coverage.
 
+Choose this check by behavioral impact, not merely by which file changed.
+Small review fixes to diagnostics, documentation, or isolated validation checks
+can use focused tests when those tests adequately exercise the change. Batch
+related fixes before running the full suite. After a successful run, inspect
+the intervening changes before repeating it; rerun when they affect the SSH
+scenarios or leave meaningful uncertainty that focused tests cannot resolve.
+Report the SHA of the last successful full run, the checks on the current SHA,
+and why a repeat was unnecessary. Do not describe an earlier run as testing the
+current tree. Release validation still follows the exact-commit requirements
+under release tag lifecycle.
+
 Pull requests do not start automated test workflows. The agent remains
-responsible for running the baseline above, choosing focused integration tests,
+responsible for selecting checks under the rules above, choosing integration tests,
 and reporting exactly what was and was not verified before review. The
 cumulative `master` workflows execute the complete native and cross-platform
 suites after merge. Pay particular attention to remote, TCP, platform-specific,
