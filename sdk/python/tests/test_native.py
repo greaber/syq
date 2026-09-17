@@ -533,6 +533,13 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(operation.disposition, syq.Disposition.SUCCEEDED)
         self.assertEqual(operation.kind, syq.EntryKind.FILE)
 
+    def test_s3_to_s3_dry_run_needs_no_coordinator_override(self) -> None:
+        self.client.cp("source", from_="s3://source", to="s3://destination",
+                       into="prefix", dry_run=True)
+        argv = self.argv()
+        self.assertIn("--dry-run", argv)
+        self.assertNotIn("--coordinate-at", argv)
+
     def test_s3_options_and_literal_headers(self) -> None:
         self.client.cp("source", to="s3://bucket", into="prefix",
                        s3_endpoint="https://storage.example", s3_region="auto",

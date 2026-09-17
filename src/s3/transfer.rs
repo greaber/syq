@@ -46,6 +46,7 @@ pub(super) struct Engine {
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
     upload_keys: OnceLock<HashMap<String, u64>>,
+    copy_checksum_unsupported: [std::sync::atomic::AtomicBool; 2],
     tuning: super::tuning::Tuning,
     cancelled: std::sync::atomic::AtomicBool,
     cancel_wake: tokio::sync::Notify,
@@ -117,6 +118,7 @@ impl Engine {
             progress,
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
+            copy_checksum_unsupported: Default::default(),
         }))
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -155,50 +157,10 @@ impl Engine {
             {
                 bail!("an expected digest requires exactly one regular file");
             }
-            self.check_upload_placement(&plan).await?;
-            if plan.len() > 1 && !self.args.existing && !self.args.ignore_existing {
-                let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-                let prefix = if target.is_empty() {
-                    String::new()
-                } else {
-                    format!("{target}/")
-                };
-                let listing = if self.args.delete {
-                    // Pruning needs every destination key, including keys absent
-                    // from the upload plan. Only this complete cache is reusable
-                    // by the deletion planner.
-                    client::list(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        None,
-                        &mut HashSet::new(),
-                    )
-                    .await
-                    .map(|listing| Some(listing.objects.into_iter().collect()))
-                } else {
-                    let source_keys = plan.iter().map(|source| source.key.as_str()).collect();
-                    client::upload_listing(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        &source_keys,
-                    )
-                    .await
-                };
-                match listing {
-                    Ok(Some(keys)) => {
-                        let _ = self.upload_keys.set(keys);
-                    }
-                    Ok(None) => {}
-                    Err(error) if self.args.delete => {
-                        self.progress
-                            .error(&format!("list S3 destination: {error:#}"));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-
+            self.check_upload_placement(plan.first().is_some_and(|s| s.kind() != "dir"))
+                .await?;
+            self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
+                .await?;
             self.tuning.observe_control(planning.elapsed());
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
@@ -427,7 +389,51 @@ impl Engine {
         )
         .into_bytes()
     }
-    async fn check_upload_placement(&self, plan: &[Source]) -> Result<()> {
+    async fn discover_destination(&self, keys: HashSet<&str>) -> Result<()> {
+        if keys.len() > 1 && !self.args.existing && !self.args.ignore_existing {
+            let target = local::key_path(&self.args.locations.last().unwrap().path)?;
+            let prefix = if target.is_empty() {
+                String::new()
+            } else {
+                format!("{target}/")
+            };
+            // A prefix listing can establish absence only for keys inside it.
+            // Mappings may name destinations outside the placement prefix.
+            if keys.iter().any(|key| !key.starts_with(&prefix)) {
+                return Ok(());
+            }
+            let listing = if self.args.delete {
+                // Pruning needs every destination key, including keys absent
+                // from the upload plan. Only this complete cache is reusable
+                // by the deletion planner.
+                client::list(
+                    &self.client,
+                    &self.options.bucket,
+                    &prefix,
+                    None,
+                    &mut HashSet::new(),
+                )
+                .await
+                .map(|listing| Some(listing.objects.into_iter().collect()))
+            } else {
+                client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys).await
+            };
+            match listing {
+                Ok(Some(keys)) => {
+                    let _ = self.upload_keys.set(keys);
+                }
+                Ok(None) => {}
+                Err(error) if self.args.delete => {
+                    self.progress
+                        .error(&format!("list S3 destination: {error:#}"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+    async fn check_upload_placement(&self, single_object: bool) -> Result<()> {
         if self.args.target_existence == Existence::Any {
             return Ok(());
         }
@@ -444,18 +450,16 @@ impl Engine {
         } else {
             format!("{target}/")
         };
-        let present =
-            exact || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
+        let needs_prefix = self.args.target_existence == Existence::Existing
+            && (self.args.placement != Placement::As || !single_object);
+        let present = (!needs_prefix && exact)
+            || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
             || (self.args.target_existence == Existence::Existing && !present)
         {
             bail!("S3 destination existence condition failed");
         }
-        if self.args.placement == Placement::As
-            && plan.first().is_some_and(|s| s.kind() == "file")
-            && present
-            && !exact
-        {
+        if self.args.placement == Placement::As && single_object && present && !exact {
             bail!("S3 destination is a prefix, not an object");
         }
         Ok(())
@@ -1205,6 +1209,11 @@ impl Engine {
             .map(crate::cli::parse_size)
             .transpose()?
             .unwrap_or(u64::MAX);
+        let source_bucket = self
+            .options
+            .source_bucket
+            .as_deref()
+            .unwrap_or(&self.options.bucket);
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
         let mut excluded_subtrees = HashSet::new();
@@ -1223,15 +1232,7 @@ impl Engine {
                 let exact = if key.is_empty() {
                     None
                 } else {
-                    client::head(
-                        &self.client,
-                        self.options
-                            .source_bucket
-                            .as_deref()
-                            .unwrap_or(&self.options.bucket),
-                        &key,
-                    )
-                    .await?
+                    client::head(&self.client, source_bucket, &key).await?
                 };
                 if exact.is_some() && directory && self.args.native_mapping.is_none() {
                     bail!("S3 selector requires a prefix but an object exists at {key:?}");
@@ -1246,10 +1247,7 @@ impl Engine {
                     exact,
                     client::list(
                         &self.client,
-                        self.options
-                            .source_bucket
-                            .as_deref()
-                            .unwrap_or(&self.options.bucket),
+                        source_bucket,
                         &prefix,
                         matcher.as_ref(),
                         &mut excluded_subtrees
@@ -1265,16 +1263,9 @@ impl Engine {
                 // copies its marker, while explicit child entries copy children.
                 let object = match exact {
                     Some(object) => object,
-                    None => client::head(
-                        &self.client,
-                        self.options
-                            .source_bucket
-                            .as_deref()
-                            .unwrap_or(&self.options.bucket),
-                        &format!("{key}/"),
-                    )
-                    .await?
-                    .context("S3 mapping source object or directory marker is missing")?,
+                    None => client::head(&self.client, source_bucket, &format!("{key}/"))
+                        .await?
+                        .context("S3 mapping source object or directory marker is missing")?,
                 };
                 if declared_kind.is_some_and(|kind| kind != object.kind()) {
                     bail!("S3 source type does not match mapping");
@@ -1294,10 +1285,7 @@ impl Engine {
                     None => {
                         client::list(
                             &self.client,
-                            self.options
-                                .source_bucket
-                                .as_deref()
-                                .unwrap_or(&self.options.bucket),
+                            source_bucket,
                             &prefix,
                             matcher.as_ref(),
                             &mut excluded_subtrees,
@@ -1356,6 +1344,8 @@ impl Engine {
                 if self.args.delete {
                     if directory {
                         prune.claim(path.as_bytes());
+                    } else if self.options.source_bucket.is_some() {
+                        prune.claim_file(path.as_bytes());
                     } else {
                         prune.protect(path.as_bytes());
                     }

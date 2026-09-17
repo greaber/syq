@@ -512,7 +512,6 @@ mod buffer_tests {
         let file = Arc::new(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
         let writer = writer::Writer::with_readback(file, size, true).unwrap();
         let object = Object {
-            website_redirect: None,
             key: "fragmented".into(),
             size,
             etag: "fixture".into(),
@@ -601,6 +600,7 @@ mod buffer_tests {
             progress: Progress::new(false, false, None, false),
             pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
+            copy_checksum_unsupported: Default::default(),
             cancelled: Default::default(),
             cancel_wake: Default::default(),
         }
@@ -640,7 +640,6 @@ mod buffer_tests {
                     hash_algorithm: HashAlgorithm::Blake3,
                 };
                 let object = Object {
-                    website_redirect: None,
                     key: "object".into(),
                     size: data.len() as u64,
                     etag: "fixture".into(),

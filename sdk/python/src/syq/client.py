@@ -1081,6 +1081,7 @@ class Client:
         if (
             from_ is not None
             and to is not None
+            and not (str(from_).startswith("s3://") and str(to).startswith("s3://"))
             and (dry_run or verify_only)
             and coordinate_at != "local"
         ):

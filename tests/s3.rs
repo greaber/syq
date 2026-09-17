@@ -153,11 +153,132 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("server-tree") {
+        let path = first.split_whitespace().nth(1).unwrap();
+        if method == "HEAD" {
+            if path == "/source/data" {
+                reply(&mut socket, 404, &[], b"", true);
+            } else {
+                assert!(
+                    path.starts_with("/source/data/"),
+                    "unnecessary destination HEAD: {path}"
+                );
+                if fault.ends_with("unsupported") && headers.contains_key("x-amz-checksum-mode") {
+                    assert!(
+                        !gate.0.swap(true, Ordering::SeqCst),
+                        "unsupported checksum mode retried on another object"
+                    );
+                    reply(&mut socket, 501, &[], b"", true);
+                } else if fault.ends_with("denied")
+                    && path.ends_with("/a")
+                    && headers.contains_key("x-amz-checksum-mode")
+                {
+                    reply(&mut socket, 403, &[], b"", true);
+                } else {
+                    if fault.ends_with("denied") && path.ends_with("/b") {
+                        assert!(
+                            headers.contains_key("x-amz-checksum-mode"),
+                            "one object's permission failure disabled other checksum reads"
+                        );
+                    }
+                    reply(
+                        &mut socket,
+                        200,
+                        &[
+                            ("Content-Length".into(), "4".into()),
+                            ("ETag".into(), "\"source\"".into()),
+                        ],
+                        b"",
+                        true,
+                    );
+                }
+            }
+        } else if method == "GET" {
+            let keys: &[&str] = if path.starts_with("/source?") || path.starts_with("/source/?") {
+                &["data/a", "data/b"]
+            } else {
+                assert!(
+                    !gate.1.swap(true, Ordering::SeqCst),
+                    "destination listing was not reused for prune"
+                );
+                if fault.ends_with("prune") {
+                    &["out/a/part1"]
+                } else {
+                    &[]
+                }
+            };
+            let entries: String = keys
+                .iter()
+                .map(|key| format!("<Contents><Key>{key}</Key><Size>4</Size></Contents>"))
+                .collect();
+            let body = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+            );
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else if method == "PUT" {
+            assert!(
+                matches!(
+                    path.split('?').next().unwrap(),
+                    "/destination/out/a" | "/destination/out/b"
+                ),
+                "{path}"
+            );
+            assert!(!headers.contains_key("if-none-match"));
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<CopyObjectResult><ETag>&quot;copied&quot;</ETag></CopyObjectResult>",
+                false,
+            );
+        } else if method == "POST" && path.contains("delete") {
+            assert!(fault.ends_with("prune"));
+            let mut body = vec![0; headers["content-length"].parse().unwrap()];
+            socket.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            assert!(body.contains("<Key>out/a/part1</Key>"), "{body}");
+            assert_eq!(body.matches("<Key>").count(), 1);
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<DeleteResult><Deleted><Key>out/a/part1</Key></Deleted></DeleteResult>",
+                false,
+            );
+        } else {
+            panic!("unexpected server-copy request: {first}");
+        }
+        return;
+    }
     if fault.starts_with("server-copy") {
         let path = first.split_whitespace().nth(1).unwrap();
         let multipart = fault.contains("multipart");
         let comparison = fault.contains("compare");
+        if fault.contains("storage-class") {
+            assert_eq!(headers["x-amz-storage-class"], "INTELLIGENT_TIERING");
+        } else {
+            assert!(
+                !headers.contains_key("x-amz-storage-class"),
+                "source class must not be preserved by default"
+            );
+        }
         if method == "HEAD" {
+            if fault == "server-copy-heads-overlap" && headers.contains_key("x-amz-checksum-mode") {
+                let (mine, other) = if path.starts_with("/source/") {
+                    (&gate.0, &gate.1)
+                } else {
+                    (&gate.1, &gate.0)
+                };
+                mine.store(true, Ordering::Release);
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !other.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(
+                    other.load(Ordering::Acquire),
+                    "source/destination HEADs did not overlap"
+                );
+            }
             if fault == "server-copy-compare-unavailable"
                 && headers.contains_key("x-amz-checksum-mode")
             {
@@ -188,6 +309,7 @@ fn serve(
                         },
                     ),
                     ("Expires".into(), "0".into()),
+                    ("x-amz-storage-class".into(), "STANDARD_IA".into()),
                     (
                         "x-amz-website-redirect-location".into(),
                         "/new-location".into(),
@@ -247,6 +369,7 @@ fn serve(
             assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if multipart && method == "POST" {
+            assert!(!headers.contains_key("if-none-match"));
             let length: usize = headers["content-length"].parse().unwrap();
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
@@ -344,10 +467,10 @@ fn serve(
                     );
                 }
             } else {
-                if comparison {
-                    assert!(!headers.contains_key("if-none-match"));
-                } else {
+                if fault == "server-copy-only-new" {
                     assert_eq!(headers["if-none-match"], "*");
+                } else {
+                    assert!(!headers.contains_key("if-none-match"));
                 }
                 assert_eq!(headers["x-amz-website-redirect-location"], "/new-location");
                 assert!(
@@ -2443,5 +2566,84 @@ fn server_copy_parts_overlap_and_respect_one_request_limit() {
             output_text(&output)
         );
         assert_eq!(server.requests.load(Ordering::Relaxed), 8, "{fault}");
+    }
+}
+
+#[test]
+fn server_copy_only_new_uses_a_conditional_write() {
+    let server = Server::start("server-copy-only-new");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+            "--only-new",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+}
+
+#[test]
+fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
+    for (fault, extra, requests) in [
+        ("server-tree-fresh", "--dry-run", 5),
+        ("server-tree-prune", "--prune", 8),
+        ("server-tree-unsupported", "--dry-run", 6),
+        ("server-tree-denied", "--dry-run", 6),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://destination",
+                "--into",
+                "out",
+                extra,
+                "--performance-tuning",
+                "s3-max-concurrent-objects=1",
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
+}
+
+#[test]
+fn server_copy_heads_overlap_and_storage_class_is_explicit() {
+    for fault in [
+        "server-copy-heads-overlap",
+        "server-copy-storage-class",
+        "server-copy-multipart-storage-class",
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+            "--performance-tuning",
+            "s3-max-concurrent-requests=2",
+        ];
+        if fault.contains("storage-class") {
+            args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
     }
 }

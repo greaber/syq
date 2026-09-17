@@ -145,6 +145,13 @@ the object's contents. `--hash`, `--verify-only`, `--expected-hash`, mapping
 expected digests, and transfer hashing are not supported for server-side copies.
 The destination uses its bucket's default encryption
 unless request headers specify otherwise; source ACLs are not copied.
+Syq leaves storage class unspecified by default, letting the destination
+service choose it; the source storage class is not preserved. To select a
+class, pass a provider-supported value, for example
+`--s3-header 'x-amz-storage-class: STANDARD_IA'` for AWS S3. The Python API
+accepts `s3_header=["x-amz-storage-class: STANDARD_IA"]`. Supported classes
+and defaults vary by provider. These headers apply when an object is copied;
+changing them alone does not force an unchanged object to be copied.
 
 Before copying, syq compares object type, size, user metadata and content headers.
 It skips objects when these match and a common provider-reported whole-object
@@ -228,9 +235,14 @@ These checks can download objects even when no replacement is needed.
 The [copy placement and overwrite options](reference.md) also apply to object
 storage, including mappings, ignore rules, size filters, `--dry-run`,
 `--only-new`, `--only-existing`, and `--skip-newer`. A prefix exists if it has
-objects beneath it; it is not an independent directory in S3. New-object
-uploads use conditional writes to avoid replacing an object created concurrently.
+objects beneath it; it is not an independent directory in S3. By default,
+uploads and server-side copies can replace an object created concurrently. `--only-new`, `--into-new`, and `--as-new` use conditional writes;
+a concurrent creation makes the write fail rather than replacing that object.
 A prefix existence check is not a transaction over the bucket.
+`--into-existing photos` requires an object beneath `photos/`, including a
+directory-marker object named `photos/`. An empty prefix without a marker does
+not exist. For a file source, `--as-existing photos` requires the exact object
+`photos`; objects beneath `photos/` do not satisfy it.
 
 Within the retry budget, syq can restart a download range that is much slower
 than comparable reads in the same copy. The retry checks the object's identity

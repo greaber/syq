@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import urllib.error
 import check as c
 
 
@@ -92,13 +93,46 @@ def check():
         # An existing destination prefix does not prohibit its exact object key.
         target = c.PREFIX + '/coexisting'
         c.request('PUT', target + '/child', b'keep')
+        refused = c.run(['--from', remote, name, '--to', remote,
+                         '--as-existing', target], ok=False, capture=True)
+        assert 'prefix, not an object' in refused.stderr, refused.stderr
         c.run(['--from', remote, name, '--to', remote, '--as', target])
+        c.run(['--from', remote, name, '--to', remote, '--as-existing', target])
         assert c.request('GET', target)[1] == b'same body'
         assert c.request('GET', target + '/child')[1] == b'keep'
         # Remove these exact keys before listing-based teardown: this MinIO
         # fixture can hide a child in LIST while its parent key exists.
         c.request('DELETE', target)
         c.request('DELETE', target + '/child')
+        # An empty prefix requires a marker to satisfy into-existing.
+        empty = c.PREFIX + '/existing-empty'
+        c.run(['--from', remote, name, '--to', remote, '--into-existing', empty],
+              ok=False, capture=True)
+        c.request('PUT', empty + '/', b'')
+        c.run(['--from', remote, name, '--to', remote, '--into-existing', empty])
+        # A source prefix without a directory marker is still a directory.
+        foreign_prefix = c.PREFIX + '/foreign-prefix'
+        c.request('PUT', foreign_prefix + '/a', b'a')
+        c.request('PUT', foreign_prefix + '/b', b'b')
+        c.run(['--from', remote, foreign_prefix, '--to', remote,
+               '--as-existing', empty, '--dry-run'])
+        # Prefix existence cannot be supplied by a bare object of the same name.
+        bare = c.PREFIX + '/bare-object'
+        c.request('PUT', bare, b'not a prefix')
+        c.run(['--from', remote, name, '--to', remote, '--into-existing', bare],
+              ok=False, capture=True)
+        mirror = c.PREFIX + '/prune-file-descendants'
+        stale = mirror + '/a/stale'
+        c.request('PUT', stale, b'extra')
+        c.run(['--from', remote, '--srcs-in', foreign_prefix, '--to', remote,
+               '--into', mirror, '--prune'])
+        assert c.request('GET', mirror + '/a')[1] == b'a'
+        try:
+            c.request('HEAD', stale)
+        except urllib.error.HTTPError as error:
+            assert error.code == 404, error
+        else:
+            raise AssertionError('foreign descendant survived prune')
         assert not c.listing(uploads=True), 'unfinished server copies remain'
         print('S3 server-copy checks passed', flush=True)
 

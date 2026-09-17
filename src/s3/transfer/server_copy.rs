@@ -55,10 +55,16 @@ fn unchanged(source: &Object, old: &Object, a: &HeadObjectOutput, b: &HeadObject
     source.kind() == old.kind()
         && source.size == old.size
         && same_metadata(a, b)
-        && full_checksum_match(a, b).unwrap_or_else(|| {
-            source.etag == old.etag
-                || (source.metadata.is_some() && source.metadata == old.metadata)
-        })
+        && full_checksum_match(a, b)
+            .unwrap_or_else(|| source.etag == old.etag || source.metadata.is_some())
+}
+
+fn copy_destination_key(job: &Download) -> String {
+    if job.key.ends_with('/') && job.size == 0 {
+        format!("{}/", job.path)
+    } else {
+        job.path.clone()
+    }
 }
 
 fn encoded_source(bucket: &str, object: &Object) -> String {
@@ -87,21 +93,35 @@ impl Engine {
         &self,
         bucket: &str,
         key: &str,
+        side: usize,
     ) -> Result<Option<(Object, HeadObjectOutput)>> {
+        let _slot = self.tuning.requests.acquire().await;
+        let unsupported = &self.copy_checksum_unsupported[side];
         let request = self.client.head_object().bucket(bucket).key(key);
-        let result = request
-            .clone()
-            .checksum_mode(ChecksumMode::Enabled)
-            .send()
-            .await;
+        let checksums = !unsupported.load(Relaxed);
+        let result = if !checksums {
+            request.clone().send().await
+        } else {
+            request
+                .clone()
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await
+        };
         // Checksums are an optional quick-check aid. Compatible providers may not
         // support this mode; AWS KMS may deny checksum access while allowing HEAD.
         // Retrying ordinary HEAD preserves that existing access, without body GETs.
         let result = match result {
             Err(e)
-                if e.raw_response()
-                    .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
+                if checksums
+                    && e.raw_response()
+                        .is_some_and(|r| matches!(r.status().as_u16(), 400 | 403 | 501)) =>
             {
+                // Only NotImplemented establishes a provider capability. A 403
+                // can be specific to one object's KMS key; do not cache it.
+                if e.raw_response().is_some_and(|r| r.status().as_u16() == 501) {
+                    unsupported.store(true, Relaxed);
+                }
                 request.send().await
             }
             result => result,
@@ -120,7 +140,14 @@ impl Engine {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
         let planning = std::time::Instant::now();
         let (plan, prune) = self.download_plan(&target).await?;
-        self.check_upload_placement(&[]).await?;
+        self.check_upload_placement(
+            plan.first()
+                .is_some_and(|job| job.path == target && !job.key.ends_with('/')),
+        )
+        .await?;
+        let keys: Vec<_> = plan.iter().map(copy_destination_key).collect();
+        self.discover_destination(keys.iter().map(String::as_str).collect())
+            .await?;
         self.tuning.observe_control(planning.elapsed());
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
@@ -145,11 +172,27 @@ impl Engine {
 
     async fn copy_object(&self, job: &Download, kind: &mut &'static str) -> Result<Option<u64>> {
         let source_bucket = self.options.source_bucket.as_deref().unwrap();
-        let slot = self.tuning.requests.acquire().await;
-        let (source, source_head) = self
-            .copy_head(source_bucket, &job.key)
-            .await?
-            .context("S3 copy source disappeared")?;
+        let key = copy_destination_key(job);
+        if job.path.is_empty() && job.key.ends_with('/') {
+            *kind = "dir";
+            return Ok(None);
+        }
+        local::key_path(key.trim_end_matches('/').as_bytes())?;
+        anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
+        let destination = async {
+            if self
+                .upload_keys
+                .get()
+                .is_some_and(|keys| !keys.contains_key(&key))
+            {
+                Ok(None)
+            } else {
+                self.copy_head(&self.options.bucket, &key, 1).await
+            }
+        };
+        let (source, existing) =
+            tokio::try_join!(self.copy_head(source_bucket, &job.key, 0), destination)?;
+        let (source, source_head) = source.context("S3 copy source disappeared")?;
         anyhow::ensure!(
             source.size == job.size,
             "S3 source size changed after planning"
@@ -159,17 +202,6 @@ impl Engine {
             "symlink" => "symlink",
             _ => "file",
         };
-        let key = if *kind == "dir" {
-            if job.path.is_empty() {
-                return Ok(None);
-            }
-            format!("{}/", job.path)
-        } else {
-            job.path.clone()
-        };
-        local::key_path(key.trim_end_matches('/').as_bytes())?;
-        anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
-        let existing = self.copy_head(&self.options.bucket, &key).await?;
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -196,19 +228,23 @@ impl Engine {
 
         let _interval = self.progress.copying_interval();
         let copy_source = encoded_source(source_bucket, &source);
+        let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
         // Respect explicit part sizing for both performance control and exercising
         // multipart copying with small disposable fixtures.
         if source.size <= self.part_size(source.size).min(5 * 1024 * 1024 * 1024) {
+            let _slot = self.tuning.requests.acquire().await;
             self.client
                 .copy_object()
                 .bucket(&self.options.bucket)
                 .key(&key)
                 .copy_source(&copy_source)
                 .copy_source_if_match(&source.etag)
-                .set_website_redirect_location(source.website_redirect.clone())
+                .set_website_redirect_location(
+                    source_head.website_redirect_location().map(str::to_owned),
+                )
                 .metadata_directive(MetadataDirective::Copy)
                 .tagging_directive(TaggingDirective::Copy)
-                .set_if_none_match(existing.is_none().then(|| "*".to_owned()))
+                .set_if_none_match(must_be_new.then(|| "*".to_owned()))
                 .send()
                 .await
                 .map_err(|e| e.into_service_error())
@@ -216,8 +252,7 @@ impl Engine {
             self.tuning.requests.completed(source.size);
             self.progress.add_bytes(source.size);
         } else {
-            drop(slot);
-            self.multipart_copy(&source, source_head, &key, &copy_source, existing.is_none())
+            self.multipart_copy(&source, source_head, &key, &copy_source, must_be_new)
                 .await?;
         }
         Ok(Some(source.size))

@@ -180,7 +180,6 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         hash_algorithm: HashAlgorithm::Blake3,
     };
     let object = Object {
-        website_redirect: None,
         key: "object".into(),
         size: SIZE as u64,
         etag: "\"fixture-v1\"".into(),

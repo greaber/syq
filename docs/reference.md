@@ -88,8 +88,8 @@ The `@` is required: `--to laptop` selects an SSH destination, while
 `--to @laptop` requires that receiver to be connected and pass its identity check.
 See [Send files home from a server](receive.md) for setup and destination paths.
 
-For object storage, use `--to s3://BUCKET` or `--from s3://BUCKET` and select
-keys with the same source and placement options. See
+For object storage, use `--to s3://BUCKET`, `--from s3://BUCKET`, or both to
+copy between buckets. Select keys with the same source and placement options. See
 [Copy to and from object storage](object-storage.md) for credentials, headers,
 metadata, and tuning.
 
