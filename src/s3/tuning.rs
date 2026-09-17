@@ -101,6 +101,7 @@ struct Window {
     previous: Option<(usize, f64)>,
     progress_start: u64,
     previous_progress_rate: Option<f64>,
+    proposed_limit: usize,
     slower_limit: usize,
     probe_preserved_rate: bool,
     object_rate: Option<(usize, f64, Duration)>,
@@ -141,6 +142,7 @@ impl Budget {
                 previous: None,
                 progress_start: 0,
                 previous_progress_rate: None,
+                proposed_limit: limit,
                 slower_limit: 0,
                 probe_preserved_rate: false,
                 object_rate: None,
@@ -192,9 +194,8 @@ impl Budget {
     pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
         let (previous, _) = s.previous?;
-        // Read before finish_objects replaces the request ceiling. Growth is
-        // always a doubling clamped to that ceiling, including the last probe.
-        (s.settled && s.limit == previous).then(|| previous.saturating_mul(2).min(s.max))
+        // Keep the actual attempted limit when smaller probes narrow the gap.
+        (s.settled && s.limit == previous).then_some(s.proposed_limit)
     }
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
@@ -248,15 +249,24 @@ impl Budget {
         let progress_rate =
             received.saturating_sub(s.progress_start) as f64 / elapsed.as_secs_f64();
         let before = s.limit;
+        let mut next_limit = s.limit.saturating_mul(2);
         if s.saturated || s.previous.is_some() {
             if let Some((old_limit, old_rate)) = s.previous {
+                // A quarter-sized probe should not need the gain of a doubling.
+                // Keep the same gain per additional request slot.
+                let added_fraction = s.limit as f64 / old_limit as f64 - 1.0;
+                let required_gain = if s.previous_progress_rate.is_some_and(|rate| rate > 0.0) {
+                    1.0 + 0.05 * added_fraction
+                } else {
+                    1.05
+                };
                 // At the object seed there may be no request waiter. A partial
                 // response wave then understates capacity on long-latency paths;
                 // collect a full count before accepting or rejecting this probe.
                 if !s.saturated && s.completed < s.limit {
                     return;
                 }
-                if rate < old_rate * 1.05 {
+                if rate < old_rate * required_gain {
                     if s.completed < s.limit {
                         if let Some(old_progress) =
                             s.previous_progress_rate.filter(|old| *old > 0.0)
@@ -265,7 +275,7 @@ impl Budget {
                             // those rates before calling an incomplete wave a
                             // loss. A late completion burst cannot erase a slow
                             // body window, nor can unfinished bytes look idle.
-                            if progress_rate >= old_progress * 1.05 {
+                            if progress_rate >= old_progress * required_gain {
                                 return;
                             }
                         } else {
@@ -277,7 +287,7 @@ impl Budget {
                             }
                             let recent_elapsed = now.duration_since(s.recent[0].0).as_secs_f64();
                             let recent_bytes: u64 = s.recent.iter().skip(1).map(|(_, n)| *n).sum();
-                            if recent_bytes as f64 / recent_elapsed >= old_rate * 1.05 {
+                            if recent_bytes as f64 / recent_elapsed >= old_rate * required_gain {
                                 return;
                             }
                         }
@@ -294,13 +304,21 @@ impl Budget {
                     // Keep the inferior setting so object admission does not
                     // discard what this completed request probe just learned.
                     s.slower_limit = old_limit;
+                    // A modest gain from a larger download window calls for
+                    // a smaller next probe, limiting work committed to overload.
+                    if s.previous_progress_rate.is_some_and(|rate| rate > 0.0)
+                        && rate < old_rate * (1.0 + 0.25 * added_fraction)
+                    {
+                        next_limit = s.limit.saturating_add((s.limit / 4).max(1));
+                    }
                     s.previous = None;
                 }
             }
             if !s.settled && s.saturated && s.limit < s.max {
                 s.previous = Some((s.limit, rate));
                 s.previous_progress_rate = Some(progress_rate);
-                s.limit = (s.limit * 2).min(s.max);
+                s.limit = next_limit.min(s.max);
+                s.proposed_limit = s.limit;
             }
         }
         // Only single-request object batches reuse this score. Match object
@@ -407,6 +425,41 @@ mod tests {
         assert_eq!(s.limit, 128);
         assert_eq!(s.previous.unwrap().0, 64);
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn smaller_download_probes_keep_useful_gains_and_the_actual_rejected_bound() {
+        // A weak gain keeps small steps; a strong gain per added slot resumes
+        // doubling, even though that small probe gained less than 25% overall.
+        for (millis, proposed) in [(2075, 100), (1875, 160)] {
+            let budget = Budget::new(32, true);
+            let mib = 1024 * 1024;
+            let sample = |count: usize, millis: u64, received: u64| {
+                {
+                    let mut s = budget.state.lock().unwrap();
+                    s.since = Some(Instant::now() - Duration::from_millis(millis));
+                    s.completed = count - 1;
+                    s.bytes = (count as u64 - 1) * mib;
+                    s.saturated = true;
+                }
+                budget.received.store(received * mib, Relaxed);
+                budget.completed(mib);
+            };
+            sample(32, 1000, 32);
+            assert_eq!(budget.state.lock().unwrap().limit, 64);
+            // A doubling improves rate by about 18%, so approach more cautiously.
+            sample(64, 1700, 96);
+            assert_eq!(budget.state.lock().unwrap().limit, 80);
+            // The smaller step can give only 2.4% more throughput and still help.
+            // Requiring the doubling's 5% gain would reject this useful step.
+            sample(80, millis, 176);
+            assert_eq!(budget.state.lock().unwrap().limit, proposed);
+            // Handoff must preserve the attempted bound, including 100.
+            sample(16, 1000, 192);
+            assert_eq!(budget.begin_objects(256), Some(80));
+            assert_eq!(budget.rejected_limit(), Some(proposed));
+            assert_eq!(budget.slower_limit(), 64);
+        }
     }
 
     #[test]
