@@ -52,6 +52,52 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
+/// Time HEAD and LIST responses to their headers. Each is one small exchange,
+/// unlike data requests, whose duration follows their bodies. Only an answer
+/// about the object or listing counts: errors and throttling describe the
+/// service, and a redirect comes from a region that does not hold the bucket.
+#[derive(Debug)]
+struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
+#[derive(Debug)]
+struct ControlStart(std::time::Instant);
+impl aws_smithy_types::config_bag::Storable for ControlStart {
+    type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
+}
+impl Intercept for ControlLatency {
+    fn name(&self) -> &'static str {
+        "SyqS3ControlLatency"
+    }
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let request = context.request();
+        if request.method() == "HEAD"
+            || (request.method() == "GET" && request.uri().contains("list-type="))
+        {
+            cfg.interceptor_state()
+                .store_put(ControlStart(std::time::Instant::now()));
+        }
+        Ok(())
+    }
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let status = context.response().status().as_u16();
+        if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
+            if (200..300).contains(&status) || status == 404 {
+                super::tuning::observe_control(&self.0, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Headers(Vec<Header>);
 impl Intercept for Headers {
@@ -130,6 +176,24 @@ pub(super) fn failure<E>(
     }
 }
 
+/// Every listing reports failures the same way. A named source is looked up
+/// with a HEAD and a listing at once, and either one may be the first to fail.
+fn listing_failure(
+    error: aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> anyhow::Error {
+    let message = failure("S3 listing", &error);
+    anyhow::Error::new(error.into_service_error()).context(message)
+}
+
+/// Whether to ask S3 for the bucket's region before copying. A custom
+/// endpoint already identifies its provider's storage and is never probed.
+fn looks_up_region(explicit_region: Option<&str>, custom_endpoint: Option<&str>) -> bool {
+    explicit_region.is_none() && custom_endpoint.is_none()
+}
+
 /// Ask S3 where a bucket is. Any response carries the answer, so this needs
 /// no permission on the bucket. The error says why there was no answer.
 async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
@@ -145,7 +209,10 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 }
 
 /// Also returns a note for verbose output when the region lookup got no answer.
-pub(super) async fn connect(options: &mut Options) -> Result<(Client, Option<String>)> {
+pub(super) async fn connect(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -179,7 +246,8 @@ pub(super) async fn connect(options: &mut Options) -> Result<(Client, Option<Str
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .interceptor(Headers(options.headers.clone()));
+        .interceptor(Headers(options.headers.clone()))
+        .interceptor(ControlLatency(control));
 
     let endpoint = options
         .endpoint
@@ -205,20 +273,27 @@ pub(super) async fn connect(options: &mut Options) -> Result<(Client, Option<Str
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
     let mut note = None;
+    let lookup = looks_up_region(options.region.as_deref(), endpoint.as_deref());
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
-    } else if shared.region().is_none() {
+    }
+    if lookup {
         // AWS serves each bucket from one region and redirects requests sent
-        // elsewhere. With no region configured, ask instead of assuming
-        // us-east-1. A configured region is used as given, and a custom
-        // endpoint already identifies its provider's storage.
+        // elsewhere. A region from the environment or a profile is the
+        // account's default, not a fact about this bucket, so it only chooses
+        // where to ask. `--s3-region` is a statement about the bucket and is
+        // used as given.
+        let hint = shared
+            .region()
+            .map_or("us-east-1", |r| r.as_ref())
+            .to_owned();
         let probe = Client::from_conf(config.clone().build());
         match bucket_region(&probe, &options.bucket).await {
             Ok(region) => config = config.region(Region::new(region)),
             Err(reason) => {
                 note = Some(format!(
-                    "could not look up the bucket's region, signing for us-east-1: {reason}"
+                    "could not look up the bucket's region, signing for {hint}: {reason}"
                 ))
             }
         }
@@ -394,10 +469,7 @@ pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -
         .max_keys(1)
         .send()
         .await
-        .map_err(|e| {
-            let message = failure("S3 listing", &e);
-            anyhow::Error::new(e.into_service_error()).context(message)
-        })?;
+        .map_err(listing_failure)?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
@@ -425,10 +497,7 @@ pub(super) async fn upload_listing(
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| {
-                let message = failure("S3 listing", &e);
-                anyhow::Error::new(e.into_service_error()).context(message)
-            })?;
+            .map_err(listing_failure)?;
         for object in output.contents() {
             let key = object.key().context("S3 listing omitted key")?;
             anyhow::ensure!(
@@ -559,10 +628,7 @@ pub(super) async fn list(
                 .set_continuation_token(token.clone())
                 .send()
                 .await
-                .map_err(|e| {
-                    let message = failure("S3 listing", &e);
-                    anyhow::Error::new(e.into_service_error()).context(message)
-                })?;
+                .map_err(listing_failure)?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             let mut reachable_exclusion = false;
             if probes_remaining > 0
@@ -601,10 +667,7 @@ pub(super) async fn list(
                         .delimiter("/")
                         .send()
                         .await
-                        .map_err(|e| {
-                            let message = failure("S3 listing", &e);
-                            anyhow::Error::new(e.into_service_error()).context(message)
-                        })?;
+                        .map_err(listing_failure)?;
                     let mut included = 0;
                     let mut excluded = 0;
                     for child in directory_page.common_prefixes() {
@@ -887,6 +950,15 @@ mod tests {
             server.join().unwrap();
             assert_eq!(region.as_deref(), Ok("eu-central-1"), "{status}");
         }
+    }
+
+    #[test]
+    fn only_an_explicit_region_or_a_custom_endpoint_skips_the_lookup() {
+        // Regions from the environment or a profile never reach this decision:
+        // they are hints for where to ask, not reasons to skip asking.
+        assert!(looks_up_region(None, None));
+        assert!(!looks_up_region(Some("eu-central-1"), None));
+        assert!(!looks_up_region(None, Some("https://storage.example")));
     }
 
     #[tokio::test]

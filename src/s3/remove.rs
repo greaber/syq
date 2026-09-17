@@ -416,7 +416,8 @@ pub(super) fn run(args: Args) -> Result<i32> {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let work = async {
             let mut options = args.s3.clone().unwrap();
-            let (client, note) = client::connect(&mut options).await?;
+            let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            let (client, note) = client::connect(&mut options, control.clone()).await?;
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
@@ -431,7 +432,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 );
                 Ok(())
             };
-            let tuning = super::tuning::Tuning::new(&options, &args);
+            let tuning = super::tuning::Tuning::new(&options, &args, control);
             let deleter = delete::Deleter {
                 client: &client,
                 bucket: &options.bucket,

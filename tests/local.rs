@@ -20168,7 +20168,11 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut socket = loop {
             match listener.accept() {
-                Ok((socket, _)) => break socket,
+                Ok((socket, _)) => {
+                    // BSD accepted sockets inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
+                    break socket;
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -20498,7 +20502,11 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         for response in [serde_json::json!({"Error":"copy denied by test policy"})] {
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && std::time::Instant::now() < deadline =>
@@ -20809,7 +20817,11 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             Instant::now() < deadline,
@@ -22428,6 +22440,102 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
             }),
             stats || debug,
             "{out:?}"
+        );
+    }
+}
+
+#[test]
+fn environment_options_apply_to_the_command_and_never_reach_children() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("source")).unwrap();
+    fs::write(t.path("source/file"), b"payload").unwrap();
+
+    // A dry run from the environment leaves the destination absent.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", &t.s("source"), "--into", &t.s("local")])
+        .env("SYQ_CP_OPTIONS", "--dry-run --quiet")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(!t.path("local").exists(), "{out:?}");
+
+    // Unbalanced quoting is a usage error before any work starts.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", &t.s("source"), "--into", &t.s("local")])
+        .env("SYQ_CP_OPTIONS", "--quiet 'oops")
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("SYQ_CP_OPTIONS is not a valid shell word list"),
+        "{out:?}"
+    );
+    assert!(!t.path("local").exists());
+
+    // Over a remote shell the options still apply, and neither the command's
+    // own variable nor another command's variable reaches the child.
+    let fake_rsh = fake_rsh(&t);
+    fs::create_dir_all(t.path("remote-bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), t.path("remote-bin/syq")).unwrap();
+    let recorder = t.path("recording-rsh");
+    executable(
+        &recorder,
+        format!(
+            "#!/bin/sh\nenv > \"$RSH_ENV_DUMP\"\nexec {} \"$@\"\n",
+            shell_words::quote(&fake_rsh.to_string_lossy())
+        )
+        .as_bytes(),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--to",
+            "host",
+            "--into",
+            &t.s("remote"),
+        ])
+        .args([
+            "--rsh",
+            &recorder.to_string_lossy(),
+            "--no-bootstrap",
+            "--no-tcp",
+        ])
+        .env("SYQ_CP_OPTIONS", "--performance-tuning workers=1 --quiet")
+        .env("SYQ_RM_OPTIONS", "--dry-run")
+        .env("RSH_ENV_DUMP", t.path("rsh.env"))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("remote/source/file")), b"payload");
+    let child_env = fs::read_to_string(t.path("rsh.env")).unwrap();
+    assert!(child_env.contains("RSH_ENV_DUMP="), "{child_env}");
+    assert!(!child_env.contains("SYQ_CP_OPTIONS"), "{child_env}");
+    assert!(!child_env.contains("SYQ_RM_OPTIONS"), "{child_env}");
+}
+
+#[test]
+fn environment_options_never_reach_internal_server_entry_points() {
+    for argv in [vec!["rsync", "--server"], vec!["--server"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(&argv)
+            .env("SYQ_RSYNC_OPTIONS", "--quiet")
+            .env("SYQ_CP_OPTIONS", "--quiet")
+            .stdin(std::process::Stdio::null())
+            .run()
+            .unwrap();
+        // The server announces itself before reading the client's preamble;
+        // an argument error would exit 2 without doing so.
+        assert!(out.stdout.starts_with(b"SYQWIRE"), "{argv:?}: {out:?}");
+        assert_ne!(out.status.code(), Some(2), "{argv:?}: {out:?}");
+        assert!(
+            !stderr_of(&out).contains("unexpected argument"),
+            "{argv:?}: {out:?}"
         );
     }
 }

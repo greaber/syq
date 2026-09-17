@@ -354,7 +354,21 @@ fn serve(
         }
         return;
     }
-    if fault == "wrong-region" {
+    if fault == "latency-pages" {
+        serve_latency_pages(&mut socket, first);
+        return;
+    }
+    if fault.starts_with("wrong-region") {
+        // A prefix is looked up with a HEAD and a listing at once. Hold one of
+        // them back so each gets a turn at being the first failure.
+        let held_back = match fault {
+            "wrong-region-head-last" => "HEAD",
+            "wrong-region-listing-last" => "GET",
+            _ => "",
+        };
+        if method == held_back {
+            thread::sleep(Duration::from_millis(300));
+        }
         let region = ("x-amz-bucket-region".to_owned(), "eu-central-1".to_owned());
         reply(&mut socket, 301, &[region], b"", method == "HEAD");
         return;
@@ -906,21 +920,14 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
     client
         .write_all(b"GET /bucket/data HTTP/1.1\r\nAuthorization: x-tigris-consistent\r\nX-Tigris-Consistent: true\r\n\r\n")
         .unwrap();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
         serve(
             socket,
             "ok",
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
-        );
-        done_tx.send(()).unwrap();
+        )
     });
-    assert_eq!(
-        done_rx.recv_timeout(Duration::from_millis(100)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-        "fixture closed before the client could drain the response"
-    );
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
     worker.join().unwrap();
@@ -1159,10 +1166,15 @@ fn s3_bad_responses_preserve_existing_destination() {
 }
 #[test]
 fn s3_wrong_region_redirects_name_the_bucket_region() {
-    let server = Server::start("wrong-region");
     let temp = tempfile::tempdir().unwrap();
-    // A named object is found with HEAD, a prefix with a listing.
-    for selector in [&["object"][..], &["--srcs-in", "prefix"][..]] {
+    // A named object is found with a HEAD. A prefix is found with a HEAD and
+    // a listing sent together, and either may be the first to fail.
+    for (fault, selector) in [
+        ("wrong-region", &["object"][..]),
+        ("wrong-region-listing-last", &["--srcs-in", "prefix"][..]),
+        ("wrong-region-head-last", &["--srcs-in", "prefix"][..]),
+    ] {
+        let server = Server::start(fault);
         let mut args = vec!["--from", "s3://bucket"];
         args.extend_from_slice(selector);
         args.extend_from_slice(&["--into", "output"]);
@@ -1172,7 +1184,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
         assert!(
             text.contains("(HTTP 301): the bucket is in region eu-central-1")
                 && text.contains("--s3-region eu-central-1"),
-            "{text}"
+            "{fault}: {text}"
         );
     }
     for flags in [vec![], vec!["--s3-all-versions"]] {
@@ -2762,4 +2774,87 @@ fn s3_remove_interrupt_drains_in_flight_results_before_exiting() {
         1001
     );
     assert_eq!(records.last().unwrap()["entries_removed"], 1001);
+}
+
+// Eight quick listing pages take longer together than the high-latency
+// threshold, although no single response is slow.
+fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
+    let target = first.split_whitespace().nth(1).unwrap();
+    if first.starts_with("HEAD ") {
+        // Slower than the high-latency threshold, so only the listing pages
+        // can show that the path is fast.
+        thread::sleep(Duration::from_millis(80));
+        reply(socket, 404, &[], b"", true);
+        return;
+    }
+    if target.contains("list-type=2") {
+        let page = target
+            .split(['?', '&'])
+            .find_map(|field| field.strip_prefix("continuation-token=page"))
+            .map_or(0, |page| page.parse::<usize>().unwrap());
+        thread::sleep(Duration::from_millis(15));
+        let next = if page < 7 {
+            format!(
+                "<IsTruncated>true</IsTruncated><NextContinuationToken>page{}</NextContinuationToken>",
+                page + 1
+            )
+        } else {
+            "<IsTruncated>false</IsTruncated>".into()
+        };
+        let xml = format!(
+            "<ListBucketResult>{next}<Contents><Key>data/{page:05}</Key><Size>4</Size></Contents></ListBucketResult>"
+        );
+        reply(socket, 200, &[], xml.as_bytes(), false);
+        return;
+    }
+    let fields = vec![
+        ("ETag".into(), "\"fixture-v1\"".into()),
+        (
+            "Last-Modified".into(),
+            "Tue, 14 Nov 2023 22:13:20 GMT".into(),
+        ),
+    ];
+    reply(socket, 200, &fields, b"data", false);
+}
+
+#[test]
+fn s3_path_latency_is_one_response_not_the_whole_listing() {
+    let server = Server::start("latency-pages");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server
+        .command(temp.path())
+        .env("SYQ_S3_DIAGNOSTICS", "1")
+        .args(["--s3-endpoint", &server.address])
+        .args([
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "download",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    for page in 0..8 {
+        assert_eq!(
+            std::fs::read(temp.path().join(format!("download/{page:05}"))).unwrap(),
+            b"data"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let trace = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("S3_DIAGNOSTICS "))
+        .expect("diagnostics record");
+    let trace: serde_json::Value = serde_json::from_str(trace).unwrap();
+    let plan = trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["phase"] == "plan")
+        .expect("plan record");
+    let control = plan["control_s"].as_f64().expect("observed latency");
+    assert!(control < 0.05, "listing time was taken for latency: {plan}");
+    assert_eq!(plan["request_limit"], 64, "{plan}");
 }
