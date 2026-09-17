@@ -1582,9 +1582,26 @@ fn server_copy_never_reads_or_relays_object_contents() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
-        let output = server.cp(
-            temp.path(),
-            &[
+        let mut command = server.command(temp.path());
+        command.args(["--s3-endpoint", &server.address]);
+        // Server copies need sockets, but no per-object source file handles or
+        // upload buffers. A large configured maximum must still work here.
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = std::mem::zeroed::<libc::rlimit>();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(128);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .args([
                 "--from",
                 "s3://source",
                 "original",
@@ -1593,8 +1610,9 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 "s3://destination",
                 "--as",
                 "copied",
-            ],
-        );
+            ])
+            .output()
+            .unwrap();
         assert_eq!(
             output.status.success(),
             fault == "server-copy",
