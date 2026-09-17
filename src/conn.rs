@@ -3766,6 +3766,9 @@ mod tests {
                     }
                     self.waiting.send(()).map_err(std::io::Error::other)?;
                     match self.input.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(chunk) if chunk.is_empty() => {
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
                         Ok(chunk) => self.current = std::io::Cursor::new(chunk),
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
                         Err(error) => return Err(std::io::Error::other(error)),
@@ -3810,6 +3813,8 @@ mod tests {
         writer.write_msg(&Response::Ok).unwrap();
         drop(writer);
         next_read();
+        send.send(Vec::new()).unwrap(); // Interrupted before the next frame.
+        next_read(); // The live reader retries, preserving its next reply.
         let before_header = std::time::Instant::now();
         send.send(wire[..5].to_vec()).unwrap();
         next_read(); // The frame header arrived; the payload is still withheld.

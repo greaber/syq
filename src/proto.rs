@@ -1633,7 +1633,13 @@ impl<R: Read> FrameReader<R> {
         &mut self,
     ) -> io::Result<(crate::wire_budget::Budgeted<T>, std::time::Instant)> {
         self.read_preamble()?;
-        self.r.fill_buf()?;
+        // Match read_exact's interrupted-read handling: a signal before the
+        // first byte must not turn a live connection into a transport failure.
+        while let Err(error) = self.r.fill_buf() {
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
         let started_at = std::time::Instant::now();
         self.read_frame().map(|message| (message, started_at))
     }
