@@ -34,47 +34,29 @@ permissions:
 
 jobs:
   focused-test:
-    if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
+    if: github.event_name == 'workflow_dispatch' && inputs.test_name == 'debug_profile_study'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [current, deps1, all1, all2]
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Restore Cargo dependencies and build output
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore registry sources only
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          key: profile-study-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
-      - name: Run the exact test
-        shell: bash
+      - name: Measure build and runtime tradeoffs
         env:
-          TEST_NAME: ${{ inputs.test_name }}
-          TEST_TARGET: ${{ inputs.test_target || 'syq' }}
-        run: |
-          # Inputs remain data; accept only ordinary Rust test identifiers.
-          [[ "$TEST_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_:]*$ ]] || {
-            echo 'Provide a fully qualified Rust test name.' >&2
-            exit 2
-          }
-          case "$TEST_TARGET" in
-            syq) target=(--bin syq) ;;
-            local|help|output|update|return_handoff|macos_exfat)
-              target=(--test "$TEST_TARGET") ;;
-            *) echo "Unknown test target: $TEST_TARGET" >&2; exit 2 ;;
-          esac
-          # Cargo otherwise succeeds when the exact filter matches no test.
-          listing=$(cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --list)
-          if ! grep -Fx -- "$TEST_NAME: test" <<< "$listing"; then
-            echo "Exact test not found in $TEST_TARGET: $TEST_NAME" >&2
-            exit 1
-          fi
-          # An explicitly selected ignored test must actually run too.
-          cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --include-ignored
+          PROFILE_VARIANT: ${{ matrix.variant }}
+        run: python3 scripts/debug-profile-study.py "$PROFILE_VARIANT"
 
   scope:
     if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
