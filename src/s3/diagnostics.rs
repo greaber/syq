@@ -99,9 +99,9 @@ pub(super) fn finish() {
 }
 
 pub(super) fn object_concurrency(before: usize, after: usize, activity_per_second: f64) {
-    if trace().is_some() {
+    if let Some(trace) = trace() {
         record(
-            json!({"phase":"object_concurrency","before":before,"after":after,"activity_per_second":activity_per_second}),
+            json!({"phase":"object_concurrency","at_s":trace.start.elapsed().as_secs_f64(),"before":before,"after":after,"activity_per_second":activity_per_second}),
         );
     }
 }

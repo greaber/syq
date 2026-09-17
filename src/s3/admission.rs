@@ -270,7 +270,10 @@ where
                 let elapsed = since.elapsed();
                 // Sparse completions need a longer window; one straggler must
                 // not be treated as a reliable measurement of a setting.
-                if elapsed >= SAMPLE && completed >= 16 {
+                // The interval controls cadence. Processing jitter can make
+                // consecutive ticks slightly less than SAMPLE apart; rejecting
+                // those ticks needlessly doubles some measurement windows.
+                if !elapsed.is_zero() && completed >= 16 {
                     limit = controller.as_mut().unwrap().observe(
                         activity as f64 / elapsed.as_secs_f64(), tasks.len(), jobs.len(),
                         (completed as f64 * 4.0 * SAMPLE.as_secs_f64() / elapsed.as_secs_f64()).ceil() as usize,
@@ -435,6 +438,47 @@ mod tests {
             assert_eq!(controller.observe(1000.0, 32, 2, 16), 32);
         }
         assert!(controller.probe.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_learns_when_timer_processing_jitter_shortens_intervals() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let copy = parallel(
+            (0..1024).collect(),
+            Concurrency {
+                initial: 4,
+                maximum: Some(16),
+                initial_probe_up: true,
+                requests: None,
+            },
+            |_| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    peak.fetch_max(active.fetch_add(1, SeqCst) + 1, SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    active.fetch_sub(1, SeqCst);
+                    Ok(Some(1024))
+                }
+            },
+        );
+        tokio::pin!(copy);
+        assert!(futures_util::poll!(&mut copy).is_pending());
+        // Poll slightly after each timer deadline. The lateness diminishes
+        // across successive deadlines, so their measured spacing is just
+        // below 250ms despite the ticker maintaining its intended cadence.
+        for _ in 0..900 {
+            tokio::time::advance(Duration::from_micros(999)).await;
+            assert!(futures_util::poll!(&mut copy).is_pending());
+        }
+        assert!(
+            peak.load(SeqCst) >= 8,
+            "three scheduled samples should suffice for the first probe"
+        );
+        copy.await.unwrap();
+        assert_eq!(active.load(SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
