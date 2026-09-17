@@ -52,6 +52,51 @@ pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
 }
 
+/// Time HEAD and LIST responses to their headers. Each is one small exchange,
+/// unlike data requests, whose duration follows their bodies. Failed attempts
+/// and throttling describe the service, not the path.
+#[derive(Debug)]
+struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
+#[derive(Debug)]
+struct ControlStart(std::time::Instant);
+impl aws_smithy_types::config_bag::Storable for ControlStart {
+    type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
+}
+impl Intercept for ControlLatency {
+    fn name(&self) -> &'static str {
+        "SyqS3ControlLatency"
+    }
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let request = context.request();
+        if request.method() == "HEAD"
+            || (request.method() == "GET" && request.uri().contains("list-type="))
+        {
+            cfg.interceptor_state()
+                .store_put(ControlStart(std::time::Instant::now()));
+        }
+        Ok(())
+    }
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let status = context.response().status().as_u16();
+        if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
+            if status < 500 && status != 429 {
+                super::tuning::observe_control(&self.0, start.elapsed());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Headers(Vec<Header>);
 impl Intercept for Headers {
@@ -96,7 +141,10 @@ impl Intercept for Headers {
     }
 }
 
-pub(super) async fn connect(options: &mut Options) -> Result<Client> {
+pub(super) async fn connect(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<Client> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
         loader = loader.profile_name(profile);
@@ -130,7 +178,8 @@ pub(super) async fn connect(options: &mut Options) -> Result<Client> {
         // Explicit payload checksums avoid aws-chunked trailers, which several
         // S3-compatible services do not implement. Downloads retain SDK checks.
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .interceptor(Headers(options.headers.clone()));
+        .interceptor(Headers(options.headers.clone()))
+        .interceptor(ControlLatency(control));
 
     let endpoint = options
         .endpoint
