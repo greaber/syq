@@ -9449,7 +9449,6 @@ mod tests {
         gate_changes: Vec<(usize, Arc<Gate>, usize)>,
         steal_on_receive: Option<Arc<Sched>>,
         stolen_file: Option<usize>,
-        receive_pause: Option<std::time::Duration>,
         reply_start_wait: Option<std::time::Duration>,
         rtt_us: Option<u64>,
         dead: bool,
@@ -9505,9 +9504,6 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             anyhow::ensure!(!state.dead, "injected dead connection");
             state.received += 1;
-            if let Some(pause) = state.receive_pause.take() {
-                std::thread::sleep(pause);
-            }
             if let Some(sched) = state.steal_on_receive.take() {
                 let Item::File(idx) = sched.next() else {
                     panic!("expected unread file group")
@@ -10318,27 +10314,21 @@ mod tests {
 
     #[test]
     fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
-        // The same wait is a source stall on a fast connection, but normal
-        // startup on a WAN or an SSH connection with a longer setup time.
-        for (rtt_us, setup_ms, reply_start_wait, expected) in [
-            (None, 0, None, [4, 4, 4, 4, 5, 6, 7, 8]),
-            (Some(10_000), 0, None, [4, 5, 6, 7, 8, 8, 8, 8]),
-            (None, 200, None, [4, 5, 6, 7, 8, 8, 8, 8]),
-            // The same slow recv is harmless when its time is in the payload.
-            (
-                None,
-                0,
-                Some(std::time::Duration::ZERO),
-                [4, 5, 6, 7, 8, 8, 8, 8],
-            ),
+        // Inject reply-start waits so scheduling delays cannot change which
+        // side of the stall allowance a case exercises.
+        for (rtt_us, setup_ms, reply_wait_ms, expected) in [
+            (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
+            (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+            (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+            // Payload time does not contribute to the reported reply-start wait.
+            (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
         ] {
             let jobs: Vec<_> = (0..8)
                 .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
                 .collect();
             let src = Arc::new(Mutex::new(PipelineState {
-                receive_pause: Some(std::time::Duration::from_millis(125)),
                 rtt_us,
-                reply_start_wait,
+                reply_start_wait: Some(std::time::Duration::from_millis(reply_wait_ms)),
                 ..Default::default()
             }));
             let dst = Arc::new(Mutex::new(PipelineState::default()));
