@@ -110,6 +110,9 @@ fn serve(
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
 ) {
+    // BSD can inherit the listener's nonblocking mode; this handler uses
+    // blocking I/O with timeouts on every platform.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -416,6 +419,50 @@ fn reply(
         let _ = socket.write_all(body);
     }
 }
+#[test]
+fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    // Reproduce BSD's accepted-socket mode on every platform and force the
+    // response to exceed the available send buffer before the client reads.
+    socket.set_nonblocking(true).unwrap();
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(4096)
+        .unwrap();
+    client
+        .write_all(b"GET /bucket/data HTTP/1.1\r\nAuthorization: x-tigris-consistent\r\nX-Tigris-Consistent: true\r\n\r\n")
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        serve(
+            socket,
+            "ok",
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
+        );
+        done_tx.send(()).unwrap();
+    });
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "fixture closed before the client could drain the response"
+    );
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    worker.join().unwrap();
+    let body = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .map(|end| &response[end + 4..])
+        .expect("HTTP response headers");
+    assert_eq!(body.len(), SIZE);
+    assert!(body.iter().all(|&byte| byte == b'x'));
+}
+
 fn output_text(output: &Output) -> String {
     format!(
         "{}\n{}",
