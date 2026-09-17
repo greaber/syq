@@ -89,32 +89,6 @@ fn initial_fast_workers(
     max_connections.min(file_batches.max(byte_batches).max(1))
 }
 
-#[cfg(debug_assertions)]
-fn record_worker_event_for_test(event: &str, worker: usize, files: usize) -> Result<()> {
-    use std::io::Write;
-    if let Some(path) = std::env::var_os("SYQ_TEST_WORKER_EVENTS") {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        file.write_all(format!("{event} {worker} {files}\n").as_bytes())?;
-    }
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn record_setup_event_for_test(event: &str) -> Result<()> {
-    use std::io::Write;
-    if let Some(path) = std::env::var_os("SYQ_TEST_SETUP_EVENTS") {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{event}")?;
-    }
-    Ok(())
-}
-
 // Keep tiny files batched, but let eligible local medium files reach the
 // guarded receiver-side copy path without shrinking ordinary range requests.
 const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
@@ -2075,7 +2049,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                     };
                     #[cfg(debug_assertions)]
-                    record_worker_event_for_test("connected", id, 0)?;
+                    crate::fsops::record_test_event(
+                        "SYQ_TEST_WORKER_EVENTS",
+                        format_args!("connected {id} 0"),
+                    )?;
                     if debug() {
                         crate::output::diagnostic!(
                             "syq: worker {id} connected in {:.2}s",
@@ -2822,7 +2799,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
         #[cfg(debug_assertions)]
-        record_setup_event_for_test("transport_ready")?;
+        crate::fsops::record_test_event("SYQ_TEST_SETUP_EVENTS", format_args!("transport_ready"))?;
         announce_detached_ready()?;
         let all_remote_endpoints_use_tcp = use_tcp
             && [&src_ep, &dst_ep]
@@ -3051,7 +3028,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     #[cfg(debug_assertions)]
-    record_setup_event_for_test("scan_complete")?;
+    crate::fsops::record_test_event("SYQ_TEST_SETUP_EVENTS", format_args!("scan_complete"))?;
     if transport_setup.is_none() {
         transport_setup = Some(finish_transport_setup(&mut args)?);
     }
@@ -7942,7 +7919,10 @@ impl Worker {
 
     fn fast_batch(&mut self, batch: &[usize]) -> Result<()> {
         #[cfg(debug_assertions)]
-        record_worker_event_for_test("batch", self.id, batch.len())?;
+        crate::fsops::record_test_event(
+            "SYQ_TEST_WORKER_EVENTS",
+            format_args!("batch {} {}", self.id, batch.len()),
+        )?;
         let jobs: Vec<WorkerJob> = {
             let all = self.sched.jobs.lock().unwrap();
             batch.iter().map(|&i| all.snapshot(i)).collect()

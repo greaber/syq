@@ -62,6 +62,21 @@ const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
+pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) -> io::Result<()> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os(variable) {
+        // Format the whole record before writing so concurrent event fields
+        // are not emitted as separate writes.
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(format!("{event}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
@@ -152,18 +167,6 @@ struct CopyLocalPolicy {
 pub(crate) enum CopyLocalOutcome {
     Copied,
     Unsupported,
-}
-
-#[cfg(all(target_os = "macos", debug_assertions))]
-fn record_copy_local_request_for_test() -> Result<()> {
-    use std::io::Write;
-    if let Some(path) = std::env::var_os("SYQ_TEST_COPY_LOCAL_REQUESTS") {
-        writeln!(
-            OpenOptions::new().create(true).append(true).open(path)?,
-            "copy-local"
-        )?;
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -5988,7 +5991,7 @@ impl FsOps {
         &mut self,
         source: &RegisteredPath,
         dst: &[u8],
-        _policy: CopyLocalPolicy,
+        policy: CopyLocalPolicy,
         copy_id: &CopyId,
         size: u64,
         _mode: u32,
@@ -5997,7 +6000,12 @@ impl FsOps {
             .operation
             .span(crate::transfer_observations::Stage::FilesystemCopy);
         #[cfg(debug_assertions)]
-        record_copy_local_request_for_test()?;
+        record_test_event("SYQ_TEST_COPY_LOCAL_REQUESTS", format_args!("copy-local"))?;
+        // This operation stages a new inode; callers must stream in-place
+        // writes even if a future coordinator bypasses copy selection.
+        if policy.inplace {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
         let (source, source_metadata, target) = self.prepare_local_copy(source, dst)?;
         let root = target.root.clone();
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
@@ -8012,6 +8020,41 @@ mod tests {
         // Return the control endpoint so tests retain the complete session
         // lifecycle in addition to each worker's own root and leaf clones.
         (worker, selections, control)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_receiver_refuses_inplace_copy_without_touching_files() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new bytes").unwrap();
+        fs::create_dir(&destination).unwrap();
+        let existing = destination.join("existing");
+        fs::write(&existing, b"old bytes").unwrap();
+        let original_inode = existing.metadata().unwrap().ino();
+        let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+        worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+        for name in [b"existing".as_slice(), b"missing"] {
+            let response = worker.handle(&Request::CopyLocal {
+                source: sources[0].clone(),
+                dst: name.to_vec(),
+                inplace: true,
+                allow_sequential_nfs_fallback: false,
+                allow_sequential_local_fallback: false,
+                copy_id: [38; 16],
+                size: 9,
+                mode: 0o600,
+            });
+            assert!(
+                matches!(response, Response::CopyLocalUnsupported),
+                "{response:?}"
+            );
+        }
+        assert_eq!(fs::read(&existing).unwrap(), b"old bytes");
+        assert_eq!(existing.metadata().unwrap().ino(), original_inode);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(fs::read(&source).unwrap(), b"new bytes");
     }
 
     #[cfg(target_os = "linux")]

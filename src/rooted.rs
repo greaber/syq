@@ -32,7 +32,7 @@ use crate::fsops::CopyLocalOutcome;
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -1076,6 +1076,9 @@ impl Root {
         path: &RelativePath,
         size: u64,
     ) -> Result<CopyLocalOutcome> {
+        if !clone_flags_can_be_removed(source_metadata) {
+            return Ok(CopyLocalOutcome::Unsupported);
+        }
         let fallback = |error: anyhow::Error| {
             if crate::transfer::debug() {
                 crate::output::diagnostic!(
@@ -1118,9 +1121,6 @@ impl Root {
         if !supported {
             return Ok(CopyLocalOutcome::Unsupported);
         }
-        if !clone_flags_can_be_removed(source_metadata) {
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         // An extra staging directory must not change destination ACL inheritance.
         match clone_directory_has_no_inheritable_acl(&parent.directory) {
             Ok(true) => {}
@@ -1135,7 +1135,7 @@ impl Root {
             Ok(temporary) => temporary,
             Err(error) => return fallback(error.context("create private clone directory")),
         };
-        let leaf = &c"data".to_owned();
+        let leaf = c"data";
         let mut trusted_directory = None;
         let result = (|| -> Result<CopyLocalOutcome> {
             #[cfg(debug_assertions)]
@@ -2052,13 +2052,7 @@ fn make_clone_directory_public_for_test(directory: &File) -> Result<()> {
 
 #[cfg(all(target_os = "macos", debug_assertions))]
 fn record_clone_attempt_for_test() -> io::Result<()> {
-    if let Some(events) = std::env::var_os("SYQ_TEST_CLONE_ATTEMPTS") {
-        use std::io::Write;
-        writeln!(
-            OpenOptions::new().create(true).append(true).open(events)?,
-            "clone"
-        )?;
-    }
+    crate::fsops::record_test_event("SYQ_TEST_CLONE_ATTEMPTS", format_args!("clone"))?;
     if std::env::var_os("SYQ_TEST_CLONE_ERROR").is_some() {
         if let Some(once) = std::env::var_os("SYQ_TEST_CLONE_ERROR_ONCE") {
             match OpenOptions::new().write(true).create_new(true).open(once) {
@@ -2141,7 +2135,7 @@ fn clone_directory_has_no_inheritable_acl(directory: &File) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
+fn clear_clone_flags_at(directory: &File, leaf: &CStr) -> Result<()> {
     #[cfg(debug_assertions)]
     fail_clone_for_test("SYQ_TEST_FAIL_CLONE_CLEAR_FLAGS")
         .context("test clear clone flags failure")?;
@@ -2169,7 +2163,7 @@ fn clear_clone_flags_at(directory: &File, leaf: &CString) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_clone_for_copy(directory: &File, leaf: &CString) -> io::Result<File> {
+fn open_clone_for_copy(directory: &File, leaf: &CStr) -> io::Result<File> {
     #[cfg(debug_assertions)]
     fail_clone_for_test("SYQ_TEST_CLONE_OPEN_EMFILE")?;
     open_at(
@@ -2688,7 +2682,7 @@ fn missing_directory_suffix(error: &anyhow::Error) -> bool {
     })
 }
 
-fn open_at(parent: RawFd, name: &CString, flags: libc::c_int, mode: u32) -> io::Result<File> {
+fn open_at(parent: RawFd, name: &CStr, flags: libc::c_int, mode: u32) -> io::Result<File> {
     // `mode_t` is narrower than `int` on some platforms (including macOS),
     // so C's default argument promotions require an `int` in this variadic
     // position. Callers restrict ordinary creation modes before reaching here.
@@ -2857,7 +2851,7 @@ fn stat_rdev(stat: &libc::stat) -> u64 {
     stat.st_rdev as u64
 }
 
-fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()> {
+fn unlink_at(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
     retry_zero(|| unsafe { libc::unlinkat(parent, name.as_ptr(), flags) })
 }
 
