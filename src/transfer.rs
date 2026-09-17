@@ -17,7 +17,7 @@ use crate::mapping::{read_mapping_manifest, DeclaredKind, ManifestEntry};
 use crate::progress::{commas, human, Progress};
 use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
-use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched, WorkerJob};
+use crate::sched::{FileJob, FileJobData, Item, RangeHandle, RangeWork, Sched, WorkerJob};
 use crate::tune::{self, Gate};
 use anyhow::{bail, ensure, Context, Result};
 use std::ffi::OsStr;
@@ -8737,7 +8737,11 @@ impl Worker {
             })
         };
         ensure!(
-            reused.hashes.len() <= indices().count(),
+            reused.hashes.len() as u64
+                <= matching
+                    .iter()
+                    .map(|(start, end)| (end - start).div_ceil(block))
+                    .sum::<u64>(),
             "too many seeded block hashes"
         );
         Ok(Self::different_ranges_at(
@@ -8951,12 +8955,15 @@ impl Worker {
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
-                if self.sched.is_failed(idx) || self.sched.is_aborted() {
-                    // Drain issued requests without sending further writes for
-                    // work cancelled by another worker.
-                    break;
-                }
                 released |= !self.gate.allowed(self.id);
+                // Check cancellation and optionally claim work with one scheduler
+                // lock, including while the last read replies are draining.
+                let claim = (!released && current.is_none() && pending_reads.len() < read_window)
+                    .then_some(max_range);
+                let mut next = match self.sched.range_work(idx, claim) {
+                    RangeWork::Cancelled => break,
+                    RangeWork::Ready(next) => next,
+                };
                 if released {
                     // Only the current range can have an unread suffix. Never
                     // reserve a batch of unread ranges from a synchronous source.
@@ -8970,7 +8977,7 @@ impl Worker {
                         // Claim only when there is room to issue a read now.
                         // Larger ranges retain their streaming selection, and
                         // a small backlog stays available to peer workers.
-                        let Some(handle) = self.sched.take_short_range(idx, max_range) else {
+                        let Some(handle) = next.take() else {
                             break;
                         };
                         let slot = flights
@@ -9009,6 +9016,9 @@ impl Worker {
                     self.benchmark.range_requests += 1;
                     self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
                     pending_reads.push_back((slot, off, n));
+                    if current.is_none() && pending_reads.len() < read_window {
+                        next = self.sched.take_short_range(idx, max_range);
+                    }
                 }
                 let Some((slot, expected_off, expected_len)) = pending_reads.pop_front() else {
                     break;

@@ -5540,7 +5540,7 @@ impl FsOps {
         }
         // A previous transfer's partial is usually closer to the source than
         // the old final. Use the final only when no readable candidate exists.
-        let mut selected_final = false;
+        let mut selected_final = None;
         if final_ranges.is_none_or(|ranges| !ranges.is_empty())
             && basis_size.unwrap_or(0) == 0
             && input.is_none()
@@ -5552,7 +5552,7 @@ impl FsOps {
                     open_existing_regular(&resolve(path), false).ok()
                 }
             });
-            selected_final = input.is_some() && final_ranges.is_some();
+            selected_final = input.as_ref().and(final_ranges);
         }
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
@@ -5565,11 +5565,7 @@ impl FsOps {
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
             let whole = [(0, len)];
-            let ranges = if selected_final {
-                final_ranges.unwrap()
-            } else {
-                &whole
-            };
+            let ranges = selected_final.unwrap_or(&whole);
             let count: u64 = ranges
                 .iter()
                 .map(|(start, end)| (end - start).div_ceil(block))
@@ -5606,7 +5602,7 @@ impl FsOps {
         self.cache_file(location, attempt, true, output);
         Ok(SeededBasis {
             hashes,
-            selected_final,
+            selected_final: selected_final.is_some(),
         })
     }
 

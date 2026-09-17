@@ -95,6 +95,12 @@ and requests. Keep `request-size=4M`: request size otherwise defaults to the
 comparison block, so setting only `comparison-block-size=64K` also shrinks
 requests and lowers the automatic streaming threshold to 256 KiB.
 
+Comparison and resume also limit how small these blocks can be for a large
+file: the hashes must fit in one response. At 64 KiB, the file must be smaller
+than 130 GiB; exceeding that limit fails the comparison rather than falling
+back to a full copy. Increase `comparison-block-size` for larger files. Doubling
+it doubles the size limit; increasing `request-size` does not change this limit.
+
 Syq fills available request windows with changed ranges from the same file,
 leaving queued work for other workers. This can help on high-latency links,
 though the result depends on the edits and connection. Both endpoints still

@@ -314,6 +314,12 @@ pub enum Item {
     Exit,
 }
 
+/// Cancellation status and an optional immediately issuable same-file range.
+pub enum RangeWork {
+    Cancelled,
+    Ready(Option<RangeHandle>),
+}
+
 /// Keep one global maximum per file. The file index supports both largest-first
 /// scheduling and short same-file claims without storing every range twice.
 #[derive(Default)]
@@ -325,17 +331,29 @@ struct RangeQueue {
 
 impl RangeQueue {
     fn push(&mut self, (idx, off, end): (usize, u64, u64)) {
-        let key = (end - off, off);
+        self.extend(idx, &[(off, end)]);
+    }
+
+    /// Publish a file's newly compared ranges with one global maximum update.
+    /// Preserve the existing offset order for both large and short claims.
+    fn extend(&mut self, idx: usize, ranges: &[(u64, u64)]) {
+        if ranges.is_empty() {
+            return;
+        }
         let file = self.by_file.entry(idx).or_default();
         let previous = file.last().copied();
-        assert!(file.insert(key));
-        if previous.is_none_or(|maximum| key > maximum) {
+        for &(off, end) in ranges {
+            assert!(file.insert((end - off, off)));
+        }
+        let maximum = file.last().copied();
+        if previous != maximum {
             if let Some((len, off)) = previous {
                 assert!(self.largest.remove(&(len, idx, off)));
             }
-            assert!(self.largest.insert((key.0, idx, key.1)));
+            let (len, off) = maximum.expect("inserted ranges");
+            assert!(self.largest.insert((len, idx, off)));
         }
-        self.len += 1;
+        self.len += ranges.len();
     }
 
     fn remove(&mut self, len: u64, idx: usize, off: u64) -> (usize, u64, u64) {
@@ -865,12 +883,27 @@ impl Sched {
         if max_size == 0 {
             return None;
         }
-        let mut g = self.inner.lock().unwrap();
-        if g.abort || g.failed.contains(&idx) || g.ranges.len() <= g.waiting_workers {
-            return None;
+        match self.range_work(idx, Some(max_size)) {
+            RangeWork::Cancelled => None,
+            RangeWork::Ready(next) => next,
         }
-        let (idx, off, end) = g.ranges.take_short(idx, max_size)?;
-        Some(g.claim_range(idx, off, end))
+    }
+
+    /// Combine the pipeline's failure, abort and optional refill probes. A
+    /// draining window still observes cancellation without three lock visits.
+    pub fn range_work(&self, idx: usize, max_size: Option<u64>) -> RangeWork {
+        let mut g = self.inner.lock().unwrap();
+        if g.abort || g.failed.contains(&idx) {
+            return RangeWork::Cancelled;
+        }
+        let next = max_size.filter(|size| *size > 0).and_then(|size| {
+            if g.ranges.len() <= g.waiting_workers {
+                return None;
+            }
+            let (idx, off, end) = g.ranges.take_short(idx, size)?;
+            Some(g.claim_range(idx, off, end))
+        });
+        RangeWork::Ready(next)
     }
 
     /// After probing a file: register its ranges. Returns the handle for the
@@ -909,9 +942,7 @@ impl Sched {
         }
         let mut it = ranges.into_iter();
         let first = it.next().map(|(off, end)| g.claim_range(idx, off, end));
-        for (off, end) in it {
-            g.ranges.push((idx, off, end));
-        }
+        g.ranges.extend(idx, it.as_slice());
         self.cv.notify_all();
         first
     }
@@ -1280,6 +1311,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn range_work_checks_cancellation_without_consuming_queued_ranges() {
+        for abort in [false, true] {
+            let sched = Sched::new(512, 8192);
+            sched.inner.lock().unwrap().probing = 1;
+            let primary = sched.ranges_ready(0, vec![(0, 512), (1024, 1536)]).unwrap();
+            assert!(matches!(sched.range_work(0, None), RangeWork::Ready(None)));
+            assert_eq!(sched.inner.lock().unwrap().ranges.len(), 1);
+            if abort {
+                sched.abort();
+            } else {
+                sched.fail_file(0);
+            }
+            for limit in [None, Some(512)] {
+                assert!(matches!(sched.range_work(0, limit), RangeWork::Cancelled));
+                assert_eq!(sched.inner.lock().unwrap().ranges.len(), 1);
+            }
+            assert!(!sched.range_done(&primary));
+        }
+    }
+
+    #[test]
     fn short_range_claim_preserves_other_files_limits_and_shares() {
         let sched = Sched::new(512, 8192);
         sched.inner.lock().unwrap().probing = 2;
@@ -1383,15 +1435,13 @@ pub(crate) mod tests {
     #[test]
     fn range_queue_updates_file_maxima_and_preserves_equal_length_order() {
         let mut queue = RangeQueue::default();
-        for range in [
-            (0, 0, 512),
-            (0, 1024, 3072),
-            (0, 4096, 6144),
-            (1, 0, 2048),
-            (2, 0, 512),
-        ] {
-            queue.push(range);
-        }
+        queue.extend(0, &[(0, 512), (1024, 3072)]);
+        // Extending an existing file replaces its maximum exactly once;
+        // empty batches must not create an empty per-file index.
+        queue.extend(0, &[(4096, 6144)]);
+        queue.extend(3, &[]);
+        queue.push((1, 0, 2048));
+        queue.push((2, 0, 512));
         assert_eq!(queue.len(), 5);
         assert_eq!(queue.largest.len(), 3);
         assert_eq!(queue.iter().count(), 5);
@@ -1415,9 +1465,10 @@ pub(crate) mod tests {
     fn range_queue_indexes_agree_after_interleaved_claims() {
         let mut queue = RangeQueue::default();
         for idx in 0..200 {
-            for i in 0..1000 {
-                queue.push((idx, i * 8192, i * 8192 + 512 * (1 + i % 8)));
-            }
+            let ranges: Vec<_> = (0..1000)
+                .map(|i| (i * 8192, i * 8192 + 512 * (1 + i % 8)))
+                .collect();
+            queue.extend(idx, &ranges);
         }
         assert_eq!(queue.len(), 200_000);
         assert_eq!(queue.largest.len(), 200);
