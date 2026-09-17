@@ -449,6 +449,62 @@ pub struct Args {
     pub paths: Vec<String>,
 }
 
+/// Extra command-line arguments taken from the environment, for adjusting a
+/// `syq cp`, `syq rsync`, or `syq rm` invocation inside a script or program
+/// that does not expose its own settings. Each variable holds one shell-style
+/// word list that is inserted right after the command name, so the caller's
+/// own arguments come later.
+pub struct EnvironmentOptions(Vec<(&'static str, OsString)>);
+
+impl EnvironmentOptions {
+    pub const VARIABLES: [(&'static str, &'static str); 3] = [
+        ("cp", "SYQ_CP_OPTIONS"),
+        ("rsync", "SYQ_RSYNC_OPTIONS"),
+        ("rm", "SYQ_RM_OPTIONS"),
+    ];
+
+    /// Read the variables and remove them from the process environment. The
+    /// removal keeps them from every child, including ssh, custom `--rsh`
+    /// commands, and syq's own local helper processes, which would otherwise
+    /// apply them a second time or forward them to another machine. Call
+    /// this before any thread starts.
+    pub fn take_from_environment() -> Self {
+        Self(
+            Self::VARIABLES
+                .iter()
+                .filter_map(|(command, name)| {
+                    let value = std::env::var_os(name)?;
+                    std::env::remove_var(name);
+                    Some((*command, value))
+                })
+                .collect(),
+        )
+    }
+
+    /// Insert the arguments for `argv[1]`'s command, if any were set.
+    pub fn insert(&self, argv: &mut Vec<OsString>) -> Result<()> {
+        let Some(command) = argv.get(1).and_then(|arg| arg.to_str()) else {
+            return Ok(());
+        };
+        let Some((_, value)) = self.0.iter().find(|(name, _)| *name == command) else {
+            return Ok(());
+        };
+        let variable = Self::VARIABLES
+            .iter()
+            .find(|(name, _)| *name == command)
+            .map(|(_, variable)| *variable)
+            .expect("every captured command has a variable");
+        let text = value
+            .to_str()
+            .with_context(|| format!("{variable} is not valid UTF-8"))?;
+        let words = shell_words::split(text).map_err(|error| {
+            anyhow::anyhow!("{variable} is not a valid shell word list: {error}")
+        })?;
+        argv.splice(2..2, words.into_iter().map(OsString::from));
+        Ok(())
+    }
+}
+
 impl Args {
     pub(crate) fn only_new_native_entries(&self) -> bool {
         self.interface == Interface::NativeCp && self.ignore_existing
@@ -2583,13 +2639,72 @@ pub fn parse_size(s: &str) -> Result<u64> {
 mod tests {
     use super::{
         native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm,
-        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args, NativeCopyCommand,
-        Placement, SourceSelection,
+        parse_size, read_files_from_reader, rsync_operator_symlink_policy, Args,
+        EnvironmentOptions, NativeCopyCommand, Placement, SourceSelection,
     };
     use crate::proto::OperatorSymlinkPolicy;
     use anyhow::{bail, Result};
     use clap::Parser;
     use std::ffi::OsString;
+
+    fn argv(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn environment_options_follow_the_command_name_and_precede_argv() {
+        let options = EnvironmentOptions(vec![
+            (
+                "cp",
+                OsString::from("--performance-tuning workers=4 --quiet"),
+            ),
+            ("rm", OsString::from("")),
+        ]);
+        let mut cp = argv(&["syq", "cp", "src", "--into", "dst"]);
+        options.insert(&mut cp).unwrap();
+        assert_eq!(
+            cp,
+            argv(&[
+                "syq",
+                "cp",
+                "--performance-tuning",
+                "workers=4",
+                "--quiet",
+                "src",
+                "--into",
+                "dst"
+            ])
+        );
+        for untouched in [
+            argv(&["syq", "rm", "old"]),
+            argv(&["syq", "rsync", "a", "b"]),
+            argv(&["syq", "persist", "status"]),
+            argv(&["syq", "--server"]),
+            argv(&["syq"]),
+        ] {
+            let mut copy = untouched.clone();
+            options.insert(&mut copy).unwrap();
+            assert_eq!(copy, untouched);
+        }
+    }
+
+    #[test]
+    fn environment_options_keep_quoting_and_reject_unbalanced_quotes() {
+        let options = EnvironmentOptions(vec![("rm", OsString::from("--cwd 'my dir'"))]);
+        let mut rm = argv(&["syq", "rm", "old"]);
+        options.insert(&mut rm).unwrap();
+        assert_eq!(rm, argv(&["syq", "rm", "--cwd", "my dir", "old"]));
+
+        let options = EnvironmentOptions(vec![("rsync", OsString::from("--syq-no-tcp 'oops"))]);
+        let error = options
+            .insert(&mut argv(&["syq", "rsync", "a", "b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("SYQ_RSYNC_OPTIONS is not a valid shell word list"),
+            "{error}"
+        );
+    }
 
     fn read_files_from_buffered_reference(raw: &[u8], nul: bool) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
