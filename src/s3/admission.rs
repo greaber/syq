@@ -317,10 +317,16 @@ where
             .requests
             .as_ref()
             .and_then(|r| r.rejected_limit());
+        // A doubling with a small gain can hide an intermediate optimum.
+        // Search that interval first; an actual loss still starts downward.
         let mut controller = Controller::new(
             initial,
             maximum,
-            concurrency.initial_probe_up && rejected.is_none(),
+            (concurrency.initial_probe_up && rejected.is_none())
+                || concurrency
+                    .requests
+                    .as_ref()
+                    .is_some_and(|r| r.probe_preserved_rate()),
         );
         if let Some(requests) = &concurrency.requests {
             // The ramp may also have demonstrated that fewer requests lose

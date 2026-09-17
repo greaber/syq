@@ -98,6 +98,7 @@ struct Window {
     saturated: bool,
     previous: Option<(usize, f64)>,
     slower_limit: usize,
+    probe_preserved_rate: bool,
     settled: bool,
 }
 pub(super) struct Budget {
@@ -122,6 +123,7 @@ impl Budget {
                 saturated: false,
                 previous: None,
                 slower_limit: 0,
+                probe_preserved_rate: false,
                 settled: false,
             }),
             changed: Notify::new(),
@@ -153,6 +155,11 @@ impl Budget {
     }
     pub fn slower_limit(&self) -> usize {
         self.state.lock().unwrap().slower_limit
+    }
+    // A rejected doubling can still have a small gain. This only chooses the
+    // first object probe; it does not accept the higher request setting.
+    pub fn probe_preserved_rate(&self) -> bool {
+        self.state.lock().unwrap().probe_preserved_rate
     }
     pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
@@ -232,6 +239,7 @@ impl Budget {
                             return;
                         }
                     }
+                    s.probe_preserved_rate = rate >= old_rate;
                     s.limit = old_limit;
                     s.settled = true;
                 } else if s.completed < s.limit {
@@ -570,11 +578,26 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn object_handoff_tries_downward_after_a_rejected_request_increase() {
+        check_handoff_direction(256, 64, 32).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_handoff_refines_upward_after_a_small_request_gain() {
+        // A 3.125% gain is too small to accept doubled requests, but suggests
+        // looking between 64 and 128 before trying fewer than 64 objects.
+        check_handoff_direction(1056, 96, 96).await;
+    }
+
+    async fn check_handoff_direction(
+        probe_bytes: u64,
+        expected_peak: usize,
+        expected_active: usize,
+    ) {
         use std::sync::atomic::AtomicUsize;
 
         let budget = Arc::new(Budget::new(64, true));
-        // The ramp tries 128 requests, finds lower throughput, and returns to 64.
-        for (bytes, completions, expected) in [(2048, 64, 128), (256, 128, 64)] {
+        // The request ramp rejects 128 and returns to 64 in both cases.
+        for (bytes, completions, expected) in [(2048, 64, 128), (probe_bytes, 128, 64)] {
             {
                 let mut state = budget.state.lock().unwrap();
                 state.since = Some(Instant::now() - Duration::from_secs(1));
@@ -616,10 +639,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let first_probe_peak = peak.load(Relaxed);
         let first_probe_active = budget.state.lock().unwrap().active;
-        // Downward is only the starting direction: later increases stay possible.
+        // The starting direction does not prevent later increases.
         copy.await.unwrap().unwrap();
-        assert_eq!(first_probe_peak, 64);
-        assert_eq!(first_probe_active, 32);
+        assert_eq!(first_probe_peak, expected_peak);
+        assert_eq!(first_probe_active, expected_active);
         assert!(peak.load(Relaxed) > 64);
     }
 
