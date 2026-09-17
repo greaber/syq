@@ -1,10 +1,8 @@
 //! Bounded recovery of a body that progresses far more slowly than its peers.
 //! Samples count time awaiting network data, excluding pacing and local writes.
-use std::{
-    collections::VecDeque,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::Mutex, time::Duration};
+
+use tokio::time::Instant;
 
 #[derive(Default)]
 pub(super) struct Recovery {

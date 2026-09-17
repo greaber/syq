@@ -166,7 +166,7 @@ impl Engine {
         loop {
             self.check_cancelled()?;
             let started = crate::s3::diagnostics::start();
-            let body_started = std::time::Instant::now();
+            let body_started = tokio::time::Instant::now();
             let mut waited = Duration::ZERO;
             let mut next_check = Duration::from_secs(1);
             let attempt_offset = offset + done;
@@ -339,9 +339,11 @@ impl Engine {
             .await;
             match result {
                 Ok(hash) => {
-                    self.tuning
-                        .reads
-                        .completed(attempt_length, waited, std::time::Instant::now());
+                    self.tuning.reads.completed(
+                        attempt_length,
+                        waited,
+                        tokio::time::Instant::now(),
+                    );
                     crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
@@ -360,8 +362,8 @@ impl Engine {
                         batch.clear();
                         fragments.clear();
                         batch_size = 0;
+                        crate::s3::backoff(attempt).await;
                     }
-                    crate::s3::backoff(attempt).await;
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -394,7 +396,7 @@ async fn read_body<F: std::future::Future>(
     waited: &mut Duration,
     mut recover: impl FnMut(Duration) -> bool,
 ) -> Result<F::Output> {
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     tokio::pin!(read);
     loop {
         match tokio::time::timeout(Duration::from_secs(1), &mut read).await {
@@ -560,7 +562,7 @@ mod buffer_tests {
         assert_eq!(&bytes, b"abcd");
     }
 
-    fn planning_engine(extra: &[&str]) -> Engine {
+    pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         let argv = [
             "cp",
             "--from",
@@ -740,3 +742,6 @@ mod buffer_tests {
         assert_eq!(budget.available_permits(), 8);
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;
