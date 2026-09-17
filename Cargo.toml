@@ -83,3 +83,7 @@ strip = "symbols"
 libc = "0.2"
 serde_json = "1"
 jsonschema = { version = "0.55", default-features = false }
+
+# Diagnostic experiment: keep the ARM C/NEON hash implementation optimized.
+[profile.dev.package.blake3]
+opt-level = 3
