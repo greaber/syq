@@ -29,6 +29,8 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -90,6 +92,23 @@ def cache_dir(root: Path, config: configparser.ConfigParser) -> Path:
     return (root / ".dvc" / configured).resolve()
 
 
+def bucket_region(bucket: str) -> str | None:
+    """Region of an AWS bucket, from the header S3 adds to every response.
+
+    syq signs requests for one region and does not follow S3's redirect to
+    another, so a bucket outside the configured region would otherwise fail.
+    """
+    request = urllib.request.Request(f"https://s3.amazonaws.com/{bucket}", method="HEAD")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            headers = response.headers
+    except urllib.error.HTTPError as error:
+        headers = error.headers  # 301 and 403 responses carry the header too
+    except OSError:
+        return None
+    return headers.get("x-amz-bucket-region")
+
+
 def parse_remote(root: Path, config: configparser.ConfigParser, name: str | None) -> Remote:
     name = name or config.get("core", "remote", fallback=None)
     if name is None:
@@ -108,6 +127,13 @@ def parse_remote(root: Path, config: configparser.ConfigParser, name: str | None
             value = config.get(section, key, fallback=None)
             if value:
                 options[option] = value
+        custom_endpoint = "s3_endpoint" in options or any(
+            os.environ.get(name) for name in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+        )
+        if "s3_region" not in options and not custom_endpoint:
+            region = bucket_region(parsed.netloc)
+            if region:
+                options["s3_region"] = region
         return Remote("s3", f"s3://{parsed.netloc}", parsed.path.strip("/"), options)
     if parsed.scheme == "ssh":
         if parsed.port is not None:
