@@ -138,7 +138,6 @@ impl Engine {
 
     pub(super) async fn server_copy(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let planning = std::time::Instant::now();
         let (plan, prune) = self.download_plan(&target).await?;
         self.check_upload_placement(
             plan.first()
@@ -148,7 +147,6 @@ impl Engine {
         let keys: Vec<_> = plan.iter().map(copy_destination_key).collect();
         self.discover_destination(keys.iter().map(String::as_str).collect())
             .await?;
-        self.tuning.observe_control(planning.elapsed());
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
         self.progress

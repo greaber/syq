@@ -10,7 +10,7 @@ use std::{
 use tokio::sync::Notify;
 
 pub(super) struct Tuning {
-    control_ns: AtomicU64,
+    control_ns: Arc<AtomicU64>,
     fixed_requests: Option<usize>,
     tigris: bool,
     upload: bool,
@@ -19,9 +19,10 @@ pub(super) struct Tuning {
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
-    pub fn new(options: &Options, args: &crate::cli::Args) -> Self {
+    /// `control` receives the fastest HEAD or LIST response seen by the client.
+    pub fn new(options: &Options, args: &crate::cli::Args, control: Arc<AtomicU64>) -> Self {
         Self {
-            control_ns: AtomicU64::new(u64::MAX),
+            control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
             upload: options.upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
@@ -46,12 +47,9 @@ impl Tuning {
             )),
         }
     }
+    #[cfg(test)]
     pub fn observe_control(&self, elapsed: Duration) {
-        // An empty placement check is not a network observation.
-        if elapsed >= Duration::from_micros(100) {
-            self.control_ns
-                .fetch_min(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
-        }
+        observe_control(&self.control_ns, elapsed);
     }
     pub fn high_latency(&self) -> bool {
         let ns = self.control_ns.load(Relaxed);
@@ -87,6 +85,11 @@ impl Tuning {
     pub fn local_latency(&self) -> bool {
         self.control_ns.load(Relaxed) < 3_000_000
     }
+}
+/// Path latency is the fastest single control response. The time to plan a copy
+/// grows with the number of listing pages, so it says little about the path.
+pub(super) fn observe_control(control_ns: &AtomicU64, elapsed: Duration) {
+    control_ns.fetch_min(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
 }
 struct Window {
     active: usize,
@@ -1066,7 +1069,7 @@ mod tests {
             (false, true, Some(100), true, Some(16), 16),
         ] {
             let tuning = Tuning {
-                control_ns: AtomicU64::new(u64::MAX),
+                control_ns: Arc::new(AtomicU64::new(u64::MAX)),
                 reads: crate::s3::read_recovery::Recovery::default(),
                 fixed_requests: fixed,
                 tigris,
