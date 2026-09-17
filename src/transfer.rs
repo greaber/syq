@@ -9691,409 +9691,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_file_groups_need_no_source_reads() {
-        let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)].map(pipeline_snapshot);
-        let src = Arc::new(Mutex::new(PipelineState::default()));
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        dst.lock()
-            .unwrap()
-            .replies
-            .push_back(Response::Applied(vec![None, None]));
-        let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
-        let algorithm = crate::hashing::HashAlgorithm::Sha256;
-        Arc::get_mut(&mut worker.opts)
-            .unwrap()
-            .hash_policy
-            .algorithm = algorithm;
-        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-        worker
-            .transfer_small_batches(&jobs, std::iter::once(0..2), &mut results)
-            .unwrap();
-        assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
-        assert!(src.lock().unwrap().requests.is_empty());
-        let destination = dst.lock().unwrap();
-        let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {
-            panic!("expected one whole-file write batch")
-        };
-        assert!(puts
-            .iter()
-            .all(|put| put.data.is_empty() && put.hash == algorithm.hash(&[])));
-    }
-
-    #[test]
-    fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
-        let sched = Arc::new(Sched::new(512, 8192));
-        let jobs: Vec<_> = (0..8)
-            .map(|i| pipeline_job(format!("file{i}").as_bytes(), 1 << 20))
-            .collect();
-        for job in &jobs {
-            sched.push_file(job.clone());
-        }
-        sched.scan_done();
-        assert!(matches!(sched.next(), Item::File(0)));
-        assert_eq!(sched.begin_fast_batch(1, 8), 8);
-        let mut batch = vec![0];
-        batch.extend(sched.take_small(1 << 20, 7, u64::MAX));
-        sched.mark_fast(7);
-        let original = batch.clone();
-        let src = Arc::new(Mutex::new(PipelineState {
-            synchronous: true,
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        for _ in 0..4 {
-            let data = vec![42; 1 << 20];
-            src.lock()
-                .unwrap()
-                .replies
-                .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
-                    hash: content_digest(&data),
-                    data,
-                })]));
-            dst.lock()
-                .unwrap()
-                .replies
-                .push_back(Response::Applied(vec![None]));
-        }
-        src.lock()
-            .unwrap()
-            .replies
-            .push_back(Response::EndpointError(WireError {
-                message: "injected read denial after publishing earlier files".into(),
-                io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
-                raw_os_error: None,
-            }));
-        src.lock().unwrap().replies.push_back(Response::Stats(
-            original[..4]
-                .iter()
-                .map(|&idx| Some(jobs[idx].entry.clone()))
-                .collect(),
-        ));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        worker.fast_batch(&mut batch).unwrap();
-        assert_eq!(batch, original);
-        assert_eq!(worker.progress.files_done.load(Relaxed), 4);
-        assert_eq!(worker.progress.errors.load(Relaxed), 1);
-        for &idx in &original[..4] {
-            assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
-            assert!(!sched.is_failed(idx));
-        }
-        assert!(sched.is_failed(original[4]));
-        let source = src.lock().unwrap();
-        let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
-            panic!("source recheck");
-        };
-        assert_eq!(
-            paths,
-            &original[..4]
-                .iter()
-                .map(|&idx| jobs[idx].src.clone())
-                .collect::<Vec<_>>()
-        );
-        drop(source);
-        let destination = dst.lock().unwrap();
-        assert_eq!(
-            destination.received, 4,
-            "drained acknowledgments remain successful"
-        );
-        drop(destination);
-        sched.complete_fast_batch(batch.len());
-        let mut remaining: std::collections::BTreeSet<_> = original[5..].iter().copied().collect();
-        while !remaining.is_empty() {
-            let Item::File(idx) = sched.next() else {
-                panic!("unwritten file was not requeued");
-            };
-            assert!(remaining.remove(&idx));
-            assert!(!sched.is_failed(idx));
-            assert!(sched.ranges_ready(idx, vec![]).is_none());
-        }
-        assert!(sched.finished());
-    }
-
-    #[test]
-    fn new_file_batch_limit_is_independent_of_comparison_blocks() {
-        let sched = Arc::new(Sched::new(64 << 10, 32 << 20));
-        let mut worker = pipeline_worker(&sched, &Default::default(), &Default::default(), false);
-        let opts = Arc::get_mut(&mut worker.opts).unwrap();
-        opts.block = 64 << 10;
-        opts.tuning.request_size = Some(4 << 20);
-        assert_eq!(fast_file_size_limit(opts, None), 4 << 20);
-        opts.tuning.batch_bytes = Some(1 << 20);
-        assert_eq!(fast_file_size_limit(opts, None), 1 << 20);
-        opts.tuning.request_size = None;
-        assert_eq!(fast_file_size_limit(opts, None), 64 << 10);
-    }
-
     fn pipeline_snapshot(job: FileJob) -> WorkerJob {
         WorkerJob {
             data: crate::sched::SnapshotData::Owned(job.data),
             dst_entry: job.dst_entry.map(crate::sched::SnapshotEntry::Owned),
-        }
-    }
-
-    #[test]
-    fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
-        // Inject reply-start waits so scheduling delays cannot change which
-        // side of the stall allowance a case exercises.
-        for (rtt_us, setup_ms, reply_wait_ms, expected) in [
-            (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
-            (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-            (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-            // Payload time does not contribute to the reported reply-start wait.
-            (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
-        ] {
-            let jobs: Vec<_> = (0..8)
-                .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
-                .collect();
-            let src = Arc::new(Mutex::new(PipelineState {
-                rtt_us,
-                reply_start_wait: Some(std::time::Duration::from_millis(reply_wait_ms)),
-                ..Default::default()
-            }));
-            let dst = Arc::new(Mutex::new(PipelineState::default()));
-            for _ in &jobs {
-                let data = vec![0; 512];
-                src.lock()
-                    .unwrap()
-                    .replies
-                    .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
-                        hash: content_digest(&data),
-                        data,
-                    })]));
-                dst.lock()
-                    .unwrap()
-                    .replies
-                    .push_back(Response::Applied(vec![None]));
-            }
-            let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
-            worker.gate.set_active(2);
-            worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
-            let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-            worker
-                .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
-                .unwrap();
-            assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
-            assert_eq!(src.lock().unwrap().sent_at_receive, expected);
-        }
-    }
-
-    #[test]
-    fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
-        for failure in ["none", "source-drop", "destination-drop"] {
-            let sched = Arc::new(Sched::new(512, 8192));
-            let jobs: Vec<_> = (0..12)
-                .map(|i| pipeline_job(format!("file{i}").as_bytes(), 256 << 10))
-                .collect();
-            for job in &jobs {
-                sched.push_file(job.clone());
-            }
-            sched.scan_done();
-            assert!(matches!(sched.next(), Item::File(0)));
-            assert_eq!(sched.begin_fast_batch(1, 12), 12);
-            let mut batch = vec![0];
-            batch.extend(sched.take_small(256 << 10, 11, u64::MAX));
-            let owned = batch[..8].to_vec();
-            let stolen = batch[8];
-            let siblings = batch[9..].to_vec();
-            sched.mark_fast(11);
-            let src = Arc::new(Mutex::new(PipelineState {
-                synchronous: true,
-                steal_on_receive: Some(sched.clone()),
-                fail_receive: (failure == "source-drop").then_some(2),
-                ..Default::default()
-            }));
-            let dst = Arc::new(Mutex::new(PipelineState {
-                fail_receive: (failure == "destination-drop").then_some(1),
-                ..Default::default()
-            }));
-            for _ in 0..2 {
-                src.lock().unwrap().replies.push_back(Response::SmallBlocks(
-                    (0..4)
-                        .map(|_| {
-                            let data = vec![0; 256 << 10];
-                            Ok(SmallBlock {
-                                hash: content_digest(&data),
-                                data,
-                            })
-                        })
-                        .collect(),
-                ));
-                dst.lock()
-                    .unwrap()
-                    .replies
-                    .push_back(Response::Applied(vec![None; 4]));
-            }
-            src.lock().unwrap().replies.push_back(Response::Stats(
-                owned
-                    .iter()
-                    .map(|&idx| Some(jobs[idx].entry.clone()))
-                    .collect(),
-            ));
-            let mut worker = pipeline_worker(&sched, &src, &dst, false);
-            let result = worker.fast_batch(&mut batch);
-            assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
-            assert_eq!(src.lock().unwrap().stolen_file, Some(stolen));
-            assert_eq!(batch, owned);
-            assert_eq!(
-                worker.progress.files_done.load(Relaxed),
-                if failure == "none" { 8 } else { 0 }
-            );
-            if failure == "none" {
-                let source = src.lock().unwrap();
-                let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
-                    panic!("source recheck")
-                };
-                assert_eq!(
-                    paths,
-                    &owned
-                        .iter()
-                        .map(|&idx| jobs[idx].src.clone())
-                        .collect::<Vec<_>>()
-                );
-            }
-            sched.complete_fast_batch(batch.len());
-            if result.is_err() {
-                for idx in batch {
-                    sched.requeue(idx);
-                }
-            }
-            // The peer owns the first file of the stolen group. Its siblings were returned
-            // to the file queue; no retry may duplicate that ownership.
-            assert!(sched.ranges_ready(stolen, vec![]).is_none());
-            let mut expected: std::collections::BTreeSet<_> = siblings.into_iter().collect();
-            if failure != "none" {
-                expected.extend(owned);
-            }
-            while !expected.is_empty() {
-                let Item::File(idx) = sched.next() else {
-                    panic!("expected queued file")
-                };
-                assert!(expected.remove(&idx), "duplicate or stolen file {idx}");
-                assert!(sched.ranges_ready(idx, vec![]).is_none());
-            }
-            assert!(sched.finished());
-        }
-    }
-
-    #[test]
-    fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
-        for (source_sync, destination_sync) in [(false, false), (true, false), (false, true)] {
-            for failure in [
-                "none",
-                "read-file",
-                "write-file",
-                "read-error",
-                "write-error",
-                "source-drop",
-                "destination-drop",
-            ] {
-                let jobs: Vec<_> = (0..8)
-                    .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
-                    .collect();
-                let groups = [0..2, 2..4, 4..6, 6..8];
-                let dst = Arc::new(Mutex::new(PipelineState {
-                    synchronous: destination_sync,
-                    fail_receive: (failure == "destination-drop").then_some(2),
-                    ..Default::default()
-                }));
-                let src = Arc::new(Mutex::new(PipelineState {
-                    synchronous: source_sync,
-                    peer: Some(dst.clone()),
-                    fail_receive: (failure == "source-drop").then_some(3),
-                    ..Default::default()
-                }));
-                for group in 0..4 {
-                    let mut blocks = Vec::new();
-                    for file in 0..2 {
-                        let data = vec![group as u8; 512];
-                        blocks.push(if failure == "read-file" && group == 1 && file == 0 {
-                            Err("injected file read error".into())
-                        } else {
-                            Ok(SmallBlock {
-                                hash: content_digest(&data),
-                                data,
-                            })
-                        });
-                    }
-                    src.lock().unwrap().replies.push_back(
-                        if failure == "read-error" && group == 1 {
-                            Response::Err("injected batch read error".into())
-                        } else {
-                            Response::SmallBlocks(blocks)
-                        },
-                    );
-                    let count = if failure == "read-file" && group == 1 {
-                        1
-                    } else {
-                        2
-                    };
-                    let applied = (0..count)
-                        .map(|file| {
-                            (failure == "write-file" && group == 1 && file == 0)
-                                .then(|| "injected file write error".into())
-                        })
-                        .collect();
-                    dst.lock().unwrap().replies.push_back(
-                        if failure == "write-error" && group == 1 {
-                            Response::Err("injected batch write error".into())
-                        } else {
-                            Response::Applied(applied)
-                        },
-                    );
-                }
-                let mut worker =
-                    pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
-                let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-                let result = worker.transfer_small_batches(&jobs, groups.into_iter(), &mut results);
-                if matches!(failure, "none" | "read-file" | "write-file") {
-                    result.unwrap();
-                    assert_eq!(results.len(), 8);
-                    for (i, result) in results.iter().enumerate() {
-                        assert_eq!(
-                            result.as_ref().expect("completed file").is_err(),
-                            failure != "none" && i == 2,
-                            "{failure} file{i}: {result:?}"
-                        );
-                    }
-                    let source = src.lock().unwrap();
-                    let destination = dst.lock().unwrap();
-                    assert_eq!(
-                        source.peer_sent_at_receive,
-                        [0, 1, 2, 3],
-                        "write each group before receiving the next"
-                    );
-                    assert_eq!(source.sent_at_receive[0], if source_sync { 1 } else { 4 });
-                    assert_eq!(
-                        destination.sent_at_receive[0],
-                        if destination_sync { 1 } else { 4 }
-                    );
-                } else {
-                    assert_eq!(
-                        result.is_err(),
-                        worker.transport_dead(),
-                        "{failure}: {result:?}"
-                    );
-                    if !worker.transport_dead() {
-                        assert!(
-                            results[..2].iter().all(|r| matches!(r, Some(Ok(())))),
-                            "earlier acknowledged files survive {failure}: {results:?}"
-                        );
-                        assert!(
-                            results[2..4].iter().all(|r| matches!(r, Some(Err(_)))),
-                            "only the failed group is failed: {failure}: {results:?}"
-                        );
-                        let source = src.lock().unwrap();
-                        let destination = dst.lock().unwrap();
-                        assert_eq!(source.received, source.requests.len(), "{failure}");
-                        assert_eq!(
-                            destination.received,
-                            destination.requests.len(),
-                            "{failure}"
-                        );
-                    }
-                }
-            }
         }
     }
 
@@ -10487,6 +10088,405 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
+        for (source_sync, destination_sync) in [(false, false), (true, false), (false, true)] {
+            for failure in [
+                "none",
+                "read-file",
+                "write-file",
+                "read-error",
+                "write-error",
+                "source-drop",
+                "destination-drop",
+            ] {
+                let jobs: Vec<_> = (0..8)
+                    .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
+                    .collect();
+                let groups = [0..2, 2..4, 4..6, 6..8];
+                let dst = Arc::new(Mutex::new(PipelineState {
+                    synchronous: destination_sync,
+                    fail_receive: (failure == "destination-drop").then_some(2),
+                    ..Default::default()
+                }));
+                let src = Arc::new(Mutex::new(PipelineState {
+                    synchronous: source_sync,
+                    peer: Some(dst.clone()),
+                    fail_receive: (failure == "source-drop").then_some(3),
+                    ..Default::default()
+                }));
+                for group in 0..4 {
+                    let mut blocks = Vec::new();
+                    for file in 0..2 {
+                        let data = vec![group as u8; 512];
+                        blocks.push(if failure == "read-file" && group == 1 && file == 0 {
+                            Err("injected file read error".into())
+                        } else {
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        });
+                    }
+                    src.lock().unwrap().replies.push_back(
+                        if failure == "read-error" && group == 1 {
+                            Response::Err("injected batch read error".into())
+                        } else {
+                            Response::SmallBlocks(blocks)
+                        },
+                    );
+                    let count = if failure == "read-file" && group == 1 {
+                        1
+                    } else {
+                        2
+                    };
+                    let applied = (0..count)
+                        .map(|file| {
+                            (failure == "write-file" && group == 1 && file == 0)
+                                .then(|| "injected file write error".into())
+                        })
+                        .collect();
+                    dst.lock().unwrap().replies.push_back(
+                        if failure == "write-error" && group == 1 {
+                            Response::Err("injected batch write error".into())
+                        } else {
+                            Response::Applied(applied)
+                        },
+                    );
+                }
+                let mut worker =
+                    pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+                let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+                let result = worker.transfer_small_batches(&jobs, groups.into_iter(), &mut results);
+                if matches!(failure, "none" | "read-file" | "write-file") {
+                    result.unwrap();
+                    assert_eq!(results.len(), 8);
+                    for (i, result) in results.iter().enumerate() {
+                        assert_eq!(
+                            result.as_ref().expect("completed file").is_err(),
+                            failure != "none" && i == 2,
+                            "{failure} file{i}: {result:?}"
+                        );
+                    }
+                    let source = src.lock().unwrap();
+                    let destination = dst.lock().unwrap();
+                    assert_eq!(
+                        source.peer_sent_at_receive,
+                        [0, 1, 2, 3],
+                        "write each group before receiving the next"
+                    );
+                    assert_eq!(source.sent_at_receive[0], if source_sync { 1 } else { 4 });
+                    assert_eq!(
+                        destination.sent_at_receive[0],
+                        if destination_sync { 1 } else { 4 }
+                    );
+                } else {
+                    assert_eq!(
+                        result.is_err(),
+                        worker.transport_dead(),
+                        "{failure}: {result:?}"
+                    );
+                    if !worker.transport_dead() {
+                        assert!(
+                            results[..2].iter().all(|r| matches!(r, Some(Ok(())))),
+                            "earlier acknowledged files survive {failure}: {results:?}"
+                        );
+                        assert!(
+                            results[2..4].iter().all(|r| matches!(r, Some(Err(_)))),
+                            "only the failed group is failed: {failure}: {results:?}"
+                        );
+                        let source = src.lock().unwrap();
+                        let destination = dst.lock().unwrap();
+                        assert_eq!(source.received, source.requests.len(), "{failure}");
+                        assert_eq!(
+                            destination.received,
+                            destination.requests.len(),
+                            "{failure}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let jobs: Vec<_> = (0..8)
+            .map(|i| pipeline_job(format!("file{i}").as_bytes(), 1 << 20))
+            .collect();
+        for job in &jobs {
+            sched.push_file(job.clone());
+        }
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        assert_eq!(sched.begin_fast_batch(1, 8), 8);
+        let mut batch = vec![0];
+        batch.extend(sched.take_small(1 << 20, 7, u64::MAX));
+        sched.mark_fast(7);
+        let original = batch.clone();
+        let src = Arc::new(Mutex::new(PipelineState {
+            synchronous: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        for _ in 0..4 {
+            let data = vec![42; 1 << 20];
+            src.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                    hash: content_digest(&data),
+                    data,
+                })]));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Applied(vec![None]));
+        }
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::EndpointError(WireError {
+                message: "injected read denial after publishing earlier files".into(),
+                io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
+                raw_os_error: None,
+            }));
+        src.lock().unwrap().replies.push_back(Response::Stats(
+            original[..4]
+                .iter()
+                .map(|&idx| Some(jobs[idx].entry.clone()))
+                .collect(),
+        ));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.fast_batch(&mut batch).unwrap();
+        assert_eq!(batch, original);
+        assert_eq!(worker.progress.files_done.load(Relaxed), 4);
+        assert_eq!(worker.progress.errors.load(Relaxed), 1);
+        for &idx in &original[..4] {
+            assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
+            assert!(!sched.is_failed(idx));
+        }
+        assert!(sched.is_failed(original[4]));
+        let source = src.lock().unwrap();
+        let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
+            panic!("source recheck");
+        };
+        assert_eq!(
+            paths,
+            &original[..4]
+                .iter()
+                .map(|&idx| jobs[idx].src.clone())
+                .collect::<Vec<_>>()
+        );
+        drop(source);
+        let destination = dst.lock().unwrap();
+        assert_eq!(
+            destination.received, 4,
+            "drained acknowledgments remain successful"
+        );
+        drop(destination);
+        sched.complete_fast_batch(batch.len());
+        let mut remaining: std::collections::BTreeSet<_> = original[5..].iter().copied().collect();
+        while !remaining.is_empty() {
+            let Item::File(idx) = sched.next() else {
+                panic!("unwritten file was not requeued");
+            };
+            assert!(remaining.remove(&idx));
+            assert!(!sched.is_failed(idx));
+            assert!(sched.ranges_ready(idx, vec![]).is_none());
+        }
+        assert!(sched.finished());
+    }
+
+    #[test]
+    fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
+        for failure in ["none", "source-drop", "destination-drop"] {
+            let sched = Arc::new(Sched::new(512, 8192));
+            let jobs: Vec<_> = (0..12)
+                .map(|i| pipeline_job(format!("file{i}").as_bytes(), 256 << 10))
+                .collect();
+            for job in &jobs {
+                sched.push_file(job.clone());
+            }
+            sched.scan_done();
+            assert!(matches!(sched.next(), Item::File(0)));
+            assert_eq!(sched.begin_fast_batch(1, 12), 12);
+            let mut batch = vec![0];
+            batch.extend(sched.take_small(256 << 10, 11, u64::MAX));
+            let owned = batch[..8].to_vec();
+            let stolen = batch[8];
+            let siblings = batch[9..].to_vec();
+            sched.mark_fast(11);
+            let src = Arc::new(Mutex::new(PipelineState {
+                synchronous: true,
+                steal_on_receive: Some(sched.clone()),
+                fail_receive: (failure == "source-drop").then_some(2),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                fail_receive: (failure == "destination-drop").then_some(1),
+                ..Default::default()
+            }));
+            for _ in 0..2 {
+                src.lock().unwrap().replies.push_back(Response::SmallBlocks(
+                    (0..4)
+                        .map(|_| {
+                            let data = vec![0; 256 << 10];
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        })
+                        .collect(),
+                ));
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Applied(vec![None; 4]));
+            }
+            src.lock().unwrap().replies.push_back(Response::Stats(
+                owned
+                    .iter()
+                    .map(|&idx| Some(jobs[idx].entry.clone()))
+                    .collect(),
+            ));
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            let result = worker.fast_batch(&mut batch);
+            assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+            assert_eq!(src.lock().unwrap().stolen_file, Some(stolen));
+            assert_eq!(batch, owned);
+            assert_eq!(
+                worker.progress.files_done.load(Relaxed),
+                if failure == "none" { 8 } else { 0 }
+            );
+            if failure == "none" {
+                let source = src.lock().unwrap();
+                let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
+                    panic!("source recheck")
+                };
+                assert_eq!(
+                    paths,
+                    &owned
+                        .iter()
+                        .map(|&idx| jobs[idx].src.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            sched.complete_fast_batch(batch.len());
+            if result.is_err() {
+                for idx in batch {
+                    sched.requeue(idx);
+                }
+            }
+            // The peer owns the first file of the stolen group. Its siblings were returned
+            // to the file queue; no retry may duplicate that ownership.
+            assert!(sched.ranges_ready(stolen, vec![]).is_none());
+            let mut expected: std::collections::BTreeSet<_> = siblings.into_iter().collect();
+            if failure != "none" {
+                expected.extend(owned);
+            }
+            while !expected.is_empty() {
+                let Item::File(idx) = sched.next() else {
+                    panic!("expected queued file")
+                };
+                assert!(expected.remove(&idx), "duplicate or stolen file {idx}");
+                assert!(sched.ranges_ready(idx, vec![]).is_none());
+            }
+            assert!(sched.finished());
+        }
+    }
+
+    #[test]
+    fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
+        // Inject reply-start waits so scheduling delays cannot change which
+        // side of the stall allowance a case exercises.
+        for (rtt_us, setup_ms, reply_wait_ms, expected) in [
+            (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
+            (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+            (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+            // Payload time does not contribute to the reported reply-start wait.
+            (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        ] {
+            let jobs: Vec<_> = (0..8)
+                .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
+                .collect();
+            let src = Arc::new(Mutex::new(PipelineState {
+                rtt_us,
+                reply_start_wait: Some(std::time::Duration::from_millis(reply_wait_ms)),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState::default()));
+            for _ in &jobs {
+                let data = vec![0; 512];
+                src.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                        hash: content_digest(&data),
+                        data,
+                    })]));
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Applied(vec![None]));
+            }
+            let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+            worker.gate.set_active(2);
+            worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
+            let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+            worker
+                .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
+                .unwrap();
+            assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+            assert_eq!(src.lock().unwrap().sent_at_receive, expected);
+        }
+    }
+
+    #[test]
+    fn empty_file_groups_need_no_source_reads() {
+        let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)].map(pipeline_snapshot);
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        dst.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Applied(vec![None, None]));
+        let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+        let algorithm = crate::hashing::HashAlgorithm::Sha256;
+        Arc::get_mut(&mut worker.opts)
+            .unwrap()
+            .hash_policy
+            .algorithm = algorithm;
+        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+        worker
+            .transfer_small_batches(&jobs, std::iter::once(0..2), &mut results)
+            .unwrap();
+        assert!(results.iter().all(|r| matches!(r, Some(Ok(())))));
+        assert!(src.lock().unwrap().requests.is_empty());
+        let destination = dst.lock().unwrap();
+        let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {
+            panic!("expected one whole-file write batch")
+        };
+        assert!(puts
+            .iter()
+            .all(|put| put.data.is_empty() && put.hash == algorithm.hash(&[])));
+    }
+
+    #[test]
+    fn new_file_batch_limit_is_independent_of_comparison_blocks() {
+        let sched = Arc::new(Sched::new(64 << 10, 32 << 20));
+        let mut worker = pipeline_worker(&sched, &Default::default(), &Default::default(), false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = 64 << 10;
+        opts.tuning.request_size = Some(4 << 20);
+        assert_eq!(fast_file_size_limit(opts, None), 4 << 20);
+        opts.tuning.batch_bytes = Some(1 << 20);
+        assert_eq!(fast_file_size_limit(opts, None), 1 << 20);
+        opts.tuning.request_size = None;
+        assert_eq!(fast_file_size_limit(opts, None), 64 << 10);
     }
 
     #[test]
