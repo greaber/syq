@@ -20,32 +20,32 @@ impl Engine {
                 requests: None,
             });
         }
-        let tiny = bytes / count < 1024 * 1024;
+        let average = bytes / count;
+        let tiny = average < 1024 * 1024;
+        let single_request = largest <= self.part_size(largest);
+        let fixed_workers = self.args.tuning_options.and_then(|t| t.s3_object_workers);
+        let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload = self.options.upload && largest <= 1024 * 1024;
         let capacity = if small_upload {
             super::super::tuning::small_upload_capacity(largest)?
         } else {
             256
         };
-        let workers =
-            if let Some(fixed) = self.args.tuning_options.and_then(|t| t.s3_object_workers) {
-                fixed
-            } else if tiny {
-                if small_upload && self.tuning.high_latency() {
-                    capacity
-                } else {
-                    256
-                }
+        let workers = if let Some(fixed) = fixed_workers {
+            fixed
+        } else if tiny {
+            if small_upload && self.tuning.high_latency() {
+                capacity
             } else {
-                32
-            };
-        if small_upload
-            && self
-                .args
-                .tuning_options
-                .and_then(|t| t.s3_object_workers)
-                .is_some_and(|n| n > capacity)
-        {
+                256
+            }
+        } else if single_request {
+            // Taper the object seed instead of dropping eightfold at 1 MiB.
+            ((256 * 1024 * 1024) / average.max(1)).clamp(32, 256) as usize
+        } else {
+            32
+        };
+        if small_upload && fixed_workers.is_some_and(|n| n > capacity) {
             bail!("s3-max-concurrent-objects exceeds the available small-upload capacity ({capacity}); lower it or increase the open-file limit");
         }
         // Automatic small-upload admission leaves room for source opens,
@@ -55,17 +55,25 @@ impl Engine {
         } else {
             workers
         };
-        self.tuning
-            .configure(tiny, if small_upload { workers } else { 256 });
-        let maximum = if count > workers as u64
-            && self
-                .args
-                .tuning_options
-                .and_then(|t| t.s3_object_workers)
-                .is_none()
+        // Keep the initial network load conservative; preparation follows the
+        // request budget until its measurements justify the larger object seed.
+        self.tuning.configure(
+            tiny,
+            if small_upload { workers } else { 256 },
+            if ramp_whole_objects { 32 } else { 64 },
+        );
+        let starting = if ramp_whole_objects {
+            workers.min(self.tuning.request_limit())
+        } else {
+            workers
+        };
+        // A short batch may fit the object target while exceeding the initial
+        // request budget. It still needs bounded preparation during the ramp.
+        let maximum = if count > starting as u64
+            && fixed_workers.is_none()
             && !self.args.dry_run
             && !self.args.verify_only
-            && largest <= self.part_size(largest)
+            && single_request
         {
             let capacity = if self.options.upload {
                 let buffer_size = if self.tuning.tigris() {
@@ -300,7 +308,70 @@ impl AsRef<[u8]> for UploadBuffer {
 }
 #[cfg(test)]
 mod buffer_tests {
-    use super::UploadBuffer;
+    use super::*;
+
+    fn planning_engine(extra: &[&str]) -> Engine {
+        let argv = [
+            "cp",
+            "--from",
+            "s3://bucket",
+            "object",
+            "--as",
+            "destination",
+        ];
+        let args = Arc::new(
+            Args::parse_args(
+                &argv
+                    .iter()
+                    .chain(extra)
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let options = args.s3.clone().unwrap();
+        let tuning = crate::s3::tuning::Tuning::new(&options, &args);
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        Engine {
+            args,
+            options,
+            tuning,
+            client: Client::from_conf(config),
+            progress: Progress::new(false, false, None, false),
+            pace: Mutex::new(tokio::time::Instant::now()),
+            upload_keys: OnceLock::new(),
+            cancelled: Default::default(),
+            cancel_wake: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn short_whole_object_batches_keep_request_preparation_bounded() {
+        for count in [32, 33, 128, 4096] {
+            let engine = planning_engine(&[]);
+            let concurrency = engine
+                .object_workers(std::iter::repeat_n(1024 * 1024, count))
+                .unwrap();
+            assert_eq!(engine.tuning.request_limit(), 32);
+            assert_eq!(concurrency.maximum, (count > 32).then_some(count.min(256)));
+            if count > 32 {
+                assert_eq!(concurrency.initial, count.min(256));
+                let requests = concurrency.requests.unwrap();
+                assert_eq!(requests.preparation_limit(), 33);
+                assert_eq!(requests.begin_objects(concurrency.initial), None);
+            }
+        }
+        let engine = planning_engine(&["--performance-tuning", "s3-max-concurrent-objects=8"]);
+        let concurrency = engine
+            .object_workers(std::iter::repeat_n(1024 * 1024, 128))
+            .unwrap();
+        assert_eq!(concurrency.initial, 8);
+        assert!(concurrency.maximum.is_none());
+    }
+
     #[tokio::test]
     async fn upload_memory_reservation_follows_the_last_sdk_body_clone() {
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(8));

@@ -295,18 +295,21 @@ where
             Some(requests) => requests.begin_objects(concurrency.initial)?,
             None => concurrency.initial,
         };
-        Some(Controller::new(
+        let rejected = concurrency
+            .requests
+            .as_ref()
+            .and_then(|r| r.rejected_limit());
+        let mut controller = Controller::new(
             initial,
             maximum,
-            // The request ramp already tested a higher setting. Try downward
-            // first after it backed off instead of immediately repeating that
-            // losing probe. This is a starting direction, not a lasting bound.
-            concurrency.initial_probe_up
-                && !concurrency
-                    .requests
-                    .as_ref()
-                    .is_some_and(|requests| requests.rejected_increase()),
-        ))
+            concurrency.initial_probe_up && rejected.is_none(),
+        );
+        if let Some(rejected) = rejected {
+            // Reuse the request ramp's result instead of immediately retrying
+            // the same losing setting. Normal revisits can reopen this bound.
+            controller.upper = controller.upper.min(rejected.max(initial + 1));
+        }
+        Some(controller)
     };
     let mut controller = begin();
     let mut handoff_pending = controller.is_some() && concurrency.requests.is_some();
@@ -549,6 +552,22 @@ mod tests {
                 "optimum {optimum}: useful fraction {fraction}"
             );
         }
+    }
+
+    #[test]
+    fn an_inherited_request_bound_can_reopen() {
+        let mut controller = Controller::new(64, 256, false);
+        controller.upper = 128;
+        let mut model = PathModel {
+            active: 64,
+            completions: 0.0,
+            random: 251,
+        };
+        // A request probe previously rejected 128. If the path now has more
+        // capacity, that hint must not become a permanent request cap.
+        let recovered = (0..400).any(|_| model.sample(&mut controller, 256, 0.0) >= 0.9);
+        assert!(recovered);
+        assert!(controller.limit > 128);
     }
 
     #[test]

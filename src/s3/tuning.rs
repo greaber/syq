@@ -58,11 +58,11 @@ impl Tuning {
         // provider; short copies cannot recover time spent ramping from 64.
         (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
     }
-    pub fn configure(&self, tiny: bool, request_cap: usize) {
+    pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
         let request_cap = request_cap.max(self.fixed_requests.unwrap_or(1));
         let mut s = self.requests.state.lock().unwrap();
         s.max = request_cap;
-        s.limit = s.limit.min(request_cap);
+        s.limit = self.fixed_requests.unwrap_or(seed).min(request_cap);
         if self.fixed_requests.is_none() && tiny && self.high_latency() {
             // At high request latency, starting below the measured capacity
             // leaves short queues waiting through an extra response cycle.
@@ -94,6 +94,7 @@ struct Window {
     since: Option<Instant>,
     bytes: u64,
     completed: usize,
+    recent: std::collections::VecDeque<(Instant, u64)>,
     saturated: bool,
     previous: Option<(usize, f64)>,
     settled: bool,
@@ -116,6 +117,7 @@ impl Budget {
                 since: None,
                 bytes: 0,
                 completed: 0,
+                recent: std::collections::VecDeque::new(),
                 saturated: false,
                 previous: None,
                 settled: false,
@@ -147,9 +149,12 @@ impl Budget {
     pub fn preparation_limit(&self) -> usize {
         self.state.lock().unwrap().limit.saturating_add(1)
     }
-    pub fn rejected_increase(&self) -> bool {
+    pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
-        s.settled && s.previous.is_some_and(|(previous, _)| s.limit == previous)
+        let (previous, _) = s.previous?;
+        // Read before finish_objects replaces the request ceiling. Growth is
+        // always a doubling clamped to that ceiling, including the last probe.
+        (s.settled && s.limit == previous).then(|| previous.saturating_mul(2).min(s.max))
     }
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
@@ -179,12 +184,25 @@ impl Budget {
         s.bytes += bytes;
         s.completed += 1;
         let Some(since) = s.since else { return };
-        let elapsed = since.elapsed();
-        if !s.adaptive || s.settled || elapsed < Duration::from_millis(250) || s.completed < 16 {
+        if !s.adaptive || s.settled {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(since);
+        // Seventeen endpoints give sixteen complete inter-arrival intervals.
+        s.recent.push_back((now, bytes));
+        if s.recent.len() > 17 {
+            s.recent.pop_front();
+        }
+        if elapsed < Duration::from_millis(250)
+            || s.completed < 16
+            || (s.previous.is_none() && s.completed < s.limit)
+        {
             return;
         }
         // A throughput plateau is a reason to stop adding competing requests.
-        // The first window includes startup and is deliberately only a baseline.
+        // The first window includes startup and is only a baseline, but must
+        // contain a full count: the first few replies understate its capacity.
         let rate = s.bytes as f64 / elapsed.as_secs_f64();
         let before = s.limit;
         if s.saturated || s.previous.is_some() {
@@ -196,6 +214,19 @@ impl Budget {
                     return;
                 }
                 if rate < old_rate * 1.05 {
+                    if s.completed < s.limit {
+                        // The aggregate rate includes a response-cycle gap. Do
+                        // not reject a partial sample while recent replies are
+                        // arriving fast; a real stall lowers both rates.
+                        if s.recent.len() < 17 {
+                            return;
+                        }
+                        let recent_elapsed = now.duration_since(s.recent[0].0).as_secs_f64();
+                        let recent_bytes: u64 = s.recent.iter().skip(1).map(|(_, n)| *n).sum();
+                        if recent_bytes as f64 / recent_elapsed >= old_rate * 1.05 {
+                            return;
+                        }
+                    }
                     s.limit = old_limit;
                     s.settled = true;
                 } else if s.completed < s.limit {
@@ -224,6 +255,7 @@ impl Budget {
         s.since = Some(Instant::now());
         s.bytes = 0;
         s.completed = 0;
+        s.recent.clear();
         s.saturated = false;
         self.changed.notify_waiters();
     }
@@ -281,6 +313,65 @@ mod tests {
     }
 
     #[test]
+    fn request_baseline_waits_for_a_full_count() {
+        let budget = Budget::new(64, true);
+        {
+            let mut s = budget.state.lock().unwrap();
+            s.since = Some(Instant::now() - Duration::from_secs(1));
+            s.saturated = true;
+        }
+        for _ in 0..63 {
+            budget.completed(1024);
+        }
+        {
+            let s = budget.state.lock().unwrap();
+            assert_eq!(s.limit, 64);
+            assert!(s.previous.is_none());
+            assert_eq!(s.completed, 63);
+        }
+        budget.completed(1024);
+        let s = budget.state.lock().unwrap();
+        assert_eq!(s.limit, 128);
+        assert_eq!(s.previous.unwrap().0, 64);
+        assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn a_fast_response_burst_is_not_an_early_request_loss() {
+        let budget = Budget::new(128, true);
+        let bytes = 1024 * 1024;
+        {
+            let mut s = budget.state.lock().unwrap();
+            let now = Instant::now();
+            s.since = Some(now - Duration::from_millis(250));
+            s.previous = Some((64, 256.0 * bytes as f64));
+            s.saturated = true;
+            s.bytes = 53 * bytes;
+            s.completed = 53;
+            s.recent = (0..16)
+                .map(|i| (now - Duration::from_micros(4000 - i * 250), bytes))
+                .collect();
+        }
+        // 54 replies / 250 ms looks slower than the baseline. The latest
+        // replies are arriving rapidly, so this partial wave is inconclusive.
+        budget.completed(bytes);
+        {
+            let mut s = budget.state.lock().unwrap();
+            assert_eq!(s.limit, 128);
+            assert!(!s.settled);
+            assert_eq!(s.completed, 54);
+            s.since = Some(Instant::now() - Duration::from_millis(300));
+            s.bytes = 127 * bytes;
+            s.completed = 127;
+        }
+        budget.completed(bytes);
+        let s = budget.state.lock().unwrap();
+        assert_eq!(s.limit, 256);
+        assert!(!s.settled);
+        assert!(s.recent.is_empty());
+    }
+
+    #[test]
     fn request_probe_requires_enough_completions_to_accept_a_gain() {
         let budget = Budget::new(64, true);
         {
@@ -288,7 +379,7 @@ mod tests {
             state.since = Some(Instant::now() - Duration::from_secs(1));
             state.saturated = true;
         }
-        for _ in 0..16 {
+        for _ in 0..64 {
             budget.completed(4096);
         }
         // A partial response wave appears faster, but fewer than 128 requests
@@ -296,11 +387,11 @@ mod tests {
         {
             let mut state = budget.state.lock().unwrap();
             state.since = Some(Instant::now() - Duration::from_secs(1));
-            state.bytes = 79 * 1024;
+            state.bytes = 79 * 4096;
             state.completed = 79;
             state.saturated = true;
         }
-        budget.completed(1024);
+        budget.completed(4096);
         let observed = {
             let state = budget.state.lock().unwrap();
             (state.limit, state.completed, state.settled)
@@ -308,8 +399,15 @@ mod tests {
         assert_eq!(observed, (128, 80, false));
         // If progress then stalls, reject the probe without waiting for 128
         // completions. The original baseline is still available for comparison.
-        budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(2));
-        budget.completed(1024);
+        {
+            let mut state = budget.state.lock().unwrap();
+            let now = Instant::now();
+            state.since = Some(now - Duration::from_secs(2));
+            state.recent = (0..16)
+                .map(|i| (now - Duration::from_millis(1015 - i), 4096))
+                .collect();
+        }
+        budget.completed(4096);
         let observed = {
             let state = budget.state.lock().unwrap();
             (state.limit, state.settled)
@@ -321,7 +419,7 @@ mod tests {
     fn object_controller_waits_for_request_ramp_or_plateau() {
         let budget = Budget::new(64, true);
         assert_eq!(budget.begin_objects(256), None);
-        for (bytes, completions, expected) in [(1024, 16, 128), (2048, 128, 256)] {
+        for (bytes, completions, expected) in [(1024, 64, 128), (2048, 128, 256)] {
             {
                 let mut s = budget.state.lock().unwrap();
                 s.since = Some(Instant::now() - Duration::from_secs(1));
@@ -344,7 +442,7 @@ mod tests {
         budget.completed(4096);
         assert!(budget.state.lock().unwrap().previous.is_none());
         assert_eq!(budget.begin_objects(256), Some(256));
-        assert!(!budget.rejected_increase());
+        assert!(budget.rejected_limit().is_none());
         assert_eq!(budget.state.lock().unwrap().limit, 256);
         budget.finish_objects(512);
         assert_eq!(budget.state.lock().unwrap().limit, 512);
@@ -379,7 +477,7 @@ mod tests {
             assert!(!s.settled);
         }
         budget.completed(1024);
-        assert!(budget.rejected_increase());
+        assert!(budget.rejected_limit().is_some());
         assert_eq!(budget.begin_objects(256), Some(128));
         assert_eq!(budget.preparation_limit(), 129);
         budget.finish_objects(512);
@@ -463,19 +561,19 @@ mod tests {
 
         let budget = Arc::new(Budget::new(64, true));
         // The ramp tries 128 requests, finds lower throughput, and returns to 64.
-        for (bytes, expected) in [(2048, 128), (1024, 64)] {
+        for (bytes, completions, expected) in [(2048, 64, 128), (256, 128, 64)] {
             {
                 let mut state = budget.state.lock().unwrap();
                 state.since = Some(Instant::now() - Duration::from_secs(1));
                 state.saturated = true;
             }
-            for _ in 0..16 {
+            for _ in 0..completions {
                 budget.completed(bytes);
             }
             let limit = budget.state.lock().unwrap().limit;
             assert_eq!(limit, expected);
         }
-        assert!(budget.rejected_increase());
+        assert!(budget.rejected_limit().is_some());
         let peak = Arc::new(AtomicUsize::new(0));
         let copy_budget = budget.clone();
         let copy_peak = peak.clone();
@@ -693,7 +791,7 @@ mod tests {
             if let Some(ms) = latency_ms {
                 tuning.observe_control(Duration::from_millis(ms));
             }
-            tuning.configure(tiny, 256);
+            tuning.configure(tiny, 256, 64);
             assert_eq!(
                 tuning.requests.state.lock().unwrap().limit,
                 expected,
