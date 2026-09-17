@@ -211,7 +211,10 @@ impl Engine {
 
     async fn delete_objects(&self, candidates: &[Candidate]) -> Result<()> {
         use aws_sdk_s3::types::{Delete, ObjectIdentifier};
-        for batch in candidates.chunks(1000) {
+        // S3 keys have no parent/child deletion dependency. Keep batches bounded
+        // independently of file-copy concurrency, and honor the request budget.
+        let mut batches = stream::iter(candidates.chunks(1000).map(|batch| async move {
+            let _slot = self.tuning.requests.acquire().await;
             self.check_cancelled()?;
             let objects = batch
                 .iter()
@@ -233,19 +236,32 @@ impl Engine {
                 )
                 .send()
                 .await;
+            let errors: HashMap<_, _> = result
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flat_map(|r| r.errors())
+                .filter_map(|e| e.key().map(|key| (key, e)))
+                .collect();
+            let deleted: std::collections::HashSet<_> = result
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flat_map(|r| r.deleted())
+                .filter_map(|d| d.key())
+                .collect();
             for c in batch {
                 let key = c.key.as_deref().unwrap();
                 let outcome = match &result {
                     Err(error) => Err(anyhow::anyhow!("{error}")),
-                    Ok(response) => {
-                        if let Some(error) = response.errors().iter().find(|e| e.key() == Some(key))
-                        {
+                    Ok(_) => {
+                        if let Some(error) = errors.get(key) {
                             Err(anyhow::anyhow!(
                                 "{}: {}",
                                 error.code().unwrap_or("S3 deletion error"),
                                 error.message().unwrap_or("")
                             ))
-                        } else if response.deleted().iter().any(|d| d.key() == Some(key)) {
+                        } else if deleted.contains(key) {
                             Ok(())
                         } else {
                             Err(anyhow::anyhow!("S3 deletion response omitted key {key:?}"))
@@ -254,8 +270,17 @@ impl Engine {
                 };
                 self.deletion_finished(c, outcome, "transport");
             }
+            Ok::<_, anyhow::Error>(())
+        }))
+        .buffer_unordered(10);
+        // Drain started requests even on cancellation; never discard their results.
+        let mut failure = None;
+        while let Some(result) = batches.next().await {
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     fn deletion_finished(&self, candidate: &Candidate, result: Result<()>, class: &'static str) {

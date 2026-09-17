@@ -152,7 +152,7 @@ fn serve(
                 "prune-outside" => vec!["elsewhere/extra".into()],
                 "prune-invalid" => vec!["mirror/bad//key".into()],
                 "prune-folder-content" => vec!["mirror/bad/".into()],
-                "prune-batch" | "prune-request-failure" => {
+                "prune-batch" | "prune-request-failure" | "prune-concurrent" => {
                     (0..1001).map(|i| format!("mirror/extra{i:04}")).collect()
                 }
                 "prune-mixed" => vec!["mirror/extra".into(), "mirror/good".into()],
@@ -179,6 +179,19 @@ fn serve(
                 .map(|s| s.split("</Key>").next().unwrap())
                 .collect();
             assert!(!keys.is_empty() && keys.len() <= 1000);
+            if fault == "prune-concurrent" {
+                let (arrived, peer) = if keys.len() == 1000 {
+                    (&gate.0, &gate.1)
+                } else {
+                    (&gate.1, &gate.0)
+                };
+                arrived.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !peer.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(peer.load(Ordering::SeqCst), "deletion batches ran serially");
+            }
             if fault == "prune-denied" || (fault == "prune-request-failure" && keys.len() == 1000) {
                 reply(
                     &mut socket,
@@ -1339,6 +1352,7 @@ fn s3_prune_limit_refuses_without_sending_delete() {
 fn s3_prune_batches_account_for_every_key_and_continue_after_errors() {
     for (fault, code, planned, completed, requests) in [
         ("prune-batch", 0, 1001, 1001, 3),
+        ("prune-concurrent", 0, 1001, 1001, 3),
         ("prune-mixed", 23, 2, 1, 2),
         ("prune-request-failure", 23, 1001, 1, 3),
     ] {
