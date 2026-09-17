@@ -117,15 +117,22 @@ impl Options {
             matches.try_contains_id(id).unwrap_or(false)
                 && matches.value_source(id) == Some(ValueSource::CommandLine)
         };
+        let removal = matches.try_contains_id("s3_all_versions").unwrap_or(false);
+        let endpoint_help = if removal {
+            "--on s3://BUCKET"
+        } else {
+            "--from s3://BUCKET or --to s3://BUCKET"
+        };
+        let operation = if removal { "removal" } else { "copies" };
         if from.is_none() && to.is_none() {
             if tuning.has_s3_controls() {
-                bail!("S3 performance tuning requires --from s3://BUCKET or --to s3://BUCKET");
+                bail!("S3 performance tuning requires {endpoint_help}");
             }
             if ["s3_endpoint", "s3_region", "s3_profile", "s3_header"]
                 .iter()
                 .any(|id| explicit(id))
             {
-                bail!("S3 options require --from s3://BUCKET or --to s3://BUCKET");
+                bail!("S3 options require {endpoint_help}");
             }
             return Ok(None);
         }
@@ -154,7 +161,10 @@ impl Options {
             "suppress_summary",
         ] {
             if explicit(id) {
-                bail!("--{} is not supported for S3 copies", id.replace('_', "-"));
+                bail!(
+                    "--{} is not supported for S3 {operation}",
+                    id.replace('_', "-")
+                );
             }
         }
         let bucket = from.or(to).unwrap().strip_prefix("s3://").unwrap();
@@ -178,7 +188,7 @@ impl Options {
             || tuning.job_storage.is_some()
         {
             bail!(
-                "filesystem performance tuning is not supported for S3 copies; use the s3-* keys"
+                "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
             );
         }
         let concurrency = tuning.s3_part_workers.unwrap_or(64);

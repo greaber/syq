@@ -1884,6 +1884,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .as_deref()
         .filter(|s| s.starts_with("s3://"));
     let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
+    if s3.is_some() && parsed.selection.follow_src {
+        bail!("--follow-src is not supported for S3 removal; object keys have no parent symlinks");
+    }
     parsed.s3_remove.validate(
         s3.is_some(),
         ordered.len(),

@@ -170,6 +170,42 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault == "remove-exact-bounded" {
+        assert_eq!(method, "GET");
+        assert!(first.contains("delimiter="));
+        let body = if first.contains("version-id-marker=old") {
+            br#"<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>ghost-other/</NextKeyMarker><DeleteMarker><Key>ghost</Key><VersionId>hidden</VersionId><IsLatest>true</IsLatest></DeleteMarker><CommonPrefixes><Prefix>ghost-other/</Prefix></CommonPrefixes></ListVersionsResult>"#.as_slice()
+        } else {
+            assert!(!first.contains("key-marker="));
+            br#"<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>ghost[opaque-cache-state]</NextKeyMarker><NextVersionIdMarker>old</NextVersionIdMarker><Version><Key>ghost</Key><VersionId>old</VersionId><IsLatest>false</IsLatest></Version></ListVersionsResult>"#.as_slice()
+        };
+        reply(&mut socket, 200, &[], body, false);
+        return;
+    }
+    if fault == "remove-ghost" {
+        assert_eq!(method, "GET");
+        assert!(first.contains("versions"));
+        if first.contains("delimiter=") {
+            reply(&mut socket, 200, &[], br#"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>ghost</Key><VersionId>old</VersionId><IsLatest>false</IsLatest></Version><DeleteMarker><Key>ghost</Key><VersionId>hidden</VersionId><IsLatest>true</IsLatest></DeleteMarker></ListVersionsResult>"#, false);
+            return;
+        }
+        reply(&mut socket, 200, &[], br#"<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>ghost/child</Key><VersionId>child</VersionId><IsLatest>true</IsLatest></Version></ListVersionsResult>"#, false);
+        return;
+    }
+    if fault == "remove-prefix-check" {
+        if method == "HEAD" {
+            reply(&mut socket, 404, &[], b"", true);
+        } else {
+            assert_eq!(method, "GET");
+            assert!(
+                first.contains("max-keys=1"),
+                "existence probe must be bounded"
+            );
+            assert!(first.contains("prefix=tree%2F"));
+            reply(&mut socket, 200, &[], b"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>tree/child</Key><Size>0</Size></Contents></ListBucketResult>", false);
+        }
+        return;
+    }
     if fault == "remove-head-throttle" {
         assert_eq!(method, "HEAD");
         if requests.load(Ordering::Relaxed) == 1 {
@@ -187,6 +223,16 @@ fn serve(
         return;
     }
     if fault.starts_with("remove-") {
+        if method == "GET" && first.contains("delimiter=") {
+            reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>",
+                false,
+            );
+            return;
+        }
         if method == "GET" {
             assert!(first.contains("versions"));
             let body = if fault == "remove-outside" {
@@ -2000,11 +2046,11 @@ fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
 #[test]
 fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
     for (fault, exit, requests) in [
-        ("remove-outside", 1, 1),
-        ("remove-no-id", 1, 1),
-        ("remove-no-cursor", 1, 1),
-        ("remove-denied", 23, 3),
-        ("remove-ok", 0, 5),
+        ("remove-outside", 1, 2),
+        ("remove-no-id", 1, 2),
+        ("remove-no-cursor", 1, 2),
+        ("remove-denied", 23, 4),
+        ("remove-ok", 0, 6),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let server = Server::start(fault);
@@ -2037,6 +2083,11 @@ fn s3_remove_versions_validates_listing_before_deleting_and_reports_failures() {
         for line in records.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(validator.is_valid(&value), "{value}");
+            if fault == "remove-denied" && value["type"] == "removal_result" {
+                assert_eq!(value["class"], "io");
+                assert_eq!(value["os_kind"], "permission_denied");
+                assert_eq!(value["retryable"], "no");
+            }
         }
         let result: serde_json::Value =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
@@ -2075,7 +2126,7 @@ fn s3_remove_dry_run_and_usage_errors_do_not_delete() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
     for options in [
         vec![
             "--on",
@@ -2288,4 +2339,152 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
         assert_eq!(terminal["files_excluded"], excluded, "{fault}: {terminal}");
         assert_eq!(terminal["files_transferred"], 0, "{fault}: {terminal}");
     }
+}
+
+#[test]
+fn s3_remove_prefix_existence_is_bounded_and_usage_mentions_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-prefix-check");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-non-dir",
+            "tree",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output_text(&output).contains("non-directory selector names a prefix"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+    for (args, message) in [
+        (
+            vec!["--s3-region", "us-east-1", "key"],
+            "S3 options require --on s3://BUCKET",
+        ),
+        (
+            vec!["--on", "s3://bucket", "--pscope", "/missing", "key"],
+            "not supported for S3 removal",
+        ),
+        (
+            vec!["--on", "s3://bucket", "--follow-src", "key"],
+            "--follow-src is not supported for S3 removal",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .arg("rm")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains(message),
+            "{}",
+            output_text(&output)
+        );
+    }
+}
+
+#[test]
+fn s3_remove_follow_still_allows_local_results_symlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let results = temp.path().join("results");
+    std::os::unix::fs::symlink("actual-results", &results).unwrap();
+    let server = Server::start("remove-head-throttle");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "key",
+            "--dry-run",
+            "--follow",
+            "--results",
+        ])
+        .arg(&results)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(std::fs::symlink_metadata(&results)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let records = std::fs::read_to_string(temp.path().join("actual-results")).unwrap();
+    assert!(records.contains("removal_trace"));
+}
+
+#[test]
+fn s3_remove_hidden_file_history_does_not_override_live_tree() {
+    for (selector, expected) in [
+        (vec!["ghost"], vec!["child"]),
+        (vec!["--src-dir", "ghost"], vec!["child"]),
+        (vec!["--srcs-in", "ghost"], vec!["child"]),
+        (vec!["--src-non-dir", "ghost"], vec!["old", "hidden"]),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("remove-ghost");
+        let output = server
+            .command_for(temp.path(), "rm")
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--on",
+                "s3://bucket",
+                "--s3-all-versions",
+                "--dry-run",
+                "--results",
+                "results.ndjson",
+            ])
+            .args(selector)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = std::fs::read_to_string(temp.path().join("results.ndjson")).unwrap();
+        let versions: Vec<String> = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|r| r["type"] == "removal_trace")
+            .map(|r| r["s3_version_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(versions, expected);
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            if expected.len() == 2 { 1 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn s3_remove_exact_versions_stops_before_unrelated_prefixes() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start("remove-exact-bounded");
+    let output = server
+        .command_for(temp.path(), "rm")
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--on",
+            "s3://bucket",
+            "--src-non-dir",
+            "ghost",
+            "--s3-all-versions",
+            "--dry-run",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(output_text(&output).contains("old"));
+    assert!(output_text(&output).contains("hidden"));
+    assert!(output_text(&output).contains("2 entries"));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
 }

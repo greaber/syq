@@ -6,7 +6,7 @@ use crate::{
     results::{RemovalRecord, RmResultRecord, RunMode, SelectionResultRecord},
 };
 use anyhow::{bail, Context, Result};
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{error::ProvideErrorMetadata, Client};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -47,6 +47,7 @@ struct Entry {
     key: String,
     version: Option<String>,
     marker: bool,
+    latest: bool,
     selector: u64,
 }
 impl Entry {
@@ -59,7 +60,7 @@ impl Entry {
     }
 }
 
-async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Entry>> {
+async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut key_marker = None;
     let mut version_marker = None;
@@ -69,21 +70,23 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Ent
             .list_object_versions()
             .bucket(bucket)
             .prefix(prefix)
+            .set_delimiter(exact.then(|| "/".to_owned()))
             .set_key_marker(key_marker)
             .set_version_id_marker(version_marker)
             .send()
             .await
             .map_err(|e| e.into_service_error())
             .context("list S3 versions")?;
-        for (key, version, marker) in output
+        let mut past_exact = false;
+        for (key, version, marker, latest) in output
             .versions()
             .iter()
-            .map(|v| (v.key(), v.version_id(), false))
+            .map(|v| (v.key(), v.version_id(), false, v.is_latest() == Some(true)))
             .chain(
                 output
                     .delete_markers()
                     .iter()
-                    .map(|v| (v.key(), v.version_id(), true)),
+                    .map(|v| (v.key(), v.version_id(), true, v.is_latest() == Some(true))),
             )
         {
             let key = key.context("S3 version listing omitted key")?;
@@ -94,10 +97,15 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Ent
             let version = version
                 .filter(|v| !v.is_empty())
                 .context("S3 version listing omitted version ID")?;
+            if exact && key != prefix {
+                past_exact = true;
+                continue;
+            }
             entries.push(Entry {
                 key: key.into(),
                 version: Some(version.into()),
                 marker,
+                latest,
                 selector: 0,
             });
         }
@@ -111,6 +119,18 @@ async fn versions(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Ent
                 .context("truncated S3 version listing omitted key marker")?
                 .to_owned(),
         );
+        // Later keys or rolled-up prefixes mean this page passed the exact
+        // key. Do not interpret continuation markers: providers may encode
+        // additional state in them (including MinIO's listing cache identity).
+        if exact
+            && (past_exact
+                || output.common_prefixes().iter().any(|p| {
+                    p.prefix()
+                        .is_some_and(|p| p.starts_with(prefix) && p != prefix)
+                }))
+        {
+            break;
+        }
         version_marker = output.next_version_id_marker().map(str::to_owned);
         anyhow::ensure!(
             seen.insert((key_marker.clone(), version_marker.clone())),
@@ -163,27 +183,52 @@ async fn plan(
         );
         anyhow::ensure!(!key.is_empty() || location.selection == SourceSelection::Contents, "select bucket contents explicitly with --srcs-in .; S3 removal does not remove buckets");
         let use_versions = args.s3_remove.s3_all_versions || exact_version.is_some();
-        let mut listed = if use_versions {
-            versions(client, bucket, &key).await?
+        let mut listed = if use_versions && !key.is_empty() {
+            versions(client, bucket, &key, true).await?
         } else {
             Vec::new()
         };
-        let exact = !key.is_empty()
-            && if use_versions {
-                listed.iter().any(|e| {
-                    e.key == key && exact_version.is_none_or(|id| e.version.as_deref() == Some(id))
-                })
-            } else {
-                present(client, bucket, &key).await?
-            };
-        anyhow::ensure!(
-            !(directory && exact),
-            "S3 directory selector conflicts with exact object {key:?}"
-        );
         let prefix = if key.is_empty() {
             String::new()
         } else {
             format!("{key}/")
+        };
+        let live_exact = !key.is_empty()
+            && if use_versions {
+                listed.iter().any(|e| e.key == key && e.latest && !e.marker)
+            } else {
+                present(client, bucket, &key).await?
+            };
+        anyhow::ensure!(
+            !(directory && live_exact),
+            "S3 directory selector conflicts with exact object {key:?}"
+        );
+        if use_versions
+            && exact_version.is_none()
+            && !live_exact
+            && (location.selection != SourceSelection::File || listed.is_empty())
+        {
+            listed.extend(versions(client, bucket, &prefix, false).await?);
+        }
+        let exact = if use_versions && !key.is_empty() {
+            if let Some(id) = exact_version {
+                listed
+                    .iter()
+                    .any(|e| e.key == key && e.version.as_deref() == Some(id))
+            } else {
+                // Resolve the current view first. Historical exact keys remain
+                // addressable when nothing live wins, or when explicitly typed.
+                let historical_exact = listed.iter().any(|e| e.key == key);
+                let live_tree = listed
+                    .iter()
+                    .any(|e| e.key.starts_with(&prefix) && e.latest && !e.marker);
+                live_exact
+                    || (!directory
+                        && historical_exact
+                        && (location.selection == SourceSelection::File || !live_tree))
+            }
+        } else {
+            live_exact
         };
         let is_tree =
             exact_version.is_none() && !exact && location.selection != SourceSelection::File;
@@ -191,10 +236,7 @@ async fn plan(
             let has_children = if use_versions {
                 listed.iter().any(|e| e.key.starts_with(&prefix))
             } else {
-                !client::list(client, bucket, &prefix, None, &mut HashSet::new())
-                    .await?
-                    .objects
-                    .is_empty()
+                client::prefix_exists(client, bucket, &prefix).await?
             };
             anyhow::ensure!(
                 !has_children,
@@ -212,6 +254,7 @@ async fn plan(
                         key,
                         version: None,
                         marker: false,
+                        latest: true,
                         selector: 0,
                     })
                     .collect();
@@ -236,6 +279,7 @@ async fn plan(
                     key: key.clone(),
                     version: None,
                     marker: false,
+                    latest: true,
                     selector: 0,
                 });
             }
@@ -267,6 +311,29 @@ async fn plan(
     // Retain delete markers until all selected data versions have been removed.
     entries.sort_by_key(|e| e.marker);
     Ok(entries)
+}
+
+fn failure_classification(
+    code: Option<&str>,
+    status: Option<u16>,
+) -> (&'static str, &'static str, Option<&'static str>) {
+    match code {
+        Some("AccessDenied" | "InvalidAccessKeyId" | "SignatureDoesNotMatch") => {
+            ("io", "no", Some("permission_denied"))
+        }
+        Some("NoSuchBucket") => ("io", "no", Some("not_found")),
+        Some("InvalidArgument" | "InvalidRequest" | "InvalidBucketName") => {
+            ("usage", "no", Some("invalid_input"))
+        }
+        Some("SlowDown" | "Throttling" | "ThrottlingException" | "RequestTimeout") => {
+            ("transport", "yes", None)
+        }
+        _ => match status {
+            Some(403) => ("io", "no", Some("permission_denied")),
+            Some(429 | 500 | 502 | 503 | 504) => ("transport", "yes", None),
+            _ => ("transport", "unknown", None),
+        },
+    }
 }
 
 pub(super) fn run(args: Args) -> Result<i32> {
@@ -311,6 +378,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 if progress.results_writer().is_some_and(|w| w.is_dead()) {
                     bail!("S3 removal result stream became unavailable");
                 }
+                let mut failure = ("transport", "unknown", None);
                 let result = if args.dry_run {
                     Ok(())
                 } else {
@@ -322,7 +390,13 @@ pub(super) fn run(args: Args) -> Result<i32> {
                         .send()
                         .await
                         .map(|_| ())
-                        .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                        .map_err(|e| {
+                            failure = failure_classification(
+                                e.as_service_error().and_then(|e| e.code()),
+                                e.raw_response().map(|r| r.status().as_u16()),
+                            );
+                            anyhow::anyhow!(e.into_service_error())
+                        })
                 };
                 let message = result
                     .as_ref()
@@ -365,9 +439,9 @@ pub(super) fn run(args: Args) -> Result<i32> {
                         kind: Some(entry.kind()),
                         disposition: if result.is_ok() { "removed" } else { "failed" },
                         attempts: Some(1),
-                        retryable: message.as_ref().map(|_| "unknown"),
-                        class: message.as_ref().map(|_| "transport"),
-                        os_kind: None,
+                        retryable: message.as_ref().map(|_| failure.1),
+                        class: message.as_ref().map(|_| failure.0),
+                        os_kind: failure.2,
                         message: message.as_deref(),
                     };
                     let version = entry.version.as_deref().map(|v| (v, entry.marker));
