@@ -153,23 +153,8 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
 
 #[cfg(debug_assertions)]
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
-    wait_for_confinement_marker_with_timeout(
-        child,
-        marker,
-        stage,
-        std::time::Duration::from_secs(5),
-    );
-}
-
-#[cfg(debug_assertions)]
-fn wait_for_confinement_marker_with_timeout(
-    child: &mut std::process::Child,
-    marker: &Path,
-    stage: &str,
-    timeout: std::time::Duration,
-) {
     let started = std::time::Instant::now();
-    let deadline = started + timeout;
+    let deadline = started + std::time::Duration::from_secs(5);
     let mut next_progress = started + std::time::Duration::from_secs(1);
     loop {
         let status = child.try_wait().unwrap();
@@ -21701,6 +21686,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "--as",
                     &t.s("out"),
                 ])
+                .process_group(0)
                 .env(ready_env, &ready)
                 .env(continue_env, &continuation)
                 // This barrier covers the second complete copy, including
@@ -21709,16 +21695,42 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            // Preparing the retained basis hashes the multi-block fixture.
-            // This bounds a deadlock, not hashing speed on a loaded runner.
-            wait_for_confinement_marker_with_timeout(
-                &mut first,
-                &ready,
-                &format!(
-                    "overlapping copy preparation (identical={identical}, existing={existing})"
-                ),
-                std::time::Duration::from_secs(60),
+            let preparing = std::time::Instant::now();
+            let stage = format!(
+                "overlapping copy preparation (identical={identical}, existing={existing})"
             );
+            let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_for_confinement_marker(&mut first, &ready, &stage);
+            }));
+            eprintln!(
+                "{stage}: elapsed={:?}, ready={}",
+                preparing.elapsed(),
+                ready.exists()
+            );
+            if let Err(panic) = waited {
+                #[cfg(target_os = "macos")]
+                {
+                    let sample_path = t.path("preparation.sample");
+                    let sample = Command::new("/usr/bin/sample")
+                        .arg(first.id().to_string())
+                        .args(["1", "-file"])
+                        .arg(&sample_path)
+                        .run();
+                    eprintln!("stack sampler: {sample:?}");
+                    eprintln!("{}", fs::read_to_string(sample_path).unwrap_or_default());
+                }
+                eprintln!(
+                    "after diagnostics: elapsed={:?}, ready={}",
+                    preparing.elapsed(),
+                    ready.exists()
+                );
+                // The test owns this process group, including any local helpers.
+                unsafe {
+                    libc::kill(-(first.id() as i32), libc::SIGKILL);
+                }
+                eprintln!("first copy output: {:?}", first.wait_with_output());
+                std::panic::resume_unwind(panic);
+            }
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
