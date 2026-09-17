@@ -3,28 +3,30 @@
 # requires-python = ">=3.10"
 # dependencies = ["syq", "pyyaml"]
 # ///
-"""Push and pull DVC-tracked data with syq.
+"""Pull and push DVC-tracked data with syq.
 
-DVC stores each tracked file in its remote under a path derived from the
-file's MD5, and describes a tracked directory with a small `.dir` object
-listing the files inside it. This script reads the `.dvc` files and
-`dvc.lock` in a repository, works out which objects each command needs, and
-hands syq one mapping per copy instead of moving objects one at a time.
+    dvc_syq.py pull  [targets]   # download missing objects, then write the workspace
+    dvc_syq.py fetch [targets]   # download into DVC's cache only
+    dvc_syq.py push  [targets]   # upload objects the remote lacks
 
-    dvc_syq.py pull            # fetch missing objects, then check out the workspace
-    dvc_syq.py fetch           # fetch into the cache only
-    dvc_syq.py push            # upload objects the remote lacks
+How DVC stores data, which is all this script relies on:
 
-Supported remotes: local directories, `ssh://host/path`, and
-`s3://bucket/prefix`. Objects written by DVC 3 are verified against their MD5
-as they arrive. Objects tracked by DVC 2 use a different cache layout and, for
-text files, a different MD5; they are copied without a digest check.
+* A `.dvc` file (or `dvc.lock`) lists tracked outputs: a path and an MD5.
+* DVC's cache holds one object per file, at a path made from its MD5. A DVC
+  remote uses exactly the same layout, so an object has the same relative
+  path in both places.
+* A tracked directory's MD5 ends in `.dir`. That object is a JSON list of the
+  files inside: `[{"md5": ..., "relpath": ...}, ...]`.
+
+So every copy is known before it starts. Each step below builds a list of
+(source, destination) pairs and gives the whole list to syq in one call.
 """
 
 from __future__ import annotations
 
 import argparse
 import configparser
+import filecmp
 import json
 import os
 import sys
@@ -32,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
@@ -42,162 +44,182 @@ import syq
 try:
     from syq import Digest, MappingEntry
 except ImportError:
-    sys.exit("error: this script needs a syq package newer than 0.6.0 (per-file expected digests)")
+    sys.exit("error: this script needs a syq package newer than 0.6.0")
+
+
+# --- DVC's data model -------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Out:
-    """One tracked output: a file or a directory."""
+class CacheObject:
+    """One object in the cache or a remote, named by its MD5."""
 
-    path: PurePosixPath  # relative to the repository root
-    md5: str  # ends with ".dir" for a directory
-    legacy: bool  # DVC 2 object: top-level cache layout, no digest check
+    md5: str  # ends with ".dir" when the object is a directory listing
+    legacy: bool  # written by DVC 2
 
     @property
-    def is_dir(self) -> bool:
+    def is_listing(self) -> bool:
         return self.md5.endswith(".dir")
+
+    @property
+    def path(self) -> str:
+        """Relative path, identical in the cache and in every remote."""
+        tail = f"{self.md5[:2]}/{self.md5[2:]}"
+        return tail if self.legacy else f"files/md5/{tail}"
+
+    @property
+    def expected_digest(self) -> Digest | None:
+        """The MD5 the object's bytes must have, when that is knowable.
+
+        DVC 2 hashed text files after normalizing their line endings, so the
+        name of a DVC 2 file object is not reliably the MD5 of its bytes.
+        """
+        if self.legacy and not self.is_listing:
+            return None
+        return Digest("md5", self.md5.removesuffix(".dir"))
+
+
+@dataclass(frozen=True)
+class Output:
+    """One tracked path in the workspace and the object holding its contents."""
+
+    path: str  # relative to the repository root
+    object: CacheObject
+
+
+def read_outputs(root: Path, dvc_file: Path) -> list[Output]:
+    """Tracked outputs listed in one `.dvc` file or `dvc.lock`."""
+    try:
+        # BaseLoader keeps every value as text; an all-digit MD5 must not become a number.
+        data = yaml.load(dvc_file.read_text(), Loader=yaml.BaseLoader) or {}
+    except (OSError, yaml.YAMLError) as error:
+        sys.exit(f"error: cannot read {dvc_file}: {error}")
+    stages = data.get("stages", {}).values() if dvc_file.name == "dvc.lock" else [data]
+    outputs = []
+    for stage in stages:
+        if any("repo" in dependency for dependency in stage.get("deps") or []):
+            # `dvc import` data lives in the source repository's remote, not this one.
+            print(f"skipping {dvc_file.relative_to(root)}: imported from another repository; use dvc pull")
+            continue
+        directory = dvc_file.parent / stage.get("wdir", ".")
+        for out in stage.get("outs") or []:
+            if "md5" not in out:
+                continue  # not cached, for example `cache: false`
+            path = (directory / out["path"]).resolve().relative_to(root.resolve())
+            # DVC 3 marks its objects with `hash: md5`; DVC 2 wrote no such field.
+            outputs.append(Output(path.as_posix(), CacheObject(out["md5"], legacy=out.get("hash") != "md5")))
+    return outputs
+
+
+def find_outputs(root: Path, targets: list[str]) -> list[Output]:
+    """Outputs of the named targets, or of every DVC file in the repository."""
+    dvc_files = []
+    for target in targets:
+        for candidate in (Path(target), Path(f"{target}.dvc")):
+            if candidate.is_file() and (candidate.suffix == ".dvc" or candidate.name == "dvc.lock"):
+                dvc_files.append(candidate.resolve())
+                break
+        else:
+            sys.exit(f"error: {target} is not a .dvc file, dvc.lock, or tracked path")
+    if not targets:
+        for directory, subdirectories, names in os.walk(root):
+            subdirectories[:] = [d for d in subdirectories if d not in (".git", ".dvc")]
+            dvc_files += [Path(directory) / n for n in names if n.endswith(".dvc") or n == "dvc.lock"]
+    outputs = [output for dvc_file in sorted(dvc_files) for output in read_outputs(root, dvc_file)]
+    if not outputs:
+        sys.exit("error: no tracked outputs found")
+    return outputs
+
+
+def read_listing(cache: Path, listing: CacheObject) -> list[tuple[str, CacheObject]]:
+    """(relative path, object) for each file in a tracked directory."""
+    try:
+        entries = json.loads((cache / listing.path).read_bytes())
+    except (OSError, ValueError) as error:
+        sys.exit(f"error: cannot read directory listing {listing.path}: {error}")
+    return [(entry["relpath"], CacheObject(entry["md5"], listing.legacy)) for entry in entries]
+
+
+def files_of(cache: Path, outputs: list[Output]) -> list[tuple[str, CacheObject]]:
+    """(workspace path, object) for every tracked file, expanding directories."""
+    files = []
+    for output in outputs:
+        if output.object.is_listing:
+            files += [(f"{output.path}/{relpath}", obj) for relpath, obj in read_listing(cache, output.object)]
+        else:
+            files.append((output.path, output.object))
+    return files
+
+
+# --- The DVC remote ---------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Remote:
-    kind: str  # "local", "ssh", or "s3"
-    endpoint: str | None  # syq --from/--to value, None for local
-    base: str  # directory or key prefix holding the objects ("" for none)
-    options: dict[str, str]
+    endpoint: str | None  # what syq's --from/--to take: a host, "s3://bucket", or None for local
+    base: str  # directory or key prefix holding the objects; "" for a bucket's root
+    s3_options: dict[str, str]
+
+    @property
+    def is_s3(self) -> bool:
+        return self.endpoint is not None and self.endpoint.startswith("s3://")
 
 
-def object_path(md5: str, legacy: bool) -> str:
-    """Relative path of an object in the cache and in every DVC remote."""
-    tail = f"{md5[:2]}/{md5[2:]}"
-    return tail if legacy else f"files/md5/{tail}"
+def read_remote(root: Path, config: configparser.ConfigParser, name: str | None) -> Remote:
+    name = name or config.get("core", "remote", fallback=None)
+    if name is None:
+        sys.exit("error: no default remote; pass --remote NAME")
+    # DVC writes the section header as ['remote "name"'], quotes included.
+    section = next((s for s in config.sections() if s.strip("'") == f'remote "{name}"'), None)
+    if section is None:
+        sys.exit(f"error: remote {name!r} is not configured")
+    settings = config[section]
+    if settings.get("version_aware") or settings.get("worktree"):
+        sys.exit(f"error: remote {name!r} uses DVC cloud versioning, which stores files differently; use dvc")
+
+    url = urlparse(settings["url"])
+    if url.scheme == "s3":
+        names = {"endpointurl": "s3_endpoint", "profile": "s3_profile", "region": "s3_region"}
+        options = {names[key]: settings[key] for key in names if settings.get(key)}
+        custom_endpoint = "s3_endpoint" in options or any(
+            os.environ.get(variable) for variable in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+        )
+        if "s3_region" not in options and not custom_endpoint:
+            region = aws_bucket_region(url.netloc)
+            if region:
+                options["s3_region"] = region
+        return Remote(f"s3://{url.netloc}", url.path.strip("/"), options)
+    if url.scheme == "ssh":
+        if url.port is not None:
+            sys.exit("error: ssh remotes with an explicit port are not supported")
+        host = f"{url.username}@{url.hostname}" if url.username else url.hostname
+        return Remote(host, url.path or ".", {})
+    if url.scheme in ("", "file"):
+        path = Path(url.path)
+        if not path.is_absolute():
+            path = root / ".dvc" / path  # DVC resolves relative remotes from its config file
+        return Remote(None, str(path.resolve()), {})
+    sys.exit(f"error: remote {name!r} uses {url.scheme}://, which this script does not support")
 
 
-def find_repo_root(start: Path) -> Path:
-    for candidate in [start, *start.parents]:
-        if (candidate / ".dvc").is_dir():
-            return candidate
-    sys.exit(f"error: no .dvc directory above {start}")
+def aws_bucket_region(bucket: str) -> str | None:
+    """Region of an AWS bucket, which S3 names in a header on every response.
 
-
-def read_config(root: Path) -> configparser.ConfigParser:
-    config = configparser.ConfigParser()
-    config.read([root / ".dvc" / "config", root / ".dvc" / "config.local"])
-    return config
-
-
-def cache_dir(root: Path, config: configparser.ConfigParser) -> Path:
-    configured = config.get("cache", "dir", fallback=None)
-    if configured is None:
-        return root / ".dvc" / "cache"
-    return (root / ".dvc" / configured).resolve()
-
-
-def bucket_region(bucket: str) -> str | None:
-    """Region of an AWS bucket, from the header S3 adds to every response.
-
-    syq signs requests for one region and does not follow S3's redirect to
-    another, so a bucket outside the configured region would otherwise fail.
+    DVC users rarely configure a region because DVC's S3 library follows
+    S3's cross-region redirects by itself.
     """
     request = urllib.request.Request(f"https://s3.amazonaws.com/{bucket}", method="HEAD")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             headers = response.headers
     except urllib.error.HTTPError as error:
-        headers = error.headers  # 301 and 403 responses carry the header too
+        headers = error.headers  # redirects and denials carry the header too
     except OSError:
         return None
     return headers.get("x-amz-bucket-region")
 
 
-def parse_remote(root: Path, config: configparser.ConfigParser, name: str | None) -> Remote:
-    name = name or config.get("core", "remote", fallback=None)
-    if name is None:
-        sys.exit("error: no default remote; pass --remote NAME")
-    # DVC writes remote sections as ['remote "name"'], quotes included.
-    section = next(
-        (s for s in config.sections() if s.strip("'") == f'remote "{name}"'), None
-    )
-    if section is None:
-        sys.exit(f"error: remote {name!r} is not configured")
-    url = config.get(section, "url")
-    parsed = urlparse(url)
-    options: dict[str, str] = {}
-    if parsed.scheme == "s3":
-        for key, option in (("endpointurl", "s3_endpoint"), ("profile", "s3_profile"), ("region", "s3_region")):
-            value = config.get(section, key, fallback=None)
-            if value:
-                options[option] = value
-        custom_endpoint = "s3_endpoint" in options or any(
-            os.environ.get(name) for name in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-        )
-        if "s3_region" not in options and not custom_endpoint:
-            region = bucket_region(parsed.netloc)
-            if region:
-                options["s3_region"] = region
-        return Remote("s3", f"s3://{parsed.netloc}", parsed.path.strip("/"), options)
-    if parsed.scheme == "ssh":
-        if parsed.port is not None:
-            sys.exit("error: ssh remotes with an explicit port are not supported by this script")
-        host = parsed.hostname or ""
-        if parsed.username:
-            host = f"{parsed.username}@{host}"
-        return Remote("ssh", host, parsed.path or ".", options)
-    if parsed.scheme in ("", "file"):
-        path = Path(parsed.path if parsed.scheme else url)
-        if not path.is_absolute():
-            path = root / ".dvc" / path
-        return Remote("local", None, str(path.resolve()), options)
-    sys.exit(f"error: remote {name!r} uses {parsed.scheme}://, which this script does not support")
-
-
-def parse_outs(root: Path, file: Path) -> list[Out]:
-    """Tracked outputs of one `.dvc` file or `dvc.lock`."""
-    try:
-        # BaseLoader keeps every scalar as text; an all-digit MD5 must not become a number.
-        data = yaml.load(file.read_text(), Loader=yaml.BaseLoader) or {}
-    except (OSError, yaml.YAMLError) as error:
-        sys.exit(f"error: cannot read {file}: {error}")
-    stages = data.get("stages", {}).values() if file.name == "dvc.lock" else [data]
-    outs: list[Out] = []
-    for stage in stages:
-        base = file.parent / stage.get("wdir", ".")
-        for out in stage.get("outs", []) or []:
-            md5 = out.get("md5")
-            if md5 is None:
-                continue  # an output without a hash is not in the cache
-            relative = (base / out["path"]).resolve().relative_to(root.resolve())
-            outs.append(Out(PurePosixPath(relative.as_posix()), md5, out.get("hash") != "md5"))
-    return outs
-
-
-def collect_outs(root: Path, targets: list[str]) -> list[Out]:
-    files: list[Path] = []
-    if targets:
-        for target in targets:
-            path = Path(target)
-            if path.is_file() and (path.suffix == ".dvc" or path.name == "dvc.lock"):
-                files.append(path)
-            elif (Path(f"{target}.dvc")).is_file():
-                files.append(Path(f"{target}.dvc"))
-            else:
-                sys.exit(f"error: {target} is not a .dvc file, dvc.lock, or tracked path")
-    else:
-        for directory, names, filenames in os.walk(root):
-            names[:] = [n for n in names if n not in (".git", ".dvc")]
-            files.extend(Path(directory) / f for f in filenames if f.endswith(".dvc") or f == "dvc.lock")
-    outs = [out for file in sorted(files) for out in parse_outs(root, file)]
-    if not outs:
-        sys.exit("error: no tracked outputs found")
-    return outs
-
-
-def read_dir_object(cache: Path, out: Out) -> list[tuple[str, str]]:
-    """(relpath, md5) pairs listed by a directory's `.dir` object."""
-    try:
-        entries = json.loads((cache / object_path(out.md5, out.legacy)).read_bytes())
-    except (OSError, ValueError) as error:
-        sys.exit(f"error: cannot read directory listing for {out.path}: {error}")
-    return [(entry["relpath"], entry["md5"]) for entry in entries]
+# --- Copying ----------------------------------------------------------------
 
 
 class ProgressLine:
@@ -227,171 +249,125 @@ class ProgressLine:
             sys.stderr.flush()
 
 
-class Transfer:
-    """Runs one mapping copy in each direction between the cache and the remote."""
-
-    def __init__(self, client: syq.Client, remote: Remote, cache: Path, dry_run: bool) -> None:
-        self.client = client
-        self.remote = remote
-        self.cache = cache
-        self.dry_run = dry_run
-
-    def remote_source(self, relative: str) -> str:
-        """Object path as a mapping source when copying from the remote."""
-        if self.remote.kind == "s3" and self.remote.base:
-            return f"{self.remote.base}/{relative}"
-        return relative
-
-    def download(self, objects: list[tuple[str, bool, str | None]], label: str) -> None:
-        """objects: (relative object path, legacy, md5 or None) tuples."""
-        if not objects:
-            print(f"{label}: nothing to fetch")
-            return
-        entries = [
-            MappingEntry(
-                src=self.remote_source(relative), dst=relative, kind="file",
-                expected_digest=None if legacy or md5 is None else Digest("md5", md5),
-            )
-            for relative, legacy, md5 in objects
-        ]
-        print(f"{label}: fetching {len(entries)} objects")
-        options: dict[str, object] = {}
-        if self.remote.kind == "s3":
-            options["from_"] = self.remote.endpoint
-        elif self.remote.kind == "ssh":
-            options["from_"] = self.remote.endpoint
-            options["cwd"] = self.remote.base
-        else:
-            options["cwd"] = self.remote.base
-        self.run(entries, into=self.cache, label=label, **options)
-
-    def upload(self, objects: list[str], label: str) -> None:
-        entries = [MappingEntry(src=relative, dst=relative, kind="file") for relative in objects]
-        print(f"{label}: offering {len(entries)} objects")
-        options: dict[str, object] = {"cwd": self.cache}
-        if self.remote.kind == "local":
-            into: str = self.remote.base
-        else:
-            options["to"] = self.remote.endpoint
-            into = self.remote.base or "."
-        self.run(entries, into=into, label=label, **options)
-
-    def run(self, entries: list[MappingEntry], *, label: str, **options: object) -> None:
-        started = time.monotonic()
-        progress = ProgressLine(label)
-        try:
-            result = self.client.cp(
-                mapping=entries, only_new=True, dry_run=self.dry_run, on_event=progress,
-                **self.remote.options, **options,
-            )
-        except syq.SyqOperationError as error:
-            progress.clear()
-            print(f"{label}: {error.result.errors} objects failed", file=sys.stderr)
-            print(error.stderr.decode(errors="replace"), file=sys.stderr)
-            sys.exit(23)
-        progress.clear()
-        seconds = time.monotonic() - started
-        rate = result.bytes_transferred / seconds / 1e6 if seconds else 0.0
-        print(
-            f"{label}: {result.files_transferred} copied, {result.files_unchanged} already present, "
-            f"{result.bytes_transferred / 1e6:.1f} MB in {seconds:.1f}s ({rate:.1f} MB/s)"
-        )
-
-
-def checkout(client: syq.Client, root: Path, cache: Path, outs: list[Out], dry_run: bool) -> None:
-    entries: list[MappingEntry] = []
-    for out in outs:
-        if out.is_dir:
-            for relpath, md5 in read_dir_object(cache, out):
-                entries.append(MappingEntry(src=object_path(md5, out.legacy), dst=str(out.path / relpath), kind="file"))
-        else:
-            entries.append(MappingEntry(src=object_path(out.md5, out.legacy), dst=str(out.path), kind="file"))
-    print(f"checkout: {len(entries)} files")
-    progress = ProgressLine("checkout")
+def copy(client: syq.Client, label: str, entries: list[MappingEntry], **options: object) -> None:
+    """Give syq one list of copies, show progress, and report the outcome."""
+    if not entries:
+        print(f"{label}: nothing to do")
+        return
+    progress = ProgressLine(label)
+    started = time.monotonic()
     try:
-        result = client.cp(mapping=entries, cwd=cache, into=root, dry_run=dry_run, on_event=progress)
+        result = client.cp(mapping=entries, on_event=progress, **options)
     except syq.SyqOperationError as error:
         progress.clear()
-        print(f"checkout: {error.result.errors} files failed", file=sys.stderr)
+        print(f"{label}: {error.result.errors} of {len(entries)} failed", file=sys.stderr)
         print(error.stderr.decode(errors="replace"), file=sys.stderr)
         sys.exit(23)
     progress.clear()
-    print(f"checkout: {result.files_transferred} written, {result.files_unchanged} unchanged")
+    seconds = time.monotonic() - started
+    print(
+        f"{label}: {result.files_transferred} copied, {result.files_unchanged} already in place, "
+        f"{result.bytes_transferred / 1e6:.1f} MB in {seconds:.1f}s"
+    )
 
 
-def pull(args: argparse.Namespace, *, checkout_after: bool) -> None:
-    root, cache, outs, transfer = setup(args)
-    dirs = [out for out in outs if out.is_dir]
-    missing = [
-        (object_path(out.md5, out.legacy), out.legacy, None)
-        for out in dirs
-        if not (cache / object_path(out.md5, out.legacy)).exists()
+def download(client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject], dry_run: bool) -> None:
+    """Remote to cache. The path is the same on both sides; S3 keys also carry the prefix."""
+    prefix = f"{remote.base}/" if remote.is_s3 and remote.base else ""
+    entries = [
+        MappingEntry(src=prefix + obj.path, dst=obj.path, kind="file", expected_digest=obj.expected_digest)
+        for obj in objects
     ]
-    transfer.download(sorted(set(missing)), "directory listings")
-    if args.dry_run and missing:
-        print("dry run: directory contents are unknown until their listings are fetched")
+    source = {"from_": remote.endpoint} if remote.endpoint else {}
+    if not remote.is_s3:
+        source["cwd"] = remote.base
+    copy(client, label, entries, into=cache, only_new=True, dry_run=dry_run, **source, **remote.s3_options)
+
+
+def upload(client: syq.Client, remote: Remote, cache: Path, label: str, objects: list[CacheObject], dry_run: bool) -> None:
+    """Cache to remote. `only_new` skips every object the remote already has."""
+    entries = [MappingEntry(src=obj.path, dst=obj.path, kind="file") for obj in objects]
+    destination = {"to": remote.endpoint} if remote.endpoint else {}
+    copy(
+        client, label, entries, cwd=cache, into=remote.base or ".", only_new=True, dry_run=dry_run,
+        **destination, **remote.s3_options,
+    )
+
+
+def checkout(client: syq.Client, root: Path, cache: Path, outputs: list[Output], dry_run: bool, force: bool) -> None:
+    """Cache to workspace. This is where objects get their real names."""
+    entries = [MappingEntry(src=obj.path, dst=path, kind="file") for path, obj in files_of(cache, outputs)]
+    if not force and not dry_run:
+        # Like DVC, refuse to replace a file whose contents differ from the tracked version.
+        # Matching size and modification time settle most files without reading them.
+        modified = [
+            str(entry.dst)
+            for entry in entries
+            if (root / str(entry.dst)).is_file()
+            and not filecmp.cmp(root / str(entry.dst), cache / str(entry.src), shallow=True)
+            and not filecmp.cmp(root / str(entry.dst), cache / str(entry.src), shallow=False)
+        ]
+        if modified:
+            shown = "\n  ".join(modified[:10])
+            sys.exit(f"error: {len(modified)} files have local changes; use --force to replace them\n  {shown}")
+    copy(client, "checkout", entries, cwd=cache, into=root, dry_run=dry_run)
+
+
+# --- Commands ---------------------------------------------------------------
+
+
+def pull(client: syq.Client, root: Path, cache: Path, remote: Remote, outputs: list[Output], args: argparse.Namespace) -> None:
+    # Directory listings first: the files inside a directory are unknown until its listing is here.
+    listings = {o.object for o in outputs if o.object.is_listing and not (cache / o.object.path).exists()}
+    download(client, remote, cache, "directory listings", sorted(listings, key=lambda o: o.md5), args.dry_run)
+    if listings and args.dry_run:
+        print("dry run: the files inside those directories are unknown until their listings are downloaded")
         return
-    wanted: dict[str, tuple[bool, str]] = {}
-    for out in outs:
-        if out.is_dir:
-            for _, md5 in read_dir_object(cache, out):
-                wanted[object_path(md5, out.legacy)] = (out.legacy, md5)
-        else:
-            wanted[object_path(out.md5, out.legacy)] = (out.legacy, out.md5)
-    files = [
-        (relative, legacy, md5)
-        for relative, (legacy, md5) in sorted(wanted.items())
-        if not (cache / relative).exists()
-    ]
-    print(f"{len(wanted)} tracked files, {len(files)} not in the cache")
-    transfer.download(files, "files")
-    if checkout_after:
-        checkout(transfer.client, root, cache, outs, args.dry_run)
+
+    wanted = {obj for _, obj in files_of(cache, outputs)}
+    missing = sorted((obj for obj in wanted if not (cache / obj.path).exists()), key=lambda o: o.md5)
+    print(f"{len(wanted)} tracked files, {len(missing)} not in the cache")
+    download(client, remote, cache, "files", missing, args.dry_run)
+
+    if args.command == "pull":
+        checkout(client, root, cache, outputs, args.dry_run, args.force)
 
 
-def push(args: argparse.Namespace) -> None:
-    _, cache, outs, transfer = setup(args)
-    objects: set[str] = set()
-    listings: set[str] = set()
-    for out in outs:
-        if out.is_dir:
-            listings.add(object_path(out.md5, out.legacy))
-            for _, md5 in read_dir_object(cache, out):
-                objects.add(object_path(md5, out.legacy))
-        else:
-            objects.add(object_path(out.md5, out.legacy))
-    absent = sorted(o for o in objects if not (cache / o).exists())
+def push(client: syq.Client, cache: Path, remote: Remote, outputs: list[Output], args: argparse.Namespace) -> None:
+    files = {obj for _, obj in files_of(cache, outputs)}
+    listings = {o.object for o in outputs if o.object.is_listing}
+    absent = sorted(obj.path for obj in files | listings if not (cache / obj.path).exists())
     if absent:
         sys.exit(f"error: {len(absent)} tracked objects are not in the local cache, for example {absent[0]}")
-    transfer.upload(sorted(objects), "files")
-    if listings:
-        transfer.upload(sorted(listings), "directory listings")
-
-
-def setup(args: argparse.Namespace) -> tuple[Path, Path, list[Out], Transfer]:
-    root = find_repo_root(Path.cwd())
-    config = read_config(root)
-    cache = cache_dir(root, config)
-    remote = parse_remote(root, config, args.remote)
-    outs = collect_outs(root, args.targets)
-    # Default to the executable bundled with the syq package, not one on PATH.
-    client = syq.Client(executable=args.syq or os.environ.get("SYQ_EXECUTABLE"))
-    print(f"remote {remote.kind}: {remote.endpoint or ''}{'/' if remote.endpoint else ''}{remote.base}")
-    return root, cache, outs, Transfer(client, remote, cache, args.dry_run)
+    # Listings go last, so a directory never appears in the remote before its files.
+    upload(client, remote, cache, "files", sorted(files, key=lambda o: o.md5), args.dry_run)
+    upload(client, remote, cache, "directory listings", sorted(listings, key=lambda o: o.md5), args.dry_run)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Push and pull DVC data with syq.")
+    parser = argparse.ArgumentParser(description="Pull and push DVC data with syq.")
     parser.add_argument("command", choices=["pull", "fetch", "push"])
     parser.add_argument("targets", nargs="*", help=".dvc files, dvc.lock, or tracked paths (default: all)")
-    parser.add_argument("--remote", help="DVC remote name (default: core.remote)")
-    parser.add_argument("--dry-run", action="store_true", help="plan without copying")
-    parser.add_argument("--syq", help="syq executable (default: $SYQ_EXECUTABLE, then the syq package's own)")
+    parser.add_argument("--remote", help="DVC remote name (default: the repository's default remote)")
+    parser.add_argument("--dry-run", action="store_true", help="show what would be copied")
+    parser.add_argument("--force", action="store_true", help="let pull replace files that have local changes")
+    parser.add_argument("--syq", help="syq executable (default: the one installed with the syq package)")
     args = parser.parse_args()
+
+    root = next((d for d in [Path.cwd(), *Path.cwd().parents] if (d / ".dvc").is_dir()), None)
+    if root is None:
+        sys.exit("error: not inside a DVC repository")
+    config = configparser.ConfigParser()
+    config.read([root / ".dvc" / "config", root / ".dvc" / "config.local"])
+    cache = (root / ".dvc" / config.get("cache", "dir", fallback="cache")).resolve()
+    remote = read_remote(root, config, args.remote)
+    outputs = find_outputs(root, args.targets)
+    client = syq.Client(executable=args.syq or os.environ.get("SYQ_EXECUTABLE"))
+
     if args.command == "push":
-        push(args)
+        push(client, cache, remote, outputs, args)
     else:
-        pull(args, checkout_after=args.command == "pull")
+        pull(client, root, cache, remote, outputs, args)
 
 
 if __name__ == "__main__":

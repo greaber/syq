@@ -84,9 +84,34 @@ class DvcExample(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("0 not in the cache", again.stdout)
 
+        (self.repo / "data" / "a.txt").write_bytes(b"edited locally\n")
+        refused = self.run_example("pull")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("data/a.txt", refused.stderr)
+        self.assertEqual((self.repo / "data" / "a.txt").read_bytes(), b"edited locally\n")
+        forced = self.run_example("pull", "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertEqual((self.repo / "data" / "a.txt").read_bytes(), FILES["data/a.txt"])
+
         pushed = self.run_example("push", "--remote", "second")
         self.assertEqual(pushed.returncode, 0, pushed.stderr)
         self.assertEqual(tree(self.second), tree(self.remote))
+
+    def test_imported_data_is_left_to_dvc(self) -> None:
+        (self.repo / "imported.dvc").write_text(
+            "deps:\n- path: x\n  repo:\n    url: https://example.invalid/registry\n"
+            "outs:\n- md5: 00000000000000000000000000000000\n  hash: md5\n  path: imported\n"
+        )
+        pulled = self.run_example("pull")
+        self.assertEqual(pulled.returncode, 0, pulled.stderr)
+        self.assertIn("skipping imported.dvc", pulled.stdout)
+        self.assertFalse((self.repo / "imported").exists())
+
+    def test_a_corrupt_directory_listing_is_rejected(self) -> None:
+        listing = next(self.remote.rglob("*.dir"))
+        listing.write_bytes(b"[]")
+        pulled = self.run_example("fetch")
+        self.assertEqual(pulled.returncode, 23, pulled.stdout + pulled.stderr)
 
     def test_a_corrupt_object_fails_only_its_own_file(self) -> None:
         store(self.remote, md5(FILES["model.bin"]), b"not the model")

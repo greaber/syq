@@ -1,15 +1,15 @@
 # Pull and push DVC data
 
-[DVC](https://dvc.org) keeps large files out of Git. It stores each tracked
-file in a remote, such as an S3 bucket, under a name made from the file's MD5,
-and commits small `.dvc` files that record those hashes. A tracked directory
-gets one extra object listing the files inside it.
-
-Because every object's location follows from its hash, a script can work out
-the complete list of copies before it starts and give syq that list at once.
 [`dvc_syq.py`](https://github.com/greaber/syq/blob/master/examples/dvc_syq.py)
-does this with the [Python SDK](python.md). It is an example to use, copy, and
-adapt, written to show what [mappings](mappings.md) make possible.
+does the work of `dvc pull` and `dvc push` with syq, and can be much faster.
+DVC transfers objects one at a time from Python. The script works out every
+copy in advance and gives syq the whole list in a single run. Repositories
+with many files gain the most.
+
+It is a short program written with the [Python SDK](python.md), meant to be
+used, read, and adapted. DVC keeps working alongside it: both use the same
+cache and the same remote, so `dvc status`, `dvc push`, and `dvc pull` treat
+the script's results as their own.
 
 ## Run it
 
@@ -20,60 +20,60 @@ dependencies for you. Inside a DVC repository:
 uv run https://raw.githubusercontent.com/greaber/syq/master/examples/dvc_syq.py pull
 ```
 
-| Command | What it does |
+| Argument | Meaning |
 |---|---|
-| `pull` | Downloads missing objects into DVC's cache, then writes the tracked files into your workspace |
-| `fetch` | Downloads into the cache only |
-| `push` | Uploads cache objects that the remote does not have |
-
-Name `.dvc` files or tracked paths after the command to limit it; otherwise
-it covers every `.dvc` file and `dvc.lock` in the repository. `--remote NAME`
-selects a remote other than the default, and `--dry-run` previews. A dry run
-of `pull` stops early when directory listings still need downloading, because
-the files inside those directories are unknown until then.
-
-DVC keeps working alongside the script. Both use the same cache and the same
-remote layout, so `dvc status`, `dvc push`, and `dvc pull` see the script's
-results as their own.
+| `pull` | Download missing objects into DVC's cache, then write the tracked files into the workspace |
+| `fetch` | Download into the cache only |
+| `push` | Upload cache objects that the remote does not have |
+| `TARGET...` | After the command: `.dvc` files or tracked paths to limit it to. The default is everything tracked in the repository |
+| `--remote NAME` | Use this DVC remote instead of the default one |
+| `--dry-run` | Show what would be copied |
+| `--force` | Let `pull` replace workspace files that have local changes |
 
 ## How it works
 
-The heart of a pull is one mapping: each entry names an object in the remote,
-where it belongs in the cache, and the MD5 it must have.
+DVC names every stored file after its MD5 and lays out its cache exactly like
+its remote. An object therefore has the same relative path in both places,
+and only the last step, writing the workspace, gives files their real names.
 
 ```python
-entries = [
-    MappingEntry(
-        src=f"files/md5/{md5[:2]}/{md5[2:]}",
-        dst=f"files/md5/{md5[:2]}/{md5[2:]}",
-        kind="file",
-        expected_digest=Digest("md5", md5),
-    )
-    for md5 in missing
+def object_path(md5):
+    return f"files/md5/{md5[:2]}/{md5[2:]}"
+
+# Remote to cache: the same path on both sides, plus the MD5 each file must have.
+downloads = [
+    MappingEntry(src=object_path(md5), dst=object_path(md5), expected_digest=Digest("md5", md5))
+    for md5 in missing_from_cache
 ]
-client.cp(mapping=entries, from_="s3://my-bucket", into=".dvc/cache", only_new=True)
+client.cp(mapping=downloads, from_="s3://my-bucket", into=".dvc/cache", only_new=True)
+
+# Cache to workspace: each object gets the name recorded in the .dvc file.
+checkout = [MappingEntry(src=object_path(md5), dst=path) for path, md5 in tracked_files]
+client.cp(mapping=checkout, cwd=".dvc/cache", into=".")
 ```
 
-Syq checks each downloaded file against its
-[expected digest](mappings.md#the-format) before putting it in place. A file
-that does not match fails on its own while the rest continue, and running the
-command again retries only what is missing. `only_new` makes a push skip
-objects the remote already has. A second, local mapping copies from the cache
-into the workspace, [cloning files](speed.md) where the filesystem allows.
+Each list is a [mapping](mappings.md): pairs of source and destination paths
+that syq copies in one run. Syq checks every download against its expected
+MD5 before putting it in place. A file that does not match fails on its own
+while the rest continue, and running the command again fetches only what is
+still missing. A push is the first copy in reverse, and `only_new` makes it
+skip objects the remote already has.
 
-## What it supports
+## Differences from DVC
 
-- Remotes that are local directories, `ssh://host/path`, or
-  `s3://bucket/prefix`. For S3 it reads `endpointurl`, `profile`, and `region`
-  from the DVC remote and otherwise uses your
-  [usual AWS credentials](object-storage.md#credentials-and-providers). SSH
-  remotes with an explicit port are refused.
-- Repositories written by DVC 2 and DVC 3. DVC 2 objects live at the top of
-  the cache instead of under `files/md5`, and DVC 2 computed the MD5 of text
-  files after normalizing line endings, so those objects are copied without a
-  digest check.
-- `pull` replaces workspace files that differ from the tracked version, as
-  `dvc checkout --force` would.
-
-The script does not hash new data or write `.dvc` files; keep using `dvc add`
-for that. It also leaves remote cleanup to `dvc gc`.
+- **Remotes.** Local directories, `ssh://host/path` without an explicit port,
+  and `s3://bucket/prefix` are supported. For S3, the script reads
+  `endpointurl`, `profile`, and `region` from the DVC remote and otherwise
+  uses your usual AWS credentials. Other remote types, and remotes using
+  DVC's cloud versioning, are refused.
+- **Imported data.** `dvc pull` fetches `dvc import` data from the repository
+  it came from. The script skips those files and says so; use `dvc pull` for
+  them.
+- **Untracked files in a tracked directory.** DVC refuses to pull until they
+  are removed, and removes them with `--force`. The script leaves them alone.
+- **Verification.** DVC does not check downloaded contents by default. The
+  script checks the MD5 of every directory listing and of every file tracked
+  by DVC 3. Files tracked by DVC 2 are not checked, because DVC 2 computed
+  the MD5 of text files after changing their line endings.
+- **Options.** `dvc pull` and `dvc push` options not in the table above, such
+  as `--all-branches`, are not available.
