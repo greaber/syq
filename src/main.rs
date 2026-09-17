@@ -146,11 +146,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(error) = environment_options.insert(&mut argv) {
-        crate::output::diagnostic!("syq: {error:#}");
-        std::process::exit(2);
-    }
-    destination::handoff::record_command_line(&argv);
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("help") {
         if let Err(error) = help::show_topic(&argv[2..]) {
             crate::output::diagnostic!("syq: {error:#}");
@@ -235,6 +230,14 @@ fn main() {
         }
         return;
     }
+    // Internal entry points above never see environment options. Insert them
+    // here, before `exec` and the copy commands, and record the result for
+    // the return-helper handoff, which both of those may perform.
+    if let Err(error) = environment_options.insert(&mut argv) {
+        crate::output::diagnostic!("syq: {error:#}");
+        std::process::exit(2);
+    }
+    destination::handoff::record_command_line(&argv);
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
         match destination::exec::run(&argv[1..]) {
             Ok(code) => std::process::exit(code),

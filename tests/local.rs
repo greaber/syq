@@ -22518,3 +22518,24 @@ fn environment_options_apply_to_the_command_and_never_reach_children() {
     assert!(!child_env.contains("SYQ_CP_OPTIONS"), "{child_env}");
     assert!(!child_env.contains("SYQ_RM_OPTIONS"), "{child_env}");
 }
+
+#[test]
+fn environment_options_never_reach_internal_server_entry_points() {
+    for argv in [vec!["rsync", "--server"], vec!["--server"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(&argv)
+            .env("SYQ_RSYNC_OPTIONS", "--quiet")
+            .env("SYQ_CP_OPTIONS", "--quiet")
+            .stdin(std::process::Stdio::null())
+            .run()
+            .unwrap();
+        // The server announces itself before reading the client's preamble;
+        // an argument error would exit 2 without doing so.
+        assert!(out.stdout.starts_with(b"SYQWIRE"), "{argv:?}: {out:?}");
+        assert_ne!(out.status.code(), Some(2), "{argv:?}: {out:?}");
+        assert!(
+            !stderr_of(&out).contains("unexpected argument"),
+            "{argv:?}: {out:?}"
+        );
+    }
+}
