@@ -102,8 +102,9 @@ bytes before applying changes. A complete rewrite skips that old-data copy
 unless an interrupted copy offers another basis for reuse. With `--inplace`,
 changes are written directly to the destination instead.
 
-The smallest supported comparison block is 64 KiB. A partial file left by an
-interrupted copy can only be reused with the same `-B` value.
+The smallest supported comparison block is 64 KiB. A later copy can reuse
+matching bytes from an interrupted copy even if you change `-B`; syq checks
+them using the new block size.
 
 ### Streaming and request windows
 

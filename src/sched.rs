@@ -314,31 +314,44 @@ pub enum Item {
     Exit,
 }
 
-/// Two indexes allow largest-first scheduling and same-file claims without
-/// scanning unrelated files or shifting the queue under the scheduler lock.
+/// Keep one global maximum per file. The file index supports both largest-first
+/// scheduling and short same-file claims without storing every range twice.
 #[derive(Default)]
 struct RangeQueue {
     largest: BTreeSet<(u64, usize, u64)>,
     by_file: HashMap<usize, BTreeSet<(u64, u64)>>,
+    len: usize,
 }
 
 impl RangeQueue {
     fn push(&mut self, (idx, off, end): (usize, u64, u64)) {
-        assert!(self.largest.insert((end - off, idx, off)));
-        assert!(self
-            .by_file
-            .entry(idx)
-            .or_default()
-            .insert((end - off, off)));
+        let key = (end - off, off);
+        let file = self.by_file.entry(idx).or_default();
+        let previous = file.last().copied();
+        assert!(file.insert(key));
+        if previous.is_none_or(|maximum| key > maximum) {
+            if let Some((len, off)) = previous {
+                assert!(self.largest.remove(&(len, idx, off)));
+            }
+            assert!(self.largest.insert((key.0, idx, key.1)));
+        }
+        self.len += 1;
     }
 
     fn remove(&mut self, len: u64, idx: usize, off: u64) -> (usize, u64, u64) {
-        assert!(self.largest.remove(&(len, idx, off)));
         let file = self.by_file.get_mut(&idx).expect("queued file");
+        let was_maximum = file.last() == Some(&(len, off));
         assert!(file.remove(&(len, off)));
+        if was_maximum {
+            assert!(self.largest.remove(&(len, idx, off)));
+            if let Some(&(next_len, next_off)) = file.last() {
+                assert!(self.largest.insert((next_len, idx, next_off)));
+            }
+        }
         if file.is_empty() {
             self.by_file.remove(&idx);
         }
+        self.len -= 1;
         (idx, off, off + len)
     }
 
@@ -353,22 +366,24 @@ impl RangeQueue {
     }
 
     fn len(&self) -> usize {
-        self.largest.len()
+        self.len
     }
 
     fn is_empty(&self) -> bool {
-        self.largest.is_empty()
+        self.len == 0
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
-        self.largest
+        self.by_file
             .iter()
-            .map(|&(len, idx, off)| (idx, off, off + len))
+            .flat_map(|(&idx, ranges)| ranges.iter().map(move |&(len, off)| (idx, off, off + len)))
     }
 
     #[cfg(test)]
     fn contains(&self, &(idx, off, end): &(usize, u64, u64)) -> bool {
-        self.largest.contains(&(end - off, idx, off))
+        self.by_file
+            .get(&idx)
+            .is_some_and(|ranges| ranges.contains(&(end - off, off)))
     }
 }
 
@@ -398,6 +413,8 @@ struct Inner {
     outstanding: HashMap<usize, u32>,
     failed: HashSet<usize>,
     probing: usize,
+    /// Workers asleep in `next`, including notified peers until they reacquire the lock.
+    waiting_workers: usize,
     /// Files owned by the pipelined small-file path. Unlike ordinary probes,
     /// these will not expose ranges another worker can steal.
     fast_probing: usize,
@@ -450,6 +467,7 @@ impl Sched {
                 outstanding: HashMap::new(),
                 failed: HashSet::new(),
                 probing: 0,
+                waiting_workers: 0,
                 fast_probing: 0,
                 fast_batches: 0,
                 fast_groups: Vec::new(),
@@ -780,7 +798,9 @@ impl Sched {
                 self.tune_cv.notify_one();
                 return Item::Exit;
             }
+            g.waiting_workers += 1;
             g = self.cv.wait(g).unwrap();
+            g.waiting_workers -= 1;
         }
     }
 
@@ -837,13 +857,10 @@ impl Sched {
     }
 
     /// Claim one same-file range only when a worker can issue its next read.
-    /// Leave one queued range per peer so a small backlog keeps its parallelism.
-    pub fn take_short_range(
-        &self,
-        idx: usize,
-        max_size: u64,
-        workers: usize,
-    ) -> Option<RangeHandle> {
+    /// Leave work for peers waiting in `next`, without reserving another range
+    /// for workers already busy. A peer returning to the queue competes normally
+    /// with these bounded, immediately issued claims.
+    pub fn take_short_range(&self, idx: usize, max_size: u64) -> Option<RangeHandle> {
         if max_size == 0 {
             return None;
         }
@@ -851,7 +868,7 @@ impl Sched {
         if g.abort
             || g.failed.contains(&idx)
             || g.outstanding.get(&idx).copied().unwrap_or(0) <= 1
-            || g.ranges.len() < workers
+            || g.ranges.len() <= g.waiting_workers
         {
             return None;
         }
@@ -1279,16 +1296,19 @@ mod tests {
             .ranges_ready(0, vec![(0, 512), (1024, 1536), (2048, 2560), (4096, 8192)])
             .unwrap();
         let other = sched.ranges_ready(1, vec![(0, 512), (1024, 1536)]).unwrap();
-        assert!(sched.take_short_range(0, 0, 1).is_none());
-        assert!(sched.take_short_range(0, 512, 5).is_none());
-        let extra = sched.take_short_range(0, 512, 4).unwrap();
+        assert!(sched.take_short_range(0, 0).is_none());
+        sched.inner.lock().unwrap().waiting_workers = 4;
+        assert!(sched.take_short_range(0, 512).is_none());
+        sched.inner.lock().unwrap().waiting_workers = 3;
+        let extra = sched.take_short_range(0, 512).unwrap();
         assert_eq!(extra.lock().unwrap().pos, 1024);
         assert_eq!(sched.inner.lock().unwrap().outstanding[&0], 4);
         assert!(!sched.range_done(&extra));
-        assert!(sched.take_short_range(0, 512, 4).is_none());
-        let extra = sched.take_short_range(0, 512, 1).unwrap();
+        assert!(sched.take_short_range(0, 512).is_none());
+        sched.inner.lock().unwrap().waiting_workers = 0;
+        let extra = sched.take_short_range(0, 512).unwrap();
         assert!(!sched.range_done(&extra));
-        assert!(sched.take_short_range(0, 512, 1).is_none());
+        assert!(sched.take_short_range(0, 512).is_none());
         sched.release_rest(&first);
         assert!(!sched.range_done(&first));
         assert!(!sched.range_done(&other));
@@ -1298,9 +1318,106 @@ mod tests {
         assert!(inner.ranges.contains(&(0, 0, 512)));
         drop(inner);
         sched.fail_file(0);
-        assert!(sched.take_short_range(0, 512, 1).is_none());
+        assert!(sched.take_short_range(0, 512).is_none());
         sched.abort();
-        assert!(sched.take_short_range(1, 512, 1).is_none());
+        assert!(sched.take_short_range(1, 512).is_none());
+    }
+
+    #[test]
+    fn short_range_tail_is_available_while_other_workers_are_busy() {
+        let sched = Sched::new(512, 8192);
+        sched.inner.lock().unwrap().probing = 2;
+        let primary = sched.ranges_ready(0, vec![(0, 512), (1024, 1536)]).unwrap();
+        let busy_peer = sched.ranges_ready(1, vec![(0, 8192)]).unwrap();
+        // Both workers own work; the sole queued range can fill the first
+        // worker's pipeline instead of waiting for it to drain and call next.
+        let extra = sched.take_short_range(0, 512).unwrap();
+        assert_eq!(extra.lock().unwrap().pos, 1024);
+        assert!(!sched.range_done(&extra));
+        assert!(sched.range_done(&primary));
+        assert!(sched.range_done(&busy_peer));
+    }
+
+    #[test]
+    fn short_range_claim_leaves_a_share_for_a_waiting_worker() {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.inner.lock().unwrap().probing = 1;
+        let primary = sched.ranges_ready(0, vec![(0, 512)]).unwrap();
+        sched.scan_done();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let peer = {
+            let sched = sched.clone();
+            std::thread::spawn(move || tx.send(sched.next()).unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let waiting = sched.inner.lock().unwrap().waiting_workers;
+            if waiting == 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                sched.abort();
+                peer.join().unwrap();
+                panic!("worker did not wait for work: waiting_workers={waiting}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            // Publish without notifying yet: the owner can claim an extra,
+            // but must leave another share for the sleeping peer.
+            inner.ranges.push((0, 1024, 1536));
+            inner.ranges.push((0, 2048, 2560));
+            *inner.outstanding.get_mut(&0).unwrap() += 2;
+        }
+        let extra = sched.take_short_range(0, 512).unwrap();
+        assert!(sched.take_short_range(0, 512).is_none());
+        sched.cv.notify_all();
+        let item = rx.recv_timeout(Duration::from_secs(2));
+        if item.is_err() {
+            sched.abort();
+        }
+        peer.join().unwrap();
+        let Item::Range(other) = item.expect("waiting worker must receive its share") else {
+            panic!("waiting worker exited without a range")
+        };
+        assert_eq!(sched.inner.lock().unwrap().waiting_workers, 0);
+        assert_ne!(extra.lock().unwrap().pos, other.lock().unwrap().pos);
+        assert!(!sched.range_done(&extra));
+        assert!(!sched.range_done(&other));
+        assert!(sched.range_done(&primary));
+        assert!(sched.finished());
+    }
+
+    #[test]
+    fn range_queue_updates_file_maxima_and_preserves_equal_length_order() {
+        let mut queue = RangeQueue::default();
+        for range in [
+            (0, 0, 512),
+            (0, 1024, 3072),
+            (0, 4096, 6144),
+            (1, 0, 2048),
+            (2, 0, 512),
+        ] {
+            queue.push(range);
+        }
+        assert_eq!(queue.len(), 5);
+        assert_eq!(queue.largest.len(), 3);
+        assert_eq!(queue.iter().count(), 5);
+        assert_eq!(queue.pop(), Some((1, 0, 2048)));
+        assert_eq!(queue.take_short(0, 512), Some((0, 0, 512)));
+        assert_eq!(queue.take_short(2, 512), Some((2, 0, 512)));
+        assert_eq!(queue.largest.len(), 1);
+        assert_eq!(queue.take_short(0, 512), None);
+        queue.push((0, 8192, 12288));
+        queue.push((1, 8192, 10240));
+        assert_eq!(queue.pop(), Some((0, 8192, 12288)));
+        assert_eq!(queue.pop(), Some((1, 8192, 10240)));
+        assert_eq!(queue.pop(), Some((0, 4096, 6144)));
+        assert_eq!(queue.pop(), Some((0, 1024, 3072)));
+        assert!(queue.is_empty());
+        assert!(queue.by_file.is_empty());
+        assert!(queue.largest.is_empty());
     }
 
     #[test]
@@ -1311,6 +1428,8 @@ mod tests {
                 queue.push((idx, i * 8192, i * 8192 + 512 * (1 + i % 8)));
             }
         }
+        assert_eq!(queue.len(), 200_000);
+        assert_eq!(queue.largest.len(), 200);
         for idx in (0..200).rev() {
             for _ in 0..125 {
                 let (_, off, end) = queue.take_short(idx, 512).unwrap();
