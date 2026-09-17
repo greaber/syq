@@ -4,7 +4,8 @@
 Run: cargo build --release --locked
      python3 scripts/benchmark-macos-clone.py target/release/syq
 
-Uses disposable directories under TMPDIR. Needs about 2 GiB free. Timings include
+Uses disposable directories under TMPDIR. Needs about 2 GiB free, or another
+10 MiB per file with --many-files (for example, --many-files=1024). Timings include
 process startup and use warm filesystem caches; they do not measure durable
 writes or predict another disk's speed. Forced ranges isolate the clone benefit
 in the same binary, rather than comparing unrelated changes between versions.
@@ -35,11 +36,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("syq", type=Path)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--many-files", type=int, default=0,
+                        help="also measure this many 5 MiB files (default: disabled)")
     args = parser.parse_args()
     if platform.system() != "Darwin":
         parser.error("this benchmark requires macOS and a clone-capable APFS TMPDIR")
     if args.rounds < 1:
         parser.error("--rounds must be positive")
+    if args.many_files < 0:
+        parser.error("--many-files must be nonnegative")
     binary = args.syq.resolve(strict=True)
     env = os.environ.copy()
     env["SYQ_DEBUG"] = "1"
@@ -49,7 +54,10 @@ def main():
         # macOS TMPDIR commonly traverses the /var -> /private/var symlink.
         # Give syq canonical fixture paths without changing its symlink policy.
         root = Path(temporary).resolve(strict=True)
-        for case, count, mib in [("large", 1, 512), ("tree", 64, 8), ("medium", 64, 1)]:
+        cases = [("large", 1, 512), ("tree", 64, 8), ("medium", 64, 1)]
+        if args.many_files:
+            cases.append(("many", args.many_files, 5))
+        for case, count, mib in cases:
             source = root / "source"
             source.mkdir()
             # Real writes, not sparse files or filesystem-compressed fixtures.

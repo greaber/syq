@@ -2,6 +2,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -106,6 +107,40 @@ fn fresh_exfat_destinations_have_unknown_inode_capacity() {
         fs::read(volume.mount.join("missing/source")).unwrap(),
         b"payload"
     );
+
+    // Cloning must not make this non-cloneable destination fail descriptor
+    // admission. The default worker ceiling fits ordinary copying within
+    // 1664 slots, but the extra 192 clone-claim slots would exceed it.
+    let payload = vec![b'x'; 5 << 20];
+    fs::write(&source, &payload).unwrap();
+    let mut limited = Command::new(env!("CARGO_BIN_EXE_syq"));
+    limited
+        .arg("cp")
+        .arg(&source)
+        .arg("--as")
+        .arg(volume.mount.join("limited"))
+        .arg("--no-progress");
+    unsafe {
+        limited.pre_exec(|| {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let limit = libc::rlimit {
+                rlim_cur: inherited.rlim_max.min(1664),
+                rlim_max: inherited.rlim_max.min(1664),
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert_success(&limited.output().unwrap());
+    assert_eq!(fs::read(volume.mount.join("limited")).unwrap(), payload);
 
     // Unknown inode accounting must not disable the byte-capacity check.
     // A sparse source exceeds the entire image without allocating that data.

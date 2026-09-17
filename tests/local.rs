@@ -334,13 +334,9 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
         .unwrap();
     // Conservatively budget every selector as parent + exact object for the
     // registry, control, and all 64 shared workers, plus worker/cache reserve.
-    // Same-machine destination workers claim exact source capabilities only
-    // on Linux and macOS, where the descriptor-copy fast paths exist.
-    let copy_local_claims = if cfg!(any(target_os = "linux", target_os = "macos")) {
-        64 * 3
-    } else {
-        0
-    };
+    // Linux still reserves its direct-copy claims. macOS disables optional
+    // clone claims under descriptor pressure before ordinary admission fails.
+    let copy_local_claims = if cfg!(target_os = "linux") { 64 * 3 } else { 0 };
     assert_eq!(
         required,
         current_open + 1572 + copy_local_claims,

@@ -159,6 +159,23 @@ enum CopyLocalOutcome {
     },
 }
 
+#[cfg(target_os = "macos")]
+impl From<crate::rooted::CloneOutcome> for CopyLocalOutcome {
+    fn from(outcome: crate::rooted::CloneOutcome) -> Self {
+        match outcome {
+            crate::rooted::CloneOutcome::Copied => Self::Copied,
+            crate::rooted::CloneOutcome::Unsupported => Self::Unsupported,
+            crate::rooted::CloneOutcome::UnsupportedVolume {
+                source_dev,
+                destination_dev,
+            } => Self::UnsupportedVolume {
+                source_dev,
+                destination_dev,
+            },
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", debug_assertions))]
 fn record_copy_local_request_for_test() -> Result<()> {
     use std::io::Write;
@@ -1458,7 +1475,7 @@ pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<
     Ok(open)
 }
 
-fn require_source_descriptor_capacity(
+pub(crate) fn require_source_descriptor_capacity(
     root_count: usize,
     shared_workers: usize,
     independent_workers: usize,
@@ -2666,16 +2683,10 @@ impl FsOps {
         let available_inodes = (files != 0 && files_available <= files).then_some(files_available);
         #[cfg(target_os = "macos")]
         let available_inodes = available_inodes.and_then(|available| {
-            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
-            if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
-                return None;
-            }
-            let filesystem = unsafe { filesystem.assume_init() };
-            let name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
             // macOS exFAT reports f_files=1 and f_favail=0 even while new
             // files can be created. That is unavailable inode accounting,
             // not exhaustion. Keep zero authoritative on other filesystems.
-            (name.to_bytes() != b"exfat").then_some(available)
+            (!crate::rooted::filesystem_is(&directory, b"exfat").ok()?).then_some(available)
         });
         #[cfg(debug_assertions)]
         let available_bytes = match std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
@@ -5679,23 +5690,12 @@ impl FsOps {
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-        let RootedTarget {
-            root: destination_root,
-            relative: destination_relative,
-            label: destination_label,
-            ..
-        } = target;
+        let destination_root = target.root.clone();
         let source_key = file_system_key(&s, source_metadata.dev());
-        self.uncache_rooted(&destination_root, &destination_relative);
+        self.uncache_rooted(&destination_root, &target.relative);
         let (target_relative, target_label) = if inplace {
-            (destination_relative, destination_label)
+            (target.relative, target.label)
         } else {
-            let target = RootedTarget {
-                root: destination_root.clone(),
-                relative: destination_relative,
-                label: destination_label,
-                create_missing_parents: false,
-            };
             rooted_partial_target(&target, copy_id)?
         };
         self.uncache_rooted(&destination_root, &target_relative);
@@ -6028,22 +6028,13 @@ impl FsOps {
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
-        match root.clone_file(&source, &source_metadata, &partial, size)? {
-            crate::rooted::CloneOutcome::Copied => {}
-            crate::rooted::CloneOutcome::Unsupported => return Ok(CopyLocalOutcome::Unsupported),
-            crate::rooted::CloneOutcome::UnsupportedVolume {
-                source_dev,
-                destination_dev,
-            } => {
-                return Ok(CopyLocalOutcome::UnsupportedVolume {
-                    source_dev,
-                    destination_dev,
-                });
-            }
+        let outcome = root.clone_file(&source, &source_metadata, &partial, size)?;
+        if outcome == crate::rooted::CloneOutcome::Copied {
+            _copy.bytes(size);
         }
         // Like Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
-        Ok(CopyLocalOutcome::Copied)
+        Ok(outcome.into())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

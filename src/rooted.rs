@@ -1111,18 +1111,17 @@ impl Root {
         } else {
             // This optimization targets APFS. Reject exFAT/SMB and other
             // destinations before probing ACLs or creating staging directories.
-            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
             let supported = if pair.0 != pair.1 {
                 false
             } else {
-                if let Err(error) = retry_zero(|| unsafe {
-                    libc::fstatfs(parent.directory.as_raw_fd(), stats.as_mut_ptr())
-                }) {
-                    return fallback(anyhow::Error::new(error).context("inspect clone filesystem"));
+                match filesystem_is(&parent.directory, b"apfs") {
+                    Ok(supported) => supported,
+                    Err(error) => {
+                        return fallback(
+                            anyhow::Error::new(error).context("inspect clone filesystem"),
+                        );
+                    }
                 }
-                let stats = unsafe { stats.assume_init() };
-                unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes()
-                    == b"apfs"
             };
             #[cfg(debug_assertions)]
             let supported =
@@ -2762,6 +2761,17 @@ fn clear_nonblocking(file: &File) -> io::Result<()> {
     retry_zero(|| unsafe {
         libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
     })
+}
+
+/// Identify the filesystem of a held descriptor without resolving its path.
+#[cfg(target_os = "macos")]
+pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs initializes the supplied structure on success, including
+    // its NUL-terminated filesystem type name. Retry an interrupted probe.
+    retry_zero(|| unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) })?;
+    let stats = unsafe { stats.assume_init() };
+    Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
 }
 
 fn retry_zero(mut operation: impl FnMut() -> libc::c_int) -> io::Result<()> {

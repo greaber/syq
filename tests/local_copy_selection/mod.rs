@@ -497,6 +497,115 @@ fn macos_immutable_clone_open_failure_cleans_up_and_streams() {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[test]
+fn macos_clone_descriptor_pressure_preserves_ordinary_copy() {
+    for force_ranges in [false, true] {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 992);
+        write(&t.path("source"), &data);
+        let mut command = compat_command();
+        command
+            .args(["-a", "--no-progress", &t.s("source"), &t.s("destination")])
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_COPY_LOCAL_REQUESTS", t.path("requests"));
+        if force_ranges {
+            command.arg("--performance-tuning=copy-path=ranges");
+        }
+        // The default 64-worker ceiling needs current_open + 1572 slots
+        // without cloning, and 192 more with it. Both copies must fit the
+        // same limit; disabling an optimization must not require fewer workers.
+        unsafe {
+            command.pre_exec(|| {
+                let mut inherited = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut inherited) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: inherited.rlim_max.min(1664),
+                    rlim_max: inherited.rlim_max.min(1664),
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("destination")), data);
+        assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
+        assert!(tuning_observed(&out)["range_requests"].as_u64().unwrap() > 0);
+        assert!(!t.path("requests").exists());
+        if !force_ranges {
+            assert!(stderr_of(&out)
+                .contains("source descriptor budget leaves no room for clone claims"));
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
+fn macos_clone_observations_count_only_successful_logical_bytes() {
+    if !macos_clone_support::available() {
+        return;
+    }
+    for fallback in [false, true] {
+        let t = Tmp::new();
+        let data = prng(5 << 20, 993);
+        write(&t.path("source"), &data);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args([
+                "cp",
+                "--src",
+                &t.s("source"),
+                "--as",
+                &t.s("destination"),
+                "--results",
+                &t.s("results.ndjson"),
+                "--no-progress",
+                "--performance-tuning=workers=1",
+            ])
+            .env("SYQ_DEBUG", "1");
+        if fallback {
+            command.env("SYQ_TEST_CLONE_ERROR", "EIO");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("destination")), data);
+        assert_eq!(
+            tuning_observed(&out)["local_whole_files"],
+            u64::from(!fallback)
+        );
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let activity = &records
+            .iter()
+            .rev()
+            .find(|record| record["type"] == "progress")
+            .unwrap()["activity"];
+        let copied_bytes: u64 = activity["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|endpoint| endpoint["cumulative_actors"].as_array().unwrap())
+            .map(|actor| actor["bytes"]["filesystem_copy"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            copied_bytes,
+            if fallback { 0 } else { data.len() as u64 },
+            "{activity}"
+        );
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[test]
 fn macos_clone_preserves_previous_run_partial() {
     if !macos_clone_support::available() {
         return;

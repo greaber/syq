@@ -144,6 +144,8 @@ pub struct Opts {
     /// Process-local negative hints keyed by source and destination devices.
     /// A current local parent stat keeps descendant mounts independent.
     local_copy_unavailable: Mutex<std::collections::HashSet<(u64, u64)>>,
+    /// Settled before worker startup; optional clone claims must fit preflight.
+    local_copy_fd_budget: AtomicBool,
     pub flags: u8,
     pub recursive: bool,
     pub links: bool,
@@ -224,6 +226,7 @@ impl Opts {
             force_ranges: self.tuning.force_ranges(),
             bandwidth_limited,
             receiver_copy_disabled: !cfg!(any(target_os = "linux", target_os = "macos"))
+                || !self.local_copy_fd_budget.load(Relaxed)
                 || self.verify_only
                 || self.dry_run
                 || self.restricted_receiver
@@ -1741,6 +1744,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     let opts = Arc::new(Opts {
         local_copy_unavailable: Mutex::new(Default::default()),
+        local_copy_fd_budget: AtomicBool::new(true),
         hash_policy: crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
@@ -2117,6 +2121,30 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         maximum_workers
     } else {
         0
+    };
+    // macOS cloning is optional. Its source is in this process, so use the
+    // same admission check as registration before reserving foreign claims.
+    // If those claims do not fit, keep the normal worker budget and byte-copy
+    // path on every filesystem, including APFS. Registration still rejects
+    // a budget that cannot accommodate the ordinary copy itself.
+    let copy_local_claim_workers = if cfg!(target_os = "macos")
+        && copy_local_claim_workers > 0
+        && crate::fsops::require_source_descriptor_capacity(
+            srcs.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        )
+        .is_err()
+    {
+        opts.local_copy_fd_budget.store(false, Relaxed);
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: macOS cloning disabled: source descriptor budget leaves no room for clone claims"
+            );
+        }
+        0
+    } else {
+        copy_local_claim_workers
     };
     let source_independent_handoff_workers = source_independent_handoff_workers
         .checked_add(copy_local_claim_workers)
@@ -9365,6 +9393,7 @@ mod tests {
     ) -> Worker {
         let opts = Arc::new(Opts {
             local_copy_unavailable: Mutex::new(Default::default()),
+            local_copy_fd_budget: AtomicBool::new(true),
             hash_policy: Default::default(),
             expected_digest: None,
             mapping_expected_digests: Default::default(),

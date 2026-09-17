@@ -11,7 +11,8 @@ On macOS, eligible local files use filesystem cloning when both paths are on
 the same APFS volume. The copy initially shares disk blocks with the source;
 later changes to either file are independent. Reported bytes count the file's
 size, so the displayed rate can exceed the disk's physical throughput.
-Other filesystems and cross-volume copies use normal copying.
+Other filesystems and cross-volume copies use normal copying. Syq also uses
+normal copying when the open-file limit leaves no room for cloning.
 
 Syq groups small files into requests to reduce per-file overhead; larger files
 can use cloning. See [batch sizes](tuning.md#batch-size-and-splitting) for how
