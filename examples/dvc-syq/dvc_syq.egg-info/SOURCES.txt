@@ -1,8 +1,0 @@
-dvc_syq.py
-pyproject.toml
-dvc_syq.egg-info/PKG-INFO
-dvc_syq.egg-info/SOURCES.txt
-dvc_syq.egg-info/dependency_links.txt
-dvc_syq.egg-info/entry_points.txt
-dvc_syq.egg-info/requires.txt
-dvc_syq.egg-info/top_level.txt
