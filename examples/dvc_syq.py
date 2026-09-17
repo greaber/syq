@@ -200,6 +200,33 @@ def read_dir_object(cache: Path, out: Out) -> list[tuple[str, str]]:
     return [(entry["relpath"], entry["md5"]) for entry in entries]
 
 
+class ProgressLine:
+    """One updating status line on a terminal, fed by syq's progress events."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.enabled = sys.stderr.isatty()
+        self.started = time.monotonic()
+        self.updated = 0.0
+
+    def __call__(self, event: object) -> None:
+        now = time.monotonic()
+        if not self.enabled or not isinstance(event, syq.ProgressEvent) or now - self.updated < 0.1:
+            return
+        self.updated = now
+        rate = event.bytes_done / max(now - self.started, 1e-9) / 1e6
+        sys.stderr.write(
+            f"\r{self.label}: {event.files_done}/{event.files_total} files, "
+            f"{event.bytes_done / 1e6:.0f}/{event.bytes_total / 1e6:.0f} MB, {rate:.1f} MB/s\x1b[K"
+        )
+        sys.stderr.flush()
+
+    def clear(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\r\x1b[K")
+            sys.stderr.flush()
+
+
 class Transfer:
     """Runs one mapping copy in each direction between the cache and the remote."""
 
@@ -251,15 +278,18 @@ class Transfer:
 
     def run(self, entries: list[MappingEntry], *, label: str, **options: object) -> None:
         started = time.monotonic()
+        progress = ProgressLine(label)
         try:
             result = self.client.cp(
-                mapping=entries, only_new=True, dry_run=self.dry_run,
+                mapping=entries, only_new=True, dry_run=self.dry_run, on_event=progress,
                 **self.remote.options, **options,
             )
         except syq.SyqOperationError as error:
+            progress.clear()
             print(f"{label}: {error.result.errors} objects failed", file=sys.stderr)
             print(error.stderr.decode(errors="replace"), file=sys.stderr)
             sys.exit(23)
+        progress.clear()
         seconds = time.monotonic() - started
         rate = result.bytes_transferred / seconds / 1e6 if seconds else 0.0
         print(
@@ -277,12 +307,15 @@ def checkout(client: syq.Client, root: Path, cache: Path, outs: list[Out], dry_r
         else:
             entries.append(MappingEntry(src=object_path(out.md5, out.legacy), dst=str(out.path), kind="file"))
     print(f"checkout: {len(entries)} files")
+    progress = ProgressLine("checkout")
     try:
-        result = client.cp(mapping=entries, cwd=cache, into=root, dry_run=dry_run)
+        result = client.cp(mapping=entries, cwd=cache, into=root, dry_run=dry_run, on_event=progress)
     except syq.SyqOperationError as error:
+        progress.clear()
         print(f"checkout: {error.result.errors} files failed", file=sys.stderr)
         print(error.stderr.decode(errors="replace"), file=sys.stderr)
         sys.exit(23)
+    progress.clear()
     print(f"checkout: {result.files_transferred} written, {result.files_unchanged} unchanged")
 
 
