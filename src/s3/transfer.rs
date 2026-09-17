@@ -1232,7 +1232,9 @@ impl Engine {
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
                 if !already_filtered {
-                    if let Some(excluded) = client::exclusion(matcher.as_ref(), &key, directory) {
+                    if let Some(excluded) =
+                        client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
+                    {
                         self.progress
                             .files_excluded
                             .fetch_add(excluded.count(&mut excluded_subtrees), Relaxed);

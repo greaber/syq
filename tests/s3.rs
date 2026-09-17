@@ -1334,7 +1334,7 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
         ("listing-flat", vec!["--ignore", "*.tmp"], 3),
         ("listing-wide", vec!["--ignore", "archive/"], 4),
         ("listing-nested", vec!["--ignore", "archive/"], 4),
-        ("listing-deep", vec!["--ignore", "archive/"], 7),
+        ("listing-deep", vec!["--ignore", "archive/"], 3),
         ("listing-nested-wide", vec!["--ignore", "archive/"], 5),
         (
             "listing-mixed",

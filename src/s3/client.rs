@@ -371,6 +371,7 @@ pub(super) fn exclusion<'a>(
     matcher: Option<&ignore::gitignore::Gitignore>,
     key: &'a str,
     directory: bool,
+    known_subtrees: &std::collections::HashSet<String>,
 ) -> Option<Exclusion<'a>> {
     let matcher = matcher?;
     let key = if directory {
@@ -378,6 +379,16 @@ pub(super) fn exclusion<'a>(
     } else {
         key
     };
+    // These boundaries were already classified under the same rules. Reuse
+    // them for adjacent objects rather than rematching a deep parent chain.
+    if directory && known_subtrees.contains(key) {
+        return Some(Exclusion::Subtree(key));
+    }
+    if let Some((parent, _)) = key.rsplit_once('/') {
+        if known_subtrees.contains(parent) {
+            return Some(Exclusion::Subtree(parent));
+        }
+    }
     for (separator, _) in key.match_indices('/') {
         let ancestor = &key[..separator];
         if !ancestor.is_empty() && matcher.matched(ancestor, true).is_ignore() {
@@ -419,7 +430,7 @@ pub(super) async fn list(
         found: false,
         excluded: 0,
     };
-    if let Some(excluded) = exclusion(matcher, prefix, true) {
+    if let Some(excluded) = exclusion(matcher, prefix, true, excluded_subtrees) {
         result.found = prefix_exists(client, bucket, prefix).await?;
         if result.found {
             result.excluded += excluded.count(excluded_subtrees);
@@ -442,18 +453,31 @@ pub(super) async fn list(
                 .map_err(|e| e.into_service_error())
                 .context("S3 listing failed")?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
+            let mut reachable_exclusion = false;
             if probes_remaining > 0
                 && token.is_none()
                 && output.is_truncated() == Some(true)
                 && !output.contents().is_empty()
                 && output.contents().iter().all(|object| {
                     object.key().is_some_and(|key| {
-                        matches!(
-                            exclusion(matcher, key, key.ends_with('/') && object.size() == Some(0)),
-                            Some(Exclusion::Subtree(_))
-                        )
+                        if let Some(Exclusion::Subtree(boundary)) = exclusion(
+                            matcher,
+                            key,
+                            key.ends_with('/') && object.size() == Some(0),
+                            excluded_subtrees,
+                        ) {
+                            reachable_exclusion |=
+                                boundary.strip_prefix(&current).is_some_and(|relative| {
+                                    relative.bytes().filter(|byte| *byte == b'/').count()
+                                        < probes_remaining
+                                });
+                            true
+                        } else {
+                            false
+                        }
                     })
                 })
+                && reachable_exclusion
             {
                 let mut probe_prefix = current.clone();
                 let mut parent_objects = Vec::new();
@@ -478,7 +502,7 @@ pub(super) async fn list(
                                 && child.ends_with('/'),
                             "S3 listing returned an invalid common prefix"
                         );
-                        if exclusion(matcher, child, true).is_some() {
+                        if exclusion(matcher, child, true, excluded_subtrees).is_some() {
                             excluded += 1;
                         } else {
                             included += 1;
@@ -529,7 +553,7 @@ pub(super) async fn list(
                 );
                 let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
                 let directory = key.ends_with('/') && size == 0;
-                if let Some(excluded) = exclusion(matcher, key, directory) {
+                if let Some(excluded) = exclusion(matcher, key, directory, excluded_subtrees) {
                     // A filename-only exclusion still encounters the key and
                     // preserves its path validation. Pruned descendants do not.
                     if excluded == Exclusion::File {
@@ -549,7 +573,7 @@ pub(super) async fn list(
                         && child.ends_with('/'),
                     "S3 listing returned an invalid common prefix"
                 );
-                if let Some(excluded) = exclusion(matcher, child, true) {
+                if let Some(excluded) = exclusion(matcher, child, true, excluded_subtrees) {
                     result.excluded += excluded.count(excluded_subtrees);
                 } else {
                     pending.push(child.to_owned());
@@ -641,8 +665,16 @@ mod tests {
                 crate::scan::build_ignore(&rules.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                     .unwrap()
                     .unwrap();
-            let actual = exclusion(Some(&matcher), key, directory);
+            let mut known_subtrees = std::collections::HashSet::new();
+            let actual = exclusion(Some(&matcher), key, directory, &known_subtrees);
             assert_eq!(actual, expected, "{rules:?} {key}");
+            if let Some(excluded) = actual {
+                excluded.count(&mut known_subtrees);
+                assert_eq!(
+                    exclusion(Some(&matcher), key, directory, &known_subtrees),
+                    expected
+                );
+            }
             assert_eq!(
                 actual.is_some(),
                 crate::scan::path_is_ignored(
