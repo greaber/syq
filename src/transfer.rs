@@ -8153,8 +8153,7 @@ impl Worker {
                 // A receive error ends draining even if the connection cannot
                 // report a dead flag. Endpoint errors consume their reply and
                 // belong only to that group; keep later acknowledgments too.
-                let response = self.dst.recv()?;
-                Self::record_small_batch_reply(sent, response, results);
+                self.receive_small_batch(sent, results)?;
             }
             Ok(())
         })();
@@ -8878,11 +8877,10 @@ impl Worker {
         flight.credited += n;
         progress.add_bytes(n);
         job.done.fetch_add(n, Relaxed);
-        let exhausted = {
+        if slot != 0 && flight.pending == 0 && {
             let range = flight.handle.lock().unwrap();
             range.pos == range.end
-        };
-        if slot != 0 && flight.pending == 0 && exhausted {
+        } {
             // The primary share remains owned by our caller until the whole
             // pipeline drains. Acknowledged extras can retire immediately.
             let done = sched.range_done(&flight.handle);

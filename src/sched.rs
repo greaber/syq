@@ -672,13 +672,16 @@ impl Sched {
         mut groups: VecDeque<std::ops::Range<usize>>,
     ) -> (std::ops::Range<usize>, FastBatchHandle) {
         let first = groups.pop_front().expect("nonempty fast batch");
+        let shareable = !groups.is_empty();
         let handle = Arc::new(Mutex::new(FastBatchState {
             owned: vec![true; files.len()],
             files,
             groups,
         }));
-        self.inner.lock().unwrap().fast_groups.push(handle.clone());
-        self.cv.notify_all();
+        if shareable {
+            self.inner.lock().unwrap().fast_groups.push(handle.clone());
+            self.cv.notify_all();
+        }
         (first, handle)
     }
 
@@ -1688,6 +1691,18 @@ mod tests {
         assert_eq!(sched.finish_fast_groups(&groups), vec![true; 6]);
         sched.complete_fast_batch(6);
         assert!(sched.finished());
+    }
+
+    #[test]
+    fn single_file_group_is_not_registered_for_stealing() {
+        let sched = Sched::new(512, 8192);
+        let mut groups = VecDeque::new();
+        groups.push_back(0..3);
+        let (first, handle) = sched.share_fast_groups(vec![(512, 0), (512, 1), (512, 2)], groups);
+        assert_eq!(first, 0..3);
+        assert!(sched.inner.lock().unwrap().fast_groups.is_empty());
+        assert!(handle.lock().unwrap().claim().is_none());
+        assert_eq!(sched.finish_fast_groups(&handle), vec![true; 3]);
     }
 
     #[test]
