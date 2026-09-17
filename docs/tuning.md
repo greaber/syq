@@ -20,7 +20,8 @@ Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work.
 Remote copies start from the last learned count for the same host route,
 direction and transport, or from 8 workers over SSH and 16 over TCP. The cache
 normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
-parent). The quick benchmark uses this cache, even though it disables SSH
+parent, and `SYQ_TUNING_CACHE` names another file or, when empty, turns the
+cache off). The quick benchmark uses this cache, even though it disables SSH
 connection persistence. Its temporary file paths do not change the cache key.
 
 Short copies may finish before syq can learn a better count. Only successful
@@ -170,6 +171,11 @@ File and byte limits are ceilings; syq may choose smaller batches. Files larger
 than the byte limit use another copy method. With `--resource-limits bandwidth=RATE`, each batch
 contains at most one file. Batch controls cannot combine with `copy-path=ranges`
 or `copy-path=streaming`; `auto-streaming` accepts them.
+
+Remote new-file copies can batch files up to the smaller of `request-size` and
+`batch-bytes`; by default, `request-size` equals the comparison block size.
+Increasing these limits can make larger files use whole-file copies held in
+memory, which restart from the beginning if interrupted.
 
 `split-min-size` sets the smallest file region an idle worker can take from
 another worker. Lower values allow finer sharing; higher values avoid small
