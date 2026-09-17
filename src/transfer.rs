@@ -8738,15 +8738,6 @@ impl Worker {
                     }
                 }
                 while !released && pending_reads.len() < read_window {
-                    if let Some(slot) = current {
-                        let exhausted = flights[slot].as_ref().is_none_or(|flight| {
-                            let range = flight.handle.lock().unwrap();
-                            range.pos == range.end
-                        });
-                        if exhausted {
-                            current = None;
-                        }
-                    }
                     if current.is_none() {
                         // Claim only when there is room to issue a read now.
                         // Larger ranges retain their streaming selection, and
@@ -8767,7 +8758,11 @@ impl Worker {
                         current = Some(slot);
                     }
                     let slot = current.expect("readable range");
-                    let flight = flights[slot].as_mut().expect("current range");
+                    let Some(flight) = flights[slot].as_mut() else {
+                        // Acknowledged extra shares can retire while reads drain.
+                        current = None;
+                        continue;
+                    };
                     let (off, n) = {
                         let mut range = flight.handle.lock().unwrap();
                         let n = (range.end - range.pos).min(block);
@@ -8776,7 +8771,7 @@ impl Worker {
                         (off, n)
                     };
                     if n == 0 {
-                        // A peer may steal the suffix between the checks.
+                        // The range is exhausted, or a peer stole its suffix.
                         current = None;
                         continue;
                     }
@@ -9406,7 +9401,6 @@ mod tests {
         gate_changes: Vec<(usize, Arc<Gate>, usize)>,
         dead: bool,
         max_pending: usize,
-        local: bool,
         latency: Option<std::time::Duration>,
         ready: std::collections::VecDeque<std::time::Instant>,
         abort_on_receive: Option<Arc<Sched>>,
@@ -9416,10 +9410,7 @@ mod tests {
 
     impl Conn for PipelineConn {
         fn supports_request_pipelining(&self) -> bool {
-            {
-                let state = self.0.lock().unwrap();
-                !state.synchronous && !state.local
-            }
+            !self.0.lock().unwrap().synchronous
         }
         fn is_dead(&self) -> bool {
             self.0.lock().unwrap().dead
@@ -9525,17 +9516,16 @@ mod tests {
     }
 
     fn pipeline_worker(
-        sched: Arc<Sched>,
-        src: Arc<Mutex<PipelineState>>,
-        dst: Arc<Mutex<PipelineState>>,
-        block: u64,
+        sched: &Arc<Sched>,
+        src: &Arc<Mutex<PipelineState>>,
+        dst: &Arc<Mutex<PipelineState>>,
         streaming: bool,
     ) -> Worker {
         let opts = Arc::new(Opts {
             hash_policy: Default::default(),
             expected_digest: None,
             mapping_expected_digests: Default::default(),
-            block,
+            block: 512,
             tuning: crate::transfer_tuning::TransferTuning {
                 copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
                 pipeline_depth: (!streaming).then_some(4),
@@ -9663,9 +9653,9 @@ mod tests {
             .collect();
         let mut walk = PruneWalk::new(&seen, b"dst", None);
         walk.push(candidate, b"dst", &[]);
-        for local in [true, false] {
+        for synchronous in [true, false] {
             let state = Arc::new(Mutex::new(PipelineState {
-                local,
+                synchronous,
                 latency: Some(std::time::Duration::from_millis(20)),
                 ..Default::default()
             }));
@@ -9677,10 +9667,13 @@ mod tests {
             let start = std::time::Instant::now();
             lookup_prune_aliases(&mut PipelineConn(state.clone()), &walk, None).unwrap();
             eprintln!(
-                "simulated RTT=20ms paths=4096 sequential={local} elapsed={:?}",
+                "simulated RTT=20ms paths=4096 sequential={synchronous} elapsed={:?}",
                 start.elapsed()
             );
-            assert_eq!(state.lock().unwrap().max_pending, if local { 1 } else { 4 });
+            assert_eq!(
+                state.lock().unwrap().max_pending,
+                if synchronous { 1 } else { 4 }
+            );
         }
     }
 
@@ -9778,32 +9771,7 @@ mod tests {
 
     #[test]
     fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source");
-        std::fs::write(&path, vec![0; 4096]).unwrap();
-        let entry = crate::fsops::lstat_entry(Vec::new(), &path).unwrap();
-        let sched = Arc::new(Sched::new(512, 8192));
-        sched.push_file(FileJob {
-            dst_entry: None,
-            data: FileJobData {
-                src: b"source".to_vec(),
-                source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"source".to_vec())
-                    .unwrap(),
-                dst: b"destination".to_vec(),
-                rel: "innocent-file".into(),
-                entry,
-                target_condition: TargetCondition::Any,
-                container_guard: None,
-                attempt: 0,
-                done: Arc::new(AtomicU64::new(0)),
-                inplace: false,
-                rel_bytes: b"innocent-file".to_vec(),
-                src_rel: None,
-            },
-        });
-        sched.scan_done();
-        assert!(matches!(sched.next(), Item::File(0)));
-        let range = sched.ranges_ready(0, vec![(0, 4096)]).unwrap();
+        let (sched, range, _) = pipeline_ranges(&[(0, 4096)]);
         let src = Arc::new(Mutex::new(PipelineState {
             abort_on_receive: Some(sched.clone()),
             ..Default::default()
@@ -9818,7 +9786,7 @@ mod tests {
         }
         let dst = Arc::new(Mutex::new(PipelineState::default()));
         dst.lock().unwrap().replies.push_back(Response::Ok);
-        let mut worker = pipeline_worker(sched.clone(), src.clone(), dst.clone(), 512, false);
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
         worker.transfer_range(&range, &mut 0).unwrap();
         assert!(!sched.range_done(&range));
         worker.finish_file(0).unwrap();
@@ -9879,8 +9847,7 @@ mod tests {
                             .push_back(Response::Prepared(Preparation::default()));
                     }
                     dst.lock().unwrap().replies.push_back(Response::Ok);
-                    let mut worker =
-                        pipeline_worker(sched.clone(), src.clone(), dst.clone(), 512, streaming);
+                    let mut worker = pipeline_worker(&sched, &src, &dst, streaming);
                     let error = worker.run().unwrap_err();
                     assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
                     assert!(sched.is_aborted());
@@ -9982,8 +9949,7 @@ mod tests {
                 if failure == "destination-drop" {
                     dst.lock().unwrap().fail_receive = Some(1);
                 }
-                let mut worker =
-                    pipeline_worker(sched.clone(), src.clone(), dst.clone(), 512, false);
+                let mut worker = pipeline_worker(&sched, &src, &dst, false);
 
                 let mut credited = 0;
                 let result = worker.transfer_range(&h, &mut credited);
@@ -10003,8 +9969,7 @@ mod tests {
                     assert!(sched.range_done(&h));
                     assert!(sched.finished());
                 } else if worker.transport_dead() {
-                    worker.undo_progress(0, credited);
-                    sched.retry_range(&h, 0);
+                    worker.retry_credited_range(&h, 0, credited);
                     let mut spans = Vec::new();
                     for i in 0..4 {
                         let Item::Range(range) = sched.next() else {
@@ -10066,8 +10031,7 @@ mod tests {
                         dst.lock().unwrap().replies.push_back(Response::Ok);
                     }
                 }
-                let mut worker =
-                    pipeline_worker(sched.clone(), src.clone(), dst.clone(), 512, false);
+                let mut worker = pipeline_worker(&sched, &src, &dst, false);
                 let mut credited = 0;
                 let result = worker.transfer_range(&h, &mut credited);
                 assert_eq!(result.is_ok(), failure.is_none(), "{result:?}");
@@ -10078,8 +10042,7 @@ mod tests {
                         (completed_extras as u64 + 1) * 1536,
                         "partially acknowledged extras must be rolled back before retry"
                     );
-                    worker.undo_progress(0, credited);
-                    sched.retry_range(&h, 0);
+                    worker.retry_credited_range(&h, 0, credited);
                     let mut retried = Vec::new();
                     for i in 0..12 - completed_extras {
                         let Item::Range(range) = sched.next() else {
@@ -10138,7 +10101,7 @@ mod tests {
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                 }
             }
-            let mut worker = pipeline_worker(sched.clone(), src.clone(), dst, 512, false);
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.same_host = same_host;
             opts.tuning = tuning.parse().unwrap();
@@ -10173,7 +10136,7 @@ mod tests {
             });
             dst.lock().unwrap().replies.push_back(Response::Ok);
         }
-        let mut worker = pipeline_worker(sched.clone(), src.clone(), dst, 512, false);
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
         worker.gate = gate;
         let mut credited = 0;
         worker.transfer_range(&h, &mut credited).unwrap();

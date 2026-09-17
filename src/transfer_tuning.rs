@@ -166,7 +166,7 @@ impl TransferTuning {
             format!(
                 "{}(ordinary ranges only; streaming above {} bytes)",
                 self.pipeline_depth(),
-                block.saturating_mul(DEFAULT_PIPELINE_DEPTH as u64)
+                self.ordinary_range_limit(same_host, block)
             )
         } else {
             format!("{}(ordinary ranges only)", self.pipeline_depth())
