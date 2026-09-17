@@ -97,6 +97,7 @@ struct Window {
     recent: std::collections::VecDeque<(Instant, u64)>,
     saturated: bool,
     previous: Option<(usize, f64)>,
+    slower_limit: usize,
     settled: bool,
 }
 pub(super) struct Budget {
@@ -120,6 +121,7 @@ impl Budget {
                 recent: std::collections::VecDeque::new(),
                 saturated: false,
                 previous: None,
+                slower_limit: 0,
                 settled: false,
             }),
             changed: Notify::new(),
@@ -148,6 +150,9 @@ impl Budget {
     }
     pub fn preparation_limit(&self) -> usize {
         self.state.lock().unwrap().limit.saturating_add(1)
+    }
+    pub fn slower_limit(&self) -> usize {
+        self.state.lock().unwrap().slower_limit
     }
     pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
@@ -235,6 +240,9 @@ impl Budget {
                     // saturated losing probe can stop at the usual sample cadence.
                     return;
                 } else {
+                    // Keep the inferior setting so object admission does not
+                    // discard what this completed request probe just learned.
+                    s.slower_limit = old_limit;
                     s.previous = None;
                 }
             }
@@ -397,6 +405,7 @@ mod tests {
             (state.limit, state.completed, state.settled)
         };
         assert_eq!(observed, (128, 80, false));
+        assert_eq!(budget.slower_limit(), 0);
         // If progress then stalls, reject the probe without waiting for 128
         // completions. The original baseline is still available for comparison.
         {
@@ -413,12 +422,14 @@ mod tests {
             (state.limit, state.settled)
         };
         assert_eq!(observed, (64, true));
+        assert_eq!(budget.slower_limit(), 0);
     }
 
     #[test]
     fn object_controller_waits_for_request_ramp_or_plateau() {
         let budget = Budget::new(64, true);
         assert_eq!(budget.begin_objects(256), None);
+        assert_eq!(budget.slower_limit(), 0);
         for (bytes, completions, expected) in [(1024, 64, 128), (2048, 128, 256)] {
             {
                 let mut s = budget.state.lock().unwrap();
@@ -429,6 +440,7 @@ mod tests {
                 budget.completed(bytes);
             }
             assert_eq!(budget.state.lock().unwrap().limit, expected);
+            assert_eq!(budget.slower_limit(), if expected == 128 { 0 } else { 64 });
             assert_eq!(budget.begin_objects(256), None);
         }
         // The final increase must be evaluated even without a request waiter.
@@ -443,6 +455,7 @@ mod tests {
         assert!(budget.state.lock().unwrap().previous.is_none());
         assert_eq!(budget.begin_objects(256), Some(256));
         assert!(budget.rejected_limit().is_none());
+        assert_eq!(budget.slower_limit(), 128);
         assert_eq!(budget.state.lock().unwrap().limit, 256);
         budget.finish_objects(512);
         assert_eq!(budget.state.lock().unwrap().limit, 512);

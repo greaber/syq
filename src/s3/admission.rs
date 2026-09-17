@@ -304,6 +304,11 @@ where
             maximum,
             concurrency.initial_probe_up && rejected.is_none(),
         );
+        if let Some(requests) = &concurrency.requests {
+            // The ramp may also have demonstrated that fewer requests lose
+            // throughput. Revisit that bound normally if conditions change.
+            controller.lower = requests.slower_limit().min(initial.saturating_sub(1));
+        }
         if let Some(rejected) = rejected {
             // Reuse the request ramp's result instead of immediately retrying
             // the same losing setting. Normal revisits can reopen this bound.
@@ -568,6 +573,34 @@ mod tests {
         let recovered = (0..400).any(|_| model.sample(&mut controller, 256, 0.0) >= 0.9);
         assert!(recovered);
         assert!(controller.limit > 128);
+    }
+
+    #[test]
+    fn an_inherited_slower_setting_does_not_prevent_decreasing_concurrency() {
+        let mut controller = Controller::new(256, 256, false);
+        controller.lower = 128;
+        let mut model = PathModel {
+            active: 256,
+            completions: 0.0,
+            random: 251,
+        };
+        // The request ramp established that 128 was slower than 256. The
+        // first object probe should refine that interval rather than halve
+        // concurrency again. A later capacity loss must still escape it.
+        for _ in 0..3 {
+            model.sample(&mut controller, 256, 0.0);
+        }
+        assert!(controller.limit > 128);
+        let recovered = (0..400).any(|_| model.sample(&mut controller, 32, 0.0) >= 0.9);
+        assert!(
+            recovered,
+            "an inherited lower bound must remain revisitable"
+        );
+        let fraction = (0..1000)
+            .map(|_| model.sample(&mut controller, 32, 0.0))
+            .sum::<f64>()
+            / 1000.0;
+        assert!(fraction > 0.95, "must sustain the recovery: {fraction}");
     }
 
     #[test]
