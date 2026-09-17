@@ -597,6 +597,66 @@ mod tests {
         assert_eq!(jobs, (0..8).collect::<Vec<_>>());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn measured_handoff_can_probe_before_more_completions() {
+        for (rate, upward, count, maximum, expected) in [
+            (Some((4, 1000.0)), true, 32, 16, 8),
+            (Some((4, 1000.0)), true, 15, 16, 4),
+            (Some((2, 1000.0)), true, 32, 16, 4),
+            (None, true, 32, 16, 4),
+            (Some((4, 1000.0)), false, 32, 16, 4),
+            (Some((4, 1000.0)), true, 32, 4, 4),
+        ] {
+            let budget = Arc::new(Budget::new(4, true));
+            budget.state.lock().unwrap().object_rate = rate;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (prepared, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let copy_gate = gate.clone();
+            let copy = tokio::spawn(async move {
+                crate::s3::admission::parallel(
+                    (0..count).collect(),
+                    crate::s3::admission::Concurrency {
+                        initial: 4,
+                        maximum: Some(maximum),
+                        initial_probe_up: upward,
+                        requests: Some(budget.clone()),
+                    },
+                    move |job| {
+                        let budget = budget.clone();
+                        let gate = copy_gate.clone();
+                        let prepared = prepared.clone();
+                        async move {
+                            let _permit = budget.acquire().await;
+                            prepared.send(job).unwrap();
+                            gate.acquire().await.unwrap().forget();
+                            Ok(Some(1024))
+                        }
+                    },
+                )
+                .await
+            });
+            // No object has completed yet. A matching request measurement is
+            // the only possible evidence for an immediate increase.
+            let mut jobs = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            while let Ok(Some(job)) = tokio::time::timeout_at(deadline, observed.recv()).await {
+                jobs.push(job);
+            }
+            let initial = jobs.len();
+            gate.add_permits(count);
+            copy.await.unwrap().unwrap();
+            while let Some(job) = observed.recv().await {
+                jobs.push(job);
+            }
+            assert_eq!(
+                initial, expected,
+                "rate={rate:?}, count={count}, upward={upward}"
+            );
+            jobs.sort_unstable();
+            assert_eq!(jobs, (0..count).collect::<Vec<_>>());
+        }
+    }
+
     #[test]
     fn handoff_rate_matches_a_completed_probe_at_the_same_limit() {
         let budget = Budget::new(64, true);

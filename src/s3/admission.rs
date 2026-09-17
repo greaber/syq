@@ -336,7 +336,7 @@ where
     F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = Result<Option<u64>>> + Send + 'static,
 {
-    let begin = || {
+    let begin = |remaining: usize| {
         let maximum = concurrency.maximum?;
         let initial = match &concurrency.requests {
             Some(requests) => requests.begin_objects(concurrency.initial)?,
@@ -358,8 +358,8 @@ where
                     .is_some_and(|r| r.probe_preserved_rate()),
         );
         if let Some(requests) = &concurrency.requests {
-            // Keep warmup exclusion, but reuse one full-count request score
-            // instead of collecting the entire baseline again after handoff.
+            // Reuse a full-count score only at the same limit. If an immediate
+            // probe is not justified, it supplies half of the new baseline.
             controller.sampler.previous = requests.object_rate(initial);
             // The ramp may also have demonstrated that fewer requests lose
             // throughput. Revisit that bound normally if conditions change.
@@ -370,9 +370,29 @@ where
             // the same losing setting. Normal revisits can reopen this bound.
             controller.upper = controller.upper.min(rejected.max(initial + 1));
         }
+        // A full-count request score at this same limit can start the first
+        // upward probe without another baseline. Keep normal warmup and fresh-
+        // work checks for the probe itself, and enough queued work to measure it.
+        if controller.upward {
+            if let Some(rate) = controller.sampler.previous {
+                let candidate = controller.candidate();
+                if candidate > initial && remaining >= candidate.saturating_mul(2) {
+                    controller.probe = Some(Probe {
+                        from: initial,
+                        baseline: rate,
+                        upward: true,
+                        revisit: false,
+                        confirming: false,
+                    });
+                    controller.limit = candidate;
+                    controller.sampler.reset();
+                    super::diagnostics::object_concurrency(initial, candidate, rate);
+                }
+            }
+        }
         Some(controller)
     };
-    let mut controller = begin();
+    let mut controller = begin(jobs.len());
     let mut handoff_pending = controller.is_some() && concurrency.requests.is_some();
     let mut limit = controller.as_ref().map_or(concurrency.initial, |c| c.limit);
     let mut tasks = tokio::task::JoinSet::new();
@@ -445,7 +465,7 @@ where
                 if controller.is_none() {
                     // Preserve the existing request ramp before taking over.
                     // Only one controller changes concurrency at a time.
-                    controller = begin();
+                    controller = begin(jobs.len());
                     if let Some(controller) = &controller {
                         generation += 1;
                         if let Some(observations) = &mut observations {
