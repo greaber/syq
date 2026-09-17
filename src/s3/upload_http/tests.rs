@@ -6,7 +6,7 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
     for synchronous in [false, true] {
         for await_response in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("source");
+            let path = temp.path().canonicalize().unwrap().join("source");
             let size = if await_response {
                 4096
             } else {
