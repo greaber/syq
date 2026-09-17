@@ -156,12 +156,17 @@ impl Engine {
                 } else {
                     format!("{target}/")
                 };
-                let keys = client::list(&self.client, &self.options.bucket, &prefix)
-                    .await?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
-                let _ = self.upload_keys.set(keys);
+                let source_keys = plan.iter().map(|source| source.key.as_str()).collect();
+                if let Some(keys) = client::upload_listing(
+                    &self.client,
+                    &self.options.bucket,
+                    &prefix,
+                    &source_keys,
+                )
+                .await?
+                {
+                    let _ = self.upload_keys.set(keys);
+                }
             }
 
             self.tuning.observe_control(planning.elapsed());
@@ -396,10 +401,8 @@ impl Engine {
         } else {
             format!("{target}/")
         };
-        let present = exact
-            || !client::list(&self.client, &self.options.bucket, &prefix)
-                .await?
-                .is_empty();
+        let present =
+            exact || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
             || (self.args.target_existence == Existence::Existing && !present)
         {
@@ -1153,7 +1156,12 @@ impl Engine {
             let (exact, listed) = if directory && self.args.native_mapping.is_none() {
                 let (exact, listed) = tokio::try_join!(
                     exact,
-                    client::list(&self.client, &self.options.bucket, &prefix)
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        matcher.as_ref()
+                    )
                 )?;
                 (exact, Some(listed))
             } else {
@@ -1183,13 +1191,24 @@ impl Engine {
                 }
                 let listed = match listed {
                     Some(listed) => listed,
-                    None => client::list(&self.client, &self.options.bucket, &prefix).await?,
+                    None => {
+                        client::list(
+                            &self.client,
+                            &self.options.bucket,
+                            &prefix,
+                            matcher.as_ref(),
+                        )
+                        .await?
+                    }
                 };
-                if listed.is_empty() {
+                if !listed.found {
                     bail!("S3 source prefix {key:?} contains no objects");
                 }
+                self.progress
+                    .files_excluded
+                    .fetch_add(listed.excluded, Relaxed);
                 let mut objects = Vec::new();
-                for (object, size) in listed {
+                for (object, size) in listed.objects {
                     let suffix = object
                         .strip_prefix(&prefix)
                         .context("S3 listing returned a key outside the requested prefix")?;

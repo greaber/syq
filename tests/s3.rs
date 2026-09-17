@@ -146,6 +146,90 @@ fn serve(
         headers.get("x-tigris-consistent").map(String::as_str),
         Some("true")
     );
+    if fault.starts_with("listing-") {
+        let target = first.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        if method == "HEAD"
+            && (url.path() == "/bucket/data"
+                || fault.starts_with("listing-budget")
+                || fault == "listing-complete")
+        {
+            reply(&mut socket, 404, &[], b"", true);
+            return;
+        }
+        if query.contains_key("list-type") {
+            assert_eq!(method, "GET");
+            assert_eq!(query.get("prefix").map(|s| s.as_ref()), Some("data/"));
+            let object =
+                |key: &str| format!("<Contents><Key>{key}</Key><Size>{SIZE}</Size></Contents>");
+            let (body, truncated) = match fault {
+                "listing-exists" => {
+                    assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
+                    (object("data/other"), true)
+                }
+                "listing-budget-many" => (
+                    object("data/other"),
+                    !query.contains_key("continuation-token"),
+                ),
+                "listing-budget" => {
+                    assert!(
+                        !query.contains_key("continuation-token"),
+                        "upload enumerated a large destination"
+                    );
+                    (object("data/other"), true)
+                }
+                "listing-complete" => (String::new(), false),
+                "listing-adaptive" | "listing-all-ignored" | "listing-wide" => {
+                    assert!(
+                        fault == "listing-wide" || !query.contains_key("continuation-token"),
+                        "enumerated an excluded subtree"
+                    );
+                    if query.contains_key("delimiter") {
+                        assert_eq!(query["delimiter"], "/");
+                        let mut body =
+                            "<CommonPrefixes><Prefix>data/archive/</Prefix></CommonPrefixes>"
+                                .to_owned();
+                        if fault == "listing-adaptive" {
+                            body.push_str(&object("data/file"));
+                        }
+                        if fault == "listing-wide" {
+                            body.push_str("<CommonPrefixes><Prefix>data/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>data/b/</Prefix></CommonPrefixes>");
+                        }
+                        (body, false)
+                    } else {
+                        // Even a malformed descendant need not be interpreted
+                        // when its whole directory is excluded.
+                        (
+                            object("data/archive/../invalid"),
+                            !query.contains_key("continuation-token"),
+                        )
+                    }
+                }
+                "listing-flat" => {
+                    assert!(
+                        !query.contains_key("delimiter"),
+                        "filename filter caused directory traversal"
+                    );
+                    (
+                        object("data/dir/file.tmp"),
+                        !query.contains_key("continuation-token"),
+                    )
+                }
+                _ => panic!("unknown listing fixture"),
+            };
+            let next = if truncated {
+                "<NextContinuationToken>next</NextContinuationToken>"
+            } else {
+                ""
+            };
+            let xml = format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>{next}{body}</ListBucketResult>");
+            reply(&mut socket, 200, &[], xml.as_bytes(), false);
+            return;
+        }
+    }
     if fault.starts_with("upload-") {
         if method == "HEAD" {
             reply(&mut socket, 404, &[], b"", true);
@@ -1198,4 +1282,107 @@ fn s3_review_verify_only_reports_expected_hash_mismatch() {
         std::fs::read(temp.path().join("result")).unwrap(),
         vec![b'x'; 65536]
     );
+}
+
+#[test]
+fn s3_listing_costs_are_bounded_without_changing_selection() {
+    for (fault, rules, expected_requests) in [
+        ("listing-adaptive", vec!["--ignore", "archive/"], 4),
+        ("listing-all-ignored", vec!["--ignore", "archive/"], 3),
+        ("listing-flat", vec!["--ignore", "*.tmp"], 3),
+        ("listing-wide", vec!["--ignore", "archive/"], 4),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "out",
+            "--dry-run",
+            "--results",
+            "results.jsonl",
+        ];
+        args.extend(rules);
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            expected_requests,
+            "{fault}"
+        );
+        validate_results(temp.path());
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(temp.path().join("results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let terminal = records
+            .iter()
+            .find(|record| record["type"] == "result")
+            .unwrap();
+        assert_eq!(
+            terminal["files_transferred"],
+            if fault == "listing-adaptive" { 1 } else { 0 },
+            "{records:?}"
+        );
+        assert_eq!(
+            terminal["files_excluded"],
+            if fault == "listing-flat" || fault == "listing-wide" {
+                2
+            } else {
+                0
+            }
+        );
+        if fault == "listing-adaptive" {
+            let trace = records
+                .iter()
+                .find(|record| record["type"] == "trace")
+                .unwrap();
+            assert_eq!(trace["dst"]["value"], "out/file");
+        }
+    }
+}
+
+#[test]
+fn s3_upload_destination_discovery_is_bounded() {
+    for (fault, placement, success, expected_requests) in [
+        ("listing-exists", "--into-new", false, 2),
+        ("listing-budget", "--into", true, 3),
+        ("listing-budget-many", "--into", true, 2),
+        ("listing-complete", "--into", true, 1),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("one"), b"one").unwrap();
+        std::fs::write(temp.path().join("two"), b"two").unwrap();
+        let mut args = vec![
+            "one",
+            "two",
+            "--to",
+            "s3://bucket",
+            placement,
+            "data",
+            "--dry-run",
+        ];
+        if fault == "listing-budget-many" {
+            std::fs::write(temp.path().join("three"), b"three").unwrap();
+            args.insert(0, "three");
+        }
+        let output = server.cp(temp.path(), &args);
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            expected_requests,
+            "{fault}"
+        );
+    }
 }

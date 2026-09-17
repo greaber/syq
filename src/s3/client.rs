@@ -285,14 +285,37 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
     }))
 }
 
-pub(super) async fn list(
+/// Existence needs only one object, regardless of the size of the prefix.
+pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
+    let output = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1)
+        .send()
+        .await
+        .map_err(|e| e.into_service_error())
+        .context("S3 listing failed")?;
+    anyhow::ensure!(
+        !output.contents().is_empty() || output.is_truncated() != Some(true),
+        "S3 existence listing was truncated without an object"
+    );
+    Ok(!output.contents().is_empty())
+}
+
+/// Bound destination discovery by the size of the upload. An incomplete listing
+/// cannot prove that an upload key is absent, so leave those decisions to HEAD.
+pub(super) async fn upload_listing(
     client: &Client,
     bucket: &str,
     prefix: &str,
-) -> Result<Vec<(String, u64)>> {
-    let mut objects = Vec::new();
+    source_keys: &std::collections::HashSet<&str>,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let mut keys = std::collections::HashSet::new();
     let mut token = None;
-    loop {
+    // Never spend as many LIST requests as checking each source with HEAD.
+    // Retain only relevant keys so a large destination cannot grow the cache.
+    for _ in 0..source_keys.len().saturating_sub(1) {
         let output = client
             .list_objects_v2()
             .bucket(bucket)
@@ -303,13 +326,13 @@ pub(super) async fn list(
             .map_err(|e| e.into_service_error())
             .context("S3 listing failed")?;
         for object in output.contents() {
-            objects.push((
-                object.key().context("S3 listing omitted key")?.to_owned(),
-                u64::try_from(object.size().context("S3 listing omitted size")?)?,
-            ));
+            let key = object.key().context("S3 listing omitted key")?;
+            if source_keys.contains(key) {
+                keys.insert(key.to_owned());
+            }
         }
-        if output.is_truncated() != Some(true) {
-            break;
+        if output.is_truncated() != Some(true) || keys.len() == source_keys.len() {
+            return Ok(Some(keys));
         }
         let next = output
             .next_continuation_token()
@@ -320,7 +343,145 @@ pub(super) async fn list(
         }
         token = Some(next);
     }
-    Ok(objects)
+    Ok(None)
+}
+
+pub(super) struct Listing {
+    pub objects: Vec<(String, u64)>,
+    pub found: bool,
+    pub excluded: u64,
+}
+
+/// Keep flat listings for small trees and filename filters. Only switch to
+/// directory discovery when the first full page shows excluded descendants.
+/// Probe one directory page, but accept it only when it prunes a subtree and
+/// leaves at most one child to visit. Otherwise reuse the flat sample. This
+/// prevents an exclusion from turning a wide tree into one request per folder.
+pub(super) async fn list(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+) -> Result<Listing> {
+    let ignored = |key: &str, directory| {
+        matcher.is_some_and(|m| crate::scan::path_is_ignored(m, key.as_bytes(), directory))
+    };
+    let mut result = Listing {
+        objects: Vec::new(),
+        found: false,
+        excluded: 0,
+    };
+    if ignored(prefix.trim_end_matches('/'), true) {
+        result.found = prefix_exists(client, bucket, prefix).await?;
+        return Ok(result);
+    }
+    let mut pending = vec![prefix.to_owned()];
+    while let Some(current) = pending.pop() {
+        let mut token = None;
+        loop {
+            let mut directories = false;
+            let mut output = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&current)
+                .set_continuation_token(token.clone())
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())
+                .context("S3 listing failed")?;
+            result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
+            if token.is_none()
+                && output.is_truncated() == Some(true)
+                && output.contents().iter().any(|object| {
+                    object.key().is_some_and(|key| {
+                        key.rsplit_once('/')
+                            .is_some_and(|(parent, _)| ignored(parent, true))
+                    })
+                })
+            {
+                let directory_page = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(&current)
+                    .delimiter("/")
+                    .send()
+                    .await
+                    .map_err(|e| e.into_service_error())
+                    .context("S3 listing failed")?;
+                let mut included = 0;
+                let mut excluded = 0;
+                for child in directory_page.common_prefixes() {
+                    let child = child.prefix().context("S3 listing omitted common prefix")?;
+                    anyhow::ensure!(
+                        child.starts_with(&current)
+                            && child.len() > current.len()
+                            && child.ends_with('/'),
+                        "S3 listing returned an invalid common prefix"
+                    );
+                    if ignored(child.trim_end_matches('/'), true) {
+                        excluded += 1;
+                    } else {
+                        included += 1;
+                    }
+                }
+                if directory_page.is_truncated() != Some(true) && excluded > 0 && included <= 1 {
+                    // Replace rather than append the sample, so objects and
+                    // exclusion counts cannot be duplicated.
+                    output = directory_page;
+                    directories = true;
+                }
+            }
+            for object in output.contents() {
+                let key = object.key().context("S3 listing omitted key")?;
+                anyhow::ensure!(
+                    key.starts_with(&current),
+                    "S3 listing returned a key outside the requested prefix"
+                );
+                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
+                let directory = key.ends_with('/') && size == 0;
+                if ignored(key, directory) {
+                    // Skipped directories need no descendant validation, as
+                    // with filesystem walks. A filename-only exclusion still
+                    // encounters the key and preserves its path validation.
+                    if !directory
+                        && !key
+                            .rsplit_once('/')
+                            .is_some_and(|(parent, _)| ignored(parent, true))
+                    {
+                        super::local::key_path(key.as_bytes())?;
+                    }
+                    result.excluded += 1;
+                } else {
+                    result.objects.push((key.to_owned(), size));
+                }
+            }
+            for child in output.common_prefixes() {
+                let child = child.prefix().context("S3 listing omitted common prefix")?;
+                anyhow::ensure!(
+                    directories
+                        && child.starts_with(&current)
+                        && child.len() > current.len()
+                        && child.ends_with('/'),
+                    "S3 listing returned an invalid common prefix"
+                );
+                if !ignored(child.trim_end_matches('/'), true) {
+                    pending.push(child.to_owned());
+                }
+            }
+            if output.is_truncated() != Some(true) {
+                break;
+            }
+            let next = output
+                .next_continuation_token()
+                .context("truncated S3 listing omitted continuation token")?
+                .to_owned();
+            if token.as_ref() == Some(&next) {
+                bail!("S3 listing repeated its continuation token");
+            }
+            token = Some(next);
+        }
+    }
+    Ok(result)
 }
 
 // GET metadata is authoritative for the body returned by that same request.

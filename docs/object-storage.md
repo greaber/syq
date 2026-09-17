@@ -17,6 +17,10 @@ Shell wildcards expand locally; use `--srcs-in PREFIX` to select object keys
 beneath a prefix. A named selector selects an exact object when it exists,
 otherwise the objects beneath `NAME/`.
 
+Ignore rules can let syq skip entire object subtrees. As with filesystem
+copies, excluded totals cover entries inspected, not unseen descendants of
+skipped directories. Keys inside skipped subtrees are not validated.
+
 ## Credentials and providers
 
 Syq uses the AWS SDK credential chain, including environment variables, shared
