@@ -143,6 +143,15 @@ than the byte limit use another copy method. With `--resource-limits bandwidth=R
 contains at most one file. Batch controls cannot combine with `copy-path=ranges`
 or `copy-path=streaming`; `auto-streaming` accepts them.
 
+Remote new-file copies keep files batched to reduce network round trips.
+Their size limit follows the request and batch limits, independently of the
+comparison block.
+Workers overlap reads and writes in bounded groups of whole files inside each
+batch. Idle workers can take groups whose reads have not started; after a source
+read stalls, its worker drains read-ahead before claiming more groups. Larger
+files can use up to one worker per file within the selected worker count; tiny
+files share workers to avoid unnecessary connection setup.
+
 `split-min-size` sets the smallest file region an idle worker can take from
 another worker. Lower values allow finer sharing; higher values avoid small
 assignments. Splits align to hash blocks and need at least twice the minimum
