@@ -135,7 +135,7 @@ pub(crate) fn claim_block_with_digest(
     }
 }
 
-pub(crate) type Responses = mpsc::Receiver<io::Result<crate::wire_budget::Budgeted<Response>>>;
+pub(crate) type Responses = mpsc::Receiver<io::Result<crate::conn::ReceivedResponse>>;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Failure {
@@ -549,10 +549,13 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
-    fn queued(value: Response) -> io::Result<crate::wire_budget::Budgeted<Response>> {
-        Ok(crate::wire_budget::Budgeted {
-            value,
-            hold: crate::wire_budget::Hold::new(),
-        })
+    fn queued(value: Response) -> io::Result<crate::conn::ReceivedResponse> {
+        Ok(crate::conn::ReceivedResponse::from_frame((
+            crate::wire_budget::Budgeted {
+                value,
+                hold: crate::wire_budget::Hold::new(),
+            },
+            std::time::Instant::now(),
+        )))
     }
 }
