@@ -72,6 +72,10 @@ signal-hook = "0.4.4"
 [build-dependencies]
 serde_json = "1"
 
+# Keep CPU-heavy copies practical in development and test builds.
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = "thin"

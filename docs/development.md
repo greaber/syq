@@ -136,7 +136,13 @@ CARGO_PROFILE_RELEASE_STRIP=none python -m pip install ./sdk/python
 
 The Python build backend must come from the pinned `pyproject.toml`. Published
 wheels are stripped explicitly by release CI. For a standalone debug executable,
-`cargo build --locked` uses Cargo's development profile.
+`cargo build --locked` uses optimization level 1 with debug symbols, debug
+assertions, and overflow checks. Tests inherit these settings. BLAKE3 uses
+level 3 in both development and test builds.
+
+For clearer debugger stepping, temporarily use
+`CARGO_PROFILE_DEV_OPT_LEVEL=0 cargo build --locked`. The BLAKE3 override still
+applies.
 
 ## Reproduce a release binary
 
