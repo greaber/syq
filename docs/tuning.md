@@ -48,6 +48,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 | Key | Default | Accepted values |
 |---|---|---|
+| `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
@@ -84,27 +85,29 @@ For existing remote copies with scattered small edits, try smaller comparison
 blocks while keeping larger transfer requests:
 
 ```sh
-syq rsync -a -B 64K --performance-tuning request-size=4M source/ host:destination/
+syq cp --srcs-in source --to host --into destination \
+  --performance-tuning comparison-block-size=64K,request-size=4M
 ```
 
 The default comparison block is 4 MiB; one changed byte makes that whole block
 need copying. Smaller blocks can reduce the data sent, but require more hashes
 and requests. Keep `request-size=4M`: request size otherwise defaults to the
-comparison block, so `-B 64K` alone also shrinks requests and lowers the automatic
-streaming threshold to 256 KiB.
+comparison block, so setting only `comparison-block-size=64K` also shrinks
+requests and lowers the automatic streaming threshold to 256 KiB.
 
 Syq fills available request windows with changed ranges from the same file,
 leaving queued work for other workers. This can help on high-latency links,
 though the result depends on the edits and connection. Both endpoints still
 read the full file to compare it. By default, syq builds the updated file beside
 the destination and then replaces it. It copies and checks reused destination
-bytes before applying changes. A complete rewrite skips that old-data copy
-unless an interrupted copy offers another basis for reuse. With `--inplace`,
+bytes before applying changes, skipping final-file blocks already known to
+differ. An interrupted copy can supply other reusable bytes. With `--inplace`,
 changes are written directly to the destination instead.
 
 The smallest supported comparison block is 64 KiB. A later copy can reuse
-matching bytes from an interrupted copy even if you change `-B`; syq checks
-them using the new block size.
+matching bytes from an interrupted copy even if you change the comparison block
+size; syq checks them using the new size. The rsync compatibility command also
+accepts `-B` / `--block-size`; do not combine it with `comparison-block-size`.
 
 ### Streaming and request windows
 

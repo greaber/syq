@@ -6703,7 +6703,7 @@ esac
         assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
         for attempt in 0..2 {
             let mut seed = Request::SeedBasis {
-                reuse_final: true,
+                final_ranges: None,
                 path: path_bytes(&fresh),
                 copy_id: [1; 16],
                 len: 3,
@@ -6713,8 +6713,8 @@ esac
             };
             let settlement = authority.authorize(&mut seed, false).unwrap();
             let response = ops.handle(&seed);
-            assert!(matches!(&response, proto::Response::Hashes(hashes)
-                if *hashes == vec![crate::fsops::content_digest(b"new")]));
+            assert!(matches!(&response, proto::Response::SeededBasis(seed)
+                if seed.hashes == vec![crate::fsops::content_digest(b"new")]));
             authority.settle(settlement, &response);
             assert!(!fresh.exists());
         }
@@ -6822,7 +6822,7 @@ esac
         };
         assert!(authority.authorize(&mut finish, false).is_err());
         let mut seed = Request::SeedBasis {
-            reuse_final: true,
+            final_ranges: None,
             path: path_bytes(&kept),
             copy_id: [1; 16],
             len: 3,
@@ -8873,7 +8873,7 @@ esac
         assert!(authority.authorize(&mut prepare("b", 3), false).is_err());
         authority.authorize(&mut prepare("b", 2), false).unwrap();
         let mut seed = Request::SeedBasis {
-            reuse_final: true,
+            final_ranges: None,
             path: root.join("target/b").as_os_str().as_bytes().to_vec(),
             copy_id: [1; 16],
             len: 3,
@@ -8996,6 +8996,36 @@ esac
         let GrantOperation::Copy(copy) = &grant.operation;
         assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
         assert_eq!(copy.limits.max_deletions, 0);
+    }
+
+    #[test]
+    fn native_comparison_block_size_sets_the_signed_receiver_limit() {
+        let args = Args::parse_args(
+            &[
+                "cp",
+                "--from",
+                "host-a",
+                "source",
+                "--to",
+                "host-b",
+                "--as",
+                "/backup",
+                "--performance-tuning=comparison-block-size=64K,request-size=4M",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let source = Location::parse("host-a:source").unwrap();
+        let grant = grant_for(
+            &args,
+            &[source],
+            EnrollmentId::random(),
+            "backup",
+            b"/backup",
+        )
+        .unwrap();
+        let GrantOperation::Copy(copy) = grant.operation;
+        assert_eq!(copy.limits.hash_block_bytes, 64 << 10);
     }
 
     #[test]

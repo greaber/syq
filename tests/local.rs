@@ -1883,6 +1883,38 @@ fn native_hash_repairs_equal_metadata_content_mismatches() {
 }
 
 #[test]
+fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
+    let t = Tmp::new();
+    let block = 64 * 1024;
+    let original = vec![17; 8 * block + 7];
+    let mut edited = original.clone();
+    for index in [1, 3, 4, 7] {
+        edited[index * block] = 91;
+    }
+    write(&t.path("src"), &edited);
+    write(&t.path("dst"), &original);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--hash",
+            "--stats",
+            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+        ])
+        .arg("--no-progress")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), edited);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("bytes transferred: 262,144"), "{stdout}");
+    assert!(stdout.contains("bytes unchanged: 262,151"), "{stdout}");
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
 fn native_filters_apply_to_copy_and_protect_pruned_paths() {
     let t = Tmp::new();
     write(&t.path("src/keep"), b"keep");
@@ -5608,34 +5640,26 @@ fn sparse_updates_recover_batched_reads_and_writes_without_losing_unchanged_byte
         }
         write(&t.path("src"), &edited);
         write(&t.path("dst"), &original);
-        let source = if pull {
-            format!("fake:{}", t.s("src"))
-        } else {
-            t.s("src")
-        };
-        let destination = if pull {
-            t.s("dst")
-        } else {
-            format!("fake:{}", t.s("dst"))
-        };
         let marker = t.path("drop-once");
-        let output = remote_syq_command(
-            &t,
-            &rsh,
-            &[
-                "-ac",
-                "--stats",
-                "--syq-no-bootstrap",
-                "--block-size=64K",
-                "--performance-tuning=copy-path=ranges,request-size=4M",
-                &source,
-                &destination,
-            ],
-        )
-        .env("SYQ_TEST_DROP_AFTER_REQUEST", drop_request)
-        .env("SYQ_TEST_DROP_MARKER", &marker)
-        .run()
-        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args(["cp", "--hash", "--stats", "--no-progress", "--rsh", rsh.to_str().unwrap(), "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp", "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,workers=1"]);
+        if pull {
+            command.args(["--from", "fake"]);
+        }
+        command.arg(t.path("src"));
+        if !pull {
+            command.args(["--to", "fake"]);
+        }
+        let output = command
+            .args(["--as", &t.s("dst")])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", drop_request)
+            .env("SYQ_TEST_DROP_MARKER", &marker)
+            .run()
+            .unwrap();
         assert_output_ok(&output);
         assert!(marker.exists());
         assert_eq!(read(&t.path("dst")), edited);

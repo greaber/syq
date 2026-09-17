@@ -227,7 +227,7 @@ pub struct Args {
     pub connections: usize,
     #[arg(skip)]
     pub connections_default: bool,
-    /// Transfer/hash block size (e.g. 4M)
+    /// Comparison and reuse block size (e.g. 4M)
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE")]
     pub block_size: String,
     /// Override transfer internals for performance troubleshooting (normally automatic)
@@ -655,6 +655,9 @@ impl Args {
             {
                 bail!("removal supports only performance-tuning workers");
             }
+            if let Some(block) = tuning.comparison_block_size {
+                self.block_size = block.to_string();
+            }
             self.connections_opt = tuning.workers;
         }
         if let Some(limits) = &self.resource_limits {
@@ -736,6 +739,13 @@ fn validate_expected_hash_selection(args: &Args) -> Result<()> {
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
     args.apply_advanced()?;
+    if matches.value_source("block_size") == Some(clap::parser::ValueSource::CommandLine)
+        && args
+            .tuning_options
+            .is_some_and(|t| t.comparison_block_size.is_some())
+    {
+        bail!("--block-size/-B conflicts with performance-tuning comparison-block-size");
+    }
     args.bwlimit_bytes = args
         .bwlimit
         .as_deref()
@@ -2860,6 +2870,56 @@ mod tests {
         assert!(!args.owner);
         assert!(!args.group);
         assert!(!args.devices);
+    }
+
+    #[test]
+    fn comparison_block_size_is_a_native_advanced_control() {
+        let args = parse_native_copy(
+            &[
+                "source",
+                "--as",
+                "destination",
+                "--performance-tuning=comparison-block-size=64K,request-size=4M",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(parse_size(&args.block_size).unwrap(), 64 << 10);
+        assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
+        let error = parse_native_copy(
+            &[
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+                "--performance-tuning=comparison-block-size=64K",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("filesystem performance tuning"),
+            "{error}"
+        );
+        for spelling in ["-B", "--block-size"] {
+            let args =
+                Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
+                    .unwrap();
+            assert_eq!(parse_size(&args.block_size).unwrap(), 128 << 10);
+            let error = Args::parse_rsync(
+                &[
+                    "source",
+                    "destination",
+                    spelling,
+                    "128K",
+                    "--performance-tuning=comparison-block-size=64K",
+                ]
+                .map(OsString::from),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("conflicts"), "{error}");
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::proto::DestinationRoot as RegisteredDestinationRoot;
 use crate::proto::*;
 use crate::sched::{FileJob, FileJobData, Item, RangeHandle, Sched, WorkerJob};
 use crate::tune::{self, Gate};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -8527,11 +8527,7 @@ impl Worker {
                     return Ok((vec![], false));
                 }
                 return Ok((
-                    self.reuse_blocks(
-                        &job,
-                        diff.source_hashes,
-                        diff.ranges.as_slice() != [(0, size)],
-                    )?,
+                    self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?,
                     true,
                 ));
             }
@@ -8675,7 +8671,7 @@ impl Worker {
             return self
                 .diff_with(
                     job,
-                    self.seed_request(job, true),
+                    self.seed_request(job, None),
                     "seed and hash destination",
                 )
                 .map(|diff| diff.ranges);
@@ -8701,25 +8697,64 @@ impl Worker {
         &mut self,
         job: &WorkerJob,
         hashes: Vec<ContentDigest>,
-        reuse_final: bool,
+        different: &[(u64, u64)],
     ) -> Result<Vec<(u64, u64)>> {
-        let response = self.dst.call(self.seed_request(job, reuse_final))?;
-        let reused = Self::hashes(ok(response, "reuse destination blocks")?)?;
-        Ok(Self::different_ranges(
-            &hashes,
-            &reused,
-            self.opts.block,
-            job.entry.size,
+        let mut matching = Vec::new();
+        let mut pos = 0;
+        for &(start, end) in different {
+            if pos < start {
+                matching.push((pos, start));
+            }
+            pos = end;
+        }
+        if pos < job.entry.size {
+            matching.push((pos, job.entry.size));
+        }
+        let response = self
+            .dst
+            .call(self.seed_request(job, Some(matching.clone())))?;
+        let Response::SeededBasis(reused) = ok(response, "reuse destination blocks")? else {
+            bail!("destination did not return seeded block hashes");
+        };
+        Self::different_seeded_ranges(&hashes, &reused, &matching, self.opts.block, job.entry.size)
+    }
+
+    fn different_seeded_ranges(
+        source: &[ContentDigest],
+        reused: &SeededBasis,
+        matching: &[(u64, u64)],
+        block: u64,
+        size: u64,
+    ) -> Result<Vec<(u64, u64)>> {
+        if !reused.selected_final {
+            // Interrupted and retry copies remain independent donors, even
+            // where the final file's blocks differed from the source.
+            return Ok(Self::different_ranges(source, &reused.hashes, block, size));
+        }
+        let indices = || {
+            matching.iter().flat_map(|&(start, end)| {
+                (start / block..end.div_ceil(block)).map(|index| index as usize)
+            })
+        };
+        ensure!(
+            reused.hashes.len() <= indices().count(),
+            "too many seeded block hashes"
+        );
+        Ok(Self::different_ranges_at(
+            source,
+            indices().zip(&reused.hashes),
+            block,
+            size,
         ))
     }
 
-    fn seed_request(&self, job: &WorkerJob, reuse_final: bool) -> Request {
+    fn seed_request(&self, job: &WorkerJob, final_ranges: Option<Vec<(u64, u64)>>) -> Request {
         Request::SeedBasis {
             path: job.dst.clone(),
             copy_id: self.copy_id(),
             len: job.entry.size,
             block: self.opts.block,
-            reuse_final,
+            final_ranges,
             attempt: job.attempt,
             guard: job.container_guard.clone(),
         }
@@ -8790,6 +8825,10 @@ impl Worker {
         match response {
             Response::Hashes(hashes) => Ok((hashes, None)),
             Response::HeldHashes { hashes, len } => Ok((hashes, Some(len))),
+            Response::SeededBasis(SeededBasis {
+                hashes,
+                selected_final: false,
+            }) => Ok((hashes, None)),
             other => bail!("unexpected response {other:?}"),
         }
     }
@@ -8800,10 +8839,22 @@ impl Worker {
         block: u64,
         size: u64,
     ) -> Vec<(u64, u64)> {
+        Self::different_ranges_at(source, destination.iter().enumerate(), block, size)
+    }
+
+    fn different_ranges_at<'a>(
+        source: &[ContentDigest],
+        destination: impl Iterator<Item = (usize, &'a ContentDigest)>,
+        block: u64,
+        size: u64,
+    ) -> Vec<(u64, u64)> {
+        let mut destination = destination.peekable();
         let n = size.div_ceil(block) as usize;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for i in 0..n {
-            let same = source.get(i).is_some() && source.get(i) == destination.get(i);
+            let same = destination
+                .next_if(|(index, _)| *index == i)
+                .is_some_and(|(_, hash)| source.get(i) == Some(hash));
             if same {
                 continue;
             }
@@ -9544,6 +9595,46 @@ fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p [u8]> {
 mod tests {
     use super::*;
     use crate::sched::tests::test_job as pipeline_job;
+
+    #[test]
+    fn seeded_hashes_preserve_selected_positions_and_require_actual_matches() {
+        let source = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let selected = [(10, 20), (30, 43)];
+        for (hashes, expected) in [
+            (
+                vec![source[1], source[3], source[4]],
+                vec![(0, 10), (20, 30)],
+            ),
+            // A changed donor block must be sent again, despite the hint.
+            (vec![[9; 32], source[3], source[4]], vec![(0, 30)]),
+            // A truncated donor returns only a prefix, not hashes shifted left.
+            (vec![source[1]], vec![(0, 10), (20, 43)]),
+            (vec![], vec![(0, 43)]),
+        ] {
+            let reused = SeededBasis {
+                hashes,
+                selected_final: true,
+            };
+            assert_eq!(
+                Worker::different_seeded_ranges(&source, &reused, &selected, 10, 43).unwrap(),
+                expected
+            );
+        }
+        let partial = SeededBasis {
+            hashes: source.to_vec(),
+            selected_final: false,
+        };
+        assert!(
+            Worker::different_seeded_ranges(&source, &partial, &[], 10, 43)
+                .unwrap()
+                .is_empty()
+        );
+        let too_many = SeededBasis {
+            hashes: source.to_vec(),
+            selected_final: true,
+        };
+        assert!(Worker::different_seeded_ranges(&source, &too_many, &selected, 10, 43).is_err());
+    }
 
     #[test]
     fn source_block_must_match_the_requested_range() {

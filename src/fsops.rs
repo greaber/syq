@@ -5432,19 +5432,35 @@ impl FsOps {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn seed_basis(
+    fn seed_basis(
         &mut self,
-        path: &[u8],
-        copy_id: &CopyId,
+        target: PartialTarget<'_>,
         len: u64,
         block: u64,
-        reuse_final: bool,
+        final_ranges: Option<&[(u64, u64)]>,
         attempt: u32,
-        guard: Option<&ContainerGuard>,
-    ) -> Result<Vec<ContentDigest>> {
+    ) -> Result<SeededBasis> {
+        let PartialTarget {
+            path,
+            id: copy_id,
+            guard,
+        } = target;
         if !hash_response_fits(block, len) {
             bail!("invalid block reuse request");
+        }
+        if let Some(ranges) = final_ranges {
+            let mut previous_end = 0;
+            for &(start, end) in ranges {
+                if start < previous_end
+                    || start >= end
+                    || end > len
+                    || !start.is_multiple_of(block)
+                    || (end != len && !end.is_multiple_of(block))
+                {
+                    bail!("invalid final basis ranges");
+                }
+                previous_end = end;
+            }
         }
         let rooted = self.rooted_destination_target(path, guard)?;
         let expected = rooted
@@ -5524,7 +5540,11 @@ impl FsOps {
         }
         // A previous transfer's partial is usually closer to the source than
         // the old final. Use the final only when no readable candidate exists.
-        if reuse_final && basis_size.unwrap_or(0) == 0 && input.is_none() {
+        let mut selected_final = false;
+        if final_ranges.is_none_or(|ranges| !ranges.is_empty())
+            && basis_size.unwrap_or(0) == 0
+            && input.is_none()
+        {
             input = held.map(|held| held.file).or_else(|| {
                 if let Some(target) = &rooted {
                     target.root.open_regular_read(&target.relative).ok()
@@ -5532,6 +5552,7 @@ impl FsOps {
                     open_existing_regular(&resolve(path), false).ok()
                 }
             });
+            selected_final = input.is_some() && final_ranges.is_some();
         }
         if basis_size.unwrap_or(0) == 0 {
             self.preallocate_new_partial(&output, len)?;
@@ -5543,36 +5564,50 @@ impl FsOps {
             .or_else(|| (basis_size.unwrap_or(0) > 0).then_some(&output));
         let mut hashes = Vec::new();
         if let Some(reader) = reader {
-            hashes.reserve(len.div_ceil(block) as usize);
+            let whole = [(0, len)];
+            let ranges = if selected_final {
+                final_ranges.unwrap()
+            } else {
+                &whole
+            };
+            let count: u64 = ranges
+                .iter()
+                .map(|(start, end)| (end - start).div_ceil(block))
+                .sum();
+            hashes.reserve(count as usize);
             let mut buffer = vec![0; block.min(len) as usize];
-            for index in 0..len.div_ceil(block) {
-                let off = index * block;
-                let bytes = &mut buffer[..(len - off).min(block) as usize];
-                if reader.read_exact_at(bytes, off).is_err() {
-                    // The controller treats an absent hash as a block to transfer.
-                    break;
+            'ranges: for &(start, end) in ranges {
+                for off in (start..end).step_by(block as usize) {
+                    let bytes = &mut buffer[..(len - off).min(block) as usize];
+                    if reader.read_exact_at(bytes, off).is_err() {
+                        // An absent trailing hash means the controller must transfer
+                        // that block, even when subsequent selected ranges exist.
+                        break 'ranges;
+                    }
+                    let hash = self.hash_policy.algorithm.hash(bytes);
+                    if input.is_some() {
+                        #[cfg(debug_assertions)]
+                        test_race_barrier(
+                            "SYQ_TEST_REUSE_READY_FILE",
+                            "SYQ_TEST_REUSE_CONTINUE_FILE",
+                            "reuse buffered bytes",
+                        )?;
+                        output
+                            .write_all_at(bytes, off)
+                            .context("write reused block")?;
+                    }
+                    hashes.push(hash);
                 }
-                // Reuse compares these with the source's comparison hashes.
-                let hash = self.hash_policy.algorithm.hash(bytes);
-                if input.is_some() {
-                    #[cfg(debug_assertions)]
-                    test_race_barrier(
-                        "SYQ_TEST_REUSE_READY_FILE",
-                        "SYQ_TEST_REUSE_CONTINUE_FILE",
-                        "reuse buffered bytes",
-                    )?;
-                    output
-                        .write_all_at(bytes, off)
-                        .context("write reused block")?;
-                }
-                hashes.push(hash);
             }
         }
         if output.metadata()?.len() != len {
             output.set_len(len)?;
         }
         self.cache_file(location, attempt, true, output);
-        Ok(hashes)
+        Ok(SeededBasis {
+            hashes,
+            selected_final,
+        })
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
@@ -6927,20 +6962,22 @@ impl FsOps {
                 copy_id,
                 len,
                 block,
-                reuse_final,
+                final_ranges,
                 attempt,
                 guard,
             } => self
                 .seed_basis(
-                    path,
-                    copy_id,
+                    PartialTarget {
+                        path,
+                        id: copy_id,
+                        guard: guard.as_ref(),
+                    },
                     *len,
                     *block,
-                    *reuse_final,
+                    final_ranges.as_deref(),
                     *attempt,
-                    guard.as_ref(),
                 )
-                .map(Response::Hashes),
+                .map(Response::SeededBasis),
             Request::CopyLocal {
                 source,
                 dst,
@@ -9226,13 +9263,15 @@ mod tests {
             .unwrap();
         operations
             .seed_basis(
-                &path_bytes(&path),
-                &copy_id,
+                PartialTarget {
+                    path: &path_bytes(&path),
+                    id: &copy_id,
+                    guard: None,
+                },
                 12,
                 MIN_HASH_BLOCK_BYTES,
-                false,
+                Some(&[] as &[(u64, u64)]),
                 0,
-                None,
             )
             .unwrap();
         let partial = partial_path(&path, &copy_id).unwrap();
@@ -9279,7 +9318,17 @@ mod tests {
         assert_eq!(hashes, vec![content_digest(b"held")]);
         assert_eq!(held_len, 4);
         operations
-            .seed_basis(b"basis", &copy_id, 4, MIN_HASH_BLOCK_BYTES, true, 0, None)
+            .seed_basis(
+                PartialTarget {
+                    path: b"basis",
+                    id: &copy_id,
+                    guard: None,
+                },
+                4,
+                MIN_HASH_BLOCK_BYTES,
+                None,
+                0,
+            )
             .unwrap();
         let basis_name = partial_path(&selected.join("basis"), &copy_id).unwrap();
         let basis_partial = moved.join(basis_name.file_name().unwrap());
@@ -10088,6 +10137,137 @@ mod tests {
     }
 
     #[test]
+    fn seed_basis_copies_only_selected_final_blocks_and_hashes_current_bytes() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        for truncate in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let path = temporary.path().join("file");
+            let id = [12; 16];
+            let len = 4 * block + 7;
+            let mut data = vec![17; len as usize];
+            fs::write(&path, &data).unwrap();
+            let mut ops = FsOps::new();
+            ops.hash_and_hold(
+                &path_bytes(&path),
+                &id,
+                block,
+                len,
+                TargetCondition::Any,
+                None,
+            )
+            .unwrap();
+            // The hint is stale: hashes must describe the buffers copied now.
+            data[block as usize..2 * block as usize].fill(91);
+            let donor = File::options().write(true).open(&path).unwrap();
+            donor
+                .write_all_at(&data[block as usize..2 * block as usize], block)
+                .unwrap();
+            if truncate {
+                donor.set_len(2 * block).unwrap();
+            }
+            let selected = [(block, 2 * block), (3 * block, len)];
+            let reused = ops
+                .seed_basis(
+                    PartialTarget {
+                        path: &path_bytes(&path),
+                        id: &id,
+                        guard: None,
+                    },
+                    len,
+                    block,
+                    Some(&selected),
+                    0,
+                )
+                .unwrap();
+            assert!(reused.selected_final);
+            let mut expected = vec![0; len as usize];
+            expected[block as usize..2 * block as usize]
+                .copy_from_slice(&data[block as usize..2 * block as usize]);
+            let mut hashes = vec![content_digest(&data[block as usize..2 * block as usize])];
+            if !truncate {
+                expected[3 * block as usize..].copy_from_slice(&data[3 * block as usize..]);
+                hashes.extend(
+                    data[3 * block as usize..]
+                        .chunks(block as usize)
+                        .map(content_digest),
+                );
+            }
+            assert_eq!(reused.hashes, hashes);
+            assert_eq!(
+                fs::read(partial_path(&path, &id).unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn seed_basis_final_hint_does_not_limit_partial_donors() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        let id = [13; 16];
+        fs::write(&path, b"wrong final").unwrap();
+        let donor = temporary.path().join(".file.syq-tmp.abcdefghijklmnop");
+        fs::write(&donor, b"valid donor").unwrap();
+        fs::set_permissions(&donor, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut ops = FsOps::new();
+        for attempt in 0..2 {
+            let reused = ops
+                .seed_basis(
+                    PartialTarget {
+                        path: &path_bytes(&path),
+                        id: &id,
+                        guard: None,
+                    },
+                    11,
+                    MIN_HASH_BLOCK_BYTES,
+                    Some(&[]),
+                    attempt,
+                )
+                .unwrap();
+            assert!(!reused.selected_final);
+            assert_eq!(reused.hashes, vec![content_digest(b"valid donor")]);
+            assert_eq!(
+                fs::read(partial_path(&path, &id).unwrap()).unwrap(),
+                b"valid donor"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_basis_rejects_invalid_ranges_before_creating_a_partial() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        let id = [14; 16];
+        let block = MIN_HASH_BLOCK_BYTES;
+        let mut ops = FsOps::new();
+        for ranges in [
+            vec![(0, 0)],
+            vec![(1, block)],
+            vec![(0, block + 1)],
+            vec![(0, 4 * block)],
+            vec![(block, 2 * block), (0, block)],
+            vec![(0, 2 * block), (block, 3 * block)],
+        ] {
+            assert!(
+                ops.seed_basis(
+                    PartialTarget {
+                        path: &path_bytes(&path),
+                        id: &id,
+                        guard: None
+                    },
+                    3 * block,
+                    block,
+                    Some(&ranges),
+                    0
+                )
+                .is_err(),
+                "{ranges:?}"
+            );
+            assert!(!partial_path(&path, &id).unwrap().exists());
+        }
+    }
+
+    #[test]
     fn seed_basis_ignores_a_previous_jobs_hold() {
         let temporary = crate::test_support::tempdir().unwrap();
         let earlier = temporary.path().join("earlier");
@@ -10112,16 +10292,18 @@ mod tests {
         // A source-side failure would leave this earlier hold unconsumed.
         let hashes = ops
             .seed_basis(
-                &path_bytes(&later),
-                &id,
+                PartialTarget {
+                    path: &path_bytes(&later),
+                    id: &id,
+                    guard: None,
+                },
                 11,
                 MIN_HASH_BLOCK_BYTES,
-                true,
-                0,
                 None,
+                0,
             )
             .unwrap();
-        assert_eq!(hashes, vec![content_digest(b"later bytes")]);
+        assert_eq!(hashes.hashes, vec![content_digest(b"later bytes")]);
         assert_eq!(
             fs::read(partial_path(&later, &id).unwrap()).unwrap(),
             b"later bytes"
@@ -10172,19 +10354,42 @@ mod tests {
                     fs::create_dir(&donor).unwrap();
                 }
                 let hashes = ops
-                    .seed_basis(&path, &id, len, MIN_HASH_BLOCK_BYTES, true, 0, None)
+                    .seed_basis(
+                        PartialTarget {
+                            path: &path,
+                            id: &id,
+                            guard: None,
+                        },
+                        len,
+                        MIN_HASH_BLOCK_BYTES,
+                        None,
+                        0,
+                    )
                     .unwrap();
-                assert!(hashes.is_empty(), "fresh zero-filled output is not a donor");
+                assert!(
+                    hashes.hashes.is_empty(),
+                    "fresh zero-filled output is not a donor"
+                );
                 let partial = partial_path(&target, &id).unwrap();
                 assert_eq!(fs::metadata(&partial).unwrap().len(), len);
                 assert!(!target.exists());
                 // On a retry the existing private output is a real basis,
                 // including blocks whose contents happen to be all zeros.
                 let hashes = ops
-                    .seed_basis(&path, &id, len, MIN_HASH_BLOCK_BYTES, true, 1, None)
+                    .seed_basis(
+                        PartialTarget {
+                            path: &path,
+                            id: &id,
+                            guard: None,
+                        },
+                        len,
+                        MIN_HASH_BLOCK_BYTES,
+                        None,
+                        1,
+                    )
                     .unwrap();
                 assert_eq!(
-                    hashes,
+                    hashes.hashes,
                     vec![content_digest(&vec![0; MIN_HASH_BLOCK_BYTES as usize]); 2]
                 );
             }
@@ -10217,17 +10422,19 @@ mod tests {
         });
         let hashes = ops
             .seed_basis(
-                &path_bytes(&target),
-                &id,
+                PartialTarget {
+                    path: &path_bytes(&target),
+                    id: &id,
+                    guard: None,
+                },
                 11,
                 MIN_HASH_BLOCK_BYTES,
-                true,
-                1,
                 None,
+                1,
             )
             .unwrap();
         let after = fs::metadata(&partial).unwrap();
-        assert_eq!(hashes, vec![content_digest(b"retry bytes")]);
+        assert_eq!(hashes.hashes, vec![content_digest(b"retry bytes")]);
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
         assert_eq!(after.ino(), before.ino());
         assert_eq!(fs::read(partial).unwrap(), b"retry bytes");
