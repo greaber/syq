@@ -1,12 +1,19 @@
-# Tuning options
+# Performance tuning
 
-Syq adjusts performance automatically. These controls are for developers and
-for investigating copies where the defaults perform poorly. These experimental controls appear in `--help-all`; their keys and
-bounds may change between releases.
+Syq adjusts performance automatically. Use these controls to investigate copies
+where the defaults perform poorly. They appear in `--help-all` and are
+experimental; their keys and bounds may change between releases.
 
-`--connections N` (or `-j N`) fixes the connection count and disables automatic
-adjustment. In `syq rsync`, use `--syq-connections N`. Use the same count when
-comparing other tuning settings. Leave it unset for everyday copies.
+`--performance-tuning workers=N` fixes the number of filesystem copy-worker
+slots instead of adjusting it automatically. Workers process files or ranges;
+several workers can share a large file. Remote workers use data channels, SSH
+channels can share a TCP socket, and local workers need no network connection.
+Idle slots do no work, and shortcuts can finish a copy using fewer workers.
+This is not a limit on total sockets, file descriptors, CPU or memory.
+
+Both `syq cp` and `syq rsync` use this spelling. Leave it unset for everyday
+copies. S3 uses separate [object, part and request controls](object-storage.md#parallelism).
+Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work.
 
 ## Remembered connection counts
 
@@ -16,29 +23,26 @@ normally lives at `~/.cache/syq/tuning.json` (`XDG_CACHE_HOME` can change its
 parent). The quick benchmark uses this cache, even though it disables SSH
 connection persistence. Its temporary file paths do not change the cache key.
 
-Learning takes time: syq samples every 2.5 seconds and needs a warm-up interval
-plus two stable samples for one measurement. Saving a count requires a
-successful copy with at least two measured worker counts and an unchanged
-transport. Failed or aborted copies leave the previous cached count intact.
-If a copy finishes during another probe, syq saves the last accepted count. Short copies may only use their starting count. The benchmark's
-[untimed warm-up](speed.md#quick-comparison) allows more time before scoring;
-neither its 60-second target nor the separate five-second automatic sizing
-target guarantees tuning has settled.
+Short copies may finish before syq can learn a better count. Only successful
+copies that compare enough connection counts without changing transport update
+the cache; failed or interrupted copies leave it unchanged. The benchmark's
+[untimed warm-up](speed.md#quick-comparison) gives learning more time before
+scoring, but does not guarantee that tuning has settled.
 
-`--connections N` disables automatic adjustment and cache use. Supplying
-`--tuning-options` bypasses reading and updating learned counts, but live
-auto-tuning continues unless you also fix `--connections`. Use `-vv` to see
+`--performance-tuning workers=N` disables automatic adjustment and cache use. Supplying
+`--performance-tuning` or `--resource-limits` bypasses reading and updating learned counts, but live
+auto-tuning continues unless you also set `workers`. Use `-vv` to see
 when syq starts from a remembered count.
 
 ## Transfer controls
 
-`syq cp` and `syq rsync` accept `--tuning-options`. Supply
+`syq cp` and `syq rsync` accept `--performance-tuning`. Supply
 comma-separated `KEY=VALUE` pairs:
 
 ```sh
 syq cp large-file --to server --as /scratch/benchmark-copy \
-  --connections 1 -v \
-  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=8
+  --performance-tuning workers=1 -v \
+  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=8
 ```
 
 | Key | Default | Accepted values |
@@ -49,14 +53,21 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `batch-files` | 128 or 512, depending on transport and latency | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch, including the first file |
 | `split-min-size` | 32 MiB, at least two hash blocks | 1 byte through 1 GiB, raised to at least two hash blocks |
-| `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--bwlimit` |
+| `job-storage` | `combined` | `combined`, `compact`, or `inline` |
+| `bw-pacing` | `125ms` when capped | `average`, or an integer interval from `1ms` through `10s`; requires a nonzero `--resource-limits bandwidth=RATE` |
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Unknown keys, repeated
 keys, and out-of-range values fail the command. Overrides apply to the remote
-coordinator too. They are not saved, and these runs neither read nor update
-the remembered connection count. Connection auto-tuning still runs unless you
-fix `--connections` (`--syq-connections` with `syq rsync`). These are experimental
-controls whose keys and bounds may change between releases.
+coordinator too and are not saved.
+
+The default `combined` shares job metadata between workers and stores jobs in
+chunks to reduce allocation and cloning. Use `--performance-tuning job-storage=compact`
+to restore individually allocated jobs and copied worker metadata when comparing
+performance. `inline` also restores the earlier contiguous job layout and keeps
+collision-check indexes until buffered entries have been applied. All modes use
+the same copy, retry, and integrity checks. As with other tuning overrides, this
+setting bypasses learned connection counts; use the same explicit `workers`
+value when comparing modes.
 
 Larger requests reduce overhead per byte; deeper pipelines allow more requests
 to await replies at once. Both can increase memory use. Neither changes the
@@ -85,38 +96,37 @@ To test the amount of outstanding large-file work over SSH, keep the worker
 count and copy method fixed, then vary only the request window:
 
 ```sh
-bash try-benchmark.sh --yes --mode pull --host j5 --workload large \
-  --tool syq --rounds 1 --size quick -- --no-tcp --connections 1 -v \
-  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
+bash try-benchmark.sh --yes --mode pull --host server --workload large \
+  --tool syq --rounds 1 --size quick -- --no-tcp --performance-tuning workers=1 -v \
+  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=4
 ```
 
 Repeat with `pipeline-depth=8` and `16`. With 1 MiB requests, these allow up to
 4, 8 and 16 MiB of outstanding range requests per endpoint per worker. They
 do not resize TCP or SSH flow-control windows. Compare separately with a run
-omitting `--tuning-options`: long remote ranges normally stream, and an explicit
+omitting `--performance-tuning`: long remote ranges normally stream, and an explicit
 pipeline depth disables that behavior. The ordinary defaults already allow
 4 MiB × 4 requests; a larger application request window may not help.
 Use a larger fixed size if the timing notes show the test is too short.
 
 For the small-file workload, vary `batch-files` and `batch-bytes` instead,
-such as `--tuning-options batch-files=512,batch-bytes=4M`. Those are batch
+such as `--performance-tuning batch-files=512,batch-bytes=4M`. Those are batch
 ceilings, and the scheduler may choose smaller batches. `pipeline-depth` does
 not multiply small-file batches. After testing these controls, vary
-`--connections` separately to assess parallelism and its startup cost.
-
+`workers` separately to assess parallelism and its startup cost.
 
 For a direct comparison without the benchmark script, use fresh scratch destinations:
 
 ```sh
-syq cp data.bin --to host --as /scratch/pipeline.bin --connections 1 -v \
-  --tuning-options copy-path=ranges,request-size=1M,pipeline-depth=4
-syq cp data.bin --to host --as /scratch/streaming.bin --connections 1 -v \
-  --tuning-options copy-path=streaming,request-size=1M
+syq cp data.bin --to host --as /scratch/pipeline.bin --performance-tuning workers=1 -v \
+  --performance-tuning copy-path=ranges,request-size=1M,pipeline-depth=4
+syq cp data.bin --to host --as /scratch/streaming.bin --performance-tuning workers=1 -v \
+  --performance-tuning copy-path=streaming,request-size=1M
 ```
 
 Streaming can be slower on short or CPU-limited copies. Memory use depends on
 request size, worker count, compression, and transport buffering. With
-`--bwlimit`, a remote source can send ahead of paced destination writes, so the
+`--resource-limits bandwidth=RATE`, a remote source can send ahead of paced destination writes, so the
 limit is an average copy rate, not a strict cap on incoming bursts.
 
 ### Batch size and splitting
@@ -130,12 +140,12 @@ For example, compare small-file batches with:
 
 ```sh
 syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
-  --connections 1 -v --tuning-options batch-files=256,batch-bytes=8M
+  --performance-tuning workers=1 -v --performance-tuning batch-files=256,batch-bytes=8M
 ```
 
 Explicit batch controls replace the small-copy shortcut with worker batches.
 File and byte limits are ceilings; syq may choose smaller batches. Files larger
-than the byte limit use another copy method. With `--bwlimit`, each batch
+than the byte limit use another copy method. With `--resource-limits bandwidth=RATE`, each batch
 contains at most one file. Batch controls cannot combine with `copy-path=ranges`
 or `copy-path=streaming`; `auto-streaming` accepts them.
 
@@ -146,7 +156,7 @@ remaining size.
 
 ### Average rate and burst patterns
 
-`--bwlimit` caps logical file-data bytes per second across workers, before
+`--resource-limits bandwidth=RATE` caps logical file-data bytes per second across workers, before
 compression, encryption, and protocol overhead.
 
 - **Timed pacing** (`bw-pacing=125ms`, the default) sends smaller requests at
@@ -160,8 +170,8 @@ For example, to test larger requests under an average rate cap:
 
 ```sh
 syq cp large-file --to server --as /scratch/benchmark-capped \
-  --connections 1 --bwlimit 1M -v \
-  --tuning-options copy-path=ranges,request-size=4M,bw-pacing=average
+  --performance-tuning workers=1 --resource-limits bandwidth=1M -v \
+  --performance-tuning copy-path=ranges,request-size=4M,bw-pacing=average
 ```
 
 Neither mode limits the size of every network burst. Streaming, queues, and
@@ -179,8 +189,8 @@ separate from [completion records](automation.md).
 Use the same reporting options and fresh disposable destinations for each
 comparison. Prefer `-v`: `--stats` bypasses the small-copy shortcut and can
 change what you measure. Use explicit defaults for the baseline, such as
-`--tuning-options copy-path=auto`.
+`--performance-tuning copy-path=auto`.
 
 Record the source data, transport, connections, settings, elapsed time, CPU use,
-and peak memory. Check exit status and copied contents. Leave `--bwlimit` unset
+and peak memory. Check exit status and copied contents. Leave `--resource-limits bandwidth=RATE` unset
 when measuring unrestricted throughput.

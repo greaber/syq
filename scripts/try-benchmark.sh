@@ -33,7 +33,7 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
   --yes                    Use defaults for unspecified choices; do not prompt
   --help                   Show this help
 
-After --, tune syq with --connections/-j, --tuning-options, --bwlimit,
+After --, tune syq with --performance-tuning, --resource-limits,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
 --tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
 These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
@@ -282,7 +282,7 @@ warm_up() {
 
 copy_with() {
     local tool=$1 source=$2 destination=$3
-    local command=() syq_options=(--preserve=permissions --results "$local_root/trial.json")
+    local command=() syq_options=(--preserve=permissions --stats --results "$local_root/trial.json")
     $show_syq_summary || syq_options+=(--suppress-summary)
     # Always suppress the tiny setup copy's summary, keeping bootstrap
     # diagnostics and authentication prompts live. Supported
@@ -373,6 +373,40 @@ copying_interval() {
     ' "${2:-optional}" "$1"
 }
 
+activity_summary() {
+    perl -MJSON::PP -e '
+        my ($summary, %previous, $header);
+        sub dominant {
+            my ($fractions)=@_;
+            return unless ref($fractions) eq "HASH";
+            my @states=sort { $fractions->{$b} <=> $fractions->{$a} || $a cmp $b } keys %$fractions;
+            return @states ? $states[0] : undef;
+        }
+        while (<>) {
+            my $record=decode_json($_);
+            next unless ($record->{type} // "") eq "progress" && ref($record->{activity}) eq "HASH";
+            my $activity=$record->{activity};
+            $summary=$activity->{summary};
+            my %current;
+            $current{workers}=dominant($activity->{workers}{fractions});
+            for my $endpoint (@{$activity->{endpoints} // []}) {
+                for my $actor (@{$endpoint->{actors} // []}) {
+                    $current{"$endpoint->{label} / $actor->{role}"}=dominant($actor->{fractions});
+                }
+            }
+            for my $label (sort keys %current) {
+                next unless defined($current{$label});
+                next if defined($previous{$label}) && $previous{$label} eq $current{$label};
+                print "Activity changes (interval dominant states; not proven causes):\n" unless $header++;
+                my $state=$current{$label}; $state =~ s/_/ /g;
+                printf "  %7.2fs  %s: %s\n", ($record->{elapsed_ms} // 0)/1000, $label, $state;
+                $previous{$label}=$current{$label};
+            }
+        }
+        print "$summary\n" if defined($summary);
+    ' "$1"
+}
+
 summarize_syq_timings() {
     [[ -s $1 ]] || return 0
     printf '\nSyq timing breakdown (means per trial):\n'
@@ -452,12 +486,12 @@ main() {
                 shift
                 while [[ $# -gt 0 ]]; do
                     case $1 in
-                        --connections|-j|--tuning-options|--bwlimit|--tcp-ports|--tcp-congestion)
+                        --performance-tuning|--resource-limits|--tcp-ports|--tcp-congestion)
                             [[ $# -ge 2 && -n $2 ]] || fail "$1 needs a value"
-                            case $1 in --connections|-j|--tuning-options) manual_tuning=true ;; esac
+                            case $1 in --performance-tuning) manual_tuning=true ;; esac
                             syq_extra+=("$1" "$2"); shift 2 ;;
-                        --connections=?*|--tuning-options=?*|--bwlimit=?*|--tcp-ports=?*|--tcp-congestion=?*|-j[0-9]*)
-                            case $1 in --connections=*|--tuning-options=*|-j[0-9]*) manual_tuning=true ;; esac
+                        --performance-tuning=?*|--resource-limits=?*|--tcp-ports=?*|--tcp-congestion=?*)
+                            case $1 in --performance-tuning=*) manual_tuning=true ;; esac
                             syq_extra+=("$1"); shift ;;
                         -v|-vv|--verbose)
                             verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;
@@ -549,7 +583,7 @@ main() {
         if ! $install && ! $yes; then ask 'syq is missing. Install the official release into ~/.local/bin? yes / no' no; [[ $REPLY != yes ]] || install=true; fi
         $install || fail 'Install syq first, or pass --install to use its official installer.'
         need curl
-        run curl --proto '=https' --tlsv1.2 -fLsS https://github.com/greaber/syq/releases/latest/download/install.sh -o "$local_root/install.sh"
+        run curl --proto '=https' --tlsv1.2 -fLsS https://dl.syq.christmas/latest/install.sh -o "$local_root/install.sh"
         run sh "$local_root/install.sh"
         export PATH="$HOME/.local/bin:$PATH"
         need syq
@@ -692,6 +726,7 @@ main() {
                     printf 'Verified contents; speed %s MB/s; elapsed %s seconds.\n' "$speed" "$seconds"
                 fi
                 if [[ $tool == syq ]]; then
+                    activity_summary "$local_root/trial.json" || fail "Cannot read syq trial activity."
                     copying_ms=$(copying_interval "$local_root/trial.json") || fail 'Cannot read syq trial timing.'
                     if [[ $copying_ms != n/a ]]; then
                         awk -v ms="$copying_ms" -v seconds="$seconds" -v bytes="$bytes" 'BEGIN {

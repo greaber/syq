@@ -75,6 +75,7 @@ pub(crate) fn drain_reads(
 
 /// Accept only the prefix still assigned to this worker. A concurrently
 /// stolen suffix may already be in flight, but must never be written twice.
+#[cfg(test)]
 pub(crate) fn claim_block(
     range: &crate::sched::RangeHandle,
     off: u64,
@@ -84,7 +85,7 @@ pub(crate) fn claim_block(
     claim_block_with_digest(range, off, hash, data, crate::fsops::content_digest)
 }
 
-fn claim_block_with_digest(
+pub(crate) fn claim_block_with_digest(
     range: &crate::sched::RangeHandle,
     off: u64,
     hash: &mut crate::proto::ContentDigest,

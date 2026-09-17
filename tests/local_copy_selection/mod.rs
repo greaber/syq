@@ -17,10 +17,10 @@ fn local_batch_boundary_and_scheduler_agree() {
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections",
-                connections,
+                "--performance-tuning",
+                &format!("workers={connections}"),
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 "--no-progress",
                 &t.s("src/"),
                 &t.s("dst/"),
@@ -61,9 +61,9 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=2",
+            "--performance-tuning=workers=2",
             "--block-size=4M",
-            "--tuning-options=request-size=4M",
+            "--performance-tuning=request-size=4M",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -84,14 +84,14 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
 
 #[test]
 fn checksum_and_paced_medium_files_keep_batches() {
-    for control in ["--checksum", "--bwlimit=1G"] {
+    for control in ["--checksum", "--resource-limits=bandwidth=1G"] {
         let t = Tmp::new();
         write(&t.path("src/file"), &prng(1 << 20, 80));
         let out = compat_command()
             .args([
                 "-a",
                 "--syq-no-tcp",
-                "--syq-connections=1",
+                "--performance-tuning=workers=1",
                 "--no-progress",
                 control,
                 &t.s("src/"),
@@ -134,7 +134,7 @@ fn remote_medium_files_keep_batches() {
                 env!("CARGO_BIN_EXE_syq"),
                 "--syq-no-bootstrap",
                 "--block-size=4M",
-                "--tuning-options=request-size=4M",
+                "--performance-tuning=request-size=4M",
                 &src,
                 &dst,
             ],
@@ -191,7 +191,7 @@ fn medium_failure_keeps_old_destination_and_resumes_changed_source() {
     let out = compat_command()
         .args([
             "-a",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -277,7 +277,7 @@ fn fresh_medium_failure_does_not_publish_and_changed_source_resumes() {
         fs::remove_file(t.path("dst/tiny")).unwrap();
     }
     let resumed = run()
-        .arg("--tuning-options=copy-path=ranges")
+        .arg("--performance-tuning=copy-path=ranges")
         .run()
         .unwrap();
     assert_output_ok(&resumed);
@@ -358,7 +358,7 @@ fn ineligible_local_copies_do_not_claim_source_capabilities() {
     let mut options = vec![
         "--checksum",
         "--bwlimit=1G",
-        "--tuning-options=copy-path=ranges",
+        "--performance-tuning=copy-path=ranges",
     ];
     if cfg!(target_os = "macos") {
         options.push("--inplace");
@@ -397,7 +397,7 @@ fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
         vec!["--inplace"],
         vec!["--checksum"],
         vec!["--bwlimit=1G"],
-        vec!["--tuning-options=copy-path=ranges"],
+        vec!["--performance-tuning=copy-path=ranges"],
     ] {
         let t = Tmp::new();
         write(&t.path("src"), &prng(5 << 20, 991));
@@ -568,7 +568,7 @@ fn macos_clone_memoizes_unsupported_volume_pairs() {
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=1",
+            "--performance-tuning=workers=1",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -618,10 +618,10 @@ fn macos_clone_syscall_errors_are_diagnosable_and_do_not_disable_siblings() {
                     .args([
                         "-a",
                         "--syq-no-tcp",
-                        "--syq-connections=1",
+                        "--performance-tuning=workers=1",
                         "--no-progress",
                         "--stats",
-                        "--tuning-options=request-size=4M",
+                        "--performance-tuning=request-size=4M",
                         &t.s("src/"),
                         &t.s("dst/"),
                     ])
@@ -696,17 +696,18 @@ fn macos_clone_source_growth_requeues_without_a_file_error() {
     let t = Tmp::new();
     write(&t.path("src"), &prng(5 << 20, 996));
     let ready = t.path("ready");
+    let continuation = t.path("continue");
     let mut child = compat_command()
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=1",
+            "--performance-tuning=workers=1",
             "--no-progress",
             &t.s("src"),
             &t.s("dst"),
         ])
         .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+        .env("SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
@@ -718,6 +719,7 @@ fn macos_clone_source_growth_requeues_without_a_file_error() {
         .unwrap()
         .write_all(&prng(1 << 20, 997))
         .unwrap();
+    release_confinement_barrier(&continuation);
     let out = wait_for_child_output(child, std::time::Duration::from_secs(30));
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), read(&t.path("src")));
@@ -736,9 +738,9 @@ fn macos_medium_files_keep_batches_when_cloning_is_unavailable() {
         .args([
             "-a",
             "--syq-no-tcp",
-            "--syq-connections=1",
+            "--performance-tuning=workers=1",
             "--block-size=4M",
-            "--tuning-options=request-size=4M",
+            "--performance-tuning=request-size=4M",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -864,7 +866,7 @@ fn macos_clone_rmdir_failure_keeps_complete_partial_for_resume() {
         .args([
             "-a",
             "--no-progress",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             &t.s("src"),
             &t.s("dst"),
         ])

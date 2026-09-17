@@ -60,7 +60,7 @@ finish within seven days of authorization.
 | `--skip-newer` | Timestamp selection uses source-reported modification times |
 | `--min-size` | Unsupported |
 | `--max-size` with `--prune` | Unsupported |
-| Fixed `--connections` above 64 | Unsupported |
+| Fixed `workers` above 64 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
@@ -157,4 +157,5 @@ Verification never installs an enrollment.
 `--verify-only` cannot combine with `--dry-run`, `--prune`, `--inplace`, or
 overwrite policies. Filters and size limits select the entries to compare;
 special files require `--preserve=specials`. Metadata is not compared, but device
-identity is. A requested results file and remote helper caches may still be written.
+identity is. A requested results file may still be written, and remote setup may
+still cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Progress {
+    pub(crate) observations: crate::transfer_observations::Observations,
     pub enabled: bool,
     pub json: bool,
     pub width: Option<usize>,
@@ -70,6 +71,8 @@ struct TermState {
     samples: VecDeque<(Instant, u64)>,
     last_json: Option<Instant>,
     last_results: Option<Instant>,
+    last_observation: Option<Instant>,
+    observation: Option<crate::transfer_observations::Interval>,
 }
 
 /// Own the ticker until it has stopped. In particular, `?` must not detach a
@@ -82,7 +85,12 @@ pub struct ProgressTicker {
 impl ProgressTicker {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.progress.stop();
-        self.thread.take().map_or(Ok(()), |thread| thread.join())
+        self.thread.take().map_or(Ok(()), |thread| {
+            // Collection must not add the remainder of a refresh interval to
+            // command latency. The token also covers stopping before park.
+            thread.thread().unpark();
+            thread.join()
+        })
     }
 
     pub fn join(mut self) -> std::thread::Result<()> {
@@ -99,6 +107,7 @@ impl Drop for ProgressTicker {
 impl Progress {
     pub fn new(enabled: bool, force: bool, width: Option<usize>, json: bool) -> Arc<Self> {
         Arc::new(Progress {
+            observations: Default::default(),
             enabled: enabled && !json && (force || std::io::stderr().is_terminal()),
             json,
             width,
@@ -129,6 +138,8 @@ impl Progress {
                 samples: VecDeque::from([(Instant::now(), 0)]),
                 last_json: None,
                 last_results: None,
+                last_observation: None,
+                observation: None,
             }),
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
@@ -254,10 +265,19 @@ impl Progress {
             None
         };
 
-        if let Some(results) = self.results.get().filter(|_| status.is_none()) {
+        if self.observations.enabled.load(Relaxed)
+            && (status.is_some()
+                || t.last_observation
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)))
+        {
+            t.last_observation = Some(now);
+            t.observation = Some(self.observations.sample());
+        }
+        if let Some(results) = self.results.get().filter(|_| status.is_none() || !self.rm) {
             let now = Instant::now();
-            if t.last_results
-                .is_none_or(|last| now - last >= Duration::from_secs(1))
+            if status.is_some()
+                || t.last_results
+                    .is_none_or(|last| now - last >= Duration::from_secs(1))
             {
                 t.last_results = Some(now);
                 results.emit_progress(&crate::results::ProgressRecord {
@@ -271,6 +291,7 @@ impl Progress {
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
                     elapsed_ms: self.start.elapsed().as_millis() as u64,
+                    activity: t.observation.as_ref(),
                 });
             }
         }
@@ -362,6 +383,11 @@ impl Progress {
         if self.enabled {
             crate::output::finish_progress();
         }
+        if !self.json && self.observations.human_summary.load(Relaxed) {
+            if let Some(observation) = &self.term.lock().unwrap().observation {
+                crate::output::diagnostic!("{}", observation.summary());
+            }
+        }
     }
 
     pub fn clear(&self) {
@@ -373,14 +399,18 @@ impl Progress {
     pub fn spawn_ticker(self: &Arc<Self>) -> Option<ProgressTicker> {
         // A results stream needs the ticker too: sampled progress records
         // are emitted from render() even when stderr is not a terminal.
-        if !self.enabled && !self.json && self.results.get().is_none() {
+        if !self.enabled
+            && !self.json
+            && self.results.get().is_none()
+            && !self.observations.enabled.load(Relaxed)
+        {
             return None;
         }
         let p = self.clone();
         let thread = std::thread::spawn(move || {
             while !p.stop.load(Relaxed) {
                 p.render();
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::park_timeout(Duration::from_millis(100));
             }
             p.clear();
         });
@@ -507,6 +537,66 @@ impl crate::tune::Meter for Progress {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn results_do_not_enable_collection_and_only_copies_emit_a_final_sample() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for removal in [false, true] {
+            let mut progress = super::Progress::new(false, false, None, false);
+            std::sync::Arc::get_mut(&mut progress).unwrap().rm = removal;
+            let sink = Sink::default();
+            progress.set_results(std::sync::Arc::new(crate::results::ResultsWriter::new(
+                Box::new(sink.clone()),
+            )));
+            assert!(!progress
+                .observations
+                .enabled
+                .load(std::sync::atomic::Ordering::Relaxed));
+            progress.finish(true);
+            let bytes = sink.0.lock().unwrap();
+            if removal {
+                assert!(bytes.is_empty());
+            } else {
+                let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(record["type"], "progress");
+                assert!(record.get("activity").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn finishing_wakes_a_parked_ticker() {
+        let progress = super::Progress::new(false, false, None, false);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let start = std::time::Instant::now();
+            std::thread::park_timeout(std::time::Duration::from_secs(10));
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "ticker was not woken on shutdown"
+            );
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        super::ProgressTicker {
+            progress,
+            thread: Some(thread),
+        }
+        .join()
+        .unwrap();
+    }
+
     use super::*;
     use crate::tune::Meter;
 

@@ -55,14 +55,18 @@ pub type PathBytes = Vec<u8>;
 /// the parallel legacy pathname is only a display/compatibility spelling.
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
-    pub(crate) root: RegisteredRootId,
-    pub relative: PathBytes,
+    root: RegisteredRootId,
+    relative: PathBytes,
 }
 
 impl RegisteredPath {
     pub(crate) fn new(root: RegisteredRootId, relative: PathBytes) -> Result<Self> {
         validate_relative_path(&relative)?;
         Ok(Self { root, relative })
+    }
+
+    pub(crate) fn relative(&self) -> &[u8] {
+        &self.relative
     }
 
     pub(crate) fn root(&self) -> RegisteredRootId {
@@ -350,6 +354,14 @@ pub struct TcpSocketStats {
     pub receive_window_limited_us: Option<u64>,
     pub send_buffer_limited_us: Option<u64>,
     pub ecn_ce_delivered: Option<u64>,
+}
+
+/// Exact-build helper telemetry; never read before Hello identity acceptance.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TransportStatsReply {
+    pub tcp: Option<TcpSocketStats>,
+    pub(crate) observation: Option<crate::transfer_observations::ServerSnapshot>,
+    pub solicited: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -744,6 +756,7 @@ pub enum Request {
     /// renamed over the final path meanwhile, its complete file remains the
     /// winner and this only touches the now-unlinked old inode.
     FinishBasis {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         copy_id: CopyId,
         meta: Meta,
@@ -813,6 +826,7 @@ pub enum Request {
         guard: Option<ContainerGuard>,
     },
     Finalize {
+        expected_digest: Option<crate::hashing::Digest>,
         path: PathBytes,
         inplace: bool,
         copy_id: CopyId,
@@ -890,6 +904,13 @@ pub enum Request {
     /// than a missing path fail the request rather than looking absent.
     PruneLookup {
         paths: Vec<PathBytes>,
+        guard: Option<ContainerGuard>,
+    },
+    // Append new variants: released completion payloads retain their indexes.
+    ConfigureHashing(crate::hashing::HashPolicy),
+    ValidateDigest {
+        path: PathBytes,
+        expected: crate::hashing::Digest,
         guard: Option<ContainerGuard>,
     },
 }
@@ -1017,7 +1038,8 @@ impl Request {
     pub(crate) fn allowed_on_source_worker(&self) -> bool {
         matches!(
             self,
-            Request::Scan { .. }
+            Request::ConfigureHashing(_)
+                | Request::Scan { .. }
                 | Request::StatMany { .. }
                 | Request::HashBlocks { .. }
                 | Request::ReadRange { .. }
@@ -1100,7 +1122,7 @@ pub enum Response {
         hash: ContentDigest,
     },
     Path(PathBytes),
-    TransportStats(Option<TcpSocketStats>),
+    TransportStats(Box<TransportStatsReply>),
     /// One bounded frame of a signed receipt stream. The final frame is marked
     /// inside the canonical frame encoding.
     Receipt(#[serde(with = "serde_bytes")] Vec<u8>),
@@ -2119,6 +2141,20 @@ mod tests {
                 error.to_string().contains("build identity mismatch"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn released_v060_preamble_preserves_explicit_compatibility() {
+        // v0.6.0 preamble, kept independent of the current encoder. Selecting
+        // release helpers must accept it; ordinary source builds must reject it.
+        const V060: &[u8] = b"SYQWIRE\0\0\x06v0.6.0";
+        let result = FrameReader::new(V060).read_preamble();
+        if crate::identity::build() == "v0.6.0" {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("build identity mismatch"), "{error}");
         }
     }
 

@@ -11,3 +11,11 @@ __pycache__/
 
 # Agent working notes / handoff plans (not committed).
 /current-plans
+
+# Nix build output links.
+/result
+/result-*
+
+# Left behind when the DVC example is installed from a local checkout.
+/examples/dvc-syq/*.egg-info/
+/examples/dvc-syq/build/

@@ -1,1 +1,1 @@
-{{#include ../sdk/python/README.md}}
+{{#include ../sdk/python/README-PYTHON.md}}

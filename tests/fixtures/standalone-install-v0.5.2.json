@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "provider": "standalone",
+  "version": "0.5.2",
+  "target": "linux-x86_64",
+  "binary": "/home/grant/repos/syq/.worktrees/remote-user-install/target/receipt-baseline-v0.5.2/syq"
+}

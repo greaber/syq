@@ -373,6 +373,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let is_control = matches!(&role, ConnectionRole::Control);
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
+    if let Some(authority) = &authority {
+        ops.set_hash_policy(authority.hash_policy());
+    }
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
@@ -463,20 +466,30 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
     r.set_limit(MAX_FRAME);
+    let telemetry_socket = tcp_socket.as_ref().and_then(|s| s.try_clone().ok());
     let reader = RequestReader::spawn(r, tcp_socket, named_socket);
+    let server_actor = ops.observations.actor("server");
+    let mut w = ObservedWriter {
+        compress: w.compress,
+        inner: w,
+        registry: ops.observations.clone(),
+        actor: server_actor.clone(),
+        last: std::time::Instant::now(),
+        enabled: false,
+        socket: telemetry_socket,
+    };
 
-    let mut t = [0f64; 3];
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
-        let t0 = std::time::Instant::now();
+        let waiting = server_actor.span(crate::transfer_observations::Stage::RequestWait);
         let queued = match reader.recv() {
             Ok(Ok(req)) => req,
             Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break,
         };
+        drop(waiting);
         let (mut req, _request_hold) = queued.into_parts();
-        t[0] += t0.elapsed().as_secs_f64();
         if !is_control
             && matches!(
                 &req,
@@ -561,6 +574,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     continue;
                 }
                 w.write_msg(&Response::Ok)?;
+                ops.begin_source_range(stream.off..stream.end);
                 let mut limit = stream.end;
                 let mut done_sent = false;
                 loop {
@@ -570,31 +584,31 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     // the client's later commands follow it on the same
                     // ordered connection, including late shrink notifications.
                     if stream.off >= limit && !done_sent {
+                        ops.end_source_range();
                         w.write_msg(&Response::ReadStreamDone)?;
                         done_sent = true;
                     }
                     if reader.stream_stopped(stream.off, &mut limit, done_sent)? {
                         break;
                     }
+                    ops.shrink_source_range(limit);
                     if stream.off >= limit {
                         // A late shrink crossed the current offset: send Done
                         // on the next iteration, without another read or RTT.
                         continue;
                     }
-                    let t0 = std::time::Instant::now();
                     let response = ops.handle_in_place(&mut stream.next_request());
-                    t[1] += t0.elapsed().as_secs_f64();
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
                         blocks += 1;
                         bytes += data.len() as u64;
                     } else {
                         stream.off = stream.end;
+                        ops.end_source_range();
                     }
-                    let t0 = std::time::Instant::now();
                     w.write_msg(&response)?;
-                    t[2] += t0.elapsed().as_secs_f64();
                 }
+                ops.end_source_range();
                 if !done_sent {
                     w.write_msg(&Response::ReadStreamDone)?;
                 }
@@ -799,7 +813,21 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
             }
             Request::TransportStats => {
-                w.write_msg(&Response::TransportStats(reader.tcp_stats()))?;
+                #[cfg(debug_assertions)]
+                if let Some(mode) = std::env::var_os("SYQ_TEST_REJECT_TELEMETRY") {
+                    if mode == "disconnect" {
+                        break;
+                    }
+                    w.write_msg(&Response::Err("telemetry unavailable (test)".into()))?;
+                    continue;
+                }
+                ops.observations.enable();
+                w.enabled = true;
+                w.write_msg(&Response::TransportStats(Box::new(TransportStatsReply {
+                    tcp: reader.tcp_stats(),
+                    observation: Some(ops.observations.snapshot()),
+                    solicited: true,
+                })))?;
             }
             Request::MappingChunk { .. } => {
                 let response = if authority.is_some() {
@@ -827,29 +855,22 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ))?,
             },
             mut other => {
-                let t0 = std::time::Instant::now();
                 let resp = ops.handle_in_place(&mut other);
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }
-                t[1] += t0.elapsed().as_secs_f64();
                 if drop_after_handling_for_test(&other) {
                     return Ok(());
                 }
-                let t0 = std::time::Instant::now();
                 w.write_msg(&resp)?;
-                t[2] += t0.elapsed().as_secs_f64();
             }
         }
     }
     if debug {
         crate::output::diagnostic!(
-            "syq server{}: {blocks} blocks, {} MiB; waiting for input {:.2}s, handling {:.2}s, writing responses {:.2}s",
+            "syq server{}: {blocks} blocks, {} MiB",
             if over_ssh { "" } else { " (tcp)" },
             bytes >> 20,
-            t[0],
-            t[1],
-            t[2]
         );
     }
     Ok(())
@@ -1375,6 +1396,38 @@ impl Read for TcpHandshakeReader {
             self.stream.set_read_timeout(Some(remaining))?;
         }
         self.stream.read(buf)
+    }
+}
+
+/// Stats follow the same exact-build response protocol. They are consumed by
+/// the existing reader before entering the bounded data-reply queue.
+struct ObservedWriter<W: Write> {
+    inner: FrameWriter<W>,
+    compress: bool,
+    registry: Arc<crate::transfer_observations::Registry>,
+    actor: Arc<crate::transfer_observations::Actor>,
+    last: std::time::Instant,
+    enabled: bool,
+    socket: Option<std::net::TcpStream>,
+}
+impl<W: Write> ObservedWriter<W> {
+    fn write_msg(&mut self, response: &Response) -> std::io::Result<()> {
+        if self.enabled
+            && self.last.elapsed() >= std::time::Duration::from_secs(1)
+            && !matches!(response, Response::TransportStats(_))
+        {
+            self.last = std::time::Instant::now();
+            self.inner
+                .write_msg(&Response::TransportStats(Box::new(TransportStatsReply {
+                    tcp: self.socket.as_ref().and_then(crate::conn::tcp_socket_stats),
+                    observation: Some(self.registry.snapshot()),
+                    solicited: false,
+                })))?;
+        }
+        let _send = self
+            .actor
+            .span(crate::transfer_observations::Stage::ResponseSend);
+        self.inner.write_msg(response)
     }
 }
 

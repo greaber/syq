@@ -26,7 +26,11 @@ result = syq.cp(srcs_in="data", into="backup")
 Arguments follow the command-line names: replace hyphens with underscores,
 and add a trailing underscore for Python keywords, such as `from_` and `as_`.
 The [copy guide](https://greaber.github.io/syq/reference.html) explains placement,
-filtering, and verification options.
+filtering, and verification options. Advanced groups take comma-separated
+strings, for example `resource_limits="bandwidth=10M"`,
+`performance_tuning="workers=4"`, or
+`integrity_checking="compare=blake3,transfer=sha256"`. They are optional;
+ordinary copies choose performance settings automatically.
 
 ## Copy over SSH
 
@@ -140,6 +144,9 @@ finish successfully before copying starts; a failed transform leaves the
 destination untouched. See
 [Rename and reorganize](https://greaber.github.io/syq/mappings.html) for mapping rules.
 
+For a complete program built on mappings, see
+[Pull and push DVC data](https://greaber.github.io/syq/dvc.html).
+
 ## Use asyncio
 
 Await operations on `AsyncClient`. Its arguments and results match `Client`:
@@ -186,7 +193,7 @@ result = client.cp("data", into="backup", timeout=None)
 ```
 
 To use an existing executable, pass `Client(executable="/opt/bin/syq")`.
-This bypasses the managed version; see
+This bypasses the bundled version; see
 [Compatibility](https://greaber.github.io/syq/python-reference.html#compatibility).
 
 <a id="native-api-reference"></a>

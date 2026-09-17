@@ -4,6 +4,7 @@
 Remote tests here fake only SSH and syq; rsync still runs its real client/server
 protocol. tests/real-ssh additionally exercises real syq over real OpenSSH.
 """
+import json
 import os
 from pathlib import Path
 import pty
@@ -63,7 +64,9 @@ if '--results' in args:
         result['copying_elapsed_ms']=copy_ms
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
         result['copying_elapsed_ms']=999999999
-    pathlib.Path(args[args.index('--results')+1]).write_text(json.dumps(result)+'\n')
+    progress={'type':'progress','activity':{'summary':'Observed worker time: source response 100% (test fixture)'}}
+    lines=[] if os.environ.get('BENCH_TEST_OLD') or '--stats' not in args else [json.dumps(progress)]
+    pathlib.Path(args[args.index('--results')+1]).write_text('\n'.join(lines+[json.dumps(result)])+'\n')
 if '--quiet' not in args and src.name == 'probe':
     print('test double: preparing matching remote helper', flush=True)
 if '--quiet' not in args and '--suppress-summary' not in args:
@@ -129,7 +132,7 @@ class BenchmarkTests(unittest.TestCase):
         log = self.root / 'args.jsonl'
         tuning = 'batch-files=256,batch-bytes=2M'
         result = self.invoke('--mode', 'push', '--host', 'test-host', '--tool', 'syq',
-                             '--', '-vv', '--no-tcp', '--connections', '4', '--tuning-options', tuning,
+                             '--', '-vv', '--no-tcp', '--performance-tuning', 'workers=4', '--performance-tuning', tuning,
                              env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count('Command:'), 1)
@@ -141,8 +144,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(len(copies), 2)  # setup and one scored copy
         for args in copies:
             self.assertIn('--no-tcp', args)
-            self.assertEqual(args[args.index('--connections')+1], '4')
-            self.assertEqual(args[args.index('--tuning-options')+1], tuning)
+            self.assertEqual(args[args.index('--performance-tuning')+1], 'workers=4')
+            self.assertEqual([args[i+1] for i, a in enumerate(args) if a == '--performance-tuning'], ['workers=4', tuning])
         self.assert_clean()
 
     def test_warmup_precedes_scored_copies_in_both_directions(self):
@@ -167,9 +170,9 @@ class BenchmarkTests(unittest.TestCase):
                 self.assert_clean()
 
     def test_warmup_can_be_skipped_and_manual_tuning_skips_it(self):
-        options = [('--warmup', 'off'), ('--', '--connections', '1'), ('--', '-j1'),
-                   ('--', '--connections=1'), ('--', '--tuning-options', 'request-size=1M'),
-                   ('--', '--tuning-options=request-size=1M'), ('--tool', 'rsync')]
+        options = [('--warmup', 'off'), ('--', '--performance-tuning', 'workers=1'),
+                   ('--', '--performance-tuning=workers=1'), ('--', '--performance-tuning', 'request-size=1M'),
+                   ('--', '--performance-tuning=request-size=1M'), ('--tool', 'rsync')]
         for args in options:
             with self.subTest(args=args):
                 result = self.invoke('--mode', 'push', '--host', 'test-host', *args)
@@ -225,6 +228,35 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn('large syq', result.stdout)
                 self.assert_clean()
 
+    def test_activity_summary_is_printed_once_per_scored_trial(self):
+        for old in [False, True]:
+            result = self.invoke('--tool', 'syq', '--workload', 'small',
+                env=dict(self.env, **({'BENCH_TEST_OLD':'1'} if old else {})))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.count('Observed worker time:'), 0 if old else 1)
+            self.assert_clean()
+
+    def test_activity_timeline_reports_changes_without_repeating_stable_states(self):
+        records = self.root / 'timeline.ndjson'
+        def sample(ms, worker, operation):
+            return {'type':'progress', 'elapsed_ms':ms, 'activity': {
+                'summary':'final summary', 'workers':{'fractions':{worker:1}},
+                'endpoints':[{'label':'destination worker 0', 'actors':[
+                    {'role':'filesystem', 'fractions':{operation:1}}]}]}}
+        records.write_text('\n'.join(json.dumps(row) for row in [
+            sample(1000,'destination_ack','filesystem_copy'),
+            sample(2000,'destination_ack','filesystem_copy'),
+            sample(3000,'source_response','destination_write')])+'\n')
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        result = subprocess.run(['bash', '-c',
+            definitions + '\nactivity_summary "$1"', 'timeline-test', str(records)],
+            text=True, capture_output=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count('workers: destination ack'), 1)
+        self.assertIn('3.00s  workers: source response', result.stdout)
+        self.assertIn('destination worker 0 / filesystem: destination write', result.stdout)
+        self.assertNotIn('2.00s', result.stdout)
+
     def test_explicit_stats_survive_concise_output(self):
         result = self.invoke('--tool', 'syq', '--', '--stats')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -234,7 +266,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_tuning_cannot_redirect_copy_or_output(self):
         for args in [('--', '--as', str(self.scratch)), ('--', '--results', str(self.sentinel)),
-                     ('--', '--prune'), ('--', '--connections'),
+                     ('--', '--prune'), ('--', '--performance-tuning'),
                      ('--tool', 'cp', '--mode', 'push', '--host', 'test-host'),
                      ('--tool', 'rsync', '--', '--no-tcp')]:
             with self.subTest(args=args):
@@ -549,7 +581,7 @@ class BenchmarkTests(unittest.TestCase):
         installer = '#!/bin/sh\nset -eu\nmkdir -p "$HOME/.local/bin"\ncp ' + shlex.quote(str(template)) + ' "$HOME/.local/bin/syq"\n'
         curl = self.bin / 'curl'
         curl.write_text('#!/usr/bin/env python3\nimport pathlib, sys\n'
-                        'assert "https://github.com/greaber/syq/releases/latest/download/install.sh" in sys.argv\n'
+                        'assert "https://dl.syq.christmas/latest/install.sh" in sys.argv\n'
                         'pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text(' + repr(installer) + ')\n')
         curl.chmod(0o755)
         result = self.invoke('--install', env=env)

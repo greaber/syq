@@ -62,9 +62,8 @@ across upgrades; include it in private backups if you want to restore the same
 identity. Losing it requires releasing the old names on each server. Copying it
 to another machine gives that machine the same receiver identity. If the old
 connection is still responsive, the replacement is rejected; use different
-profile names to receive on both machines at once. If the old connection is
-unresponsive, reconnecting waits for its heartbeat cleanup to release the name
-lock. It does not displace the existing connection.
+profile names to receive on both machines at once. An unresponsive connection
+must time out before its name can reconnect.
 
 ## Directories
 

@@ -197,10 +197,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 | "follow_dst" => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "progress_json"
                 | "stats" => "Progress and results",
-                "bwlimit" => "Bandwidth",
-                "connections" | "connections_opt" | "block_size" | "tuning_options" => {
-                    "Performance troubleshooting"
-                }
+                "resource_limits_arg" => "Resource limits",
+                "integrity_checking_arg" | "hash" | "expected_digest" => "Integrity checking",
+                "performance_tuning" | "block_size" => "Performance tuning",
                 "auth_from" | "via" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "tcp_plain" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",
@@ -267,7 +266,7 @@ pub(crate) fn lifecycle() -> Command {
     configure(Command::new("syq")
         .about("Install the newest signed syq release")
         .override_usage("syq --self-update")
-        .before_help("Standalone (curl installer) installs: syq --self-update\nHomebrew installs: brew upgrade syq\nSource builds: rebuild or reinstall.\n\nStandalone installs show new-version reminders at most daily after successful\nfilesystem commands when stderr is a terminal and quiet mode is off. Set\nSYQ_NO_UPDATE_CHECK to disable reminders; explicit self-update still works.\nUpdates verify signed release metadata and never install as a side effect of copying.")
+        .before_help("Standalone (curl installer) installs: syq --self-update\nHomebrew installs: brew upgrade syq\nSource builds: rebuild or reinstall.\n\nStandalone and Homebrew installs show new-version reminders at most daily after\nsuccessful filesystem commands when stderr is a terminal and quiet mode is off.\nSet SYQ_NO_UPDATE_CHECK or DO_NOT_TRACK to disable reminders; explicit self-update still works.\nUpdates verify signed release metadata and never install as a side effect of copying.")
         .arg(Arg::new("self_update").long("self-update").action(ArgAction::SetTrue).exclusive(true)
             .help("Update the executable registered by the standalone installer"))
         .arg(Arg::new("register_standalone_install").long("register-standalone-install")

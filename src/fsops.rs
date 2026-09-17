@@ -10,6 +10,7 @@ use crate::rooted::{
     read_open_symlink, root_metadata_from_std, OperatorFinalComponent, OperatorResolver,
     PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
+use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
@@ -25,6 +26,22 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Compare at the decimal precision suggested by the destination timestamp.
+/// Trailing zeros may reflect either filesystem truncation or a round timestamp;
+/// this is the size/mtime shortcut, not a content verification.
+pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> bool {
+    if destination == 0 {
+        return true;
+    }
+    let mut precision = 1;
+    let mut fraction = destination;
+    while fraction.is_multiple_of(10) {
+        precision *= 10;
+        fraction /= 10;
+    }
+    source / precision == destination / precision
+}
 
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
 const FD_CACHE_MAX: usize = 16;
@@ -45,12 +62,7 @@ const COMMON_NAME_MAX: usize = 255;
 const NAME_MAX_CACHE_CAP: usize = 1024;
 
 #[cfg(debug_assertions)]
-pub(crate) fn test_race_barrier(
-    ready_env: &str,
-    continue_env: &str,
-    hold_env: &str,
-    label: &str,
-) -> Result<()> {
+pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
     if continuation.is_some() && ready.is_none() {
@@ -96,11 +108,6 @@ pub(crate) fn test_race_barrier(
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    if let Some(ms) = std::env::var_os(hold_env) {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
     Ok(())
 }
 
@@ -110,6 +117,7 @@ struct NameMaxCache {
     devices: HashMap<u64, usize>,
 }
 
+#[cfg(test)]
 pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
     *blake3::hash(data).as_bytes()
 }
@@ -187,20 +195,11 @@ fn discard_rooted_copy_partial(
 
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 fn hold_copy_local_before_destination_open_for_test() -> Result<()> {
-    if let Some(ready) = std::env::var_os("SYQ_TEST_COPY_LOCAL_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write local-copy-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_COPY_LOCAL_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_COPY_LOCAL_READY_FILE",
+        "SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE",
+        "local-copy destination open",
+    )
 }
 
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
@@ -670,22 +669,11 @@ fn hold_operator_control_path_for_test(path: &Path) -> Result<()> {
     if expected.as_bytes() != path.as_os_str().as_bytes() {
         return Ok(());
     }
-    if let Some(ready) = std::env::var_os("SYQ_TEST_CONTROL_PATH_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write control-path-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_CONTROL_PATH_MS") {
-        let ms = ms
-            .to_string_lossy()
-            .parse::<u64>()
-            .context("parse SYQ_TEST_HOLD_CONTROL_PATH_MS")?;
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_CONTROL_PATH_READY_FILE",
+        "SYQ_TEST_CONTROL_PATH_CONTINUE_FILE",
+        "control-path selection",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -1034,10 +1022,16 @@ pub(crate) fn partial_path_with_name_max(
     Ok(parent.join(OsString::from_vec(component)))
 }
 
+const RECOVERY_PREFIX: &str = ".syq-swap-";
+
+pub(crate) fn recovery_name(process: u32, counter: u64) -> String {
+    format!("{RECOVERY_PREFIX}{process}-{counter}")
+}
+
 /// Names used for displaced entries during interrupted replacement. Keep
 /// this separate from resumable partials: clean-partials must not remove them.
 pub fn is_recovery_name(name: &OsStr) -> bool {
-    let Some(suffix) = name.as_bytes().strip_prefix(b".syq-swap-") else {
+    let Some(suffix) = name.as_bytes().strip_prefix(RECOVERY_PREFIX.as_bytes()) else {
         return false;
     };
     let mut fields = suffix.split(|byte| *byte == b'-');
@@ -1431,7 +1425,7 @@ fn source_descriptor_requirement(
 /// descriptors. Its directory descriptor is visible in the listing, which is
 /// a harmless conservative overcount. The portable fallback scans the finite
 /// descriptor range and treats unexpected `fcntl` errors as open.
-fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
+pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
     for fd_directory in ["/proc/self/fd", "/dev/fd"] {
         if let Ok(entries) = fs::read_dir(fd_directory) {
             return Ok(entries.count());
@@ -1482,7 +1476,7 @@ fn require_source_descriptor_capacity(
     )?;
     if required as u128 > limit.rlim_cur as u128 {
         bail!(
-            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller explicit --connections value",
+            "source setup needs about {required} open-file slots ({current_open} currently open) for {root_count} roots, {shared_workers} shared workers, and {independent_workers} independent workers, but this endpoint permits {}; reduce the number of source selectors or use a smaller performance-tuning workers value",
             limit.rlim_cur
         );
     }
@@ -1490,7 +1484,12 @@ fn require_source_descriptor_capacity(
 }
 
 pub struct FsOps {
-    fds: HashMap<FdKey, File>,
+    hash_policy: crate::hashing::HashPolicy,
+    pub(crate) observations: Arc<crate::transfer_observations::Registry>,
+    operation: Arc<crate::transfer_observations::Actor>,
+    #[cfg(target_os = "linux")]
+    read_ahead: crate::read_ahead::ReadAhead,
+    fds: HashMap<FdKey, CachedFile>,
     fd_order: Vec<FdKey>,
     /// One final-file descriptor retained between the hash response and the
     /// controller's decision to repair or accept that exact inode.
@@ -1641,12 +1640,34 @@ impl Default for FsOps {
 }
 
 impl FsOps {
+    pub(crate) fn set_hash_policy(&mut self, policy: crate::hashing::HashPolicy) {
+        self.hash_policy = policy;
+    }
+
+    fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
+        let _hash = self
+            .operation
+            .span(crate::transfer_observations::Stage::Hashing);
+        self.hash_policy.payload_algorithm().hash(bytes)
+    }
+
     pub fn new() -> Self {
         Self::with_descriptor_session(DescriptorSessionSlot::default())
     }
 
     pub(crate) fn with_descriptor_session(descriptor_session: DescriptorSessionSlot) -> Self {
+        let observations = Arc::new(crate::transfer_observations::Registry::default());
+        let operation = observations.actor("filesystem");
         FsOps {
+            hash_policy: crate::hashing::HashPolicy {
+                algorithm: crate::hashing::HashAlgorithm::Blake3,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            },
+            observations: observations.clone(),
+            operation: operation.clone(),
+            #[cfg(target_os = "linux")]
+            read_ahead: crate::read_ahead::ReadAhead::observed(observations, operation),
             fds: HashMap::new(),
             fd_order: Vec::new(),
             held_basis: None,
@@ -1765,7 +1786,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_DESTINATION_ANCHORED_FILE",
             "SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS",
             "destination-anchor-ready",
         )?;
         Ok(ticket)
@@ -1792,7 +1812,9 @@ impl FsOps {
         let mut total = 0u64;
         let mut names: Vec<&[u8]> = Vec::with_capacity(request.files.len());
         for file in &request.files {
-            if content_digest(&file.data) != file.hash {
+            if self.hash_policy.transfer_integrity
+                && self.observed_payload_hash(&file.data) != file.hash
+            {
                 bail!("block hash mismatch on receive");
             }
             let bytes = file.data.len() as u64;
@@ -1839,8 +1861,8 @@ impl FsOps {
                 }
             }
         }
-        // This fused path serves native copies: use all available timestamp
-        // precision, matching the native planner's quick check.
+        // This fused path serves native copies: share the planner's inferred
+        // destination precision so dispatch does not change the skip decision.
         let mut unchanged: Vec<bool> = request
             .files
             .iter()
@@ -1850,7 +1872,10 @@ impl FsOps {
                     request.flags & flags::TIMES != 0
                         && stat.st_size as u64 == file.data.len() as u64
                         && stat.st_mtime == file.meta.mtime
-                        && stat.st_mtime_nsec as u32 == file.meta.mtime_nsec
+                        && destination_fraction_matches(
+                            file.meta.mtime_nsec,
+                            stat.st_mtime_nsec as u32,
+                        )
                 })
             })
             .collect();
@@ -1918,10 +1943,10 @@ impl FsOps {
                 Read::by_ref(&mut opened)
                     .take(file.data.len() as u64 + 1)
                     .read_to_end(&mut bytes)?;
-                Ok(
-                    (bytes.len() == file.data.len() && content_digest(&bytes) == file.hash)
-                        .then_some((target, opened)),
-                )
+                if bytes.len() != file.data.len() {
+                    return Ok(None);
+                }
+                Ok((bytes == file.data).then_some((target, opened)))
             })();
             match check {
                 Ok(Some(held)) => {
@@ -1970,7 +1995,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_SMALL_COPY_READY_FILE",
             "SYQ_TEST_SMALL_COPY_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_SMALL_COPY_MS",
             "small copy staged",
         )?;
         // Each publication/metadata repair has its own outcome. Unchanged
@@ -2105,7 +2129,7 @@ impl FsOps {
         if basis_size.is_some() {
             file.set_len(0)?;
         }
-        file.write_all_at(data, 0)
+        observed_write(&self.operation, &file, data, 0)
             .with_context(|| format!("write {}", label.display()))?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
@@ -2298,7 +2322,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE",
             "SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_SOURCE_ROOTS_MS",
             "source-registration-ready",
         )?;
         Ok(registered)
@@ -2417,7 +2440,7 @@ impl FsOps {
                 SourceRootHandle {
                     root: Arc::new(Root::from_directory(directory)?),
                     _leaf_object: leaf_object.map(Arc::new),
-                    selection: source.selection.relative.clone(),
+                    selection: source.selection.relative().to_vec(),
                     expected_leaf: source.expected_leaf.clone(),
                 },
             );
@@ -2434,17 +2457,22 @@ impl FsOps {
             .map(|source| source.root.identity())
     }
 
-    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+    fn registered_source_handle(&self, source: &RegisteredPath) -> Result<&SourceRootHandle> {
         let handle = self
             .source_roots
             .get(&source.root())
             .with_context(|| format!("unknown registered source root {}", source.root().get()))?;
-        if !handle.selection.is_empty() && source.relative != handle.selection {
+        if !handle.selection.is_empty() && source.relative() != handle.selection {
             bail!("registered source leaf does not authorize the requested path");
         }
+        Ok(handle)
+    }
+
+    fn registered_source_target(&self, source: &RegisteredPath) -> Result<RegisteredSourceTarget> {
+        let handle = self.registered_source_handle(source)?;
         Ok(RegisteredSourceTarget {
             root: handle.root.clone(),
-            relative: RelativePath::new(&source.relative)?,
+            relative: RelativePath::new(source.relative())?,
             expected_leaf: handle.expected_leaf.clone(),
             leaf_object: handle._leaf_object.clone(),
         })
@@ -2467,7 +2495,7 @@ impl FsOps {
             let target = self.registered_source_target(source)?;
             return Ok(Some(SourceScanRoot {
                 root: target.root,
-                relative: source.relative.clone(),
+                relative: source.relative().to_vec(),
                 expected_leaf: target.expected_leaf,
             }));
         }
@@ -2504,6 +2532,7 @@ impl FsOps {
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. }
             | Request::FileHash { guard, .. }
+            | Request::ValidateDigest { guard, .. }
             | Request::Canonicalize { guard, .. } => guard.is_some(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
             _ => false,
@@ -2635,6 +2664,19 @@ impl FsOps {
         let files_available = statvfs_counter(stats.f_favail);
         let available_bytes = blocks_available.saturating_mul(fragment_size);
         let available_inodes = (files != 0 && files_available <= files).then_some(files_available);
+        #[cfg(target_os = "macos")]
+        let available_inodes = available_inodes.and_then(|available| {
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let filesystem = unsafe { filesystem.assume_init() };
+            let name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) };
+            // macOS exFAT reports f_files=1 and f_favail=0 even while new
+            // files can be created. That is unavailable inode accounting,
+            // not exhaustion. Keep zero authoritative on other filesystems.
+            (name.to_bytes() != b"exfat").then_some(available)
+        });
         #[cfg(debug_assertions)]
         let available_bytes = match std::env::var_os("SYQ_TEST_AVAILABLE_BYTES") {
             Some(value) => value
@@ -2832,6 +2874,7 @@ impl FsOps {
             | Request::WriteRange { path, guard, .. }
             | Request::Finalize { path, guard, .. }
             | Request::FileHash { path, guard, .. }
+            | Request::ValidateDigest { path, guard, .. }
             | Request::Canonicalize { path, guard } => {
                 if guard.is_none() {
                     map(path)?;
@@ -2851,7 +2894,8 @@ impl FsOps {
                     }
                 }
             }
-            Request::Hello { .. }
+            Request::ConfigureHashing(_)
+            | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
             | Request::ListDirDetails { .. }
@@ -2995,7 +3039,13 @@ impl FsOps {
         }
     }
 
-    fn cached(&mut self, p: &Path, write: bool, attempt: u32, private: bool) -> Result<&File> {
+    fn cached(
+        &mut self,
+        p: &Path,
+        write: bool,
+        attempt: u32,
+        private: bool,
+    ) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Path(p.to_path_buf()),
             attempt,
@@ -3010,7 +3060,7 @@ impl FsOps {
             if private {
                 require_safe_partial(&f, p)?;
             }
-            self.fds.insert(key.clone(), f);
+            self.fds.insert(key.clone(), CachedFile::new(f));
             self.fd_order.push(key.clone());
         }
         Ok(self.fds.get(&key).unwrap())
@@ -3027,7 +3077,7 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.insert(key.clone(), file);
+        self.fds.insert(key.clone(), CachedFile::new(file));
         self.fd_order.push(key);
     }
 
@@ -3042,7 +3092,10 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.get(&key).map(File::try_clone).transpose()
+        self.fds
+            .get(&key)
+            .map(|file| file.file().try_clone())
+            .transpose()
     }
 
     fn uncache(&mut self, p: &Path) -> Option<File> {
@@ -3060,7 +3113,11 @@ impl FsOps {
         let mut removed = None;
         self.fd_order.retain(|key| {
             if &key.location == location {
-                removed = self.fds.remove(key).or(removed.take());
+                removed = self
+                    .fds
+                    .remove(key)
+                    .map(CachedFile::into_file)
+                    .or(removed.take());
                 false
             } else {
                 true
@@ -3076,7 +3133,7 @@ impl FsOps {
         relative: &RelativePath,
         attempt: u32,
         private: bool,
-    ) -> Result<&File> {
+    ) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Rooted {
                 root: root.identity(),
@@ -3099,7 +3156,7 @@ impl FsOps {
                     bail!("partial {} changed while opening it", label.display());
                 }
             }
-            self.fds.insert(key.clone(), file);
+            self.fds.insert(key.clone(), CachedFile::new(file));
             self.fd_order.push(key.clone());
         }
         Ok(self.fds.get(&key).unwrap())
@@ -3125,11 +3182,13 @@ impl FsOps {
                 let victim = self.fd_order.remove(0);
                 self.fds.remove(&victim);
             }
-            self.fds
-                .insert(key.clone(), open_registered_source(target)?);
+            self.fds.insert(
+                key.clone(),
+                CachedFile::new(open_registered_source(target)?),
+            );
             self.fd_order.push(key.clone());
         }
-        Ok(self.fds.get(&key).unwrap())
+        Ok(self.fds.get(&key).unwrap().file())
     }
 
     /// Batches are statted on several threads: on network filesystems each
@@ -3154,11 +3213,11 @@ impl FsOps {
             if follow {
                 return vec![None; paths.len()];
             }
-            return parallel_map(paths, |path| {
-                let relative = RelativePath::new(path).ok()?;
-                let metadata = root.metadata(&relative).ok()?;
-                rooted_entry(&root, &relative, Vec::new(), metadata).ok()
-            });
+            return parallel_map_init(
+                paths,
+                || None,
+                |parent, path| stat_with_parent(&root, parent, path),
+            );
         }
         parallel_map(paths, |p| {
             let full = resolve(p);
@@ -3228,43 +3287,63 @@ impl FsOps {
             if sources.len() != paths.len() {
                 bail!("source stat capability count does not match path count");
             }
-            let targets = sources
+            // Validate capability authority eagerly. RegisteredPath construction
+            // and deserialization guarantee valid relative path bytes.
+            let mut targets = sources
                 .iter()
-                .map(|source| self.registered_source_target(source))
+                .enumerate()
+                .map(|(index, source)| {
+                    let handle = self.registered_source_handle(source)?;
+                    let parent = source
+                        .relative()
+                        .rsplitn(2, |b| *b == b'/')
+                        .nth(1)
+                        .unwrap_or(b"");
+                    Ok(((source.root().get(), parent), index, source, handle))
+                })
                 .collect::<Result<Vec<_>>>()?;
+            // Group only metadata lookups; data-job scheduling stays unchanged.
+            targets.sort_unstable_by_key(|(key, ..)| *key);
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            return parallel_map(&targets, |target| {
-                let Some(expected) = target.expected_leaf.as_ref() else {
-                    let Some(metadata) = target.root.metadata(&target.relative).ok() else {
-                        return Ok(None);
+            let results = parallel_map_init(
+                &targets,
+                || None,
+                |parent, (_, _, source, target)| {
+                    let Some(expected) = target.expected_leaf.as_ref() else {
+                        return Ok(stat_with_parent(&target.root, parent, source.relative()));
                     };
-                    return Ok(
-                        rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok(),
-                    );
-                };
-                let metadata = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("inspect registered source leaf")?;
-                require_source_leaf_identity(expected, metadata)?;
-                let entry = rooted_source_entry(
-                    &target.root,
-                    &target.relative,
-                    Vec::new(),
-                    metadata,
-                    Some(expected),
-                )?;
-                let after = target
-                    .root
-                    .metadata(&target.relative)
-                    .context("recheck registered source leaf")?;
-                require_source_leaf_identity(expected, after)?;
-                Ok(Some(entry))
-            })
-            .into_iter()
-            .collect();
+                    let relative = RelativePath::new(source.relative())?;
+                    let metadata = target
+                        .root
+                        .metadata(&relative)
+                        .context("inspect registered source leaf")?;
+                    require_source_leaf_identity(expected, metadata)?;
+                    let entry = rooted_source_entry(
+                        &target.root,
+                        &relative,
+                        Vec::new(),
+                        metadata,
+                        Some(expected),
+                    )?;
+                    let after = target
+                        .root
+                        .metadata(&relative)
+                        .context("recheck registered source leaf")?;
+                    require_source_leaf_identity(expected, after)?;
+                    Ok(Some(entry))
+                },
+            );
+            // Scatter before collecting so the first error, as well as each
+            // successful entry, follows request order rather than lookup order.
+            debug_assert_eq!(targets.len(), sources.len());
+            debug_assert_eq!(results.len(), targets.len());
+            let mut ordered: Vec<_> = (0..sources.len()).map(|_| Ok(None)).collect();
+            for ((_, index, ..), result) in targets.into_iter().zip(results) {
+                ordered[index] = result;
+            }
+            return ordered.into_iter().collect();
         }
         if self.destination_root.is_none()
             && !self.source_roots.is_empty()
@@ -4201,7 +4280,6 @@ fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
     test_race_barrier(
         "SYQ_TEST_GUARDED_MUTATION_READY_FILE",
         "SYQ_TEST_GUARDED_MUTATION_CONTINUE_FILE",
-        "SYQ_TEST_HOLD_GUARDED_MUTATION_MS",
         "guarded-mutation-ready",
     )
 }
@@ -4213,20 +4291,11 @@ fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
 
 #[cfg(debug_assertions)]
 fn hold_before_quick_metadata_for_test() -> Result<()> {
-    if let Some(ready) = std::env::var_os("SYQ_TEST_QUICK_META_READY_FILE") {
-        fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write quick-metadata-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_QUICK_META_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    test_race_barrier(
+        "SYQ_TEST_QUICK_META_READY_FILE",
+        "SYQ_TEST_QUICK_META_CONTINUE_FILE",
+        "quick metadata repair",
+    )
 }
 
 #[cfg(not(debug_assertions))]
@@ -4451,7 +4520,7 @@ fn set_meta_handle_known_portable(
 }
 
 #[cfg(target_os = "linux")]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     let fd = file.as_raw_fd();
     let r = unsafe { libc::fchmodat(fd, c"".as_ptr(), mode as libc::mode_t, libc::AT_EMPTY_PATH) };
     if r == 0 {
@@ -4475,7 +4544,7 @@ fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
+pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     Ok(())
 }
@@ -4513,12 +4582,73 @@ fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
     Ok(())
 }
 
+// Retain only the last parent in a metadata chunk. Like descriptor scanning,
+// this observes the selected directory if it is renamed during the chunk.
+// Symlink reads and identity checks use that same parent; the next chunk or
+// request starts without a retained handle and resolves the path again.
+struct HeldMetadataParent {
+    // Device/inode can coincide across bind-mount views. Retain the actual
+    // opened root so its distinct object identity cannot be recycled.
+    root: Arc<Root>,
+    path: PathBytes,
+    directory: File,
+}
+
+fn stat_with_parent(
+    root: &Arc<Root>,
+    parent: &mut Option<HeldMetadataParent>,
+    path: &[u8],
+) -> Option<Entry> {
+    if path.starts_with(b"/") {
+        return None;
+    }
+    let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
+        *parent = None;
+        let relative = RelativePath::new(path).ok()?;
+        let metadata = root.metadata(&relative).ok()?;
+        return rooted_entry(root, &relative, Vec::new(), metadata).ok();
+    };
+    let parent_path = &path[..separator];
+    let name = &path[separator + 1..];
+    if parent
+        .as_ref()
+        .is_none_or(|held| !Arc::ptr_eq(&held.root, root) || held.path != parent_path)
+    {
+        *parent = None;
+        let directory = root
+            .open_directory(&RelativePath::new(parent_path).ok()?)
+            .ok()?;
+        *parent = Some(HeldMetadataParent {
+            root: root.clone(),
+            path: parent_path.to_vec(),
+            directory,
+        });
+    }
+    // The held parent's key was validated when opened. This operation validates
+    // the leaf, so siblings do not need an allocated RelativePath for validation.
+    let directory = &parent.as_ref()?.directory;
+    let metadata = root.metadata_in_directory(directory, name).ok()?;
+    rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
+}
+
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    parallel_map_init(items, || (), |_, item| f(item))
+}
+
+// State belongs to one bounded input chunk and is discarded before returning.
+// Metadata lookups can reuse a held parent for adjacent siblings, while later
+// requests resolve the namespace afresh. No state is shared between workers.
+fn parallel_map_init<T: Sync, R: Send, S>(
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) -> R + Sync,
+) -> Vec<R> {
     if items.len() < PAR_MIN {
-        return items.iter().map(&f).collect();
+        let mut state = init();
+        return items.iter().map(|item| f(&mut state, item)).collect();
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
@@ -4533,7 +4663,11 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
     pool.install(|| {
         items
             .par_chunks(chunk)
-            .flat_map_iter(|chunk| chunk.iter().map(&f))
+            .flat_map_iter(|chunk| {
+                let mut state = init();
+                let f = &f;
+                chunk.iter().map(move |item| f(&mut state, item))
+            })
             .collect()
     })
 }
@@ -4541,7 +4675,34 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 /// Hash exactly `len` bytes in fixed blocks. A short reader contributes the
 /// bytes it has and empty hashes for the missing blocks, matching both source
 /// and destination behavior through one implementation.
+#[cfg(test)]
 fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<ContentDigest>> {
+    hash_reader_observed(
+        reader,
+        block,
+        len,
+        None,
+        crate::hashing::HashAlgorithm::Blake3,
+    )
+}
+fn observed_write(
+    actor: &Arc<crate::transfer_observations::Actor>,
+    file: &File,
+    data: &[u8],
+    off: u64,
+) -> std::io::Result<()> {
+    let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
+    file.write_all_at(data, off)?;
+    writing.bytes(data.len() as u64);
+    Ok(())
+}
+fn hash_reader_observed(
+    reader: &mut impl Read,
+    block: u64,
+    len: u64,
+    actor: Option<&Arc<crate::transfer_observations::Actor>>,
+    algorithm: crate::hashing::HashAlgorithm,
+) -> Result<Vec<ContentDigest>> {
     if !hash_response_fits(block, len) {
         bail!("hash block size or response count is outside protocol limits");
     }
@@ -4553,16 +4714,27 @@ fn hash_reader(reader: &mut impl Read, block: u64, len: u64) -> Result<Vec<Conte
         let want = remaining.min(block) as usize;
         let mut got = 0;
         while got < want {
-            let read = reader.read(&mut buf[got..want])?;
+            let read = {
+                let reading =
+                    actor.map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
+                let n = reader.read(&mut buf[got..want])?;
+                if let Some(reading) = reading {
+                    reading.bytes(n as u64);
+                }
+                n
+            };
             if read == 0 {
                 break;
             }
             got += read;
         }
-        hashes.push(content_digest(&buf[..got]));
+        {
+            let _hash = actor.map(|a| a.span(crate::transfer_observations::Stage::Hashing));
+            hashes.push(algorithm.hash(&buf[..got]));
+        }
         if got < want {
             while hashes.len() < n {
-                hashes.push(content_digest(&[]));
+                hashes.push(algorithm.hash(&[]));
             }
             break;
         }
@@ -5108,7 +5280,6 @@ impl FsOps {
             test_race_barrier(
                 "SYQ_TEST_PARTIAL_READY_FILE",
                 "SYQ_TEST_PARTIAL_CONTINUE_FILE",
-                "SYQ_TEST_HOLD_PARTIAL_MS",
                 "partial-ready",
             )?;
             self.cache_file(
@@ -5156,7 +5327,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_PARTIAL_READY_FILE",
             "SYQ_TEST_PARTIAL_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_PARTIAL_MS",
             "partial-ready",
         )?;
         self.cache_file(FileLocation::Path(pp), attempt, true, f);
@@ -5193,7 +5363,13 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
-        let hashes = hash_reader(&mut file, block, len)?;
+        let hashes = hash_reader_observed(
+            &mut file,
+            block,
+            len,
+            Some(&self.operation),
+            self.hash_policy.algorithm,
+        )?;
         self.held_basis = Some(HeldBasis {
             location,
             label,
@@ -5204,7 +5380,6 @@ impl FsOps {
         test_race_barrier(
             "SYQ_TEST_BASIS_READY_FILE",
             "SYQ_TEST_BASIS_CONTINUE_FILE",
-            "SYQ_TEST_HOLD_BASIS_MS",
             "basis-ready",
         )?;
         // Hashing is intentionally limited to the source length. Report the
@@ -5401,13 +5576,13 @@ impl FsOps {
                     // The controller treats an absent hash as a block to transfer.
                     break;
                 }
-                let hash = content_digest(bytes);
+                // Reuse compares these with the source's comparison hashes.
+                let hash = self.hash_policy.algorithm.hash(bytes);
                 if input.is_some() {
                     #[cfg(debug_assertions)]
                     test_race_barrier(
                         "SYQ_TEST_REUSE_READY_FILE",
                         "SYQ_TEST_REUSE_CONTINUE_FILE",
-                        "SYQ_TEST_HOLD_REUSE_MS",
                         "reuse buffered bytes",
                     )?;
                     output
@@ -5433,7 +5608,7 @@ impl FsOps {
         let source_target = self
             .registered_source_target(source)
             .context("resolve registered local-copy source")?;
-        let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
+        let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         let s = open_registered_source(&source_target)
             .with_context(|| format!("open registered source {}", source_label.display()))?;
         let destination_root = self
@@ -5490,13 +5665,16 @@ impl FsOps {
         size: u64,
         mode: u32,
     ) -> Result<CopyLocalOutcome> {
+        let _copy = self
+            .operation
+            .span(crate::transfer_observations::Stage::FilesystemCopy);
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
         } = policy;
         let (s, source_metadata, target) = self.prepare_local_copy(source, dst)?;
-        let source_label = PathBuf::from(OsStr::from_bytes(&source.relative));
+        let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
         // Advisory sequential readahead for the kernel copy on Linux.
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
@@ -5678,9 +5856,22 @@ impl FsOps {
                 return Ok(CopyLocalOutcome::Unsupported);
             }
         }
+        // Preserve physical clones before considering read-ahead. A clone
+        // needs no source data in memory; metadata I/O is not a reason to
+        // prefetch the contents of a successfully cloned file.
+        let local_read_ahead = source_fs.local_userspace_copy
+            && destination_fs.local_userspace_copy
+            && !source_fs.is_nfs
+            && !destination_fs.is_nfs
+            && !destination_fs.synchronous
+            && !userspace_fallback;
+        let cloned = local_read_ahead && crate::local_copy::try_clone(&s, &d, size);
+        let preparation = &mut self.read_ahead;
+        let mut read_ahead = (local_read_ahead && !cloned).then(|| preparation.range(&s, 0..size));
         let mut source_offset: libc::off64_t = 0;
         let mut destination_offset: libc::off64_t = 0;
-        let mut remaining = size;
+        let mut remaining = if cloned { 0 } else { size };
+        let mut previous_input = crate::read_ahead::Activity::sample();
         while remaining > 0 && !userspace_fallback {
             // SAFETY: each offset is its own local that outlives the call, so
             // the kernel reads and advances the two through distinct pointers.
@@ -5690,7 +5881,11 @@ impl FsOps {
                     &mut source_offset,
                     d.as_raw_fd(),
                     &mut destination_offset,
-                    remaining as usize,
+                    if read_ahead.is_some() {
+                        remaining.min(crate::read_ahead::BLOCK) as usize
+                    } else {
+                        remaining as usize
+                    },
                     0,
                 )
             };
@@ -5742,8 +5937,30 @@ impl FsOps {
                 bail!("source shortened while copying {}", source_label.display());
             }
             remaining -= n as u64;
+            if let Some(read_ahead) = &mut read_ahead {
+                let prepare = if read_ahead.needs_observation() {
+                    let current = crate::read_ahead::Activity::sample();
+                    let input = current.input_since(previous_input);
+                    previous_input = current;
+                    input
+                } else {
+                    false
+                };
+                read_ahead.advance(size - remaining, prepare);
+                #[cfg(debug_assertions)]
+                if size - remaining == n as u64 {
+                    test_race_barrier(
+                        "SYQ_TEST_OVERLAP_READY",
+                        "SYQ_TEST_OVERLAP_CONTINUE",
+                        "local copy first block",
+                    )?;
+                }
+            }
         }
+        drop(read_ahead);
+
         if userspace_fallback {
+            let mut prepared = preparation.range(&s, 0..size);
             let mut source = &s;
             let mut destination = &d;
             source.seek(SeekFrom::Start(0))?;
@@ -5752,12 +5969,18 @@ impl FsOps {
             let mut remaining = size;
             while remaining > 0 {
                 let want = remaining.min(buffer.len() as u64) as usize;
+                let before = prepared
+                    .needs_observation()
+                    .then(crate::read_ahead::Activity::sample);
                 let n = source
                     .read(&mut buffer[..want])
                     .with_context(|| format!("read {}", source_label.display()))?;
                 if n == 0 {
                     bail!("source shortened while copying {}", source_label.display());
                 }
+                let prepare = before.is_some_and(|before| {
+                    crate::read_ahead::Activity::sample().read_wait_since(before)
+                });
                 destination
                     .write_all(&buffer[..n])
                     .with_context(|| format!("write {}", target_label.display()))?;
@@ -5766,7 +5989,6 @@ impl FsOps {
                     test_race_barrier(
                         "SYQ_TEST_COPY_LOCAL_WRITTEN_FILE",
                         "SYQ_TEST_COPY_LOCAL_CONTINUE_FILE",
-                        "SYQ_TEST_HOLD_COPY_LOCAL_WRITTEN_MS",
                         "local-copy first write",
                     )?;
                     if std::env::var_os("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE").is_some() {
@@ -5775,9 +5997,11 @@ impl FsOps {
                     }
                 }
                 remaining -= n as u64;
+                prepared.advance(size - remaining, prepare);
             }
             d.set_len(size)?;
         }
+        _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
     }
 
@@ -5791,6 +6015,9 @@ impl FsOps {
         size: u64,
         _mode: u32,
     ) -> Result<CopyLocalOutcome> {
+        let _copy = self
+            .operation
+            .span(crate::transfer_observations::Stage::FilesystemCopy);
         #[cfg(debug_assertions)]
         record_copy_local_request_for_test()?;
         if policy.inplace {
@@ -5847,7 +6074,7 @@ impl FsOps {
         let flags = put.flags;
         let inplace = put.inplace;
         let condition = put.condition;
-        if content_digest(data) != hash {
+        if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
             bail!("block hash mismatch on receive");
         }
         let staged_mode = staged_file_mode(meta, flags);
@@ -5909,7 +6136,7 @@ impl FsOps {
                         })?
                     }
                 };
-                file.write_all_at(data, 0)
+                observed_write(&self.operation, &file, data, 0)
                     .with_context(|| format!("write {}", rooted.label.display()))?;
                 set_meta_file(&file, meta, flags)
                     .with_context(|| format!("set metadata {}", rooted.label.display()))?;
@@ -5939,7 +6166,7 @@ impl FsOps {
                 let file = rooted.root.open_regular_write(&rooted.relative, false)?;
                 require_open_target(&file, &rooted.label, condition)?;
                 file.set_len(0)?;
-                file.write_all_at(data, 0)
+                observed_write(&self.operation, &file, data, 0)
                     .with_context(|| format!("write existing {}", rooted.label.display()))?;
                 file.set_len(data.len() as u64)?;
                 set_meta_file(&file, meta, flags)
@@ -5964,7 +6191,7 @@ impl FsOps {
             if basis_size.is_some() {
                 file.set_len(0)?;
             }
-            file.write_all_at(data, 0)
+            observed_write(&self.operation, &file, data, 0)
                 .with_context(|| format!("write {}", label.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", label.display()))?;
@@ -5985,7 +6212,7 @@ impl FsOps {
             let file = open_existing_regular(&p, true)?;
             require_open_target(&file, &p, condition)?;
             file.set_len(0)?;
-            file.write_all_at(data, 0)
+            observed_write(&self.operation, &file, data, 0)
                 .with_context(|| format!("write existing {}", p.display()))?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", p.display()))?;
@@ -6000,7 +6227,7 @@ impl FsOps {
         if basis_size.is_some() {
             f.set_len(0)?;
         }
-        f.write_all_at(data, 0)
+        observed_write(&self.operation, &f, data, 0)
             .with_context(|| format!("write {}", pp.display()))?;
         set_meta_file(&f, meta, flags).with_context(|| format!("set metadata {}", pp.display()))?;
         #[cfg(debug_assertions)]
@@ -6033,7 +6260,13 @@ impl FsOps {
             }
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file = open_registered_source(&source_target)?;
-                return hash_reader(&mut file, block, len);
+                return hash_reader_observed(
+                    &mut file,
+                    block,
+                    len,
+                    Some(&self.operation),
+                    self.hash_policy.algorithm,
+                );
             }
             // Only an explicitly unconfined rsync source session can reach
             // this legacy branch after source roots have been initialized.
@@ -6056,7 +6289,13 @@ impl FsOps {
             if which == Which::Partial {
                 require_safe_rooted_named_partial(&target.root, &relative, &label, &file)?;
             }
-            return hash_reader(&mut file, block, len);
+            return hash_reader_observed(
+                &mut file,
+                block,
+                len,
+                Some(&self.operation),
+                self.hash_policy.algorithm,
+            );
         }
         let p = resolve(target.path);
         let p = if which == Which::Partial {
@@ -6076,7 +6315,28 @@ impl FsOps {
         if which == Which::Partial {
             require_safe_partial(&f, &p)?;
         }
-        hash_reader(&mut f, block, len)
+        hash_reader_observed(
+            &mut f,
+            block,
+            len,
+            Some(&self.operation),
+            self.hash_policy.algorithm,
+        )
+    }
+
+    pub(crate) fn begin_source_range(&mut self, _range: std::ops::Range<u64>) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.begin_stream(_range);
+    }
+
+    pub(crate) fn shrink_source_range(&mut self, _end: u64) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.shrink_stream(_end);
+    }
+
+    pub(crate) fn end_source_range(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.read_ahead.end_stream();
     }
 
     pub fn read_range(
@@ -6087,6 +6347,7 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<Response> {
+        let operation = self.operation.clone();
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
             || std::env::var_os("SYQ_TEST_FAIL_READ_RANGE_NAME")
@@ -6097,23 +6358,49 @@ impl FsOps {
         if u64::from(len) > MAX_READ_BYTES {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
-        let target = self.source_content_target(source)?;
-        let p = resolve(path);
-        let f = if let Some((root_id, target)) = target {
-            let relative_bytes = &source
-                .expect("rooted source target requires a registered reference")
-                .relative;
-            self.cached_source_read(root_id, relative_bytes, &target, attempt)?
-        } else {
-            // This is either a pre-registration test/control operation or the
-            // explicit rsync --insecure-links compatibility path.
-            self.cached(&p, false, attempt, false)?
-        };
-        let mut data = vec![0u8; len as usize];
-        f.read_exact_at(&mut data, off)
-            .with_context(|| format!("read {} @{off}+{len}", p.display()))?;
-        let hash = content_digest(&data);
-        Ok(Response::Block { off, hash, data })
+        #[cfg(target_os = "linux")]
+        let mut preparation = std::mem::take(&mut self.read_ahead);
+        let result = (|| {
+            let target = self.source_content_target(source)?;
+            let p = resolve(path);
+            let f = if let Some((root_id, target)) = target {
+                let relative_bytes = source
+                    .expect("rooted source target requires a registered reference")
+                    .relative();
+                self.cached_source_read(root_id, relative_bytes, &target, attempt)?
+            } else {
+                // This is either a pre-registration test/control operation or the
+                // explicit rsync --insecure-links compatibility path.
+                self.cached(&p, false, attempt, false)?.file()
+            };
+            let mut data = vec![0u8; len as usize];
+            #[cfg(target_os = "linux")]
+            let read = preparation.read_exact_at(f, &mut data, off);
+            #[cfg(not(target_os = "linux"))]
+            let read = {
+                let reading = operation.span(crate::transfer_observations::Stage::SourceRead);
+                let result = f.read_exact_at(&mut data, off);
+                if result.is_ok() {
+                    reading.bytes(u64::from(len));
+                }
+                result
+            };
+            read.with_context(|| format!("read {} @{off}+{len}", p.display()))?;
+            let hash = {
+                if self.hash_policy.transfer_integrity {
+                    let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+                    self.hash_policy.payload_algorithm().hash(&data)
+                } else {
+                    [0; 32]
+                }
+            };
+            Ok(Response::Block { off, hash, data })
+        })();
+        #[cfg(target_os = "linux")]
+        {
+            self.read_ahead = preparation;
+        }
+        result
     }
 
     fn write_range(
@@ -6131,31 +6418,111 @@ impl FsOps {
         {
             bail!("test range write failure");
         }
-        if content_digest(data) != hash {
+        let operation = self.operation.clone();
+        let actual_hash = {
+            if self.hash_policy.transfer_integrity {
+                let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
+                self.hash_policy.payload_algorithm().hash(data)
+            } else {
+                [0; 32]
+            }
+        };
+        if self.hash_policy.transfer_integrity && actual_hash != hash {
             bail!("block hash mismatch on receive @{off}");
         }
-        if let Some(rooted) = self.rooted_destination_target(target.path, target.guard)? {
+        let (file, label) = if let Some(rooted) =
+            self.rooted_destination_target(target.path, target.guard)?
+        {
             let (relative, label) = if inplace {
                 (rooted.relative.clone(), rooted.label.clone())
             } else {
                 rooted_partial_target(&rooted, target.id)?
             };
             let file = self.cached_rooted(&label, &rooted.root, &relative, attempt, !inplace)?;
-            return file
-                .write_all_at(data, off)
-                .with_context(|| format!("write {} @{off}", label.display()));
-        }
-        let p = resolve(target.path);
-        let p = if inplace {
-            p
+            (file, label)
         } else {
-            self.partial_path(&p, target.id)?
+            let path = resolve(target.path);
+            let label = if inplace {
+                path
+            } else {
+                self.partial_path(&path, target.id)?
+            };
+            let file = self.cached(&label, true, attempt, !inplace)?;
+            (file, label)
         };
-        let f = self.cached(&p, true, attempt, !inplace)?;
-        f.write_all_at(data, off)
-            .with_context(|| format!("write {} @{off}", p.display()))
+        let writing = operation.span(crate::transfer_observations::Stage::DestinationWrite);
+        let result = file.write_range_at(data, off);
+        if result.is_ok() {
+            writing.bytes(data.len() as u64);
+        }
+        result.with_context(|| format!("write {} @{off}", label.display()))
     }
 
+    fn verify_expected_inode(
+        writer: &File,
+        reader: &File,
+        expected: &crate::hashing::Digest,
+    ) -> Result<()> {
+        let written = writer.metadata()?;
+        let read = reader.metadata()?;
+        if written.dev() != read.dev() || written.ino() != read.ino() {
+            bail!("destination changed before digest validation");
+        }
+        Self::verify_expected_file(reader, expected)
+    }
+
+    fn verify_expected_file(file: &File, expected: &crate::hashing::Digest) -> Result<()> {
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut hasher = expected.algorithm.hasher();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        expected
+            .verify(&hasher.finalize())
+            .context("expected file digest mismatch")
+    }
+
+    fn validate_expected_path(
+        &self,
+        path: &[u8],
+        expected: &crate::hashing::Digest,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<()> {
+        let file = if let Some(target) = self.rooted_destination_target(path, guard)? {
+            target.root.open_regular_read(&target.relative)?
+        } else {
+            open_existing_regular(&resolve(path), false)?
+        };
+        Self::verify_expected_file(&file, expected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_basis_expected(
+        &mut self,
+        path: &[u8],
+        copy_id: &CopyId,
+        meta: &Meta,
+        flags: u8,
+        condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+        expected: Option<&crate::hashing::Digest>,
+    ) -> Result<()> {
+        if let Some(expected) = expected {
+            Self::verify_expected_file(
+                &self.held_basis.as_ref().context("no retained basis")?.file,
+                expected,
+            )?;
+        }
+        self.finish_basis(path, copy_id, meta, flags, condition, guard)
+    }
+
+    #[cfg(test)]
     fn finalize(
         &mut self,
         path: &[u8],
@@ -6165,8 +6532,23 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
     ) -> Result<()> {
+        self.finalize_expected(None, path, inplace, copy_id, meta, flags, mutation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_expected(
+        &mut self,
+        expected: Option<&crate::hashing::Digest>,
+        path: &[u8],
+        inplace: bool,
+        copy_id: &CopyId,
+        meta: &Meta,
+        flags: u8,
+        mutation: TargetMutation<'_>,
+    ) -> Result<()> {
         if let Some(target) = self.rooted_destination_target(path, mutation.guard)? {
-            return self.finalize_rooted(&target, inplace, copy_id, meta, flags, mutation);
+            return self
+                .finalize_rooted(&target, inplace, copy_id, meta, flags, mutation, expected);
         }
         let TargetMutation { condition, .. } = mutation;
         let p = resolve(path);
@@ -6186,6 +6568,10 @@ impl FsOps {
             require_open_target(&f, &p, condition)?;
         } else {
             require_safe_partial(&f, &src)?;
+        }
+        if let Some(expected) = expected {
+            let reader = open_existing_regular(&src, false)?;
+            Self::verify_expected_inode(&f, &reader, expected)?;
         }
         if !inplace
             && matches!(
@@ -6232,6 +6618,7 @@ impl FsOps {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_rooted(
         &mut self,
         target: &RootedTarget,
@@ -6240,6 +6627,7 @@ impl FsOps {
         meta: &Meta,
         flags: u8,
         mutation: TargetMutation<'_>,
+        expected: Option<&crate::hashing::Digest>,
     ) -> Result<()> {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
@@ -6249,6 +6637,10 @@ impl FsOps {
                 .map(Ok)
                 .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
             require_open_target(&file, &target.label, condition)?;
+            if let Some(expected) = expected {
+                let reader = target.root.open_regular_read(&target.relative)?;
+                Self::verify_expected_inode(&file, &reader, expected)?;
+            }
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             if guarded || condition != TargetCondition::Any {
@@ -6268,6 +6660,10 @@ impl FsOps {
             .map(Ok)
             .unwrap_or_else(|| target.root.open_regular_write(&src_relative, false))?;
         require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        if let Some(expected) = expected {
+            let reader = target.root.open_regular_read(&src_relative)?;
+            Self::verify_expected_inode(&file, &reader, expected)?;
+        }
 
         if !guarded
             && matches!(
@@ -6364,7 +6760,7 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
-        let mut h = blake3::Hasher::new();
+        let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
         loop {
@@ -6377,7 +6773,7 @@ impl FsOps {
         }
         Ok(Response::FileHash {
             size,
-            hash: *h.finalize().as_bytes(),
+            hash: h.finalize(),
         })
     }
 
@@ -6391,6 +6787,9 @@ impl FsOps {
     /// Dispatch a single-response request, rewriting its paths in place.
     /// The caller must not dispatch the mapped request again.
     pub fn handle_in_place(&mut self, req: &mut Request) -> Response {
+        let _handling = self
+            .operation
+            .span(crate::transfer_observations::Stage::Handling);
         if let Err(error) = self
             .validate_source_session_request(req)
             .and_then(|()| self.validate_destination_session_request(req))
@@ -6404,6 +6803,17 @@ impl FsOps {
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
         let r: Result<Response> = match &req {
+            Request::ConfigureHashing(policy) => {
+                self.hash_policy = *policy;
+                Ok(Response::Ok)
+            }
+            Request::ValidateDigest {
+                path,
+                expected,
+                guard,
+            } => self
+                .validate_expected_path(path, expected, guard.as_ref())
+                .map(|_| Response::Ok),
             Request::ListDir {
                 directory,
                 confined_root,
@@ -6582,6 +6992,7 @@ impl FsOps {
                 .hash_and_hold(path, copy_id, *block, *len, *condition, guard.as_ref())
                 .map(|(hashes, len)| Response::HeldHashes { hashes, len }),
             Request::FinishBasis {
+                expected_digest,
                 path,
                 copy_id,
                 meta,
@@ -6589,7 +7000,15 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .finish_basis(path, copy_id, meta, *flags, *condition, guard.as_ref())
+                .finish_basis_expected(
+                    path,
+                    copy_id,
+                    meta,
+                    *flags,
+                    *condition,
+                    guard.as_ref(),
+                    expected_digest.as_ref(),
+                )
                 .map(|_| Response::Ok),
             Request::SeedBasis {
                 path,
@@ -6729,6 +7148,7 @@ impl FsOps {
                 )
                 .map(|_| Response::Ok),
             Request::Finalize {
+                expected_digest,
                 path,
                 inplace,
                 copy_id,
@@ -6737,7 +7157,8 @@ impl FsOps {
                 condition,
                 guard,
             } => self
-                .finalize(
+                .finalize_expected(
+                    expected_digest.as_ref(),
                     path,
                     *inplace,
                     copy_id,
@@ -7228,7 +7649,7 @@ fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
-fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
+pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
     if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0 {
         return Ok(());
     }
@@ -7337,6 +7758,28 @@ fn apply_owner_if_changed(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn replacement_names_preserve_existing_recovery_format() {
+        assert_eq!(recovery_name(123, 456), ".syq-swap-123-456");
+        // Literal old names stay protected; never regenerate this inventory.
+        for name in [
+            ".syq-swap-123-456",
+            ".syq-swap-0-0",
+            ".syq-swap-4294967295-18446744073709551615",
+        ] {
+            assert!(is_recovery_name(OsStr::new(name)));
+        }
+        for name in [
+            ".syq-swap-",
+            ".syq-swap-123-",
+            ".syq-swap--456",
+            ".syq-swap-123-456-extra",
+            ".syq-swap-123-x",
+        ] {
+            assert!(!is_recovery_name(OsStr::new(name)));
+        }
+    }
+
+    #[test]
     fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         use std::os::unix::fs::PermissionsExt;
         let tree = crate::test_support::tempdir().unwrap();
@@ -7368,6 +7811,210 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::{symlink, FileTypeExt};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn selected_hash_is_independent_of_payload_integrity() {
+        use crate::hashing::{HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        fs::write(&path, b"file contents").unwrap();
+        for algorithm in [
+            HashAlgorithm::Blake3,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Xxh3,
+        ] {
+            let mut operations = FsOps::new();
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: false,
+                transfer_hash_type: None,
+            });
+            let response = operations
+                .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
+                .unwrap();
+            assert!(matches!(response, Response::Block { hash, .. } if hash == [0;32]));
+            let response = operations
+                .file_hash(path.as_os_str().as_bytes(), None, None)
+                .unwrap();
+            assert!(
+                matches!(response, Response::FileHash { hash, .. } if hash == algorithm.hash(b"file contents"))
+            );
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            });
+            let response = operations
+                .read_range(path.as_os_str().as_bytes(), None, 0, 0, 13)
+                .unwrap();
+            assert!(
+                matches!(response, Response::Block { hash, .. } if hash == algorithm.hash(b"file contents"))
+            );
+        }
+    }
+
+    #[test]
+    fn payload_integrity_checks_are_explicit() {
+        use crate::hashing::{HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        let path = path.as_os_str().as_bytes();
+        let copy_id = [3; 16];
+        let mut operations = FsOps::new();
+        operations.set_hash_policy(HashPolicy::default());
+        operations
+            .prepare(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                PrepareOptions {
+                    size: 3,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap();
+        operations
+            .write_range(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                false,
+                0,
+                0,
+                [19; 32],
+                b"old",
+            )
+            .unwrap();
+        for algorithm in [
+            HashAlgorithm::Blake3,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Md5,
+            HashAlgorithm::Xxh3,
+        ] {
+            operations.set_hash_policy(HashPolicy {
+                algorithm,
+                transfer_integrity: true,
+                transfer_hash_type: None,
+            });
+            assert!(operations
+                .write_range(
+                    PartialTarget {
+                        path,
+                        id: &copy_id,
+                        guard: None
+                    },
+                    false,
+                    0,
+                    0,
+                    [19; 32],
+                    b"new"
+                )
+                .is_err());
+            operations
+                .write_range(
+                    PartialTarget {
+                        path,
+                        id: &copy_id,
+                        guard: None,
+                    },
+                    false,
+                    0,
+                    0,
+                    algorithm.hash(b"new"),
+                    b"new",
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn expected_digest_failure_preserves_existing_destination() {
+        use crate::hashing::{Digest, HashAlgorithm, HashPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target");
+        fs::write(&path, b"old").unwrap();
+        let path = path.as_os_str().as_bytes();
+        let copy_id = [7; 16];
+        let mut operations = FsOps::new();
+        operations.set_hash_policy(HashPolicy::default());
+        operations
+            .prepare(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                PrepareOptions {
+                    size: 3,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap();
+        operations
+            .write_range(
+                PartialTarget {
+                    path,
+                    id: &copy_id,
+                    guard: None,
+                },
+                false,
+                0,
+                0,
+                [0; 32],
+                b"new",
+            )
+            .unwrap();
+        let meta = Meta {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"bad");
+        assert!(operations
+            .finalize_expected(
+                Some(&expected),
+                path,
+                false,
+                &copy_id,
+                &meta,
+                0,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None
+                }
+            )
+            .is_err());
+        assert_eq!(fs::read(resolve(path)).unwrap(), b"old");
+        let expected = Digest::hash_bytes(HashAlgorithm::Md5, b"new");
+        operations
+            .finalize_expected(
+                Some(&expected),
+                path,
+                false,
+                &copy_id,
+                &meta,
+                0,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(resolve(path)).unwrap(), b"new");
+    }
 
     fn test_dir() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -9199,12 +9846,14 @@ mod tests {
         let first_inode = operations
             .cached_rooted(Path::new("same"), &first_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();
         let second_inode = operations
             .cached_rooted(Path::new("same"), &second_root, &relative, 0, false)
             .unwrap()
+            .file()
             .metadata()
             .unwrap()
             .ino();
@@ -9600,6 +10249,13 @@ mod tests {
             .unwrap();
         let before = fs::metadata(&partial).unwrap();
         let mut ops = FsOps::new();
+        // Retried bytes are compared with source block hashes, independently
+        // of the hash used to check transported payloads.
+        ops.set_hash_policy(crate::hashing::HashPolicy {
+            algorithm: crate::hashing::HashAlgorithm::Blake3,
+            transfer_integrity: true,
+            transfer_hash_type: Some(crate::hashing::HashAlgorithm::Sha256),
+        });
         let hashes = ops
             .seed_basis(&path_bytes(&target), &id, 11, MIN_HASH_BLOCK_BYTES, 1, None)
             .unwrap();
@@ -10303,7 +10959,7 @@ mod tests {
         let Response::SourceRootsRegistered(roots) = response else {
             panic!("unexpected source registration response: {response:?}")
         };
-        assert_eq!(roots[0].selection.relative, b"selected");
+        assert_eq!(roots[0].selection.relative(), b"selected");
         assert!(roots[0].expected_leaf.is_some());
         assert!(control.source_roots[&roots[0].selection.root()]
             ._leaf_object
@@ -10491,6 +11147,148 @@ mod tests {
         assert_eq!(entries[0].link.as_deref(), Some(target.as_bytes()));
     }
 
+    #[test]
+    fn metadata_parent_cache_distinguishes_opened_roots_with_same_inode() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"old").unwrap();
+        let first = Arc::new(Root::open(base).unwrap());
+        let second = Arc::new(Root::open(base).unwrap());
+        assert_eq!(first.identity(), second.identity());
+        let mut parent = None;
+        assert_eq!(
+            stat_with_parent(&first, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            3
+        );
+        // Force the held parent to differ from a fresh lookup without requiring
+        // mount privileges. The second opened root must start a new lookup even
+        // though its device/inode match: bind-mount views can differ this way too.
+        fs::rename(base.join("parent"), base.join("old-parent")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"replacement").unwrap();
+        assert_eq!(
+            stat_with_parent(&second, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            11
+        );
+        // The second root keeps its own parent pinned across sibling lookups.
+        fs::rename(base.join("parent"), base.join("second-parent")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"new").unwrap();
+        assert_eq!(
+            stat_with_parent(&second, &mut parent, b"parent/file")
+                .unwrap()
+                .size,
+            11
+        );
+    }
+
+    #[test]
+    fn metadata_chunk_pins_parent_and_new_request_resolves_replacement() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"original").unwrap();
+        symlink("original-target", base.join("parent/link")).unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut parent = None;
+        let original = stat_with_parent(&root, &mut parent, b"parent/file").unwrap();
+        fs::rename(base.join("parent"), base.join("moved")).unwrap();
+        fs::create_dir(base.join("parent")).unwrap();
+        fs::write(base.join("parent/file"), b"replacement").unwrap();
+        symlink("replacement-target", base.join("parent/link")).unwrap();
+        assert_eq!(
+            stat_with_parent(&root, &mut parent, b"parent/file")
+                .unwrap()
+                .ino,
+            original.ino
+        );
+        assert_eq!(
+            stat_with_parent(&root, &mut parent, b"parent/link")
+                .unwrap()
+                .link
+                .as_deref(),
+            Some(b"original-target".as_slice())
+        );
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(root);
+        let paths = vec![b"parent/file".to_vec(), b"parent/link".to_vec()];
+        let entries = ops.stat_many(&paths, false, None);
+        assert_ne!(entries[0].as_ref().unwrap().ino, original.ino);
+        assert_eq!(
+            entries[1].as_ref().unwrap().link.as_deref(),
+            Some(b"replacement-target".as_slice())
+        );
+        fs::remove_dir_all(base.join("parent")).unwrap();
+        symlink("moved", base.join("parent")).unwrap();
+        assert!(ops
+            .stat_many(&paths, false, None)
+            .iter()
+            .all(Option::is_none));
+    }
+
+    #[test]
+    fn metadata_chunks_keep_input_order_and_do_not_reuse_a_different_parent() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        for directory in ["a", "b"] {
+            fs::create_dir(base.join(directory)).unwrap();
+            fs::write(base.join(directory).join("file"), directory.as_bytes()).unwrap();
+        }
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut ops = FsOps::new();
+        ops.destination_root = Some(root.clone());
+        // Exercise raw filename bytes only where the filesystem accepts them.
+        let raw_path = if crate::test_support::filesystem_accepts_non_utf8_names() {
+            b"a/raw-\xff".as_slice()
+        } else {
+            b"a/raw-plain".as_slice()
+        };
+        fs::write(base.join(OsStr::from_bytes(raw_path)), b"raw").unwrap();
+        let names = [
+            b"a/file".as_slice(),
+            b"a/missing",
+            b"b/file",
+            b"absent/file",
+            b"a",
+            b"",
+            b"../a/file",
+            b"a//file",
+            b"/a",
+            b"/a/file",
+            b"/",
+            b"a/.",
+            b"a/..",
+            b"a/file/",
+            b"a\0/file",
+            b"a/f\0",
+            raw_path,
+        ];
+        let paths: Vec<_> = names
+            .iter()
+            .cycle()
+            .take(1024)
+            .map(|p| p.to_vec())
+            .collect();
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let relative = RelativePath::new(path).ok()?;
+                let metadata = root.metadata(&relative).ok()?;
+                rooted_entry(&root, &relative, Vec::new(), metadata).ok()
+            })
+            .collect();
+        let actual = ops.stat_many(&paths, false, None);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
     fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
         let observations = parallel_map(items, |&index| {
             let thread = std::thread::current();
@@ -10573,12 +11371,23 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         let (mut worker, selections, _control) =
             registered_source_worker(&[temporary.path()], false);
+        for parent in 0..4 {
+            fs::create_dir(temporary.path().join(format!("p{parent}"))).unwrap();
+        }
         for idx in 0..129 {
-            fs::write(temporary.path().join(format!("f{idx}")), vec![0; idx]).unwrap();
+            fs::write(
+                temporary.path().join(format!("p{}/f{idx}", idx % 4)),
+                vec![0; idx],
+            )
+            .unwrap();
         }
         for count in [31, 32, 65, 128, 7, 129] {
             let sources: Vec<_> = (0..count)
-                .map(|idx| selections[0].join(format!("f{idx}").as_bytes()).unwrap())
+                .map(|idx| {
+                    selections[0]
+                        .join(format!("p{}/f{idx}", idx % 4).as_bytes())
+                        .unwrap()
+                })
                 .collect();
             let response = worker.handle(&Request::StatMany {
                 paths: vec![b"/display/path/is/not/authority".to_vec(); count],
@@ -10594,6 +11403,117 @@ mod tests {
                 assert_eq!(entry.map(|e| e.size), Some(idx as u64));
             }
         }
+    }
+
+    #[test]
+    fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let roots: Vec<_> = ["first", "second"]
+            .iter()
+            .map(|name| temporary.path().join(name))
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            fs::create_dir_all(root.join("parent")).unwrap();
+            fs::write(root.join("parent/file"), vec![0; index + 1]).unwrap();
+            symlink(format!("target-{index}"), root.join("parent/link")).unwrap();
+        }
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&roots[0], &roots[1]], false);
+        // Adjacent siblings exercise reuse; identical relative parents under
+        // distinct source roots must never share the held directory. Cover
+        // both paths with misleading labels.
+        let parallel_count = 386;
+        assert!(parallel_count >= PAR_MIN);
+        for count in [parallel_count, 12] {
+            let sources: Vec<_> = (0..count)
+                .map(|index| {
+                    selections[(index / 3) % 2]
+                        .join(if count >= PAR_MIN {
+                            // Every boundary lookup must find a file, so a
+                            // cached wrong root cannot hide as None == None.
+                            b"parent/file".as_slice()
+                        } else {
+                            [b"parent/file".as_slice(), b"parent/link", b"parent/missing"]
+                                [index % 3]
+                        })
+                        .unwrap()
+                })
+                .collect();
+            if count == parallel_count {
+                let chunk = sources.len().div_ceil(PAR_THREADS).max(1);
+                let first_root_count = sources
+                    .iter()
+                    .filter(|source| source.root() == selections[0].root())
+                    .count();
+                assert_ne!(
+                    first_root_count % chunk,
+                    0,
+                    "the root boundary must fall inside a parallel chunk"
+                );
+            }
+            let paths = vec![b"/ignored/display/path".to_vec(); count];
+            let expected: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    let target = worker.registered_source_target(source).unwrap();
+                    let metadata = target.root.metadata(&target.relative).ok()?;
+                    rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
+                })
+                .collect();
+            let actual = worker
+                .stat_many_request(&paths, Some(&sources), true, None)
+                .unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "batch of {count}, item {index}"
+                );
+            }
+        }
+        let sources = vec![selections[0].join(b"parent/file").unwrap(); 64];
+        let paths = vec![b"ignored".to_vec(); sources.len()];
+        fs::rename(roots[0].join("parent"), roots[0].join("moved")).unwrap();
+        fs::create_dir(roots[0].join("parent")).unwrap();
+        fs::write(roots[0].join("parent/file"), b"replacement").unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), false, None)
+            .unwrap();
+        assert!(actual
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 11)));
+        fs::remove_dir_all(roots[0].join("parent")).unwrap();
+        symlink("moved", roots[0].join("parent")).unwrap();
+        let actual = worker
+            .stat_many_request(&paths, Some(&sources), true, None)
+            .unwrap();
+        assert!(actual.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn source_stat_grouping_reports_the_first_error_in_request_order() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let (mut worker, selections, _control) =
+            registered_source_worker(&[&first, &second], false);
+        fs::rename(&first, temporary.path().join("held-first")).unwrap();
+        fs::write(&first, b"replacement").unwrap();
+        fs::remove_file(&second).unwrap();
+        // Sorting processes the lower registered root first, but its identity
+        // failure must not mask the missing-file error requested first.
+        let sources = vec![selections[1].clone(), selections[0].clone()];
+        let error = worker
+            .stat_many_request(&vec![b"ignored".to_vec(); 2], Some(&sources), false, None)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "inspect registered source leaf");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]

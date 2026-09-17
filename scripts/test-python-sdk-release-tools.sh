@@ -8,7 +8,7 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/sdk/python/src/syq"
-cp "$repo_dir/sdk/python/README.md" "$work/sdk/python/README.md"
+cp "$repo_dir/sdk/python/README-PYTHON.md" "$work/sdk/python/README-PYTHON.md"
 cp "$repo_dir/sdk/python/pyproject.toml" "$work/sdk/python/pyproject.toml"
 cp "$repo_dir/sdk/python/src/syq/syq-release-manifest.json" \
   "$work/sdk/python/src/syq/syq-release-manifest.json"
@@ -42,7 +42,7 @@ python3 "$script_dir/prepare-python-sdk-release.py" \
 
 grep -Fx "version = \"$next_python_version\"" \
   "$work/sdk/python/pyproject.toml" >/dev/null
-cmp "$repo_dir/sdk/python/README.md" "$work/sdk/python/README.md"
+cmp "$repo_dir/sdk/python/README-PYTHON.md" "$work/sdk/python/README-PYTHON.md"
 cmp "$candidate" "$work/sdk/python/src/syq/syq-release-manifest.json"
 
 # Portable tree fingerprint: GNU coreutils on Linux, Perl shasum on macOS.
@@ -61,7 +61,7 @@ test "$before" = "$after"
 
 misaligned="$work/misaligned"
 mkdir -p "$misaligned/sdk/python/src/syq"
-cp "$repo_dir/sdk/python/README.md" "$misaligned/sdk/python/README.md"
+cp "$repo_dir/sdk/python/README-PYTHON.md" "$misaligned/sdk/python/README-PYTHON.md"
 cp "$repo_dir/sdk/python/pyproject.toml" "$misaligned/sdk/python/pyproject.toml"
 cp "$repo_dir/sdk/python/src/syq/syq-release-manifest.json" \
   "$misaligned/sdk/python/src/syq/syq-release-manifest.json"

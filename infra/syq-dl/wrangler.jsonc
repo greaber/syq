@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "syq-dl",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "routes": [{ "pattern": "dl.syq.christmas", "custom_domain": true }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "syq-dl",
+      "database_id": "8662903e-2e41-4c24-8186-d6c5fb2884e2"
+    }
+  ],
+  "vars": {
+    "GITHUB_RELEASES": "https://github.com/greaber/syq/releases",
+    "HOME_REDIRECT": "https://greaber.github.io/syq/install.html"
+  }
+}

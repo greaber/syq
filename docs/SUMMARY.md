@@ -6,6 +6,7 @@
 
 - [Install and setup](install.md)
 - [Copy files](reference.md)
+- [Copy to and from object storage](object-storage.md)
 - [Remove files](remove.md)
 - [Send files home from a server](receive.md)
 - [Run commands on your receiving machine](exec.md)
@@ -37,3 +38,4 @@
 - [Python](python.md)
   - [Guide and examples](python-guide.md)
   - [API reference](python-reference.md)
+  - [Example: DVC data](dvc.md)

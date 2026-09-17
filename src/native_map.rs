@@ -396,20 +396,11 @@ fn push_directory_children(
 
 #[cfg(debug_assertions)]
 fn hold_map_selection_for_test() -> Result<()> {
-    if let Some(ready) = std::env::var_os("SYQ_TEST_MAP_SELECTION_READY_FILE") {
-        std::fs::write(&ready, b"ready").with_context(|| {
-            format!(
-                "write map-selection-ready signal {}",
-                Path::new(&ready).display()
-            )
-        })?;
-    }
-    if let Some(ms) = std::env::var_os("SYQ_TEST_HOLD_MAP_SELECTION_MS") {
-        if let Ok(ms) = ms.to_string_lossy().parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-    Ok(())
+    crate::fsops::test_race_barrier(
+        "SYQ_TEST_MAP_SELECTION_READY_FILE",
+        "SYQ_TEST_MAP_SELECTION_CONTINUE_FILE",
+        "map selection",
+    )
 }
 
 #[cfg(not(debug_assertions))]

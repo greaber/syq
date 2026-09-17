@@ -73,7 +73,7 @@ def main():
                                [str(binary), "cp", "--srcs-in", str(source), "--into",
                                 str(destination), "--no-progress"])
                     if name == "ranges":
-                        command += ["--tuning-options=copy-path=ranges"]
+                        command += ["--performance-tuning=copy-path=ranges"]
                     started = time.perf_counter()
                     result = subprocess.run(command, env=env, capture_output=True,
                                             text=True, timeout=180)

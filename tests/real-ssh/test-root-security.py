@@ -51,19 +51,25 @@ def main():
             source.write_bytes(b"payload\0" * (1 << 20))
             os.chown(source, 1000, 1000)
             if interface == "rsync":
-                args = ["syq", "rsync", "-a", "--syq-connections", "1", "--bwlimit", "1G", str(source), str(destination)]
+                args = ["syq", "rsync", "-a", "--performance-tuning", "workers=1", "--resource-limits", "bandwidth=1G", str(source), str(destination)]
             else:
-                args = ["syq", "cp", "--connections", "1", "--tuning-options", "copy-path=ranges", str(source), "--as", str(destination)]
+                args = ["syq", "cp", "--performance-tuning", "workers=1", "--performance-tuning", "copy-path=ranges", str(source), "--as", str(destination)]
                 if interface == "native-owner":
                     args.extend(["--preserve", "ownership,permissions"])
             args.append("--no-progress")
-            process = subprocess.Popen(args, env={**os.environ, "SYQ_TEST_HOLD_PARTIAL_MS": "10000"}, start_new_session=True)
+            ready = root / f"partial-ready-{interface}"
+            continuation = root / f"partial-continue-{interface}"
+            process = subprocess.Popen(args, env={
+                **os.environ,
+                "SYQ_TEST_PARTIAL_READY_FILE": str(ready),
+                "SYQ_TEST_PARTIAL_CONTINUE_FILE": str(continuation),
+            }, start_new_session=True)
             deadline = time.monotonic() + 10
             partials = []
             try:
                 while time.monotonic() < deadline:
-                    partials = list(root.glob(".*.syq-tmp.*"))
-                    if partials:
+                    if ready.exists():
+                        partials = list(root.glob(".*.syq-tmp.*"))
                         break
                     assert process.poll() is None, "copy exited before producing a partial"
                     print(f"Waiting for {interface} partial: {partials}", flush=True)

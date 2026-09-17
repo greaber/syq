@@ -20,6 +20,7 @@ from ._defaults import CLIENT_DEFAULT, Timeout, resolve_timeout
 from ._mapping import Mapping as FileMapping, _source_options
 from ._paths import PathArgument, _map_stream_cwd
 from .managed import managed_executable
+from .bundled import bundled_executable
 from .errors import (
     SyqInvocationError,
     SyqOperationError,
@@ -30,6 +31,7 @@ from .errors import (
 from .models import (
     AutomationEvent,
     CpResult,
+    Digest,
     IgnoreFrom,
     MappingEntry,
     OperationStatus,
@@ -91,7 +93,7 @@ def run(
     if isinstance(args, (str, bytes, os.PathLike)):
         raise TypeError("args must be a sequence of individual arguments")
     executable_text = (
-        os.fspath(managed_executable())
+        os.fspath(bundled_executable())
         if executable is None
         else _text_arg(executable, label="executable")
     )
@@ -553,6 +555,20 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
     return value
 
 
+def _s3_arguments(
+    argv: list[Argument], endpoint: str | None, region: str | None,
+    profile: str | None, headers: Iterable[str] | None,
+) -> None:
+    for option, value in (("s3_endpoint", endpoint), ("s3_region", region), ("s3_profile", profile)):
+        if value is not None:
+            argv.append("--" + option.replace("_", "-") + "=" + _text_arg(value, label=option))
+    if headers is not None:
+        if isinstance(headers, (str, bytes)):
+            raise SyqInvocationError("s3_header must be an iterable of header strings")
+        for header in headers:
+            argv.append("--s3-header=" + _text_arg(header, label="s3_header"))
+
+
 def _copy_arguments(
     command: str,
     sources: tuple[PathArgument, ...],
@@ -582,8 +598,8 @@ def _copy_arguments(
     only_existing: bool,
     skip_newer: bool,
     no_compress: bool,
-    bwlimit: str | int | None,
-    connections: int | None,
+    resource_limits: str | None,
+    performance_tuning: str | None,
     receiver_max_entries: int | None,
     receiver_max_bytes: str | int | None,
     receiver_receipt: str | None,
@@ -594,6 +610,8 @@ def _copy_arguments(
     max_size: str | int | None,
     min_size: str | int | None,
     max_delete: int | None,
+    integrity_checking: str | None = None,
+    expected_digest: Digest | None = None,
 ) -> tuple[list[Argument], int, int]:
     argv: list[Argument] = [command]
     source_count = 0
@@ -663,6 +681,13 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
+    _append_text(argv, "--integrity-checking", integrity_checking)
+    if expected_digest is not None:
+        if not isinstance(expected_digest, Digest):
+            raise SyqInvocationError("expected_digest must be a Digest")
+        if source_count != 1 or contents_count or src_dir is not None:
+            raise SyqInvocationError("expected_digest requires exactly one regular-file source")
+        argv.extend(("--expected-hash", f"{expected_digest.algorithm}:{expected_digest.value}"))
     if verify_only and (dry_run or prune or inplace or only_new or only_existing or skip_newer):
         raise SyqInvocationError("verify_only conflicts with dry_run, prune, inplace, and overwrite policies")
     if only_new and (only_existing or skip_newer or inplace):
@@ -681,10 +706,8 @@ def _copy_arguments(
             argv.append(option)
     if no_compress:
         argv.append("--no-compress")
-    _append_text(argv, "--bwlimit", bwlimit)
-    connections = _positive_integer(connections, option="--connections")
-    if connections is not None:
-        argv.extend(("--connections", str(connections)))
+    _append_text(argv, "--resource-limits", resource_limits)
+    _append_text(argv, "--performance-tuning", performance_tuning)
     receiver_max_entries = _nonnegative_integer(
         receiver_max_entries, option="--receiver-max-entries"
     )
@@ -745,7 +768,7 @@ def _rm_arguments(
     follow: bool,
     follow_src: bool,
     dry_run: bool,
-    connections: int | None,
+    performance_tuning: str | None,
     syq_path: str | os.PathLike[str] | None,
     no_bootstrap: bool,
     pscope: PathArgument | None,
@@ -779,9 +802,7 @@ def _rm_arguments(
         argv.append("--follow-src")
     if dry_run:
         argv.append("--dry-run")
-    connections = _positive_integer(connections, option="--connections")
-    if connections is not None:
-        argv.extend(("--connections", str(connections)))
+    _append_text(argv, "--performance-tuning", performance_tuning)
     if on is None and (syq_path is not None or no_bootstrap):
         raise SyqInvocationError(
             "syq_path and no_bootstrap apply only to a remote removal endpoint"
@@ -909,7 +930,7 @@ class Client:
         if self._executable is not None:
             return self._executable
         if self._cache_dir is None:
-            return os.fspath(managed_executable())
+            return os.fspath(bundled_executable())
         return os.fspath(managed_executable(cache_dir=self._cache_dir))
 
     def run(
@@ -1018,13 +1039,19 @@ class Client:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        integrity_checking: str | None = None,
+        expected_digest: Digest | None = None,
         verify_only: bool = False,
         only_new: bool = False,
         only_existing: bool = False,
         skip_newer: bool = False,
         no_compress: bool = False,
-        bwlimit: str | int | None = None,
-        connections: int | None = None,
+        resource_limits: str | None = None,
+        performance_tuning: str | None = None,
+        s3_endpoint: str | None = None,
+        s3_region: str | None = None,
+        s3_profile: str | None = None,
+        s3_header: Iterable[str] | None = None,
         auth_from: str | None = None,
         via: str | None = None,
         coordinate_at: str | None = None,
@@ -1063,6 +1090,8 @@ class Client:
                 f"a remote-to-remote {'verification' if verify_only else 'dry run'} cannot produce the results "
                 "stream this surface relies on; pass coordinate_at='local'"
             )
+        if expected_digest is not None and mapping is not None:
+            raise SyqInvocationError("expected_digest with mapping belongs on each MappingEntry")
         cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
         )
@@ -1090,13 +1119,15 @@ class Client:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            integrity_checking=integrity_checking,
+            expected_digest=expected_digest,
             verify_only=verify_only,
             only_new=only_new,
             only_existing=only_existing,
             skip_newer=skip_newer,
             no_compress=no_compress,
-            bwlimit=bwlimit,
-            connections=connections,
+            resource_limits=resource_limits,
+            performance_tuning=performance_tuning,
             receiver_max_entries=receiver_max_entries,
             receiver_max_bytes=receiver_max_bytes,
             receiver_receipt=receiver_receipt,
@@ -1108,6 +1139,7 @@ class Client:
             min_size=min_size,
             max_delete=max_delete,
         )
+        _s3_arguments(argv, s3_endpoint, s3_region, s3_profile, s3_header)
         if auth_from is not None and via is not None:
             raise SyqInvocationError("auth_from conflicts with via")
         if auth_from is not None:
@@ -1198,7 +1230,7 @@ class Client:
         follow_src: bool = False,
         results: BinaryIO | None = None,
         dry_run: bool = False,
-        connections: int | None = None,
+        performance_tuning: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
         pscope: PathArgument | None = None,
@@ -1219,7 +1251,7 @@ class Client:
             follow=follow,
             follow_src=follow_src,
             dry_run=dry_run,
-            connections=connections,
+            performance_tuning=performance_tuning,
             syq_path=syq_path,
             no_bootstrap=no_bootstrap,
             pscope=pscope,
@@ -1287,8 +1319,8 @@ class Client:
             only_existing=False,
             skip_newer=False,
             no_compress=False,
-            bwlimit=None,
-            connections=None,
+            resource_limits=None,
+            performance_tuning=None,
             receiver_max_entries=None,
             receiver_max_bytes=None,
             receiver_receipt=None,

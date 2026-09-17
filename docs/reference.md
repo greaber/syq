@@ -24,19 +24,14 @@ inheritable access control entries, filesystem-compressed files, and files
 whose metadata cannot be safely removed also use normal copying. Cloned copies
 omit source extended attributes and file flags, just as normal copies do.
 
-The default final summary reports transferred files and bytes, unchanged
-files and bytes, directories created, elapsed time, rate, and any errors.
+The final summary shows what was copied or skipped, how long it took, and any
+errors. Add `-v` to list copied paths. For connection and performance details,
+see [diagnosing a slow copy](speed.md#diagnose-a-slow-copy).
 
-Add `-v` to list copied paths. `-vv` also explains helper selection and
-transport; `--stats` adds scan totals, excluded-file counts, connection count,
-and available TCP statistics. For example:
-
-```sh
-syq cp -vv --stats project --into backup
-```
-
-See [diagnosing a slow copy](speed.md#diagnose-a-slow-copy) for interpreting
-transport and performance details.
+On Linux, syq asks the kernel to read ahead in source files when reads show
+storage activity or waits. This works for local and remote copies and uses a
+small, bounded number of helper threads. Local copies can also use faster
+filesystem copy operations when available.
 
 ## See where files go
 
@@ -106,12 +101,16 @@ Enclose IPv6 addresses in brackets: `alice@[2001:db8::1]:2222`.
 A colon in a native path is simply part of the path.
 
 Use `--to @NAME` to send local source files to a registered receiving machine.
-The `@` is required: `--to laptop` always selects an SSH destination, while
-`--to @laptop` selects the receiver and fails if it is offline or its identity
-check fails. Receiver destinations do not switch to SSH when unavailable. See [Send files home from a server](receive.md)
-for setup and receiver-side path settings.
+The `@` is required: `--to laptop` selects an SSH destination, while
+`--to @laptop` requires that receiver to be connected and pass its identity check.
+See [Send files home from a server](receive.md) for setup and destination paths.
 
-For two remote endpoints, see [Copy between servers](remote-to-remote.md).
+For object storage, use `--to s3://BUCKET` or `--from s3://BUCKET` and select
+keys with the same source and placement options. See
+[Copy to and from object storage](object-storage.md) for credentials, headers,
+metadata, and tuning.
+
+For two SSH endpoints, see [Copy between servers](remote-to-remote.md).
 
 ## Progress
 
@@ -145,6 +144,10 @@ syq cp report.txt --as-new reports/final.txt
 `--into` uses or creates a directory. `--as` can rename a directory too.
 Sources that would collide at one destination are refused before copying.
 
+For a missing or empty destination, syq checks available space and, where the
+filesystem reports it, capacity for new files. It refuses a clear shortage,
+but these estimates do not guarantee that the copy will fit.
+
 ## Choose which existing files to update
 
 By default, selected destination entries are updated when needed.
@@ -176,8 +179,9 @@ The placement options `--into-existing` and `--as-existing` check only the
 placement path, rather than every copied entry.
 
 `--skip-newer` compares timestamps, not the age of the contents. It affects only
-regular-file pairs; replacing a different entry type still occurs. Combine it
-with `--only-existing` to avoid creating missing entries too.
+regular-file pairs; replacements between non-directory entry types still
+occur, but replacing a directory with a non-directory or the reverse is
+refused. Combine it with `--only-existing` to avoid creating missing entries too.
 
 `--only-new` cannot combine with either policy. Neither `--only-new` nor
 `--skip-newer` can combine with `--inplace`: an interrupted write could leave
@@ -188,20 +192,22 @@ These options do not disable `--prune`; requested pruning still removes extras.
 
 ## Preview changes
 
-`--dry-run` previews a copy without changing the destination. On its own it
-prints a summary; combine it with `-v` to list the planned changes by path:
+`--dry-run` shows planned changes without carrying out the copy or deletions.
+Add `-v` to list the changes by path:
 
 ```sh
 syq cp --dry-run -v --srcs-in project --into backup
 ```
 
 The summary shows where files would land, what would change, and how much
-data may move. Copy data stays unchanged; a requested results file is still
-written. The filesystem can change between preview and execution.
+data may move. A requested results file is still written, and remote setup may
+cache the helper or [install syq](install.md#automatic-installation-on-ssh-servers).
+The filesystem can change between preview and execution.
 
 ## Mirror a directory
 
-`--prune` removes destination files that have no counterpart in the source:
+`--prune` removes destination files that have no counterpart in the source,
+including [copies to and from S3](object-storage.md):
 
 ```sh
 syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
@@ -215,19 +221,19 @@ Pruning stays inside the copied directories. Copying named directories `a`
 and `b` into `backup` prunes `backup/a` and `backup/b`, leaving `backup/c` alone.
 Ignored paths and files skipped by size limits are protected.
 
-Scan or copy errors prevent deletion. Syq refuses to prune a destination
-that it can identify as containing its source. Checks cover local copies and
-copies between remote paths with the same host name, user, and port. They do not
-detect overlap through different SSH aliases, local-to-SSH connections, or shared
-storage across different hosts. An interruption after deletion starts can leave
-some extras removed. Do not prune
-while another copy is writing into the same tree: its completed files can be treated as extras. Recognized partial files
-and replacement recovery entries (`.syq-swap-<pid>-<number>`) are protected
-from pruning, along with their contents and parent directories. With `-v`, syq
-lists each extra file it keeps because its name matches the partial-file format.
-When a copied path resolves to a different filename spelling at the destination,
-pruning protects that entry. If hard links make the match ambiguous, it can keep
-additional links to the same file.
+Scan or copy errors prevent deletion. An interruption after deletion starts
+can leave some extras removed. Do not prune while another copy is writing into
+the same tree: its completed files can be treated as extras.
+
+Keep the source outside the destination you are pruning. Syq checks this for
+local copies and remote paths with the same host name, user, and port, but
+cannot detect overlap through different SSH aliases, local-to-SSH connections,
+or shared storage across hosts.
+
+Pruning keeps syq's partial files and `.syq-swap-...` recovery entries, including
+their contents and parent directories. Use `-v` to see files kept because their
+names match the partial-file format. If different filename spellings resolve
+to a copied file, syq protects it; this can also keep extra hard links to it.
 
 ## Ignoring paths
 
@@ -261,40 +267,20 @@ Ignored paths are also protected from pruning.
 
 ## Resume an interrupted copy
 
-Rerun the command. Completed files are skipped; partially copied files can
-reuse matching blocks. Each run writes its own fresh partial beside the
-destination and replaces the final file only when complete. When resuming,
-syq can copy bytes from a previous partial or the existing destination into its
-own output, hash the bytes it copied, and transfer blocks that differ from the
-source before publishing. The previous partial stays unchanged. Reuse is best
-effort; local direct copies can be faster than looking for reusable blocks and
-take priority.
+Rerun the command. Completed files are skipped, and syq can reuse matching
+parts of an interrupted file. It writes a new temporary file beside the
+destination and replaces the final file only when complete. Previous partials
+stay unchanged. Reuse is not guaranteed; local copies may use the filesystem's
+faster copy operations instead.
 
 Resuming requires space for the new output as well as the previous partial.
 This can require enough free space for another complete file, even when only
 a small amount remains to transfer.
 
-Syq preserves filename bytes and reports names the destination cannot create as
-copy errors. It checks exact destination and partial-file name conflicts, but
-does not preflight case or Unicode equivalence. Source names that the destination
-considers equivalent can overwrite one another; rename them before copying when
-you need to preserve both files.
-
-A directory cannot replace a file or symlink, and a file, symlink or special
-file cannot replace a directory, even an empty one. Syq reports an error and
-skips the conflicting directory's subtree. This follows cp's conservative
-behavior and applies to both `syq cp` and `syq rsync`.
-
-Replacements between non-directory entries stage the new entry before
-publication. Some guarded replacements require an atomic exchange; if the
-filesystem does not support it, the old entry is preserved and the operation
-fails. An interrupted exchange can leave the previous entry beside its
-replacement under a `.syq-swap-...` name; inspect it before removing it.
-
-Concurrent copies use separate partials. With unchanged sources, each completed
-file comes from one copy; different copies may win for different files. This
-does not make a whole tree a snapshot. `--inplace` still exposes unfinished
-updates, and pruning can delete another copy's completed files.
+Concurrent copies use separate temporary files. With unchanged sources, each
+completed file comes from one copy, but the whole tree is not a snapshot.
+[In-place writes](#in-place-writes) expose unfinished updates, and pruning can
+delete another copy's completed files.
 
 Partials are named `.FILENAME.syq-tmp.RANDOM`, with 16 random characters at the
 end. The filename portion is shortened or omitted when space is tight. Syq
@@ -309,14 +295,13 @@ and run:
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 # Search several remote trees with the parallel removal workers.
-syq clean-partials --on server --cwd /data -j 8 backup archive
+syq clean-partials --on server --cwd /data --performance-tuning workers=8 backup archive
 ```
 
 This command removes regular files with the current partial-name format. It
 keeps directories, other filenames, and symlinks, and does not follow symlinks.
-Use `--root DIR` to confine traversal and `--results FILE` for removal results.
-The results use the same `mode: "rm"` records as `syq rm`; they do not distinguish
-a partial sweep from other removal commands.
+Use `--root DIR` to confine traversal and `--results FILE` for the same
+[removal records](automation.md#removal-records) as `syq rm` (`mode: "rm"`).
 A regular file deliberately named like a partial is also selected. Old partial
 formats are neither reused nor selected by this command; remove those manually.
 
@@ -328,19 +313,40 @@ directories and their contents. An error removing a `.syq-swap-` directory leave
 the final destination unchanged and may leave a complete partial. Rerun the
 copy to finish; use `syq clean-partials` as described above to remove leftover
 partials after all copies have stopped.
+## Conflicting names and file types
+
+Some filesystems treat names that differ only in case or Unicode spelling as
+the same name. Syq does not detect these collisions before copying, so one
+source can overwrite another. Rename conflicting sources first to keep both.
+Names the destination cannot create are reported as copy errors.
+
+Both `syq cp` and `syq rsync` refuse to replace a directory with a file, symlink,
+or special file, or the reverse, even when the directory is empty. The copy
+reports an error and skips that directory's contents. Move or remove the
+conflicting destination before retrying.
+
+Other replacements can fail if the filesystem lacks the operation needed to
+replace the old entry safely; the old entry is kept. An interruption can leave
+it beside its replacement under a `.syq-swap-...` name. Inspect that entry before
+removing it; `clean-partials` does not remove recovery entries.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match, including
-fractional seconds. It preserves the source timestamp at the destination, so
-the machines' clocks do not need to agree. A changed timestamp triggers checking
-even when it is older than the destination's, unless you request `--skip-newer`.
-A destination that rounds timestamps to coarser precision can cause unchanged
-files to be checked or copied again on later runs.
+Syq normally skips files whose size and modification time match. `syq cp`
+compares whole seconds exactly and ignores as many trailing fractional digits
+as are zero in the destination timestamp. For example, destination `.120000000`
+seconds matches source `.123456789`; a whole-second destination timestamp
+ignores the source fraction entirely. This accommodates destinations that
+truncate fractional seconds. Directory metadata previews use the same fractional
+precision rule. `syq rsync` compares whole seconds only when checking file contents.
+
+Syq preserves the source timestamp at the destination, so the machines' clocks
+do not need to agree. A timestamp difference outside that precision triggers
+checking even when the source is older, unless you request `--skip-newer`.
 
 Matching metadata is a shortcut, not proof that contents match. An edit can
-preserve both size and timestamp, and some filesystems record timestamps with
-less precision. `--hash` checks contents even when those two attributes match:
+preserve both size and timestamp, and changes within the ignored fraction can
+be missed. `--hash` checks contents even when those two attributes match:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
@@ -351,9 +357,56 @@ copies, syq still compares blocks when size or modification time differs,
 even without `--hash`, so it can reuse unchanged data. Local and small copies
 may use faster paths instead.
 
-Transferred data is always checked for corruption. For files being changed by
-another program, stop the writer or copy a snapshot. No copy makes the whole
-tree transactional or guarantees durability across power loss.
+Advanced controls keep resource policy, performance choices and integrity
+checking separate:
+
+| Option | Purpose |
+|---|---|
+| `--resource-limits bandwidth=RATE` | Caps aggregate logical file-data throughput |
+| `--performance-tuning workers=N` | Fixes filesystem copy-worker slots instead of adjusting them automatically |
+| `--integrity-checking compare=HASH,transfer=HASH` | Chooses content comparison and extra payload checks independently |
+
+Each option accepts comma-separated `KEY=VALUE` pairs and can be repeated with
+different keys. Duplicate keys are errors. See [performance tuning](tuning.md)
+for the worker and S3 request controls. These tune parallelism; they do not
+bound total sockets, file descriptors, CPU or memory.
+
+Comparison defaults to `compare=size-mtime`. If those attributes are insufficient,
+use `compare=blake3`, also available as `--hash`. Other choices are `sha256`,
+`md5`, and `xxh3-128`. MD5 supports existing manifests; XXH3-128 is a fast
+noncryptographic checksum. Neither provides cryptographic collision resistance.
+`--hash` conflicts with a different explicit comparison choice.
+
+Extra payload checks default to `transfer=off`. Enable them with, for example,
+`--integrity-checking transfer=blake3`; the same four hash types are supported.
+The comparison and transfer hash types can differ. SSH and encrypted TCP retain
+their transport protection independently, and `--tcp-plain` does not enable
+payload checks automatically. Same-host copies keep their kernel-copy and
+whole-file shortcuts. Use `--expected-hash` to validate the complete local result.
+Content comparison, verification and recovery still hash data when needed.
+[S3 provider checksums](object-storage.md#metadata-and-integrity) also stay enabled.
+
+To require a particular whole-file digest, use `--expected-hash ALGORITHM:HEX`
+with one named regular file:
+
+```sh
+syq cp data.bin --as backup.bin --expected-hash md5:900150983cd24fb0d6963f7d28e17f72
+```
+
+This checks all resulting bytes, including reused data, before reporting success;
+a metadata match alone is insufficient. When size and modification time match,
+syq validates the existing destination and skips copying if its digest matches.
+Otherwise it copies and validates the result; a mismatch fails that file. With normal
+staging, validation happens before replacing the destination. With `--inplace`,
+the file has already been modified when validation finishes. Use
+[per-file mapping expectations](mappings.md#the-format) for a batch. Selection
+filters still exclude files, and excluded files are not digest-verified.
+The expected digest's algorithm can differ from either integrity-checking hash type. Dry runs
+preview changes without validating the expectation.
+
+For files being changed by another program, stop the writer or copy a snapshot.
+No copy makes the whole tree transactional or guarantees durability across
+power loss.
 
 To compare without writing, use `--verify-only`:
 

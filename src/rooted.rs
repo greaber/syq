@@ -16,7 +16,8 @@
 //! directory enumeration separately opens an independent readable descriptor.
 //!
 //! Linux uses `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` to
-//! open a validated multi-component directory path in one syscall. Kernels or
+//! resolve a validated path and open its directory or regular-file leaf in
+//! one syscall. Kernels or
 //! sandboxes without that syscall retain the same component-by-component
 //! descriptor walk used on other Unix platforms; neither path falls back to
 //! an unconfined pathname.
@@ -978,7 +979,7 @@ impl Root {
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
         let (parent, leaf) = if path.is_empty() {
             (
-                self.directory.try_clone().context("duplicate root fd")?,
+                DirectoryHandle::Borrowed(&self.directory),
                 component_cstring(b"."),
             )
         } else {
@@ -1001,20 +1002,35 @@ impl Root {
             .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
+    // The Linux syscall resolves the parent and opens the leaf under the same
+    // no-symlink restrictions, without allocating a temporary parent fd. Keep
+    // the descriptor walk for unsupported syscalls and paths it cannot handle
+    // (for example, paths longer than a single syscall accepts).
+    fn open_leaf(&self, path: &RelativePath, flags: libc::c_int, mode: u32) -> Result<File> {
+        path.leaf()?;
+        #[cfg(target_os = "linux")]
+        match open_components_openat2(&self.directory, &path.components, flags, mode) {
+            Ok(file) => return Ok(file),
+            Err(error) if expected_open_failure(&error) => return Err(error.into()),
+            Err(_) => {}
+        }
+        let parent = self.resolve_parent(path)?;
+        open_at(parent.directory.as_raw_fd(), &parent.leaf, flags, mode).map_err(Into::into)
+    }
+
     fn open_regular(
         &self,
         path: &RelativePath,
         access: libc::c_int,
         truncate: bool,
     ) -> Result<File> {
-        let parent = self.resolve_parent(path)?;
-        let file = open_at(
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
-            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-            0,
-        )
-        .with_context(|| format!("open confined regular file {}", path.label()))?;
+        let file = self
+            .open_leaf(
+                path,
+                access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+                0,
+            )
+            .with_context(|| format!("open confined regular file {}", path.label()))?;
         require_regular(&file, path)?;
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
@@ -1028,20 +1044,19 @@ impl Root {
     /// Create a new regular leaf. Existing leaves of every type are refused.
     /// Special permission bits require the explicit metadata operations.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
-        let parent = self.resolve_parent(path)?;
-        let file = open_at(
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_NOCTTY
-                | libc::O_CLOEXEC,
-            mode & 0o777,
-        )
-        .with_context(|| format!("create confined file {}", path.label()))?;
+        let file = self
+            .open_leaf(
+                path,
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_NOCTTY
+                    | libc::O_CLOEXEC,
+                mode & 0o777,
+            )
+            .with_context(|| format!("create confined file {}", path.label()))?;
         require_regular(&file, path)?;
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
@@ -1470,13 +1485,18 @@ impl Root {
                 components: components.clone(),
             };
             #[cfg(not(target_os = "macos"))]
-            let directory = self.open_directory(&candidate);
+            let directory = if candidate.is_empty() {
+                Ok(DirectoryHandle::Borrowed(&self.directory))
+            } else {
+                self.open_directory(&candidate).map(DirectoryHandle::Owned)
+            };
             #[cfg(target_os = "macos")]
             let directory = if candidate.is_empty() {
-                self.directory.try_clone().map_err(anyhow::Error::from)
+                Ok(DirectoryHandle::Borrowed(&self.directory))
             } else {
                 self.resolve_parent(&candidate).and_then(|parent| {
                     open_directory_metadata_at(&parent.directory, parent.leaf.as_bytes())
+                        .map(DirectoryHandle::Owned)
                         .map_err(anyhow::Error::from)
                 })
             };
@@ -1576,13 +1596,21 @@ impl Root {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> io::Result<()> {
-        let parent = self
-            .resolve_parent(path)
-            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        let (directory, leaf) = if path.is_empty() {
+            (
+                DirectoryHandle::Borrowed(&self.directory),
+                component_cstring(b"."),
+            )
+        } else {
+            let parent = self
+                .resolve_parent(path)
+                .map_err(|error| io::Error::other(format!("{error:#}")))?;
+            (parent.directory, parent.leaf)
+        };
         retry_zero(|| unsafe {
             libc::fchownat(
-                parent.directory.as_raw_fd(),
-                parent.leaf.as_ptr(),
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
                 uid.unwrap_or(u32::MAX),
                 gid.unwrap_or(u32::MAX),
                 libc::AT_SYMLINK_NOFOLLOW,
@@ -1593,7 +1621,7 @@ impl Root {
     pub(crate) fn set_times(&self, path: &RelativePath, times: &[libc::timespec; 2]) -> Result<()> {
         let (parent, leaf) = if path.is_empty() {
             (
-                self.directory.try_clone().context("duplicate root fd")?,
+                DirectoryHandle::Borrowed(&self.directory),
                 component_cstring(b"."),
             )
         } else {
@@ -1809,7 +1837,8 @@ impl Root {
         staged_identity: (u64, u64),
     ) -> Result<()> {
         let (staged_dev, staged_ino) = staged_identity;
-        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         retry_zero(|| unsafe {
@@ -1836,7 +1865,8 @@ impl Root {
         staged_identity: (u64, u64),
     ) -> Result<()> {
         let (staged_dev, staged_ino) = staged_identity;
-        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         retry_zero(|| unsafe {
@@ -1882,7 +1912,8 @@ impl Root {
         expected_ctime: Option<(i64, u32)>,
     ) -> Result<()> {
         let (staged_dev, staged_ino) = staged_identity;
-        let (source_parent, target_parent) = self.resolve_publish_parents(source, target)?;
+        let source_parent = self.resolve_parent(source)?;
+        let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         let before = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
@@ -1942,26 +1973,22 @@ impl Root {
             .with_context(|| format!("remove displaced confined path {}", target.label()))
     }
 
-    fn resolve_publish_parents(
-        &self,
+    fn resolve_publish_target<'a>(
+        &'a self,
         source: &RelativePath,
+        source_parent: &'a ResolvedParent<'_>,
         target: &RelativePath,
-    ) -> Result<(ResolvedParent, ResolvedParent)> {
+    ) -> Result<ResolvedParent<'a>> {
         let (source_parents, _) = source.leaf()?;
         let (target_parents, target_leaf) = target.leaf()?;
-        let source_parent = self.resolve_parent(source)?;
-        let target_parent = if source_parents == target_parents {
-            ResolvedParent {
-                directory: source_parent
-                    .directory
-                    .try_clone()
-                    .context("duplicate publication parent fd")?,
+        if source_parents == target_parents {
+            Ok(ResolvedParent {
+                directory: DirectoryHandle::Borrowed(&source_parent.directory),
                 leaf: component_cstring(target_leaf),
-            }
+            })
         } else {
-            self.resolve_parent(target)?
-        };
-        Ok((source_parent, target_parent))
+            self.resolve_parent(target)
+        }
     }
 
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
@@ -1989,10 +2016,16 @@ impl Root {
         .with_context(|| format!("{operation} confined path {}", path.label()))
     }
 
-    fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent> {
+    fn resolve_parent(&self, path: &RelativePath) -> Result<ResolvedParent<'_>> {
         let (parents, leaf) = path.leaf()?;
-        let directory = open_directory_components(&self.directory, parents)
-            .with_context(|| format!("resolve confined parent for {}", path.label()))?;
+        let directory = if parents.is_empty() {
+            DirectoryHandle::Borrowed(&self.directory)
+        } else {
+            DirectoryHandle::Owned(
+                open_directory_components(&self.directory, parents)
+                    .with_context(|| format!("resolve confined parent for {}", path.label()))?,
+            )
+        };
         Ok(ResolvedParent {
             directory,
             leaf: component_cstring(leaf),
@@ -2022,8 +2055,26 @@ impl CloneOutcome {
     }
 }
 
-struct ResolvedParent {
-    directory: File,
+// A leaf directly under the retained root needs no new descriptor. Borrowing
+// keeps that root alive for the operation; descendants still resolve afresh.
+enum DirectoryHandle<'a> {
+    Borrowed(&'a File),
+    Owned(File),
+}
+
+impl std::ops::Deref for DirectoryHandle<'_> {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        match self {
+            Self::Borrowed(file) => file,
+            Self::Owned(file) => file,
+        }
+    }
+}
+
+struct ResolvedParent<'a> {
+    directory: DirectoryHandle<'a>,
     leaf: CString,
 }
 
@@ -2563,23 +2614,26 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
 /// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
 /// permission is available. Neither changes permissions during inspection.
 /// Descendant lookups still enforce search permission and never follow links.
+#[cfg(target_os = "macos")]
 fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
-    #[cfg(target_os = "macos")]
-    {
-        match open_directory_at(parent, component) {
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
-                parent.as_raw_fd(),
-                &component_cstring(component),
-                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            ),
-            result => result,
-        }
+    match open_directory_at(parent, component) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
+            parent.as_raw_fd(),
+            &component_cstring(component),
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ),
+        result => result,
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        open_directory_at(parent, component)
-    }
+}
+
+// Missing entries and exclusive-create collisions already answer the lookup.
+// Retrying them with a descriptor walk adds allocation and close contention.
+// Preserve fallback for other errors, including unavailable syscalls, long paths,
+// and resolution races that the component walk can handle independently.
+#[cfg(target_os = "linux")]
+fn expected_open_failure(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EEXIST))
 }
 
 fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
@@ -2587,6 +2641,7 @@ fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Resul
     {
         match open_directory_components_fast(parent, components) {
             Ok(directory) => Ok(directory),
+            Err(error) if expected_open_failure(&error) => Err(error),
             Err(_) => open_directory_components_one_at_a_time(parent, components),
         }
     }
@@ -2600,8 +2655,11 @@ fn open_directory_components_one_at_a_time(
     parent: &File,
     components: &[Vec<u8>],
 ) -> io::Result<File> {
-    let mut directory = parent.try_clone()?;
-    for component in components {
+    let Some((first, remaining)) = components.split_first() else {
+        return parent.try_clone();
+    };
+    let mut directory = open_directory_at(parent, first)?;
+    for component in remaining {
         directory = open_directory_at(&directory, component)?;
     }
     Ok(directory)
@@ -2623,6 +2681,21 @@ fn open_directory_components_fast(parent: &File, components: &[Vec<u8>]) -> io::
 
 #[cfg(target_os = "linux")]
 fn open_directory_components_openat2(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+    open_components_openat2(
+        parent,
+        components,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_components_openat2(
+    parent: &File,
+    components: &[Vec<u8>],
+    flags: libc::c_int,
+    mode: u32,
+) -> io::Result<File> {
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -2645,8 +2718,8 @@ fn open_directory_components_openat2(parent: &File, components: &[Vec<u8>]) -> i
     }
     let path = CString::new(path).expect("RelativePath already rejected NUL");
     let how = OpenHow {
-        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
-        mode: 0,
+        flags: flags as u64,
+        mode: mode as u64,
         resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
     };
     loop {
@@ -2855,12 +2928,12 @@ fn unlink_at(parent: RawFd, name: &CString, flags: libc::c_int) -> io::Result<()
 }
 
 fn create_temporary(
-    parent: &ResolvedParent,
+    parent: &ResolvedParent<'_>,
     create: impl Fn(RawFd, &CString) -> io::Result<()>,
 ) -> Result<CString> {
     for _ in 0..32 {
         let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(".syq-swap-{}-{counter}", std::process::id()))
+        let name = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
             .expect("generated swap name contains no NUL");
         match create(parent.directory.as_raw_fd(), &name) {
             Ok(()) => return Ok(name),
@@ -4296,6 +4369,135 @@ mod tests {
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(fs::read(&inside).unwrap(), b"updated");
         assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn missing_entries_and_exclusive_collisions_preserve_errno_and_contents() {
+        let tree = TestDir::new("expected-open-failures");
+        let root = Root::open(tree.path()).unwrap();
+        fs::create_dir(tree.path().join("parent")).unwrap();
+        fs::write(tree.path().join("parent/existing"), b"preserve").unwrap();
+        symlink("existing", tree.path().join("parent/link")).unwrap();
+        for path in [b"parent/missing".as_slice(), b"absent/child"] {
+            for error in [
+                root.open_regular_read(&relative(path)).unwrap_err(),
+                root.open_directory(&relative(path)).unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+            }
+        }
+        for path in [b"parent/existing".as_slice(), b"parent/link", b"parent"] {
+            let error = root.create_file(&relative(path), 0o600).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EEXIST)
+            );
+        }
+        assert_eq!(
+            fs::read(tree.path().join("parent/existing")).unwrap(),
+            b"preserve"
+        );
+        assert!(fs::symlink_metadata(tree.path().join("parent/link"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    #[test]
+    fn regular_opens_walk_paths_longer_than_one_syscall_accepts() {
+        let tree = TestDir::new("long-regular-open");
+        let root = Root::open(tree.path()).unwrap();
+        let mut components = Vec::new();
+        // Create via held descriptors, so setup does not itself rely on a
+        // process pathname longer than PATH_MAX being accepted.
+        let mut directory = root.open_directory(&relative(b"")).unwrap();
+        for index in 0..24 {
+            let name = format!("{index:02}-{}", "x".repeat(197)).into_bytes();
+            let c_name = component_cstring(&name);
+            assert_eq!(
+                unsafe { libc::mkdirat(directory.as_raw_fd(), c_name.as_ptr(), 0o700) },
+                0
+            );
+            directory = open_directory_at(&directory, &name).unwrap();
+            components.push(name);
+        }
+        components.push(b"file".to_vec());
+        let path = RelativePath { components };
+        let mut file = root.create_file(&path, 0o600).unwrap();
+        file.write_all(b"long path").unwrap();
+        drop(file);
+        let mut file = root.open_regular_read(&path).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"long path");
+        root.unlink(&path).unwrap();
+    }
+
+    #[test]
+    fn regular_opens_refuse_special_leaves_and_preserve_open_flags() {
+        let tree = TestDir::new("regular-open-flags");
+        fs::create_dir(tree.path().join("nested")).unwrap();
+        fs::write(tree.path().join("nested/file"), b"contents").unwrap();
+        symlink("file", tree.path().join("nested/link")).unwrap();
+        let fifo = CString::new(tree.path().join("nested/fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let root = Root::open(tree.path()).unwrap();
+        for path in [b"nested".as_slice(), b"nested/link", b"nested/fifo"] {
+            assert!(root.open_regular_read(&relative(path)).is_err());
+            assert!(root.open_regular_write(&relative(path), true).is_err());
+            assert!(root.create_file(&relative(path), 0o600).is_err());
+        }
+        assert_eq!(
+            fs::read(tree.path().join("nested/file")).unwrap(),
+            b"contents"
+        );
+        let file = root
+            .open_regular_write(&relative(b"nested/file"), true)
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(descriptor_flags, -1);
+        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn publication_parent_stays_pinned_when_its_name_is_replaced() {
+        let tree = TestDir::new("borrowed-publication-parent");
+        fs::create_dir(tree.path().join("gate")).unwrap();
+        let root = Root::open(tree.path()).unwrap();
+        let source = relative(b"gate/partial");
+        let target = relative(b"gate/final");
+        let file = root.create_file(&source, 0o600).unwrap();
+        let source_parent = root.resolve_parent(&source).unwrap();
+        fs::rename(tree.path().join("gate"), tree.path().join("moved")).unwrap();
+        fs::create_dir(tree.path().join("gate")).unwrap();
+        fs::write(tree.path().join("gate/final"), b"replacement").unwrap();
+        let target_parent = root
+            .resolve_publish_target(&source, &source_parent, &target)
+            .unwrap();
+        assert_eq!(
+            target_parent.directory.metadata().unwrap().ino(),
+            source_parent.directory.metadata().unwrap().ino()
+        );
+        assert!(metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf).is_err());
+        assert_eq!(
+            metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)
+                .unwrap()
+                .ino,
+            file.metadata().unwrap().ino()
+        );
+        assert_eq!(
+            fs::read(tree.path().join("gate/final")).unwrap(),
+            b"replacement"
+        );
+        // A later independent operation resolves the replacement afresh.
+        assert_eq!(root.metadata(&target).unwrap().len, 11);
     }
 
     #[test]

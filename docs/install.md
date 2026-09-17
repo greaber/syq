@@ -5,18 +5,40 @@ Syq runs on Linux and macOS, on x86-64 and ARM64.
 ## Standalone installer
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/greaber/syq/releases/latest/download/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh
 ```
 
 Installs into `~/.local/bin` without `sudo`. Make sure that directory is on your
 `PATH`. To choose another directory, download the script and run
 `sh install.sh --bin-dir DIR`.
 
+## Automatic installation on SSH servers
+
+When an official syq release installs its helper on an SSH server, it also
+tries to install the same version at `~/.local/bin/syq` for use on that server.
+Existing files and symlinks there are left alone; shell startup files are
+never edited. Syq reports installation or failure unless `--quiet` is set.
+Shell completion and background connections can also trigger installation,
+without printing a notice. Failure to install this command does not stop the
+transfer.
+
+Use `syq --self-update` on the server to update this command. To reinstall a
+removed command, run the standalone installer above on the server.
+
+Reusing a cached helper does not repeat this installation step. Development
+builds and connections using `--syq-path` or `--no-bootstrap` do not install
+the command.
+
 ## Homebrew
 
 ```sh
 brew install greaber/tap/syq
 ```
+
+## Build from source
+
+See [source builds](development.md) for Cargo builds, custom compilation options,
+and choosing between your own executable and compatible official SSH helpers.
 
 ## Try a benchmark
 
@@ -26,12 +48,10 @@ Compare syq with rsync on your own machines, or with rsync and cp locally:
 curl --proto '=https' --tlsv1.2 -fLsS https://raw.githubusercontent.com/greaber/syq/master/scripts/try-benchmark.sh | bash
 ```
 
-The default sends 1,024 small throwaway files to an SSH host you choose and
-compares syq with rsync over three rounds, following an untimed tuning warm-up
-(`--warmup off` skips it). Local copies, large files, and
-automatic sizing are optional. The script checks the copied contents and cleans up afterward.
+Choose an SSH host to compare syq with rsync, or a local copy to include cp.
+The script creates test data, checks the copied contents, and cleans up afterward.
 If syq is missing, it offers to install it. See [quick comparison](speed.md#quick-comparison)
-to download the script and run it again.
+for workload sizes, warm-up time, and command-line options.
 
 <figure class="benchmark-example">
 <table>
@@ -53,8 +73,20 @@ which provides more extensive benchmarks. Your results will depend on your machi
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
 for Homebrew.
 
-Standalone installs print an update reminder; nothing updates automatically.
-Set `SYQ_NO_UPDATE_CHECK=1` to disable reminders.
+Standalone and Homebrew installs may print an update reminder in a terminal,
+at most once a day after a successful command, naming the upgrade command for
+that install. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
+`DO_NOT_TRACK=1` to disable reminders.
+
+Downloads and the daily reminder check go through `dl.syq.christmas`, a host
+run by the maintainer that serves the GitHub release files from a cache. It
+records each request's time, syq version, platform, the connection's IP
+address, and the country, region, and city derived from that address, so the
+project can see how many installs exist and which versions are in use.
+Nothing identifies an install, and the check sends nothing else.
+Non-interactive use never makes the reminder check. Every download is
+verified against the signed release manifest, so the host cannot substitute
+files.
 
 ## Shell completion
 

@@ -26,8 +26,8 @@ expect_failure() {
   }
 }
 
-# Scope pull requests to affected Linux checks; broader cross-subsystem,
-# architecture, and platform checks remain cumulative after merge.
+# Select affected checks; native changes keep broader cross-subsystem,
+# architecture, and platform coverage after merge.
 assert_scope() {
   local output=$1 key=$2 expected=$3
   grep -Fx "$key=$expected" <<<"$output" >/dev/null
@@ -39,10 +39,27 @@ scope_keys=(
 )
 
 paths="$work/paths"
-printf 'README.md\n' >"$paths"
-scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
-for key in "${scope_keys[@]}"; do
-  assert_scope "$scope" "$key" false
+for path in \
+  README.md \
+  sdk/README.md sdk/RELEASING.md \
+  sdk/python/README-PYTHON.md sdk/python/NATIVE_API.md sdk/python/API_DESIGN.md \
+  sdk/js/README.md sdk/go/README.md \
+  book.toml theme/head.hbs theme/docs.css theme/copy-demo.js \
+  .agents/skills/syq-release/SKILL.md \
+  .agents/skills/syq-release/agents/openai.yaml
+do
+  printf '%s\n' "$path" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  for key in "${scope_keys[@]}"; do
+    assert_scope "$scope" "$key" false
+  done
+done
+# Documentation exceptions must not hide SDK fixtures, build metadata, or
+# the API specification consumed by the native CLI.
+for path in sdk/python/tests/example.md sdk/python/pyproject.toml; do
+  printf '%s\n' "$path" >"$paths"
+  scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
+  assert_scope "$scope" python_sdk true
 done
 printf 'docs/mappings.md\n' >"$paths"
 scope=$(SYQ_TEST_CHANGED_PATHS_FILE="$paths" "$script_dir/ci-scope.sh")
@@ -75,6 +92,8 @@ assert_scope "$scope" python_sdk true
 for sdk_script in \
   scripts/check-python-api-sync.py \
   scripts/normalize-python-sdist.py \
+  scripts/check-python-wheel.py \
+  scripts/stage-python-sdk.py \
   scripts/prepare-python-sdk-release.py \
   scripts/run-generated-sdk-post-merge-ci.sh \
   scripts/select-trusted-pr.jq \
@@ -218,12 +237,75 @@ assert_scope "$scope" macos true
 assert_scope "$scope" linux_arm64 true
 assert_scope "$scope" full_suite true
 
+# Exercise the real macOS classification step, rather than duplicating its
+# selection logic here. Missing/renamed step boundaries fail this check.
+# shellcheck disable=SC2016 # Match literal shell expressions in the workflow.
+macos_step=$(sed -n '/^          scope=$(scripts\/ci-scope.sh/,/^          echo "needed=$needed" >> "$GITHUB_OUTPUT"/p' \
+  "$script_dir/../.github/workflows/macos.yml")
+[ -n "$macos_step" ]
+assert_macos_needed() {
+  local expected=$1
+  shift
+  printf '%s\n' "$@" >"$paths"
+  : >"$work/macos-output"
+  (cd "$script_dir/.." && \
+    SYQ_TEST_CHANGED_PATHS_FILE="$paths" GITHUB_EVENT_PATH="$push_event" \
+    GITHUB_OUTPUT="$work/macos-output" bash -euo pipefail -c "$macos_step")
+  assert_scope "$(cat "$work/macos-output")" needed "$expected"
+}
+assert_macos_needed false docs/mappings.md sdk/python/NATIVE_API.md
+assert_macos_needed false theme/docs.js book.toml
+assert_macos_needed false tests/real-ssh/scenarios.sh docs/example.sh
+assert_macos_needed true docs/mappings.md src/main.rs
+assert_macos_needed true sdk/python/native-api.json
+assert_macos_needed true sdk/python/src/syq/client.py
+assert_macos_needed true scripts/test-installer.sh
+assert_macos_needed true .github/workflows/macos.yml
+assert_macos_needed true unknown-input
+
+# Reproduce a documentation-only post-merge push, including the SDK guide and
+# executable mapping examples. Only the focused example checks are selected.
+git -C "$scope_repo" switch -qc documentation-push "$advanced_base"
+mkdir -p "$scope_repo/docs" "$scope_repo/theme"
+printf 'mapping examples\n' >"$scope_repo/docs/mappings.md"
+printf 'API guide\n' >"$scope_repo/sdk/python/NATIVE_API.md"
+printf 'body {}\n' >"$scope_repo/theme/docs.css"
+git -C "$scope_repo" add .
+git -C "$scope_repo" commit -qm documentation-push
+documentation_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg before "$advanced_base" --arg after "$documentation_head" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+for key in "${scope_keys[@]}"; do
+  case "$key" in
+    mapping_docs|full_suite) assert_scope "$scope" "$key" true ;;
+    *) assert_scope "$scope" "$key" false ;;
+  esac
+done
+
+# Both sides of a rename remain visible even when the destination is one of
+# the explicitly excluded SDK documents.
+git -C "$scope_repo" switch -qc sdk-doc-rename "$advanced_base"
+git -C "$scope_repo" mv sdk/python/mapping sdk/python/NATIVE_API.md
+git -C "$scope_repo" commit -qm sdk-doc-rename
+sdk_rename_head=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg before "$advanced_base" --arg after "$sdk_rename_head" \
+  '{before:$before,after:$after}' >"$push_event"
+scope=$(cd "$scope_repo" && "$script_dir/ci-scope.sh" "$push_event")
+assert_scope "$scope" python_sdk true
+
 printf '{}\n' >"$work/workflow-dispatch-event.json"
 scope=$(cd "$scope_repo" && \
   "$script_dir/ci-scope.sh" "$work/workflow-dispatch-event.json")
 for key in "${scope_keys[@]}"; do
   assert_scope "$scope" "$key" true
 done
+# A manual release-validation run must still start the complete macOS suite.
+: >"$work/macos-output"
+(cd "$script_dir/.." && \
+  GITHUB_EVENT_PATH="$work/workflow-dispatch-event.json" \
+  GITHUB_OUTPUT="$work/macos-output" bash -euo pipefail -c "$macos_step")
+assert_scope "$(cat "$work/macos-output")" needed true
 
 # Generated Python SDK validation passes an exact checked-out commit, retaining
 # normal path selection instead of treating its workflow dispatch as a manual
@@ -246,92 +328,17 @@ expect_failure 'is not checked out' env \
   SYQ_CI_SCOPE_COMMIT=0123456789abcdef0123456789abcdef01234567 \
   bash -c "cd '$scope_repo' && '$script_dir/ci-scope.sh' '$work/workflow-dispatch-event.json'"
 
-# The generated SDK follow-up dispatches CI on a branch pinned to the exact
-# merge commit, binds the returned run to that commit, and requires its SDK job.
-post_merge_bin="$work/post-merge-bin"
-mkdir "$post_merge_bin"
-post_merge_sha=0123456789abcdef0123456789abcdef01234567
-cat >"$post_merge_bin/gh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-case "$1:$2" in
-  api:*)
-    case " $* " in
-      *'/git/ref/heads/automation/python-sdk-v0.1.9 '*)
-        jq -cn --arg sha "${SYQ_TEST_REF_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{object:{sha:$sha}}'
-        ;;
-      *'/actions/workflows/ci.yml/dispatches '*)
-        case " $* " in
-          *" inputs[scope_commit]=$SYQ_TEST_MERGE_SHA "*) ;;
-          *) echo "scoped dispatch omitted merge commit: $*" >&2; exit 2 ;;
-        esac
-        printf '{"workflow_run_id":501}\n'
-        ;;
-      *'/actions/workflows/ci.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:501,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/workflows/rsync-compat.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:502,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/workflows/macos.yml/runs?'*)
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          '{workflow_runs:[{id:503,event:"workflow_dispatch",head_sha:$sha,created_at:"2026-01-01T00:00:00Z"}]}'
-        ;;
-      *'/actions/runs/501/jobs?per_page=100 '*)
-        jq -cn --arg conclusion "${SYQ_TEST_SDK_CONCLUSION:-success}" \
-          '{jobs:[{name:"sdks",status:"completed",conclusion:$conclusion}]}'
-        ;;
-      *'/actions/runs/'*)
-        run_id=${2##*/}
-        jq -cn --arg sha "${SYQ_TEST_RUN_SHA:-$SYQ_TEST_MERGE_SHA}" \
-          --argjson id "$run_id" \
-          '{id:$id,event:"workflow_dispatch",head_sha:$sha,status:"queued",conclusion:null}'
-        ;;
-      *) echo "unexpected fake gh api invocation: $*" >&2; exit 2 ;;
-    esac
-    ;;
-  run:watch)
-    [ "${SYQ_TEST_WATCH_RESULT:-success}" = success ]
-    ;;
-  *) echo "unexpected fake gh invocation: $*" >&2; exit 2 ;;
-esac
-EOF
-chmod 755 "$post_merge_bin/gh"
-SYQ_TEST_MERGE_SHA="$post_merge_sha" PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha" \
-  >"$work/post-merge.out"
-grep -F "Post-merge Python SDK validation passed for $post_merge_sha" \
-  "$work/post-merge.out" >/dev/null
-expect_failure 'does not point to expected merge commit' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
-  SYQ_TEST_REF_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml dispatch did not create' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" \
-  SYQ_TEST_RUN_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  SYQ_POST_MERGE_POLL_ATTEMPTS=1 \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
-expect_failure 'ci.yml run 501 sdks job is completed/failure' env \
-  SYQ_TEST_MERGE_SHA="$post_merge_sha" SYQ_TEST_SDK_CONCLUSION=failure \
-  PATH="$post_merge_bin:$PATH" \
-  "$script_dir/run-generated-sdk-post-merge-ci.sh" \
-  greaber/syq automation/python-sdk-v0.1.9 "$post_merge_sha"
+# Exercise dispatch identity, stale ref recovery, and exact-commit SDK gating.
+"$script_dir/test-generated-sdk-post-merge-ci.sh"
 
 # Build a clean disposable canonical checkout and serve every GitHub/registry
 # response from fixtures. The preflight must not create a tag or publication.
 preflight_repo="$work/preflight-repo"
 preflight_bin="$work/preflight-bin"
 mkdir -p "$preflight_repo/.github/release-notes" "$preflight_repo/.github/workflows" "$preflight_repo/scripts" \
-  "$preflight_repo/sdk/python" "$preflight_bin"
+  "$preflight_repo/sdk/python" "$preflight_repo/src" "$preflight_bin"
 cp "$script_dir/check-python-api-sync.py" "$preflight_repo/scripts/"
+printf '%s\n' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' >"$preflight_repo/src/release-public-key.txt"
 cat >"$preflight_repo/sdk/python/native-api.json" <<'EOF'
 {"schema":1,"commands":{}}
 EOF
@@ -395,7 +402,7 @@ fi
 case "$1:$2" in
   repo:view) printf 'greaber/syq\n' ;;
   secret:list) printf '[{"name":"SYQ_RELEASE_SIGNING_KEY_PEM_B64"},{"name":"HOMEBREW_TAP_DEPLOY_KEY"}]\n' ;;
-  variable:list) printf '[{"name":"SYQ_RELEASE_PUBLIC_KEY","value":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]\n' ;;
+  variable:list) jq -n --arg key "${SYQ_TEST_PUBLIC_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}" '[{name:"SYQ_RELEASE_PUBLIC_KEY",value:$key}]' ;;
   api:user) printf 'greaber\n' ;;
   api:*)
     case " $* " in
@@ -441,6 +448,14 @@ preflight_env=(
 (cd "$preflight_repo" && env "${preflight_env[@]}" \
   "$script_dir/release-preflight.sh" v9.9.9) >"$work/preflight.out"
 grep -F "Release preflight passed for v9.9.9 at $preflight_head" "$work/preflight.out" >/dev/null
+# Rotating the repository key must also update the embedded source-build key.
+if (cd "$preflight_repo" && env "${preflight_env[@]}" \
+  SYQ_TEST_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB= \
+  "$script_dir/release-preflight.sh" v9.9.9) >"$work/key-drift.out" 2>&1; then
+  echo 'preflight unexpectedly accepted a stale source-build verification key' >&2
+  exit 1
+fi
+grep -F 'SYQ_RELEASE_PUBLIC_KEY differs from src/release-public-key.txt' "$work/key-drift.out" >/dev/null
 # Exercise preflight with allowlist options whose quoted whitespace changes
 # awk field positions. Keep the repository's real allowlist untouched.
 option_scripts="$work/tag-option-scripts"

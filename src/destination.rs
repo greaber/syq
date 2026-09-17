@@ -1633,6 +1633,9 @@ mod tests {
 
     #[test]
     fn partial_writes_do_not_renew_the_exchange_deadline() {
+        // Encode before starting the short socket deadline.
+        let mut message = Vec::new();
+        write_message(&mut message, &"x".repeat(MAX_MESSAGE / 2)).unwrap();
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         socket2::SockRef::from(&writer)
             .set_send_buffer_size(1024)
@@ -1640,14 +1643,13 @@ mod tests {
         reader
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        let (stop, stopped) = mpsc::channel();
         let peer = std::thread::spawn(move || {
             let end = Instant::now() + Duration::from_secs(2);
             let mut received = 0;
             let mut bytes = [0; 1024];
             while Instant::now() < end {
                 match reader.read(&mut bytes) {
-                    Ok(0) => break,
+                    Ok(0) => return received,
                     Ok(count) => received += count,
                     Err(error)
                         if matches!(
@@ -1656,24 +1658,22 @@ mod tests {
                         ) => {}
                     Err(error) => panic!("{error}"),
                 }
-                if stopped.recv_timeout(Duration::from_millis(30)).is_ok() {
-                    break;
-                }
+                std::thread::sleep(Duration::from_millis(30));
             }
-            received
+            panic!("peer did not reach EOF after receiving {received} bytes");
         });
         let start = Instant::now();
-        let result = write_message(
-            &mut DeadlineSocket {
-                socket: &mut writer,
-                deadline: start + Duration::from_millis(150),
-            },
-            &"x".repeat(MAX_MESSAGE / 2),
-        );
+        let result = DeadlineSocket {
+            socket: &mut writer,
+            deadline: start + Duration::from_millis(150),
+        }
+        .write_all(&message);
         let elapsed = start.elapsed();
-        let _ = stop.send(());
+        // Let the peer drain bytes already accepted by the socket. Stopping
+        // it immediately can report zero payload progress when it is delayed.
+        drop(writer);
         let received = peer.join().unwrap();
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(received > 4, "peer made no payload progress");
         assert!(
             elapsed < Duration::from_millis(500),

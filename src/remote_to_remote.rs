@@ -921,8 +921,28 @@ fn run_remote(
     if !args.compress {
         remote.push("--no-compress".into());
     }
-    if args.checksum {
-        remote.push("--hash".into());
+    remote.push(format!(
+        "--integrity-checking=compare={},transfer={}",
+        if args.checksum {
+            args.hash_algorithm.to_string()
+        } else {
+            "size-mtime".into()
+        },
+        if args.transfer_integrity {
+            args.transfer_hash_type.unwrap_or_default().to_string()
+        } else {
+            "off".into()
+        }
+    ));
+    let mut limits = args.resource_limits.clone().unwrap_or_default();
+    // The rsync-compatible --bwlimit also lowers to the native coordinator group.
+    limits.bandwidth = args.bwlimit.clone();
+    if limits.bandwidth.is_some() {
+        remote.push(format!("--resource-limits={limits}"));
+    }
+
+    if let Some(expected) = &args.expected_digest {
+        remote.push(format!("--expected-hash={expected}"));
     }
     for (enabled, option) in [
         (args.verify_only, "--verify-only"),
@@ -962,10 +982,6 @@ fn run_remote(
     if args.devices {
         remote.push("--preserve=specials".into());
     }
-    if let Some(j) = args.connections_opt {
-        remote.push("-j".into());
-        remote.push(j.to_string());
-    }
     if let Some(maximum) = &args.max_size {
         remote.push(format!("--max-size={maximum}"));
     }
@@ -973,10 +989,7 @@ fn run_remote(
         remote.push(format!("--min-size={minimum}"));
     }
     if let Some(tuning) = args.tuning_options {
-        remote.push(format!("--tuning-options={tuning}"));
-    }
-    if let Some(rate) = &args.bwlimit {
-        remote.push(format!("--bwlimit={rate}"));
+        remote.push(format!("--performance-tuning={tuning}"));
     }
     if args.stats {
         remote.push("--stats".into());

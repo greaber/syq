@@ -141,7 +141,7 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
     command
         .arg("-e")
         .arg(rsh)
-        .args(["--syq-no-bootstrap", "--syq-connections", "1"])
+        .args(["--syq-no-bootstrap", "--performance-tuning", "workers=1"])
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -157,15 +157,26 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
 
 #[cfg(debug_assertions)]
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !marker.exists() && std::time::Instant::now() < deadline {
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(5);
+    let mut next_progress = started + std::time::Duration::from_secs(1);
+    loop {
+        let status = child.try_wait().unwrap();
+        assert!(status.is_none(), "syq exited before {stage}: {status:?}");
+        if marker.exists() {
+            return;
+        }
         assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before {stage}"
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {stage}: marker {} absent, syq still running",
+            marker.display()
         );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for {stage}: {}", marker.display());
+            next_progress += std::time::Duration::from_secs(1);
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(marker.exists(), "timed out waiting for {stage}");
 }
 
 #[cfg(debug_assertions)]
@@ -219,8 +230,8 @@ fn source_fd_budget_handles_deep_tree_with_96_slots() {
     let mut command = compat_command();
     command.args([
         "-a",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         "--no-progress",
         &t.s("source/"),
         &t.s("destination/"),
@@ -243,7 +254,7 @@ fn source_fd_budget_handles_ten_exact_sources_with_128_slots() {
     }
 
     let mut command = compat_command();
-    command.args(["-a", "--syq-connections", "1", "--no-progress"]);
+    command.args(["-a", "--performance-tuning", "workers=1", "--no-progress"]);
     command.args(&sources);
     command.arg(t.s("destination/"));
     command.env("SYQ_DEBUG", "1");
@@ -266,8 +277,8 @@ fn source_fd_preflight_rejects_shared_worker_boundary_before_destination_creatio
     let mut command = compat_command();
     command.args([
         "-a",
-        "--syq-connections",
-        "64",
+        "--performance-tuning",
+        "workers=64",
         "--no-progress",
         &t.s("source"),
         &t.s("destination"),
@@ -530,7 +541,7 @@ fn confinement_matrix_remote_destination_parent_swap_is_confined_for_tcp_and_ssh
         let destination = format!("127.0.0.1:{}/", t.s("dst"));
 
         let mut child = confinement_remote_command(&t, tcp)
-            .args(["-a", "--bwlimit", "1G"])
+            .args(["-a", "--resource-limits", "bandwidth=1G"])
             .arg(t.s("src/"))
             .arg(&destination)
             .arg("--no-progress")
@@ -598,40 +609,31 @@ fn source_scan_uses_registered_root_after_operator_path_replacement() {
         write(&t.path("src/original"), b"original");
         write(&t.path("outside/replacement"), b"replacement");
         let ready = t.path("source-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args(insecure.then_some("--insecure-links"))
             .args([
                 "-anv",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
             ])
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -656,38 +658,32 @@ fn self_copy_guard_does_not_reject_a_destination_outside_the_moved_source() {
     let t = Tmp::new();
     write(&t.path("src/original"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
     let source = format!("{}/", t.s("src"));
     let destination = format!("{}/", t.s("src/out"));
 
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &source,
             &destination,
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
 
     fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
     fs::create_dir(t.path("src")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert_output_ok(&output);
     assert_eq!(read(&t.path("src/out/original")), b"original");
@@ -699,38 +695,32 @@ fn self_copy_guard_rejects_a_destination_inside_the_moved_source() {
     let t = Tmp::new();
     write(&t.path("src/original"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
     let source = format!("{}/", t.s("src"));
     let destination = format!("{}/", t.s("selected-and-moved/out"));
 
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &source,
             &destination,
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the source root"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
 
     fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
     fs::create_dir(t.path("src")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -747,6 +737,7 @@ fn exact_regular_source_replacement_is_rejected_after_registration() {
     let t = Tmp::new();
     write(&t.path("selected"), b"original");
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -758,24 +749,17 @@ fn exact_regular_source_replacement_is_rejected_after_registration() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the exact regular source"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     write(&t.path("selected"), b"replacement");
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -794,6 +778,7 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
     write(&t.path("target-b"), b"b");
     std::os::unix::fs::symlink("target-a", t.path("selected")).unwrap();
     let ready = t.path("source-ready");
+    let continuation = t.path("continue");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
@@ -805,24 +790,17 @@ fn exact_symlink_source_replacement_is_rejected_after_registration() {
             "--no-progress",
         ])
         .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-        .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before registering the exact symlink source"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "source registration timed out");
+    wait_for_confinement_marker(&mut child, &ready, "source roots");
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     std::os::unix::fs::symlink("target-b", t.path("selected")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "unexpected success: {output:?}");
     assert!(
@@ -844,13 +822,14 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
         write(&t.path("outside/small"), b"replaced");
         write(&t.path("outside/large"), &vec![b'r'; 5 << 20]);
         let ready = t.path("source-content-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args(insecure.then_some("--insecure-links"))
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
@@ -862,28 +841,18 @@ fn source_small_and_range_reads_use_registered_root_after_path_replacement() {
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_COPY_LOCAL_SOURCE_NFS", "1")
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(tuning_observed(&output)["local_whole_files"], 0);
@@ -910,18 +879,19 @@ fn copy_local_uses_registered_source_after_path_replacement() {
         write(&t.path("src/other"), &vec![b'o'; 5 << 20]);
         write(&t.path("outside/file"), &vec![b'r'; original.len()]);
         let ready = t.path("source-capability-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
             ])
             .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_SOURCE_ROOTS_MS", "750")
+            .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
             // A pathname fallback would read through the replacement below. A
             // streaming fallback fails instead of hiding that CopyLocal was not
             // exercised.
@@ -933,22 +903,12 @@ fn copy_local_uses_registered_source_after_path_replacement() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before registering the source root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "source root was not registered before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "source roots");
 
         fs::rename(t.path("src"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("src")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst/file")), original);
@@ -968,18 +928,19 @@ fn copy_local_refuses_a_replaced_destination_parent() {
         fs::create_dir_all(t.path("dst/tree")).unwrap();
         write(&t.path("outside/sentinel"), b"unchanged");
         let ready = t.path("copy-local-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
                 "-a",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
             ])
             .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+            .env("SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(userspace.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
@@ -987,19 +948,12 @@ fn copy_local_refuses_a_replaced_destination_parent() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the local-copy destination open"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "local copy did not reach the test hook");
+        wait_for_confinement_marker(&mut child, &ready, "copy local");
 
         fs::rename(t.path("dst/tree"), t.path("dst/tree-original")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/tree")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success(), "unexpected success: {output:?}");
         assert_eq!(read(&t.path("outside/sentinel")), b"unchanged");
@@ -1020,19 +974,20 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
         set_mtime(&t.path("src/file"), 1_700_000_000);
         set_mtime(&t.path("dst/file"), 1_600_000_000);
         let ready = t.path("copy-local-ready");
+        let continuation = t.path("continue");
 
         let mut child = compat_command()
             .args([
                 "-a",
                 "--inplace",
-                "--syq-connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 &t.s("src/"),
                 &t.s("dst/"),
                 "--no-progress",
             ])
             .env("SYQ_TEST_COPY_LOCAL_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_COPY_LOCAL_MS", "750")
+            .env("SYQ_TEST_COPY_LOCAL_OPEN_CONTINUE_FILE", &continuation)
             .env("SYQ_TEST_FAIL_READ_RANGE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1041,19 +996,12 @@ fn inplace_copy_local_replaces_a_raced_destination_symlink() {
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the local-copy destination open"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready.exists(), "local copy did not reach the test hook");
+        wait_for_confinement_marker(&mut child, &ready, "copy local");
 
         fs::remove_file(t.path("dst/file")).unwrap();
         std::os::unix::fs::symlink("../outside", t.path("dst/file")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("outside")), b"unchanged");
@@ -1174,11 +1122,12 @@ fn start_held_control_path(
     command: &mut Command,
     selected: &Path,
     ready: &Path,
+    continuation: &Path,
 ) -> std::process::Child {
     command
         .env("SYQ_TEST_CONTROL_PATH", selected)
         .env("SYQ_TEST_CONTROL_PATH_READY_FILE", ready)
-        .env("SYQ_TEST_HOLD_CONTROL_PATH_MS", "2000")
+        .env("SYQ_TEST_CONTROL_PATH_CONTINUE_FILE", continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
@@ -1187,18 +1136,7 @@ fn start_held_control_path(
 
 #[cfg(debug_assertions)]
 fn wait_for_control_path_selection(child: &mut std::process::Child, ready: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq exited before retaining the selected control path"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        ready.exists(),
-        "control path was not retained before timeout"
-    );
+    wait_for_confinement_marker(child, ready, "control-path selection");
 }
 
 #[cfg(debug_assertions)]
@@ -1901,8 +1839,8 @@ fn native_copy_accepts_copy_only_operational_controls() {
             &t.s("src/file"),
             "--as-new",
             &t.s("copied"),
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-compress",
             "--stats",
             "--no-progress",
@@ -1922,11 +1860,11 @@ fn native_copy_accepts_copy_only_operational_controls() {
         &t.s("src/file"),
         "--as-new",
         &t.s("invalid"),
-        "--bwlimit",
-        "fast",
+        "--resource-limits",
+        "bandwidth=fast",
     ]);
     assert_eq!(invalid.status.code(), Some(2));
-    assert!(stderr_of(&invalid).contains("bad --bwlimit"));
+    assert!(stderr_of(&invalid).contains("bad bandwidth"));
     assert!(!t.path("invalid").exists());
 }
 
@@ -2158,7 +2096,12 @@ fn native_remote_destination_socket_policy_uses_handshake_capability() {
             .args(["cp", "--rsh"])
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-            .args(["--no-tcp", "-j", "1", "--preserve=specials"])
+            .args([
+                "--no-tcp",
+                "--performance-tuning",
+                "workers=1",
+                "--preserve=specials",
+            ])
             .args(["--srcs-in", &t.s("src"), "--to", "fake", "--into"])
             .arg(t.path(destination))
             .arg("--no-progress")
@@ -2659,6 +2602,7 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
         write(&outside, control_contents.as_bytes());
         let destination = t.path("dst");
         let ready = t.path("control-ready");
+        let continuation = t.path("control-continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         match family {
             "native-ignore" => {
@@ -2699,12 +2643,13 @@ fn control_input_replacement_symlinks_cannot_redirect_reads() {
             }
             _ => unreachable!(),
         }
-        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
         wait_for_control_path_selection(&mut child, &ready);
 
         fs::rename(&selected, t.path("original-control")).unwrap();
         symlink(&outside, &selected).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = wait_for_control_path_output(child);
         assert!(
             !output.status.success(),
@@ -2731,6 +2676,7 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
     write(&selected, b"# no exclusions\n");
     let destination = t.path("dst");
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--ignore-from"])
@@ -2740,12 +2686,13 @@ fn regular_control_input_raced_to_fifo_fails_without_blocking() {
         .arg("--into")
         .arg(&destination)
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     fs::rename(&selected, t.path("original-control")).unwrap();
     mkfifo(&selected);
 
+    release_confinement_barrier(&continuation);
     let output = wait_for_control_path_output(child);
     assert!(!output.status.success());
     assert!(
@@ -2767,6 +2714,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
     mkfifo(&selected);
     let destination = t.path("dst");
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--ignore-from"])
@@ -2776,7 +2724,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
         .arg("--into")
         .arg(&destination)
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     let original = t.path("original-control");
@@ -2791,6 +2739,7 @@ fn selected_fifo_replacement_reads_the_retained_fifo() {
         writer_tx.send(result).unwrap();
     });
 
+    release_confinement_barrier(&continuation);
     let output = wait_for_control_path_output(child);
     let used_retained_fifo = match writer_rx.recv_timeout(std::time::Duration::from_secs(2)) {
         Ok(result) => {
@@ -2901,6 +2850,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
         }
         let destination = t.path("dst");
         let ready = t.path("control-ready");
+        let continuation = t.path("control-continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args(["cp", "--results"])
@@ -2909,7 +2859,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
             .arg("--as")
             .arg(&destination)
             .arg("-q");
-        let mut child = start_held_control_path(&mut command, &selected, &ready);
+        let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
         wait_for_control_path_selection(&mut child, &ready);
 
         if initially_exists {
@@ -2917,6 +2867,7 @@ fn results_replacement_symlinks_cannot_redirect_creation_or_truncation() {
         }
         symlink(&outside, &selected).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert!(
             !output.status.success(),
@@ -2993,6 +2944,7 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
     let selected = t.path("results-link");
     symlink("intended-results", &selected).unwrap();
     let ready = t.path("control-ready");
+    let continuation = t.path("control-continue");
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
         .args(["cp", "--follow", "--results"])
@@ -3001,12 +2953,13 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
         .arg("--as")
         .arg(t.path("dst"))
         .arg("-q");
-    let mut child = start_held_control_path(&mut command, &selected, &ready);
+    let mut child = start_held_control_path(&mut command, &selected, &ready, &continuation);
     wait_for_control_path_selection(&mut child, &ready);
 
     fs::remove_file(&selected).unwrap();
     symlink(t.path("outside-results"), &selected).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert_output_ok(&output);
     assert_eq!(read(&t.path("outside-results")), b"do not replace");
@@ -3650,27 +3603,50 @@ fn interrupted_partial(args: &[&str], dir: &Path) -> PathBuf {
 
 #[cfg(debug_assertions)]
 fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> PathBuf {
+    let barrier = tempfile::tempdir().unwrap();
+    let ready = barrier.path().join("ready");
+    let continuation = barrier.path().join("continue");
     let mut command = compat_command();
     command
         .args(args)
         .arg("--no-progress")
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "10000");
+        .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+        .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
+        .process_group(0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     let mut child = command.start().unwrap();
-    let partial = (0..300).find_map(|_| {
-        let mut partials = partial_files(dir);
-        if partials.len() == 1 {
-            partials.pop()
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            None
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
         }
-    });
-    let _ = child.kill();
-    let _ = child.wait();
-    partial.expect("copy never created its job-scoped partial")
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for partial preparation in {}", dir.display());
+            next_progress += std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // A helper may own the blocked preparation. Stop the whole isolated group
+    // so no writer can continue changing the partial after this fixture returns.
+    let stopped_early = child.try_wait().unwrap();
+    let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let kill_error = std::io::Error::last_os_error();
+    child.wait().unwrap();
+    assert!(
+        killed == 0 || kill_error.raw_os_error() == Some(libc::ESRCH),
+        "stop partial-copy process group: {kill_error}"
+    );
+    assert!(
+        stopped_early.is_none(),
+        "copy exited before interruption: {stopped_early:?}"
+    );
+    assert!(ready.exists(), "copy never reached partial preparation");
+    let mut partials = partial_files(dir);
+    assert_eq!(partials.len(), 1, "expected one prepared partial");
+    partials.pop().unwrap()
 }
 
 /// Keeps executable fixtures from being written while a child is forked.
@@ -3865,13 +3841,15 @@ exec /bin/sh -c "$1"
 }
 
 fn remote_syq_command(t: &Tmp, rsh: &Path, args: &[&str]) -> Command {
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    fs::set_permissions(t.path("remote-home"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut cmd = compat_command();
     cmd.args([
         "-e",
         rsh.to_str().unwrap(),
         "--syq-no-tcp",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
     ])
     .args(args)
     .arg("--no-progress")
@@ -4067,9 +4045,175 @@ fn add_remote_tool(t: &Tmp, name: &str) {
 }
 
 #[test]
+fn background_bootstrap_installs_the_command_quietly() {
+    use base64::Engine;
+
+    for completion in [true, false] {
+        for upload in [false, true] {
+            let t = Tmp::new();
+            fs::create_dir(t.runtime()).unwrap();
+            write(&t.path("remote-home/data/name"), b"remote");
+            setup_release_bootstrap(&t);
+            if upload {
+                executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+            }
+            let ssh = fake_ssh(&t);
+            // Stop after bootstrap for the return service: its receiver protocol
+            // is unrelated to whether setup publishes an interactive command.
+            let script = fs::read_to_string(&ssh).unwrap().replace(
+                "exec /bin/sh -c",
+                "case \"$1\" in *--return-receiver*) exit 0 ;; esac\nexec /bin/sh -c",
+            );
+            executable(&ssh, script.as_bytes());
+            let path = t.s("remote-home/data/n");
+            let mut command = if completion {
+                completion_command(
+                    &t,
+                    &[
+                        "__complete",
+                        "bash",
+                        "4",
+                        "--",
+                        "syq",
+                        "cp",
+                        "--from",
+                        "fake.example",
+                        &path,
+                    ],
+                )
+            } else {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command
+                    .arg("--return-connect-install")
+                    .arg(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake.example"));
+                command
+            };
+            let output = command
+                .env("HOME", t.path("home"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .env("XDG_RUNTIME_DIR", t.runtime())
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("release.gz"))
+                .env(
+                    "FAKE_REMOTE_RELEASE_MANIFEST",
+                    t.path("release-manifest.json"),
+                )
+                .env("FAKE_CURL_LOG", t.path("curl.log"))
+                .env("SYQ_COMPLETION_DEBUG", "1")
+                .env("SYQ_TEST_RELEASE_BUILD", "1")
+                .env(
+                    "SYQ_TEST_RELEASE_PUBLIC_KEY",
+                    fs::read_to_string(t.path("release-public-key"))
+                        .unwrap()
+                        .trim(),
+                )
+                .env(
+                    "SYQ_TEST_RELEASE_DOWNLOADS",
+                    "https://release.invalid/download",
+                )
+                .env("SYQ_TEST_FIXTURES", &t.0)
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            if completion {
+                assert_eq!(
+                    completion_values(&output.stdout),
+                    vec![(
+                        b'f',
+                        t.path("remote-home/data/name")
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec()
+                    )],
+                    "completion={completion}, upload={upload}: {output:?}"
+                );
+            }
+            assert!(
+                cached_remote_helper(&t).is_file(),
+                "completion={completion}, upload={upload}: {output:?}"
+            );
+            assert_eq!(
+                read(&t.path("remote-home/.local/bin/syq")),
+                read(&cached_remote_helper(&t))
+            );
+            assert!(t.path("remote-home/.local/bin/.syq-install.json").is_file());
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            assert!(log.contains("--install-remote-command"), "{log}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("installed syq"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("syq-remote-install-notice:"));
+        }
+    }
+}
+
+#[test]
+fn bootstrap_disconnect_relays_install_notices_without_wire_tags() {
+    for (upload, quiet) in [(false, false), (true, false), (false, true), (true, true)] {
+        let t = Tmp::new();
+        setup_release_bootstrap(&t);
+        if upload {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        let rsh = fake_rsh(&t);
+        let script = fs::read_to_string(&rsh).unwrap().replace(
+            "exec /bin/sh -c \"$1\"",
+            r#"case "$1" in
+    *--install-remote-command*)
+        /bin/sh -c "$1"
+        status=$?
+        [ "$status" -eq 0 ] || exit "$status"
+        echo 'SSH connection closed after bootstrap' >&2
+        exit 255
+        ;;
+esac
+exec /bin/sh -c "$1""#,
+        );
+        executable(&rsh, script.as_bytes());
+        write(&t.path("src"), b"payload");
+        let remote = format!("fake:{}", t.s("dst"));
+        let mut command = remote_syq_command(&t, &rsh, &[&t.s("src"), &remote]);
+        if quiet {
+            command.arg("--quiet");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(cached_remote_helper(&t).is_file(), "{output:?}");
+        assert!(t.path("remote-home/.local/bin/syq").is_file(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("SSH connection closed after bootstrap"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("255"), "{stderr}");
+        assert!(!stderr.contains("syq-remote-install-notice:"), "{stderr}");
+        assert_eq!(
+            stderr.contains("syq: fake: installed syq"),
+            !quiet,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn managed_remote_helper_install_is_cached() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap();
+    executable(
+        &rsh,
+        script
+            .replace(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nprintf 'unrelated SSH banner' >&2\n",
+            )
+            .as_bytes(),
+    );
     setup_release_bootstrap(&t);
 
     write(&t.path("src"), b"first");
@@ -4078,6 +4222,26 @@ fn managed_remote_helper_install_is_cached() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"first");
     assert!(cached_remote_helper(&t).is_file());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("syq: fake: unrelated SSH banner"));
+    for line in stderr
+        .lines()
+        .filter(|line| line.contains("installed syq") || line.contains("on your shell PATH"))
+    {
+        assert!(
+            line.starts_with("syq: fake: "),
+            "missing host label: {line}"
+        );
+    }
+    let installed = t.path("remote-home/.local/bin/syq");
+    assert_eq!(read(&installed), read(&cached_remote_helper(&t)));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("installed syq"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ensure ~/.local/bin is on your shell PATH")
+    );
+    // Updating the interactive command must leave the helper usable.
+    write(&installed, b"user-managed replacement");
+
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -4111,6 +4275,39 @@ fn managed_remote_helper_install_is_cached() {
         .matches("syq-helper-target:")
         .count();
     assert_eq!(probes, 1, "cache hit should not probe the platform again");
+
+    // The command's receipt does not suppress recovery of a missing helper.
+    let receipt = installed.with_file_name(".syq-install.json");
+    let saved_receipt = read(&receipt);
+    fs::remove_file(&installed).unwrap();
+    fs::remove_file(cached_remote_helper(&t)).unwrap();
+    write(&t.path("src"), b"third");
+    let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"third");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert!(
+        !installed.exists(),
+        "preserve a deliberately removed command"
+    );
+    assert_eq!(read(&receipt), saved_receipt);
+}
+
+#[test]
+fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    write(&t.path("remote-home/.local"), b"not a directory");
+    write(&t.path("src"), b"copy succeeds");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"copy succeeds");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not install ~/.local/bin/syq"));
 }
 
 #[test]
@@ -4135,6 +4332,10 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"integrity fallback");
     assert_eq!(
+        read(&t.path("remote-home/.local/bin/syq")),
+        read(&cached_remote_helper(&t))
+    );
+    assert_eq!(
         read(&cached_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
@@ -4143,6 +4344,10 @@ fn remote_helper_integrity_mismatch_warns_and_uploads_verified_binary() {
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("installed syq"),
+        "quiet hides optional installation notices"
+    );
     assert!(
         stderr.contains("remote helper download failed integrity verification"),
         "{stderr}"
@@ -4265,6 +4470,13 @@ fn remote_manifest_signature_failure_warns_and_uses_local_verified_release() {
 fn failed_remote_download_falls_back_to_verified_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
+    let script = fs::read_to_string(&rsh).unwrap();
+    executable(
+        &rsh,
+        script
+            .replace("#!/bin/sh\n", "#!/bin/sh\numask 027\n")
+            .as_bytes(),
+    );
     setup_release_bootstrap(&t);
     executable(
         &t.path("remote-bin/curl"),
@@ -4280,6 +4492,17 @@ exit 22
 
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"download fallback");
+    for directory in ["remote-home/.local", "remote-home/.local/bin"] {
+        assert_eq!(
+            fs::metadata(t.path(directory)).unwrap().mode() & 0o777,
+            0o750
+        );
+    }
+    assert_eq!(
+        fs::metadata(cached_remote_helper(&t)).unwrap().mode() & 0o777,
+        0o700
+    );
+
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("remote download unavailable"), "{stderr}");
     assert!(
@@ -4467,6 +4690,7 @@ fn development_build_uploads_itself_and_reuses_cached_helper() {
         read(&cached_remote_helper(&t)),
         read(Path::new(env!("CARGO_BIN_EXE_syq")))
     );
+    assert!(!t.path("remote-home/.local/bin/syq").exists());
     assert!(!t.path("curl.log").exists());
     assert!(!cached_local_helper(&t).exists());
 
@@ -4479,6 +4703,54 @@ fn development_build_uploads_itself_and_reuses_cached_helper() {
         "cache hit probed: {log}"
     );
     assert!(!log.contains(".upload"), "cache hit uploaded: {log}");
+}
+
+#[test]
+fn source_build_can_download_helpers_without_installing_a_command() {
+    for upload in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        setup_release_bootstrap(&t);
+        if upload {
+            executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        }
+        write(&t.path("src"), b"source client with release helpers");
+        let remote = format!("fake:{}", t.s("dst"));
+        let out = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+            .env("SYQ_TEST_RELEASE_BUILD", "0")
+            .env("SYQ_TEST_RELEASE_HELPERS", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        assert!(cached_remote_helper(&t).exists());
+        assert!(!t.path("remote-home/.local/bin/syq").exists());
+        if upload {
+            // Falling back must download a verified release locally, not send
+            // the source executable merely because it is the same platform.
+            assert!(cached_local_helper(&t).exists());
+        } else {
+            assert!(!read(&t.path("curl.log")).is_empty());
+        }
+    }
+}
+
+#[test]
+fn development_build_attempts_upload_for_an_unlisted_platform() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    executable(
+        &t.path("remote-bin/uname"),
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+    );
+    write(&t.path("src"), b"custom target");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+    assert!(!t.path("remote-home/.local/bin/syq").exists());
+    let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+    assert_output_ok(&out);
 }
 
 #[test]
@@ -4513,7 +4785,11 @@ fn development_build_rejects_cross_platform_upload() {
 fn development_build_does_not_install_an_unrunnable_upload() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Model a host on which the uploaded binary cannot execute.
+    // Model an unlisted host on which the uploaded binary cannot execute.
+    executable(
+        &t.path("remote-bin/uname"),
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+    );
     executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
     write(&t.path("src"), b"must not copy");
     let remote = format!("fake:{}", t.s("dst"));
@@ -4524,8 +4800,14 @@ fn development_build_does_not_install_an_unrunnable_upload() {
         stderr.contains("uploaded helper cannot run on this host"),
         "{stderr}"
     );
+    assert!(stderr.contains("Linux riscv64"), "{stderr}");
     assert!(!t.path("dst").exists());
-    let helper = cached_remote_helper(&t);
+    let helper = cached_remote_helper(&t)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("self/syq");
     assert!(!helper.exists());
     assert_eq!(fs::read_dir(helper.parent().unwrap()).unwrap().count(), 0);
 }
@@ -4802,7 +5084,13 @@ fn single_verbose_keeps_file_listing_semantics() {
         .arg(&rsh)
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--syq-no-tcp", "-v", "-a", "--syq-connections", "1"])
+        .args([
+            "--syq-no-tcp",
+            "-v",
+            "-a",
+            "--performance-tuning",
+            "workers=1",
+        ])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -4909,8 +5197,8 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
             "--syq-tcp-plain",
             "--inplace",
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -4965,7 +5253,7 @@ fn automatic_ssh_starts_only_workers_that_can_help_the_file() {
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path(label));
         if fixed {
-            command.args(["--syq-connections", "8"]);
+            command.args(["--performance-tuning", "workers=8"]);
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
@@ -5060,7 +5348,7 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     let out = compat_command()
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
-        .args(["--syq-no-tcp", "-a", "--syq-connections", "1"])
+        .args(["--syq-no-tcp", "-a", "--performance-tuning", "workers=1"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -5112,8 +5400,8 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
             "--syq-tcp-congestion=reno",
             "--stats",
             "-avv",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5158,8 +5446,8 @@ fn rejected_tcp_congestion_override_is_fatal_instead_of_falling_back() {
         .args([
             "--syq-tcp-congestion=syq_missing_cc",
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5206,8 +5494,8 @@ fn ordinary_tcp_setup_failure_still_falls_back_with_congestion_notice() {
             "--syq-tcp-congestion=reno",
             &format!("--syq-tcp-ports={port}-{port}"),
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
         ])
         .arg(t.s("src"))
         .arg(&remote)
@@ -5242,7 +5530,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         .unwrap()
         .as_bytes(),
     );
-    let run = |destination: &str, fixed: Option<usize>| {
+    let run = |destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
             .arg("-e")
@@ -5250,8 +5538,11 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
             .arg("--rsync-path")
             .arg(env!("CARGO_BIN_EXE_syq"))
             .args(["--syq-no-tcp", "--stats", "-avv"]);
+        if limited {
+            command.arg("--resource-limits=bandwidth=1M");
+        }
         if let Some(fixed) = fixed {
-            command.args(["--syq-connections", &fixed.to_string()]);
+            command.args(["--performance-tuning", &format!("workers={fixed}")]);
         }
         command
             .arg(t.s("src"))
@@ -5266,7 +5557,7 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
     };
     write(&t.path("src"), b"remembered start");
 
-    let automatic = run("auto", None);
+    let automatic = run("auto", None, false);
     assert_output_ok(&automatic);
     assert!(
         String::from_utf8_lossy(&automatic.stderr)
@@ -5281,7 +5572,17 @@ fn remembered_path_count_seeds_auto_tuning_but_fixed_count_does_not_rewrite_it()
         String::from_utf8_lossy(&automatic.stdout)
     );
 
-    let fixed = run("fixed", Some(3));
+    let limited = run("limited", None, true);
+    assert_output_ok(&limited);
+    assert!(
+        String::from_utf8_lossy(&limited.stderr)
+            .contains("starting with 1 connections remembered for this path"),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    assert_eq!(read(&t.path("limited")), read(&t.path("src")));
+
+    let fixed = run("fixed", Some(3), true);
     assert_output_ok(&fixed);
     let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
     assert_eq!(cached["paths"]["local>fake|ssh"], 1);
@@ -5363,7 +5664,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
             "-a",
             "--syq-no-bootstrap",
             "--block-size=64K",
-            "--bwlimit=4M",
+            "--resource-limits=bandwidth=4M",
             "--stats",
             &t.s("src/"),
             &remote,
@@ -5739,7 +6040,15 @@ fn resume_from_partial() {
     fs::create_dir_all(t.path("dst")).unwrap();
     let src = t.s("src/big.bin");
     let dst = t.s("dst/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     // Fake an interrupted transfer: first half present, rest preallocated.
     let partial = interrupted_partial(&args, &t.path("dst"));
     {
@@ -5767,10 +6076,26 @@ fn checksum_toggle_accepts_prior_partial_candidates() {
     set_mtime(&t.path("src"), 1_600_000_000);
     let src = t.s("src");
     let dst = t.s("dst");
-    let initial = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let initial = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&initial, &t.0);
 
-    run_ok(&["-ac", "--block-size", "1M", "--bwlimit", "1G", &src, &dst]);
+    run_ok(&[
+        "-ac",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ]);
 
     assert_eq!(read(&t.path("dst")), data);
     assert!(
@@ -5808,6 +6133,458 @@ fn checksum_repairs_silent_corruption() {
         "only one block should be resent: {out}"
     );
     assert_same_tree(&t.path("src"), &t.path("dst"));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn hash_policy_verify_only_expected_mismatch_exits() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--verify-only",
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--results",
+            &t.s("results.ndjson"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    let output = wait_for_control_path_output(child);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("expected md5 hash"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read(&t.path("destination")), b"abc");
+    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+    let terminal: serde_json::Value =
+        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["status"], "partial");
+}
+
+#[test]
+fn hash_policy_independent_compare_and_payload_hashes_cross_transports() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(5 * 1024 * 1024 + 13, 999);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for path in ["ranges", "streaming"] {
+            let destination = format!("destination-{tcp}-{path}");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                &t.s("source"),
+                "--to",
+                "fake",
+                "--as",
+                &t.s(&destination),
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--performance-tuning",
+                &format!("workers=2,copy-path={path}"),
+                "--integrity-checking=compare=xxh3-128,transfer=sha256",
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--no-progress",
+            ]);
+            if !tcp {
+                command.arg("--no-tcp");
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            assert!(read(&t.path(&destination)) == data);
+        }
+    }
+}
+
+#[test]
+fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
+    let t = Tmp::new();
+    // Three default 4 MiB hash blocks; only the last block differs.
+    let contents = prng(12 << 20, 1000);
+    write(&t.path("source"), &contents);
+    for (compare, transfer) in [("blake3", "sha256"), ("xxh3-128", "blake3")] {
+        let results = t.s(&format!("results-{compare}-{transfer}.ndjson"));
+        let mut previous = contents.clone();
+        *previous.last_mut().unwrap() ^= 1;
+        write(&t.path("destination"), &previous);
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--performance-tuning=workers=1,copy-path=ranges",
+            &format!("--integrity-checking=compare={compare},transfer={transfer}"),
+            "--results",
+            &results,
+        ]);
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("destination")), contents);
+        let records = fs::read_to_string(results).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(summary["bytes_transferred"], 4 << 20, "{summary}");
+        assert_eq!(summary["bytes_unchanged"], 8 << 20, "{summary}");
+    }
+}
+
+#[test]
+fn hash_policy_expected_match_skips_copy_and_repairs_corruption() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"abc");
+    write(&t.path("destination"), b"abc");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(t.path("destination"), fs::Permissions::from_mode(0o600)).unwrap();
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    let copy = |results: &str| {
+        let output = native_syq(&[
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--preserve=permissions",
+            "--expected-hash",
+            "md5:900150983cd24fb0d6963f7d28e17f72",
+            "--results",
+            &t.s(results),
+        ]);
+        assert_output_ok(&output);
+        let records = fs::read_to_string(t.path(results)).unwrap();
+        serde_json::from_str::<serde_json::Value>(records.lines().last().unwrap()).unwrap()
+    };
+    let summary = copy("match.jsonl");
+    assert_eq!(summary["files_unchanged"], 1);
+    assert_eq!(summary["bytes_transferred"], 0);
+    let metadata = fs::metadata(t.path("destination")).unwrap();
+    assert_eq!(metadata.ino(), inode, "matching destination was replaced");
+    assert_eq!(metadata.mode() & 0o777, 0o640);
+    // Equal size and mtime must not hide differing bytes.
+    write(&t.path("destination"), b"bad");
+    set_mtime(&t.path("destination"), 1_700_000_000);
+    let summary = copy("repair.jsonl");
+    assert_eq!(summary["bytes_transferred"], 3);
+    assert_eq!(read(&t.path("destination")), b"abc");
+    // --hash must still compare source contents even when the expectation
+    // matches the destination and metadata agrees.
+    write(&t.path("source"), b"bad");
+    set_mtime(&t.path("source"), 1_700_000_000);
+    let output = native_syq(&[
+        "cp",
+        "--hash",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        "md5:900150983cd24fb0d6963f7d28e17f72",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("destination")), b"abc");
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn hash_policy_integrity_preserves_local_copy_and_expected_validation() {
+    let t = Tmp::new();
+    let contents = prng(5 << 20, 993);
+    write(&t.path("source"), &contents);
+    let correct = format!("blake3:{}", blake3::hash(&contents).to_hex());
+    let wrong = format!("blake3:{}", "0".repeat(64));
+    for (name, expected, succeeds) in [
+        ("plain", None, true),
+        ("expected", Some(correct.as_str()), true),
+        ("mismatch", Some(wrong.as_str()), false),
+    ] {
+        write(&t.path(name), b"previous contents");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s(name),
+            "--integrity-checking=transfer=xxh3-128",
+        ]);
+        if let Some(expected) = expected {
+            command.args(["--expected-hash", expected]);
+        }
+        let output = command
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+            .run()
+            .unwrap();
+        if succeeds {
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path(name)), contents);
+            let observed = tuning_observed(&output);
+            assert_eq!(observed["local_whole_files"], 1);
+            assert_eq!(observed["range_requests"], 0);
+        } else {
+            assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+            assert!(
+                stderr_of(&output).contains("expected blake3 hash"),
+                "{}",
+                stderr_of(&output)
+            );
+            assert_eq!(read(&t.path(name)), b"previous contents");
+        }
+    }
+}
+
+#[test]
+fn hash_policy_expected_mismatch_preserves_destination() {
+    for size in [3, 5 * 1024 * 1024] {
+        let t = Tmp::new();
+        write(&t.path("source"), &vec![b'n'; size]);
+        write(&t.path("destination"), b"previous contents");
+        let output = native_syq(&[
+            "cp",
+            "--src",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--expected-hash",
+            "md5:00000000000000000000000000000000",
+            "--results",
+            &t.s("results.ndjson"),
+        ]);
+        assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("expected"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(read(&t.path("destination")), b"previous contents");
+        let results = fs::read_to_string(t.path("results.ndjson")).unwrap();
+        assert_automation_stream(
+            &automation_validator(),
+            &results,
+            "expected digest mismatch",
+        );
+        let failed: serde_json::Value = results
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "operation_result" && record["disposition"] == "failed"
+            })
+            .unwrap();
+        assert_eq!(
+            failed["expected_digest"],
+            serde_json::json!({"algorithm": "md5", "value": "0".repeat(32)})
+        );
+    }
+}
+
+#[test]
+fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
+    let validator = automation_validator();
+    let mut record = serde_json::json!({
+        "schema": "syq.automation", "schema_version": 1, "seq": 1,
+        "type": "operation_result", "action": "transfer_file", "kind": "file",
+        "dst": {"encoding": "utf-8", "value": "file"}, "disposition": "failed",
+    });
+    assert!(
+        validator.is_valid(&record),
+        "old records need no expectation"
+    );
+    for (algorithm, length) in [
+        ("blake3", 64),
+        ("sha256", 64),
+        ("md5", 32),
+        ("xxh3-128", 32),
+    ] {
+        record["expected_digest"] =
+            serde_json::json!({"algorithm": algorithm, "value": "a".repeat(length)});
+        assert!(validator.is_valid(&record), "{record}");
+        record["expected_digest"]["value"] = "a".repeat(if length == 64 { 32 } else { 64 }).into();
+        assert!(!validator.is_valid(&record), "{record}");
+        record["expected_digest"]["value"] = "g".repeat(length).into();
+        assert!(!validator.is_valid(&record), "{record}");
+    }
+    record["expected_digest"] =
+        serde_json::json!({"algorithm": "rolling", "value": "a".repeat(32)});
+    assert!(!validator.is_valid(&record));
+}
+
+#[test]
+fn hash_policy_expected_empty_file_is_checked_before_publication() {
+    let t = Tmp::new();
+    write(&t.path("empty"), b"");
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("empty"),
+        "--as",
+        &t.s("good"),
+        "--expected-hash",
+        "md5:d41d8cd98f00b204e9800998ecf8427e",
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--integrity-checking=transfer=blake3",
+    ]);
+    assert_eq!(read(&t.path("good")), b"");
+    let output = native_syq(&[
+        "cp",
+        "--src",
+        &t.s("empty"),
+        "--as",
+        &t.s("bad"),
+        "--expected-hash",
+        "md5:00000000000000000000000000000000",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        !t.path("bad").exists(),
+        "a mismatching empty file must not be published"
+    );
+}
+
+#[test]
+fn hash_policy_inplace_mismatch_reports_changed_contents() {
+    let t = Tmp::new();
+    let contents = prng(5 * 1024 * 1024, 991);
+    write(&t.path("source"), &contents);
+    write(&t.path("destination"), &vec![b'o'; contents.len()]);
+    let inode = fs::metadata(t.path("destination")).unwrap().ino();
+    let output = native_syq(&[
+        "cp",
+        "--inplace",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        "md5:00000000000000000000000000000000",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("destination")), contents);
+    assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
+fn hash_policy_xxh3_compares_repairs_and_verifies() {
+    let t = Tmp::new();
+    let contents = prng(5 * 1024 * 1024, 992);
+    let mut bad = contents.clone();
+    bad[1_234_567] ^= 1;
+    write(&t.path("source"), &contents);
+    write(&t.path("destination"), &bad);
+    set_mtime(&t.path("source"), 1_600_000_000);
+    set_mtime(&t.path("destination"), 1_600_000_000);
+    // The default metadata comparison cannot detect this same-size, same-time edit.
+    run_native_ok(&["cp", "--src", &t.s("source"), "--as", &t.s("destination")]);
+    assert_eq!(read(&t.path("destination")), bad);
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--integrity-checking=transfer=blake3",
+    ]);
+    assert_eq!(read(&t.path("destination")), contents);
+    run_native_ok(&[
+        "cp",
+        "--verify-only",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--integrity-checking",
+        "compare=xxh3-128",
+    ]);
+    write(&t.path("destination"), &bad);
+    let output = native_syq(&[
+        "cp",
+        "--verify-only",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--integrity-checking",
+        "compare=xxh3-128",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(
+        read(&t.path("destination")),
+        bad,
+        "verification must not repair"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hash_policy_expected_digest_covers_resumed_bytes_after_algorithm_change() {
+    let t = Tmp::new();
+    let contents = prng(9 * 1024 * 1024 + 123, 993);
+    write(&t.path("source"), &contents);
+    let partial = interrupted_partial(
+        &[
+            "-a",
+            "--block-size",
+            "4M",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("source"),
+            &t.s("destination"),
+        ],
+        &t.0,
+    );
+    let reused = 4 * 1024 * 1024;
+    {
+        let file = File::create(&partial).unwrap();
+        (&file).write_all(&contents[..reused]).unwrap();
+        file.set_len(contents.len() as u64).unwrap();
+    }
+    let expected = format!(
+        "sha256:{}",
+        Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    run_native_ok(&[
+        "cp",
+        "--src",
+        &t.s("source"),
+        "--as",
+        &t.s("destination"),
+        "--expected-hash",
+        &expected,
+        "--integrity-checking",
+        "compare=xxh3-128",
+        "--resource-limits",
+        "bandwidth=1G",
+        "--results",
+        &t.s("results.ndjson"),
+    ]);
+    assert_eq!(read(&t.path("destination")), contents);
+    assert!(
+        partial.exists(),
+        "another invocation's partial remains untouched"
+    );
+    let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+    let summary: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert!(
+        summary["bytes_unchanged"].as_u64().unwrap() >= reused as u64,
+        "{summary}"
+    );
 }
 
 #[test]
@@ -5860,8 +6637,8 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
     let copy = syq(&[
         "-a",
         "-c",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -5879,8 +6656,8 @@ fn hash_errors_do_not_desynchronize_worker_connections() {
         "-a",
         "--syq-verify-only",
         "-v",
-        "--syq-connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -5906,8 +6683,8 @@ fn large_file_parallel_chunks() {
     set_mtime(&t.path("src/huge.bin"), 1_600_000_000);
     run_ok(&[
         "-a",
-        "--syq-connections",
-        "8",
+        "--performance-tuning",
+        "workers=8",
         "--block-size",
         "1M",
         &t.s("src/"),
@@ -5921,12 +6698,12 @@ fn large_file_parallel_chunks() {
     let dst = t.s("dst/");
     let args = [
         "-a",
-        "--syq-connections",
-        "8",
+        "--performance-tuning",
+        "workers=8",
         "--block-size",
         "1M",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         &src,
         &dst,
     ];
@@ -5953,10 +6730,10 @@ fn progress_bar_slow_copy_stays_on_one_line_and_leaves_final_counts() {
             "--as",
             &t.s("dst"),
             "--progress",
-            "--connections",
-            "4",
-            "--bwlimit",
-            "1M",
+            "--performance-tuning",
+            "workers=4",
+            "--resource-limits",
+            "bandwidth=1M",
         ])
         .run()
         .unwrap();
@@ -6025,8 +6802,8 @@ fn progress_bar_does_not_mix_with_json_progress() {
             &t.s("dst"),
             "--progress",
             "--progress-json",
-            "--bwlimit",
-            "1M",
+            "--resource-limits",
+            "bandwidth=1M",
         ])
         .run()
         .unwrap();
@@ -6060,6 +6837,79 @@ fn progress_bar_is_opt_in_for_pipes_and_disabled_by_no_progress() {
 }
 
 #[test]
+fn tuning_options_job_storage_copies_and_updates_with_both_interfaces() {
+    for mode in ["compact", "inline", "combined"] {
+        for interface in ["cp", "rsync"] {
+            for engine in ["auto", "ranges"] {
+                let t = Tmp::new();
+                for (name, size) in [("empty", 0), ("small", 4194), ("nested/large", 2 << 20)] {
+                    write(&t.path(&format!("source/{name}")), &prng(size, 350));
+                }
+                let copy = || {
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                    command.args([
+                        interface,
+                        "--no-progress",
+                        "--stats",
+                        "--performance-tuning",
+                        "workers=2",
+                        &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
+                    ]);
+                    if interface == "cp" {
+                        command.args(["--hash", "--preserve=permissions"]);
+                        command.args(["--srcs-in", &t.s("source"), "--into", &t.s("destination")]);
+                    } else {
+                        command.args(["-a", "--checksum", &t.s("source/"), &t.s("destination")]);
+                    }
+                    let out = command.run().unwrap();
+                    assert_output_ok(&out);
+                    assert!(
+                        stderr_of(&out).contains(&format!("job-storage={mode}")),
+                        "{out:?}"
+                    );
+                    assert_same_tree(&t.path("source"), &t.path("destination"));
+                };
+                copy(); // Fresh files, including batch-eligible and range work.
+                copy(); // Existing matching files.
+                write(&t.path("source/small"), &prng(4194, 351));
+                write(&t.path("source/nested/large"), &prng(2 << 20, 351));
+                copy(); // Same-size changed destinations require fresh metadata.
+            }
+        }
+    }
+}
+
+#[test]
+fn tuning_options_job_storage_inplace_preserves_hardlinks() {
+    for mode in ["compact", "inline", "combined"] {
+        for engine in ["auto", "ranges"] {
+            let t = Tmp::new();
+            write(&t.path("source"), &prng(4194, 351));
+            write(&t.path("destination"), b"old destination");
+            fs::hard_link(t.path("destination"), t.path("alias")).unwrap();
+            let inode = fs::metadata(t.path("destination")).unwrap().ino();
+            let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "cp",
+                    &t.s("source"),
+                    "--as",
+                    &t.s("destination"),
+                    "--inplace",
+                    "--no-progress",
+                    "--performance-tuning",
+                    "workers=2",
+                    &format!("--performance-tuning=job-storage={mode},copy-path={engine}"),
+                ])
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+            assert_eq!(read(&t.path("alias")), read(&t.path("source")));
+        }
+    }
+}
+
+#[test]
 fn tuning_options_force_ranges_for_small_and_whole_local_files() {
     let t = Tmp::new();
     for (file, size) in [("small", 1024), ("large", 6 << 20), ("empty", 0)] {
@@ -6072,9 +6922,9 @@ fn tuning_options_force_ranges_for_small_and_whole_local_files() {
             &t.s("source"),
             "--into",
             &t.s("destination"),
-            "--tuning-options=copy-path=ranges,request-size=1M,split-min-size=1M",
-            "-j",
-            "2",
+            "--performance-tuning=copy-path=ranges,request-size=1M,split-min-size=1M",
+            "--performance-tuning",
+            "workers=2",
             "-v",
             "--no-progress",
             "--preserve=permissions",
@@ -6118,14 +6968,14 @@ fn auto_streaming_preserves_shortcuts_and_streams_remote_large_files() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                "2",
+                "--performance-tuning",
+                "workers=2",
                 "--no-progress",
                 "--no-tcp",
                 "--stats",
                 "--preserve=permissions",
                 "-v",
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("copy-path={mode},request-size=1M"),
             ]);
             if route == "pull" {
@@ -6181,8 +7031,8 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "--no-progress",
                 "--no-tcp",
                 "--stats",
@@ -6255,8 +7105,8 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
                 "-v",
                 "--stats",
                 "--no-compress",
-                "--bwlimit=512K",
-                "--connections=1",
+                "--resource-limits=bandwidth=512K",
+                "--performance-tuning=workers=1",
                 "--no-progress",
                 "--rsh",
                 rsh.to_str().unwrap(),
@@ -6328,14 +7178,14 @@ fn streaming_copies_local_trees_and_remote_ranges() {
                 rsh.to_str().unwrap(),
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
-                "--connections",
-                &workers.to_string(),
+                "--performance-tuning",
+                &format!("workers={workers}"),
                 "--no-progress",
                 "--preserve=permissions",
                 "-v",
                 "--tcp-ports",
                 EPHEMERAL_TCP_PORTS,
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("copy-path=streaming,request-size={request},split-min-size=1M"),
             ]);
             if route.starts_with("ssh") {
@@ -6392,8 +7242,8 @@ fn streaming_and_default_copies_share_resume_partials() {
             &[
                 "-a",
                 "--block-size=1M",
-                "--bwlimit=1G",
-                &format!("--tuning-options=copy-path={before}"),
+                "--resource-limits=bandwidth=1G",
+                &format!("--performance-tuning=copy-path={before}"),
                 &src,
                 &dst,
             ],
@@ -6406,8 +7256,8 @@ fn streaming_and_default_copies_share_resume_partials() {
         let out = run_ok(&[
             "-a",
             "--block-size=1M",
-            "--bwlimit=1G",
-            &format!("--tuning-options=copy-path={after},request-size=128K,bw-pacing=average"),
+            "--resource-limits=bandwidth=1G",
+            &format!("--performance-tuning=copy-path={after},request-size=128K,bw-pacing=average"),
             &src,
             &dst,
         ]);
@@ -6439,7 +7289,7 @@ fn streaming_reopens_a_dropped_write_connection() {
         &[
             "-a",
             "--syq-no-bootstrap",
-            "--tuning-options=copy-path=streaming,request-size=64K",
+            "--performance-tuning=copy-path=streaming,request-size=64K",
             &t.s("src"),
             &format!("fake:{}", t.s("dst")),
         ],
@@ -6547,8 +7397,8 @@ fn streaming_read_errors_do_not_publish_a_file() {
     write(&t.path("src"), &data);
     let args = [
         "-a",
-        "--syq-connections=1",
-        "--tuning-options=copy-path=streaming,request-size=64K",
+        "--performance-tuning=workers=1",
+        "--performance-tuning=copy-path=streaming,request-size=64K",
         &t.s("src"),
         &t.s("dst"),
     ];
@@ -6580,10 +7430,10 @@ fn tuning_options_batch_limits_include_the_first_file() {
                 &t.s("source"),
                 "--into",
                 &destination,
-                "--tuning-options",
+                "--performance-tuning",
                 &format!("batch-files={files},batch-bytes={bytes}"),
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
                 "--preserve=permissions",
@@ -6624,11 +7474,11 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
                 "--syq-path",
                 env!("CARGO_BIN_EXE_syq"),
                 "--no-tcp",
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
-                "--tuning-options",
+                "--performance-tuning",
                 options,
             ])
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -6663,12 +7513,12 @@ fn tuning_options_average_pacing_pays_for_one_large_request() {
                 &t.s("source"),
                 "--as",
                 &t.s(pacing),
-                "-j",
-                "1",
+                "--performance-tuning",
+                "workers=1",
                 "-v",
                 "--no-progress",
-                "--bwlimit=2M",
-                "--tuning-options",
+                "--resource-limits=bandwidth=2M",
+                "--performance-tuning",
                 &format!("copy-path=ranges,request-size=2M,bw-pacing={pacing}"),
             ])
             .run()
@@ -6697,7 +7547,7 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             .run()
             .unwrap();
         assert_output_ok(&help);
-        assert!(!String::from_utf8_lossy(&help.stdout).contains("--tuning-options"));
+        assert!(!String::from_utf8_lossy(&help.stdout).contains("--performance-tuning"));
         let help = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([interface, "--help-all"])
             .run()
@@ -6705,11 +7555,15 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
         assert_output_ok(&help);
         let text = String::from_utf8_lossy(&help.stdout);
         assert!(
-            text.contains("--tuning-options") && text.contains("pipeline-depth"),
+            text.contains("--performance-tuning")
+                && text.contains("pipeline-depth")
+                && text.contains("job-storage=combined|compact|inline"),
             "{text}"
         );
         for options in [
             "typo=4",
+            "job-storage=unknown",
+            "job-storage=inline,job-storage=compact",
             "pipeline-depth=0",
             "request-size=65M",
             "pipeline-depth=4,pipeline-depth=8",
@@ -6719,13 +7573,13 @@ fn tuning_options_are_in_full_help_and_validate_before_copying() {
             "bw-pacing=average",
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-            command.args([interface, "--tuning-options", options, &t.s("source")]);
+            command.args([interface, "--performance-tuning", options, &t.s("source")]);
             if interface == "cp" {
                 command.arg("--as");
             }
             let out = command.arg(t.s("destination")).run().unwrap();
             assert!(!out.status.success(), "{out:?}");
-            assert!(stderr_of(&out).contains("--tuning-options"), "{out:?}");
+            assert!(stderr_of(&out).contains("--performance-tuning"), "{out:?}");
             assert!(!t.path("destination").exists());
         }
     }
@@ -6744,6 +7598,7 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
         for pull in [false, true] {
             for (size, depth) in [(64 << 10, 1), (1 << 20, 8), (64 << 10, 64), (8 << 20, 8)] {
                 let destination = t.s(&format!("dst-{tcp}-{pull}-{size}-{depth}"));
+                let storage = if depth == 8 { "inline" } else { "compact" };
                 let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
                 command.args([
                     "cp",
@@ -6751,14 +7606,14 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     rsh.to_str().unwrap(),
                     "--syq-path",
                     env!("CARGO_BIN_EXE_syq"),
-                    "--connections",
-                    "1",
+                    "--performance-tuning",
+                    "workers=1",
                     "--no-progress",
                     "--stats",
                     "--tcp-ports",
                     EPHEMERAL_TCP_PORTS,
-                    "--tuning-options",
-                    &format!("request-size={size},pipeline-depth={depth}"),
+                    "--performance-tuning",
+                    &format!("request-size={size},pipeline-depth={depth},job-storage={storage}"),
                 ]);
                 if !tcp {
                     command.arg("--no-tcp");
@@ -6810,7 +7665,13 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     set_mtime(&t.path("source"), 1_600_000_000);
     let src = t.s("source");
     let dst = t.s("destination");
-    let initial = ["-a", "--block-size=1M", "--bwlimit=1G", &src, &dst];
+    let initial = [
+        "-a",
+        "--block-size=1M",
+        "--resource-limits=bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&initial, &t.0);
     let f = File::create(&partial).unwrap();
     (&f).write_all(&data[..3 * 1024 * 1024]).unwrap();
@@ -6819,8 +7680,8 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     let out = run_ok(&[
         "-a",
         "--block-size=1M",
-        "--bwlimit=1G",
-        "--tuning-options=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
+        "--resource-limits=bandwidth=1G",
+        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
         &src,
         &dst,
     ]);
@@ -6840,9 +7701,9 @@ fn tuning_options_keep_the_aggregate_bandwidth_limit() {
     let start = std::time::Instant::now();
     let out = run_ok(&[
         "-a",
-        "--bwlimit=1M",
-        "--syq-connections=4",
-        "--tuning-options=request-size=64M,pipeline-depth=64",
+        "--resource-limits=bandwidth=1M",
+        "--performance-tuning=workers=4",
+        "--performance-tuning=request-size=64M,pipeline-depth=64",
         &t.s("source"),
         &t.s("destination"),
     ]);
@@ -6869,10 +7730,10 @@ fn bwlimit_is_aggregate_across_workers() {
     let start = std::time::Instant::now();
     run_ok(&[
         "-a",
-        "--syq-connections",
-        "4",
-        "--bwlimit",
-        "1M",
+        "--performance-tuning",
+        "workers=4",
+        "--resource-limits",
+        "bandwidth=1M",
         &t.s("src/"),
         &t.s("dst/"),
     ]);
@@ -6888,10 +7749,16 @@ fn bwlimit_is_aggregate_across_workers() {
 fn bwlimit_rejects_invalid_rates() {
     let t = Tmp::new();
     write(&t.path("src/f"), b"x");
-    let out = syq(&["-a", "--bwlimit", "fast", &t.s("src/"), &t.s("dst/")]);
+    let out = syq(&[
+        "-a",
+        "--resource-limits",
+        "bandwidth=fast",
+        &t.s("src/"),
+        &t.s("dst/"),
+    ]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bad --bwlimit"),
+        String::from_utf8_lossy(&out.stderr).contains("bad bandwidth"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -7115,10 +7982,10 @@ fn fallocate_no_space_is_fatal_and_stops_later_files() {
             "-a",
             "--block-size",
             "64K",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst"),
             "--no-progress",
@@ -7154,10 +8021,10 @@ fn fallocate_unsupported_filesystem_still_uses_sparse_fallback() {
             "-a",
             "--block-size",
             "64K",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst"),
             "--no-progress",
@@ -7184,10 +8051,10 @@ fn fallocate_quota_error_is_preserved_in_results() {
             "src",
             "--into-existing",
             "dst",
-            "--bwlimit",
-            "1G",
-            "--connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             "--results",
             "results.ndjson",
             "-q",
@@ -7773,7 +8640,7 @@ fn partial_symlink_is_not_followed() {
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
     let src = t.s("src");
     let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::remove_file(&partial).unwrap();
     // A malicious/stale partial symlink pointing outside must not be followed.
@@ -7811,7 +8678,12 @@ fn file_over_nonempty_destination_directory_reports_error_without_panicking() {
     write(&t.path("src/foo"), b"source");
     write(&t.path("dest/foo/keep"), b"keep");
 
-    let out = syq(&["--syq-connections", "1", &t.s("src/foo"), &t.s("dest")]);
+    let out = syq(&[
+        "--performance-tuning",
+        "workers=1",
+        &t.s("src/foo"),
+        &t.s("dest"),
+    ]);
 
     assert_eq!(out.status.code(), Some(23));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -7958,8 +8830,8 @@ fn small_inplace_files_use_one_batched_worker() {
         .args([
             "-a",
             "--inplace",
-            "--syq-connections",
-            "32",
+            "--performance-tuning",
+            "workers=32",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -8092,7 +8964,7 @@ fn hardlinked_partial_does_not_corrupt_external_file() {
     write(&t.path("external"), b"EXTERNAL-DO-NOT-TOUCH");
     let src = t.s("src");
     let dst = t.s("out");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::remove_file(&partial).unwrap();
     // A partial hardlinked to an external file (as a dedup/backup tool might make).
@@ -8276,6 +9148,95 @@ fn native_remote_rm_uses_explicit_or_path_selected_helpers() {
 /// as one control-connection request. Its destination state, summary, and
 /// results records must match the ordinary engine's for the same copy, and
 /// anything the one-turn path declines must reach the engine unchanged.
+#[test]
+fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
+    for (source_seconds, source_nsec, destination_nsec, same_size, matches) in [
+        (10, 123_456_789, 120_000_000, true, true),
+        (10, 123_456_789, 123_456_700, true, true),
+        (10, 123_456_789, 0, true, true),
+        (10, 130_000_000, 120_000_000, true, false),
+        (10, 120_000_000, 123_456_789, true, false),
+        (11, 123_456_789, 120_000_000, true, false),
+        (10, 123_456_789, 120_000_000, false, false),
+    ] {
+        for option in [None, Some("--stats"), Some("--dry-run"), Some("--hash")] {
+            let t = Tmp::new();
+            let ssh = fake_ssh(&t);
+            write(&t.path("source"), b"new");
+            let old: &[u8] = if same_size { b"old" } else { b"older" };
+            write(&t.path("remote-home/dest/source"), old);
+            for (path, seconds, nanos) in [
+                ("source", source_seconds, source_nsec),
+                ("remote-home/dest/source", 10, destination_nsec),
+            ] {
+                File::open(t.path(path))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos),
+                    ))
+                    .unwrap();
+            }
+            let before = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-progress",
+                    "--results",
+                    &t.s("results.ndjson"),
+                    &t.s("source"),
+                    "--to",
+                    "fake.example",
+                    "--into",
+                    &t.s("remote-home/dest"),
+                ])
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                )
+                .env("SYQ_DEBUG", "1");
+            if let Some(option) = option {
+                command.arg(option);
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            assert_eq!(
+                stderr_of(&output).contains("small copy: published"),
+                option.is_none(),
+                "wrong dispatch for {option:?}: {}",
+                stderr_of(&output)
+            );
+            let skipped = matches && option != Some("--hash");
+            let unchanged = skipped || option == Some("--dry-run");
+            assert_eq!(read(&t.path("remote-home/dest/source")), if unchanged { old } else { b"new" },
+                "option={option:?}, source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}");
+            if unchanged {
+                let after = fs::metadata(t.path("remote-home/dest/source")).unwrap();
+                assert_eq!(after.ino(), before.ino());
+                assert_eq!(
+                    (after.mtime(), after.mtime_nsec()),
+                    (before.mtime(), before.mtime_nsec())
+                );
+            }
+            let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(result["status"], "success");
+            assert_eq!(result["files_unchanged"], u64::from(skipped), "{records}");
+            assert_eq!(
+                result["bytes_transferred"],
+                if skipped { 0 } else { 3 },
+                "{records}"
+            );
+        }
+    }
+}
+
 #[test]
 fn small_pushes_take_one_turn_and_match_the_engine() {
     let t = Tmp::new();
@@ -8652,6 +9613,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
         )
         .unwrap();
         let ready = t.path("ready");
+        let continuation = t.path("continue");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args([
@@ -8673,7 +9635,7 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
                 format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
             )
             .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+            .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
             .env("SYQ_DEBUG", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -8681,14 +9643,10 @@ fn small_push_quick_check_uses_the_same_source_snapshot_as_the_engine() {
             command.env("SYQ_TEST_DISABLE_SMALL_COPY", "1");
         }
         let mut child = command.start().unwrap();
-        wait_for(
-            "quick-check metadata repair",
-            std::time::Duration::from_secs(5),
-            || ready.exists(),
-        );
-        assert!(child.try_wait().unwrap().is_none());
+        wait_for_confinement_marker(&mut child, &ready, "quick metadata repair");
         write(&t.path("source"), b"new contents");
         set_mtime(&t.path("source"), 1_700_000_001);
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("remote-home/dest/source")), b"old");
@@ -9290,8 +10248,8 @@ fn native_selectors_support_bulk_mixing_and_late_modifiers() {
         "z",
         "--cwd",
         &t.s("sources"),
-        "--connections",
-        "1",
+        "--performance-tuning",
+        "workers=1",
         "--into",
         &t.s("dest"),
     ]);
@@ -9811,7 +10769,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/ok"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     assert!(partial.exists());
@@ -9827,7 +10791,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/gone"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::remove_file(t.path("src/gone")).unwrap();
@@ -9840,7 +10810,13 @@ fn delete_preserves_partial_candidates() {
     write(&t.path("src/bad"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::set_permissions(t.path("src/bad"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -10396,8 +11372,8 @@ fn delete_with_inplace_replacing_many_symlinks() {
         "-a",
         "--inplace",
         "--delete",
-        "--syq-connections",
-        "16",
+        "--performance-tuning",
+        "workers=16",
         &t.s("src/"),
         &t.s("dst"),
     ]);
@@ -10526,7 +11502,13 @@ fn delete_keeps_partials_of_filtered_files() {
     write(&t.path("src/big"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     run_ok(&[
@@ -10544,7 +11526,13 @@ fn delete_keeps_partials_of_filtered_files() {
     write(&t.path("src/f"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     write(&t.path("dst/f"), b"newer on dst");
@@ -10871,7 +11859,15 @@ fn previous_partial_name_can_be_copied_as_payload() {
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     let src = t.s("src/");
     let dst = t.s("dst/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, &dst];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        &dst,
+    ];
     let partial = interrupted_partial(&args, &t.path("dst"));
     let collision_name = partial.file_name().unwrap().to_owned();
     fs::remove_file(&partial).unwrap();
@@ -10897,7 +11893,15 @@ fn previous_partial_name_can_be_copied_with_dot_destination() {
     write(&t.path("src/file"), &vec![b'x'; 5 * 1024 * 1024]);
     fs::create_dir(t.path("dst")).unwrap();
     let src = t.s("src/");
-    let args = ["-a", "--block-size", "1M", "--bwlimit", "1G", &src, "."];
+    let args = [
+        "-a",
+        "--block-size",
+        "1M",
+        "--resource-limits",
+        "bandwidth=1G",
+        &src,
+        ".",
+    ];
     let partial = interrupted_partial_from(&args, &t.path("dst"), Some(&t.path("dst")));
     let collision_name = partial.file_name().unwrap().to_owned();
     fs::remove_file(&partial).unwrap();
@@ -11033,37 +12037,34 @@ fn different_jobs_use_distinct_partial_inodes() {
     write(&t.path("first"), &first_contents);
     write(&t.path("second"), &second_contents);
 
+    let ready = t.path("partial-ready");
+    let continuation = t.path("partial-continue");
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("out"),
         ])
-        .env("SYQ_TEST_HOLD_PARTIAL_MS", "2000")
+        .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+        .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let first_partial = (0..300).find_map(|_| {
-        let mut partials = partial_files(&t.0);
-        if partials.len() == 1 {
-            partials.pop()
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            None
-        }
-    });
-    let first_partial = first_partial.expect("first copy never created its sidecar");
+    wait_for_confinement_marker(&mut first, &ready, "partial preparation");
+    let partials = partial_files(&t.0);
+    assert_eq!(partials.len(), 1);
+    let first_partial = &partials[0];
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("out"),
     ]);
@@ -11077,6 +12078,7 @@ fn different_jobs_use_distinct_partial_inodes() {
         first_partial.exists(),
         "the second job must not rename the first job's partial"
     );
+    release_confinement_barrier(&continuation);
     assert!(first.wait().unwrap().success());
     assert_eq!(read(&t.path("out")), first_contents);
     assert!(partial_files(&t.0).is_empty());
@@ -11101,10 +12103,10 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("basis"),
@@ -11121,10 +12123,10 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("basis"),
     ]);
@@ -11148,31 +12150,24 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
     set_mtime(&t.path("src"), 1_600_000_001);
     set_mtime(&t.path("basis"), 1_600_000_000);
     let ready = t.path("basis-ready");
+    let continuation = t.path("continue");
 
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("src"),
             &t.s("basis"),
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .env("SYQ_TEST_BASIS_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "copy never retained its destination basis");
+    wait_for_confinement_marker(&mut child, &ready, "basis");
 
     OpenOptions::new()
         .append(true)
@@ -11181,6 +12176,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         .write_all(b"trailing data")
         .unwrap();
 
+    release_confinement_barrier(&continuation);
     assert!(child.wait().unwrap().success());
     assert_eq!(read(&t.path("basis")), contents);
     assert!(partial_files(&t.0).is_empty());
@@ -11201,31 +12197,24 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     set_mtime(&t.path("first"), 1_600_000_001);
     set_mtime(&t.path("second"), 1_600_000_002);
     let ready = t.path("basis-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
-            "--bwlimit",
-            "1G",
+            "--performance-tuning",
+            "workers=1",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("first"),
             &t.s("basis"),
         ])
         .env("SYQ_TEST_BASIS_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_BASIS_MS", "2000")
+        .env("SYQ_TEST_BASIS_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never retained its destination basis");
+    wait_for_confinement_marker(&mut first, &ready, "basis");
     assert!(
         partial_files(&t.0).is_empty(),
         "content comparison must not allocate a full sidecar"
@@ -11233,10 +12222,10 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
 
     let second = syq(&[
         "-a",
-        "--syq-connections",
-        "1",
-        "--bwlimit",
-        "1G",
+        "--performance-tuning",
+        "workers=1",
+        "--resource-limits",
+        "bandwidth=1G",
         &t.s("second"),
         &t.s("basis"),
     ]);
@@ -11246,6 +12235,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_002);
 
+    release_confinement_barrier(&continuation);
     assert!(first.wait().unwrap().success());
     // The second job renamed a complete file over the descriptor retained by
     // the first. Metadata applied through the old descriptor cannot leak onto
@@ -11271,22 +12261,15 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     set_mtime(&t.path("first"), 1_600_000_000);
     set_mtime(&t.path("second"), 1_600_000_001);
     let ready = t.path("quick-meta-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_QUICK_META_MS", "2000")
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never reached quick-check metadata repair");
+    wait_for_confinement_marker(&mut first, &ready, "quick meta");
 
     let second = syq(&["-a", &t.s("second"), &t.s("basis")]);
     assert_output_ok(&second);
@@ -11295,6 +12278,7 @@ fn quick_check_metadata_repair_does_not_touch_a_concurrent_publication() {
     assert_eq!(published.mode() & 0o777, 0o640);
     assert_eq!(published.mtime(), 1_600_000_001);
 
+    release_confinement_barrier(&continuation);
     assert_eq!(first.wait().unwrap().code(), Some(23));
     assert_eq!(read(&t.path("basis")), b"bbbb");
     let published = fs::metadata(t.path("basis")).unwrap();
@@ -11336,24 +12320,18 @@ fn quick_check_metadata_open_reports_concurrent_fifo_without_blocking() {
     set_mtime(&t.path("basis"), 1_600_000_000);
     set_mtime(&t.path("first"), 1_600_000_000);
     let ready = t.path("quick-meta-ready");
+    let continuation = t.path("continue");
 
     let mut first = compat_command()
         .args(["-a", "--no-progress", &t.s("first"), &t.s("basis")])
         .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_QUICK_META_MS", "1000")
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
         .start()
         .unwrap();
-    let held = (0..300).any(|_| {
-        if ready.exists() {
-            true
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    });
-    assert!(held, "first copy never reached quick-check metadata repair");
+    wait_for_confinement_marker(&mut first, &ready, "quick meta");
 
     assert_output_ok(&syq(&["-a", &t.s("second"), &t.s("basis")]));
+    release_confinement_barrier(&continuation);
     let status = (0..300).find_map(|_| {
         let status = first.try_wait().unwrap();
         if status.is_none() {
@@ -11385,7 +12363,13 @@ fn checksum_identical_file_preserves_destination_inode() {
     set_mtime(&t.path("dst"), 1_600_000_000);
     let before = fs::metadata(t.path("dst")).unwrap();
 
-    let output = run_ok(&["-ac", "--bwlimit", "1G", &t.s("src"), &t.s("dst")]);
+    let output = run_ok(&[
+        "-ac",
+        "--resource-limits",
+        "bandwidth=1G",
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
 
     assert_eq!(transferred(&output), 0, "{output}");
     let after = fs::metadata(t.path("dst")).unwrap();
@@ -11406,7 +12390,7 @@ fn unreadable_interrupted_partials_are_left_alone() {
     for (i, mode) in [0o444, 0o000].into_iter().enumerate() {
         let src = t.s("src");
         let dst = t.s(&format!("out-{i}"));
-        let args = ["-a", "--bwlimit", "1G", &src, &dst];
+        let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
         let partial = interrupted_partial(&args, &t.0);
         fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
 
@@ -11425,7 +12409,7 @@ fn unchmodable_interrupted_partial_is_left_alone() {
     write(&t.path("src"), &contents);
     let src = t.s("src");
     let dst = t.s("dst");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o000)).unwrap();
 
@@ -11449,7 +12433,7 @@ fn writable_interrupted_partial_is_left_unchanged() {
     write(&t.path("src"), &contents);
     let src = t.s("src");
     let dst = t.s("dst");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.0);
     write(&partial, &contents);
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o644)).unwrap();
@@ -11472,8 +12456,8 @@ fn copy_local_exdev_fallback_leaves_no_partial() {
     let out = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--no-progress",
             &t.s("src"),
             &t.s("dst"),
@@ -11560,7 +12544,7 @@ fn copy_local_disk_exdev_uses_parallel_whole_file_workers() {
         let mut command = compat_command();
         command.args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")]);
         if let Some(connections) = connections {
-            command.args(["--syq-connections", connections]);
+            command.args(["--performance-tuning", &format!("workers={connections}")]);
         }
         let out = command
             .env("SYQ_DEBUG", "1")
@@ -11610,8 +12594,8 @@ fn copy_local_disk_whole_files_write_concurrently() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--syq-connections",
-            "2",
+            "--performance-tuning",
+            "workers=2",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -11663,7 +12647,7 @@ fn copy_local_disk_single_file_retains_parallel_ranges() {
         let mut command = compat_command();
         command.args(["-a", "--stats", "--no-progress", &t.s("src"), &t.s("dst")]);
         if let Some(connections) = connections {
-            command.args(["--syq-connections", connections]);
+            command.args(["--performance-tuning", &format!("workers={connections}")]);
         }
         let out = command
             .env("SYQ_DEBUG", "1")
@@ -11694,7 +12678,7 @@ fn copy_local_disk_single_file_retains_parallel_ranges() {
 fn copy_local_disk_exdev_preserves_range_controls() {
     for (args, synchronous) in [
         (vec!["--checksum"], false),
-        (vec!["--bwlimit", "1G"], false),
+        (vec!["--resource-limits", "bandwidth=1G"], false),
         (vec![], true),
     ] {
         let t = Tmp::new();
@@ -11757,7 +12741,7 @@ fn copy_local_disk_write_failure_keeps_old_destination_and_resumes_changed_sourc
     let out = compat_command()
         .args([
             "-a",
-            "--tuning-options=copy-path=ranges",
+            "--performance-tuning=copy-path=ranges",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -11834,7 +12818,7 @@ fn copy_local_nfs_exdev_keeps_automatic_parallel_cases() {
     let cases: &[(&[&str], Option<&str>)] = &[
         (&[], Some("SYQ_TEST_COPY_LOCAL_SOURCE_NFS")),
         (&[], Some("SYQ_TEST_COPY_LOCAL_NFS_SYNC")),
-        (&["--syq-connections", "2"], None),
+        (&["--performance-tuning", "workers=2"], None),
     ];
     for (extra_args, extra_env) in cases {
         let t = Tmp::new();
@@ -11874,7 +12858,7 @@ fn long_basename_partial_is_truncated_and_retry_copies_correctly() {
     fs::create_dir_all(t.path("dst")).unwrap();
     let src = t.s(&format!("src/{basename}"));
     let dst = t.s("dst/");
-    let args = ["-a", "--bwlimit", "1G", &src, &dst];
+    let args = ["-a", "--resource-limits", "bandwidth=1G", &src, &dst];
     let partial = interrupted_partial(&args, &t.path("dst"));
     assert!(partial.file_name().unwrap().as_encoded_bytes().len() <= 255);
     assert!(partial
@@ -11934,6 +12918,13 @@ fn impossible_sidecar_name_fails_one_file_and_continues() {
 #[cfg(debug_assertions)]
 #[test]
 fn changed_source_retry_uses_published_file_as_block_basis() {
+    for storage in ["compact", "inline", "combined"] {
+        changed_source_retry_uses_published_file_as_block_basis_with_storage(storage);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn changed_source_retry_uses_published_file_as_block_basis_with_storage(storage: &str) {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let mut changed = original.clone();
@@ -11946,11 +12937,12 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
+        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args([
             "-a",
             "--stats",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--no-progress",
             &t.s("src/"),
             &t.s("dst/"),
@@ -12007,6 +12999,13 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn changed_source_retry_still_uses_copy_file_range() {
+    for storage in ["compact", "inline", "combined"] {
+        changed_source_retry_still_uses_copy_file_range_with_storage(storage);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn changed_source_retry_still_uses_copy_file_range_with_storage(storage: &str) {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let changed = vec![b'b'; 8 * 1024 * 1024];
@@ -12018,6 +13017,7 @@ fn changed_source_retry_still_uses_copy_file_range() {
     let ready = t.path("finalize-ready");
     let continuation = t.path("finalize-continue");
     let mut child = compat_command()
+        .arg(format!("--performance-tuning=job-storage={storage}"))
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
         .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
         .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
@@ -12157,37 +13157,34 @@ fn destination_root_replacement_after_selection_cannot_redirect_worker() {
         fs::create_dir_all(t.path("dst")).unwrap();
         fs::create_dir_all(t.path("outside")).unwrap();
         let ready = t.path("anchor-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
-        command.args(["-a", "--syq-connections", "1", &t.s("src/"), &t.s("dst/")]);
+        command.args([
+            "-a",
+            "--performance-tuning",
+            "workers=1",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ]);
         if no_tcp {
             command.arg("--syq-no-tcp");
         }
         let mut child = command
             .arg("--no-progress")
             .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "1000")
+            .env("SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before retaining the destination root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination root was not retained before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination anchor");
 
         fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("selected-and-moved/f")), b"payload");
@@ -12209,13 +13206,15 @@ fn destination_file_write_refuses_descendant_symlink_swap() {
         fs::create_dir_all(t.path("dst/victim")).unwrap();
         write(&t.path("outside/sentinel"), b"outside");
 
+        let ready = t.path("partial-ready");
+        let continuation = t.path("partial-continue");
         let mut command = compat_command();
         command.args([
             "-a",
-            "--bwlimit",
-            "1G",
-            "--syq-connections",
-            "1",
+            "--resource-limits",
+            "bandwidth=1G",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -12224,31 +13223,20 @@ fn destination_file_write_refuses_descendant_symlink_swap() {
         }
         let mut child = command
             .arg("--no-progress")
-            .env("SYQ_TEST_HOLD_PARTIAL_MS", "1000")
+            .env("SYQ_TEST_PARTIAL_READY_FILE", &ready)
+            .env("SYQ_TEST_PARTIAL_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while partial_files(&t.path("dst/victim")).len() != 1
-            && std::time::Instant::now() < deadline
-        {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before preparing the destination sidecar"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            partial_files(&t.path("dst/victim")).len(),
-            1,
-            "destination sidecar was not prepared before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "partial preparation");
+        assert_eq!(partial_files(&t.path("dst/victim")).len(), 1);
 
         fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
         assert_eq!(read(&t.path("outside/sentinel")), b"outside");
@@ -12271,13 +13259,14 @@ fn destination_prune_scan_uses_retained_root_after_replacement() {
         write(&t.path("dst/extra"), b"extra");
         write(&t.path("outside/sentinel"), b"outside");
         let ready = t.path("anchor-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
         command.args([
             "-a",
             "--delete",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -12287,28 +13276,18 @@ fn destination_prune_scan_uses_retained_root_after_replacement() {
         let mut child = command
             .arg("--no-progress")
             .env("SYQ_TEST_DESTINATION_ANCHORED_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_ANCHOR_MS", "750")
+            .env("SYQ_TEST_DESTINATION_ANCHOR_CONTINUE_FILE", &continuation)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before retaining the destination root"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination root was not retained before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination anchor");
 
         fs::rename(t.path("dst"), t.path("selected-and-moved")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_output_ok(&output);
         assert!(!t.path("selected-and-moved/extra").exists());
@@ -12329,13 +13308,14 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
         write(&t.path("dst/victim/extra"), b"extra");
         write(&t.path("outside/sentinel"), b"outside");
         let ready = t.path("scan-ready");
+        let continuation = t.path("continue");
 
         let mut command = compat_command();
         command.args([
             "-a",
             "--delete",
-            "--syq-connections",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src/"),
             &t.s("dst/"),
         ]);
@@ -12346,28 +13326,21 @@ fn destination_prune_scan_refuses_descendant_symlink_swap() {
             .arg("--no-progress")
             .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY", "victim")
             .env("SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE", &ready)
-            .env("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY_MS", "750")
+            .env(
+                "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_CONTINUE_FILE",
+                &continuation,
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .start()
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "syq exited before reaching the descendant directory scan"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "destination descendant scan was not reached before timeout"
-        );
+        wait_for_confinement_marker(&mut child, &ready, "destination scan directory");
 
         fs::rename(t.path("dst/victim"), t.path("displaced-victim")).unwrap();
         std::os::unix::fs::symlink(t.path("outside"), t.path("dst/victim")).unwrap();
 
+        release_confinement_barrier(&continuation);
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
         assert!(
@@ -12721,8 +13694,8 @@ fn stats_report_connection_tuning_mode() {
     let out = run_ok(&[
         "-a",
         "--stats",
-        "--syq-connections",
-        "3",
+        "--performance-tuning",
+        "workers=3",
         &t.s("src/"),
         &t.s("fixed/"),
     ]);
@@ -13063,13 +14036,19 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
     write(&t.path(&format!("src/{long}")), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     let so = run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         "--max-size",
         "1K",
@@ -13082,8 +14061,8 @@ fn truncated_sidecar_of_a_filtered_file_survives_delete() {
     fs::remove_file(t.path(&format!("src/{long}"))).unwrap();
     run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         &t.s("src/"),
         &t.s("dst"),
@@ -13098,15 +14077,21 @@ fn partial_survives_when_target_becomes_a_directory() {
     write(&t.path("src/x"), &vec![7u8; 8 << 20]);
     fs::create_dir_all(t.path("dst")).unwrap();
     let partial = interrupted_partial(
-        &["-a", "--bwlimit", "1G", &t.s("src/"), &t.s("dst")],
+        &[
+            "-a",
+            "--resource-limits",
+            "bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst"),
+        ],
         &t.path("dst"),
     );
     fs::remove_file(t.path("src/x")).unwrap();
     write(&t.path("src/x/inside"), b"now a directory");
     run_ok(&[
         "-a",
-        "--bwlimit",
-        "1G",
+        "--resource-limits",
+        "bandwidth=1G",
         "--delete",
         &t.s("src/"),
         &t.s("dst"),
@@ -13252,15 +14237,21 @@ fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
         fs::create_dir_all(t.path("dst")).unwrap();
         let dst = format!("{}{spelling}", t.s("dst"));
         let partial = interrupted_partial(
-            &["-a", "--bwlimit", "1G", &t.s("src/"), &dst],
+            &[
+                "-a",
+                "--resource-limits",
+                "bandwidth=1G",
+                &t.s("src/"),
+                &dst,
+            ],
             &t.path("dst"),
         );
         // Filtered target: the sidecar is resume state and must survive, in
         // this spelling and cross-spelling alike.
         let so = run_ok(&[
             "-a",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--delete",
             "--max-size",
             "10",
@@ -13270,8 +14261,8 @@ fn live_sidecar_survives_delete_with_dotted_destination_spelling() {
         assert!(partial.exists(), "{spelling}: {so}");
         let so = run_ok(&[
             "-a",
-            "--bwlimit",
-            "1G",
+            "--resource-limits",
+            "bandwidth=1G",
             "--delete",
             "--max-size",
             "10",
@@ -13397,6 +14388,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--inplace",
             "--prune",
             "--max-delete=1",
+            "--performance-tuning=job-storage=inline",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -13428,6 +14420,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--inplace",
         "--prune",
         "--max-delete=1",
+        "--performance-tuning=job-storage=inline",
     ] {
         assert!(
             log.contains(option),
@@ -13449,8 +14442,8 @@ fn native_coordinate_at_dst_reverses_the_remote_ssh_edge() {
         .args([
             "--no-tcp",
             "--tcp-ports=49000-49002",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--srcs-in",
@@ -13582,8 +14575,8 @@ fn native_coordinate_at_local_relays_between_remote_endpoints() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--srcs-in",
@@ -13653,8 +14646,8 @@ fn native_endpoint_port_reaches_ssh() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             &t.s("src"),
             "--to",
             "backup.example:2222",
@@ -13706,8 +14699,8 @@ fn native_remote_exact_bare_home_expands_before_identity_check() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--src",
             &t.s("src"),
             "--to",
@@ -13737,8 +14730,8 @@ fn native_detach_waits_for_coordinator_readiness() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--detach",
             "--from",
             "hostA",
@@ -13826,8 +14819,8 @@ fn native_detach_broken_stdout_reports_running_job_without_panicking() {
             "--syq-path",
             env!("CARGO_BIN_EXE_syq"),
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--detach",
             "--from",
             "hostA",
@@ -14090,29 +15083,23 @@ fn native_map_scans_the_pinned_selection_after_path_replacement() {
     write(&t.path("selected/original.txt"), b"original");
     write(&t.path("outside/outside.txt"), b"outside");
     let ready = t.path("map-ready");
+    let continuation = t.path("continue");
     let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["map", "--srcs-in", "selected"])
         .current_dir(t.path(""))
         .env("SYQ_TEST_MAP_SELECTION_READY_FILE", &ready)
-        .env("SYQ_TEST_HOLD_MAP_SELECTION_MS", "750")
+        .env("SYQ_TEST_MAP_SELECTION_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .start()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ready.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "syq map exited before pinning its selection"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "syq map did not reach the selection hook");
+    wait_for_confinement_marker(&mut child, &ready, "map selection");
 
     fs::rename(t.path("selected"), t.path("selected-original")).unwrap();
     symlink("outside", t.path("selected")).unwrap();
 
+    release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     let lines = map_lines(&output);
     let sources: Vec<_> = lines.iter().map(|line| map_path(line, "src")).collect();
@@ -14287,14 +15274,14 @@ fn native_map_exposes_only_manifest_shaping_options() {
         "--dry-run",
         "--verbose",
         "--quiet",
-        "--connections",
+        "--performance-tuning",
         "--progress",
         "--no-progress",
         "--progress-json",
         "--hash",
         "--no-compress",
-        "--bwlimit",
-        "--stats",
+        "--resource-limits",
+        "bandwidth=--stats",
         "--ignore",
         "--ignore-from",
         "--preserve",
@@ -14592,8 +15579,8 @@ fn native_cp_results_copying_interval_covers_paced_content_but_not_unchanged_fil
                 "dst",
                 "--results",
                 result,
-                "--bwlimit",
-                "1M",
+                "--resource-limits",
+                "bandwidth=1M",
                 "--stats",
                 "--no-progress",
             ],
@@ -15402,7 +16389,9 @@ const DOC_JQ_RETRY_GATE: &str = r#"if (.[-1].type? // "") != "result"
         else .[] | select(.type == "operation_result"
                           and .disposition == "failed"
                           and .retryable != "no")
-             | {src, dst, kind} end"#;
+             | {src, dst, kind}
+               + (if has("expected_digest") then {expected_digest} else {} end)
+        end"#;
 
 /// Assert the doc contains the complete invocation — flags included — that
 /// the test executes, so an undocumented flag can never make a broken
@@ -15497,11 +16486,14 @@ fn mappings_md_min_size_example_works_verbatim() {
 fn mappings_md_retry_gate_example_works_verbatim() {
     let t = Tmp::new();
     write(&t.path("src/ok.txt"), b"ok");
-    let manifest = format!(
-        "{}{}",
-        entry_line("gone.txt", "g.txt", None),
-        entry_line("ok.txt", "ok.txt", None),
-    );
+    let expected = serde_json::json!({
+        "algorithm": "md5",
+        "value": "f2c67381db28fa11c59fe7a6df0f2587",
+    });
+    let mut missing: serde_json::Value =
+        serde_json::from_str(&entry_line("gone.txt", "g.txt", None)).unwrap();
+    missing["expected_digest"] = expected.clone();
+    let manifest = format!("{missing}\n{}", entry_line("ok.txt", "ok.txt", None));
     let cp = syq_cp_in(
         &t.path(""),
         &[
@@ -15525,6 +16517,7 @@ fn mappings_md_retry_gate_example_works_verbatim() {
     assert!(out.status.success());
     let retry: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one retry entry");
     assert_eq!(retry["dst"]["value"], "g.txt");
+    assert_eq!(retry["expected_digest"], expected);
     // The emitted entry executes as a mapping after the source appears.
     write(&t.path("src/gone.txt"), b"late");
     let cp = syq_cp_in(
@@ -17715,7 +18708,7 @@ fn durable_and_ephemeral_policies_reach_implicit_ssh_connections() {
         .to_owned();
     let mut copy = Command::new(env!("CARGO_BIN_EXE_syq"));
     copy.args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1"])
+        .args(["--no-tcp", "--performance-tuning", "workers=1"])
         .arg(t.path("src"))
         .args(["--to", "backup.example:2222", "--as"])
         .arg(t.path("global-dst"))
@@ -17785,7 +18778,7 @@ exit 0
         .args(["cp", "--pscope"])
         .arg(&scope)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1"])
+        .args(["--no-tcp", "--performance-tuning", "workers=1"])
         .arg(t.path("src"))
         .args(["--to", "backup.example:2222", "--as"])
         .arg(t.path("scoped-dst"))
@@ -18095,6 +19088,61 @@ fn native_cp_results_dry_and_live_directory_totals_agree() {
 }
 
 #[test]
+fn native_cp_activity_covers_short_copies_and_preserves_terminal_order() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), &vec![7; 2 * 1024 * 1024]);
+    let out = syq_cp_in(
+        &t.path(""),
+        &[
+            "--srcs-in",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            "activity.ndjson",
+            "--stats",
+            "-q",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(read(&t.path("src/a")), read(&t.path("dst/a")));
+    let content = String::from_utf8(read(&t.path("activity.ndjson"))).unwrap();
+    assert_automation_stream(&automation_validator(), &content, "activity copy");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["type"], "result");
+    let activity = &records
+        .iter()
+        .rev()
+        .find(|r| r["type"] == "progress")
+        .unwrap()["activity"];
+    assert!(activity["workers"]["observed"].as_u64().unwrap() > 0);
+    assert_eq!(activity["workers"]["active"], 0);
+    let fractions = activity["workers"]["cumulative_fractions"]
+        .as_object()
+        .unwrap();
+    assert!((fractions.values().map(|v| v.as_f64().unwrap()).sum::<f64>() - 1.0).abs() < 1e-9);
+    assert!(activity["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["observed_ns"].as_u64().unwrap() > 0)));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("Observed worker time:"));
+    assert!(stderr.contains("worker 0 (process "), "{stderr}");
+    assert!(stderr.contains("bytes"), "{stderr}");
+    assert!(stderr.contains("CPU: user"), "{stderr}");
+    assert!(!stderr.contains("1 workers"), "{stderr}");
+}
+
+#[test]
 fn native_cp_results_non_tty_run_emits_progress_records() {
     let t = Tmp::new();
     write(&t.path("src/big.bin"), &vec![7u8; 64 * 1024]);
@@ -18105,8 +19153,8 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
             "src",
             "--into",
             "dst",
-            "--bwlimit",
-            "32",
+            "--resource-limits",
+            "bandwidth=32",
             "--results",
             "r1.ndjson",
             "-q",
@@ -18119,6 +19167,12 @@ fn native_cp_results_non_tty_run_emits_progress_records() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|v| v["type"] == "progress")
+        .inspect(|v| {
+            assert!(
+                v.get("activity").is_none(),
+                "plain results must not enable telemetry: {v}"
+            )
+        })
         .count();
     // ~2s at the rate limit: the ticker samples once immediately and then
     // at least once more at the one-second throttle, TTY or not.
@@ -18597,8 +19651,8 @@ fn native_results_on_remote_coordinators_need_a_receiver_or_explicit_relay() {
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
         .args([
             "--no-tcp",
-            "-j",
-            "1",
+            "--performance-tuning",
+            "workers=1",
             "--from",
             "hostA",
             "--src",
@@ -18657,7 +19711,14 @@ fn native_remote_to_remote_carries_any_path_bytes_directly() {
         .args(["cp", "--rsh"])
         .arg(&rsh)
         .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
-        .args(["--no-tcp", "-j", "1", "--from", "hostA", "--root"])
+        .args([
+            "--no-tcp",
+            "--performance-tuning",
+            "workers=1",
+            "--from",
+            "hostA",
+            "--root",
+        ])
         .arg(&source_base)
         .arg("--src")
         .arg(name)
@@ -19150,7 +20211,11 @@ fn owned_receiver_wait_respects_deadline_with_partial_identity_reply() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut socket = loop {
             match listener.accept() {
-                Ok((socket, _)) => break socket,
+                Ok((socket, _)) => {
+                    // BSD accepted sockets inherit the listener's nonblocking mode.
+                    socket.set_nonblocking(false).unwrap();
+                    break socket;
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         && std::time::Instant::now() < deadline =>
@@ -19480,7 +20545,11 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
         for response in [serde_json::json!({"Error":"copy denied by test policy"})] {
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && std::time::Instant::now() < deadline =>
@@ -19791,7 +20860,11 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    Ok((socket, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             Instant::now() < deadline,
@@ -20605,7 +21678,14 @@ fn clean_partials_selects_only_current_regular_files() {
     let preview = String::from_utf8_lossy(&preview.stdout);
     assert!(preview.contains("would remove 2 entries"), "{preview}");
     assert_eq!(listing(&t.path("tree")), before);
-    run_native_ok(&["clean-partials", "-j", "4", "--root", &t.s(""), "tree"]);
+    run_native_ok(&[
+        "clean-partials",
+        "--performance-tuning",
+        "workers=4",
+        "--root",
+        &t.s(""),
+        "tree",
+    ]);
     assert!(!t.path(&format!("tree/{current}")).exists());
     assert!(!t.path(&format!("tree/nested/{compact}")).exists());
     assert_eq!(read(&t.path(&format!("tree/{old}"))), b"old format");
@@ -20652,10 +21732,10 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "cp",
                     "--hash",
                     "--no-tcp",
-                    "--bwlimit",
-                    "1G",
-                    "-j",
-                    "2",
+                    "--resource-limits",
+                    "bandwidth=1G",
+                    "--performance-tuning",
+                    "workers=2",
                     "--no-progress",
                     &t.s("first"),
                     "--as",
@@ -20669,17 +21749,23 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            wait_for_confinement_marker(&mut first, &ready, "overlapping copy preparation");
+            wait_for_confinement_marker(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
+            );
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
                     "cp",
                     "--hash",
                     "--no-tcp",
-                    "--bwlimit",
-                    "1G",
-                    "-j",
-                    "2",
+                    "--resource-limits",
+                    "bandwidth=1G",
+                    "--performance-tuning",
+                    "workers=2",
                     "--no-progress",
                     &t.s("second"),
                     "--as",
@@ -20728,8 +21814,8 @@ fn resume_uses_the_verified_buffer_when_candidate_changes_or_disappears() {
                 "-ac",
                 "--block-size",
                 "1M",
-                "--bwlimit",
-                "1G",
+                "--resource-limits",
+                "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
@@ -20976,8 +22062,8 @@ fn seeding_preallocates_before_copying_donor_bytes() {
         let out = compat_command()
             .args([
                 "-ac",
-                "--bwlimit",
-                "1G",
+                "--resource-limits",
+                "bandwidth=1G",
                 "--no-progress",
                 &t.s("src"),
                 &t.s("out"),
@@ -21013,7 +22099,7 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
     let out = run_ok(&[
         "-ac",
         "--block-size=1M",
-        "--bwlimit=1G",
+        "--resource-limits=bandwidth=1G",
         &t.s("src"),
         &t.s("out"),
     ]);
@@ -21023,4 +22109,382 @@ fn resume_prefers_a_partial_to_the_old_destination_contents() {
         "{out}"
     );
     assert_eq!(partial_files(&t.0).len(), 1);
+}
+
+#[test]
+fn native_mtime_uses_destination_decimal_precision() {
+    // Different same-size bytes make an accidental copy/skip observable. Set
+    // exact timestamps to emulate destination truncation without mounting a FS.
+    for (source_nsec, destination_nsec, source_seconds, same_size, skipped) in [
+        (123_456_789, 123_456_789, 10, true, true),
+        (123_456_789, 123_456_788, 10, true, false),
+        (123_456_789, 123_456_700, 10, true, true),
+        (123_456_789, 123_456_800, 10, true, false),
+        (123_456_789, 120_000_000, 10, true, true),
+        (129_999_999, 120_000_000, 10, true, true),
+        (130_000_000, 120_000_000, 10, true, false),
+        (120_000_000, 123_456_789, 10, true, false),
+        (999_999_999, 0, 10, true, true),
+        (0, 0, 10, true, true),
+        (123_456_789, 0, 11, true, false),
+        (123_456_789, 0, 9, true, false),
+        (123_456_789, 120_000_000, 10, false, false),
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"new");
+        write(&t.path("dst"), if same_size { b"old" } else { b"older" });
+        for (name, seconds, nanos) in [
+            ("src", source_seconds, source_nsec),
+            ("dst", 10, destination_nsec),
+        ] {
+            let time = std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos);
+            File::options()
+                .write(true)
+                .open(t.path(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        run_native_ok(&["cp", &t.s("src"), "--as", &t.s("dst")]);
+        assert_eq!(
+            read(&t.path("dst")),
+            if skipped { b"old" } else { b"new" },
+            "source={source_seconds}.{source_nsec:09}, destination=10.{destination_nsec:09}"
+        );
+        if skipped {
+            // Content verification must bypass the inferred-precision shortcut.
+            run_native_ok(&["cp", "--hash", &t.s("src"), "--as", &t.s("dst")]);
+            assert_eq!(read(&t.path("dst")), b"new");
+        }
+    }
+}
+
+#[test]
+fn directory_dry_run_uses_destination_timestamp_precision() {
+    for (source_ns, destination_ns, differs) in [
+        (123_456_789, 120_000_000, false),
+        (123_456_789, 0, false),
+        (123_456_789, 130_000_000, true),
+        (120_000_000, 123_456_789, true),
+    ] {
+        let t = Tmp::new();
+        fs::create_dir_all(t.path("src/sub")).unwrap();
+        fs::create_dir_all(t.path("dst/sub")).unwrap();
+        set_mtime(&t.path("src"), 10);
+        set_mtime(&t.path("dst"), 10);
+        for (name, nanos) in [("src/sub", source_ns), ("dst/sub", destination_ns)] {
+            File::open(t.path(name))
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(10, nanos)),
+                )
+                .unwrap();
+        }
+        let out = syq_cp_in(
+            &t.path(""),
+            &["src", "--as", "dst", "--dry-run", "-v"],
+            None,
+        );
+        assert_output_ok(&out);
+        let stderr = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stderr.contains("metadata"), differs, "{stderr}");
+    }
+}
+
+#[test]
+fn delete_many_roots_keeps_claims_in_their_own_scope() {
+    let t = Tmp::new();
+    let mut sources = Vec::new();
+    for i in 0..40 {
+        let name = format!("group-{i:02}");
+        write(&t.path(&format!("src/{name}/keep")), b"keep");
+        write(&t.path(&format!("dst/{name}/keep")), b"keep");
+        write(&t.path(&format!("dst/{name}/extra")), b"extra");
+        sources.push(t.s(&format!("src/{name}")));
+    }
+    let destination = t.s("dst");
+    for dry in [true, false] {
+        let mut args = vec![if dry { "-an" } else { "-a" }, "--delete"];
+        args.extend(sources.iter().map(String::as_str));
+        args.push(&destination);
+        run_ok(&args);
+        for i in 0..40 {
+            assert_eq!(read(&t.path(&format!("dst/group-{i:02}/keep"))), b"keep");
+            assert_eq!(t.path(&format!("dst/group-{i:02}/extra")).exists(), dry);
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_read_ahead_preserves_staged_and_inplace_contents() {
+    for force_read_ahead in [false, true] {
+        for inplace in [false, true] {
+            let t = Tmp::new();
+            let data = prng((17 << 20) + 73, 918);
+            write(&t.path("source"), &data);
+            write(&t.path("destination"), b"old destination");
+            let inode = fs::metadata(t.path("destination")).unwrap().ino();
+            let mut command = compat_command();
+            command.args(["-a", "--no-progress", &t.s("source"), &t.s("destination")]);
+            if inplace {
+                command.arg("--inplace");
+            }
+            if force_read_ahead {
+                command.env("SYQ_TEST_LOCAL_READ_AHEAD", "1");
+            }
+            let out = command
+                .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+                .env("SYQ_DEBUG", "1")
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            if force_read_ahead {
+                assert!(stderr_of(&out).contains("source read-ahead started"));
+            }
+            assert_eq!(read(&t.path("destination")), data);
+            if inplace {
+                assert_eq!(fs::metadata(t.path("destination")).unwrap().ino(), inode);
+            }
+            assert!(partial_files(&t.0).is_empty());
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn local_read_ahead_shrink_keeps_old_destination() {
+    {
+        let t = Tmp::new();
+        write(&t.path("source"), &prng(17 << 20, 919));
+        write(&t.path("destination"), b"old destination");
+        let ready = t.path("ready");
+        let resume = t.path("continue");
+        let mut child = compat_command()
+            .args(["-a", "--no-progress", &t.s("source"), &t.s("destination")])
+            .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+            .env("SYQ_TEST_OVERLAP_READY", &ready)
+            .env("SYQ_TEST_OVERLAP_CONTINUE", &resume)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(child.try_wait().unwrap().is_none());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "overlap copy did not reach its first-block barrier"
+        );
+        File::create(t.path("source")).unwrap();
+        write(&resume, b"continue");
+        let out = child.wait_with_output().unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(read(&t.path("destination")), b"old destination");
+        let changed = prng(17 << 20, 920);
+        write(&t.path("source"), &changed);
+        let out = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--performance-tuning=copy-path=ranges",
+                &t.s("source"),
+                &t.s("destination"),
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("destination")), changed);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(17 * 1024 * 1024 + 123, 357);
+    write(&t.path("source"), &data);
+    for tcp in [false, true] {
+        for pull in [false, true] {
+            for stream in [false, true] {
+                let destination = t.s(&format!("dst-{tcp}-{pull}-{stream}"));
+                let result_path = t.s(&format!("activity-{tcp}-{pull}-{stream}.ndjson"));
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--performance-tuning",
+                    "workers=1",
+                    "--no-progress",
+                    "--results",
+                    &result_path,
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--performance-tuning",
+                    if stream {
+                        "copy-path=streaming,request-size=4194304"
+                    } else {
+                        "copy-path=ranges,request-size=4194304,pipeline-depth=8"
+                    },
+                ]);
+                if tcp {
+                    command.env("SYQ_TEST_REQUIRE_TCP", "1");
+                } else {
+                    command.arg("--no-tcp");
+                }
+                if pull {
+                    command.args(["--from", "host"]);
+                }
+                command.arg(t.s("source"));
+                if !pull {
+                    command.args(["--to", "host"]);
+                }
+                let out = command
+                    .args(["--as", &destination])
+                    .env("SYQ_DEBUG", "1")
+                    .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"))
+                    .run()
+                    .unwrap();
+                assert_output_ok(&out);
+                let stderr = stderr_of(&out);
+                assert!(
+                    stderr.contains("source read-ahead started"),
+                    "tcp={tcp} pull={pull} stream={stream}: {stderr}"
+                );
+                if stream {
+                    assert_eq!(
+                        stderr.matches("source read-ahead started").count(),
+                        1,
+                        "stream should keep one preparation interval: {stderr}"
+                    );
+                }
+                assert_eq!(read(Path::new(&destination)), data);
+                let content = fs::read_to_string(&result_path).unwrap();
+                assert_automation_stream(&automation_validator(), &content, "remote activity");
+                let records: Vec<serde_json::Value> = content
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                let samples: Vec<_> = records.iter().filter_map(|r| r.get("activity")).collect();
+                assert!(samples
+                    .iter()
+                    .any(|s| s["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["actors"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|a| a["fractions"].get("source_read").is_some()))));
+                assert!(samples.iter().any(|s| s["processes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["local"] == false && p["cpu"].is_object())));
+                assert!(
+                    samples.iter().any(|sample| sample["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(
+                            |endpoint| endpoint["actors"].as_array().unwrap().iter().any(|actor| {
+                                actor["role"] == "prefetch"
+                                    && actor["bytes"]["prefetch_advice"]
+                                        .as_u64()
+                                        .is_some_and(|n| n > 0)
+                                    && actor["helper_cpu"].is_object()
+                            })
+                        )),
+                    "helper advice and CPU must be observable: {samples:?}"
+                );
+                if tcp {
+                    assert!(samples.iter().any(|s| s["endpoints"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["peer_tcp"].is_object())));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let data = prng(64 * 1024 + 123, 359);
+    write(&t.path("source"), &data);
+    for (stats, debug, failure) in [
+        (false, false, "reject"),
+        (true, false, "reject"),
+        (false, true, "reject"),
+        (true, false, "disconnect"),
+        (false, true, "disconnect"),
+    ] {
+        let destination = t.s(&format!("destination-{stats}-{debug}-{failure}"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--performance-tuning",
+            "workers=1",
+            "--no-tcp",
+            "--no-progress",
+            "--results",
+            &t.s(&format!("results-{stats}-{debug}-{failure}")),
+        ]);
+        if stats {
+            command.arg("--stats");
+        }
+        if debug {
+            command.env("SYQ_DEBUG", "1");
+        } else {
+            command.env_remove("SYQ_DEBUG");
+        }
+        let out = command
+            .arg(t.s("source"))
+            .args(["--to", "host", "--as", &destination])
+            .env("SYQ_TEST_REJECT_TELEMETRY", failure)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        if debug && failure == "reject" {
+            assert!(stderr_of(&out).contains("small copy: published"), "{out:?}");
+        }
+        assert_eq!(read(Path::new(&destination)), data);
+        assert_eq!(
+            stderr_of(&out).contains(if failure == "reject" {
+                "telemetry unavailable; continuing copy"
+            } else {
+                "recovering without remote telemetry"
+            }),
+            stats || debug,
+            "{out:?}"
+        );
+    }
 }
