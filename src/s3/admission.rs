@@ -67,6 +67,7 @@ struct Controller {
     reference: Option<f64>,
     changed_scores: usize,
     rate_variation: f64,
+    growth_baseline: Option<(usize, f64)>,
 }
 
 impl Controller {
@@ -89,6 +90,7 @@ impl Controller {
             reference: None,
             changed_scores: 0,
             rate_variation: 0.0,
+            growth_baseline: None,
         }
     }
 
@@ -144,6 +146,13 @@ impl Controller {
                     } else {
                         self.upper = probe.from;
                     }
+                    // Preserve momentum after a strong gain. Only reconsider
+                    // an increase whose gain was already sublinear, so one
+                    // later noisy score cannot reverse useful rapid growth.
+                    let growth = self.limit as f64 / probe.from as f64 - 1.0;
+                    self.growth_baseline = (probe.upward
+                        && score < probe.baseline * (1.0 + growth * 0.5))
+                        .then_some((probe.from, probe.baseline));
                     self.upward = probe.upward;
                     self.hold = 0;
                 } else {
@@ -164,6 +173,14 @@ impl Controller {
                 self.hold -= 1;
             } else if score > 0.0 && queued >= measurement_work.max(active.saturating_mul(2)) {
                 self.observe_change(score);
+                if let Some((from, baseline)) = self.growth_baseline.take() {
+                    // Use the latest score, not the transient burst that may
+                    // have accepted the increase. A large concurrency increase
+                    // with little gain can have crossed an intermediate peak.
+                    // Keep the gain, but search that interval before growing.
+                    let concurrency_gain = self.limit as f64 / from as f64 - 1.0;
+                    self.upward = score >= baseline * (1.0 + concurrency_gain * 0.25);
+                }
                 if self.limit == self.maximum {
                     self.upward = false;
                 }
@@ -250,6 +267,7 @@ impl Controller {
                 self.upper = self.maximum + 1;
                 self.failures = [0; 2];
                 self.revisit_at = [0; 2];
+                self.growth_baseline = None;
             } else {
                 if reference > 0.0 {
                     self.rate_variation =
@@ -533,6 +551,48 @@ mod tests {
             }
             rate / (optimum as f64 * 16.0 * jitter)
         }
+    }
+
+    #[test]
+    fn small_upward_gains_refine_the_interval_before_growing_again() {
+        for (probe_rate, later_rate, next) in [
+            (1040.0, 1040.0, 96),
+            (1300.0, 1040.0, 96),
+            (1400.0, 1400.0, 192),
+            (1600.0, 1040.0, 192),
+        ] {
+            let mut controller = Controller::new(64, 256, true);
+            for _ in 0..3 {
+                controller.observe(1000.0, 64, 10000, 16);
+            }
+            assert_eq!(controller.limit, 128);
+            for _ in 0..3 {
+                controller.observe(probe_rate, 128, 10000, 16);
+            }
+            // Both gains are kept. Only the next search direction differs.
+            assert_eq!(controller.limit, 128);
+            assert!(controller.probe.is_none());
+            assert_eq!(controller.lower, 64);
+            controller.observe(later_rate, 128, 10000, 16);
+            assert_eq!(controller.observe(later_rate, 128, 10000, 16), next);
+        }
+    }
+
+    #[test]
+    fn intermediate_optimum_is_found_before_repeated_upward_probes() {
+        let mut controller = Controller::new(64, 256, false);
+        controller.lower = 32;
+        controller.upper = 128;
+        let mut model = PathModel {
+            active: 64,
+            completions: 0.0,
+            random: 251,
+        };
+        // The request ramp rejected 128, but the optimum lies above 64.
+        // Finding a small gain at 96 should lead to testing 80, rather than
+        // spending a short copy probing 112 and returning to 96.
+        let found = (0..20).any(|_| model.sample(&mut controller, 80, 0.0) >= 0.99);
+        assert!(found, "intermediate optimum was not found promptly");
     }
 
     #[test]
