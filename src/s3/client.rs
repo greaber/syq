@@ -10,15 +10,37 @@ use aws_smithy_runtime_api::{
         interceptors::{
             context::{
                 BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+                InterceptorContext,
             },
             Intercept,
         },
+        retries::classifiers::{ClassifyRetry, RetryAction},
         runtime_components::RuntimeComponents,
     },
 };
 use aws_smithy_types::config_bag::ConfigBag;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
+
+// HEAD errors have no XML body, so the SDK cannot recover a provider's
+// TooManyRequests error code. Keep throttling inside its bounded retry policy.
+#[derive(Debug)]
+struct HeadThrottling;
+impl ClassifyRetry for HeadThrottling {
+    fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
+        if context
+            .response()
+            .is_some_and(|r| r.status().as_u16() == 429)
+        {
+            RetryAction::throttling_error()
+        } else {
+            RetryAction::NoActionIndicated
+        }
+    }
+    fn name(&self) -> &'static str {
+        "S3 HEAD throttling"
+    }
+}
 
 #[derive(Debug)]
 struct Headers(Vec<Header>);
@@ -254,7 +276,15 @@ impl Object {
 }
 
 pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Option<Object>> {
-    let output = match client.head_object().bucket(bucket).key(key).send().await {
+    let output = match client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .customize()
+        .config_override(aws_sdk_s3::config::Builder::new().retry_classifier(HeadThrottling))
+        .send()
+        .await
+    {
         Ok(output) => output,
         Err(error)
             if error

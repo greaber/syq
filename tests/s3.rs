@@ -59,6 +59,10 @@ impl Server {
         }
     }
     fn command(&self, temp: &Path) -> Command {
+        self.command_with_retries(temp, 0)
+    }
+    fn command_with_retries(&self, temp: &Path, retries: u32) -> Command {
+        let retry_option = format!("s3-retries={retries}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args([
@@ -66,7 +70,7 @@ impl Server {
                 "--s3-region",
                 "us-east-1",
                 "--performance-tuning",
-                "s3-retries=0",
+                &retry_option,
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",
@@ -267,6 +271,19 @@ fn serve(
             b"",
             false,
         );
+        return;
+    }
+    if method == "HEAD"
+        && (fault == "single-throttle-always"
+            || (matches!(fault, "single-throttle-once" | "single-transient-once")
+                && !gate.0.swap(true, Ordering::SeqCst)))
+    {
+        let status = if fault == "single-transient-once" {
+            503
+        } else {
+            429
+        };
+        reply(&mut socket, status, &[], b"", false);
         return;
     }
     if fault == "head-denied" && method == "HEAD" {
@@ -1506,4 +1523,46 @@ fn s3_head_failure_reports_http_status_without_a_response_body() {
         "{}",
         output_text(&output)
     );
+}
+
+#[test]
+fn s3_head_throttling_uses_the_retry_budget_and_keeps_permanent_errors_final() {
+    for (fault, retries, expected_exit, requests) in [
+        ("single-throttle-once", 2, 0, 2),
+        ("single-transient-once", 2, 0, 2),
+        ("single-throttle-once", 0, 23, 1),
+        ("single-throttle-always", 2, 23, 3),
+        ("head-denied", 2, 23, 1),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        std::fs::write(&path, vec![b'x'; 65536]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1700000000))
+            .unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
 }

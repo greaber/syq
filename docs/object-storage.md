@@ -69,7 +69,7 @@ parallelism rather than bounding the process's total resource use:
 | `s3-max-concurrent-objects=N` | Maximum objects in progress; 1–65536 |
 | `s3-max-concurrent-parts-per-object=N` | Maximum simultaneous parts or ranges for each object; 1–1024 |
 | `s3-part-size=SIZE` | Part/range size; 5M–5G |
-| `s3-retries=N` | Transient retry budget; 0–100, default 10 |
+| `s3-retries=N` | Transient failure and throttling retry budget; 0–100, default 10 |
 
 These are nested concurrency limits, not counts of worker threads. An object
 stays in progress through preparation, hashing, data transfer and finalization.
