@@ -101,7 +101,7 @@ struct Window {
     previous: Option<(usize, f64)>,
     slower_limit: usize,
     probe_preserved_rate: bool,
-    object_rate: Option<(usize, f64)>,
+    object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
 }
 pub(super) struct Budget {
@@ -165,11 +165,11 @@ impl Budget {
     pub fn probe_preserved_rate(&self) -> bool {
         self.state.lock().unwrap().probe_preserved_rate
     }
-    pub fn object_rate(&self, workers: usize) -> Option<f64> {
+    pub fn object_rate(&self, workers: usize) -> Option<(f64, Duration)> {
         let s = self.state.lock().unwrap();
         s.object_rate
-            .filter(|(limit, _)| *limit == workers)
-            .map(|(_, rate)| rate)
+            .filter(|(limit, _, _)| *limit == workers)
+            .map(|(_, rate, elapsed)| (rate, elapsed))
     }
     pub fn rejected_limit(&self) -> Option<usize> {
         let s = self.state.lock().unwrap();
@@ -278,6 +278,7 @@ impl Budget {
                 before,
                 (s.bytes as f64 + s.completed as f64 * crate::tune::FILE_CREDIT as f64)
                     / elapsed.as_secs_f64(),
+                elapsed,
             ));
         }
         super::diagnostics::request_window(
@@ -608,7 +609,8 @@ mod tests {
             (Some((4, 1000.0)), true, 32, 4, 4),
         ] {
             let budget = Arc::new(Budget::new(4, true));
-            budget.state.lock().unwrap().object_rate = rate;
+            budget.state.lock().unwrap().object_rate =
+                rate.map(|(limit, rate)| (limit, rate, Duration::from_secs(1)));
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let (prepared, mut observed) = tokio::sync::mpsc::unbounded_channel();
             let copy_gate = gate.clone();
@@ -672,7 +674,8 @@ mod tests {
             }
             assert!(budget.object_rate(64).is_none());
         }
-        let rate = budget.object_rate(128).unwrap();
+        let (rate, elapsed) = budget.object_rate(128).unwrap();
+        assert!(elapsed >= Duration::from_secs(1));
         let expected = 128.0 * (2048 + crate::tune::FILE_CREDIT) as f64;
         assert!((rate / expected - 1.0).abs() < 0.01);
     }

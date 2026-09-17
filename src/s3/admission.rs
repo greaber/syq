@@ -7,13 +7,15 @@ const SAMPLE: Duration = Duration::from_millis(250);
 
 // Object completions can arrive in batches even on a stationary path. Waiting
 // for adjacent rates to agree discards partial batches, biases the score, and
-// stretches the controller's sampling and backoff periods. Average every pair
-// of eligible observations instead. The driver still requires 16 completions
-// per observation and measures its actual elapsed time.
+// stretches sampling and backoff periods. Combine each pair by elapsed time:
+// sparse completions can extend a window, so equal weighting would overstate
+// the contribution of a short burst. The driver requires 16 completions per
+// observation and supplies its actual duration.
 #[derive(Default)]
 struct RateWindow {
     previous: Option<f64>,
     previous_fresh: Option<f64>,
+    previous_elapsed: Duration,
     discard: bool,
 }
 
@@ -21,20 +23,37 @@ impl RateWindow {
     fn reset(&mut self) {
         self.previous = None;
         self.previous_fresh = None;
+        self.previous_elapsed = Duration::ZERO;
         self.discard = true;
     }
 
-    fn push(&mut self, rate: f64, fresh: f64) -> Option<(f64, f64)> {
+    fn seed(&mut self, rate: f64, elapsed: Duration) {
+        self.previous = Some(rate);
+        self.previous_fresh = None;
+        self.previous_elapsed = elapsed;
+    }
+
+    fn remember(&mut self, rate: f64, fresh: f64, elapsed: Duration) {
+        self.seed(rate, elapsed);
+        self.previous_fresh = Some(fresh);
+    }
+
+    fn push(&mut self, rate: f64, fresh: f64, elapsed: Duration) -> Option<(f64, f64)> {
         if self.discard {
             self.discard = false;
             return None;
         }
         if let Some(previous) = self.previous.take() {
             let previous_fresh = self.previous_fresh.take().unwrap_or(previous);
-            Some(((previous + rate) * 0.5, (previous_fresh + fresh) * 0.5))
+            let seconds = elapsed.as_secs_f64();
+            let previous_seconds = self.previous_elapsed.as_secs_f64();
+            let total = previous_seconds + seconds;
+            Some((
+                (previous * previous_seconds + rate * seconds) / total,
+                (previous_fresh * previous_seconds + fresh * seconds) / total,
+            ))
         } else {
-            self.previous = Some(rate);
-            self.previous_fresh = Some(fresh);
+            self.remember(rate, fresh, elapsed);
             None
         }
     }
@@ -98,6 +117,7 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     fn observe(
         &mut self,
         rate: f64,
@@ -105,6 +125,18 @@ impl Controller {
         queued: usize,
         measurement_work: usize,
         old_rate: f64,
+    ) -> usize {
+        self.observe_window(rate, active, queued, measurement_work, old_rate, SAMPLE)
+    }
+
+    fn observe_window(
+        &mut self,
+        rate: f64,
+        active: usize,
+        queued: usize,
+        measurement_work: usize,
+        old_rate: f64,
+        elapsed: Duration,
     ) -> usize {
         if rate > 0.0 && old_rate >= rate && !self.sampler.discard {
             // No completion in this window describes the new setting yet.
@@ -120,7 +152,7 @@ impl Controller {
             return self.limit;
         }
         let fresh = (rate - old_rate).max(0.0);
-        if let Some((score, fresh_score)) = self.sampler.push(rate, fresh) {
+        if let Some((score, fresh_score)) = self.sampler.push(rate, fresh, elapsed) {
             let before = self.limit;
             self.scores += 1;
             if let Some(mut probe) = self.probe.take() {
@@ -133,8 +165,7 @@ impl Controller {
                     // Old completions could explain the apparent gain. Neither
                     // accept it nor infer a loss from excluding that traffic.
                     // Keep the latest observation so the next one can resolve it.
-                    self.sampler.previous = Some(rate);
-                    self.sampler.previous_fresh = Some(fresh);
+                    self.sampler.remember(rate, fresh, elapsed);
                     self.probe = Some(probe);
                     return self.limit;
                 }
@@ -195,8 +226,7 @@ impl Controller {
                 // Establish a baseline whose old-work contribution is smaller
                 // than the minimum gain we search for. Sparse late completions
                 // can still be included without restarting the whole warmup.
-                self.sampler.previous = Some(rate);
-                self.sampler.previous_fresh = Some(fresh);
+                self.sampler.remember(rate, fresh, elapsed);
                 return self.limit;
             } else if self.hold > 0 {
                 self.hold -= 1;
@@ -359,8 +389,10 @@ where
         );
         if let Some(requests) = &concurrency.requests {
             // Reuse a full-count score only at the same limit. If an immediate
-            // probe is not justified, it supplies half of the new baseline.
-            controller.sampler.previous = requests.object_rate(initial);
+            // probe is not justified, it supplies the first baseline observation.
+            if let Some((rate, elapsed)) = requests.object_rate(initial) {
+                controller.sampler.seed(rate, elapsed);
+            }
             // The ramp may also have demonstrated that fewer requests lose
             // throughput. Revisit that bound normally if conditions change.
             controller.lower = requests.slower_limit().min(initial.saturating_sub(1));
@@ -499,10 +531,11 @@ where
                         });
                     }
                     let before = limit;
-                    limit = controller.as_mut().unwrap().observe(
+                    limit = controller.as_mut().unwrap().observe_window(
                         activity as f64 / elapsed.as_secs_f64(), tasks.len(), jobs.len(),
                         (completed as f64 * 4.0 * SAMPLE.as_secs_f64() / elapsed.as_secs_f64()).ceil() as usize,
                         old_activity as f64 / elapsed.as_secs_f64(),
+                        elapsed,
                     );
                     if limit != before {
                         generation += 1;
@@ -549,12 +582,12 @@ mod tests {
     #[test]
     fn resetting_measurements_excludes_the_previous_setting() {
         let mut window = Controller::new(7, 256, false).sampler;
-        assert!(window.push(100.0, 100.0).is_none());
-        assert!(window.push(10000.0, 10000.0).is_none());
+        assert!(window.push(100.0, 100.0, SAMPLE).is_none());
+        assert!(window.push(10000.0, 10000.0, SAMPLE).is_none());
         window.reset();
-        assert!(window.push(20000.0, 20000.0).is_none());
-        assert!(window.push(10.0, 10.0).is_none());
-        assert_eq!(window.push(20.0, 20.0), Some((15.0, 15.0)));
+        assert!(window.push(20000.0, 20000.0, SAMPLE).is_none());
+        assert!(window.push(10.0, 10.0, SAMPLE).is_none());
+        assert_eq!(window.push(20.0, 20.0, SAMPLE), Some((15.0, 15.0)));
     }
 
     #[test]
@@ -611,7 +644,7 @@ mod tests {
     fn sparse_old_completions_do_not_delay_clear_decisions() {
         let mut controller = Controller::new(256, 512, true);
         controller.upper = 512;
-        controller.sampler.previous = Some(300.0);
+        controller.sampler.seed(300.0, SAMPLE);
         assert_eq!(controller.observe(300.0, 256, 10000, 16, 300.0), 256);
         assert_eq!(controller.observe(300.0, 256, 10000, 16, 2.0), 384);
         assert_eq!(controller.observe(300.0, 384, 10000, 16, 300.0), 384);
@@ -679,20 +712,50 @@ mod tests {
     #[test]
     fn inherited_request_score_still_excludes_the_handoff_warmup() {
         let mut controller = Controller::new(32, 256, true);
-        controller.sampler.previous = Some(1000.0);
+        controller.sampler.seed(1000.0, SAMPLE);
         assert_eq!(controller.observe(100000.0, 32, 10000, 16, 0.0), 32);
         assert_eq!(controller.observe(1000.0, 32, 10000, 16, 0.0), 64);
         assert_eq!(controller.probe.as_ref().unwrap().baseline, 1000.0);
     }
 
     #[test]
+    fn a_short_burst_cannot_outweigh_a_long_slow_window() {
+        for reverse in [false, true] {
+            let mut samples = [(960.0, SAMPLE), (16.0 / 1.5, Duration::from_millis(1500))];
+            if reverse {
+                samples.reverse();
+            }
+            let mut sampler = RateWindow::default();
+            assert!(sampler
+                .push(samples[0].0, samples[0].0 * 0.5, samples[0].1)
+                .is_none());
+            let (total, fresh) = sampler
+                .push(samples[1].0, samples[1].0 * 0.5, samples[1].1)
+                .unwrap();
+            assert!((total - 256.0 / 1.75).abs() < 1e-9);
+            assert!((fresh - 128.0 / 1.75).abs() < 1e-9);
+        }
+        let mut controller = Controller::new(256, 1024, true);
+        for _ in 0..3 {
+            controller.observe(475.0, 256, 10000, 16, 0.0);
+        }
+        assert_eq!(controller.limit, 512);
+        controller.observe(475.0, 512, 10000, 16, 475.0); // Warmup.
+        controller.observe_window(960.0, 512, 10000, 16, 0.0, SAMPLE);
+        assert_eq!(
+            controller.observe_window(16.0 / 1.5, 512, 10000, 16, 0.0, Duration::from_millis(1500)),
+            256
+        );
+    }
+
+    #[test]
     fn scores_include_partial_completion_batches() {
         let mut sampler = Controller::new(7, 256, false).sampler;
-        assert!(sampler.push(0.0, 0.0).is_none()); // Discard the warmup observation.
+        assert!(sampler.push(0.0, 0.0, SAMPLE).is_none()); // Discard the warmup observation.
         let counts = [28.0, 35.0, 35.0, 28.0, 35.0, 35.0];
         let scores: Vec<_> = counts
             .into_iter()
-            .filter_map(|rate| sampler.push(rate, rate))
+            .filter_map(|rate| sampler.push(rate, rate, SAMPLE))
             .collect();
         assert_eq!(scores.len(), 3);
         let measured = scores.iter().map(|(score, _)| score).sum::<f64>() / scores.len() as f64;
