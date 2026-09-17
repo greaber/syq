@@ -55,15 +55,22 @@ every request, including listing, multipart operations, and retries. Use
 provider headers that are valid on all these operations. Repeating the same
 name uses the last value. Headers are passed through, not interpreted as a
 metadata-editing operation: the service may apply a header differently to
-CopyObject and multipart creation. Syq refuses overrides of authentication, request
+CopyObject and multipart creation. For example, a custom `x-amz-meta-project`
+header does not replace source metadata under CopyObject’s COPY directive,
+but can set metadata during multipart creation. Such an override can cause
+repeated copying because destination metadata keeps differing from the source.
+Syq refuses overrides of authentication, request
 framing, ranges, conditional writes, checksums, and its own metadata headers.
 Header values are omitted from results and recovery records. Command-line
 arguments may still be visible to other processes on the machine.
 
 The account needs object read/write and bucket listing permissions. Multipart
 recovery also needs permission to list uploaded parts and abort obsolete
-uploads. Server-side copies also need permission to read source tags and write
-destination tags; syq fails if it cannot preserve them. Syq does not change
+uploads. Server-side copies preserve tags. Multipart copies read source tags
+unless HEAD explicitly reports zero tags, so they can require tag-reading
+permission in addition to the permissions for a single-request copy. Missing
+tag counts are treated as unknown; syq fails rather than silently dropping tags.
+Writing copied tags requires the corresponding destination permission. Syq does not change
 bucket policies or lifecycle rules.
 
 ## Parallelism
@@ -168,7 +175,9 @@ part of this quick check; tag-only changes do not trigger a copy.
 S3 permits a key and keys beneath its corresponding prefix to coexist. Server-side
 copies do not reject an existing destination solely for that reason.
 
-Large objects use concurrent multipart server-side copying, with the shared
+By default, server-side copies use one copy request up to the 5 GiB limit.
+An explicit `s3-part-size` also sets the multipart threshold, capped at that
+limit. Larger objects use concurrent multipart server-side copying, with the shared
 request budget and per-object part limit described above. Failed or cancelled
 multipart copies attempt to abort their unfinished upload; retries restart that object.
 If cleanup fails, syq reports the upload ID for manual cleanup. Already completed

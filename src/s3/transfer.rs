@@ -160,7 +160,7 @@ impl Engine {
             {
                 bail!("an expected digest requires exactly one regular file");
             }
-            self.check_upload_placement(plan.first().is_some_and(|s| s.kind() != "dir"))
+            self.check_upload_placement(plan.first().map(|s| s.kind() != "dir"))
                 .await?;
             self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
                 .await?;
@@ -433,7 +433,7 @@ impl Engine {
 
         Ok(())
     }
-    async fn check_upload_placement(&self, single_object: bool) -> Result<()> {
+    async fn check_upload_placement(&self, single_object: Option<bool>) -> Result<()> {
         if self.args.target_existence == Existence::Any {
             return Ok(());
         }
@@ -451,7 +451,7 @@ impl Engine {
             format!("{target}/")
         };
         let needs_prefix = self.args.target_existence == Existence::Existing
-            && (self.args.placement != Placement::As || !single_object);
+            && (self.args.placement != Placement::As || single_object == Some(false));
         let present = (!needs_prefix && exact)
             || client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
         if (self.args.target_existence == Existence::New && present)
@@ -459,7 +459,8 @@ impl Engine {
         {
             bail!("S3 destination existence condition failed");
         }
-        if self.args.placement == Placement::As && single_object && present && !exact {
+        if self.args.placement == Placement::As && single_object == Some(true) && present && !exact
+        {
             bail!("S3 destination is a prefix, not an object");
         }
         Ok(())
@@ -1176,21 +1177,8 @@ impl Engine {
                 selectors.push((key, path, location.selection, None, None));
             }
         }
-        if self.options.source_bucket.is_some() {
-            if selectors.iter().any(|s| s.4.is_some()) {
-                bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
-            }
-            if self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str()) {
-                for (source, _, _, _, _) in &selectors {
-                    for (_, target, _, _, _) in &selectors {
-                        if super::prune::beneath(source.as_bytes(), target.as_bytes()).is_some()
-                            || super::prune::beneath(target.as_bytes(), source.as_bytes()).is_some()
-                        {
-                            bail!("S3 source and destination paths overlap in the same bucket");
-                        }
-                    }
-                }
-            }
+        if self.options.source_bucket.is_some() && selectors.iter().any(|s| s.4.is_some()) {
+            bail!("S3-to-S3 copies stay server-side; mapping expected digests require reading object contents and are not supported");
         }
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let min = self
@@ -1215,6 +1203,10 @@ impl Engine {
         let mut out = Vec::new();
         let mut claims = BTreeMap::new();
         let mut excluded_subtrees = HashSet::new();
+        let same_bucket =
+            self.options.source_bucket.as_deref() == Some(self.options.bucket.as_str());
+        let mut copy_sources = Vec::new();
+        let mut copy_targets = Vec::new();
         for (key, path, selection, declared_kind, expected_digest) in selectors {
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
@@ -1297,6 +1289,17 @@ impl Engine {
                 self.progress
                     .files_excluded
                     .fetch_add(listed.excluded, Relaxed);
+                if same_bucket {
+                    copy_sources.push((prefix.clone(), true));
+                    copy_targets.push((
+                        if path.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{path}/")
+                        },
+                        true,
+                    ));
+                }
                 if self.args.delete {
                     prune.scope(path.as_bytes(), key.as_bytes());
                 }
@@ -1320,6 +1323,17 @@ impl Engine {
             };
             for (key, size, path) in objects {
                 let directory = key.ends_with('/') && size == 0;
+                if same_bucket {
+                    copy_sources.push((key.clone(), false));
+                    copy_targets.push((
+                        if directory {
+                            format!("{path}/")
+                        } else {
+                            path.clone()
+                        },
+                        false,
+                    ));
+                }
                 if !already_filtered {
                     if let Some(excluded) =
                         client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
@@ -1342,7 +1356,10 @@ impl Engine {
                 if self.args.delete {
                     if directory {
                         prune.claim(path.as_bytes());
-                    } else if self.options.source_bucket.is_some() {
+                    } else if self.options.source_bucket.is_some()
+                        && !self.args.ignore_existing
+                        && !self.args.existing
+                    {
                         prune.claim_file(path.as_bytes());
                     } else {
                         prune.protect(path.as_bytes());
@@ -1355,6 +1372,9 @@ impl Engine {
                     expected_digest: expected_digest.clone(),
                 });
             }
+        }
+        if same_bucket {
+            server_copy::check_overlap(&copy_sources, &copy_targets)?;
         }
         Ok((out, prune))
     }

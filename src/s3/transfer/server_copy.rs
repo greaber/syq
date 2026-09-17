@@ -88,7 +88,66 @@ fn encoded_source(bucket: &str, object: &Object) -> String {
     source
 }
 
+// Prefix ranges include their trailing slash; exact marker objects are exact
+// keys too. Ordered lookups avoid comparing every source with every target.
+pub(super) fn check_overlap(sources: &[(String, bool)], targets: &[(String, bool)]) -> Result<()> {
+    use std::collections::BTreeSet;
+    let exact: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, prefix)| !prefix)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let prefixes: BTreeSet<&str> = sources
+        .iter()
+        .filter(|(_, prefix)| *prefix)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    for (key, prefix) in targets {
+        let key = key.as_str();
+        let inside_source = prefixes.contains("")
+            || key
+                .match_indices('/')
+                .any(|(index, _)| prefixes.contains(&key[..=index]));
+        let contains_source = *prefix
+            && (exact
+                .range(key..)
+                .next()
+                .is_some_and(|source| source.starts_with(key))
+                || prefixes
+                    .range(key..)
+                    .next()
+                    .is_some_and(|source| source.starts_with(key)));
+        anyhow::ensure!(
+            !(exact.contains(key) || inside_source || contains_source),
+            "S3 source and destination paths overlap in the same bucket"
+        );
+    }
+    Ok(())
+}
+
 impl Engine {
+    fn copy_error(&self, error: anyhow::Error) -> anyhow::Error {
+        if error
+            .downcast_ref::<client::RequestFailure>()
+            .is_some_and(|e| e.region_mismatch())
+        {
+            error.context(format!("S3-to-S3 source bucket {:?} and destination bucket {:?} both use region {}; cross-region copies are not supported by this route, and changing --s3-region changes both endpoints",
+                self.options.source_bucket.as_deref().unwrap(), self.options.bucket,
+                self.client.config().region().map_or("unknown", |region| region.as_ref())))
+        } else {
+            error
+        }
+    }
+
+    pub(super) fn copy_request_limit(&self, size: u64) -> u64 {
+        const MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024;
+        if self.options.automatic_part_size {
+            MAX_SINGLE_COPY
+        } else {
+            self.part_size(size).min(MAX_SINGLE_COPY)
+        }
+    }
+
     async fn copy_head(
         &self,
         bucket: &str,
@@ -131,17 +190,25 @@ impl Engine {
             Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => {
                 return Ok(None)
             }
-            Err(e) => return Err(e.into_service_error()).context("S3 copy HEAD failed"),
+            Err(e) => {
+                let detail = client::failure("S3 copy HEAD", &e);
+                return Err(
+                    self.copy_error(anyhow::Error::new(e.into_service_error()).context(detail))
+                );
+            }
         };
         Ok(Some((client::from_head(key, &output)?, output)))
     }
 
     pub(super) async fn server_copy(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let (plan, prune) = self.download_plan(&target).await?;
+        let (plan, prune) = self
+            .download_plan(&target)
+            .await
+            .map_err(|error| self.copy_error(error))?;
         self.check_upload_placement(
             plan.first()
-                .is_some_and(|job| job.path == target && !job.key.ends_with('/')),
+                .map(|job| job.path == target && !job.key.ends_with('/')),
         )
         .await?;
         let keys: Vec<_> = plan.iter().map(copy_destination_key).collect();
@@ -229,7 +296,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing || self.args.target_existence == Existence::New;
         // Respect explicit part sizing for both performance control and exercising
         // multipart copying with small disposable fixtures.
-        if source.size <= self.part_size(source.size).min(5 * 1024 * 1024 * 1024) {
+        if source.size <= self.copy_request_limit(source.size) {
             let _slot = self.tuning.requests.acquire().await;
             self.client
                 .copy_object()
@@ -272,16 +339,20 @@ impl Engine {
         );
         let setup_slot = self.tuning.requests.acquire().await;
         self.check_cancelled()?;
-        let tags = self
-            .client
-            .get_object_tagging()
-            .bucket(bucket)
-            .key(&source.key)
-            .set_version_id(source.version.clone())
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())?;
-        let tagging = {
+        let tagging = if metadata.tag_count() == Some(0) {
+            String::new()
+        } else {
+            // Missing tag count is unknown, not zero: permission and provider
+            // differences can omit it even when tags exist.
+            let tags = self
+                .client
+                .get_object_tagging()
+                .bucket(bucket)
+                .key(&source.key)
+                .set_version_id(source.version.clone())
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())?;
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             for tag in tags.tag_set() {
                 serializer.append_pair(tag.key(), tag.value());
@@ -405,5 +476,45 @@ impl Engine {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn overlap_distinguishes_exact_keys_from_prefixes() {
+        let keys = |values: &[(&str, bool)]| {
+            values
+                .iter()
+                .map(|(key, prefix)| ((*key).to_owned(), *prefix))
+                .collect::<Vec<_>>()
+        };
+        for (sources, targets, overlap) in [
+            (vec![("a/child", false)], vec![("a", false)], false),
+            (vec![("a", false)], vec![("a/child", false)], false),
+            (vec![("a/", false)], vec![("a/child", false)], false),
+            (vec![("a", false)], vec![("a", false)], true),
+            (vec![("a/", true)], vec![("a/child", false)], true),
+            (vec![("a/child", false)], vec![("a/", true)], true),
+            (vec![("a/", true)], vec![("a/sub/", true)], true),
+            (vec![("a/", true)], vec![("ab/", true)], false),
+            (vec![("a", false)], vec![("", true)], true),
+            (vec![("", true)], vec![("a", false)], true),
+        ] {
+            assert_eq!(
+                check_overlap(&keys(&sources), &keys(&targets)).is_err(),
+                overlap,
+                "{sources:?} {targets:?}"
+            );
+        }
+        // Exercise manifest-sized input; the former nested loop had 400M pairs.
+        let sources: Vec<_> = (0..20_000)
+            .map(|i| (format!("source/{i}"), false))
+            .collect();
+        let targets: Vec<_> = (0..20_000)
+            .map(|i| (format!("target/{i}"), false))
+            .collect();
+        check_overlap(&sources, &targets).unwrap();
     }
 }

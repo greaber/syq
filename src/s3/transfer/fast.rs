@@ -22,7 +22,12 @@ impl Engine {
         }
         let average = bytes / count;
         let tiny = average < 1024 * 1024;
-        let single_request = largest <= self.part_size(largest);
+        let single_request = largest
+            <= if self.options.source_bucket.is_some() {
+                self.copy_request_limit(largest)
+            } else {
+                self.part_size(largest)
+            };
         let fixed_workers = self.args.tuning_options.and_then(|t| t.s3_object_workers);
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload =
@@ -432,6 +437,33 @@ impl AsRef<[u8]> for UploadBuffer {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn server_copy_threshold_tracks_single_request_scheduling() {
+        let mut engine = planning_engine(&[]);
+        engine.options.source_bucket = Some("source".into());
+        let limit = 5 * 1024 * 1024 * 1024;
+        assert_eq!(engine.copy_request_limit(32 << 20), limit);
+        assert_eq!(engine.copy_request_limit(limit + 1), limit);
+        assert!(engine
+            .object_workers([256 << 20; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_some());
+        assert!(engine
+            .object_workers([limit + 1; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_none());
+        let mut explicit = planning_engine(&["--performance-tuning", "s3-part-size=64M"]);
+        explicit.options.source_bucket = Some("source".into());
+        assert_eq!(explicit.copy_request_limit(32 << 20), 64 << 20);
+        assert!(explicit
+            .object_workers([256 << 20; 100].into_iter())
+            .unwrap()
+            .maximum
+            .is_none());
+    }
 
     #[tokio::test]
     async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {

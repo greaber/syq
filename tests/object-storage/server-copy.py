@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import urllib.error
 import check as c
 
@@ -133,6 +134,40 @@ def check():
             assert error.code == 404, error
         else:
             raise AssertionError('foreign descendant survived prune')
+        # Filtering every source must not turn --as-existing into a directory check.
+        c.run(['--from', remote, name, '--to', remote, '--as-existing', name + '-copy',
+               '--max-size=0'])
+        local_file = root / 'filtered-file'
+        local_file.write_bytes(b'filtered')
+        c.run([local_file, '--to', remote, '--as-existing', name + '-copy', '--max-size=0'])
+        assert c.request('GET', name + '-copy')[1] == b'same body'
+        # Exact target keys may prefix another source key without overwriting it.
+        mapped = c.PREFIX + '/exact-map'
+        c.request('PUT', mapped + '/source', b'first')
+        c.request('PUT', mapped + '/parent/child', b'second')
+        manifest = root / 'exact-map.jsonl'
+        entries = [{'src': {'encoding': 'utf-8', 'value': mapped + '/' + src},
+                    'dst': {'encoding': 'utf-8', 'value': dst}, 'kind': 'file'}
+                   for src, dst in [('source', 'parent'), ('parent/child', 'out')]]
+        manifest.write_text(''.join(json.dumps(entry) + '\n' for entry in entries))
+        c.run(['--from', remote, '--mapping', manifest, '--to', remote, '--into', mapped])
+        assert c.request('GET', mapped + '/parent')[1] == b'first'
+        assert c.request('GET', mapped + '/out')[1] == b'second'
+        assert c.request('GET', mapped + '/parent/child')[1] == b'second'
+        c.request('DELETE', mapped + '/parent')
+        c.request('DELETE', mapped + '/parent/child')
+        # Default sizing must not turn a modest foreign object into multipart data
+        # whose ETag differs on every subsequent copy.
+        automatic = c.PREFIX + '/automatic'
+        c.request('PUT', automatic, b'x' * (32 * 1024 * 1024))
+        results = root / 'automatic-results.jsonl'
+        command = [str(c.SYQ), 'cp', '--no-progress', '--from', remote, automatic,
+                   '--to', remote, '--as', automatic + '-copy', '--results', str(results)]
+        for copied in [1, 0]:
+            subprocess.run(command, check=True, timeout=180)
+            terminal = json.loads(results.read_text().splitlines()[-1])
+            assert terminal['files_transferred'] == copied, terminal
+            results.unlink()
         assert not c.listing(uploads=True), 'unfinished server copies remain'
         print('S3 server-copy checks passed', flush=True)
 

@@ -153,26 +153,42 @@ fn response_region(
         .map(str::to_owned)
 }
 
-/// Describe a failed request. A bodyless redirect otherwise reads as an
-/// "unhandled error", although S3 says where the bucket is.
-fn failure<E>(
+#[derive(Debug)]
+pub(super) struct RequestFailure {
+    operation: String,
+    status: Option<u16>,
+    region: Option<String>,
+}
+impl RequestFailure {
+    pub(super) fn region_mismatch(&self) -> bool {
+        self.status == Some(301) && self.region.is_some()
+    }
+}
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed", self.operation)?;
+        if let Some(status) = self.status {
+            write!(f, " (HTTP {status})")?;
+        }
+        if let (Some(301), Some(region)) = (self.status, &self.region) {
+            write!(f, ": the bucket is in region {region}; check the configured endpoint and signing region")?;
+        }
+        Ok(())
+    }
+}
+
+/// Preserve structured region information for the two-endpoint copy diagnostic.
+pub(super) fn failure<E>(
     operation: &str,
     error: &aws_sdk_s3::error::SdkError<
         E,
         aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
-) -> String {
-    let response = error.raw_response();
-    match (
-        response.map(|r| r.status().as_u16()),
-        response_region(response),
-    ) {
-        (Some(301), Some(region)) => format!(
-            "{operation} failed (HTTP 301): the bucket is in region {region}; \
-             pass --s3-region {region} or set AWS_REGION"
-        ),
-        (Some(status), _) => format!("{operation} failed (HTTP {status})"),
-        (None, _) => format!("{operation} failed"),
+) -> RequestFailure {
+    RequestFailure {
+        operation: operation.into(),
+        status: error.raw_response().map(|r| r.status().as_u16()),
+        region: response_region(error.raw_response()),
     }
 }
 
@@ -451,8 +467,10 @@ pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -
         .max_keys(1)
         .send()
         .await
-        .map_err(|e| e.into_service_error())
-        .context("S3 listing failed")?;
+        .map_err(|e| {
+            let detail = failure("S3 listing", &e);
+            anyhow::Error::new(e.into_service_error()).context(detail)
+        })?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
@@ -614,8 +632,10 @@ pub(super) async fn list(
                 .set_continuation_token(token.clone())
                 .send()
                 .await
-                .map_err(|e| e.into_service_error())
-                .context("S3 listing failed")?;
+                .map_err(|e| {
+                    let detail = failure("S3 listing", &e);
+                    anyhow::Error::new(e.into_service_error()).context(detail)
+                })?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             let mut reachable_exclusion = false;
             if probes_remaining > 0
@@ -654,8 +674,10 @@ pub(super) async fn list(
                         .delimiter("/")
                         .send()
                         .await
-                        .map_err(|e| e.into_service_error())
-                        .context("S3 listing failed")?;
+                        .map_err(|e| {
+                            let detail = failure("S3 listing", &e);
+                            anyhow::Error::new(e.into_service_error()).context(detail)
+                        })?;
                     let mut included = 0;
                     let mut excluded = 0;
                     for child in directory_page.common_prefixes() {

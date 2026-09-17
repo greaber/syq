@@ -62,6 +62,9 @@ impl Server {
         self.command_with_retries(temp, 0)
     }
     fn command_with_retries(&self, temp: &Path, retries: u32) -> Command {
+        self.command_with_part_size(temp, retries, true)
+    }
+    fn command_with_part_size(&self, temp: &Path, retries: u32, explicit: bool) -> Command {
         let retry_option = format!("s3-retries={retries}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
@@ -74,8 +77,6 @@ impl Server {
                 "--s3-header",
                 "X-Tigris-Consistent: true",
                 "--no-progress",
-                "--performance-tuning",
-                "s3-part-size=5M",
                 "--performance-tuning",
                 "s3-max-concurrent-parts-per-object=3",
             ])
@@ -90,6 +91,9 @@ impl Server {
             .env("AWS_SHARED_CREDENTIALS_FILE", temp.join("no-credentials"))
             .env("XDG_CACHE_HOME", temp.join("cache"))
             .current_dir(temp);
+        if explicit {
+            command.args(["--performance-tuning", "s3-part-size=5M"]);
+        }
         command
     }
     fn cp(&self, temp: &Path, args: &[&str]) -> Output {
@@ -158,6 +162,23 @@ fn serve(
         if method == "HEAD" {
             if path == "/source/data" {
                 reply(&mut socket, 404, &[], b"", true);
+            } else if path.starts_with("/destination/")
+                && (fault.ends_with("skipped") || fault.ends_with("missing"))
+            {
+                if fault.ends_with("missing") {
+                    reply(&mut socket, 404, &[], b"", true);
+                } else {
+                    reply(
+                        &mut socket,
+                        200,
+                        &[
+                            ("Content-Length".into(), "4".into()),
+                            ("ETag".into(), "\"source\"".into()),
+                        ],
+                        b"",
+                        true,
+                    );
+                }
             } else {
                 assert!(
                     path.starts_with("/source/data/"),
@@ -201,7 +222,9 @@ fn serve(
                     !gate.1.swap(true, Ordering::SeqCst),
                     "destination listing was not reused for prune"
                 );
-                if fault.ends_with("prune") {
+                if fault.ends_with("skipped") || fault.ends_with("missing") {
+                    &["out/a/part1", "out/b/part1"]
+                } else if fault.ends_with("prune") {
                     &["out/a/part1"]
                 } else {
                     &[]
@@ -294,7 +317,9 @@ fn serve(
                 let mut fields = vec![
                     (
                         "Content-Length".into(),
-                        if multipart {
+                        if fault == "server-copy-automatic" {
+                            (32 * 1024 * 1024).to_string()
+                        } else if multipart {
                             (6 * 1024 * 1024).to_string()
                         } else {
                             "4".into()
@@ -346,6 +371,12 @@ fn serve(
                         },
                     ));
                 }
+                if fault.ends_with("zero-tags") {
+                    fields.push(("x-amz-tagging-count".into(), "0".into()));
+                }
+                if fault.ends_with("tags-denied") {
+                    fields.push(("x-amz-tagging-count".into(), "1".into()));
+                }
                 if fault == "server-copy-compare-metadata" {
                     fields.push((
                         "x-amz-meta-project".into(),
@@ -357,6 +388,17 @@ fn serve(
                 reply(&mut socket, 404, &[], b"", true);
             }
         } else if multipart && path.contains("tagging") {
+            assert!(!fault.ends_with("zero-tags"));
+            if fault.ends_with("denied") {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code></Error>",
+                    false,
+                );
+                return;
+            }
             assert_eq!(method, "GET");
             reply(
                 &mut socket,
@@ -1319,7 +1361,7 @@ fn s3_wrong_region_redirects_name_the_bucket_region() {
         assert!(!output.status.success(), "{text}");
         assert!(
             text.contains("(HTTP 301): the bucket is in region eu-central-1")
-                && text.contains("--s3-region eu-central-1"),
+                && text.contains("configured endpoint and signing region"),
             "{text}"
         );
     }
@@ -2751,4 +2793,115 @@ fn s3_path_latency_is_one_response_not_the_whole_listing() {
     let control = plan["control_s"].as_f64().expect("observed latency");
     assert!(control < 0.05, "listing time was taken for latency: {plan}");
     assert_eq!(plan["request_limit"], 64, "{plan}");
+}
+
+#[test]
+fn server_copy_automatic_sizing_uses_one_copy_request() {
+    let server = Server::start("server-copy-automatic");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server
+        .command_with_part_size(temp.path(), 0, false)
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn server_copy_prune_protects_keys_under_skip_options() {
+    for (fault, option) in [
+        ("server-tree-skipped", "--only-new"),
+        ("server-tree-missing", "--only-existing"),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://destination",
+                "--into",
+                "out",
+                "--prune",
+                option,
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.requests.load(Ordering::Relaxed), 7);
+    }
+}
+
+#[test]
+fn server_copy_only_skips_tag_reads_for_explicit_zero() {
+    for (fault, success, requests) in [
+        ("server-copy-multipart-zero-tags", true, 7),
+        ("server-copy-multipart-tags-denied", false, 4),
+        ("server-copy-multipart-unknown-denied", false, 4),
+    ] {
+        let server = Server::start(fault);
+        let temp = tempfile::tempdir().unwrap();
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "original",
+                "--to",
+                "s3://destination",
+                "--as",
+                "copied",
+            ],
+        );
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests, "{fault}");
+    }
+}
+
+#[test]
+fn server_copy_region_error_explains_both_endpoints() {
+    let server = Server::start("wrong-region");
+    let temp = tempfile::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "original",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+        ],
+    );
+    let text = output_text(&output);
+    assert!(!output.status.success());
+    assert!(
+        text.contains("source")
+            && text.contains("destination")
+            && text.contains("changing --s3-region changes both endpoints")
+            && text.contains("eu-central-1"),
+        "{text}"
+    );
+    assert!(!text.contains("pass --s3-region eu-central-1"), "{text}");
+    assert_eq!(server.requests.load(Ordering::Relaxed), 1);
 }
