@@ -21686,7 +21686,6 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "--as",
                     &t.s("out"),
                 ])
-                .process_group(0)
                 .env(ready_env, &ready)
                 .env(continue_env, &continuation)
                 // This barrier covers the second complete copy, including
@@ -21695,33 +21694,13 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                 .stderr(Stdio::piped())
                 .start()
                 .unwrap();
-            let preparing = std::time::Instant::now();
-            let stage = format!(
-                "overlapping copy preparation (identical={identical}, existing={existing})"
+            wait_for_confinement_marker(
+                &mut first,
+                &ready,
+                &format!(
+                    "overlapping copy preparation (identical={identical}, existing={existing})"
+                ),
             );
-            let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                wait_for_confinement_marker(&mut first, &ready, &stage);
-            }));
-            writeln!(
-                std::io::stderr(),
-                "{stage}: elapsed={:?}, ready={}",
-                preparing.elapsed(),
-                ready.exists()
-            )
-            .unwrap();
-            if let Err(panic) = waited {
-                eprintln!(
-                    "after diagnostics: elapsed={:?}, ready={}",
-                    preparing.elapsed(),
-                    ready.exists()
-                );
-                // The test owns this process group, including any local helpers.
-                unsafe {
-                    libc::kill(-(first.id() as i32), libc::SIGKILL);
-                }
-                eprintln!("first copy output: {:?}", first.wait_with_output());
-                std::panic::resume_unwind(panic);
-            }
             let second_started = std::time::Instant::now();
             let second = Command::new(env!("CARGO_BIN_EXE_syq"))
                 .args([
@@ -22450,24 +22429,5 @@ fn rejected_telemetry_subscription_does_not_fail_remote_copy() {
             stats || debug,
             "{out:?}"
         );
-    }
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[ignore = "temporary macOS CI reproduction for PR 383"]
-fn debug_concurrent_publication_with_neighboring_tests() {
-    for round in 0..10 {
-        writeln!(
-            std::io::stderr(),
-            "concurrent publication reproduction round {round}"
-        )
-        .unwrap();
-        std::thread::scope(|scope| {
-            scope.spawn(concurrent_copies_union);
-            scope.spawn(concurrent_default_tree_copies_keep_every_file_whole);
-            scope.spawn(concurrent_small_pushes_publish_independent_files);
-            concurrent_identical_and_different_copies_publish_complete_files();
-        });
     }
 }
