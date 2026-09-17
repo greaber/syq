@@ -144,6 +144,9 @@ impl Budget {
             ready.await;
         }
     }
+    pub fn preparation_limit(&self) -> usize {
+        self.state.lock().unwrap().limit.saturating_add(1)
+    }
     pub fn rejected_increase(&self) -> bool {
         let s = self.state.lock().unwrap();
         s.settled && s.previous.is_some_and(|(previous, _)| s.limit == previous)
@@ -296,6 +299,77 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn request_ramp_bounds_preparation_and_refills_after_growth() {
+        let budget = Arc::new(Budget::new(2, true));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (prepared, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let copy_budget = budget.clone();
+        let copy_gate = gate.clone();
+        let copy = tokio::spawn(async move {
+            crate::s3::admission::parallel(
+                (0..8).collect(),
+                crate::s3::admission::Concurrency {
+                    initial: 8,
+                    maximum: Some(16),
+                    initial_probe_up: true,
+                    requests: Some(copy_budget.clone()),
+                },
+                move |job| {
+                    let budget = copy_budget.clone();
+                    let gate = copy_gate.clone();
+                    let prepared = prepared.clone();
+                    async move {
+                        prepared.send(job).unwrap();
+                        let _permit = budget.acquire().await;
+                        gate.acquire().await.unwrap().forget();
+                        Ok(Some(1024))
+                    }
+                },
+            )
+            .await
+        });
+        let mut jobs = Vec::new();
+        for _ in 0..3 {
+            jobs.push(
+                tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                    .await
+                    .expect("prepared work did not refill")
+                    .unwrap(),
+            );
+        }
+        let extra_before = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
+        let saturated = budget.state.lock().unwrap().saturated;
+        budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
+        for _ in 0..16 {
+            budget.completed(1024);
+        }
+        let grown_limit = budget.state.lock().unwrap().limit;
+        for _ in 0..2 {
+            jobs.push(
+                tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                    .await
+                    .expect("prepared work did not refill")
+                    .unwrap(),
+            );
+        }
+        let extra_after = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
+        gate.add_permits(8);
+        copy.await.unwrap().unwrap();
+        while let Some(job) = observed.recv().await {
+            jobs.push(job);
+        }
+        assert!(extra_before.is_err(), "prepared more than one waiting job");
+        assert!(saturated, "the prepared waiter must signal request demand");
+        assert_eq!(grown_limit, 4);
+        assert!(
+            extra_after.is_err(),
+            "growth prepared too many waiting jobs"
+        );
+        jobs.sort_unstable();
+        assert_eq!(jobs, (0..8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn object_handoff_tries_downward_after_a_rejected_request_increase() {
         use std::sync::atomic::AtomicUsize;
 
@@ -380,7 +454,7 @@ mod tests {
             )
             .await
         });
-        // Two requests are running; the other six live jobs wait for a permit.
+        // Two requests are running; prepared work waits for a permit.
         observed.recv().await.unwrap();
         observed.recv().await.unwrap();
         budget.state.lock().unwrap().settled = true;

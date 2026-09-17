@@ -330,7 +330,18 @@ where
                 .finish_objects(concurrency.maximum.unwrap());
             handoff_pending = false;
         }
-        while error.is_none() && tasks.len() < limit {
+        // While the request ramp is in charge, prepare only one job beyond
+        // its current capacity. That waiter signals demand without starting
+        // a queue that must drain if the ramp backs off.
+        let preparation_limit = if controller.is_none() && concurrency.maximum.is_some() {
+            concurrency
+                .requests
+                .as_ref()
+                .map_or(limit, |requests| limit.min(requests.preparation_limit()))
+        } else {
+            limit
+        };
+        while error.is_none() && tasks.len() < preparation_limit {
             let Some(job) = jobs.next() else { break };
             tasks.spawn(work(job));
         }
