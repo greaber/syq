@@ -233,6 +233,14 @@ fn serve(
         let length: usize = headers["content-length"].parse().unwrap();
         let mut body = vec![0; length];
         socket.read_exact(&mut body).unwrap();
+        if let Some(status) = match fault {
+            "upload-throttle-always" => Some(429),
+            "upload-transient-always" => Some(503),
+            _ => None,
+        } {
+            reply(&mut socket, status, &[], b"", false);
+            return;
+        }
         use base64::Engine as _;
         use sha2::Digest as _;
         assert_eq!(
@@ -1606,6 +1614,37 @@ fn s3_get_throttling_without_a_body_is_retried() {
             expected_exit == 0,
             "retries {retries}"
         );
+    }
+}
+
+#[test]
+fn s3_upload_retries_share_one_budget_for_throttling_and_transient_errors() {
+    for fault in ["upload-throttle-always", "upload-transient-always"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), 1)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "source",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the PUT and exactly one retry: the in-memory body
+        // must not also be retried inside the SDK.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 3, "{fault}");
     }
 }
 

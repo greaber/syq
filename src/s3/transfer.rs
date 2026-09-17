@@ -752,6 +752,7 @@ impl Engine {
                     .set_metadata(Some(metadata.encode()))
                     .set_if_none_match(must_be_new.then(|| "*".into()))
                     .customize()
+                    .config_override(super::client::without_sdk_retries())
                     .disable_payload_signing();
                 let request = if let Some(file) = &sync_file {
                     request.interceptor(file.clone())
@@ -968,6 +969,7 @@ impl Engine {
                                     (algorithm == Algorithm::Md5).then(|| checksum.clone()),
                                 )
                                 .customize()
+                                .config_override(super::client::without_sdk_retries())
                                 .disable_payload_signing();
                             let request = if let Some(file) = &sync_file {
                                 request.interceptor(file.clone())

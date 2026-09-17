@@ -44,6 +44,13 @@ impl ClassifyRetry for Throttling {
     }
 }
 
+/// Body-carrying uploads retry in their own loop, which rebuilds a body the
+/// SDK cannot rewind. Disabling SDK retries there keeps `s3-retries` a single
+/// budget for every body size instead of compounding for small in-memory ones.
+pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
+}
+
 #[derive(Debug)]
 struct Headers(Vec<Header>);
 impl Intercept for Headers {
