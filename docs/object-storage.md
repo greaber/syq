@@ -50,7 +50,9 @@ arguments may still be visible to other processes on the machine.
 
 The account needs object read/write and bucket listing permissions. Multipart
 recovery also needs permission to list uploaded parts and abort obsolete
-uploads. Syq does not change bucket policies or lifecycle rules.
+uploads. Server-side copies also need permission to read source tags and write
+destination tags; syq fails if it cannot preserve them. Syq does not change
+bucket policies or lifecycle rules.
 
 ## Parallelism
 
@@ -101,7 +103,8 @@ and collision checks finish before copying starts, so planning memory grows
 with the number of selected objects.
 
 `--resource-limits bandwidth=RATE` limits the aggregate scheduled data rate,
-with bursts up to a part on upload. `--no-compress` has no effect because object
+with bursts up to a part on upload. It does not pace server-side copies, where
+object bodies do not pass through this machine. `--no-compress` has no effect because object
 bodies are transferred without compression.
 
 ## Copy between buckets or prefixes

@@ -163,6 +163,7 @@ fn serve(
                             },
                         ),
                         ("ETag".into(), "\"source-etag\"".into()),
+                        ("Expires".into(), "0".into()),
                         (
                             "x-amz-website-redirect-location".into(),
                             "/new-location".into(),
@@ -185,6 +186,7 @@ fn serve(
             );
         } else if fault == "server-copy-multipart-fails" && method == "POST" {
             assert!(path.contains("uploads"));
+            assert_eq!(headers.get("expires").map(String::as_str), Some("0"));
             reply(&mut socket, 200, &[], b"<InitiateMultipartUploadResult><UploadId>owned</UploadId></InitiateMultipartUploadResult>", false);
         } else if fault == "server-copy-multipart-fails" && method == "DELETE" {
             assert!(path.contains("uploadId=owned"));
@@ -1586,6 +1588,7 @@ fn server_copy_never_reads_or_relays_object_contents() {
                 "--from",
                 "s3://source",
                 "original",
+                "--performance-tuning=s3-max-concurrent-objects=4096",
                 "--to",
                 "s3://destination",
                 "--as",

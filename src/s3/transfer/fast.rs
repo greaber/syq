@@ -16,7 +16,8 @@ impl Engine {
             return Ok(1);
         }
         let tiny = bytes / count < 1024 * 1024;
-        let small_upload = self.options.upload && largest <= 1024 * 1024;
+        let small_upload =
+            self.options.upload && self.options.source_bucket.is_none() && largest <= 1024 * 1024;
         let capacity = if small_upload {
             super::super::tuning::small_upload_capacity(largest)?
         } else {

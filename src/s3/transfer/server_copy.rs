@@ -115,7 +115,7 @@ impl Engine {
             return Ok(Some(source.size));
         }
         self.check_cancelled()?;
-        self.pace(source.size).await?;
+
         let copy_source = encoded_source(source_bucket, &source);
         // Respect explicit part sizing for both performance control and exercising
         // multipart copying with small disposable fixtures.
@@ -193,18 +193,18 @@ impl Engine {
             .set_content_disposition(metadata.content_disposition().map(str::to_owned))
             .set_cache_control(metadata.cache_control().map(str::to_owned))
             .set_website_redirect_location(metadata.website_redirect_location().map(str::to_owned))
-            .set_expires(
-                metadata
-                    .expires_string()
-                    .map(|v| {
-                        aws_smithy_types::DateTime::from_str(
-                            v,
-                            aws_smithy_types::date_time::Format::HttpDate,
-                        )
-                    })
-                    .transpose()?,
-            )
             .set_tagging((!tagging.is_empty()).then_some(tagging))
+            .customize()
+            .map_request(move |mut request| {
+                // Expires is an opaque HTTP hint. Providers can retain values
+                // such as "0" which the SDK's typed date setter cannot represent.
+                if let Some(expires) = metadata.expires_string() {
+                    request
+                        .headers_mut()
+                        .try_insert("expires", expires.to_owned())?;
+                }
+                Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
+            })
             .send()
             .await
             .map_err(|e| e.into_service_error())?;
