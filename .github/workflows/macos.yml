@@ -25,6 +25,7 @@ on:
           - update
           - return_handoff
           - macos_exfat
+          - s3
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.run_id }}
@@ -63,7 +64,7 @@ jobs:
           }
           case "$TEST_TARGET" in
             syq) target=(--bin syq) ;;
-            local|help|output|update|return_handoff|macos_exfat)
+            local|help|output|update|return_handoff|macos_exfat|s3)
               target=(--test "$TEST_TARGET") ;;
             *) echo "Unknown test target: $TEST_TARGET" >&2; exit 2 ;;
           esac
