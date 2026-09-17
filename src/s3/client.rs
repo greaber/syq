@@ -263,7 +263,13 @@ pub(super) async fn head(client: &Client, bucket: &str, key: &str) -> Result<Opt
         {
             return Ok(None)
         }
-        Err(error) => return Err(error.into_service_error()).context("S3 HEAD failed"),
+        Err(error) => {
+            let status = error.raw_response().map(|r| r.status().as_u16());
+            return Err(error.into_service_error()).with_context(|| match status {
+                Some(status) => format!("S3 HEAD failed (HTTP {status})"),
+                None => "S3 HEAD failed".to_owned(),
+            });
+        }
     };
     let size = u64::try_from(
         output

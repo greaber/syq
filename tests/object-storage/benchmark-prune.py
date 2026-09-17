@@ -21,11 +21,13 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -35,6 +37,7 @@ def main():
     parser.add_argument('--syq', required=True, type=Path)
     parser.add_argument('--s5cmd', required=True, type=Path)
     parser.add_argument('--baseline', type=Path)
+    parser.add_argument('--syq-tuning', help='Optional performance-tuning override for the syq binaries')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--count', type=int, default=100000)
     parser.add_argument('--size', type=int, default=1024)
@@ -51,6 +54,10 @@ def main():
         binaries['baseline'] = args.baseline.resolve()
     hashes = {name: hashlib.sha256(binary.read_bytes()).hexdigest() for name, binary in binaries.items()}
     args.output.mkdir(parents=True, exist_ok=False)
+    # Reuse the trust store across independent verification requests. The
+    # benchmarked binaries use their own HTTP clients and are unaffected.
+    urllib.request.install_opener(urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl.create_default_context())))
     # check.py only uses argv[1] to set its executable; its signed HTTP helpers
     # are independent of syq and own a fresh random prefix.
     sys.argv = [sys.argv[0], str(args.syq.resolve())]
@@ -65,6 +72,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     rows = []
     report = dict(prefix=c.PREFIX, endpoint=c.ENDPOINT, bucket=c.BUCKET, region=c.REGION,
+                  harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   binary_sha256=hashes, settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   host=os.uname().nodename, cpus=len(os.sched_getaffinity(0)), load=os.getloadavg(),
                   records=rows, complete=False, cleaned=False)
@@ -74,9 +82,11 @@ def main():
 
     sequence = 0
 
-    def run(command, label):
+    def run(command, label, checked=True):
         nonlocal sequence
         sequence += 1
+        report['phase'] = label
+        save()
         stem = args.output / f'{sequence:04}-{label}'
         started = time.monotonic()
         ended = []
@@ -95,15 +105,15 @@ def main():
                         print(f'{label}: running {time.monotonic() - started:.0f}s', flush=True)
                         if time.monotonic() - started >= args.timeout:
                             raise TimeoutError(f'{label}: see {stem}.log')
-                if child.returncode:
+                if child.returncode and checked:
                     raise RuntimeError(f'{label}: exit {child.returncode}; see {stem}.log')
             finally:
                 if child.poll() is None:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait(timeout=10)
                 waiter.join(timeout=10)
-        user, system, rss = map(float, stem.with_suffix('.usage').read_text().split())
-        return dict(seconds=ended[0] - started, user_cpu=user, system_cpu=system, max_rss_kib=rss,
+        user, system, rss = map(float, stem.with_suffix('.usage').read_text().splitlines()[-1].split())
+        return dict(seconds=ended[0] - started, exit_code=child.returncode, user_cpu=user, system_cpu=system, max_rss_kib=rss,
                     command=list(map(str, command)), log=str(stem.with_suffix('.log')))
 
     def command(tool, direction, local, prefix, prune=True):
@@ -113,13 +123,15 @@ def main():
                     str(local) + '/' if direction == 'upload' else remote + '*',
                     remote if direction == 'upload' else str(local) + '/']
         return [binaries[tool], 'cp', '--no-progress',
+                *(['--performance-tuning', args.syq_tuning] if args.syq_tuning else []),
                 *(['--srcs-in', local, '--to', f's3://{c.BUCKET}', '--into', prefix] if direction == 'upload'
                   else ['--from', f's3://{c.BUCKET}', '--srcs-in', prefix, '--into', local]),
                 *(['--prune'] if prune else [])]
 
     def remove(keys):
-        for start in range(0, len(keys), 1000):
-            batch = keys[start:start + 1000]
+        report['phase'] = 'untimed cleanup'
+        save()
+        def batch_remove(batch):
             assert all(k.startswith(c.PREFIX + '/') for k in batch)
             data = ('<Delete>' + ''.join(f'<Object><Key>{escape(k)}</Key></Object>' for k in batch) + '</Delete>').encode()
             # The independent signer supplies SHA256; Content-MD5 supports S3's
@@ -130,6 +142,13 @@ def main():
             deleted = {n.text for d in root if d.tag.rsplit('}', 1)[-1] == 'Deleted'
                        for n in d if n.tag.rsplit('}', 1)[-1] == 'Key'}
             assert deleted == set(batch), 'cleanup response did not acknowledge every key'
+            return len(batch)
+        with ThreadPoolExecutor(10) as pool:
+            removed = 0
+            for count in pool.map(batch_remove, (keys[i:i + 1000] for i in range(0, len(keys), 1000))):
+                removed += count
+                if removed % 10000 == 0 or removed == len(keys):
+                    print(f'Untimed cleanup: {removed}/{len(keys)} keys removed', flush=True)
 
     def verify(prefix, source):
         expected = {p.name for p in source.iterdir()}
@@ -138,7 +157,7 @@ def main():
         samples = sorted(expected)[:16] + sorted(n for n in expected if n.startswith('new'))
         def check(name):
             assert c.request('GET', prefix + '/' + name)[1] == (source / name).read_bytes(), name
-        with ThreadPoolExecutor(16) as pool:
+        with ThreadPoolExecutor(64) as pool:
             list(pool.map(check, samples))
 
     save()
@@ -187,7 +206,8 @@ def main():
                                     # are never retried or discarded.
                                     for attempt in range(3):
                                         try:
-                                            run(command('s5cmd', 'upload', extras, prefix, False), 'restore-extras')
+                                            run([binaries['s5cmd'], '--endpoint-url', c.ENDPOINT, 'cp',
+                                                 str(extras) + '/*', f's3://{c.BUCKET}/{prefix}/'], 'restore-extras')
                                             break
                                         except RuntimeError:
                                             if attempt == 2:
@@ -200,11 +220,15 @@ def main():
                                 for path in extras.iterdir():
                                     shutil.copy2(path, local / path.name)
                             label = f'{case}-{direction}-{tool}-{rep}'
-                            row = run(command(tool, direction, local, prefix), label)
+                            row = run(command(tool, direction, local, prefix), label, checked=False)
                             row.update(case=case, direction=direction, tool=tool, repeat=rep,
                                        keep=keep, extra=extra, new=new, verified=False,
                                        long_enough=row['seconds'] >= args.minimum_seconds)
                             rows.append(row); save()
+                            if row['exit_code']:
+                                raise RuntimeError(f'{label}: exit {row["exit_code"]}; see {row["log"]}')
+                            report['phase'] = 'verify-' + label
+                            save()
                             if direction == 'upload':
                                 verify(prefix, source)
                             else:
@@ -218,6 +242,7 @@ def main():
     except BaseException as error:
         report['failure'] = f'{type(error).__name__}: {error}'
         save()
+        print('Benchmark failed: ' + report['failure'] + '; cleaning owned prefix', flush=True)
         raise
     finally:
         for key, upload in c.listing(uploads=True):

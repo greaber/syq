@@ -269,6 +269,10 @@ fn serve(
         );
         return;
     }
+    if fault == "head-denied" && method == "HEAD" {
+        reply(&mut socket, 403, &[], b"", false);
+        return;
+    }
     if fault == "missing" {
         reply(&mut socket, 404, &[], b"", false);
         return;
@@ -1485,4 +1489,21 @@ fn s3_unchanged_upload_does_not_read_body_unless_content_check_requested() {
             ),
         }
     }
+}
+
+#[test]
+fn s3_head_failure_reports_http_status_without_a_response_body() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("source"), b"source").unwrap();
+    let server = Server::start("head-denied");
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert_eq!(output.status.code(), Some(23), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("S3 HEAD failed (HTTP 403)"),
+        "{}",
+        output_text(&output)
+    );
 }
