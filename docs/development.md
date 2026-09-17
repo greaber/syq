@@ -207,20 +207,20 @@ With provider credentials and an existing bucket, run
 is a JSON object of headers. The test creates a unique `syq-tests/` prefix and
 removes only its own objects and multipart uploads. To compare an optimized
 build with s5cmd under the same environment, run
-`python3 tests/object-storage/benchmark.py target/release/syq --s5cmd /path/to/s5cmd --output target/s3-benchmark.json`.
-It alternates tool order, checks downloaded bytes, and removes its test prefix.
-The benchmark requires Python 3.11 or newer. If your provider requires a custom
-header, ensure both clients send it: stock s5cmd has no arbitrary-header option.
-
-For pruning comparisons, use
-`python3 tests/object-storage/benchmark-prune.py --syq target/release/syq --s5cmd /path/to/s5cmd --output target/s3-prune-benchmark`
-with the same credentials and a bucket that has never enabled versioning.
-It compares deletion, unchanged trees, and mixed copies with pruning in both
-directions. The default uses 100,000 objects and three repetitions; increase
-`--count` or `--size` when trials fall below the reported ten-second minimum.
-Raw timings, CPU and memory use, binary hashes, verification results, and logs
-are saved in the output directory. Setup and verification are untimed.
-Use `--s5cmd-quiet` for a separate control without s5cmd's per-object logging.
+`python3 tests/object-storage/benchmark.py --syq target/release/syq --s5cmd /path/to/s5cmd --output target/s3-benchmark`.
+The transfer workloads (`large`, `medium`, `small`) report throughput; the
+pruning workloads (`delete`, `noop`, `mixed`) mirror 100,000 small objects with
+`--prune` in both directions and need a bucket that has never enabled
+versioning. Select a subset with `--workloads`, omit `--s5cmd` to measure syq
+alone, or add `--baseline` for an older syq build. Each trial alternates tool
+order, verifies the result, and is flagged when it falls below the ten-second
+minimum; raise `--count` or `--size` in that case. Raw timings, CPU and memory
+use, binary hashes, verification results, and logs are saved in the output
+directory, and the test prefix is removed afterwards. Setup and verification
+are untimed. The benchmark requires Python 3.11 or newer and `/usr/bin/time`.
+If your provider requires a custom header, ensure both clients send it: stock
+s5cmd has no arbitrary-header option. `--s5cmd-quiet` runs s5cmd without its
+per-object logging as a separate control.
 
 For documentation changes, run `python3 scripts/check-doc-links.py`.
 See the repository's `AGENTS.md` for the full contribution workflow.

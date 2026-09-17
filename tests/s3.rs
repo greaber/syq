@@ -276,10 +276,13 @@ fn serve(
         );
         return;
     }
-    if method == "HEAD"
+    if (method == "HEAD"
         && (fault == "single-throttle-always"
             || (matches!(fault, "single-throttle-once" | "single-transient-once")
-                && !gate.0.swap(true, Ordering::SeqCst)))
+                && !gate.0.swap(true, Ordering::SeqCst))))
+        || (method == "GET"
+            && fault == "single-get-throttle-once"
+            && !gate.0.swap(true, Ordering::SeqCst))
     {
         let status = if fault == "single-transient-once" {
             503
@@ -1570,6 +1573,40 @@ fn s3_head_failure_reports_http_status_without_a_response_body() {
         "{}",
         output_text(&output)
     );
+}
+
+#[test]
+fn s3_get_throttling_without_a_body_is_retried() {
+    for (retries, expected_exit, requests) in [(2, 0, 3), (0, 23, 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::start("single-get-throttle-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, then the throttled GET and its retry.
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        assert_eq!(
+            temp.path().join("result").exists(),
+            expected_exit == 0,
+            "retries {retries}"
+        );
+    }
 }
 
 #[test]
