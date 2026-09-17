@@ -176,6 +176,18 @@ fn failure<E>(
     }
 }
 
+/// Every listing reports failures the same way. A named source is looked up
+/// with a HEAD and a listing at once, and either one may be the first to fail.
+fn listing_failure(
+    error: aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> anyhow::Error {
+    let message = failure("S3 listing", &error);
+    anyhow::Error::new(error.into_service_error()).context(message)
+}
+
 /// Ask S3 where a bucket is. Any response carries the answer, so this needs
 /// no permission on the bucket. The error says why there was no answer.
 async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<String, String> {
@@ -444,8 +456,7 @@ pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -
         .max_keys(1)
         .send()
         .await
-        .map_err(|e| e.into_service_error())
-        .context("S3 listing failed")?;
+        .map_err(listing_failure)?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
@@ -473,10 +484,7 @@ pub(super) async fn upload_listing(
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| {
-                let message = failure("S3 listing", &e);
-                anyhow::Error::new(e.into_service_error()).context(message)
-            })?;
+            .map_err(listing_failure)?;
         for object in output.contents() {
             let key = object.key().context("S3 listing omitted key")?;
             anyhow::ensure!(
@@ -607,8 +615,7 @@ pub(super) async fn list(
                 .set_continuation_token(token.clone())
                 .send()
                 .await
-                .map_err(|e| e.into_service_error())
-                .context("S3 listing failed")?;
+                .map_err(listing_failure)?;
             result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
             let mut reachable_exclusion = false;
             if probes_remaining > 0
@@ -647,8 +654,7 @@ pub(super) async fn list(
                         .delimiter("/")
                         .send()
                         .await
-                        .map_err(|e| e.into_service_error())
-                        .context("S3 listing failed")?;
+                        .map_err(listing_failure)?;
                     let mut included = 0;
                     let mut excluded = 0;
                     for child in directory_page.common_prefixes() {
