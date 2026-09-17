@@ -42,6 +42,15 @@ PRUNE = ['delete', 'noop', 'mixed']
 STAMP = (1700000000, 1700000000)
 
 
+def transfer_tuning_mode(args):
+    if any(value is not None for value in (args.workers, args.concurrency, args.part_size)):
+        return "shared-overrides"
+    if args.syq_tuning or any(value is not None for value in
+                              (args.s5cmd_workers, args.s5cmd_concurrency, args.s5cmd_part_size)):
+        return "per-tool-overrides"
+    return "tool-defaults"
+
+
 def transfer_tuning(args):
     """No explicit settings means the binary's automatic defaults."""
     shared = [("s3-max-concurrent-objects", args.workers),
@@ -120,7 +129,7 @@ def main():
     rows = []
     report = dict(prefix=c.PREFIX, endpoint=c.ENDPOINT, bucket=c.BUCKET, region=c.REGION,
                   harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                  binary_sha256=hashes, settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                  binary_sha256=hashes, transfer_tuning_mode=transfer_tuning_mode(args), settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   host=os.uname().nodename, cpus=len(os.sched_getaffinity(0)), load=os.getloadavg(),
                   records=rows, complete=False, cleaned=False)
     header_flags = [flag for name, value in c.HEADERS.items() for flag in ['--s3-header', name + ': ' + value]]
